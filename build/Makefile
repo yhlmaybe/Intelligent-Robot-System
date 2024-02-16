@@ -144,19 +144,6 @@ depend:
 .PHONY : depend
 
 #=============================================================================
-# Target rules for targets named Intelligent-Robot-System_CMake
-
-# Build rule for target.
-Intelligent-Robot-System_CMake: cmake_check_build_system
-	$(MAKE) -f CMakeFiles/Makefile2 Intelligent-Robot-System_CMake
-.PHONY : Intelligent-Robot-System_CMake
-
-# fast build rule for target.
-Intelligent-Robot-System_CMake/fast:
-	$(MAKE) -f CMakeFiles/Intelligent-Robot-System_CMake.dir/build.make CMakeFiles/Intelligent-Robot-System_CMake.dir/build
-.PHONY : Intelligent-Robot-System_CMake/fast
-
-#=============================================================================
 # Target rules for targets named ContinuousSubmit
 
 # Build rule for target.
@@ -404,6 +391,19 @@ NightlyMemCheck/fast:
 .PHONY : NightlyMemCheck/fast
 
 #=============================================================================
+# Target rules for targets named IRS_CMake
+
+# Build rule for target.
+IRS_CMake: cmake_check_build_system
+	$(MAKE) -f CMakeFiles/Makefile2 IRS_CMake
+.PHONY : IRS_CMake
+
+# fast build rule for target.
+IRS_CMake/fast:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/build
+.PHONY : IRS_CMake/fast
+
+#=============================================================================
 # Target rules for targets named ContinuousStart
 
 # Build rule for target.
@@ -520,13 +520,80 @@ ExperimentalBuild/fast:
 	$(MAKE) -f CMakeFiles/ExperimentalBuild.dir/build.make CMakeFiles/ExperimentalBuild.dir/build
 .PHONY : ExperimentalBuild/fast
 
+#=============================================================================
+# Target rules for targets named SEC_LIST
+
+# Build rule for target.
+SEC_LIST: cmake_check_build_system
+	$(MAKE) -f CMakeFiles/Makefile2 SEC_LIST
+.PHONY : SEC_LIST
+
+# fast build rule for target.
+SEC_LIST/fast:
+	$(MAKE) -f SteeringEngineControl/CMakeFiles/SEC_LIST.dir/build.make SteeringEngineControl/CMakeFiles/SEC_LIST.dir/build
+.PHONY : SEC_LIST/fast
+
+IRSInitiate.o: IRSInitiate.cpp.o
+
+.PHONY : IRSInitiate.o
+
+# target to build an object file
+IRSInitiate.cpp.o:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o
+.PHONY : IRSInitiate.cpp.o
+
+IRSInitiate.i: IRSInitiate.cpp.i
+
+.PHONY : IRSInitiate.i
+
+# target to preprocess a source file
+IRSInitiate.cpp.i:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.i
+.PHONY : IRSInitiate.cpp.i
+
+IRSInitiate.s: IRSInitiate.cpp.s
+
+.PHONY : IRSInitiate.s
+
+# target to generate assembly for a file
+IRSInitiate.cpp.s:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.s
+.PHONY : IRSInitiate.cpp.s
+
+Manager.o: Manager.cpp.o
+
+.PHONY : Manager.o
+
+# target to build an object file
+Manager.cpp.o:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/Manager.cpp.o
+.PHONY : Manager.cpp.o
+
+Manager.i: Manager.cpp.i
+
+.PHONY : Manager.i
+
+# target to preprocess a source file
+Manager.cpp.i:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/Manager.cpp.i
+.PHONY : Manager.cpp.i
+
+Manager.s: Manager.cpp.s
+
+.PHONY : Manager.s
+
+# target to generate assembly for a file
+Manager.cpp.s:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/Manager.cpp.s
+.PHONY : Manager.cpp.s
+
 main.o: main.cpp.o
 
 .PHONY : main.o
 
 # target to build an object file
 main.cpp.o:
-	$(MAKE) -f CMakeFiles/Intelligent-Robot-System_CMake.dir/build.make CMakeFiles/Intelligent-Robot-System_CMake.dir/main.cpp.o
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/main.cpp.o
 .PHONY : main.cpp.o
 
 main.i: main.cpp.i
@@ -535,7 +602,7 @@ main.i: main.cpp.i
 
 # target to preprocess a source file
 main.cpp.i:
-	$(MAKE) -f CMakeFiles/Intelligent-Robot-System_CMake.dir/build.make CMakeFiles/Intelligent-Robot-System_CMake.dir/main.cpp.i
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/main.cpp.i
 .PHONY : main.cpp.i
 
 main.s: main.cpp.s
@@ -544,7 +611,7 @@ main.s: main.cpp.s
 
 # target to generate assembly for a file
 main.cpp.s:
-	$(MAKE) -f CMakeFiles/Intelligent-Robot-System_CMake.dir/build.make CMakeFiles/Intelligent-Robot-System_CMake.dir/main.cpp.s
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/main.cpp.s
 .PHONY : main.cpp.s
 
 # Help Target
@@ -556,7 +623,6 @@ help:
 	@echo "... rebuild_cache"
 	@echo "... test"
 	@echo "... package"
-	@echo "... Intelligent-Robot-System_CMake"
 	@echo "... ContinuousSubmit"
 	@echo "... ContinuousMemCheck"
 	@echo "... ContinuousConfigure"
@@ -578,6 +644,7 @@ help:
 	@echo "... NightlyCoverage"
 	@echo "... ExperimentalCoverage"
 	@echo "... NightlyMemCheck"
+	@echo "... IRS_CMake"
 	@echo "... ContinuousStart"
 	@echo "... NightlySubmit"
 	@echo "... ContinuousCoverage"
@@ -587,6 +654,13 @@ help:
 	@echo "... ContinuousTest"
 	@echo "... ContinuousUpdate"
 	@echo "... ExperimentalBuild"
+	@echo "... SEC_LIST"
+	@echo "... IRSInitiate.o"
+	@echo "... IRSInitiate.i"
+	@echo "... IRSInitiate.s"
+	@echo "... Manager.o"
+	@echo "... Manager.i"
+	@echo "... Manager.s"
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"

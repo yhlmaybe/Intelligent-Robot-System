@@ -1,0 +1,2 @@
+/usr/bin/ar qc libSEC_LIST.a  CMakeFiles/SEC_LIST.dir/SECDrive.cpp.o
+/usr/bin/ranlib libSEC_LIST.a

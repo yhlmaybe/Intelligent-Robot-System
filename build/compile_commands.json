@@ -1,7 +1,22 @@
 [
 {
   "directory": "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build",
-  "command": "/usr/bin/aarch64-linux-gnu-g++    -g   -o CMakeFiles/Intelligent-Robot-System_CMake.dir/main.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/main.cpp",
+  "command": "/usr/bin/aarch64-linux-gnu-g++   -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/SteeringEngineControl  -g   -o CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSInitiate.cpp",
+  "file": "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSInitiate.cpp"
+},
+{
+  "directory": "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build",
+  "command": "/usr/bin/aarch64-linux-gnu-g++   -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/SteeringEngineControl  -g   -o CMakeFiles/IRS_CMake.dir/Manager.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/Manager.cpp",
+  "file": "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/Manager.cpp"
+},
+{
+  "directory": "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build",
+  "command": "/usr/bin/aarch64-linux-gnu-g++   -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/SteeringEngineControl  -g   -o CMakeFiles/IRS_CMake.dir/main.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/main.cpp",
   "file": "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/main.cpp"
+},
+{
+  "directory": "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/SteeringEngineControl",
+  "command": "/usr/bin/aarch64-linux-gnu-g++   -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/SteeringEngineControl  -g   -o CMakeFiles/SEC_LIST.dir/SECDrive.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/SteeringEngineControl/SECDrive.cpp",
+  "file": "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/SteeringEngineControl/SECDrive.cpp"
 }
 ]
