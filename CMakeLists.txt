@@ -17,9 +17,8 @@ add_subdirectory(SteeringEngineControl)
 
 add_executable(IRS_CMake ${IRS_LIST})
 
+target_compile_options(IRS_CMake PRIVATE -Wall)
 target_link_libraries(IRS_CMake SEC_LIST)
-
-target_compile_options(IRS_CMake -wall)
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
 set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})

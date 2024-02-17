@@ -1,5 +1,5 @@
 #include <iostream>
 
 int main(int, char**){
-    std::cout << "Hello, from Intelligent-Robot-System!\n";
+    std::cout << "Hello, sss fssffsssaaa Intelligent-Robot-System!\n";
 }
