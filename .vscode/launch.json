@@ -4,15 +4,15 @@
     // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-        
+
         {
             "name": "(gdb) 启动",
             "type": "cppdbg",
             "request": "launch",
-            "program": "输入程序名称，例如 ${workspaceFolder}/a.out",
+            "program": "${workspaceFolder}/build/IRS_CMake",
             "args": [],
             "stopAtEntry": false,
-            "cwd": "${fileDirname}",
+            "cwd": "${workspaceFolder}",
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
@@ -27,7 +27,9 @@
                     "text": "-gdb-set disassembly-flavor intel",
                     "ignoreFailures": true
                 }
-            ]
+            ],
+            "preLaunchTask": "Build",
+            "miDebuggerPath": "/usr/bin/gdb"
         }
 
     ]

@@ -6,6 +6,10 @@
 
 #IncludeRegexTransform: 
 
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSInitiate.cpp
+
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/Manager.cpp
+
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/main.cpp
 iostream
 -
