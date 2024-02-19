@@ -32,9 +32,9 @@
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles/ContinuousTest.dir
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles/ContinuousUpdate.dir
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles/ExperimentalBuild.dir
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/SteeringEngineControl/CMakeFiles/rebuild_cache.dir
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/SteeringEngineControl/CMakeFiles/edit_cache.dir
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/SteeringEngineControl/CMakeFiles/test.dir
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/SteeringEngineControl/CMakeFiles/SEC_LIST.dir
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/SteeringEngineControl/CMakeFiles/package_source.dir
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/SteeringEngineControl/CMakeFiles/package.dir
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/CMakeFiles/rebuild_cache.dir
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/CMakeFiles/edit_cache.dir
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/CMakeFiles/test.dir
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/CMakeFiles/SC_LIST.dir
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/CMakeFiles/package_source.dir
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/CMakeFiles/package.dir

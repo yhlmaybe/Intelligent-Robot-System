@@ -39,7 +39,7 @@ SET(CPACK_IGNORE_FILES "/CVS/;/\\.svn/;/\\.bzr/;/\\.hg/;/\\.git/;\\.swp\$;\\.#;/
 SET(CPACK_INSTALLED_DIRECTORIES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System;/")
 SET(CPACK_INSTALL_CMAKE_PROJECTS "")
 SET(CPACK_INSTALL_PREFIX "/usr/local")
-SET(CPACK_MODULE_PATH "")
+SET(CPACK_MODULE_PATH ";/usr/share/cmake-3.10/Modules")
 SET(CPACK_NSIS_DISPLAY_NAME "Intelligent-Robot-System 0.1.1")
 SET(CPACK_NSIS_INSTALLER_ICON_CODE "")
 SET(CPACK_NSIS_INSTALLER_MUI_ICON_CODE "")

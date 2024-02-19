@@ -142,7 +142,6 @@ IRS_CMake: CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o
 IRS_CMake: CMakeFiles/IRS_CMake.dir/Manager.cpp.o
 IRS_CMake: CMakeFiles/IRS_CMake.dir/main.cpp.o
 IRS_CMake: CMakeFiles/IRS_CMake.dir/build.make
-IRS_CMake: SteeringEngineControl/libSEC_LIST.a
 IRS_CMake: CMakeFiles/IRS_CMake.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Linking CXX executable IRS_CMake"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/IRS_CMake.dir/link.txt --verbose=$(VERBOSE)

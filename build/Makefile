@@ -521,17 +521,17 @@ ExperimentalBuild/fast:
 .PHONY : ExperimentalBuild/fast
 
 #=============================================================================
-# Target rules for targets named SEC_LIST
+# Target rules for targets named SC_LIST
 
 # Build rule for target.
-SEC_LIST: cmake_check_build_system
-	$(MAKE) -f CMakeFiles/Makefile2 SEC_LIST
-.PHONY : SEC_LIST
+SC_LIST: cmake_check_build_system
+	$(MAKE) -f CMakeFiles/Makefile2 SC_LIST
+.PHONY : SC_LIST
 
 # fast build rule for target.
-SEC_LIST/fast:
-	$(MAKE) -f SteeringEngineControl/CMakeFiles/SEC_LIST.dir/build.make SteeringEngineControl/CMakeFiles/SEC_LIST.dir/build
-.PHONY : SEC_LIST/fast
+SC_LIST/fast:
+	$(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/build
+.PHONY : SC_LIST/fast
 
 IRSInitiate.o: IRSInitiate.cpp.o
 
@@ -654,7 +654,7 @@ help:
 	@echo "... ContinuousTest"
 	@echo "... ContinuousUpdate"
 	@echo "... ExperimentalBuild"
-	@echo "... SEC_LIST"
+	@echo "... SC_LIST"
 	@echo "... IRSInitiate.o"
 	@echo "... IRSInitiate.i"
 	@echo "... IRSInitiate.s"

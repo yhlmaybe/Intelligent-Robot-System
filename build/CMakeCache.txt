@@ -280,9 +280,21 @@ MEMORYCHECK_SUPPRESSIONS_FILE:FILEPATH=
 //Path to a program.
 P4COMMAND:FILEPATH=P4COMMAND-NOTFOUND
 
+//Path to a program.
+PYTHON_EXECUTABLE:FILEPATH=/usr/bin/python
+
+//The directory containing a CMake configuration file for Python3.
+Python3_DIR:PATH=Python3_DIR-NOTFOUND
+
+//The directory containing a CMake configuration file for Python.
+Python_DIR:PATH=Python_DIR-NOTFOUND
+
 //Path to scp command, used by CTest for submitting results to
 // a Dart server
 SCPCOMMAND:FILEPATH=/usr/bin/scp
+
+//Dependencies for target
+SC_LIST_LIB_DEPENDS:STATIC=
 
 //Dependencies for target
 SEC_LIST_LIB_DEPENDS:STATIC=
@@ -298,6 +310,15 @@ SLURM_SRUN_COMMAND:FILEPATH=SLURM_SRUN_COMMAND-NOTFOUND
 
 //Path to a program.
 SVNCOMMAND:FILEPATH=SVNCOMMAND-NOTFOUND
+
+//The directory containing a CMake configuration file for python3.6.
+python3.6_DIR:PATH=python3.6_DIR-NOTFOUND
+
+//The directory containing a CMake configuration file for python3.
+python3_DIR:PATH=python3_DIR-NOTFOUND
+
+//The directory containing a CMake configuration file for python.
+python_DIR:PATH=python_DIR-NOTFOUND
 
 
 ########################
@@ -489,6 +510,8 @@ CVSCOMMAND-ADVANCED:INTERNAL=1
 CVS_UPDATE_OPTIONS-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: DART_TESTING_TIMEOUT
 DART_TESTING_TIMEOUT-ADVANCED:INTERNAL=1
+//Details about finding PythonInterp
+FIND_PACKAGE_MESSAGE_DETAILS_PythonInterp:INTERNAL=[/usr/bin/python][v3.6.9()]
 //ADVANCED property for variable: GITCOMMAND
 GITCOMMAND-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: HGCOMMAND
@@ -501,6 +524,8 @@ MEMORYCHECK_COMMAND-ADVANCED:INTERNAL=1
 MEMORYCHECK_SUPPRESSIONS_FILE-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: P4COMMAND
 P4COMMAND-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: PYTHON_EXECUTABLE
+PYTHON_EXECUTABLE-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: SCPCOMMAND
 SCPCOMMAND-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: SITE
