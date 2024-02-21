@@ -29,6 +29,13 @@ if(PYTHON_EXECUTABLE)
     add_executable(IRS_CMake ${IRS_LIST})
 
     target_link_libraries(IRS_CMake python)
+#   target_link_libraries(IRS_CMake /usr/lib/python3.6/config-3.6m-aarch64-linux-gnu/libpython3.6.so)
+
+    target_include_directories(IRS_CMake PRIVATE ${Python_INCLUDE_DIRS})
+   
+    target_link_libraries(IRS_CMake SC_LIST)
+    
+    target_compile_options(IRS_CMake PRIVATE -Wall)
 
 else()
     message(FATAL_ERROR "python not found")
@@ -41,30 +48,6 @@ message("lib : ${PYTHON_LIBRARY_DIR}")
 message("include : ${PYTHON_INCLUDE_DIR}")
 
 add_subdirectory(ServoControl)
-
-
-#if(PYTHON_EXECUTABLE)
-#    message(STATUS "Python executable found at: ${PYTHON_EXECUTABLE}")
-#    
-#    execute_process(COMMAND ${PYTHON_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_paths()['include'])" OUTPUT_VARIABLE PYTHON_INCLUDE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
-#    include_directories(${PYTHON_INCLUDE_DIR})
-#
-#    execute_process(COMMAND ${PYTHON_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_paths()['stdlib'])" OUTPUT_VARIABLE PYTHON_LIBRARY_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
-#    link_directories(${PYTHON_LIBRARY_DIR})
-#    
-#    add_executable(IRS_CMake ${IRS_LIST})
-#
-#    #target_link_libraries(IRS_CMake PRIVATE ${Python_LIBRARIES})
-#
-#    target_compile_options(IRS_CMake PRIVATE -Wall)
-#    target_link_libraries(IRS_CMake SC_LIST)
-#    target_link_libraries(IRS_CMake ${PYTHON_LIBRARY_DIR}/libpython3.so)
-#    else()
-#    message(FATAL_ERROR "python not found.")
-#endif()
-
-
-#target_include_directories(IRS_CMake PRIVATE ${Python_INCLUDE_DIRS})
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
 set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})

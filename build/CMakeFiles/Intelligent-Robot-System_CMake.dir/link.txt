@@ -1,1 +1,0 @@
-/usr/bin/aarch64-linux-gnu-g++  -g  -rdynamic CMakeFiles/Intelligent-Robot-System_CMake.dir/main.cpp.o  -o Intelligent-Robot-System_CMake 

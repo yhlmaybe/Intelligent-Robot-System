@@ -671,7 +671,7 @@ clean: CMakeFiles/NightlyMemCheck.dir/clean
 # Target rules for target CMakeFiles/IRS_CMake.dir
 
 # All Build rule for target.
-CMakeFiles/IRS_CMake.dir/all:
+CMakeFiles/IRS_CMake.dir/all: ServoControl/CMakeFiles/SC_LIST.dir/all
 	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/depend
 	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=1,2,3,4 "Built target IRS_CMake"
@@ -684,7 +684,7 @@ all: CMakeFiles/IRS_CMake.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/IRS_CMake.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles 4
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles 6
 	$(MAKE) -f CMakeFiles/Makefile2 CMakeFiles/IRS_CMake.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles 0
 .PHONY : CMakeFiles/IRS_CMake.dir/rule

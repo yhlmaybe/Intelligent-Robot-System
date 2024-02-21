@@ -60,15 +60,15 @@ include CMakeFiles/IRS_CMake.dir/flags.make
 CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o: CMakeFiles/IRS_CMake.dir/flags.make
 CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o: ../IRSInitiate.cpp
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o"
-	/usr/bin/aarch64-linux-gnu-g++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSInitiate.cpp
+	/usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSInitiate.cpp
 
 CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.i"
-	/usr/bin/aarch64-linux-gnu-g++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSInitiate.cpp > CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.i
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSInitiate.cpp > CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.i
 
 CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.s"
-	/usr/bin/aarch64-linux-gnu-g++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSInitiate.cpp -o CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.s
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSInitiate.cpp -o CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.s
 
 CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o.requires:
 
@@ -84,15 +84,15 @@ CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o.provides.build: CMakeFiles/IRS_CMake.
 CMakeFiles/IRS_CMake.dir/Manager.cpp.o: CMakeFiles/IRS_CMake.dir/flags.make
 CMakeFiles/IRS_CMake.dir/Manager.cpp.o: ../Manager.cpp
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object CMakeFiles/IRS_CMake.dir/Manager.cpp.o"
-	/usr/bin/aarch64-linux-gnu-g++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRS_CMake.dir/Manager.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/Manager.cpp
+	/usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRS_CMake.dir/Manager.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/Manager.cpp
 
 CMakeFiles/IRS_CMake.dir/Manager.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/IRS_CMake.dir/Manager.cpp.i"
-	/usr/bin/aarch64-linux-gnu-g++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/Manager.cpp > CMakeFiles/IRS_CMake.dir/Manager.cpp.i
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/Manager.cpp > CMakeFiles/IRS_CMake.dir/Manager.cpp.i
 
 CMakeFiles/IRS_CMake.dir/Manager.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRS_CMake.dir/Manager.cpp.s"
-	/usr/bin/aarch64-linux-gnu-g++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/Manager.cpp -o CMakeFiles/IRS_CMake.dir/Manager.cpp.s
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/Manager.cpp -o CMakeFiles/IRS_CMake.dir/Manager.cpp.s
 
 CMakeFiles/IRS_CMake.dir/Manager.cpp.o.requires:
 
@@ -108,15 +108,15 @@ CMakeFiles/IRS_CMake.dir/Manager.cpp.o.provides.build: CMakeFiles/IRS_CMake.dir/
 CMakeFiles/IRS_CMake.dir/main.cpp.o: CMakeFiles/IRS_CMake.dir/flags.make
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../main.cpp
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CXX object CMakeFiles/IRS_CMake.dir/main.cpp.o"
-	/usr/bin/aarch64-linux-gnu-g++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRS_CMake.dir/main.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/main.cpp
+	/usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRS_CMake.dir/main.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/main.cpp
 
 CMakeFiles/IRS_CMake.dir/main.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/IRS_CMake.dir/main.cpp.i"
-	/usr/bin/aarch64-linux-gnu-g++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/main.cpp > CMakeFiles/IRS_CMake.dir/main.cpp.i
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/main.cpp > CMakeFiles/IRS_CMake.dir/main.cpp.i
 
 CMakeFiles/IRS_CMake.dir/main.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRS_CMake.dir/main.cpp.s"
-	/usr/bin/aarch64-linux-gnu-g++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/main.cpp -o CMakeFiles/IRS_CMake.dir/main.cpp.s
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/main.cpp -o CMakeFiles/IRS_CMake.dir/main.cpp.s
 
 CMakeFiles/IRS_CMake.dir/main.cpp.o.requires:
 
@@ -142,6 +142,7 @@ IRS_CMake: CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o
 IRS_CMake: CMakeFiles/IRS_CMake.dir/Manager.cpp.o
 IRS_CMake: CMakeFiles/IRS_CMake.dir/main.cpp.o
 IRS_CMake: CMakeFiles/IRS_CMake.dir/build.make
+IRS_CMake: ServoControl/libSC_LIST.a
 IRS_CMake: CMakeFiles/IRS_CMake.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Linking CXX executable IRS_CMake"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/IRS_CMake.dir/link.txt --verbose=$(VERBOSE)

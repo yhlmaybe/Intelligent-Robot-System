@@ -14,7 +14,7 @@ CostDataFile:
 Site: ubuntu
 
 # Build name is osname-revision-compiler, i.e. Linux-2.4.2-2smp-c++
-BuildName: Linux-aarch64-linux-gnu-g++
+BuildName: Linux-c++
 
 # Subprojects
 LabelsForSubprojects: 
@@ -72,7 +72,7 @@ UpdateOptions:
 UpdateType: git
 
 # Compiler info
-Compiler: /usr/bin/aarch64-linux-gnu-g++
+Compiler: /usr/bin/c++
 CompilerVersion: 7.5.0
 
 # Dynamic analysis (MemCheck)

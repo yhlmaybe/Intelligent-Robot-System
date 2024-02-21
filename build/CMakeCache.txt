@@ -23,14 +23,15 @@ BZRCOMMAND:FILEPATH=BZRCOMMAND-NOTFOUND
 //Path to a program.
 CMAKE_AR:FILEPATH=/usr/bin/ar
 
-//No help, variable specified on the command line.
-CMAKE_BUILD_TYPE:STRING=Debug
+//Choose the type of build, options are: None(CMAKE_CXX_FLAGS or
+// CMAKE_C_FLAGS used) Debug Release RelWithDebInfo MinSizeRel.
+CMAKE_BUILD_TYPE:STRING=
 
 //Enable/Disable color output during build.
 CMAKE_COLOR_MAKEFILE:BOOL=ON
 
-//No help, variable specified on the command line.
-CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/aarch64-linux-gnu-g++
+//CXX compiler
+CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/c++
 
 //A wrapper around 'ar' adding the appropriate '--plugin' option
 // for the GCC compiler
@@ -56,8 +57,8 @@ CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
 //Flags used by the compiler during release builds with debug info.
 CMAKE_CXX_FLAGS_RELWITHDEBINFO:STRING=-O2 -g -DNDEBUG
 
-//No help, variable specified on the command line.
-CMAKE_C_COMPILER:FILEPATH=/usr/bin/aarch64-linux-gnu-gcc
+//C compiler
+CMAKE_C_COMPILER:FILEPATH=/usr/bin/cc
 
 //A wrapper around 'ar' adding the appropriate '--plugin' option
 // for the GCC compiler
@@ -98,8 +99,8 @@ CMAKE_EXE_LINKER_FLAGS_RELEASE:STRING=
 //Flags used by the linker during Release with Debug Info builds.
 CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO:STRING=
 
-//No help, variable specified on the command line.
-CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE
+//Enable/Disable output of compile commands during generation.
+CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=OFF
 
 //Install path prefix, prepended onto install directories.
 CMAKE_INSTALL_PREFIX:PATH=/usr/local
@@ -283,21 +284,12 @@ P4COMMAND:FILEPATH=P4COMMAND-NOTFOUND
 //Path to a program.
 PYTHON_EXECUTABLE:FILEPATH=/usr/bin/python
 
-//The directory containing a CMake configuration file for Python3.
-Python3_DIR:PATH=Python3_DIR-NOTFOUND
-
-//The directory containing a CMake configuration file for Python.
-Python_DIR:PATH=Python_DIR-NOTFOUND
-
 //Path to scp command, used by CTest for submitting results to
 // a Dart server
 SCPCOMMAND:FILEPATH=/usr/bin/scp
 
 //Dependencies for target
 SC_LIST_LIB_DEPENDS:STATIC=
-
-//Dependencies for target
-SEC_LIST_LIB_DEPENDS:STATIC=
 
 //Name of the computer/site where compile is being run
 SITE:STRING=ubuntu
@@ -310,15 +302,6 @@ SLURM_SRUN_COMMAND:FILEPATH=SLURM_SRUN_COMMAND-NOTFOUND
 
 //Path to a program.
 SVNCOMMAND:FILEPATH=SVNCOMMAND-NOTFOUND
-
-//The directory containing a CMake configuration file for python3.6.
-python3.6_DIR:PATH=python3.6_DIR-NOTFOUND
-
-//The directory containing a CMake configuration file for python3.
-python3_DIR:PATH=python3_DIR-NOTFOUND
-
-//The directory containing a CMake configuration file for python.
-python_DIR:PATH=python_DIR-NOTFOUND
 
 
 ########################

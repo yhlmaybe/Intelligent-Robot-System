@@ -60,15 +60,15 @@ include ServoControl/CMakeFiles/SC_LIST.dir/flags.make
 ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o: ServoControl/CMakeFiles/SC_LIST.dir/flags.make
 ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o: ../ServoControl/SCDrive.cpp
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o"
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl && /usr/bin/aarch64-linux-gnu-g++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/SC_LIST.dir/SCDrive.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.cpp
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl && /usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/SC_LIST.dir/SCDrive.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.cpp
 
 ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.i: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/SC_LIST.dir/SCDrive.cpp.i"
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl && /usr/bin/aarch64-linux-gnu-g++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.cpp > CMakeFiles/SC_LIST.dir/SCDrive.cpp.i
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.cpp > CMakeFiles/SC_LIST.dir/SCDrive.cpp.i
 
 ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/SC_LIST.dir/SCDrive.cpp.s"
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl && /usr/bin/aarch64-linux-gnu-g++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.cpp -o CMakeFiles/SC_LIST.dir/SCDrive.cpp.s
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.cpp -o CMakeFiles/SC_LIST.dir/SCDrive.cpp.s
 
 ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o.requires:
 
