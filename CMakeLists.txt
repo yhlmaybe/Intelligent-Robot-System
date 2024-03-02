@@ -5,9 +5,16 @@ set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH}" "/usr/share/cmake-3.10/Modules")
 
 set(CMAKE_BUILD_TYPE Debug)
 
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
+
+set(CMAKE_INCLUDE_CURRENT_DIR ON)
+
 include_directories(
 ${CMAKE_SOURCE_DIR}/include
 ${CMAKE_SOURCE_DIR}/ServoControl
+${CMAKE_SOURCE_DIR}/IRSGUI
 )
 
 include(CTest)
@@ -16,6 +23,12 @@ enable_testing()
 aux_source_directory(. IRS_LIST)
 
 find_program(PYTHON_EXECUTABLE python)
+
+find_package(Qt5 COMPONENTS Core Gui Widgets REQUIRED)
+
+message(STATUS "Qt5_DIR = ${Qt5_DIR}")
+
+set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
 if(PYTHON_EXECUTABLE)
     message(STATUS "python executable found at ${PYTHON_EXECUTABLE}")
@@ -34,6 +47,9 @@ if(PYTHON_EXECUTABLE)
     target_include_directories(IRS_CMake PRIVATE ${Python_INCLUDE_DIRS})
    
     target_link_libraries(IRS_CMake SC_LIST)
+    target_link_libraries(IRS_CMake IRSGUI_LIST)
+
+    target_link_libraries(IRS_CMake Qt5::Core Qt5::Gui Qt5::Widgets)
     
     target_compile_options(IRS_CMake PRIVATE -Wall)
 
@@ -48,6 +64,7 @@ message("lib : ${PYTHON_LIBRARY_DIR}")
 message("include : ${PYTHON_INCLUDE_DIR}")
 
 add_subdirectory(ServoControl)
+add_subdirectory(IRSGUI)
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
 set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})

@@ -521,6 +521,19 @@ ExperimentalBuild/fast:
 .PHONY : ExperimentalBuild/fast
 
 #=============================================================================
+# Target rules for targets named IRS_CMake_autogen
+
+# Build rule for target.
+IRS_CMake_autogen: cmake_check_build_system
+	$(MAKE) -f CMakeFiles/Makefile2 IRS_CMake_autogen
+.PHONY : IRS_CMake_autogen
+
+# fast build rule for target.
+IRS_CMake_autogen/fast:
+	$(MAKE) -f CMakeFiles/IRS_CMake_autogen.dir/build.make CMakeFiles/IRS_CMake_autogen.dir/build
+.PHONY : IRS_CMake_autogen/fast
+
+#=============================================================================
 # Target rules for targets named SC_LIST
 
 # Build rule for target.
@@ -532,6 +545,45 @@ SC_LIST: cmake_check_build_system
 SC_LIST/fast:
 	$(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/build
 .PHONY : SC_LIST/fast
+
+#=============================================================================
+# Target rules for targets named SC_LIST_autogen
+
+# Build rule for target.
+SC_LIST_autogen: cmake_check_build_system
+	$(MAKE) -f CMakeFiles/Makefile2 SC_LIST_autogen
+.PHONY : SC_LIST_autogen
+
+# fast build rule for target.
+SC_LIST_autogen/fast:
+	$(MAKE) -f ServoControl/CMakeFiles/SC_LIST_autogen.dir/build.make ServoControl/CMakeFiles/SC_LIST_autogen.dir/build
+.PHONY : SC_LIST_autogen/fast
+
+#=============================================================================
+# Target rules for targets named IRSGUI_LIST
+
+# Build rule for target.
+IRSGUI_LIST: cmake_check_build_system
+	$(MAKE) -f CMakeFiles/Makefile2 IRSGUI_LIST
+.PHONY : IRSGUI_LIST
+
+# fast build rule for target.
+IRSGUI_LIST/fast:
+	$(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build
+.PHONY : IRSGUI_LIST/fast
+
+#=============================================================================
+# Target rules for targets named IRSGUI_LIST_autogen
+
+# Build rule for target.
+IRSGUI_LIST_autogen: cmake_check_build_system
+	$(MAKE) -f CMakeFiles/Makefile2 IRSGUI_LIST_autogen
+.PHONY : IRSGUI_LIST_autogen
+
+# fast build rule for target.
+IRSGUI_LIST_autogen/fast:
+	$(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/build
+.PHONY : IRSGUI_LIST_autogen/fast
 
 IRSInitiate.o: IRSInitiate.cpp.o
 
@@ -559,6 +611,33 @@ IRSInitiate.s: IRSInitiate.cpp.s
 IRSInitiate.cpp.s:
 	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.s
 .PHONY : IRSInitiate.cpp.s
+
+IRS_CMake_autogen/mocs_compilation.o: IRS_CMake_autogen/mocs_compilation.cpp.o
+
+.PHONY : IRS_CMake_autogen/mocs_compilation.o
+
+# target to build an object file
+IRS_CMake_autogen/mocs_compilation.cpp.o:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o
+.PHONY : IRS_CMake_autogen/mocs_compilation.cpp.o
+
+IRS_CMake_autogen/mocs_compilation.i: IRS_CMake_autogen/mocs_compilation.cpp.i
+
+.PHONY : IRS_CMake_autogen/mocs_compilation.i
+
+# target to preprocess a source file
+IRS_CMake_autogen/mocs_compilation.cpp.i:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.i
+.PHONY : IRS_CMake_autogen/mocs_compilation.cpp.i
+
+IRS_CMake_autogen/mocs_compilation.s: IRS_CMake_autogen/mocs_compilation.cpp.s
+
+.PHONY : IRS_CMake_autogen/mocs_compilation.s
+
+# target to generate assembly for a file
+IRS_CMake_autogen/mocs_compilation.cpp.s:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.s
+.PHONY : IRS_CMake_autogen/mocs_compilation.cpp.s
 
 Manager.o: Manager.cpp.o
 
@@ -654,10 +733,17 @@ help:
 	@echo "... ContinuousTest"
 	@echo "... ContinuousUpdate"
 	@echo "... ExperimentalBuild"
+	@echo "... IRS_CMake_autogen"
 	@echo "... SC_LIST"
+	@echo "... SC_LIST_autogen"
+	@echo "... IRSGUI_LIST"
+	@echo "... IRSGUI_LIST_autogen"
 	@echo "... IRSInitiate.o"
 	@echo "... IRSInitiate.i"
 	@echo "... IRSInitiate.s"
+	@echo "... IRS_CMake_autogen/mocs_compilation.o"
+	@echo "... IRS_CMake_autogen/mocs_compilation.i"
+	@echo "... IRS_CMake_autogen/mocs_compilation.s"
 	@echo "... Manager.o"
 	@echo "... Manager.i"
 	@echo "... Manager.s"

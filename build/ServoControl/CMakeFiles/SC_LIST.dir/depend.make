@@ -3,3 +3,5 @@
 
 ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o: ../ServoControl/SCDrive.cpp
 
+ServoControl/CMakeFiles/SC_LIST.dir/SC_LIST_autogen/mocs_compilation.cpp.o: ServoControl/SC_LIST_autogen/mocs_compilation.cpp
+

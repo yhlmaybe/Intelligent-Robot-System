@@ -4,7 +4,6 @@
     // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-
         {
             "name": "(gdb) 启动",
             "type": "cppdbg",
@@ -29,8 +28,8 @@
                 }
             ],
             "preLaunchTask": "Build",
-            "miDebuggerPath": "/usr/bin/gdb"
+            "miDebuggerPath": "/usr/bin/gdb",
+            "visualizerFile": "/home/yhlmaybe/.config/Code/User/workspaceStorage/94514940a753352c301eff3f3ed85b1c/tonka3000.qtvsctools/qt.natvis.xml"
         }
-
     ]
 }

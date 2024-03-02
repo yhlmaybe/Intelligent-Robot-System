@@ -1,4 +1,6 @@
 file(REMOVE_RECURSE
+  "IRS_CMake_autogen"
+  "CMakeFiles/IRS_CMake_autogen.dir/AutogenOldSettings.cmake"
   "CMakeFiles/ExperimentalSubmit"
 )
 

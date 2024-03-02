@@ -1,2 +1,2 @@
-/usr/bin/ar qc libSC_LIST.a  CMakeFiles/SC_LIST.dir/SCDrive.cpp.o
+/usr/bin/ar qc libSC_LIST.a  CMakeFiles/SC_LIST.dir/SCDrive.cpp.o CMakeFiles/SC_LIST.dir/SC_LIST_autogen/mocs_compilation.cpp.o
 /usr/bin/ranlib libSC_LIST.a

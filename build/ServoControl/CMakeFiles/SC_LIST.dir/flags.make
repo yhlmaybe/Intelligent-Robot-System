@@ -6,5 +6,5 @@ CXX_FLAGS = -g
 
 CXX_DEFINES = 
 
-CXX_INCLUDES = -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl -I/usr/include/python3.6m 
+CXX_INCLUDES = -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/SC_LIST_autogen/include -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI -I/usr/include/python3.6m 
 
