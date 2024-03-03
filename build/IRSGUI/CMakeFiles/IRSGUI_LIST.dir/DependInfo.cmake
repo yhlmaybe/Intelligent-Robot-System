@@ -5,7 +5,7 @@ set(CMAKE_DEPENDS_LANGUAGES
 # The set of files for implicit dependencies of each language:
 set(CMAKE_DEPENDS_CHECK_CXX
   "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/mocs_compilation.cpp" "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o"
-  "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI/InitiateUI.cpp" "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o"
+  "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI/mainwindow.cpp" "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o"
   )
 set(CMAKE_CXX_COMPILER_ID "GNU")
 

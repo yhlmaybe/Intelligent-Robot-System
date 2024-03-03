@@ -57,28 +57,28 @@ include IRSGUI/CMakeFiles/IRSGUI_LIST.dir/progress.make
 # Include the compile flags for this target's objects.
 include IRSGUI/CMakeFiles/IRSGUI_LIST.dir/flags.make
 
-IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/flags.make
-IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o: ../IRSGUI/InitiateUI.cpp
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o"
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI/InitiateUI.cpp
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/flags.make
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../IRSGUI/mainwindow.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o"
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI/mainwindow.cpp
 
-IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.i"
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI/InitiateUI.cpp > CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.i
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.i"
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI/mainwindow.cpp > CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.i
 
-IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.s"
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI/InitiateUI.cpp -o CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.s
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.s"
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI/mainwindow.cpp -o CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.s
 
-IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o.requires:
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o.requires:
 
-.PHONY : IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o.requires
+.PHONY : IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o.requires
 
-IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o.provides: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o.requires
-	$(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o.provides.build
-.PHONY : IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o.provides
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o.provides: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o.requires
+	$(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o.provides.build
+.PHONY : IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o.provides
 
-IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o.provides.build: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o.provides.build: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
 
 
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/flags.make
@@ -107,13 +107,13 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o.pro
 
 # Object files for target IRSGUI_LIST
 IRSGUI_LIST_OBJECTS = \
-"CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o" \
+"CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o" \
 "CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o"
 
 # External object files for target IRSGUI_LIST
 IRSGUI_LIST_EXTERNAL_OBJECTS =
 
-IRSGUI/libIRSGUI_LIST.a: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o
+IRSGUI/libIRSGUI_LIST.a: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
 IRSGUI/libIRSGUI_LIST.a: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o
 IRSGUI/libIRSGUI_LIST.a: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make
 IRSGUI/libIRSGUI_LIST.a: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/link.txt
@@ -126,7 +126,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build: IRSGUI/libIRSGUI_LIST.a
 
 .PHONY : IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build
 
-IRSGUI/CMakeFiles/IRSGUI_LIST.dir/requires: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o.requires
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/requires: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o.requires
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/requires: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o.requires
 
 .PHONY : IRSGUI/CMakeFiles/IRSGUI_LIST.dir/requires

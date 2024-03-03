@@ -7,7 +7,7 @@ CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o: IRS_CMake_aut
 
 CMakeFiles/IRS_CMake.dir/Manager.cpp.o: ../Manager.cpp
 
-CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSGUI/InitiateUI.h
+CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSGUI/mainwindow.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../main.cpp
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qalgorithms.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qarraydata.h
@@ -88,6 +88,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qf
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qfontinfo.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qfontmetrics.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qguiapplication.h
+CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qicon.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qimage.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qinputmethod.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qkeysequence.h
@@ -109,14 +110,12 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qv
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qwindowdefs.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qwindowdefs_win.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QApplication
-CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QDialog
-CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QLabel
+CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMainWindow
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qapplication.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdesktopwidget.h
-CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdialog.h
-CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qframe.h
-CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qlabel.h
+CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmainwindow.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qsizepolicy.h
+CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtabwidget.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtwidgets-config.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtwidgetsglobal.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qwidget.h

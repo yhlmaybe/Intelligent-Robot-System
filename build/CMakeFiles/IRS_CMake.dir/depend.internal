@@ -8,7 +8,7 @@ CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o
 CMakeFiles/IRS_CMake.dir/Manager.cpp.o
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/Manager.cpp
 CMakeFiles/IRS_CMake.dir/main.cpp.o
- ../IRSGUI/InitiateUI.h
+ ../IRSGUI/mainwindow.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/main.cpp
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qalgorithms.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qarraydata.h
@@ -89,6 +89,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qfontinfo.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qfontmetrics.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qguiapplication.h
+ /usr/include/aarch64-linux-gnu/qt5/QtGui/qicon.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qimage.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qinputmethod.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qkeysequence.h
@@ -110,14 +111,12 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qwindowdefs.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qwindowdefs_win.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QApplication
- /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QDialog
- /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QLabel
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMainWindow
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qapplication.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdesktopwidget.h
- /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdialog.h
- /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qframe.h
- /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qlabel.h
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmainwindow.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qsizepolicy.h
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtabwidget.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtwidgets-config.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtwidgetsglobal.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qwidget.h

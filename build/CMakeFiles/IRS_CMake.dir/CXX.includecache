@@ -6,10 +6,8 @@
 
 #IncludeRegexTransform: 
 
-../IRSGUI/InitiateUI.h
-QDialog
--
-QLabel
+../IRSGUI/mainwindow.h
+QMainWindow
 -
 
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSInitiate.cpp
@@ -23,10 +21,10 @@ iostream
 -
 python3.6/Python.h
 -
+mainwindow.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/mainwindow.h
 QApplication
 -
-InitiateUI.h
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/InitiateUI.h
 
 /usr/include/aarch64-linux-gnu/qt5/QtCore/qalgorithms.h
 QtCore/qglobal.h
@@ -822,6 +820,16 @@ QtCore/qpoint.h
 QtCore/qsize.h
 -
 
+/usr/include/aarch64-linux-gnu/qt5/QtGui/qicon.h
+QtGui/qtguiglobal.h
+-
+QtCore/qsize.h
+-
+QtCore/qlist.h
+-
+QtGui/qpixmap.h
+-
+
 /usr/include/aarch64-linux-gnu/qt5/QtGui/qimage.h
 QtGui/qtguiglobal.h
 -
@@ -1024,13 +1032,9 @@ QtGui/qtguiglobal.h
 qapplication.h
 /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qapplication.h
 
-/usr/include/aarch64-linux-gnu/qt5/QtWidgets/QDialog
-qdialog.h
-/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdialog.h
-
-/usr/include/aarch64-linux-gnu/qt5/QtWidgets/QLabel
-qlabel.h
-/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qlabel.h
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMainWindow
+qmainwindow.h
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmainwindow.h
 
 /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qapplication.h
 QtWidgets/qtwidgetsglobal.h
@@ -1056,22 +1060,12 @@ QtWidgets/qtwidgetsglobal.h
 QtWidgets/qwidget.h
 -
 
-/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdialog.h
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmainwindow.h
 QtWidgets/qtwidgetsglobal.h
 -
 QtWidgets/qwidget.h
 -
-
-/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qframe.h
-QtWidgets/qtwidgetsglobal.h
--
-QtWidgets/qwidget.h
--
-
-/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qlabel.h
-QtWidgets/qtwidgetsglobal.h
--
-QtWidgets/qframe.h
+QtWidgets/qtabwidget.h
 -
 
 /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qsizepolicy.h
@@ -1080,6 +1074,14 @@ QtWidgets/qtwidgetsglobal.h
 QtCore/qobject.h
 -
 QtCore/qalgorithms.h
+-
+
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtabwidget.h
+QtWidgets/qtwidgetsglobal.h
+-
+QtWidgets/qwidget.h
+-
+QtGui/qicon.h
 -
 
 /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtwidgets-config.h

@@ -200,32 +200,32 @@ IRSGUI_LIST_autogen/mocs_compilation.cpp.s:
 	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.s
 .PHONY : IRSGUI_LIST_autogen/mocs_compilation.cpp.s
 
-InitiateUI.o: InitiateUI.cpp.o
+mainwindow.o: mainwindow.cpp.o
 
-.PHONY : InitiateUI.o
+.PHONY : mainwindow.o
 
 # target to build an object file
-InitiateUI.cpp.o:
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o
-.PHONY : InitiateUI.cpp.o
+mainwindow.cpp.o:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
+.PHONY : mainwindow.cpp.o
 
-InitiateUI.i: InitiateUI.cpp.i
+mainwindow.i: mainwindow.cpp.i
 
-.PHONY : InitiateUI.i
+.PHONY : mainwindow.i
 
 # target to preprocess a source file
-InitiateUI.cpp.i:
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.i
-.PHONY : InitiateUI.cpp.i
+mainwindow.cpp.i:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.i
+.PHONY : mainwindow.cpp.i
 
-InitiateUI.s: InitiateUI.cpp.s
+mainwindow.s: mainwindow.cpp.s
 
-.PHONY : InitiateUI.s
+.PHONY : mainwindow.s
 
 # target to generate assembly for a file
-InitiateUI.cpp.s:
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.s
-.PHONY : InitiateUI.cpp.s
+mainwindow.cpp.s:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.s
+.PHONY : mainwindow.cpp.s
 
 # Help Target
 help:
@@ -243,9 +243,9 @@ help:
 	@echo "... IRSGUI_LIST_autogen/mocs_compilation.o"
 	@echo "... IRSGUI_LIST_autogen/mocs_compilation.i"
 	@echo "... IRSGUI_LIST_autogen/mocs_compilation.s"
-	@echo "... InitiateUI.o"
-	@echo "... InitiateUI.i"
-	@echo "... InitiateUI.s"
+	@echo "... mainwindow.o"
+	@echo "... mainwindow.i"
+	@echo "... mainwindow.s"
 .PHONY : help
 
 

@@ -1,2 +1,2 @@
-/usr/bin/ar qc libIRSGUI_LIST.a  CMakeFiles/IRSGUI_LIST.dir/InitiateUI.cpp.o CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o
+/usr/bin/ar qc libIRSGUI_LIST.a  CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o
 /usr/bin/ranlib libIRSGUI_LIST.a

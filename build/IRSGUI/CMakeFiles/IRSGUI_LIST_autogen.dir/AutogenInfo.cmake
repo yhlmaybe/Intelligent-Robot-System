@@ -7,7 +7,7 @@ set(AM_CMAKE_CURRENT_SOURCE_DIR "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robo
 set(AM_CMAKE_CURRENT_BINARY_DIR "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/")
 set(AM_CMAKE_INCLUDE_DIRECTORIES_PROJECT_BEFORE "")
 set(AM_BUILD_DIR "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen")
-set(AM_SOURCES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI/InitiateUI.cpp")
+set(AM_SOURCES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI/mainwindow.cpp")
 set(AM_HEADERS "")
 # Qt environment
 set(AM_QT_VERSION_MAJOR "5")
