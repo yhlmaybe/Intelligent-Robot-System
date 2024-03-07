@@ -1138,6 +1138,7 @@ IRSGUI/preinstall:
 # Target rules for target IRSGUI/CMakeFiles/IRSGUI_LIST.dir
 
 # All Build rule for target.
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/all: ServoControl/CMakeFiles/SC_LIST.dir/all
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/all: IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/all
 	$(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/depend
 	$(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build
@@ -1151,7 +1152,7 @@ all: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/all
 
 # Build rule for subdir invocation for target.
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles 4
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles 8
 	$(MAKE) -f CMakeFiles/Makefile2 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles 0
 .PHONY : IRSGUI/CMakeFiles/IRSGUI_LIST.dir/rule
@@ -1175,7 +1176,7 @@ clean: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/clean
 # Target rules for target IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir
 
 # All Build rule for target.
-IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/all:
+IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/all: ServoControl/CMakeFiles/SC_LIST.dir/all
 	$(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/depend
 	$(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/build
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=4 "Built target IRSGUI_LIST_autogen"
@@ -1183,7 +1184,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/all:
 
 # Build rule for subdir invocation for target.
 IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles 1
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles 5
 	$(MAKE) -f CMakeFiles/Makefile2 IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles 0
 .PHONY : IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/rule

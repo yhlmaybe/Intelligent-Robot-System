@@ -14,6 +14,8 @@
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QButtonGroup>
 #include <QtWidgets/QHeaderView>
+#include <QtWidgets/QLabel>
+#include <QtWidgets/QLineEdit>
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QMenuBar>
 #include <QtWidgets/QPushButton>
@@ -27,7 +29,9 @@ class Ui_MainWindow
 {
 public:
     QWidget *centralWidget;
-    QPushButton *pushButton;
+    QPushButton *SetServoNo_Button;
+    QLabel *ServoNo_Lable;
+    QLineEdit *ServoNo_LineEdit;
     QMenuBar *menuBar;
     QToolBar *mainToolBar;
     QStatusBar *statusBar;
@@ -39,9 +43,15 @@ public:
         MainWindow->resize(400, 300);
         centralWidget = new QWidget(MainWindow);
         centralWidget->setObjectName(QStringLiteral("centralWidget"));
-        pushButton = new QPushButton(centralWidget);
-        pushButton->setObjectName(QStringLiteral("pushButton"));
-        pushButton->setGeometry(QRect(190, 100, 89, 25));
+        SetServoNo_Button = new QPushButton(centralWidget);
+        SetServoNo_Button->setObjectName(QStringLiteral("SetServoNo_Button"));
+        SetServoNo_Button->setGeometry(QRect(10, 30, 89, 25));
+        ServoNo_Lable = new QLabel(centralWidget);
+        ServoNo_Lable->setObjectName(QStringLiteral("ServoNo_Lable"));
+        ServoNo_Lable->setGeometry(QRect(240, 30, 71, 21));
+        ServoNo_LineEdit = new QLineEdit(centralWidget);
+        ServoNo_LineEdit->setObjectName(QStringLiteral("ServoNo_LineEdit"));
+        ServoNo_LineEdit->setGeometry(QRect(110, 30, 113, 25));
         MainWindow->setCentralWidget(centralWidget);
         menuBar = new QMenuBar(MainWindow);
         menuBar->setObjectName(QStringLiteral("menuBar"));
@@ -62,7 +72,8 @@ public:
     void retranslateUi(QMainWindow *MainWindow)
     {
         MainWindow->setWindowTitle(QApplication::translate("MainWindow", "MainWindow", Q_NULLPTR));
-        pushButton->setText(QApplication::translate("MainWindow", "PushButton", Q_NULLPTR));
+        SetServoNo_Button->setText(QApplication::translate("MainWindow", "SetServoNo", Q_NULLPTR));
+        ServoNo_Lable->setText(QApplication::translate("MainWindow", "null", Q_NULLPTR));
     } // retranslateUi
 
 };

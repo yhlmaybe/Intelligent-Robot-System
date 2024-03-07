@@ -171,6 +171,7 @@ IRS_CMake: CMakeFiles/IRS_CMake.dir/build.make
 IRS_CMake: ServoControl/libSC_LIST.a
 IRS_CMake: IRSGUI/libIRSGUI_LIST.a
 IRS_CMake: /usr/lib/aarch64-linux-gnu/libQt5Widgets.so.5.9.5
+IRS_CMake: ServoControl/libSC_LIST.a
 IRS_CMake: /usr/lib/aarch64-linux-gnu/libQt5Gui.so.5.9.5
 IRS_CMake: /usr/lib/aarch64-linux-gnu/libQt5Core.so.5.9.5
 IRS_CMake: CMakeFiles/IRS_CMake.dir/link.txt

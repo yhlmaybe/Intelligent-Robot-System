@@ -2,6 +2,7 @@
     "files.associations": {
         "qdialog": "cpp",
         "qlabel": "cpp",
-        "qapplication": "cpp"
+        "qapplication": "cpp",
+        "qmainwindow": "cpp"
     }
 }

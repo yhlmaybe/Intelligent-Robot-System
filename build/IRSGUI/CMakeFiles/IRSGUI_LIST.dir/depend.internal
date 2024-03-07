@@ -202,12 +202,16 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qpaintdevice.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qpainterpath.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qpalette.h
+ /usr/include/aarch64-linux-gnu/qt5/QtGui/qpen.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qpixelformat.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qpixmap.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qpolygon.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qregion.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qrgb.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qrgba64.h
+ /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextcursor.h
+ /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextformat.h
+ /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextoption.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qtgui-config.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qtguiglobal.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qtouchdevice.h
@@ -220,6 +224,8 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QApplication
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QButtonGroup
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QHeaderView
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QLabel
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QLineEdit
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMainWindow
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMenuBar
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QPushButton
@@ -239,6 +245,8 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdesktopwidget.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qframe.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qheaderview.h
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qlabel.h
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qlineedit.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmainwindow.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmenu.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmenubar.h
