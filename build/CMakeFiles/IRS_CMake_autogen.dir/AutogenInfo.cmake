@@ -18,7 +18,7 @@ set(AM_QT_RCC_EXECUTABLE "/usr/lib/qt5/bin/rcc")
 # MOC settings
 set(AM_MOC_SKIP "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRS_CMake_autogen/mocs_compilation.cpp")
 set(AM_MOC_DEFINITIONS "QT_CORE_LIB;QT_GUI_LIB;QT_WIDGETS_LIB")
-set(AM_MOC_INCLUDES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRS_CMake_autogen/include;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI;/usr/include/python3.6m;/usr/include/aarch64-linux-gnu/qt5;/usr/include/aarch64-linux-gnu/qt5/QtCore;/usr/lib/aarch64-linux-gnu/qt5/mkspecs/linux-g++;/usr/include/aarch64-linux-gnu/qt5/QtGui;/usr/include/aarch64-linux-gnu/qt5/QtWidgets")
+set(AM_MOC_INCLUDES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRS_CMake_autogen/include;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI;/usr/include/python3.6m;/opt/ros/eloquent/include;/usr/include/aarch64-linux-gnu/qt5;/usr/include/aarch64-linux-gnu/qt5/QtCore;/usr/lib/aarch64-linux-gnu/qt5/mkspecs/linux-g++;/usr/include/aarch64-linux-gnu/qt5/QtGui;/usr/include/aarch64-linux-gnu/qt5/QtWidgets")
 set(AM_MOC_OPTIONS "")
 set(AM_MOC_RELAXED_MODE "FALSE")
 set(AM_MOC_MACRO_NAMES "Q_OBJECT;Q_GADGET;Q_NAMESPACE")

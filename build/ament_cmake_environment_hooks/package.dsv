@@ -1,0 +1,4 @@
+source;share/Intelligent-Robot-System/local_setup.bash
+source;share/Intelligent-Robot-System/local_setup.dsv
+source;share/Intelligent-Robot-System/local_setup.sh
+source;share/Intelligent-Robot-System/local_setup.zsh

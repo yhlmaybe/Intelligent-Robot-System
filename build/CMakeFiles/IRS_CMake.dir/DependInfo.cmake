@@ -27,6 +27,7 @@ set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "../ServoControl"
   "../IRSGUI"
   "/usr/include/python3.6m"
+  "/opt/ros/eloquent/include"
   "/usr/include/aarch64-linux-gnu/qt5"
   "/usr/include/aarch64-linux-gnu/qt5/QtCore"
   "/usr/lib/aarch64-linux-gnu/qt5/mkspecs/linux-g++"

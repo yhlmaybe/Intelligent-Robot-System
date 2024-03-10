@@ -4,7 +4,8 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/usr/include/aarch64-linux-gnu/qt5/**"
+                "/usr/include/aarch64-linux-gnu/qt5/**",
+                "/opt/ros/eloquent/include/**"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/gcc",

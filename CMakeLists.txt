@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.0.0)
 project(Intelligent-Robot-System VERSION 0.1.0 LANGUAGES C CXX)
 
+cmake_policy(SET CMP0057 NEW)
+
 set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH}" "/usr/share/cmake-3.10/Modules")
 
 set(CMAKE_BUILD_TYPE Debug)
@@ -11,11 +13,17 @@ set(CMAKE_AUTOUIC ON)
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
-include_directories(
-${CMAKE_SOURCE_DIR}/include
-${CMAKE_SOURCE_DIR}/ServoControl
-${CMAKE_SOURCE_DIR}/IRSGUI
-)
+if(NOT CMAKE_C_STANDARD)
+    set(CMAKE_C_STANDARD 99)
+endif()
+
+if(NOT CMAKE_CXX_STANDARD)
+    set(CMAKE_CXX_STANDARD 14)
+endif()
+
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options(-Wall -Wextra -Wpedantic)
+endif()  
 
 include(CTest)
 enable_testing()
@@ -26,9 +34,16 @@ find_program(PYTHON_EXECUTABLE python)
 
 find_package(Qt5 COMPONENTS Core Gui Widgets REQUIRED)
 
-message(STATUS "Qt5_DIR = ${Qt5_DIR}")
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
 
-set(CMAKE_INCLUDE_CURRENT_DIR ON)
+include_directories(
+${CMAKE_SOURCE_DIR}/include
+${CMAKE_SOURCE_DIR}/ServoControl
+${CMAKE_SOURCE_DIR}/IRSGUI
+)
+
+message(STATUS "Qt5_DIR = ${Qt5_DIR}")
 
 if(PYTHON_EXECUTABLE)
     message(STATUS "python executable found at ${PYTHON_EXECUTABLE}")
@@ -51,17 +66,30 @@ if(PYTHON_EXECUTABLE)
 
     target_link_libraries(IRS_CMake Qt5::Core Qt5::Gui Qt5::Widgets)
     
-    target_compile_options(IRS_CMake PRIVATE -Wall)
+    ament_target_dependencies(IRS_CMake "rclcpp")
+
+    #target_compile_options(IRS_CMake PRIVATE -Wall)
 
 else()
     message(FATAL_ERROR "python not found")
 endif()
 
-
-
-
 message("lib : ${PYTHON_LIBRARY_DIR}")
 message("include : ${PYTHON_INCLUDE_DIR}")
+
+install(TARGETS
+    IRS_CMake  
+    DESTINATION lib/${PROJECT_NAME}
+)
+
+if(BUILD_TESTING)
+    find_package(ament_lint_auto REQUIRED)
+    set(ament_cmake_copyright_FOUND TRUE)
+    set(ament_cmake_cpplint_FOUND TRUE)
+    ament_lint_auto_find_test_dependencies()
+endif()
+
+ament_package()
 
 add_subdirectory(ServoControl)
 add_subdirectory(IRSGUI)
