@@ -1,0 +1,2 @@
+/usr/bin/ar qc libROSMANAGER_LIST.a  CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o
+/usr/bin/ranlib libROSMANAGER_LIST.a

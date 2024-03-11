@@ -129,36 +129,11 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o.provides: CMakeFiles/IRS_CMake.dir/main.cpp.
 CMakeFiles/IRS_CMake.dir/main.cpp.o.provides.build: CMakeFiles/IRS_CMake.dir/main.cpp.o
 
 
-CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o: CMakeFiles/IRS_CMake.dir/flags.make
-CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o: IRS_CMake_autogen/mocs_compilation.cpp
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building CXX object CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o"
-	/usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRS_CMake_autogen/mocs_compilation.cpp
-
-CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.i"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRS_CMake_autogen/mocs_compilation.cpp > CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.i
-
-CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.s"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRS_CMake_autogen/mocs_compilation.cpp -o CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.s
-
-CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o.requires:
-
-.PHONY : CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o.requires
-
-CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o.provides: CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o.requires
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o.provides.build
-.PHONY : CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o.provides
-
-CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o.provides.build: CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o
-
-
 # Object files for target IRS_CMake
 IRS_CMake_OBJECTS = \
 "CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o" \
 "CMakeFiles/IRS_CMake.dir/Manager.cpp.o" \
-"CMakeFiles/IRS_CMake.dir/main.cpp.o" \
-"CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o"
+"CMakeFiles/IRS_CMake.dir/main.cpp.o"
 
 # External object files for target IRS_CMake
 IRS_CMake_EXTERNAL_OBJECTS =
@@ -166,11 +141,11 @@ IRS_CMake_EXTERNAL_OBJECTS =
 IRS_CMake: CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o
 IRS_CMake: CMakeFiles/IRS_CMake.dir/Manager.cpp.o
 IRS_CMake: CMakeFiles/IRS_CMake.dir/main.cpp.o
-IRS_CMake: CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o
 IRS_CMake: CMakeFiles/IRS_CMake.dir/build.make
 IRS_CMake: ServoControl/libSC_LIST.a
 IRS_CMake: IRSGUI/libIRSGUI_LIST.a
-IRS_CMake: /usr/lib/aarch64-linux-gnu/libQt5Widgets.so.5.9.5
+IRS_CMake: ROSManager/libROSMANAGER_LIST.a
+IRS_CMake: ServoControl/libSC_LIST.a
 IRS_CMake: /opt/ros/eloquent/lib/librclcpp.so
 IRS_CMake: /opt/ros/eloquent/lib/librcl.so
 IRS_CMake: /opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_c.so
@@ -185,15 +160,6 @@ IRS_CMake: /opt/ros/eloquent/lib/librmw.so
 IRS_CMake: /opt/ros/eloquent/lib/librcutils.so
 IRS_CMake: /opt/ros/eloquent/lib/librcl_logging_spdlog.so
 IRS_CMake: /opt/ros/eloquent/lib/librcpputils.so
-IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_c.so
-IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_cpp.so
-IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_c.so
-IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_generator_c.so
-IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_cpp.so
-IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_c.so
-IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_cpp.so
-IRS_CMake: /opt/ros/eloquent/lib/librosidl_typesupport_introspection_c.so
-IRS_CMake: /opt/ros/eloquent/lib/librosidl_typesupport_introspection_cpp.so
 IRS_CMake: /opt/ros/eloquent/lib/librosgraph_msgs__rosidl_generator_c.so
 IRS_CMake: /opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_c.so
 IRS_CMake: /opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_cpp.so
@@ -201,16 +167,32 @@ IRS_CMake: /opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_introspect
 IRS_CMake: /opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_introspection_cpp.so
 IRS_CMake: /opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_fastrtps_c.so
 IRS_CMake: /opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_fastrtps_cpp.so
-IRS_CMake: /opt/ros/eloquent/lib/librosidl_typesupport_cpp.so
-IRS_CMake: /opt/ros/eloquent/lib/librosidl_typesupport_c.so
-IRS_CMake: /opt/ros/eloquent/lib/librosidl_generator_c.so
 IRS_CMake: /opt/ros/eloquent/lib/librcl_yaml_param_parser.so
 IRS_CMake: /opt/ros/eloquent/lib/libtracetools.so
-IRS_CMake: ServoControl/libSC_LIST.a
+IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_c.so
+IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_cpp.so
+IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_c.so
+IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_generator_c.so
+IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_cpp.so
+IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_c.so
+IRS_CMake: /opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_cpp.so
+IRS_CMake: /opt/ros/eloquent/lib/librosidl_typesupport_c.so
+IRS_CMake: /opt/ros/eloquent/lib/librosidl_typesupport_cpp.so
+IRS_CMake: /opt/ros/eloquent/lib/librosidl_generator_c.so
+IRS_CMake: /opt/ros/eloquent/lib/librosidl_typesupport_introspection_c.so
+IRS_CMake: /opt/ros/eloquent/lib/librosidl_typesupport_introspection_cpp.so
+IRS_CMake: /opt/ros/eloquent/lib/libstd_msgs__rosidl_generator_c.so
+IRS_CMake: /opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_c.so
+IRS_CMake: /opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_cpp.so
+IRS_CMake: /opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_introspection_c.so
+IRS_CMake: /opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_introspection_cpp.so
+IRS_CMake: /opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_fastrtps_c.so
+IRS_CMake: /opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_fastrtps_cpp.so
+IRS_CMake: /usr/lib/aarch64-linux-gnu/libQt5Widgets.so.5.9.5
 IRS_CMake: /usr/lib/aarch64-linux-gnu/libQt5Gui.so.5.9.5
 IRS_CMake: /usr/lib/aarch64-linux-gnu/libQt5Core.so.5.9.5
 IRS_CMake: CMakeFiles/IRS_CMake.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Linking CXX executable IRS_CMake"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Linking CXX executable IRS_CMake"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/IRS_CMake.dir/link.txt --verbose=$(VERBOSE)
 
 # Rule to build all files generated by this target.
@@ -221,7 +203,6 @@ CMakeFiles/IRS_CMake.dir/build: IRS_CMake
 CMakeFiles/IRS_CMake.dir/requires: CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o.requires
 CMakeFiles/IRS_CMake.dir/requires: CMakeFiles/IRS_CMake.dir/Manager.cpp.o.requires
 CMakeFiles/IRS_CMake.dir/requires: CMakeFiles/IRS_CMake.dir/main.cpp.o.requires
-CMakeFiles/IRS_CMake.dir/requires: CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o.requires
 
 .PHONY : CMakeFiles/IRS_CMake.dir/requires
 

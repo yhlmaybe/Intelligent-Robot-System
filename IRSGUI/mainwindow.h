@@ -3,6 +3,7 @@
 
 #include <python3.6/Python.h>//it must be placed before <QMainWindow>, otherwise an error will be reported
 #include <QMainWindow>
+#include <rclcpp/rclcpp.hpp>
 
 namespace Ui {
 class MainWindow;
@@ -15,23 +16,12 @@ class MainWindow : public QMainWindow
 public:
     explicit MainWindow(QWidget *parent = 0);
     ~MainWindow();
-    
-    PyObject *pModule;
-    PyObject *pDict;
-    PyObject *pClassCalc;
-    PyObject *pConstruct;
-    PyObject *pArgs;
-    PyObject *pInstance;
-    PyObject *pRetvalue;
-
 
 private:
     Ui::MainWindow *ui;
-
+    void Initiate();
 
 private slots:
-
-    void GetServoId();
 
 };
 

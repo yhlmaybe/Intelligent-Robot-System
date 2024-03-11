@@ -204,21 +204,6 @@ SC_LIST/fast:
 	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/build
 .PHONY : SC_LIST/fast
 
-# Convenience name for target.
-ServoControl/CMakeFiles/SC_LIST_autogen.dir/rule:
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f CMakeFiles/Makefile2 ServoControl/CMakeFiles/SC_LIST_autogen.dir/rule
-.PHONY : ServoControl/CMakeFiles/SC_LIST_autogen.dir/rule
-
-# Convenience name for target.
-SC_LIST_autogen: ServoControl/CMakeFiles/SC_LIST_autogen.dir/rule
-
-.PHONY : SC_LIST_autogen
-
-# fast build rule for target.
-SC_LIST_autogen/fast:
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST_autogen.dir/build.make ServoControl/CMakeFiles/SC_LIST_autogen.dir/build
-.PHONY : SC_LIST_autogen/fast
-
 SCDrive.o: SCDrive.cpp.o
 
 .PHONY : SCDrive.o
@@ -246,33 +231,6 @@ SCDrive.cpp.s:
 	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.s
 .PHONY : SCDrive.cpp.s
 
-SC_LIST_autogen/mocs_compilation.o: SC_LIST_autogen/mocs_compilation.cpp.o
-
-.PHONY : SC_LIST_autogen/mocs_compilation.o
-
-# target to build an object file
-SC_LIST_autogen/mocs_compilation.cpp.o:
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/SC_LIST_autogen/mocs_compilation.cpp.o
-.PHONY : SC_LIST_autogen/mocs_compilation.cpp.o
-
-SC_LIST_autogen/mocs_compilation.i: SC_LIST_autogen/mocs_compilation.cpp.i
-
-.PHONY : SC_LIST_autogen/mocs_compilation.i
-
-# target to preprocess a source file
-SC_LIST_autogen/mocs_compilation.cpp.i:
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/SC_LIST_autogen/mocs_compilation.cpp.i
-.PHONY : SC_LIST_autogen/mocs_compilation.cpp.i
-
-SC_LIST_autogen/mocs_compilation.s: SC_LIST_autogen/mocs_compilation.cpp.s
-
-.PHONY : SC_LIST_autogen/mocs_compilation.s
-
-# target to generate assembly for a file
-SC_LIST_autogen/mocs_compilation.cpp.s:
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/SC_LIST_autogen/mocs_compilation.cpp.s
-.PHONY : SC_LIST_autogen/mocs_compilation.cpp.s
-
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -289,13 +247,9 @@ help:
 	@echo "... test"
 	@echo "... edit_cache"
 	@echo "... rebuild_cache"
-	@echo "... SC_LIST_autogen"
 	@echo "... SCDrive.o"
 	@echo "... SCDrive.i"
 	@echo "... SCDrive.s"
-	@echo "... SC_LIST_autogen/mocs_compilation.o"
-	@echo "... SC_LIST_autogen/mocs_compilation.i"
-	@echo "... SC_LIST_autogen/mocs_compilation.s"
 .PHONY : help
 
 

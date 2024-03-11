@@ -7,7 +7,7 @@ set(AM_CMAKE_CURRENT_SOURCE_DIR "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robo
 set(AM_CMAKE_CURRENT_BINARY_DIR "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/")
 set(AM_CMAKE_INCLUDE_DIRECTORIES_PROJECT_BEFORE "")
 set(AM_BUILD_DIR "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/SC_LIST_autogen")
-set(AM_SOURCES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.cpp")
+set(AM_SOURCES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/NodeManager.cpp;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.cpp")
 set(AM_HEADERS "")
 # Qt environment
 set(AM_QT_VERSION_MAJOR "5")

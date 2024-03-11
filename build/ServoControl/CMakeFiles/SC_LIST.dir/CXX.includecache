@@ -7,6 +7,10 @@
 #IncludeRegexTransform: 
 
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.cpp
+SCDrive.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
 
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/SC_LIST_autogen/mocs_compilation.cpp
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
+python3.6/Python.h
+-
 

@@ -284,7 +284,7 @@ GITCOMMAND:FILEPATH=/usr/bin/git
 HGCOMMAND:FILEPATH=HGCOMMAND-NOTFOUND
 
 //Dependencies for the target
-IRSGUI_LIST_LIB_DEPENDS:STATIC=general;Qt5::Core;general;Qt5::Gui;general;Qt5::Widgets;general;python;general;SC_LIST;
+IRSGUI_LIST_LIB_DEPENDS:STATIC=general;Qt5::Core;general;Qt5::Gui;general;Qt5::Widgets;general;SC_LIST;general;ROSMANAGER_LIST;
 
 //Value Computed by CMake
 Intelligent-Robot-System_BINARY_DIR:STATIC=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build
@@ -328,6 +328,9 @@ Qt5Widgets_DIR:PATH=/usr/lib/aarch64-linux-gnu/cmake/Qt5Widgets
 //The directory containing a CMake configuration file for Qt5.
 Qt5_DIR:PATH=/usr/lib/aarch64-linux-gnu/cmake/Qt5
 
+//Dependencies for the target
+ROSMANAGER_LIST_LIB_DEPENDS:STATIC=general;/opt/ros/eloquent/lib/librclcpp.so;general;/opt/ros/eloquent/lib/librcl.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_introspection_cpp.so;general;-lpthread;general;/opt/ros/eloquent/lib/librmw_implementation.so;general;/opt/ros/eloquent/lib/librmw.so;general;/opt/ros/eloquent/lib/librcutils.so;general;/opt/ros/eloquent/lib/librcl_logging_spdlog.so;general;/opt/ros/eloquent/lib/librcpputils.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librcl_yaml_param_parser.so;general;/opt/ros/eloquent/lib/libtracetools.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_fastrtps_cpp.so;
+
 //Path to scp command, used by CTest for submitting results to
 // a Dart server
 SCPCOMMAND:FILEPATH=/usr/bin/scp
@@ -348,7 +351,7 @@ SLURM_SRUN_COMMAND:FILEPATH=SLURM_SRUN_COMMAND-NOTFOUND
 SVNCOMMAND:FILEPATH=SVNCOMMAND-NOTFOUND
 
 //Path to a library.
-_lib:FILEPATH=/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_opensplice_cpp.so
+_lib:FILEPATH=/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_opensplice_cpp.so
 
 //The directory containing a CMake configuration file for amenet_cmake.
 amenet_cmake_DIR:PATH=amenet_cmake_DIR-NOTFOUND
@@ -512,6 +515,9 @@ rosidl_typesupport_introspection_c_DIR:PATH=/opt/ros/eloquent/share/rosidl_types
 //The directory containing a CMake configuration file for rosidl_typesupport_introspection_cpp.
 rosidl_typesupport_introspection_cpp_DIR:PATH=/opt/ros/eloquent/share/rosidl_typesupport_introspection_cpp/cmake
 
+//The directory containing a CMake configuration file for std_msgs.
+std_msgs_DIR:PATH=/opt/ros/eloquent/share/std_msgs/cmake
+
 //The directory containing a CMake configuration file for tracetools.
 tracetools_DIR:PATH=/opt/ros/eloquent/share/tracetools/cmake
 
@@ -629,7 +635,7 @@ CMAKE_MODULE_LINKER_FLAGS_RELWITHDEBINFO-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_NM
 CMAKE_NM-ADVANCED:INTERNAL=1
 //number of local generators
-CMAKE_NUMBER_OF_MAKEFILES:INTERNAL=3
+CMAKE_NUMBER_OF_MAKEFILES:INTERNAL=4
 //ADVANCED property for variable: CMAKE_OBJCOPY
 CMAKE_OBJCOPY-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_OBJDUMP

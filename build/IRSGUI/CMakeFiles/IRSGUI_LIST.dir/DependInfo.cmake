@@ -23,17 +23,19 @@ set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "IRSGUI/IRSGUI_LIST_autogen/include"
   "../include"
   "../ServoControl"
-  "/usr/include/python3.6m"
+  "../ROSMANAGER_LIST"
   "/usr/include/aarch64-linux-gnu/qt5"
   "/usr/include/aarch64-linux-gnu/qt5/QtCore"
   "/usr/lib/aarch64-linux-gnu/qt5/mkspecs/linux-g++"
   "/usr/include/aarch64-linux-gnu/qt5/QtGui"
   "/usr/include/aarch64-linux-gnu/qt5/QtWidgets"
+  "/opt/ros/eloquent/include"
   )
 
 # Targets to which this target links.
 set(CMAKE_TARGET_LINKED_INFO_FILES
   "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/CMakeFiles/SC_LIST.dir/DependInfo.cmake"
+  "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/DependInfo.cmake"
   )
 
 # Fortran module output directory.

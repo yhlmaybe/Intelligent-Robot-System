@@ -68,6 +68,16 @@ install/local/fast: preinstall/fast
 	/usr/bin/cmake -DCMAKE_INSTALL_LOCAL_ONLY=1 -P cmake_install.cmake
 .PHONY : install/local/fast
 
+# Special rule for the target list_install_components
+list_install_components:
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Available install components are: \"Unspecified\""
+.PHONY : list_install_components
+
+# Special rule for the target list_install_components
+list_install_components/fast: list_install_components
+
+.PHONY : list_install_components/fast
+
 # Special rule for the target install
 install: preinstall
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Install the project..."
@@ -79,16 +89,6 @@ install/fast: preinstall/fast
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Install the project..."
 	/usr/bin/cmake -P cmake_install.cmake
 .PHONY : install/fast
-
-# Special rule for the target list_install_components
-list_install_components:
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Available install components are: \"Unspecified\""
-.PHONY : list_install_components
-
-# Special rule for the target list_install_components
-list_install_components/fast: list_install_components
-
-.PHONY : list_install_components/fast
 
 # Special rule for the target edit_cache
 edit_cache:
@@ -266,19 +266,6 @@ ContinuousStart: cmake_check_build_system
 ContinuousStart/fast:
 	$(MAKE) -f CMakeFiles/ContinuousStart.dir/build.make CMakeFiles/ContinuousStart.dir/build
 .PHONY : ContinuousStart/fast
-
-#=============================================================================
-# Target rules for targets named Intelligent-Robot-System_uninstall
-
-# Build rule for target.
-Intelligent-Robot-System_uninstall: cmake_check_build_system
-	$(MAKE) -f CMakeFiles/Makefile2 Intelligent-Robot-System_uninstall
-.PHONY : Intelligent-Robot-System_uninstall
-
-# fast build rule for target.
-Intelligent-Robot-System_uninstall/fast:
-	$(MAKE) -f CMakeFiles/Intelligent-Robot-System_uninstall.dir/build.make CMakeFiles/Intelligent-Robot-System_uninstall.dir/build
-.PHONY : Intelligent-Robot-System_uninstall/fast
 
 #=============================================================================
 # Target rules for targets named IRS_CMake
@@ -567,19 +554,6 @@ ContinuousSubmit/fast:
 .PHONY : ContinuousSubmit/fast
 
 #=============================================================================
-# Target rules for targets named uninstall
-
-# Build rule for target.
-uninstall: cmake_check_build_system
-	$(MAKE) -f CMakeFiles/Makefile2 uninstall
-.PHONY : uninstall
-
-# fast build rule for target.
-uninstall/fast:
-	$(MAKE) -f CMakeFiles/uninstall.dir/build.make CMakeFiles/uninstall.dir/build
-.PHONY : uninstall/fast
-
-#=============================================================================
 # Target rules for targets named NightlyTest
 
 # Build rule for target.
@@ -593,19 +567,6 @@ NightlyTest/fast:
 .PHONY : NightlyTest/fast
 
 #=============================================================================
-# Target rules for targets named IRS_CMake_autogen
-
-# Build rule for target.
-IRS_CMake_autogen: cmake_check_build_system
-	$(MAKE) -f CMakeFiles/Makefile2 IRS_CMake_autogen
-.PHONY : IRS_CMake_autogen
-
-# fast build rule for target.
-IRS_CMake_autogen/fast:
-	$(MAKE) -f CMakeFiles/IRS_CMake_autogen.dir/build.make CMakeFiles/IRS_CMake_autogen.dir/build
-.PHONY : IRS_CMake_autogen/fast
-
-#=============================================================================
 # Target rules for targets named SC_LIST
 
 # Build rule for target.
@@ -617,19 +578,6 @@ SC_LIST: cmake_check_build_system
 SC_LIST/fast:
 	$(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/build
 .PHONY : SC_LIST/fast
-
-#=============================================================================
-# Target rules for targets named SC_LIST_autogen
-
-# Build rule for target.
-SC_LIST_autogen: cmake_check_build_system
-	$(MAKE) -f CMakeFiles/Makefile2 SC_LIST_autogen
-.PHONY : SC_LIST_autogen
-
-# fast build rule for target.
-SC_LIST_autogen/fast:
-	$(MAKE) -f ServoControl/CMakeFiles/SC_LIST_autogen.dir/build.make ServoControl/CMakeFiles/SC_LIST_autogen.dir/build
-.PHONY : SC_LIST_autogen/fast
 
 #=============================================================================
 # Target rules for targets named IRSGUI_LIST
@@ -657,6 +605,45 @@ IRSGUI_LIST_autogen/fast:
 	$(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/build
 .PHONY : IRSGUI_LIST_autogen/fast
 
+#=============================================================================
+# Target rules for targets named uninstall
+
+# Build rule for target.
+uninstall: cmake_check_build_system
+	$(MAKE) -f CMakeFiles/Makefile2 uninstall
+.PHONY : uninstall
+
+# fast build rule for target.
+uninstall/fast:
+	$(MAKE) -f ROSManager/CMakeFiles/uninstall.dir/build.make ROSManager/CMakeFiles/uninstall.dir/build
+.PHONY : uninstall/fast
+
+#=============================================================================
+# Target rules for targets named ROSMANAGER_LIST
+
+# Build rule for target.
+ROSMANAGER_LIST: cmake_check_build_system
+	$(MAKE) -f CMakeFiles/Makefile2 ROSMANAGER_LIST
+.PHONY : ROSMANAGER_LIST
+
+# fast build rule for target.
+ROSMANAGER_LIST/fast:
+	$(MAKE) -f ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/build.make ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/build
+.PHONY : ROSMANAGER_LIST/fast
+
+#=============================================================================
+# Target rules for targets named Intelligent-Robot-System_uninstall
+
+# Build rule for target.
+Intelligent-Robot-System_uninstall: cmake_check_build_system
+	$(MAKE) -f CMakeFiles/Makefile2 Intelligent-Robot-System_uninstall
+.PHONY : Intelligent-Robot-System_uninstall
+
+# fast build rule for target.
+Intelligent-Robot-System_uninstall/fast:
+	$(MAKE) -f ROSManager/CMakeFiles/Intelligent-Robot-System_uninstall.dir/build.make ROSManager/CMakeFiles/Intelligent-Robot-System_uninstall.dir/build
+.PHONY : Intelligent-Robot-System_uninstall/fast
+
 IRSInitiate.o: IRSInitiate.cpp.o
 
 .PHONY : IRSInitiate.o
@@ -683,33 +670,6 @@ IRSInitiate.s: IRSInitiate.cpp.s
 IRSInitiate.cpp.s:
 	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.s
 .PHONY : IRSInitiate.cpp.s
-
-IRS_CMake_autogen/mocs_compilation.o: IRS_CMake_autogen/mocs_compilation.cpp.o
-
-.PHONY : IRS_CMake_autogen/mocs_compilation.o
-
-# target to build an object file
-IRS_CMake_autogen/mocs_compilation.cpp.o:
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o
-.PHONY : IRS_CMake_autogen/mocs_compilation.cpp.o
-
-IRS_CMake_autogen/mocs_compilation.i: IRS_CMake_autogen/mocs_compilation.cpp.i
-
-.PHONY : IRS_CMake_autogen/mocs_compilation.i
-
-# target to preprocess a source file
-IRS_CMake_autogen/mocs_compilation.cpp.i:
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.i
-.PHONY : IRS_CMake_autogen/mocs_compilation.cpp.i
-
-IRS_CMake_autogen/mocs_compilation.s: IRS_CMake_autogen/mocs_compilation.cpp.s
-
-.PHONY : IRS_CMake_autogen/mocs_compilation.s
-
-# target to generate assembly for a file
-IRS_CMake_autogen/mocs_compilation.cpp.s:
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.s
-.PHONY : IRS_CMake_autogen/mocs_compilation.cpp.s
 
 Manager.o: Manager.cpp.o
 
@@ -772,17 +732,16 @@ help:
 	@echo "... clean"
 	@echo "... depend"
 	@echo "... install/local"
-	@echo "... install"
-	@echo "... list_install_components"
 	@echo "... ExperimentalBuild"
 	@echo "... ContinuousUpdate"
+	@echo "... list_install_components"
 	@echo "... ExperimentalStart"
 	@echo "... Nightly"
 	@echo "... ContinuousCoverage"
 	@echo "... ContinuousStart"
-	@echo "... Intelligent-Robot-System_uninstall"
 	@echo "... IRS_CMake"
 	@echo "... ExperimentalCoverage"
+	@echo "... install"
 	@echo "... NightlyConfigure"
 	@echo "... NightlyCoverage"
 	@echo "... edit_cache"
@@ -806,22 +765,19 @@ help:
 	@echo "... ContinuousMemCheck"
 	@echo "... ExperimentalConfigure"
 	@echo "... ContinuousSubmit"
-	@echo "... uninstall"
 	@echo "... package"
 	@echo "... test"
 	@echo "... NightlyTest"
 	@echo "... rebuild_cache"
-	@echo "... IRS_CMake_autogen"
 	@echo "... SC_LIST"
-	@echo "... SC_LIST_autogen"
 	@echo "... IRSGUI_LIST"
 	@echo "... IRSGUI_LIST_autogen"
+	@echo "... uninstall"
+	@echo "... ROSMANAGER_LIST"
+	@echo "... Intelligent-Robot-System_uninstall"
 	@echo "... IRSInitiate.o"
 	@echo "... IRSInitiate.i"
 	@echo "... IRSInitiate.s"
-	@echo "... IRS_CMake_autogen/mocs_compilation.o"
-	@echo "... IRS_CMake_autogen/mocs_compilation.i"
-	@echo "... IRS_CMake_autogen/mocs_compilation.s"
 	@echo "... Manager.o"
 	@echo "... Manager.i"
 	@echo "... Manager.s"

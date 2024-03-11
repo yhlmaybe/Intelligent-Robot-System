@@ -1,5 +1,3 @@
-set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH}" "/usr/share/cmake-3.10/Modules")
-
 find_program(PYTHON_EXECUTABLE python)
 
 if(PYTHON_EXECUTABLE)
@@ -19,8 +17,9 @@ if(PYTHON_EXECUTABLE)
 #   target_link_libraries(SC_LIST /usr/lib/python3.6/config-3.6m-aarch64-linux-gnu/libpython3.6.so)
 
     target_include_directories(SC_LIST PRIVATE ${Python_INCLUDE_DIRS})
-    
-    target_compile_options(IRS_CMake PRIVATE -Wall)
+
+    message("lib : ${PYTHON_LIBRARY_DIR}")
+    message("include : ${PYTHON_INCLUDE_DIR}")
 
 else()
     message(FATAL_ERROR "python not found")

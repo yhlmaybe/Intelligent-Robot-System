@@ -3,8 +3,6 @@
 
 CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o: ../IRSInitiate.cpp
 
-CMakeFiles/IRS_CMake.dir/IRS_CMake_autogen/mocs_compilation.cpp.o: IRS_CMake_autogen/mocs_compilation.cpp
-
 CMakeFiles/IRS_CMake.dir/Manager.cpp.o: ../Manager.cpp
 
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSGUI/mainwindow.h
