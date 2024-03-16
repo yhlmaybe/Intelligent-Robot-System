@@ -36,7 +36,7 @@ public:
 
 struct ServoDriveInfo
 {
-    Servo* servo;
+    std::shared_ptr<Servo>  servo;
     int position;
     double time;
 };

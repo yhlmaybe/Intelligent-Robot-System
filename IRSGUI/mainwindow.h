@@ -22,7 +22,7 @@ public:
 private:
     Ui::MainWindow *ui;
 
-    std::list<Servo> servos;
+    std::list<std::shared_ptr<Servo>> servos;
 
     std::shared_ptr<ServoDriveNodeListener> servoDriveNodeListener;
 

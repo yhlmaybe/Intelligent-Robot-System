@@ -9,14 +9,14 @@
 class ServoDriveNodeListener : public rclcpp::Node
 {
 public:
-     ServoDriveNodeListener(std::list<Servo> servoList);
+     ServoDriveNodeListener(std::list<std::shared_ptr<Servo>> servoList);
     
 
 private:
 
-    std::map<int, Servo> idServoKeyValues;
+    std::map<int, std::shared_ptr<Servo>> idServoKeyValues;
 
-    std::list<Servo> servoList;
+    std::list<std::shared_ptr<Servo>> servoList;
 
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr subscription;
 
