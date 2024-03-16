@@ -1,2 +1,2 @@
-/usr/bin/ar qc libSC_LIST.a  CMakeFiles/SC_LIST.dir/SCDrive.cpp.o
+/usr/bin/ar qc libSC_LIST.a  CMakeFiles/SC_LIST.dir/SCDrive.cpp.o CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o
 /usr/bin/ranlib libSC_LIST.a

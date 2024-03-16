@@ -21,7 +21,6 @@ set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "IRSGUI"
   "../IRSGUI"
   "IRSGUI/IRSGUI_LIST_autogen/include"
-  "../include"
   "../ServoControl"
   "../ROSMANAGER_LIST"
   "/usr/include/aarch64-linux-gnu/qt5"

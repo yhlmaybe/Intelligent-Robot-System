@@ -13,7 +13,6 @@ set(CMAKE_CXX_COMPILER_ID "GNU")
 set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "ROSManager"
   "../ROSManager"
-  "../include"
   "../ServoControl"
   "../IRSGUI"
   "../ROSMANAGER_LIST"

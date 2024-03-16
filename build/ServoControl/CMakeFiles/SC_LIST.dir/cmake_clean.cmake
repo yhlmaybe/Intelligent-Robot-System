@@ -1,5 +1,6 @@
 file(REMOVE_RECURSE
   "CMakeFiles/SC_LIST.dir/SCDrive.cpp.o"
+  "CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o"
   "libSC_LIST.pdb"
   "libSC_LIST.a"
 )

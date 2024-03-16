@@ -9,6 +9,7 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/NodeManager.cpp
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/NodeManager.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
+ /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
  /opt/ros/eloquent/include/builtin_interfaces/msg/duration.hpp
  /opt/ros/eloquent/include/builtin_interfaces/msg/duration__struct.hpp
  /opt/ros/eloquent/include/builtin_interfaces/msg/duration__traits.hpp

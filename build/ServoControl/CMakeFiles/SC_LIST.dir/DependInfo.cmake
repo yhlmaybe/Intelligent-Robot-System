@@ -5,6 +5,7 @@ set(CMAKE_DEPENDS_LANGUAGES
 # The set of files for implicit dependencies of each language:
 set(CMAKE_DEPENDS_CHECK_CXX
   "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.cpp" "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o"
+  "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.cpp" "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o"
   )
 set(CMAKE_CXX_COMPILER_ID "GNU")
 
@@ -12,7 +13,6 @@ set(CMAKE_CXX_COMPILER_ID "GNU")
 set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "ServoControl"
   "../ServoControl"
-  "../include"
   "../IRSGUI"
   "../ROSMANAGER_LIST"
   "/usr/include/python3.6m"

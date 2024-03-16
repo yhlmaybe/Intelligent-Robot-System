@@ -8,6 +8,7 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ROSManager/MsgMa
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ROSManager/NodeManager.cpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ROSManager/NodeManager.h
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ServoControl/SCDrive.h
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ServoControl/ServoInitiate.h
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/builtin_interfaces/msg/duration.hpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/builtin_interfaces/msg/duration__struct.hpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/builtin_interfaces/msg/duration__traits.hpp

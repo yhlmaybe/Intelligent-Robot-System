@@ -644,60 +644,6 @@ intelligent_robot_system_uninstall/fast:
 	$(MAKE) -f ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build.make ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build
 .PHONY : intelligent_robot_system_uninstall/fast
 
-IRSInitiate.o: IRSInitiate.cpp.o
-
-.PHONY : IRSInitiate.o
-
-# target to build an object file
-IRSInitiate.cpp.o:
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.o
-.PHONY : IRSInitiate.cpp.o
-
-IRSInitiate.i: IRSInitiate.cpp.i
-
-.PHONY : IRSInitiate.i
-
-# target to preprocess a source file
-IRSInitiate.cpp.i:
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.i
-.PHONY : IRSInitiate.cpp.i
-
-IRSInitiate.s: IRSInitiate.cpp.s
-
-.PHONY : IRSInitiate.s
-
-# target to generate assembly for a file
-IRSInitiate.cpp.s:
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSInitiate.cpp.s
-.PHONY : IRSInitiate.cpp.s
-
-Manager.o: Manager.cpp.o
-
-.PHONY : Manager.o
-
-# target to build an object file
-Manager.cpp.o:
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/Manager.cpp.o
-.PHONY : Manager.cpp.o
-
-Manager.i: Manager.cpp.i
-
-.PHONY : Manager.i
-
-# target to preprocess a source file
-Manager.cpp.i:
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/Manager.cpp.i
-.PHONY : Manager.cpp.i
-
-Manager.s: Manager.cpp.s
-
-.PHONY : Manager.s
-
-# target to generate assembly for a file
-Manager.cpp.s:
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/Manager.cpp.s
-.PHONY : Manager.cpp.s
-
 main.o: main.cpp.o
 
 .PHONY : main.o
@@ -775,12 +721,6 @@ help:
 	@echo "... uninstall"
 	@echo "... ROSMANAGER_LIST"
 	@echo "... intelligent_robot_system_uninstall"
-	@echo "... IRSInitiate.o"
-	@echo "... IRSInitiate.i"
-	@echo "... IRSInitiate.s"
-	@echo "... Manager.o"
-	@echo "... Manager.i"
-	@echo "... Manager.s"
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"

@@ -35,8 +35,8 @@ list
 -
 MsgManager.h
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/MsgManager.h
-../ServoControl/SCDrive.h
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
+../ServoControl/ServoInitiate.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
 
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
 python3.6/Python.h
@@ -51,6 +51,10 @@ future
 -
 map
 -
+
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
+SCDrive.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
 
 /opt/ros/eloquent/include/builtin_interfaces/msg/duration.hpp
 builtin_interfaces/msg/duration__struct.hpp

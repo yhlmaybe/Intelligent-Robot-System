@@ -9,7 +9,7 @@
 class ServoDriveNodeListener : public rclcpp::Node
 {
 public:
-     ServoDriveNodeListener(const std::list<Servo> servoList);
+     ServoDriveNodeListener(std::list<Servo> servoList);
     
 
 private:

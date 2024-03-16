@@ -4,3 +4,7 @@
 ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o: ../ServoControl/SCDrive.cpp
 ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o: ../ServoControl/SCDrive.h
 
+ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../ServoControl/SCDrive.h
+ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../ServoControl/ServoInitiate.cpp
+ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../ServoControl/ServoInitiate.h
+

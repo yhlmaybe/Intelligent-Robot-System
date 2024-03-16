@@ -6,13 +6,6 @@
 #include <map>
 
 
-struct ServoDriveInfo
-{
-    Servo* servo;
-    int position;
-    double time;
-};
-
 class ServoOperate
 {
   
@@ -41,6 +34,12 @@ public:
     int id = 0;
 };
 
+struct ServoDriveInfo
+{
+    Servo* servo;
+    int position;
+    double time;
+};
 
 class DriveHandle
 {

@@ -231,6 +231,33 @@ SCDrive.cpp.s:
 	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.s
 .PHONY : SCDrive.cpp.s
 
+ServoInitiate.o: ServoInitiate.cpp.o
+
+.PHONY : ServoInitiate.o
+
+# target to build an object file
+ServoInitiate.cpp.o:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o
+.PHONY : ServoInitiate.cpp.o
+
+ServoInitiate.i: ServoInitiate.cpp.i
+
+.PHONY : ServoInitiate.i
+
+# target to preprocess a source file
+ServoInitiate.cpp.i:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.i
+.PHONY : ServoInitiate.cpp.i
+
+ServoInitiate.s: ServoInitiate.cpp.s
+
+.PHONY : ServoInitiate.s
+
+# target to generate assembly for a file
+ServoInitiate.cpp.s:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.s
+.PHONY : ServoInitiate.cpp.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -250,6 +277,9 @@ help:
 	@echo "... SCDrive.o"
 	@echo "... SCDrive.i"
 	@echo "... SCDrive.s"
+	@echo "... ServoInitiate.o"
+	@echo "... ServoInitiate.i"
+	@echo "... ServoInitiate.s"
 .PHONY : help
 
 

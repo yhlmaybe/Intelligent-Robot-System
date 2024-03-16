@@ -6,5 +6,5 @@ CXX_FLAGS = -g   -Wall -Wextra -Wpedantic -std=gnu++14
 
 CXX_DEFINES = 
 
-CXX_INCLUDES = -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSMANAGER_LIST -I/usr/lib/aarch64-linux-gnu -I/opt/ros/eloquent/include 
+CXX_INCLUDES = -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSMANAGER_LIST -I/usr/lib/aarch64-linux-gnu -I/opt/ros/eloquent/include 
 

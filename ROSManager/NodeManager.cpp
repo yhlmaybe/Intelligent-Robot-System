@@ -1,9 +1,9 @@
 #include "NodeManager.h"
 
-ServoDriveNodeListener::ServoDriveNodeListener(const std::list<Servo> servos) 
+ServoDriveNodeListener::ServoDriveNodeListener(std::list<Servo> servos) 
     : Node("serve_drive_node_listener"), servoList(std::move(servos))
 {
-    for(const auto& it : servoList)
+    for(auto& it : servoList)
     {
         idServoKeyValues.insert(std::make_pair(it.id, it));
     }
