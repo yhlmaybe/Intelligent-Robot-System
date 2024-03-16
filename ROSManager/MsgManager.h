@@ -10,6 +10,7 @@ struct ServoMsg
     int id;
     std::string name;
     int position;
+    double time;
 };
 
 

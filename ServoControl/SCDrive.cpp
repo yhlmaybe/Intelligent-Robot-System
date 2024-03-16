@@ -27,7 +27,7 @@ ServoOperate::~ServoOperate()
     Py_DECREF(pModule);
 }
 
-void ServoOperate::SetServoPosition(int position, int time)
+void ServoOperate::SetServoPosition(int position, double time)
 {
     PyObject *pRetvalue = PyObject_CallMethod(instance, "set_servo_position", "iii", id, position, time);
     // PyObject *pRetvalue = PyObject_CallMethod(instance, "set_servo_position", "");
@@ -55,13 +55,13 @@ Servo::Servo(std::string name, int id)
     this->operate = std::make_unique<ServoOperate>(name, id);
 }
 
-void DriveHandle::SetServoPosition(std::map<Servo, int> servoPositions, int time)
+void DriveHandle::SetServoPosition(std::list<ServoDriveInfo> servoInfo)
 {
     std::list<std::future<void>> results;
-    for(auto it = servoPositions.begin(); it != servoPositions.end(); ++it)
+    for(auto it = servoInfo.begin(); it != servoInfo.end(); ++it)
     {
-        results.push_back(std::async(std::launch::async, [&it, time](){
-            it->first.operate->SetServoPosition(it->second, time);
+        results.push_back(std::async(std::launch::async, [&it](){
+            it->servo->operate->SetServoPosition(it->position, it->time);
         }));
     }
 

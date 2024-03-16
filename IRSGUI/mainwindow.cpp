@@ -8,7 +8,7 @@ MainWindow::MainWindow(QWidget *parent) :
 {
     ui->setupUi(this);
 
-    //connect(ui->SetServoNo_Button, SIGNAL(clicked()), this, SLOT(GetServoId()));
+    connect(ui->SetServoNo_Button, SIGNAL(clicked()), this, SLOT(StartROSServoDriveNode()));
 }
 
 MainWindow::~MainWindow()
@@ -23,4 +23,15 @@ void MainWindow::Initiate()
     Py_Initialize();
     PyRun_SimpleString("import sys");
     PyRun_SimpleString("sys.path.append('./ServoControl')");      
+    servos = ServoInitiate::Initiate();
+}
+
+void MainWindow::StartROSServoDriveNode()
+{
+    std::thread([this]()
+    {
+        servoDriveNodeListener = std::make_shared<ServoDriveNodeListener>(servos);
+        rclcpp::spin(servoDriveNodeListener);
+    }).detach();
+    
 }

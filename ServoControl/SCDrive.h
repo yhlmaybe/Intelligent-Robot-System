@@ -5,6 +5,14 @@
 #include <future>
 #include <map>
 
+
+struct ServoDriveInfo
+{
+    Servo* servo;
+    int position;
+    double time;
+};
+
 class ServoOperate
 {
   
@@ -12,7 +20,7 @@ public:
 
     ServoOperate(std::string name, int id);
     ~ServoOperate();
-    void SetServoPosition(int position, int time);
+    void SetServoPosition(int position, double time);
     void SetServoStop();
     std::string name = "";
     int id = 0;
@@ -37,6 +45,6 @@ public:
 class DriveHandle
 {
 public:
-    static void SetServoPosition(std::map<Servo, int> servoPositions, int time);
+    static void SetServoPosition(std::list<ServoDriveInfo> servoInfo);
 };
 

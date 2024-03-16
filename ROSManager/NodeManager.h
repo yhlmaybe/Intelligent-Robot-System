@@ -4,17 +4,19 @@
 #include <list>
 
 #include "MsgManager.h"
-#include "../ServoControl/SCDrive.h"
+#include "../ServoControl/ServoInitiate.h"
 
 class ServoDriveNodeListener : public rclcpp::Node
 {
 public:
-     ServoDriveNodeListener(std::map<int, Servo> servoKeyValues);
+     ServoDriveNodeListener(const std::list<Servo> servoList);
     
 
 private:
 
-    std::map<int, Servo> servoKeyValues;
+    std::map<int, Servo> idServoKeyValues;
+
+    std::list<Servo> servoList;
 
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr subscription;
 

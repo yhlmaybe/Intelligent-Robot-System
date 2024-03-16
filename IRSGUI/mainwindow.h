@@ -5,6 +5,8 @@
 #include <QMainWindow>
 #include <rclcpp/rclcpp.hpp>
 
+#include "../ROSManager/NodeManager.h"
+
 namespace Ui {
 class MainWindow;
 }
@@ -19,9 +21,15 @@ public:
 
 private:
     Ui::MainWindow *ui;
+
+    std::list<Servo> servos;
+
+    std::shared_ptr<ServoDriveNodeListener> servoDriveNodeListener;
+
     void Initiate();
 
 private slots:
+    void StartROSServoDriveNode();
 
 };
 

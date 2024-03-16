@@ -27,7 +27,6 @@ enable_testing()
 aux_source_directory(. IRS_LIST)
 
 include_directories(
-    ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/ServoControl
     ${CMAKE_SOURCE_DIR}/IRSGUI
     ${CMAKE_SOURCE_DIR}/ROSMANAGER_LIST
