@@ -5,10 +5,10 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 
+
 int main(int argc, char *argv[])
 {
     QApplication a(argc, argv);
-    
     rclcpp::init(argc, argv);
 
     MainWindow w;
@@ -16,3 +16,4 @@ int main(int argc, char *argv[])
 
     return a.exec();
 } 
+

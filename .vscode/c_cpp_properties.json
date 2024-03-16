@@ -8,10 +8,10 @@
                 "/opt/ros/eloquent/include/**"
             ],
             "defines": [],
-            "compilerPath": "/usr/bin/gcc",
-            "cStandard": "c11",
+            "compilerPath": "/usr/bin/clang",
+            "cStandard": "c17",
             "cppStandard": "gnu++14",
-            "intelliSenseMode": "linux-gcc-arm64",
+            "intelliSenseMode": "linux-clang-arm64",
             "configurationProvider": "ms-vscode.cmake-tools"
         }
     ],

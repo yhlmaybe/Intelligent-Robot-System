@@ -18,6 +18,6 @@ private:
 
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr subscription;
 
-    void DoListen(std_msgs::msg::String msg);
+    void DoListen(const std_msgs::msg::String::SharedPtr msg);
 
 };
