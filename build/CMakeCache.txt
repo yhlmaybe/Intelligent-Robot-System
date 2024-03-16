@@ -156,7 +156,7 @@ CMAKE_OBJCOPY:FILEPATH=/usr/bin/objcopy
 CMAKE_OBJDUMP:FILEPATH=/usr/bin/objdump
 
 //Value Computed by CMake
-CMAKE_PROJECT_NAME:STATIC=Intelligent-Robot-System
+CMAKE_PROJECT_NAME:STATIC=intelligent_robot_system
 
 //Path to a program.
 CMAKE_RANLIB:FILEPATH=/usr/bin/ranlib
@@ -277,6 +277,21 @@ CVS_UPDATE_OPTIONS:STRING=-d -A -P
 //Maximum time allowed before CTest will kill the test.
 DART_TESTING_TIMEOUT:STRING=1500
 
+//Path to a library.
+FastCDR_LIBRARY_DEBUG:FILEPATH=FastCDR_LIBRARY_DEBUG-NOTFOUND
+
+//Path to a library.
+FastCDR_LIBRARY_RELEASE:FILEPATH=FastCDR_LIBRARY_RELEASE-NOTFOUND
+
+//Path to a file.
+FastRTPS_INCLUDE_DIR:PATH=FastRTPS_INCLUDE_DIR-NOTFOUND
+
+//Path to a library.
+FastRTPS_LIBRARY_DEBUG:FILEPATH=FastRTPS_LIBRARY_DEBUG-NOTFOUND
+
+//Path to a library.
+FastRTPS_LIBRARY_RELEASE:FILEPATH=FastRTPS_LIBRARY_RELEASE-NOTFOUND
+
 //Path to a program.
 GITCOMMAND:FILEPATH=/usr/bin/git
 
@@ -284,7 +299,7 @@ GITCOMMAND:FILEPATH=/usr/bin/git
 HGCOMMAND:FILEPATH=HGCOMMAND-NOTFOUND
 
 //Dependencies for the target
-IRSGUI_LIST_LIB_DEPENDS:STATIC=general;Qt5::Core;general;Qt5::Gui;general;Qt5::Widgets;general;SC_LIST;general;ROSMANAGER_LIST;
+IRSGUI_LIST_LIB_DEPENDS:STATIC=general;Qt5::Core;general;Qt5::Gui;general;Qt5::Widgets;general;ROSMANAGER_LIST;
 
 //Value Computed by CMake
 Intelligent-Robot-System_BINARY_DIR:STATIC=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build
@@ -301,11 +316,26 @@ MEMORYCHECK_COMMAND:FILEPATH=MEMORYCHECK_COMMAND-NOTFOUND
 //File that contains suppressions for the memory checker
 MEMORYCHECK_SUPPRESSIONS_FILE:FILEPATH=
 
+//Path to a library.
+OPENSSL_CRYPTO_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libcrypto.so
+
+//Path to a file.
+OPENSSL_INCLUDE_DIR:PATH=/usr/include
+
+//Path to a library.
+OPENSSL_SSL_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libssl.so
+
 //Path to a program.
 P4COMMAND:FILEPATH=P4COMMAND-NOTFOUND
 
+//pkg-config executable
+PKG_CONFIG_EXECUTABLE:FILEPATH=/usr/bin/pkg-config
+
 //Path to a program.
 PYTHON_EXECUTABLE:FILEPATH=/usr/bin/python
+
+//Path to a file.
+PYTHON_INCLUDE_DIR:PATH=/usr/include/python3.6m
 
 //Path to a library.
 PYTHON_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libpython3.6m.so
@@ -315,6 +345,9 @@ PYTHON_LIBRARY_DEBUG:FILEPATH=PYTHON_LIBRARY_DEBUG-NOTFOUND
 
 //Specify specific Python version to use ('major.minor' or 'major')
 PYTHON_VERSION:STRING=
+
+//The directory containing a CMake configuration file for PugiXML.
+PugiXML_DIR:PATH=PugiXML_DIR-NOTFOUND
 
 //The directory containing a CMake configuration file for Qt5Core.
 Qt5Core_DIR:PATH=/usr/lib/aarch64-linux-gnu/cmake/Qt5Core
@@ -329,7 +362,7 @@ Qt5Widgets_DIR:PATH=/usr/lib/aarch64-linux-gnu/cmake/Qt5Widgets
 Qt5_DIR:PATH=/usr/lib/aarch64-linux-gnu/cmake/Qt5
 
 //Dependencies for the target
-ROSMANAGER_LIST_LIB_DEPENDS:STATIC=general;/opt/ros/eloquent/lib/librclcpp.so;general;/opt/ros/eloquent/lib/librcl.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_introspection_cpp.so;general;-lpthread;general;/opt/ros/eloquent/lib/librmw_implementation.so;general;/opt/ros/eloquent/lib/librmw.so;general;/opt/ros/eloquent/lib/librcutils.so;general;/opt/ros/eloquent/lib/librcl_logging_spdlog.so;general;/opt/ros/eloquent/lib/librcpputils.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librcl_yaml_param_parser.so;general;/opt/ros/eloquent/lib/libtracetools.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_fastrtps_cpp.so;
+ROSMANAGER_LIST_LIB_DEPENDS:STATIC=general;/opt/ros/eloquent/lib/librclcpp.so;general;/opt/ros/eloquent/lib/librcl.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_introspection_cpp.so;general;-lpthread;general;/opt/ros/eloquent/lib/librmw_implementation.so;general;/opt/ros/eloquent/lib/librmw.so;general;/opt/ros/eloquent/lib/librcutils.so;general;/opt/ros/eloquent/lib/librcl_logging_spdlog.so;general;/opt/ros/eloquent/lib/librcpputils.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librcl_yaml_param_parser.so;general;/opt/ros/eloquent/lib/libtracetools.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_fastrtps_cpp.so;general;SC_LIST;general;pugixml;
 
 //Path to scp command, used by CTest for submitting results to
 // a Dart server
@@ -350,8 +383,14 @@ SLURM_SRUN_COMMAND:FILEPATH=SLURM_SRUN_COMMAND-NOTFOUND
 //Path to a program.
 SVNCOMMAND:FILEPATH=SVNCOMMAND-NOTFOUND
 
+//The directory containing a CMake configuration file for TinyXML2.
+TinyXML2_DIR:PATH=TinyXML2_DIR-NOTFOUND
+
 //Path to a library.
 _lib:FILEPATH=/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_opensplice_cpp.so
+
+//Path to a file.
+_numpy_h:FILEPATH=/usr/include/python3.6m/numpy/numpyconfig.h
 
 //The directory containing a CMake configuration file for amenet_cmake.
 amenet_cmake_DIR:PATH=amenet_cmake_DIR-NOTFOUND
@@ -452,6 +491,57 @@ builtin_interfaces_DIR:PATH=/opt/ros/eloquent/share/builtin_interfaces/cmake
 //The directory containing a CMake configuration file for catkin.
 catkin_DIR:PATH=catkin_DIR-NOTFOUND
 
+//The directory containing a CMake configuration file for fastcdr.
+fastcdr_DIR:PATH=/opt/ros/eloquent/share/fastcdr/cmake
+
+//The directory containing a CMake configuration file for fastrtps.
+fastrtps_DIR:PATH=/opt/ros/eloquent/share/fastrtps/cmake
+
+//The directory containing a CMake configuration file for fastrtps_cmake_module.
+fastrtps_cmake_module_DIR:PATH=/opt/ros/eloquent/share/fastrtps_cmake_module/cmake
+
+//The directory containing a CMake configuration file for foonathan_memory.
+foonathan_memory_DIR:PATH=/opt/ros/eloquent/lib/foonathan_memory/cmake
+
+//Value Computed by CMake
+intelligent_robot_system_BINARY_DIR:STATIC=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build
+
+//Value Computed by CMake
+intelligent_robot_system_SOURCE_DIR:STATIC=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System
+
+//Dependencies for the target
+intelligent_robot_system__python_LIB_DEPENDS:STATIC=general;/usr/lib/aarch64-linux-gnu/libpython3.6m.so;general;intelligent_robot_system__rosidl_typesupport_c;
+
+//Dependencies for the target
+intelligent_robot_system__rosidl_generator_c_LIB_DEPENDS:STATIC=general;/opt/ros/eloquent/lib/librosidl_generator_c.so;
+
+//Dependencies for the target
+intelligent_robot_system__rosidl_typesupport_c_LIB_DEPENDS:STATIC=general;intelligent_robot_system__rosidl_generator_c;general;intelligent_robot_system__rosidl_typesupport_fastrtps_c;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_c.so;
+
+//Dependencies for the target
+intelligent_robot_system__rosidl_typesupport_c__pyext_LIB_DEPENDS:STATIC=general;intelligent_robot_system__python;general;/usr/lib/aarch64-linux-gnu/libpython3.6m.so;general;intelligent_robot_system__rosidl_typesupport_c;general;intelligent_robot_system__rosidl_typesupport_c;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librcutils.so;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librmw.so;
+
+//Dependencies for the target
+intelligent_robot_system__rosidl_typesupport_cpp_LIB_DEPENDS:STATIC=general;intelligent_robot_system__rosidl_typesupport_fastrtps_cpp;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_cpp.so;
+
+//Dependencies for the target
+intelligent_robot_system__rosidl_typesupport_fastrtps_c_LIB_DEPENDS:STATIC=general;/opt/ros/eloquent/lib/librcutils.so;general;/opt/ros/eloquent/lib/librmw.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librcutils.so;general;/opt/ros/eloquent/lib/librmw.so;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_fastrtps_c.so;general;intelligent_robot_system__rosidl_generator_c;general;intelligent_robot_system__rosidl_typesupport_fastrtps_cpp;
+
+//Dependencies for the target
+intelligent_robot_system__rosidl_typesupport_fastrtps_c__pyext_LIB_DEPENDS:STATIC=general;intelligent_robot_system__python;general;/usr/lib/aarch64-linux-gnu/libpython3.6m.so;general;intelligent_robot_system__rosidl_typesupport_fastrtps_c;general;intelligent_robot_system__rosidl_typesupport_c;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librcutils.so;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librmw.so;
+
+//Dependencies for the target
+intelligent_robot_system__rosidl_typesupport_fastrtps_cpp_LIB_DEPENDS:STATIC=general;/opt/ros/eloquent/lib/librcutils.so;general;/opt/ros/eloquent/lib/librmw.so;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_fastrtps_cpp.so;general;fastrtps;general;fastcdr;
+
+//Dependencies for the target
+intelligent_robot_system__rosidl_typesupport_introspection_c_LIB_DEPENDS:STATIC=general;intelligent_robot_system__rosidl_generator_c;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_c.so;
+
+//Dependencies for the target
+intelligent_robot_system__rosidl_typesupport_introspection_cpp_LIB_DEPENDS:STATIC=general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_cpp.so;
+
+//The directory containing a CMake configuration file for python_cmake_module.
+python_cmake_module_DIR:PATH=/opt/ros/eloquent/share/python_cmake_module/cmake
+
 //The directory containing a CMake configuration file for rcl.
 rcl_DIR:PATH=/opt/ros/eloquent/share/rcl/cmake
 
@@ -476,6 +566,12 @@ rcutils_DIR:PATH=/opt/ros/eloquent/share/rcutils/cmake
 //The directory containing a CMake configuration file for rmw.
 rmw_DIR:PATH=/opt/ros/eloquent/share/rmw/cmake
 
+//The directory containing a CMake configuration file for rmw_fastrtps_cpp.
+rmw_fastrtps_cpp_DIR:PATH=/opt/ros/eloquent/share/rmw_fastrtps_cpp/cmake
+
+//The directory containing a CMake configuration file for rmw_fastrtps_shared_cpp.
+rmw_fastrtps_shared_cpp_DIR:PATH=/opt/ros/eloquent/share/rmw_fastrtps_shared_cpp/cmake
+
 //The directory containing a CMake configuration file for rmw_implementation.
 rmw_implementation_DIR:PATH=/opt/ros/eloquent/share/rmw_implementation/cmake
 
@@ -491,6 +587,9 @@ rosidl_adapter_DIR:PATH=/opt/ros/eloquent/share/rosidl_adapter/cmake
 //The directory containing a CMake configuration file for rosidl_cmake.
 rosidl_cmake_DIR:PATH=/opt/ros/eloquent/share/rosidl_cmake/cmake
 
+//The directory containing a CMake configuration file for rosidl_default_generators.
+rosidl_default_generators_DIR:PATH=/opt/ros/eloquent/share/rosidl_default_generators/cmake
+
 //The directory containing a CMake configuration file for rosidl_default_runtime.
 rosidl_default_runtime_DIR:PATH=/opt/ros/eloquent/share/rosidl_default_runtime/cmake
 
@@ -500,11 +599,20 @@ rosidl_generator_c_DIR:PATH=/opt/ros/eloquent/share/rosidl_generator_c/cmake
 //The directory containing a CMake configuration file for rosidl_generator_cpp.
 rosidl_generator_cpp_DIR:PATH=/opt/ros/eloquent/share/rosidl_generator_cpp/cmake
 
+//The directory containing a CMake configuration file for rosidl_generator_py.
+rosidl_generator_py_DIR:PATH=/opt/ros/eloquent/share/rosidl_generator_py/cmake
+
 //The directory containing a CMake configuration file for rosidl_typesupport_c.
 rosidl_typesupport_c_DIR:PATH=/opt/ros/eloquent/share/rosidl_typesupport_c/cmake
 
 //The directory containing a CMake configuration file for rosidl_typesupport_cpp.
 rosidl_typesupport_cpp_DIR:PATH=/opt/ros/eloquent/share/rosidl_typesupport_cpp/cmake
+
+//The directory containing a CMake configuration file for rosidl_typesupport_fastrtps_c.
+rosidl_typesupport_fastrtps_c_DIR:PATH=/opt/ros/eloquent/share/rosidl_typesupport_fastrtps_c/cmake
+
+//The directory containing a CMake configuration file for rosidl_typesupport_fastrtps_cpp.
+rosidl_typesupport_fastrtps_cpp_DIR:PATH=/opt/ros/eloquent/share/rosidl_typesupport_fastrtps_cpp/cmake
 
 //The directory containing a CMake configuration file for rosidl_typesupport_interface.
 rosidl_typesupport_interface_DIR:PATH=/opt/ros/eloquent/share/rosidl_typesupport_interface/cmake
@@ -722,10 +830,16 @@ CVSCOMMAND-ADVANCED:INTERNAL=1
 CVS_UPDATE_OPTIONS-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: DART_TESTING_TIMEOUT
 DART_TESTING_TIMEOUT-ADVANCED:INTERNAL=1
+//Details about finding FastRTPS
+FIND_PACKAGE_MESSAGE_DETAILS_FastRTPS:INTERNAL=[/opt/ros/eloquent/include][/opt/ros/eloquent/lib/libfastrtps.so][v()]
+//Details about finding OpenSSL
+FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL:INTERNAL=[/usr/lib/aarch64-linux-gnu/libcrypto.so][/usr/include][v1.1.1()]
+//Details about finding PythonExtra
+FIND_PACKAGE_MESSAGE_DETAILS_PythonExtra:INTERNAL=[.so][/usr/include/python3.6m][/usr/lib/aarch64-linux-gnu/libpython3.6m.so][.cpython-36m-aarch64-linux-gnu][v()]
 //Details about finding PythonInterp
 FIND_PACKAGE_MESSAGE_DETAILS_PythonInterp:INTERNAL=[/usr/bin/python][v3.6.9(3)]
 //Details about finding PythonLibs
-FIND_PACKAGE_MESSAGE_DETAILS_PythonLibs:INTERNAL=[/usr/lib/aarch64-linux-gnu/libpython3.6m.so][/usr/include/python3.6m][v3.6.9()]
+FIND_PACKAGE_MESSAGE_DETAILS_PythonLibs:INTERNAL=[/usr/lib/aarch64-linux-gnu/libpython3.6m.so][/usr/include/python3.6m][v3.6.9(3.5)]
 //Details about finding Threads
 FIND_PACKAGE_MESSAGE_DETAILS_Threads:INTERNAL=[TRUE][v()]
 //ADVANCED property for variable: GITCOMMAND
@@ -738,14 +852,32 @@ MAKECOMMAND-ADVANCED:INTERNAL=1
 MEMORYCHECK_COMMAND-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: MEMORYCHECK_SUPPRESSIONS_FILE
 MEMORYCHECK_SUPPRESSIONS_FILE-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OPENSSL_CRYPTO_LIBRARY
+OPENSSL_CRYPTO_LIBRARY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OPENSSL_INCLUDE_DIR
+OPENSSL_INCLUDE_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OPENSSL_SSL_LIBRARY
+OPENSSL_SSL_LIBRARY-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: P4COMMAND
 P4COMMAND-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: PKG_CONFIG_EXECUTABLE
+PKG_CONFIG_EXECUTABLE-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: PYTHON_EXECUTABLE
 PYTHON_EXECUTABLE-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: PYTHON_INCLUDE_DIR
+PYTHON_INCLUDE_DIR-ADVANCED:INTERNAL=1
+//The directory for Python library installation. This needs to
+// be in PYTHONPATH when 'setup.py install' is called.
+PYTHON_INSTALL_DIR:INTERNAL=lib/python3/dist-packages
 //ADVANCED property for variable: PYTHON_LIBRARY
 PYTHON_LIBRARY-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: PYTHON_LIBRARY_DEBUG
 PYTHON_LIBRARY_DEBUG-ADVANCED:INTERNAL=1
+//The SOABI suffix for Python native extensions. See PEP-3149:
+// https://www.python.org/dev/peps/pep-3149/.
+PYTHON_SOABI:INTERNAL=cpython-36m-aarch64-linux-gnu
+//The full suffix for Python native extensions. See PEP-3149: https://www.python.org/dev/peps/pep-3149/.
+PythonExtra_EXTENSION_SUFFIX:INTERNAL=.cpython-36m-aarch64-linux-gnu
 //ADVANCED property for variable: SCPCOMMAND
 SCPCOMMAND-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: SITE
@@ -756,4 +888,41 @@ SLURM_SBATCH_COMMAND-ADVANCED:INTERNAL=1
 SLURM_SRUN_COMMAND-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: SVNCOMMAND
 SVNCOMMAND-ADVANCED:INTERNAL=1
+_OPENSSL_CFLAGS:INTERNAL=
+_OPENSSL_CFLAGS_I:INTERNAL=
+_OPENSSL_CFLAGS_OTHER:INTERNAL=
+_OPENSSL_FOUND:INTERNAL=1
+_OPENSSL_INCLUDEDIR:INTERNAL=/usr/include
+_OPENSSL_INCLUDE_DIRS:INTERNAL=
+_OPENSSL_LDFLAGS:INTERNAL=-lssl;-lcrypto
+_OPENSSL_LDFLAGS_OTHER:INTERNAL=
+_OPENSSL_LIBDIR:INTERNAL=/usr/lib/aarch64-linux-gnu
+_OPENSSL_LIBRARIES:INTERNAL=ssl;crypto
+_OPENSSL_LIBRARY_DIRS:INTERNAL=
+_OPENSSL_LIBS:INTERNAL=
+_OPENSSL_LIBS_L:INTERNAL=
+_OPENSSL_LIBS_OTHER:INTERNAL=
+_OPENSSL_LIBS_PATHS:INTERNAL=
+_OPENSSL_PREFIX:INTERNAL=/usr
+_OPENSSL_STATIC_CFLAGS:INTERNAL=
+_OPENSSL_STATIC_CFLAGS_I:INTERNAL=
+_OPENSSL_STATIC_CFLAGS_OTHER:INTERNAL=
+_OPENSSL_STATIC_INCLUDE_DIRS:INTERNAL=
+_OPENSSL_STATIC_LDFLAGS:INTERNAL=-lssl;-lcrypto;-ldl;-pthread
+_OPENSSL_STATIC_LDFLAGS_OTHER:INTERNAL=-pthread
+_OPENSSL_STATIC_LIBDIR:INTERNAL=
+_OPENSSL_STATIC_LIBRARIES:INTERNAL=ssl;crypto;dl
+_OPENSSL_STATIC_LIBRARY_DIRS:INTERNAL=
+_OPENSSL_STATIC_LIBS:INTERNAL=
+_OPENSSL_STATIC_LIBS_L:INTERNAL=
+_OPENSSL_STATIC_LIBS_OTHER:INTERNAL=
+_OPENSSL_STATIC_LIBS_PATHS:INTERNAL=
+_OPENSSL_VERSION:INTERNAL=1.1.1
+_OPENSSL_openssl_INCLUDEDIR:INTERNAL=
+_OPENSSL_openssl_LIBDIR:INTERNAL=
+_OPENSSL_openssl_PREFIX:INTERNAL=
+_OPENSSL_openssl_VERSION:INTERNAL=
+__pkg_config_arguments__OPENSSL:INTERNAL=QUIET;openssl
+__pkg_config_checked__OPENSSL:INTERNAL=1
+prefix_result:INTERNAL=/usr/lib/aarch64-linux-gnu
 

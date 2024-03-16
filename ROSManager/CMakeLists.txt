@@ -5,6 +5,10 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 
+message("CMAKElujing: ${CMAKE_MODULE_PATH}")
+
+include_directories(/usr/lib/aarch64-linux-gnu)
+
 ament_target_dependencies(ROSMANAGER_LIST "rclcpp" "std_msgs")
 
 install(TARGETS
@@ -20,3 +24,7 @@ if(BUILD_TESTING)
 endif()
 
 ament_package()
+
+target_link_libraries(ROSMANAGER_LIST SC_LIST)
+
+target_link_libraries(ROSMANAGER_LIST pugixml)

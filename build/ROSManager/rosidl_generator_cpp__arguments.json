@@ -1,0 +1,22 @@
+{
+  "package_name": "intelligent_robot_system",
+  "output_dir": "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/rosidl_generator_cpp/intelligent_robot_system",
+  "template_dir": "/opt/ros/eloquent/share/rosidl_generator_cpp/cmake/../resource",
+  "idl_tuples": [
+    "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/rosidl_adapter/intelligent_robot_system:msg/ServeDrivePosition.idl"
+  ],
+  "target_dependencies": [
+    "/opt/ros/eloquent/share/rosidl_generator_cpp/cmake/../../../lib/rosidl_generator_cpp/rosidl_generator_cpp",
+    "/opt/ros/eloquent/share/rosidl_generator_cpp/cmake/../../../lib/python3.6/site-packages/rosidl_generator_cpp/__init__.py",
+    "/opt/ros/eloquent/share/rosidl_generator_cpp/cmake/../resource/action__struct.hpp.em",
+    "/opt/ros/eloquent/share/rosidl_generator_cpp/cmake/../resource/action__traits.hpp.em",
+    "/opt/ros/eloquent/share/rosidl_generator_cpp/cmake/../resource/idl.hpp.em",
+    "/opt/ros/eloquent/share/rosidl_generator_cpp/cmake/../resource/idl__struct.hpp.em",
+    "/opt/ros/eloquent/share/rosidl_generator_cpp/cmake/../resource/idl__traits.hpp.em",
+    "/opt/ros/eloquent/share/rosidl_generator_cpp/cmake/../resource/msg__struct.hpp.em",
+    "/opt/ros/eloquent/share/rosidl_generator_cpp/cmake/../resource/msg__traits.hpp.em",
+    "/opt/ros/eloquent/share/rosidl_generator_cpp/cmake/../resource/srv__struct.hpp.em",
+    "/opt/ros/eloquent/share/rosidl_generator_cpp/cmake/../resource/srv__traits.hpp.em",
+    "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/rosidl_adapter/intelligent_robot_system/msg/ServeDrivePosition.idl"
+  ]
+}

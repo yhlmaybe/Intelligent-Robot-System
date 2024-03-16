@@ -1,35 +1,72 @@
 #include "SCDrive.h"
 
-
-void ServoOperate::SetServoPosition(int id, int position, int time)
+ServoOperate::ServoOperate(std::string name, int id)
 {
-    PyObject *pModule = PyImport_ImportModule("ServoManager");
+    this->name = name;
+    this->id = id;
+    pModule = PyImport_ImportModule("ServoManager");
     if (pModule)
     {
-
-        PyObject *class_obj = PyObject_GetAttrString(pModule, "ServoController");
+        class_obj = PyObject_GetAttrString(pModule, "ServoController");
         if (class_obj)
         {
             PyObject *pArgs = PyTuple_Pack(2, Py_BuildValue("s", "/dev/ttyTHS1"), Py_BuildValue("i", 115200));
-            if (pArgs)
+            instance = PyObject_CallObject(class_obj, pArgs);
+            if(instance)
             {
-                PyObject *instance = PyObject_CallObject(class_obj, pArgs);
-                if (instance)
-                {
-                    PyObject *pRetvalue = PyObject_CallMethod(instance, "set_servo_position", "iii", id, position, time);
-                    //PyObject *pRetvalue = PyObject_CallMethod(instance, "set_servo_position", "");
-                    //if (pRetvalue)
-                    //{
-                    //    int id;
-                    //    PyArg_Parse(pRetvalue, "i", &id);
-                    //    const char *idChar = std::to_string(id).c_str();
-                    //    ui->ServoNo_Lable->setText(idChar);
-                    //}
-
-                }
+                isAvaiable = true;
             }
         }
     }
-   
 }
-    
+
+ServoOperate::~ServoOperate()
+{
+    Py_DECREF(instance);
+    Py_DECREF(class_obj);
+    Py_DECREF(pModule);
+}
+
+void ServoOperate::SetServoPosition(int position, int time)
+{
+    PyObject *pRetvalue = PyObject_CallMethod(instance, "set_servo_position", "iii", id, position, time);
+    // PyObject *pRetvalue = PyObject_CallMethod(instance, "set_servo_position", "");
+    // if (pRetvalue)
+    //{
+    //     int id;
+    //     PyArg_Parse(pRetvalue, "i", &id);
+    //     const char *idChar = std::to_string(id).c_str();
+    //     ui->ServoNo_Lable->setText(idChar);
+    // }
+    if(!pRetvalue) Py_DECREF(pRetvalue);
+}
+
+void ServoOperate::SetServoStop()
+{
+    PyObject_CallMethod(instance, "stop", "i", id);
+} 
+
+
+
+Servo::Servo(std::string name, int id)
+{
+    this->name = name;
+    this->id = id;
+    this->operate = std::make_unique<ServoOperate>(name, id);
+}
+
+void DriveHandle::SetServoPosition(std::map<Servo, int> servoPositions, int time)
+{
+    std::list<std::future<void>> results;
+    for(auto it = servoPositions.begin(); it != servoPositions.end(); ++it)
+    {
+        results.push_back(std::async(std::launch::async, [&it, time](){
+            it->first.operate->SetServoPosition(it->second, time);
+        }));
+    }
+
+    for(auto& resule : results)
+    {
+        resule.wait();
+    }
+}

@@ -1,4 +1,5 @@
 file(REMOVE_RECURSE
+  "CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o"
   "CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o"
   "libROSMANAGER_LIST.pdb"
   "libROSMANAGER_LIST.a"

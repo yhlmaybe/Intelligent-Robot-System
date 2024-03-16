@@ -1,0 +1,19 @@
+{
+  "package_name": "intelligent_robot_system",
+  "output_dir": "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/rosidl_typesupport_fastrtps_c/intelligent_robot_system",
+  "template_dir": "/opt/ros/eloquent/share/rosidl_typesupport_fastrtps_c/resource",
+  "idl_tuples": [
+    "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/rosidl_adapter/intelligent_robot_system:msg/ServeDrivePosition.idl"
+  ],
+  "target_dependencies": [
+    "/opt/ros/eloquent/lib/rosidl_typesupport_fastrtps_c/rosidl_typesupport_fastrtps_c",
+    "/opt/ros/eloquent/lib/python3.6/site-packages/rosidl_typesupport_fastrtps_c/__init__.py",
+    "/opt/ros/eloquent/share/rosidl_typesupport_fastrtps_c/resource/idl__rosidl_typesupport_fastrtps_c.h.em",
+    "/opt/ros/eloquent/share/rosidl_typesupport_fastrtps_c/resource/idl__type_support_c.cpp.em",
+    "/opt/ros/eloquent/share/rosidl_typesupport_fastrtps_c/resource/msg__rosidl_typesupport_fastrtps_c.h.em",
+    "/opt/ros/eloquent/share/rosidl_typesupport_fastrtps_c/resource/msg__type_support_c.cpp.em",
+    "/opt/ros/eloquent/share/rosidl_typesupport_fastrtps_c/resource/srv__rosidl_typesupport_fastrtps_c.h.em",
+    "/opt/ros/eloquent/share/rosidl_typesupport_fastrtps_c/resource/srv__type_support_c.cpp.em",
+    "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/rosidl_adapter/intelligent_robot_system/msg/ServeDrivePosition.idl"
+  ]
+}

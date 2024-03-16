@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.0.0)
-project(Intelligent-Robot-System VERSION 0.1.0 LANGUAGES C CXX)
+project(intelligent_robot_system VERSION 0.1.0 LANGUAGES C CXX)
 
 cmake_policy(SET CMP0057 NEW)
 

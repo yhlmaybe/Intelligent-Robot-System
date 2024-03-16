@@ -4,6 +4,7 @@ set(CMAKE_DEPENDS_LANGUAGES
   )
 # The set of files for implicit dependencies of each language:
 set(CMAKE_DEPENDS_CHECK_CXX
+  "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/MsgManager.cpp" "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o"
   "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/NodeManager.cpp" "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o"
   )
 set(CMAKE_CXX_COMPILER_ID "GNU")
@@ -16,11 +17,13 @@ set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "../ServoControl"
   "../IRSGUI"
   "../ROSMANAGER_LIST"
+  "/usr/lib/aarch64-linux-gnu"
   "/opt/ros/eloquent/include"
   )
 
 # Targets to which this target links.
 set(CMAKE_TARGET_LINKED_INFO_FILES
+  "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl/CMakeFiles/SC_LIST.dir/DependInfo.cmake"
   )
 
 # Fortran module output directory.

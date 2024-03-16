@@ -57,9 +57,33 @@ include ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/progress.make
 # Include the compile flags for this target's objects.
 include ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/flags.make
 
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o: ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/flags.make
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o: ../ROSManager/MsgManager.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o"
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager && /usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/MsgManager.cpp
+
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.i"
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/MsgManager.cpp > CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.i
+
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.s"
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/MsgManager.cpp -o CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.s
+
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o.requires:
+
+.PHONY : ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o.requires
+
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o.provides: ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o.requires
+	$(MAKE) -f ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/build.make ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o.provides.build
+.PHONY : ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o.provides
+
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o.provides.build: ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o
+
+
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/flags.make
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ROSManager/NodeManager.cpp
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o"
 	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager && /usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/NodeManager.cpp
 
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.i: cmake_force
@@ -83,15 +107,17 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o.provides.build: ROSM
 
 # Object files for target ROSMANAGER_LIST
 ROSMANAGER_LIST_OBJECTS = \
+"CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o" \
 "CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o"
 
 # External object files for target ROSMANAGER_LIST
 ROSMANAGER_LIST_EXTERNAL_OBJECTS =
 
+ROSManager/libROSMANAGER_LIST.a: ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o
 ROSManager/libROSMANAGER_LIST.a: ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o
 ROSManager/libROSMANAGER_LIST.a: ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/build.make
 ROSManager/libROSMANAGER_LIST.a: ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Linking CXX static library libROSMANAGER_LIST.a"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Linking CXX static library libROSMANAGER_LIST.a"
 	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager && $(CMAKE_COMMAND) -P CMakeFiles/ROSMANAGER_LIST.dir/cmake_clean_target.cmake
 	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager && $(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/ROSMANAGER_LIST.dir/link.txt --verbose=$(VERBOSE)
 
@@ -100,6 +126,7 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/build: ROSManager/libROSMANAGER_LIST.a
 
 .PHONY : ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/build
 
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/requires: ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o.requires
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/requires: ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o.requires
 
 .PHONY : ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/requires

@@ -64,7 +64,7 @@
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/CMakeFiles/uninstall.dir
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/CMakeFiles/list_install_components.dir
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/CMakeFiles/ROSMANAGER_LIST.dir
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/CMakeFiles/Intelligent-Robot-System_uninstall.dir
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/CMakeFiles/package.dir
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/CMakeFiles/package_source.dir
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/CMakeFiles/install/local.dir

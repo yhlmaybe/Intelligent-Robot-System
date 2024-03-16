@@ -1,13 +1,14 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>Intelligent-Robot-System</name>
+  <name>intelligent_robot_system</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
   <maintainer email="496041257@qq.com">yhlmaybe</maintainer>
   <license>TODO: License declaration</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
 

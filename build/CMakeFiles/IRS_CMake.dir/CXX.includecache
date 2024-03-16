@@ -29,6 +29,8 @@ QApplication
 -
 rclcpp/rclcpp.hpp
 -
+std_msgs/msg/string.hpp
+-
 
 /opt/ros/eloquent/include/builtin_interfaces/msg/duration.hpp
 builtin_interfaces/msg/duration__struct.hpp
@@ -2823,6 +2825,38 @@ rosidl_generator_c/visibility_control.h
 -
 
 /opt/ros/eloquent/include/rosidl_typesupport_interface/macros.h
+
+/opt/ros/eloquent/include/std_msgs/msg/string.hpp
+std_msgs/msg/string__struct.hpp
+/opt/ros/eloquent/include/std_msgs/msg/std_msgs/msg/string__struct.hpp
+std_msgs/msg/string__traits.hpp
+/opt/ros/eloquent/include/std_msgs/msg/std_msgs/msg/string__traits.hpp
+
+/opt/ros/eloquent/include/std_msgs/msg/string__struct.hpp
+rosidl_generator_cpp/bounded_vector.hpp
+-
+rosidl_generator_cpp/message_initialization.hpp
+-
+algorithm
+-
+array
+-
+memory
+-
+string
+-
+vector
+-
+
+/opt/ros/eloquent/include/std_msgs/msg/string__traits.hpp
+std_msgs/msg/string__struct.hpp
+/opt/ros/eloquent/include/std_msgs/msg/std_msgs/msg/string__struct.hpp
+rosidl_generator_cpp/traits.hpp
+-
+stdint.h
+-
+type_traits
+-
 
 /opt/ros/eloquent/include/tracetools/config.h
 

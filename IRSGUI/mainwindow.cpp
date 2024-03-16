@@ -13,15 +13,14 @@ MainWindow::MainWindow(QWidget *parent) :
 
 MainWindow::~MainWindow()
 {
-    delete ui;
     rclcpp::shutdown();
-     Py_Finalize();
+    Py_Finalize();
+    delete ui;
 }
 
 void MainWindow::Initiate()
 {
     Py_Initialize();
     PyRun_SimpleString("import sys");
-    PyRun_SimpleString("sys.path.append('./ServoControl')");
-       
+    PyRun_SimpleString("sys.path.append('./ServoControl')");      
 }

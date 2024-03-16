@@ -632,17 +632,17 @@ ROSMANAGER_LIST/fast:
 .PHONY : ROSMANAGER_LIST/fast
 
 #=============================================================================
-# Target rules for targets named Intelligent-Robot-System_uninstall
+# Target rules for targets named intelligent_robot_system_uninstall
 
 # Build rule for target.
-Intelligent-Robot-System_uninstall: cmake_check_build_system
-	$(MAKE) -f CMakeFiles/Makefile2 Intelligent-Robot-System_uninstall
-.PHONY : Intelligent-Robot-System_uninstall
+intelligent_robot_system_uninstall: cmake_check_build_system
+	$(MAKE) -f CMakeFiles/Makefile2 intelligent_robot_system_uninstall
+.PHONY : intelligent_robot_system_uninstall
 
 # fast build rule for target.
-Intelligent-Robot-System_uninstall/fast:
-	$(MAKE) -f ROSManager/CMakeFiles/Intelligent-Robot-System_uninstall.dir/build.make ROSManager/CMakeFiles/Intelligent-Robot-System_uninstall.dir/build
-.PHONY : Intelligent-Robot-System_uninstall/fast
+intelligent_robot_system_uninstall/fast:
+	$(MAKE) -f ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build.make ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build
+.PHONY : intelligent_robot_system_uninstall/fast
 
 IRSInitiate.o: IRSInitiate.cpp.o
 
@@ -774,7 +774,7 @@ help:
 	@echo "... IRSGUI_LIST_autogen"
 	@echo "... uninstall"
 	@echo "... ROSMANAGER_LIST"
-	@echo "... Intelligent-Robot-System_uninstall"
+	@echo "... intelligent_robot_system_uninstall"
 	@echo "... IRSInitiate.o"
 	@echo "... IRSInitiate.i"
 	@echo "... IRSInitiate.s"

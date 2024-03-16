@@ -3,6 +3,7 @@
 #include "mainwindow.h"
 #include <QApplication>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
 
 int main(int argc, char *argv[])
 {

@@ -400,5 +400,5 @@ set(CMAKE_DEPEND_INFO_FILES
   "IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/DependInfo.cmake"
   "ROSManager/CMakeFiles/uninstall.dir/DependInfo.cmake"
   "ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/DependInfo.cmake"
-  "ROSManager/CMakeFiles/Intelligent-Robot-System_uninstall.dir/DependInfo.cmake"
+  "ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/DependInfo.cmake"
   )

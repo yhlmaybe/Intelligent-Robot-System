@@ -220,19 +220,46 @@ ROSMANAGER_LIST/fast:
 .PHONY : ROSMANAGER_LIST/fast
 
 # Convenience name for target.
-ROSManager/CMakeFiles/Intelligent-Robot-System_uninstall.dir/rule:
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f CMakeFiles/Makefile2 ROSManager/CMakeFiles/Intelligent-Robot-System_uninstall.dir/rule
-.PHONY : ROSManager/CMakeFiles/Intelligent-Robot-System_uninstall.dir/rule
+ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/rule:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f CMakeFiles/Makefile2 ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/rule
+.PHONY : ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/rule
 
 # Convenience name for target.
-Intelligent-Robot-System_uninstall: ROSManager/CMakeFiles/Intelligent-Robot-System_uninstall.dir/rule
+intelligent_robot_system_uninstall: ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/rule
 
-.PHONY : Intelligent-Robot-System_uninstall
+.PHONY : intelligent_robot_system_uninstall
 
 # fast build rule for target.
-Intelligent-Robot-System_uninstall/fast:
-	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ROSManager/CMakeFiles/Intelligent-Robot-System_uninstall.dir/build.make ROSManager/CMakeFiles/Intelligent-Robot-System_uninstall.dir/build
-.PHONY : Intelligent-Robot-System_uninstall/fast
+intelligent_robot_system_uninstall/fast:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build.make ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build
+.PHONY : intelligent_robot_system_uninstall/fast
+
+MsgManager.o: MsgManager.cpp.o
+
+.PHONY : MsgManager.o
+
+# target to build an object file
+MsgManager.cpp.o:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/build.make ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.o
+.PHONY : MsgManager.cpp.o
+
+MsgManager.i: MsgManager.cpp.i
+
+.PHONY : MsgManager.i
+
+# target to preprocess a source file
+MsgManager.cpp.i:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/build.make ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.i
+.PHONY : MsgManager.cpp.i
+
+MsgManager.s: MsgManager.cpp.s
+
+.PHONY : MsgManager.s
+
+# target to generate assembly for a file
+MsgManager.cpp.s:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/build.make ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/MsgManager.cpp.s
+.PHONY : MsgManager.cpp.s
 
 NodeManager.o: NodeManager.cpp.o
 
@@ -274,11 +301,14 @@ help:
 	@echo "... uninstall"
 	@echo "... list_install_components"
 	@echo "... ROSMANAGER_LIST"
-	@echo "... Intelligent-Robot-System_uninstall"
+	@echo "... intelligent_robot_system_uninstall"
 	@echo "... package"
 	@echo "... package_source"
 	@echo "... install/local"
 	@echo "... test"
+	@echo "... MsgManager.o"
+	@echo "... MsgManager.i"
+	@echo "... MsgManager.s"
 	@echo "... NodeManager.o"
 	@echo "... NodeManager.i"
 	@echo "... NodeManager.s"
