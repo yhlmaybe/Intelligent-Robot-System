@@ -98,6 +98,7 @@
 #define __FLT64X_DENORM_MIN__ 6.47517511943802511092443895822764655e-4966F64x
 #define __FLT32X_HAS_INFINITY__ 1
 #define __INT32_MAX__ 0x7fffffff
+#define POCO_NO_AUTOMATIC_LIBS 1
 #define __INT_WIDTH__ 32
 #define __SIZEOF_LONG__ 8
 #define __STDC_IEC_559__ 1
@@ -140,6 +141,7 @@
 #define __cpp_ref_qualifiers 200710
 #define __DEC128_MAX__ 9.999999999999999999999999999999999E6144DL
 #define __INT_LEAST32_MAX__ 0x7fffffff
+#define PLUGINLIB__DISABLE_BOOST_FUNCTIONS 1
 #define __DEC32_MIN__ 1E-95DF
 #define __DEPRECATED 1
 #define __cpp_rvalue_references 200610

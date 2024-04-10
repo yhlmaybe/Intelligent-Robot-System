@@ -24,7 +24,7 @@ private:
 
     std::list<std::shared_ptr<Servo>> servos;
 
-    std::shared_ptr<ServoDriveNodeListener> servoDriveNodeListener;
+    std::shared_ptr<ServoDriveNodeListenerNode> servoDriveNodeListenerNode;
 
     void Initiate();
 

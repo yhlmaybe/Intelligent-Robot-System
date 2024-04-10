@@ -38,10 +38,6 @@ if(NOT DEFINED CMAKE_CROSSCOMPILING)
 endif()
 
 if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/lib/intelligent_robot_system" TYPE STATIC_LIBRARY FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/libROSMANAGER_LIST.a")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
   file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/ament_index/resource_index/package_run_dependencies" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ament_cmake_index/share/ament_index/resource_index/package_run_dependencies/intelligent_robot_system")
 endif()
 

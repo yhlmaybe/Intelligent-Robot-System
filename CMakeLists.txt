@@ -5,6 +5,8 @@ cmake_policy(SET CMP0057 NEW)
 
 set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH}" "/usr/share/cmake-3.10/Modules")
 
+set(INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/install")
+
 set(CMAKE_BUILD_TYPE Debug)
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
@@ -47,3 +49,9 @@ set(CPACK_PROJECT_NAME ${PROJECT_NAME})
 set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})
 
 include(CPack)
+
+#install dir, use cmake.. and make install
+install(DIRECTORY ROSManager
+    DESTINATION ${INSTALL_DIR}
+    FILES_MATCHING PATTERN "*"
+    PATTERN "package.xml" EXCLUDE)   

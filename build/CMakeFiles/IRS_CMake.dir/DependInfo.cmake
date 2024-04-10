@@ -10,6 +10,8 @@ set(CMAKE_CXX_COMPILER_ID "GNU")
 
 # Preprocessor definitions for this target.
 set(CMAKE_TARGET_DEFINITIONS_CXX
+  "PLUGINLIB__DISABLE_BOOST_FUNCTIONS"
+  "POCO_NO_AUTOMATIC_LIBS"
   "QT_CORE_LIB"
   "QT_GUI_LIB"
   "QT_WIDGETS_LIB"
@@ -28,6 +30,11 @@ set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "/usr/include/aarch64-linux-gnu/qt5/QtGui"
   "/usr/include/aarch64-linux-gnu/qt5/QtWidgets"
   "/opt/ros/eloquent/include"
+  "/opt/ros/eloquent/opt/yaml_cpp_vendor/lib/cmake/yaml-cpp/../../../include"
+  "/usr/include/eigen3"
+  "/usr/include/aarch64-linux-gnu"
+  "/opt/ros/eloquent/opt/yaml_cpp_vendor/include"
+  "/opt/ros/eloquent/opt/rviz_ogre_vendor/include/OGRE"
   )
 
 # Targets to which this target links.

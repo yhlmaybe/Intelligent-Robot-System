@@ -31,6 +31,9 @@ AMENT_CMAKE_SYMLINK_INSTALL:BOOL=OFF
 // step
 AMENT_CMAKE_UNINSTALL_TARGET:BOOL=ON
 
+//Add ogre_media resources to RViz
+AMENT_RVIZ_OGRE_MEDIA:BOOL=ON
+
 //The path where test results are generated
 AMENT_TEST_RESULTS_DIR:STRING=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/test_results
 
@@ -268,6 +271,12 @@ CTEST_SUBMIT_RETRY_COUNT:STRING=3
 //How long to wait between timed-out CTest submissions.
 CTEST_SUBMIT_RETRY_DELAY:STRING=5
 
+//Path to a file.
+CURL_INCLUDE_DIR:PATH=/usr/include/aarch64-linux-gnu
+
+//Path to a library.
+CURL_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libcurl.so
+
 //Path to a program.
 CVSCOMMAND:FILEPATH=CVSCOMMAND-NOTFOUND
 
@@ -276,6 +285,24 @@ CVS_UPDATE_OPTIONS:STRING=-d -A -P
 
 //Maximum time allowed before CTest will kill the test.
 DART_TESTING_TIMEOUT:STRING=1500
+
+//The directory containing a CMake configuration file for Eigen3.
+Eigen3_DIR:PATH=/usr/lib/cmake/eigen3
+
+//Path to a library.
+FREEIMAGE_LIBRARIES:FILEPATH=FREEIMAGE_LIBRARIES-NOTFOUND
+
+//Path to a file.
+FREETYPE_INCLUDE_DIR_freetype2:PATH=/usr/include/freetype2
+
+//Path to a file.
+FREETYPE_INCLUDE_DIR_ft2build:PATH=/usr/include/freetype2
+
+//Path to a library.
+FREETYPE_LIBRARY_DEBUG:FILEPATH=FREETYPE_LIBRARY_DEBUG-NOTFOUND
+
+//Path to a library.
+FREETYPE_LIBRARY_RELEASE:FILEPATH=/usr/lib/aarch64-linux-gnu/libfreetype.so
 
 //Path to a library.
 FastCDR_LIBRARY_DEBUG:FILEPATH=FastCDR_LIBRARY_DEBUG-NOTFOUND
@@ -316,6 +343,33 @@ MEMORYCHECK_COMMAND:FILEPATH=MEMORYCHECK_COMMAND-NOTFOUND
 //File that contains suppressions for the memory checker
 MEMORYCHECK_SUPPRESSIONS_FILE:FILEPATH=
 
+//Path to a file.
+OPENGL_EGL_INCLUDE_DIR:PATH=/usr/include
+
+//Path to a file.
+OPENGL_GLX_INCLUDE_DIR:PATH=/usr/include
+
+//Path to a file.
+OPENGL_INCLUDE_DIR:PATH=/usr/include
+
+//Path to a library.
+OPENGL_egl_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libEGL.so
+
+//Path to a library.
+OPENGL_gl_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libGL.so
+
+//Path to a library.
+OPENGL_glu_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libGLU.so
+
+//Path to a library.
+OPENGL_glx_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libGLX.so
+
+//Path to a library.
+OPENGL_opengl_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libOpenGL.so
+
+//Path to a file.
+OPENGL_xmesa_INCLUDE_DIR:PATH=OPENGL_xmesa_INCLUDE_DIR-NOTFOUND
+
 //Path to a library.
 OPENSSL_CRYPTO_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libcrypto.so
 
@@ -346,6 +400,12 @@ PYTHON_LIBRARY_DEBUG:FILEPATH=PYTHON_LIBRARY_DEBUG-NOTFOUND
 //Specify specific Python version to use ('major.minor' or 'major')
 PYTHON_VERSION:STRING=
 
+//The directory containing a CMake configuration file for PocoFoundation.
+PocoFoundation_DIR:PATH=/usr/lib/cmake/Poco
+
+//The directory containing a CMake configuration file for Poco.
+Poco_DIR:PATH=/usr/lib/cmake/Poco
+
 //The directory containing a CMake configuration file for PugiXML.
 PugiXML_DIR:PATH=PugiXML_DIR-NOTFOUND
 
@@ -362,7 +422,7 @@ Qt5Widgets_DIR:PATH=/usr/lib/aarch64-linux-gnu/cmake/Qt5Widgets
 Qt5_DIR:PATH=/usr/lib/aarch64-linux-gnu/cmake/Qt5
 
 //Dependencies for the target
-ROSMANAGER_LIST_LIB_DEPENDS:STATIC=general;/opt/ros/eloquent/lib/librclcpp.so;general;/opt/ros/eloquent/lib/librcl.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_introspection_cpp.so;general;-lpthread;general;/opt/ros/eloquent/lib/librmw_implementation.so;general;/opt/ros/eloquent/lib/librmw.so;general;/opt/ros/eloquent/lib/librcutils.so;general;/opt/ros/eloquent/lib/librcl_logging_spdlog.so;general;/opt/ros/eloquent/lib/librcpputils.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librcl_yaml_param_parser.so;general;/opt/ros/eloquent/lib/libtracetools.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_fastrtps_cpp.so;general;SC_LIST;general;pugixml;
+ROSMANAGER_LIST_LIB_DEPENDS:STATIC=general;/usr/lib/aarch64-linux-gnu/libcurl.so;general;/opt/ros/eloquent/lib/librviz_rendering.so;general;stdc++fs;general;/opt/ros/eloquent/lib/libament_index_cpp.so;general;Poco::Foundation;general;/opt/ros/eloquent/lib/libclass_loader.so;general;/usr/lib/aarch64-linux-gnu/libtinyxml2.so;general;/opt/ros/eloquent/lib/libsensor_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libsensor_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libsensor_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libsensor_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libsensor_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libsensor_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libsensor_msgs__rosidl_typesupport_fastrtps_cpp.so;general;orocos-kdl;general;/opt/ros/eloquent/lib/libtf2_ros.so;general;/opt/ros/eloquent/lib/libmessage_filters.so;general;/opt/ros/eloquent/lib/librclcpp.so;general;/opt/ros/eloquent/lib/librcl.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librcl_interfaces__rosidl_typesupport_introspection_cpp.so;general;-lpthread;general;/opt/ros/eloquent/lib/librmw_implementation.so;general;/opt/ros/eloquent/lib/librmw.so;general;/opt/ros/eloquent/lib/librcutils.so;general;/opt/ros/eloquent/lib/librcl_logging_spdlog.so;general;/opt/ros/eloquent/lib/librcpputils.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/librosgraph_msgs__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librcl_yaml_param_parser.so;general;/opt/ros/eloquent/lib/libtracetools.so;general;/opt/ros/eloquent/lib/libunique_identifier_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libunique_identifier_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libunique_identifier_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libunique_identifier_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libunique_identifier_msgs__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/libunique_identifier_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libunique_identifier_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libaction_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libaction_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libaction_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libaction_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libaction_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libaction_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libaction_msgs__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/libtf2_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libtf2_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libtf2_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libtf2_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libtf2_msgs__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/libtf2_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libtf2_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libtf2.so;general;yaml-cpp;general;/opt/ros/eloquent/lib/librviz_common.so;general;/opt/ros/eloquent/lib/liburdf.so;general;/usr/lib/aarch64-linux-gnu/libtinyxml.so;optimized;/opt/ros/eloquent/lib/liburdfdom_sensor.so;debug;/opt/ros/eloquent/lib/liburdfdom_sensor.so;optimized;/opt/ros/eloquent/lib/liburdfdom_model_state.so;debug;/opt/ros/eloquent/lib/liburdfdom_model_state.so;optimized;/opt/ros/eloquent/lib/liburdfdom_model.so;debug;/opt/ros/eloquent/lib/liburdfdom_model.so;optimized;/opt/ros/eloquent/lib/liburdfdom_world.so;debug;/opt/ros/eloquent/lib/liburdfdom_world.so;general;console_bridge;general;/opt/ros/eloquent/lib/libgeometry_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libgeometry_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libgeometry_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libgeometry_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libgeometry_msgs__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/libgeometry_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libgeometry_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libbuiltin_interfaces__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_fastrtps_cpp.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libvisualization_msgs__rosidl_generator_c.so;general;/opt/ros/eloquent/lib/libvisualization_msgs__rosidl_typesupport_c.so;general;/opt/ros/eloquent/lib/libvisualization_msgs__rosidl_typesupport_cpp.so;general;/opt/ros/eloquent/lib/libvisualization_msgs__rosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/libvisualization_msgs__rosidl_typesupport_introspection_cpp.so;general;/opt/ros/eloquent/lib/libvisualization_msgs__rosidl_typesupport_fastrtps_c.so;general;/opt/ros/eloquent/lib/libvisualization_msgs__rosidl_typesupport_fastrtps_cpp.so;general;SC_LIST;general;pugixml;general;rviz_common::rviz_common;
 
 //Path to scp command, used by CTest for submitting results to
 // a Dart server
@@ -383,14 +443,245 @@ SLURM_SRUN_COMMAND:FILEPATH=SLURM_SRUN_COMMAND-NOTFOUND
 //Path to a program.
 SVNCOMMAND:FILEPATH=SVNCOMMAND-NOTFOUND
 
+//Path to a file.
+TINYXML2_INCLUDE_DIR:PATH=/usr/include
+
+//Path to a library.
+TINYXML2_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libtinyxml2.so
+
 //The directory containing a CMake configuration file for TinyXML2.
 TinyXML2_DIR:PATH=TinyXML2_DIR-NOTFOUND
 
+//The directory containing a CMake configuration file for TinyXML.
+TinyXML_DIR:PATH=TinyXML_DIR-NOTFOUND
+
+//Path to a file.
+TinyXML_INCLUDE_DIR:PATH=/usr/include
+
 //Path to a library.
-_lib:FILEPATH=/opt/ros/eloquent/lib/libstd_msgs__rosidl_typesupport_opensplice_cpp.so
+TinyXML_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libtinyxml.so
+
+//Path to a file.
+X11_ICE_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_ICE_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libICE.so
+
+//Path to a file.
+X11_SM_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_SM_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libSM.so
+
+//Path to a file.
+X11_X11_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_X11_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libX11.so
+
+//Path to a file.
+X11_XRes_INCLUDE_PATH:PATH=X11_XRes_INCLUDE_PATH-NOTFOUND
+
+//Path to a library.
+X11_XRes_LIB:FILEPATH=X11_XRes_LIB-NOTFOUND
+
+//Path to a file.
+X11_XShm_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a file.
+X11_XSync_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a file.
+X11_XTest_INCLUDE_PATH:PATH=X11_XTest_INCLUDE_PATH-NOTFOUND
+
+//Path to a library.
+X11_XTest_LIB:FILEPATH=X11_XTest_LIB-NOTFOUND
+
+//Path to a file.
+X11_Xaccessrules_INCLUDE_PATH:PATH=X11_Xaccessrules_INCLUDE_PATH-NOTFOUND
+
+//Path to a file.
+X11_Xaccessstr_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a file.
+X11_Xau_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_Xau_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXau.so
+
+//Path to a file.
+X11_Xcomposite_INCLUDE_PATH:PATH=X11_Xcomposite_INCLUDE_PATH-NOTFOUND
+
+//Path to a library.
+X11_Xcomposite_LIB:FILEPATH=X11_Xcomposite_LIB-NOTFOUND
+
+//Path to a file.
+X11_Xcursor_INCLUDE_PATH:PATH=X11_Xcursor_INCLUDE_PATH-NOTFOUND
+
+//Path to a library.
+X11_Xcursor_LIB:FILEPATH=X11_Xcursor_LIB-NOTFOUND
+
+//Path to a file.
+X11_Xdamage_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_Xdamage_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXdamage.so
+
+//Path to a file.
+X11_Xdmcp_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_Xdmcp_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXdmcp.so
+
+//Path to a library.
+X11_Xext_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXext.so
+
+//Path to a file.
+X11_Xfixes_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_Xfixes_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXfixes.so
+
+//Path to a file.
+X11_Xft_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_Xft_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXft.so
+
+//Path to a file.
+X11_Xi_INCLUDE_PATH:PATH=X11_Xi_INCLUDE_PATH-NOTFOUND
+
+//Path to a library.
+X11_Xi_LIB:FILEPATH=X11_Xi_LIB-NOTFOUND
+
+//Path to a file.
+X11_Xinerama_INCLUDE_PATH:PATH=X11_Xinerama_INCLUDE_PATH-NOTFOUND
+
+//Path to a library.
+X11_Xinerama_LIB:FILEPATH=X11_Xinerama_LIB-NOTFOUND
+
+//Path to a file.
+X11_Xinput_INCLUDE_PATH:PATH=X11_Xinput_INCLUDE_PATH-NOTFOUND
+
+//Path to a library.
+X11_Xinput_LIB:FILEPATH=X11_Xinput_LIB-NOTFOUND
+
+//Path to a file.
+X11_Xkb_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a file.
+X11_Xkbfile_INCLUDE_PATH:PATH=X11_Xkbfile_INCLUDE_PATH-NOTFOUND
+
+//Path to a library.
+X11_Xkbfile_LIB:FILEPATH=X11_Xkbfile_LIB-NOTFOUND
+
+//Path to a file.
+X11_Xkblib_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a file.
+X11_Xlib_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a file.
+X11_Xmu_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_Xmu_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXmu.so
+
+//Path to a file.
+X11_Xpm_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_Xpm_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXpm.so
+
+//Path to a file.
+X11_Xrandr_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_Xrandr_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXrandr.so
+
+//Path to a file.
+X11_Xrender_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_Xrender_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXrender.so
+
+//Path to a file.
+X11_Xscreensaver_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_Xscreensaver_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXss.so
+
+//Path to a file.
+X11_Xshape_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a file.
+X11_Xt_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+X11_Xt_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXt.so
+
+//Path to a file.
+X11_Xutil_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a file.
+X11_Xv_INCLUDE_PATH:PATH=X11_Xv_INCLUDE_PATH-NOTFOUND
+
+//Path to a library.
+X11_Xv_LIB:FILEPATH=X11_Xv_LIB-NOTFOUND
+
+//Path to a library.
+X11_Xxf86misc_LIB:FILEPATH=X11_Xxf86misc_LIB-NOTFOUND
+
+//Path to a library.
+X11_Xxf86vm_LIB:FILEPATH=/usr/lib/aarch64-linux-gnu/libXxf86vm.so
+
+//Path to a file.
+X11_dpms_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a file.
+X11_xf86misc_INCLUDE_PATH:PATH=X11_xf86misc_INCLUDE_PATH-NOTFOUND
+
+//Path to a file.
+X11_xf86vmode_INCLUDE_PATH:PATH=/usr/include
+
+//Path to a library.
+XAW_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libXaw.so
+
+//Path to a file.
+ZLIB_INCLUDE_DIR:PATH=/usr/include
+
+//Path to a library.
+ZLIB_LIBRARY_DEBUG:FILEPATH=ZLIB_LIBRARY_DEBUG-NOTFOUND
+
+//Path to a library.
+ZLIB_LIBRARY_RELEASE:FILEPATH=/usr/lib/aarch64-linux-gnu/libz.so
+
+//Path to a library.
+_lib:FILEPATH=/opt/ros/eloquent/lib/liburdf.so
 
 //Path to a file.
 _numpy_h:FILEPATH=/usr/include/python3.6m/numpy/numpyconfig.h
+
+//Path to a library.
+_ogre_main_static_library_abs:FILEPATH=/opt/ros/eloquent/opt/rviz_ogre_vendor/lib/libOgreMain.so
+
+//Path to a library.
+_ogre_main_static_library_debug_abs:FILEPATH=_ogre_main_static_library_debug_abs-NOTFOUND
+
+//Path to a library.
+_ogre_overlay_static_library_abs:FILEPATH=/opt/ros/eloquent/opt/rviz_ogre_vendor/lib/libOgreOverlay.so
+
+//Path to a library.
+_ogre_overlay_static_library_debug_abs:FILEPATH=_ogre_overlay_static_library_debug_abs-NOTFOUND
+
+//Path to a library.
+_render_system_gl_static_library_abs:FILEPATH=_render_system_gl_static_library_abs-NOTFOUND
+
+//Path to a library.
+_render_system_gl_static_library_debug_abs:FILEPATH=_render_system_gl_static_library_debug_abs-NOTFOUND
+
+//The directory containing a CMake configuration file for action_msgs.
+action_msgs_DIR:PATH=/opt/ros/eloquent/share/action_msgs/cmake
 
 //The directory containing a CMake configuration file for amenet_cmake.
 amenet_cmake_DIR:PATH=amenet_cmake_DIR-NOTFOUND
@@ -467,6 +758,9 @@ ament_cppcheck_BIN:FILEPATH=/opt/ros/eloquent/bin/ament_cppcheck
 //Path to a program.
 ament_flake8_BIN:FILEPATH=/opt/ros/eloquent/bin/ament_flake8
 
+//The directory containing a CMake configuration file for ament_index_cpp.
+ament_index_cpp_DIR:PATH=/opt/ros/eloquent/share/ament_index_cpp/cmake
+
 //The directory containing a CMake configuration file for ament_lint_auto.
 ament_lint_auto_DIR:PATH=/opt/ros/eloquent/share/ament_lint_auto/cmake
 
@@ -491,6 +785,15 @@ builtin_interfaces_DIR:PATH=/opt/ros/eloquent/share/builtin_interfaces/cmake
 //The directory containing a CMake configuration file for catkin.
 catkin_DIR:PATH=catkin_DIR-NOTFOUND
 
+//The directory containing a CMake configuration file for class_loader.
+class_loader_DIR:PATH=/opt/ros/eloquent/share/class_loader/cmake
+
+//The directory containing a CMake configuration file for console_bridge.
+console_bridge_DIR:PATH=/opt/ros/eloquent/lib/console_bridge/cmake
+
+//The directory containing a CMake configuration file for eigen3_cmake_module.
+eigen3_cmake_module_DIR:PATH=/opt/ros/eloquent/share/eigen3_cmake_module/cmake
+
 //The directory containing a CMake configuration file for fastcdr.
 fastcdr_DIR:PATH=/opt/ros/eloquent/share/fastcdr/cmake
 
@@ -502,6 +805,9 @@ fastrtps_cmake_module_DIR:PATH=/opt/ros/eloquent/share/fastrtps_cmake_module/cma
 
 //The directory containing a CMake configuration file for foonathan_memory.
 foonathan_memory_DIR:PATH=/opt/ros/eloquent/lib/foonathan_memory/cmake
+
+//The directory containing a CMake configuration file for geometry_msgs.
+geometry_msgs_DIR:PATH=/opt/ros/eloquent/share/geometry_msgs/cmake
 
 //Value Computed by CMake
 intelligent_robot_system_BINARY_DIR:STATIC=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build
@@ -539,6 +845,27 @@ intelligent_robot_system__rosidl_typesupport_introspection_c_LIB_DEPENDS:STATIC=
 //Dependencies for the target
 intelligent_robot_system__rosidl_typesupport_introspection_cpp_LIB_DEPENDS:STATIC=general;/opt/ros/eloquent/lib/librosidl_generator_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_c.so;general;/opt/ros/eloquent/lib/librosidl_typesupport_introspection_cpp.so;
 
+//The directory containing a CMake configuration file for libcurl_vendor.
+libcurl_vendor_DIR:PATH=/opt/ros/eloquent/share/libcurl_vendor/cmake
+
+//The directory containing a CMake configuration file for message_filters.
+message_filters_DIR:PATH=/opt/ros/eloquent/share/message_filters/cmake
+
+//Path to a library.
+onelib:FILEPATH=/opt/ros/eloquent/lib/liburdfdom_world.so
+
+//Path to a library.
+onelibd:FILEPATH=/opt/ros/eloquent/lib/liburdfdom_world.so
+
+//The directory containing a CMake configuration file for orocos_kdl.
+orocos_kdl_DIR:PATH=/opt/ros/eloquent/share/orocos_kdl
+
+//The directory containing a CMake configuration file for pluginlib.
+pluginlib_DIR:PATH=/opt/ros/eloquent/share/pluginlib/cmake
+
+//The directory containing a CMake configuration file for poco_vendor.
+poco_vendor_DIR:PATH=/opt/ros/eloquent/share/poco_vendor/cmake
+
 //The directory containing a CMake configuration file for python_cmake_module.
 python_cmake_module_DIR:PATH=/opt/ros/eloquent/share/python_cmake_module/cmake
 
@@ -562,6 +889,9 @@ rcpputils_DIR:PATH=/opt/ros/eloquent/share/rcpputils/cmake
 
 //The directory containing a CMake configuration file for rcutils.
 rcutils_DIR:PATH=/opt/ros/eloquent/share/rcutils/cmake
+
+//The directory containing a CMake configuration file for resource_retriever.
+resource_retriever_DIR:PATH=/opt/ros/eloquent/share/resource_retriever/cmake
 
 //The directory containing a CMake configuration file for rmw.
 rmw_DIR:PATH=/opt/ros/eloquent/share/rmw/cmake
@@ -623,14 +953,62 @@ rosidl_typesupport_introspection_c_DIR:PATH=/opt/ros/eloquent/share/rosidl_types
 //The directory containing a CMake configuration file for rosidl_typesupport_introspection_cpp.
 rosidl_typesupport_introspection_cpp_DIR:PATH=/opt/ros/eloquent/share/rosidl_typesupport_introspection_cpp/cmake
 
+//The directory containing a CMake configuration file for rviz_common.
+rviz_common_DIR:PATH=/opt/ros/eloquent/share/rviz_common/cmake
+
+//The directory containing a CMake configuration file for rviz_ogre_vendor.
+rviz_ogre_vendor_DIR:PATH=/opt/ros/eloquent/share/rviz_ogre_vendor/cmake
+
+//The directory containing a CMake configuration file for rviz_rendering.
+rviz_rendering_DIR:PATH=/opt/ros/eloquent/share/rviz_rendering/cmake
+
+//The directory containing a CMake configuration file for sensor_msgs.
+sensor_msgs_DIR:PATH=/opt/ros/eloquent/share/sensor_msgs/cmake
+
 //The directory containing a CMake configuration file for std_msgs.
 std_msgs_DIR:PATH=/opt/ros/eloquent/share/std_msgs/cmake
+
+//The directory containing a CMake configuration file for tf2.
+tf2_DIR:PATH=/opt/ros/eloquent/share/tf2/cmake
+
+//The directory containing a CMake configuration file for tf2_geometry_msgs.
+tf2_geometry_msgs_DIR:PATH=/opt/ros/eloquent/share/tf2_geometry_msgs/cmake
+
+//The directory containing a CMake configuration file for tf2_msgs.
+tf2_msgs_DIR:PATH=/opt/ros/eloquent/share/tf2_msgs/cmake
+
+//The directory containing a CMake configuration file for tf2_ros.
+tf2_ros_DIR:PATH=/opt/ros/eloquent/share/tf2_ros/cmake
+
+//The directory containing a CMake configuration file for tinyxml2_vendor.
+tinyxml2_vendor_DIR:PATH=/opt/ros/eloquent/share/tinyxml2_vendor/cmake
+
+//The directory containing a CMake configuration file for tinyxml_vendor.
+tinyxml_vendor_DIR:PATH=/opt/ros/eloquent/share/tinyxml_vendor/cmake
 
 //The directory containing a CMake configuration file for tracetools.
 tracetools_DIR:PATH=/opt/ros/eloquent/share/tracetools/cmake
 
+//The directory containing a CMake configuration file for unique_identifier_msgs.
+unique_identifier_msgs_DIR:PATH=/opt/ros/eloquent/share/unique_identifier_msgs/cmake
+
+//The directory containing a CMake configuration file for urdf.
+urdf_DIR:PATH=/opt/ros/eloquent/share/urdf/cmake
+
+//The directory containing a CMake configuration file for urdfdom.
+urdfdom_DIR:PATH=/opt/ros/eloquent/lib/urdfdom/cmake
+
+//The directory containing a CMake configuration file for urdfdom_headers.
+urdfdom_headers_DIR:PATH=/opt/ros/eloquent/lib/urdfdom_headers/cmake
+
+//The directory containing a CMake configuration file for visualization_msgs.
+visualization_msgs_DIR:PATH=/opt/ros/eloquent/share/visualization_msgs/cmake
+
 //Path to a program.
 xmllint_BIN:FILEPATH=/usr/bin/xmllint
+
+//The directory containing a CMake configuration file for yaml_cpp_vendor.
+yaml_cpp_vendor_DIR:PATH=/opt/ros/eloquent/share/yaml_cpp_vendor/cmake
 
 
 ########################
@@ -713,6 +1091,10 @@ CMAKE_GENERATOR:INTERNAL=Unix Makefiles
 CMAKE_GENERATOR_PLATFORM:INTERNAL=
 //Name of generator toolset.
 CMAKE_GENERATOR_TOOLSET:INTERNAL=
+//Have function connect
+CMAKE_HAVE_CONNECT:INTERNAL=1
+//Have function gethostbyname
+CMAKE_HAVE_GETHOSTBYNAME:INTERNAL=1
 //Have symbol pthread_create
 CMAKE_HAVE_LIBC_CREATE:INTERNAL=
 //Have library pthreads
@@ -721,11 +1103,17 @@ CMAKE_HAVE_PTHREADS_CREATE:INTERNAL=
 CMAKE_HAVE_PTHREAD_CREATE:INTERNAL=1
 //Have include pthread.h
 CMAKE_HAVE_PTHREAD_H:INTERNAL=1
+//Have function remove
+CMAKE_HAVE_REMOVE:INTERNAL=1
+//Have function shmat
+CMAKE_HAVE_SHMAT:INTERNAL=1
 //Source directory with the top level CMakeLists.txt file for this
 // project
 CMAKE_HOME_DIRECTORY:INTERNAL=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System
 //Install .so files without execute permission.
 CMAKE_INSTALL_SO_NO_EXE:INTERNAL=1
+//Have library ICE
+CMAKE_LIB_ICE_HAS_ICECONNECTIONNUMBER:INTERNAL=1
 //ADVANCED property for variable: CMAKE_LINKER
 CMAKE_LINKER-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_MAKE_PROGRAM
@@ -824,6 +1212,10 @@ CPACK_SOURCE_ZIP-ADVANCED:INTERNAL=1
 CTEST_SUBMIT_RETRY_COUNT-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CTEST_SUBMIT_RETRY_DELAY
 CTEST_SUBMIT_RETRY_DELAY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CURL_INCLUDE_DIR
+CURL_INCLUDE_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CURL_LIBRARY
+CURL_LIBRARY-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CVSCOMMAND
 CVSCOMMAND-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CVS_UPDATE_OPTIONS
@@ -832,6 +1224,8 @@ CVS_UPDATE_OPTIONS-ADVANCED:INTERNAL=1
 DART_TESTING_TIMEOUT-ADVANCED:INTERNAL=1
 //Details about finding FastRTPS
 FIND_PACKAGE_MESSAGE_DETAILS_FastRTPS:INTERNAL=[/opt/ros/eloquent/include][/opt/ros/eloquent/lib/libfastrtps.so][v()]
+//Details about finding OpenGL
+FIND_PACKAGE_MESSAGE_DETAILS_OpenGL:INTERNAL=[/usr/lib/aarch64-linux-gnu/libOpenGL.so][/usr/lib/aarch64-linux-gnu/libGLX.so][/usr/include][c ][v()]
 //Details about finding OpenSSL
 FIND_PACKAGE_MESSAGE_DETAILS_OpenSSL:INTERNAL=[/usr/lib/aarch64-linux-gnu/libcrypto.so][/usr/include][v1.1.1()]
 //Details about finding PythonExtra
@@ -842,6 +1236,20 @@ FIND_PACKAGE_MESSAGE_DETAILS_PythonInterp:INTERNAL=[/usr/bin/python][v3.6.9(3)]
 FIND_PACKAGE_MESSAGE_DETAILS_PythonLibs:INTERNAL=[/usr/lib/aarch64-linux-gnu/libpython3.6m.so][/usr/include/python3.6m][v3.6.9(3.5)]
 //Details about finding Threads
 FIND_PACKAGE_MESSAGE_DETAILS_Threads:INTERNAL=[TRUE][v()]
+//Details about finding TinyXML2
+FIND_PACKAGE_MESSAGE_DETAILS_TinyXML2:INTERNAL=[/usr/lib/aarch64-linux-gnu/libtinyxml2.so][/usr/include][v()]
+//Details about finding X11
+FIND_PACKAGE_MESSAGE_DETAILS_X11:INTERNAL=[/usr/lib/aarch64-linux-gnu/libX11.so][/usr/include]
+//Details about finding ZLIB
+FIND_PACKAGE_MESSAGE_DETAILS_ZLIB:INTERNAL=[/usr/lib/aarch64-linux-gnu/libz.so][/usr/include][v1.2.11()]
+//ADVANCED property for variable: FREETYPE_INCLUDE_DIR_freetype2
+FREETYPE_INCLUDE_DIR_freetype2-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: FREETYPE_INCLUDE_DIR_ft2build
+FREETYPE_INCLUDE_DIR_ft2build-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: FREETYPE_LIBRARY_DEBUG
+FREETYPE_LIBRARY_DEBUG-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: FREETYPE_LIBRARY_RELEASE
+FREETYPE_LIBRARY_RELEASE-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: GITCOMMAND
 GITCOMMAND-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: HGCOMMAND
@@ -852,6 +1260,24 @@ MAKECOMMAND-ADVANCED:INTERNAL=1
 MEMORYCHECK_COMMAND-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: MEMORYCHECK_SUPPRESSIONS_FILE
 MEMORYCHECK_SUPPRESSIONS_FILE-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OPENGL_EGL_INCLUDE_DIR
+OPENGL_EGL_INCLUDE_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OPENGL_GLX_INCLUDE_DIR
+OPENGL_GLX_INCLUDE_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OPENGL_INCLUDE_DIR
+OPENGL_INCLUDE_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OPENGL_egl_LIBRARY
+OPENGL_egl_LIBRARY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OPENGL_gl_LIBRARY
+OPENGL_gl_LIBRARY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OPENGL_glu_LIBRARY
+OPENGL_glu_LIBRARY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OPENGL_glx_LIBRARY
+OPENGL_glx_LIBRARY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OPENGL_opengl_LIBRARY
+OPENGL_opengl_LIBRARY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: OPENGL_xmesa_INCLUDE_DIR
+OPENGL_xmesa_INCLUDE_DIR-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: OPENSSL_CRYPTO_LIBRARY
 OPENSSL_CRYPTO_LIBRARY-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: OPENSSL_INCLUDE_DIR
@@ -888,6 +1314,144 @@ SLURM_SBATCH_COMMAND-ADVANCED:INTERNAL=1
 SLURM_SRUN_COMMAND-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: SVNCOMMAND
 SVNCOMMAND-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: TINYXML2_INCLUDE_DIR
+TINYXML2_INCLUDE_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: TINYXML2_LIBRARY
+TINYXML2_LIBRARY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: TinyXML_INCLUDE_DIR
+TinyXML_INCLUDE_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: TinyXML_LIBRARY
+TinyXML_LIBRARY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_ICE_INCLUDE_PATH
+X11_ICE_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_ICE_LIB
+X11_ICE_LIB-ADVANCED:INTERNAL=1
+//Have library /usr/lib/aarch64-linux-gnu/libX11.so;/usr/lib/aarch64-linux-gnu/libXext.so
+X11_LIB_X11_SOLO:INTERNAL=1
+//ADVANCED property for variable: X11_SM_INCLUDE_PATH
+X11_SM_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_SM_LIB
+X11_SM_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_X11_INCLUDE_PATH
+X11_X11_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_X11_LIB
+X11_X11_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_XRes_INCLUDE_PATH
+X11_XRes_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_XRes_LIB
+X11_XRes_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_XShm_INCLUDE_PATH
+X11_XShm_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_XSync_INCLUDE_PATH
+X11_XSync_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_XTest_INCLUDE_PATH
+X11_XTest_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_XTest_LIB
+X11_XTest_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xaccessrules_INCLUDE_PATH
+X11_Xaccessrules_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xaccessstr_INCLUDE_PATH
+X11_Xaccessstr_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xau_INCLUDE_PATH
+X11_Xau_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xau_LIB
+X11_Xau_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xcomposite_INCLUDE_PATH
+X11_Xcomposite_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xcomposite_LIB
+X11_Xcomposite_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xcursor_INCLUDE_PATH
+X11_Xcursor_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xcursor_LIB
+X11_Xcursor_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xdamage_INCLUDE_PATH
+X11_Xdamage_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xdamage_LIB
+X11_Xdamage_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xdmcp_INCLUDE_PATH
+X11_Xdmcp_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xdmcp_LIB
+X11_Xdmcp_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xext_LIB
+X11_Xext_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xfixes_INCLUDE_PATH
+X11_Xfixes_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xfixes_LIB
+X11_Xfixes_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xft_INCLUDE_PATH
+X11_Xft_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xft_LIB
+X11_Xft_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xi_INCLUDE_PATH
+X11_Xi_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xi_LIB
+X11_Xi_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xinerama_INCLUDE_PATH
+X11_Xinerama_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xinerama_LIB
+X11_Xinerama_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xinput_INCLUDE_PATH
+X11_Xinput_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xinput_LIB
+X11_Xinput_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xkb_INCLUDE_PATH
+X11_Xkb_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xkbfile_INCLUDE_PATH
+X11_Xkbfile_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xkbfile_LIB
+X11_Xkbfile_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xkblib_INCLUDE_PATH
+X11_Xkblib_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xlib_INCLUDE_PATH
+X11_Xlib_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xmu_INCLUDE_PATH
+X11_Xmu_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xmu_LIB
+X11_Xmu_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xpm_INCLUDE_PATH
+X11_Xpm_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xpm_LIB
+X11_Xpm_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xrandr_INCLUDE_PATH
+X11_Xrandr_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xrandr_LIB
+X11_Xrandr_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xrender_INCLUDE_PATH
+X11_Xrender_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xrender_LIB
+X11_Xrender_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xscreensaver_INCLUDE_PATH
+X11_Xscreensaver_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xscreensaver_LIB
+X11_Xscreensaver_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xshape_INCLUDE_PATH
+X11_Xshape_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xt_INCLUDE_PATH
+X11_Xt_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xt_LIB
+X11_Xt_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xutil_INCLUDE_PATH
+X11_Xutil_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xv_INCLUDE_PATH
+X11_Xv_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xv_LIB
+X11_Xv_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xxf86misc_LIB
+X11_Xxf86misc_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_Xxf86vm_LIB
+X11_Xxf86vm_LIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_dpms_INCLUDE_PATH
+X11_dpms_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_xf86misc_INCLUDE_PATH
+X11_xf86misc_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: X11_xf86vmode_INCLUDE_PATH
+X11_xf86vmode_INCLUDE_PATH-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: ZLIB_INCLUDE_DIR
+ZLIB_INCLUDE_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: ZLIB_LIBRARY_DEBUG
+ZLIB_LIBRARY_DEBUG-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: ZLIB_LIBRARY_RELEASE
+ZLIB_LIBRARY_RELEASE-ADVANCED:INTERNAL=1
 _OPENSSL_CFLAGS:INTERNAL=
 _OPENSSL_CFLAGS_I:INTERNAL=
 _OPENSSL_CFLAGS_OTHER:INTERNAL=

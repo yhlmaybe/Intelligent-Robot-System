@@ -9,6 +9,15 @@ set(CMAKE_DEPENDS_CHECK_CXX
   )
 set(CMAKE_CXX_COMPILER_ID "GNU")
 
+# Preprocessor definitions for this target.
+set(CMAKE_TARGET_DEFINITIONS_CXX
+  "PLUGINLIB__DISABLE_BOOST_FUNCTIONS"
+  "POCO_NO_AUTOMATIC_LIBS"
+  "QT_CORE_LIB"
+  "QT_GUI_LIB"
+  "QT_WIDGETS_LIB"
+  )
+
 # The include file search paths:
 set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "ROSManager"
@@ -18,6 +27,16 @@ set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "../ROSMANAGER_LIST"
   "/usr/lib/aarch64-linux-gnu"
   "/opt/ros/eloquent/include"
+  "/opt/ros/eloquent/opt/yaml_cpp_vendor/lib/cmake/yaml-cpp/../../../include"
+  "/usr/include/eigen3"
+  "/usr/include/aarch64-linux-gnu"
+  "/opt/ros/eloquent/opt/yaml_cpp_vendor/include"
+  "/opt/ros/eloquent/opt/rviz_ogre_vendor/include/OGRE"
+  "/usr/include/aarch64-linux-gnu/qt5"
+  "/usr/include/aarch64-linux-gnu/qt5/QtWidgets"
+  "/usr/include/aarch64-linux-gnu/qt5/QtGui"
+  "/usr/include/aarch64-linux-gnu/qt5/QtCore"
+  "/usr/lib/aarch64-linux-gnu/qt5/mkspecs/linux-g++"
   )
 
 # Targets to which this target links.

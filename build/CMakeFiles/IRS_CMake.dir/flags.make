@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/c++
 CXX_FLAGS = -g   -Wall -Wextra -Wpedantic -fPIC -std=gnu++14
 
-CXX_DEFINES = -DQT_CORE_LIB -DQT_GUI_LIB -DQT_WIDGETS_LIB
+CXX_DEFINES = -DPLUGINLIB__DISABLE_BOOST_FUNCTIONS -DPOCO_NO_AUTOMATIC_LIBS -DQT_CORE_LIB -DQT_GUI_LIB -DQT_WIDGETS_LIB
 
-CXX_INCLUDES = -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSMANAGER_LIST -isystem /usr/include/aarch64-linux-gnu/qt5 -isystem /usr/include/aarch64-linux-gnu/qt5/QtCore -isystem /usr/lib/aarch64-linux-gnu/qt5/mkspecs/linux-g++ -isystem /usr/include/aarch64-linux-gnu/qt5/QtGui -isystem /usr/include/aarch64-linux-gnu/qt5/QtWidgets -I/opt/ros/eloquent/include 
+CXX_INCLUDES = -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSMANAGER_LIST -isystem /usr/include/aarch64-linux-gnu/qt5 -isystem /usr/include/aarch64-linux-gnu/qt5/QtCore -isystem /usr/lib/aarch64-linux-gnu/qt5/mkspecs/linux-g++ -isystem /usr/include/aarch64-linux-gnu/qt5/QtGui -isystem /usr/include/aarch64-linux-gnu/qt5/QtWidgets -isystem /opt/ros/eloquent/include -isystem /opt/ros/eloquent/opt/yaml_cpp_vendor/lib/cmake/yaml-cpp/../../../include -isystem /usr/include/eigen3 -isystem /usr/include/aarch64-linux-gnu -isystem /opt/ros/eloquent/opt/yaml_cpp_vendor/include -isystem /opt/ros/eloquent/opt/rviz_ogre_vendor/include/OGRE 
 

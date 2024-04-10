@@ -30,8 +30,8 @@ void MainWindow::StartROSServoDriveNode()
 {
     std::thread([this]()
     {
-        servoDriveNodeListener = std::make_shared<ServoDriveNodeListener>(servos);
-        rclcpp::spin(servoDriveNodeListener);
+        servoDriveNodeListenerNode = std::make_shared<ServoDriveNodeListenerNode>(servos);
+        rclcpp::spin(servoDriveNodeListenerNode);
     }).detach();
-    
+    RvizUrdfManager::Initial();
 }
