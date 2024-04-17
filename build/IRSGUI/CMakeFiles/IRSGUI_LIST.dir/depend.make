@@ -8,6 +8,8 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: ..
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: ../ServoControl/ServoInitiate.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/moc_mainwindow.cpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: IRSGUI/IRSGUI_LIST_autogen/mocs_compilation.cpp
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: ../include/IRSFunction.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: ../include/ROSParametersData.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/builtin_interfaces/msg/duration.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/builtin_interfaces/msg/duration__struct.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/builtin_interfaces/msg/duration__traits.hpp
@@ -44,6 +46,8 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /o
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/kdl/tree.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/kdl/utilities/kdl-config.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/kdl/utilities/utility.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/kdl_parser/kdl_parser.hpp
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/kdl_parser/visibility_control.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/rcl/allocator.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/rcl/arguments.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/rcl/client.h
@@ -241,6 +245,9 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /o
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/rosidl_typesupport_cpp/message_type_support.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/rosidl_typesupport_cpp/service_type_support.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/rosidl_typesupport_interface/macros.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/sensor_msgs/msg/joint_state.hpp
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/sensor_msgs/msg/joint_state__struct.hpp
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/sensor_msgs/msg/joint_state__traits.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/std_msgs/msg/color_rgba__struct.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/std_msgs/msg/header__struct.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/std_msgs/msg/header__traits.hpp
@@ -281,6 +288,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /o
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/visualization_msgs/msg/marker_array.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/visualization_msgs/msg/marker_array__struct.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /opt/ros/eloquent/include/visualization_msgs/msg/marker_array__traits.hpp
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/QSharedMemory
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qalgorithms.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qarraydata.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qatomic.h
@@ -332,6 +340,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /u
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qscopedpointer.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qset.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qshareddata.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedmemory.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedpointer.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedpointer_impl.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qsize.h
@@ -378,7 +387,13 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /u
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qwindowdefs.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qwindowdefs_win.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMainWindow
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMessageBox
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QScrollBar
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qabstractslider.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdialog.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmainwindow.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmessagebox.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qscrollbar.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qsizepolicy.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtabwidget.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtwidgets-config.h
@@ -391,6 +406,8 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../ROSManager/MsgManager.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../ROSManager/NodeManager.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../ServoControl/SCDrive.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../ServoControl/ServoInitiate.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../include/IRSFunction.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../include/ROSParametersData.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/builtin_interfaces/msg/duration.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/builtin_interfaces/msg/duration__struct.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/builtin_interfaces/msg/duration__traits.hpp
@@ -427,6 +444,8 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/kd
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/kdl/tree.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/kdl/utilities/kdl-config.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/kdl/utilities/utility.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/kdl_parser/kdl_parser.hpp
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/kdl_parser/visibility_control.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/rcl/allocator.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/rcl/arguments.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/rcl/client.h
@@ -624,6 +643,9 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/ro
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/rosidl_typesupport_cpp/message_type_support.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/rosidl_typesupport_cpp/service_type_support.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/rosidl_typesupport_interface/macros.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/sensor_msgs/msg/joint_state.hpp
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/sensor_msgs/msg/joint_state__struct.hpp
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/sensor_msgs/msg/joint_state__traits.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/std_msgs/msg/color_rgba__struct.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/std_msgs/msg/header__struct.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/std_msgs/msg/header__traits.hpp
@@ -664,6 +686,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/vi
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/visualization_msgs/msg/marker_array.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/visualization_msgs/msg/marker_array__struct.hpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /opt/ros/eloquent/include/visualization_msgs/msg/marker_array__traits.hpp
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/QSharedMemory
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/QVariant
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qabstractitemmodel.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qalgorithms.h
@@ -721,6 +744,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-g
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qscopedpointer.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qset.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qshareddata.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedmemory.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedpointer.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedpointer_impl.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qsize.h
@@ -739,13 +763,16 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-g
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qvarlengtharray.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qvector.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qversiontagging.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qabstracttextdocumentlayout.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qbrush.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qcolor.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qcursor.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qevent.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qfont.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qfontdatabase.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qfontinfo.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qfontmetrics.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qglyphrun.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qguiapplication.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qicon.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qimage.h
@@ -759,11 +786,14 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-g
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qpixelformat.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qpixmap.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qpolygon.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qrawfont.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qregion.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qrgb.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qrgba64.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextcursor.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextdocument.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextformat.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextlayout.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextoption.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qtgui-config.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtGui/qtguiglobal.h
@@ -781,7 +811,10 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-g
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QLineEdit
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMainWindow
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMenuBar
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMessageBox
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QPlainTextEdit
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QPushButton
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QScrollBar
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QStatusBar
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QToolBar
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QWidget
@@ -796,6 +829,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-g
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qapplication.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qbuttongroup.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdesktopwidget.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdialog.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qframe.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qheaderview.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qlabel.h
@@ -803,8 +837,11 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-g
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmainwindow.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmenu.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmenubar.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmessagebox.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qplaintextedit.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qpushbutton.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qrubberband.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qscrollbar.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qsizepolicy.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qslider.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qstatusbar.h
@@ -812,6 +849,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-g
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qstyleoption.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtabbar.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtabwidget.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtextedit.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtoolbar.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtwidgets-config.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtwidgetsglobal.h

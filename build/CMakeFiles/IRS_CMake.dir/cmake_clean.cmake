@@ -1,4 +1,5 @@
 file(REMOVE_RECURSE
+  "CMakeFiles/IRS_CMake.dir/ParametersManager.cpp.o"
   "CMakeFiles/IRS_CMake.dir/main.cpp.o"
   "IRS_CMake.pdb"
   "IRS_CMake"

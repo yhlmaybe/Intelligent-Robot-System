@@ -9,6 +9,8 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ROSManager/NodeM
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ROSManager/NodeManager.h
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ServoControl/SCDrive.h
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ServoControl/ServoInitiate.h
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../include/IRSFunction.h
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../include/ROSParametersData.h
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/builtin_interfaces/msg/duration.hpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/builtin_interfaces/msg/duration__struct.hpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/builtin_interfaces/msg/duration__traits.hpp
@@ -45,6 +47,8 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/i
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/kdl/tree.hpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/kdl/utilities/kdl-config.h
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/kdl/utilities/utility.h
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/kdl_parser/kdl_parser.hpp
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/kdl_parser/visibility_control.hpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/rcl/allocator.h
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/rcl/arguments.h
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/rcl/client.h
@@ -242,6 +246,9 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/i
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/rosidl_typesupport_cpp/message_type_support.hpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/rosidl_typesupport_cpp/service_type_support.hpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/rosidl_typesupport_interface/macros.h
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/sensor_msgs/msg/joint_state.hpp
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/sensor_msgs/msg/joint_state__struct.hpp
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/sensor_msgs/msg/joint_state__traits.hpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/std_msgs/msg/color_rgba__struct.hpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/std_msgs/msg/header__struct.hpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: /opt/ros/eloquent/include/std_msgs/msg/header__traits.hpp

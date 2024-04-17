@@ -13,8 +13,8 @@ set(CMAKE_CXX_COMPILER_ID "GNU")
 set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "ServoControl"
   "../ServoControl"
+  "../include"
   "../IRSGUI"
-  "../ROSMANAGER_LIST"
   "/usr/include/python3.6m"
   )
 

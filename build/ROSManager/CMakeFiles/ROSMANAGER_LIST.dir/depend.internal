@@ -10,6 +10,8 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/NodeManager.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
+ /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h
+ /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/ROSParametersData.h
  /opt/ros/eloquent/include/builtin_interfaces/msg/duration.hpp
  /opt/ros/eloquent/include/builtin_interfaces/msg/duration__struct.hpp
  /opt/ros/eloquent/include/builtin_interfaces/msg/duration__traits.hpp
@@ -46,6 +48,8 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o
  /opt/ros/eloquent/include/kdl/tree.hpp
  /opt/ros/eloquent/include/kdl/utilities/kdl-config.h
  /opt/ros/eloquent/include/kdl/utilities/utility.h
+ /opt/ros/eloquent/include/kdl_parser/kdl_parser.hpp
+ /opt/ros/eloquent/include/kdl_parser/visibility_control.hpp
  /opt/ros/eloquent/include/rcl/allocator.h
  /opt/ros/eloquent/include/rcl/arguments.h
  /opt/ros/eloquent/include/rcl/client.h
@@ -243,6 +247,9 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o
  /opt/ros/eloquent/include/rosidl_typesupport_cpp/message_type_support.hpp
  /opt/ros/eloquent/include/rosidl_typesupport_cpp/service_type_support.hpp
  /opt/ros/eloquent/include/rosidl_typesupport_interface/macros.h
+ /opt/ros/eloquent/include/sensor_msgs/msg/joint_state.hpp
+ /opt/ros/eloquent/include/sensor_msgs/msg/joint_state__struct.hpp
+ /opt/ros/eloquent/include/sensor_msgs/msg/joint_state__traits.hpp
  /opt/ros/eloquent/include/std_msgs/msg/color_rgba__struct.hpp
  /opt/ros/eloquent/include/std_msgs/msg/header__struct.hpp
  /opt/ros/eloquent/include/std_msgs/msg/header__traits.hpp

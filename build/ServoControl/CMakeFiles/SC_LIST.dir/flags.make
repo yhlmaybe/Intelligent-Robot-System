@@ -6,5 +6,5 @@ CXX_FLAGS = -g   -Wall -Wextra -Wpedantic -std=gnu++14
 
 CXX_DEFINES = 
 
-CXX_INCLUDES = -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSMANAGER_LIST -I/usr/include/python3.6m 
+CXX_INCLUDES = -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include -I/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSGUI -I/usr/include/python3.6m 
 

@@ -96,3 +96,18 @@ if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_
   file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/intelligent_robot_system" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/package.xml")
 endif()
 
+if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
+  list(APPEND CMAKE_ABSOLUTE_DESTINATION_FILES
+   "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/install/rviz;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/install/urdf")
+  if(CMAKE_WARN_ON_ABSOLUTE_INSTALL_DESTINATION)
+    message(WARNING "ABSOLUTE path INSTALL DESTINATION : ${CMAKE_ABSOLUTE_DESTINATION_FILES}")
+  endif()
+  if(CMAKE_ERROR_ON_ABSOLUTE_INSTALL_DESTINATION)
+    message(FATAL_ERROR "ABSOLUTE path INSTALL DESTINATION forbidden (by caller): ${CMAKE_ABSOLUTE_DESTINATION_FILES}")
+  endif()
+file(INSTALL DESTINATION "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/install" TYPE DIRECTORY FILES
+    "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/rviz"
+    "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/urdf"
+    )
+endif()
+

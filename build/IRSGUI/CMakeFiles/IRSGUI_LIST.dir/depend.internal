@@ -9,6 +9,8 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/moc_mainwindow.cpp
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/mocs_compilation.cpp
+ /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h
+ /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/ROSParametersData.h
  /opt/ros/eloquent/include/builtin_interfaces/msg/duration.hpp
  /opt/ros/eloquent/include/builtin_interfaces/msg/duration__struct.hpp
  /opt/ros/eloquent/include/builtin_interfaces/msg/duration__traits.hpp
@@ -45,6 +47,8 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o
  /opt/ros/eloquent/include/kdl/tree.hpp
  /opt/ros/eloquent/include/kdl/utilities/kdl-config.h
  /opt/ros/eloquent/include/kdl/utilities/utility.h
+ /opt/ros/eloquent/include/kdl_parser/kdl_parser.hpp
+ /opt/ros/eloquent/include/kdl_parser/visibility_control.hpp
  /opt/ros/eloquent/include/rcl/allocator.h
  /opt/ros/eloquent/include/rcl/arguments.h
  /opt/ros/eloquent/include/rcl/client.h
@@ -242,6 +246,9 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o
  /opt/ros/eloquent/include/rosidl_typesupport_cpp/message_type_support.hpp
  /opt/ros/eloquent/include/rosidl_typesupport_cpp/service_type_support.hpp
  /opt/ros/eloquent/include/rosidl_typesupport_interface/macros.h
+ /opt/ros/eloquent/include/sensor_msgs/msg/joint_state.hpp
+ /opt/ros/eloquent/include/sensor_msgs/msg/joint_state__struct.hpp
+ /opt/ros/eloquent/include/sensor_msgs/msg/joint_state__traits.hpp
  /opt/ros/eloquent/include/std_msgs/msg/color_rgba__struct.hpp
  /opt/ros/eloquent/include/std_msgs/msg/header__struct.hpp
  /opt/ros/eloquent/include/std_msgs/msg/header__traits.hpp
@@ -282,6 +289,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o
  /opt/ros/eloquent/include/visualization_msgs/msg/marker_array.hpp
  /opt/ros/eloquent/include/visualization_msgs/msg/marker_array__struct.hpp
  /opt/ros/eloquent/include/visualization_msgs/msg/marker_array__traits.hpp
+ /usr/include/aarch64-linux-gnu/qt5/QtCore/QSharedMemory
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qalgorithms.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qarraydata.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qatomic.h
@@ -333,6 +341,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qscopedpointer.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qset.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qshareddata.h
+ /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedmemory.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedpointer.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedpointer_impl.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qsize.h
@@ -379,7 +388,13 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qwindowdefs.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qwindowdefs_win.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMainWindow
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMessageBox
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QScrollBar
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qabstractslider.h
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdialog.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmainwindow.h
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmessagebox.h
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qscrollbar.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qsizepolicy.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtabwidget.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtwidgets-config.h
@@ -392,6 +407,8 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/NodeManager.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
+ /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h
+ /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/ROSParametersData.h
  /opt/ros/eloquent/include/builtin_interfaces/msg/duration.hpp
  /opt/ros/eloquent/include/builtin_interfaces/msg/duration__struct.hpp
  /opt/ros/eloquent/include/builtin_interfaces/msg/duration__traits.hpp
@@ -428,6 +445,8 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /opt/ros/eloquent/include/kdl/tree.hpp
  /opt/ros/eloquent/include/kdl/utilities/kdl-config.h
  /opt/ros/eloquent/include/kdl/utilities/utility.h
+ /opt/ros/eloquent/include/kdl_parser/kdl_parser.hpp
+ /opt/ros/eloquent/include/kdl_parser/visibility_control.hpp
  /opt/ros/eloquent/include/rcl/allocator.h
  /opt/ros/eloquent/include/rcl/arguments.h
  /opt/ros/eloquent/include/rcl/client.h
@@ -625,6 +644,9 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /opt/ros/eloquent/include/rosidl_typesupport_cpp/message_type_support.hpp
  /opt/ros/eloquent/include/rosidl_typesupport_cpp/service_type_support.hpp
  /opt/ros/eloquent/include/rosidl_typesupport_interface/macros.h
+ /opt/ros/eloquent/include/sensor_msgs/msg/joint_state.hpp
+ /opt/ros/eloquent/include/sensor_msgs/msg/joint_state__struct.hpp
+ /opt/ros/eloquent/include/sensor_msgs/msg/joint_state__traits.hpp
  /opt/ros/eloquent/include/std_msgs/msg/color_rgba__struct.hpp
  /opt/ros/eloquent/include/std_msgs/msg/header__struct.hpp
  /opt/ros/eloquent/include/std_msgs/msg/header__traits.hpp
@@ -665,6 +687,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /opt/ros/eloquent/include/visualization_msgs/msg/marker_array.hpp
  /opt/ros/eloquent/include/visualization_msgs/msg/marker_array__struct.hpp
  /opt/ros/eloquent/include/visualization_msgs/msg/marker_array__traits.hpp
+ /usr/include/aarch64-linux-gnu/qt5/QtCore/QSharedMemory
  /usr/include/aarch64-linux-gnu/qt5/QtCore/QVariant
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qabstractitemmodel.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qalgorithms.h
@@ -722,6 +745,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qscopedpointer.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qset.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qshareddata.h
+ /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedmemory.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedpointer.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedpointer_impl.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qsize.h
@@ -740,13 +764,16 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qvarlengtharray.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qvector.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qversiontagging.h
+ /usr/include/aarch64-linux-gnu/qt5/QtGui/qabstracttextdocumentlayout.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qbrush.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qcolor.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qcursor.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qevent.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qfont.h
+ /usr/include/aarch64-linux-gnu/qt5/QtGui/qfontdatabase.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qfontinfo.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qfontmetrics.h
+ /usr/include/aarch64-linux-gnu/qt5/QtGui/qglyphrun.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qguiapplication.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qicon.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qimage.h
@@ -760,11 +787,14 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qpixelformat.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qpixmap.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qpolygon.h
+ /usr/include/aarch64-linux-gnu/qt5/QtGui/qrawfont.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qregion.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qrgb.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qrgba64.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextcursor.h
+ /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextdocument.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextformat.h
+ /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextlayout.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextoption.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qtgui-config.h
  /usr/include/aarch64-linux-gnu/qt5/QtGui/qtguiglobal.h
@@ -782,7 +812,10 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QLineEdit
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMainWindow
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMenuBar
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMessageBox
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QPlainTextEdit
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QPushButton
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QScrollBar
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QStatusBar
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QToolBar
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QWidget
@@ -797,6 +830,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qapplication.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qbuttongroup.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdesktopwidget.h
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdialog.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qframe.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qheaderview.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qlabel.h
@@ -804,8 +838,11 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmainwindow.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmenu.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmenubar.h
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmessagebox.h
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qplaintextedit.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qpushbutton.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qrubberband.h
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qscrollbar.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qsizepolicy.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qslider.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qstatusbar.h
@@ -813,6 +850,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qstyleoption.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtabbar.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtabwidget.h
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtextedit.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtoolbar.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtwidgets-config.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtwidgetsglobal.h

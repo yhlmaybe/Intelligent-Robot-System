@@ -1,9 +1,3 @@
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/ROSManager/MsgManager.h
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/ROSManager/MsgManager.cpp
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/ROSManager/urdf/text.urdf
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/ROSManager/NodeManager.cpp
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/ROSManager/NodeManager.h
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/ROSManager/CMakeLists.txt
 /usr/local/share/ament_index/resource_index/package_run_dependencies/intelligent_robot_system
 /usr/local/share/ament_index/resource_index/parent_prefix_path/intelligent_robot_system
 /usr/local/share/intelligent_robot_system/environment/ament_prefix_path.sh
@@ -19,3 +13,4 @@
 /usr/local/share/intelligent_robot_system/cmake/intelligent_robot_systemConfig.cmake
 /usr/local/share/intelligent_robot_system/cmake/intelligent_robot_systemConfig-version.cmake
 /usr/local/share/intelligent_robot_system/package.xml
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/install/urdf/text.urdf

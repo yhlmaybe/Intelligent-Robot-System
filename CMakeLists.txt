@@ -29,9 +29,8 @@ enable_testing()
 aux_source_directory(. IRS_LIST)
 
 include_directories(
-    ${CMAKE_SOURCE_DIR}/ServoControl
+    ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/IRSGUI
-    ${CMAKE_SOURCE_DIR}/ROSMANAGER_LIST
 )
 
 add_executable(IRS_CMake ${IRS_LIST})
@@ -50,8 +49,3 @@ set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})
 
 include(CPack)
 
-#install dir, use cmake.. and make install
-install(DIRECTORY ROSManager
-    DESTINATION ${INSTALL_DIR}
-    FILES_MATCHING PATTERN "*"
-    PATTERN "package.xml" EXCLUDE)   

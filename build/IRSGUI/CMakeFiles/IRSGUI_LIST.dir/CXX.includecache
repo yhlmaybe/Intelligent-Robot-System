@@ -19,8 +19,16 @@ QMainWindow
 -
 rclcpp/rclcpp.hpp
 -
+QScrollBar
+-
+QSharedMemory
+-
+QMessageBox
+-
 ../ROSManager/NodeManager.h
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/NodeManager.h
+../include/IRSFunction.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h
 
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/MsgManager.h
 string
@@ -45,10 +53,18 @@ thread
 -
 list
 -
+map
+-
+memory
+-
 MsgManager.h
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/MsgManager.h
 ../ServoControl/ServoInitiate.h
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
+../include/ROSParametersData.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/ROSParametersData.h
+../include/IRSFunction.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h
 rclcpp_components/register_node_macro.hpp
 -
 robot_state_publisher/robot_state_publisher.h
@@ -62,6 +78,16 @@ tf2_ros/static_transform_broadcaster.h
 tf2_ros/transform_broadcaster.h
 -
 visualization_msgs/msg/marker_array.hpp
+-
+kdl/tree.hpp
+-
+kdl_parser/kdl_parser.hpp
+-
+sensor_msgs/msg/joint_state.hpp
+-
+tf2_ros/static_transform_broadcaster.h
+-
+tf2_ros/transform_broadcaster.h
 -
 
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
@@ -93,6 +119,14 @@ QtCore/qmetatype.h
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/mocs_compilation.cpp
 EWIEGA46WW/moc_mainwindow.cpp
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/moc_mainwindow.cpp
+
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h
+string
+-
+
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/ROSParametersData.h
+string
+-
 
 /opt/ros/eloquent/include/builtin_interfaces/msg/duration.hpp
 builtin_interfaces/msg/duration__struct.hpp
@@ -479,6 +513,20 @@ cassert
 -
 cmath
 -
+
+/opt/ros/eloquent/include/kdl_parser/kdl_parser.hpp
+string
+-
+tinyxml.h
+-
+kdl/tree.hpp
+/opt/ros/eloquent/include/kdl_parser/kdl/tree.hpp
+urdf_model/model.h
+/opt/ros/eloquent/include/kdl_parser/urdf_model/model.h
+kdl_parser/visibility_control.hpp
+/opt/ros/eloquent/include/kdl_parser/kdl_parser/visibility_control.hpp
+
+/opt/ros/eloquent/include/kdl_parser/visibility_control.hpp
 
 /opt/ros/eloquent/include/rcl/allocator.h
 rcutils/allocator.h
@@ -3258,6 +3306,42 @@ rosidl_generator_c/visibility_control.h
 
 /opt/ros/eloquent/include/rosidl_typesupport_interface/macros.h
 
+/opt/ros/eloquent/include/sensor_msgs/msg/joint_state.hpp
+sensor_msgs/msg/joint_state__struct.hpp
+/opt/ros/eloquent/include/sensor_msgs/msg/sensor_msgs/msg/joint_state__struct.hpp
+sensor_msgs/msg/joint_state__traits.hpp
+/opt/ros/eloquent/include/sensor_msgs/msg/sensor_msgs/msg/joint_state__traits.hpp
+
+/opt/ros/eloquent/include/sensor_msgs/msg/joint_state__struct.hpp
+rosidl_generator_cpp/bounded_vector.hpp
+-
+rosidl_generator_cpp/message_initialization.hpp
+-
+algorithm
+-
+array
+-
+memory
+-
+string
+-
+vector
+-
+std_msgs/msg/header__struct.hpp
+/opt/ros/eloquent/include/sensor_msgs/msg/std_msgs/msg/header__struct.hpp
+
+/opt/ros/eloquent/include/sensor_msgs/msg/joint_state__traits.hpp
+sensor_msgs/msg/joint_state__struct.hpp
+/opt/ros/eloquent/include/sensor_msgs/msg/sensor_msgs/msg/joint_state__struct.hpp
+rosidl_generator_cpp/traits.hpp
+-
+stdint.h
+-
+type_traits
+-
+std_msgs/msg/header__traits.hpp
+/opt/ros/eloquent/include/sensor_msgs/msg/std_msgs/msg/header__traits.hpp
+
 /opt/ros/eloquent/include/std_msgs/msg/color_rgba__struct.hpp
 rosidl_generator_cpp/bounded_vector.hpp
 -
@@ -3679,6 +3763,10 @@ stdint.h
 -
 type_traits
 -
+
+/usr/include/aarch64-linux-gnu/qt5/QtCore/QSharedMemory
+qsharedmemory.h
+/usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedmemory.h
 
 /usr/include/aarch64-linux-gnu/qt5/QtCore/QVariant
 qvariant.h
@@ -4192,6 +4280,10 @@ QtCore/qhash.h
 QtCore/qhashfunctions.h
 -
 
+/usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedmemory.h
+QtCore/qobject.h
+-
+
 /usr/include/aarch64-linux-gnu/qt5/QtCore/qsharedpointer.h
 QtCore/qglobal.h
 -
@@ -4394,6 +4486,20 @@ QtCore/qpoint.h
 QtCore/qglobal.h
 -
 
+/usr/include/aarch64-linux-gnu/qt5/QtGui/qabstracttextdocumentlayout.h
+QtGui/qtguiglobal.h
+-
+QtCore/qobject.h
+-
+QtGui/qtextlayout.h
+-
+QtGui/qtextdocument.h
+-
+QtGui/qtextcursor.h
+-
+QtGui/qpalette.h
+-
+
 /usr/include/aarch64-linux-gnu/qt5/QtGui/qbrush.h
 QtGui/qtguiglobal.h
 -
@@ -4478,6 +4584,16 @@ QtCore/qstring.h
 QtCore/qsharedpointer.h
 -
 
+/usr/include/aarch64-linux-gnu/qt5/QtGui/qfontdatabase.h
+QtGui/qtguiglobal.h
+-
+QtGui/qwindowdefs.h
+-
+QtCore/qstring.h
+-
+QtGui/qfont.h
+-
+
 /usr/include/aarch64-linux-gnu/qt5/QtGui/qfontinfo.h
 QtGui/qtguiglobal.h
 -
@@ -4494,6 +4610,18 @@ QtGui/qfont.h
 QtCore/qsharedpointer.h
 -
 QtCore/qrect.h
+-
+
+/usr/include/aarch64-linux-gnu/qt5/QtGui/qglyphrun.h
+QtGui/qtguiglobal.h
+-
+QtCore/qsharedpointer.h
+-
+QtCore/qvector.h
+-
+QtCore/qpoint.h
+-
+QtGui/qrawfont.h
 -
 
 /usr/include/aarch64-linux-gnu/qt5/QtGui/qguiapplication.h
@@ -4648,6 +4776,26 @@ QtCore/qpoint.h
 QtCore/qrect.h
 -
 
+/usr/include/aarch64-linux-gnu/qt5/QtGui/qrawfont.h
+QtGui/qtguiglobal.h
+-
+QtCore/qstring.h
+-
+QtCore/qiodevice.h
+-
+QtCore/qglobal.h
+-
+QtCore/qobject.h
+-
+QtCore/qpoint.h
+-
+QtGui/qfont.h
+-
+QtGui/qtransform.h
+-
+QtGui/qfontdatabase.h
+-
+
 /usr/include/aarch64-linux-gnu/qt5/QtGui/qregion.h
 QtGui/qtguiglobal.h
 -
@@ -4682,6 +4830,22 @@ QtCore/qshareddata.h
 QtGui/qtextformat.h
 -
 
+/usr/include/aarch64-linux-gnu/qt5/QtGui/qtextdocument.h
+QtGui/qtguiglobal.h
+-
+QtCore/qobject.h
+-
+QtCore/qsize.h
+-
+QtCore/qrect.h
+-
+QtCore/qvariant.h
+-
+QtGui/qfont.h
+-
+QtCore/qurl.h
+-
+
 /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextformat.h
 QtGui/qtguiglobal.h
 -
@@ -4700,6 +4864,30 @@ QtGui/qpen.h
 QtGui/qbrush.h
 -
 QtGui/qtextoption.h
+-
+
+/usr/include/aarch64-linux-gnu/qt5/QtGui/qtextlayout.h
+QtGui/qtguiglobal.h
+-
+QtCore/qstring.h
+-
+QtCore/qnamespace.h
+-
+QtCore/qrect.h
+-
+QtCore/qvector.h
+-
+QtGui/qcolor.h
+-
+QtCore/qobject.h
+-
+QtGui/qevent.h
+-
+QtGui/qtextformat.h
+-
+QtGui/qglyphrun.h
+-
+QtGui/qtextcursor.h
 -
 
 /usr/include/aarch64-linux-gnu/qt5/QtGui/qtextoption.h
@@ -4814,9 +5002,21 @@ qmainwindow.h
 qmenubar.h
 /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmenubar.h
 
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMessageBox
+qmessagebox.h
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmessagebox.h
+
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/QPlainTextEdit
+qplaintextedit.h
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qplaintextedit.h
+
 /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QPushButton
 qpushbutton.h
 /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qpushbutton.h
+
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/QScrollBar
+qscrollbar.h
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qscrollbar.h
 
 /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QStatusBar
 qstatusbar.h
@@ -4932,6 +5132,12 @@ QtWidgets/qtwidgetsglobal.h
 QtWidgets/qwidget.h
 -
 
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdialog.h
+QtWidgets/qtwidgetsglobal.h
+-
+QtWidgets/qwidget.h
+-
+
 /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qframe.h
 QtWidgets/qtwidgetsglobal.h
 -
@@ -4988,6 +5194,30 @@ QtWidgets/qtwidgetsglobal.h
 QtWidgets/qmenu.h
 -
 
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qmessagebox.h
+QtWidgets/qtwidgetsglobal.h
+-
+QtWidgets/qdialog.h
+-
+
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qplaintextedit.h
+QtWidgets/qtwidgetsglobal.h
+-
+QtWidgets/qtextedit.h
+-
+QtWidgets/qabstractscrollarea.h
+-
+QtGui/qtextdocument.h
+-
+QtGui/qtextoption.h
+-
+QtGui/qtextcursor.h
+-
+QtGui/qtextformat.h
+-
+QtGui/qabstracttextdocumentlayout.h
+-
+
 /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qpushbutton.h
 QtWidgets/qtwidgetsglobal.h
 -
@@ -4998,6 +5228,14 @@ QtWidgets/qabstractbutton.h
 QtWidgets/qtwidgetsglobal.h
 -
 QtWidgets/qwidget.h
+-
+
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qscrollbar.h
+QtWidgets/qtwidgetsglobal.h
+-
+QtWidgets/qwidget.h
+-
+QtWidgets/qabstractslider.h
 -
 
 /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qsizepolicy.h
@@ -5080,6 +5318,20 @@ QtWidgets/qwidget.h
 QtGui/qicon.h
 -
 
+/usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtextedit.h
+QtWidgets/qtwidgetsglobal.h
+-
+QtWidgets/qabstractscrollarea.h
+-
+QtGui/qtextdocument.h
+-
+QtGui/qtextoption.h
+-
+QtGui/qtextcursor.h
+-
+QtGui/qtextformat.h
+-
+
 /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qtoolbar.h
 QtWidgets/qtwidgetsglobal.h
 -
@@ -5146,6 +5398,8 @@ QtWidgets/QLineEdit
 QtWidgets/QMainWindow
 -
 QtWidgets/QMenuBar
+-
+QtWidgets/QPlainTextEdit
 -
 QtWidgets/QPushButton
 -

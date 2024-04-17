@@ -22,9 +22,8 @@ set(CMAKE_TARGET_DEFINITIONS_CXX
 set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "ROSManager"
   "../ROSManager"
-  "../ServoControl"
+  "../include"
   "../IRSGUI"
-  "../ROSMANAGER_LIST"
   "/usr/lib/aarch64-linux-gnu"
   "/opt/ros/eloquent/include"
   "/opt/ros/eloquent/opt/yaml_cpp_vendor/lib/cmake/yaml-cpp/../../../include"

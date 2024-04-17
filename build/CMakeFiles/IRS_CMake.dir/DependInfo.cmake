@@ -4,6 +4,7 @@ set(CMAKE_DEPENDS_LANGUAGES
   )
 # The set of files for implicit dependencies of each language:
 set(CMAKE_DEPENDS_CHECK_CXX
+  "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ParametersManager.cpp" "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles/IRS_CMake.dir/ParametersManager.cpp.o"
   "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/main.cpp" "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles/IRS_CMake.dir/main.cpp.o"
   )
 set(CMAKE_CXX_COMPILER_ID "GNU")
@@ -21,9 +22,8 @@ set(CMAKE_TARGET_DEFINITIONS_CXX
 set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "."
   "../"
-  "../ServoControl"
+  "../include"
   "../IRSGUI"
-  "../ROSMANAGER_LIST"
   "/usr/include/aarch64-linux-gnu/qt5"
   "/usr/include/aarch64-linux-gnu/qt5/QtCore"
   "/usr/lib/aarch64-linux-gnu/qt5/mkspecs/linux-g++"

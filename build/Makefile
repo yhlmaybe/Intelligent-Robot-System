@@ -644,6 +644,33 @@ intelligent_robot_system_uninstall/fast:
 	$(MAKE) -f ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build.make ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build
 .PHONY : intelligent_robot_system_uninstall/fast
 
+ParametersManager.o: ParametersManager.cpp.o
+
+.PHONY : ParametersManager.o
+
+# target to build an object file
+ParametersManager.cpp.o:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/ParametersManager.cpp.o
+.PHONY : ParametersManager.cpp.o
+
+ParametersManager.i: ParametersManager.cpp.i
+
+.PHONY : ParametersManager.i
+
+# target to preprocess a source file
+ParametersManager.cpp.i:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/ParametersManager.cpp.i
+.PHONY : ParametersManager.cpp.i
+
+ParametersManager.s: ParametersManager.cpp.s
+
+.PHONY : ParametersManager.s
+
+# target to generate assembly for a file
+ParametersManager.cpp.s:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/ParametersManager.cpp.s
+.PHONY : ParametersManager.cpp.s
+
 main.o: main.cpp.o
 
 .PHONY : main.o
@@ -721,6 +748,9 @@ help:
 	@echo "... uninstall"
 	@echo "... ROSMANAGER_LIST"
 	@echo "... intelligent_robot_system_uninstall"
+	@echo "... ParametersManager.o"
+	@echo "... ParametersManager.i"
+	@echo "... ParametersManager.s"
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"

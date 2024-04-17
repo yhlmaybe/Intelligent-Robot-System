@@ -7,6 +7,8 @@ find_package(std_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(rviz_common REQUIRED)
 find_package(urdf REQUIRED)
+find_package(orocos_kdl REQUIRED)
+find_package(kdl_parser REQUIRED)
 
 
 message("CMAKElujing: ${CMAKE_MODULE_PATH}")
@@ -29,3 +31,11 @@ target_link_libraries(ROSMANAGER_LIST SC_LIST)
 target_link_libraries(ROSMANAGER_LIST pugixml)
 
 target_link_libraries(ROSMANAGER_LIST rviz_common::rviz_common)
+
+target_link_libraries(ROSMANAGER_LIST ${orocos_kdl_LIBRARIES} ${kdl_parser_LIBRARIES})
+
+
+#install dir, use cmake.. and make install
+install(DIRECTORY rviz urdf
+    DESTINATION ${INSTALL_DIR}/install
+    )   
