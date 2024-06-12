@@ -98,9 +98,13 @@ future
 map
 -
 
+../ServoControl/ServoID.h
+
 ../ServoControl/ServoInitiate.h
 SCDrive.h
 ../ServoControl/SCDrive.h
+ServoID.h
+../ServoControl/ServoID.h
 
 ../include/IRSFunction.h
 string
@@ -110,7 +114,17 @@ string
 string
 -
 
-/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ParametersManager.cpp
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/IRSFunction.cpp
+include/IRSFunction.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h
+
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSParametersData.cpp
+string
+-
+include/ROSParametersData.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/ROSParametersData.h
+
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h
 string
 -
 

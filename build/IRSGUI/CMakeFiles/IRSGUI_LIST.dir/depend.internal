@@ -6,6 +6,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/MsgManager.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/NodeManager.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
+ /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/moc_mainwindow.cpp
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/mocs_compilation.cpp
@@ -406,6 +407,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/MsgManager.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/NodeManager.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
+ /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/ROSParametersData.h

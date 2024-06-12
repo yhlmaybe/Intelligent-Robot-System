@@ -37,11 +37,15 @@ private:
 
     void Initiate();
 
-    void IRS_MESSAGE(std::string message);
+    void Message(std::string message);
 
 
 private slots:
     void StartROSServoDriveNode();
+
+    void SetServoNo();
+
+    void GetServoNo();
 
 };
 

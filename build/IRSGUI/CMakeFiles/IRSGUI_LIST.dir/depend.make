@@ -5,6 +5,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: ..
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: ../ROSManager/MsgManager.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: ../ROSManager/NodeManager.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: ../ServoControl/SCDrive.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: ../ServoControl/ServoID.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: ../ServoControl/ServoInitiate.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/moc_mainwindow.cpp
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: IRSGUI/IRSGUI_LIST_autogen/mocs_compilation.cpp
@@ -405,6 +406,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../IRSGUI/mainwindow.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../ROSManager/MsgManager.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../ROSManager/NodeManager.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../ServoControl/SCDrive.h
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../ServoControl/ServoID.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../ServoControl/ServoInitiate.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../include/IRSFunction.h
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../include/ROSParametersData.h

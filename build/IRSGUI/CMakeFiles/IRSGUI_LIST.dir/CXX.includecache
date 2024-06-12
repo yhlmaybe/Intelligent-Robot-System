@@ -104,9 +104,13 @@ future
 map
 -
 
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.h
+
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
 SCDrive.h
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
+ServoID.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.h
 
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/moc_mainwindow.cpp
 ../../../../IRSGUI/mainwindow.h

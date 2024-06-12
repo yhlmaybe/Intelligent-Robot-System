@@ -231,6 +231,33 @@ SCDrive.cpp.s:
 	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.s
 .PHONY : SCDrive.cpp.s
 
+ServoID.o: ServoID.cpp.o
+
+.PHONY : ServoID.o
+
+# target to build an object file
+ServoID.cpp.o:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o
+.PHONY : ServoID.cpp.o
+
+ServoID.i: ServoID.cpp.i
+
+.PHONY : ServoID.i
+
+# target to preprocess a source file
+ServoID.cpp.i:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.i
+.PHONY : ServoID.cpp.i
+
+ServoID.s: ServoID.cpp.s
+
+.PHONY : ServoID.s
+
+# target to generate assembly for a file
+ServoID.cpp.s:
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build && $(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.s
+.PHONY : ServoID.cpp.s
+
 ServoInitiate.o: ServoInitiate.cpp.o
 
 .PHONY : ServoInitiate.o
@@ -277,6 +304,9 @@ help:
 	@echo "... SCDrive.o"
 	@echo "... SCDrive.i"
 	@echo "... SCDrive.s"
+	@echo "... ServoID.o"
+	@echo "... ServoID.i"
+	@echo "... ServoID.s"
 	@echo "... ServoInitiate.o"
 	@echo "... ServoInitiate.i"
 	@echo "... ServoInitiate.s"

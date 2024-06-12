@@ -644,32 +644,59 @@ intelligent_robot_system_uninstall/fast:
 	$(MAKE) -f ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build.make ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build
 .PHONY : intelligent_robot_system_uninstall/fast
 
-ParametersManager.o: ParametersManager.cpp.o
+IRSFunction.o: IRSFunction.cpp.o
 
-.PHONY : ParametersManager.o
+.PHONY : IRSFunction.o
 
 # target to build an object file
-ParametersManager.cpp.o:
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/ParametersManager.cpp.o
-.PHONY : ParametersManager.cpp.o
+IRSFunction.cpp.o:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o
+.PHONY : IRSFunction.cpp.o
 
-ParametersManager.i: ParametersManager.cpp.i
+IRSFunction.i: IRSFunction.cpp.i
 
-.PHONY : ParametersManager.i
+.PHONY : IRSFunction.i
 
 # target to preprocess a source file
-ParametersManager.cpp.i:
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/ParametersManager.cpp.i
-.PHONY : ParametersManager.cpp.i
+IRSFunction.cpp.i:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.i
+.PHONY : IRSFunction.cpp.i
 
-ParametersManager.s: ParametersManager.cpp.s
+IRSFunction.s: IRSFunction.cpp.s
 
-.PHONY : ParametersManager.s
+.PHONY : IRSFunction.s
 
 # target to generate assembly for a file
-ParametersManager.cpp.s:
-	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/ParametersManager.cpp.s
-.PHONY : ParametersManager.cpp.s
+IRSFunction.cpp.s:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.s
+.PHONY : IRSFunction.cpp.s
+
+ROSParametersData.o: ROSParametersData.cpp.o
+
+.PHONY : ROSParametersData.o
+
+# target to build an object file
+ROSParametersData.cpp.o:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o
+.PHONY : ROSParametersData.cpp.o
+
+ROSParametersData.i: ROSParametersData.cpp.i
+
+.PHONY : ROSParametersData.i
+
+# target to preprocess a source file
+ROSParametersData.cpp.i:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.i
+.PHONY : ROSParametersData.cpp.i
+
+ROSParametersData.s: ROSParametersData.cpp.s
+
+.PHONY : ROSParametersData.s
+
+# target to generate assembly for a file
+ROSParametersData.cpp.s:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.s
+.PHONY : ROSParametersData.cpp.s
 
 main.o: main.cpp.o
 
@@ -748,9 +775,12 @@ help:
 	@echo "... uninstall"
 	@echo "... ROSMANAGER_LIST"
 	@echo "... intelligent_robot_system_uninstall"
-	@echo "... ParametersManager.o"
-	@echo "... ParametersManager.i"
-	@echo "... ParametersManager.s"
+	@echo "... IRSFunction.o"
+	@echo "... IRSFunction.i"
+	@echo "... IRSFunction.s"
+	@echo "... ROSParametersData.o"
+	@echo "... ROSParametersData.i"
+	@echo "... ROSParametersData.s"
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"

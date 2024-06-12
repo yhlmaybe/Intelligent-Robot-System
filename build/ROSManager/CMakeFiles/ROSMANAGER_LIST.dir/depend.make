@@ -8,6 +8,7 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ROSManager/MsgMa
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ROSManager/NodeManager.cpp
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ROSManager/NodeManager.h
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ServoControl/SCDrive.h
+ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ServoControl/ServoID.h
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../ServoControl/ServoInitiate.h
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../include/IRSFunction.h
 ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: ../include/ROSParametersData.h

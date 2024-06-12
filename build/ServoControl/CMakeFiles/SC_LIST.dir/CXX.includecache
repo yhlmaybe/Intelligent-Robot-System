@@ -24,6 +24,12 @@ future
 map
 -
 
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.cpp
+ServoID.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.h
+
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.h
+
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.cpp
 ServoInitiate.h
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
@@ -31,4 +37,6 @@ ServoInitiate.h
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
 SCDrive.h
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
+ServoID.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.h
 

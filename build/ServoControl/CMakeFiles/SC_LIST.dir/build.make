@@ -81,9 +81,33 @@ ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o.provides: ServoControl/CMakeFi
 ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o.provides.build: ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o
 
 
+ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o: ServoControl/CMakeFiles/SC_LIST.dir/flags.make
+ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o: ../ServoControl/ServoID.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o"
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl && /usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/SC_LIST.dir/ServoID.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.cpp
+
+ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/SC_LIST.dir/ServoID.cpp.i"
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.cpp > CMakeFiles/SC_LIST.dir/ServoID.cpp.i
+
+ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/SC_LIST.dir/ServoID.cpp.s"
+	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.cpp -o CMakeFiles/SC_LIST.dir/ServoID.cpp.s
+
+ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o.requires:
+
+.PHONY : ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o.requires
+
+ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o.provides: ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o.requires
+	$(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o.provides.build
+.PHONY : ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o.provides
+
+ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o.provides.build: ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o
+
+
 ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ServoControl/CMakeFiles/SC_LIST.dir/flags.make
 ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../ServoControl/ServoInitiate.cpp
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CXX object ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o"
 	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl && /usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o -c /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.cpp
 
 ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.i: cmake_force
@@ -108,16 +132,18 @@ ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o.provides.build: ServoCon
 # Object files for target SC_LIST
 SC_LIST_OBJECTS = \
 "CMakeFiles/SC_LIST.dir/SCDrive.cpp.o" \
+"CMakeFiles/SC_LIST.dir/ServoID.cpp.o" \
 "CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o"
 
 # External object files for target SC_LIST
 SC_LIST_EXTERNAL_OBJECTS =
 
 ServoControl/libSC_LIST.a: ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o
+ServoControl/libSC_LIST.a: ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o
 ServoControl/libSC_LIST.a: ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o
 ServoControl/libSC_LIST.a: ServoControl/CMakeFiles/SC_LIST.dir/build.make
 ServoControl/libSC_LIST.a: ServoControl/CMakeFiles/SC_LIST.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Linking CXX static library libSC_LIST.a"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Linking CXX static library libSC_LIST.a"
 	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl && $(CMAKE_COMMAND) -P CMakeFiles/SC_LIST.dir/cmake_clean_target.cmake
 	cd /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ServoControl && $(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/SC_LIST.dir/link.txt --verbose=$(VERBOSE)
 
@@ -127,6 +153,7 @@ ServoControl/CMakeFiles/SC_LIST.dir/build: ServoControl/libSC_LIST.a
 .PHONY : ServoControl/CMakeFiles/SC_LIST.dir/build
 
 ServoControl/CMakeFiles/SC_LIST.dir/requires: ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o.requires
+ServoControl/CMakeFiles/SC_LIST.dir/requires: ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o.requires
 ServoControl/CMakeFiles/SC_LIST.dir/requires: ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o.requires
 
 .PHONY : ServoControl/CMakeFiles/SC_LIST.dir/requires

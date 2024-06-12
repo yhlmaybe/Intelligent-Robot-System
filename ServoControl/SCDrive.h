@@ -5,7 +5,6 @@
 #include <future>
 #include <map>
 
-
 class ServoOperate
 {
   

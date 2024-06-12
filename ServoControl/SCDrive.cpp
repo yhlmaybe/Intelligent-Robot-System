@@ -22,9 +22,9 @@ ServoOperate::ServoOperate(std::string name, int id)
 
 ServoOperate::~ServoOperate()
 {
-    Py_DECREF(instance);
-    Py_DECREF(class_obj);
-    Py_DECREF(pModule);
+    //Py_DECREF(instance);
+    //Py_DECREF(class_obj);
+    //Py_DECREF(pModule);
 }
 
 void ServoOperate::SetServoPosition(int position, double time)
