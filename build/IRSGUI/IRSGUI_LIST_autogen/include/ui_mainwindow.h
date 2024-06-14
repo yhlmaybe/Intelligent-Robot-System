@@ -33,9 +33,10 @@ public:
     QPushButton *SetServoNo_Button;
     QLabel *ServoNo_Lable;
     QLineEdit *ServoNo_LineEdit;
-    QPushButton *Initiate_Button;
+    QPushButton *ROSNodeInitiate_Button;
     QPlainTextEdit *MessageText;
     QPushButton *GetServoNo_Button;
+    QPushButton *ServesInitiate_Button;
     QMenuBar *menuBar;
     QToolBar *mainToolBar;
     QStatusBar *statusBar;
@@ -56,9 +57,9 @@ public:
         ServoNo_LineEdit = new QLineEdit(centralWidget);
         ServoNo_LineEdit->setObjectName(QStringLiteral("ServoNo_LineEdit"));
         ServoNo_LineEdit->setGeometry(QRect(110, 30, 71, 25));
-        Initiate_Button = new QPushButton(centralWidget);
-        Initiate_Button->setObjectName(QStringLiteral("Initiate_Button"));
-        Initiate_Button->setGeometry(QRect(290, 30, 89, 25));
+        ROSNodeInitiate_Button = new QPushButton(centralWidget);
+        ROSNodeInitiate_Button->setObjectName(QStringLiteral("ROSNodeInitiate_Button"));
+        ROSNodeInitiate_Button->setGeometry(QRect(260, 70, 121, 25));
         MessageText = new QPlainTextEdit(centralWidget);
         MessageText->setObjectName(QStringLiteral("MessageText"));
         MessageText->setGeometry(QRect(10, 120, 381, 111));
@@ -66,6 +67,9 @@ public:
         GetServoNo_Button = new QPushButton(centralWidget);
         GetServoNo_Button->setObjectName(QStringLiteral("GetServoNo_Button"));
         GetServoNo_Button->setGeometry(QRect(10, 80, 89, 25));
+        ServesInitiate_Button = new QPushButton(centralWidget);
+        ServesInitiate_Button->setObjectName(QStringLiteral("ServesInitiate_Button"));
+        ServesInitiate_Button->setGeometry(QRect(260, 30, 121, 25));
         MainWindow->setCentralWidget(centralWidget);
         menuBar = new QMenuBar(MainWindow);
         menuBar->setObjectName(QStringLiteral("menuBar"));
@@ -88,8 +92,9 @@ public:
         MainWindow->setWindowTitle(QApplication::translate("MainWindow", "MainWindow", Q_NULLPTR));
         SetServoNo_Button->setText(QApplication::translate("MainWindow", "SetServoNo", Q_NULLPTR));
         ServoNo_Lable->setText(QApplication::translate("MainWindow", "null", Q_NULLPTR));
-        Initiate_Button->setText(QApplication::translate("MainWindow", "Initiate", Q_NULLPTR));
+        ROSNodeInitiate_Button->setText(QApplication::translate("MainWindow", "ROSNodeInitiate", Q_NULLPTR));
         GetServoNo_Button->setText(QApplication::translate("MainWindow", "GetServoNo", Q_NULLPTR));
+        ServesInitiate_Button->setText(QApplication::translate("MainWindow", "ServesInitiate", Q_NULLPTR));
     } // retranslateUi
 
 };

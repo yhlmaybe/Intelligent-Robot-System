@@ -5,6 +5,8 @@
 #include <future>
 #include <map>
 
+#include "../include/IRSFunction.h"
+
 class ServoOperate
 {
   

@@ -23,6 +23,8 @@ future
 -
 map
 -
+../include/IRSFunction.h
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h
 
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.cpp
 ServoID.h
@@ -39,4 +41,8 @@ SCDrive.h
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
 ServoID.h
 /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.h
+
+/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h
+string
+-
 

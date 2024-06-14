@@ -50,17 +50,17 @@
      </rect>
     </property>
    </widget>
-   <widget class="QPushButton" name="Initiate_Button">
+   <widget class="QPushButton" name="ROSNodeInitiate_Button">
     <property name="geometry">
      <rect>
-      <x>290</x>
-      <y>30</y>
-      <width>89</width>
+      <x>260</x>
+      <y>70</y>
+      <width>121</width>
       <height>25</height>
      </rect>
     </property>
     <property name="text">
-     <string>Initiate</string>
+     <string>ROSNodeInitiate</string>
     </property>
    </widget>
    <widget class="QPlainTextEdit" name="MessageText">
@@ -87,6 +87,19 @@
     </property>
     <property name="text">
      <string>GetServoNo</string>
+    </property>
+   </widget>
+   <widget class="QPushButton" name="ServesInitiate_Button">
+    <property name="geometry">
+     <rect>
+      <x>260</x>
+      <y>30</y>
+      <width>121</width>
+      <height>25</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>ServesInitiate</string>
     </property>
    </widget>
   </widget>

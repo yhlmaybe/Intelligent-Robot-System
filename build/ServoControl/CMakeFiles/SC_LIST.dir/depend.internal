@@ -4,6 +4,7 @@
 ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.cpp
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/SCDrive.h
+ /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h
 ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.cpp
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.h
@@ -12,3 +13,4 @@ ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoID.h
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.cpp
  /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ServoControl/ServoInitiate.h
+ /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/include/IRSFunction.h

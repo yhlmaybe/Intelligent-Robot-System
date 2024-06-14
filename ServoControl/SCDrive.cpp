@@ -29,21 +29,22 @@ ServoOperate::~ServoOperate()
 
 void ServoOperate::SetServoPosition(int position, double time)
 {
-    PyObject *pRetvalue = PyObject_CallMethod(instance, "set_servo_position", "iii", id, position, time);
-    // PyObject *pRetvalue = PyObject_CallMethod(instance, "set_servo_position", "");
-    // if (pRetvalue)
-    //{
-    //     int id;
-    //     PyArg_Parse(pRetvalue, "i", &id);
-    //     const char *idChar = std::to_string(id).c_str();
-    //     ui->ServoNo_Lable->setText(idChar);
-    // }
-    if(!pRetvalue) Py_DECREF(pRetvalue);
+    if(isAvaiable)
+    PyObject_CallMethod(instance, "set_servo_position", "iii", id, position, time);
+    else
+    {
+        IRS_MESSAGE("servo" + this->name + "error , could not set position");
+    }
 }
 
 void ServoOperate::SetServoStop()
 {
+    if(isAvaiable)
     PyObject_CallMethod(instance, "stop", "i", id);
+    else
+    {
+        IRS_MESSAGE("servo" + this->name + "error , could not stop");
+    }
 } 
 
 

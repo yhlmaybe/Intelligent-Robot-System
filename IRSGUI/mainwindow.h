@@ -31,6 +31,10 @@ private:
 
     Ui::MainWindow *ui;
 
+    bool isInitROSNode = false;
+
+    bool isInitServo = false;
+
     std::list<std::shared_ptr<Servo>> servos;
 
     std::shared_ptr<ServoDriveNodeListenerNode> servoDriveNodeListenerNode;
@@ -39,13 +43,17 @@ private:
 
     void Message(std::string message);
 
+    void StartROSServoDriveNode();
 
 private slots:
-    void StartROSServoDriveNode();
 
     void SetServoNo();
 
     void GetServoNo();
+
+    void ROSNodeInitiate();
+
+    void ServosInitiate();
 
 };
 

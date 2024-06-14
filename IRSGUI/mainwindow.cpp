@@ -43,7 +43,8 @@ MainWindow::MainWindow(QWidget *parent) :
 
     connect(ui->SetServoNo_Button, SIGNAL(clicked()), this, SLOT(SetServoNo()));
     connect(ui->GetServoNo_Button, SIGNAL(clicked()), this, SLOT(GetServoNo()));
-    
+    connect(ui->ROSNodeInitiate_Button, SIGNAL(clicked()), this, SLOT(ROSNodeInitiate()));
+    connect(ui->ServesInitiate_Button, SIGNAL(clicked()), this, SLOT(ServosInitiate()));
 }
 
 MainWindow::~MainWindow()
@@ -60,7 +61,6 @@ void MainWindow::Initiate()
     Py_Initialize();
     PyRun_SimpleString("import sys");
     PyRun_SimpleString("sys.path.append('./ServoControl')");      
-    servos = ServoInitiate::Initiate();
 }
 
 void MainWindow::Message(std::string message)
@@ -150,5 +150,24 @@ void MainWindow::GetServoNo()
                 }
             }
         }
+    }
+}
+
+void MainWindow::ROSNodeInitiate()
+{
+    if(!isInitROSNode)
+    {
+        StartROSServoDriveNode();
+        isInitROSNode = true;
+    }
+
+}
+
+void MainWindow::ServosInitiate()
+{
+    if(!isInitServo)
+    {
+        servos = ServoInitiate::Initiate();
+        isInitServo = true;
     }
 }

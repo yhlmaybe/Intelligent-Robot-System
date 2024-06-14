@@ -3,6 +3,7 @@
 
 ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o: ../ServoControl/SCDrive.cpp
 ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o: ../ServoControl/SCDrive.h
+ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o: ../include/IRSFunction.h
 
 ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o: ../ServoControl/ServoID.cpp
 ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o: ../ServoControl/ServoID.h
@@ -11,4 +12,5 @@ ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../ServoControl/SCDrive
 ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../ServoControl/ServoID.h
 ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../ServoControl/ServoInitiate.cpp
 ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../ServoControl/ServoInitiate.h
+ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../include/IRSFunction.h
 
