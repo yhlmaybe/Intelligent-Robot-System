@@ -40,11 +40,13 @@ struct ServoDriveInfo
     std::shared_ptr<Servo>  servo;
     int position;
     double time;
+
+   ServoDriveInfo(std::shared_ptr<Servo> servo, int position, double time) : servo(servo), position(position), time(time) { }
 };
 
 class DriveHandle
 {
 public:
-    static void SetServoPosition(std::list<ServoDriveInfo> servoInfo);
+    static void SetServoPosition(std::list<std::shared_ptr<ServoDriveInfo>> servoInfo);
 };
 

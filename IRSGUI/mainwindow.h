@@ -33,8 +33,6 @@ private:
 
     bool isInitROSNode = false;
 
-    bool isInitServo = false;
-
     std::list<std::shared_ptr<Servo>> servos;
 
     std::shared_ptr<ServoDriveNodeListenerNode> servoDriveNodeListenerNode;

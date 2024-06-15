@@ -56,10 +56,10 @@ Servo::Servo(std::string name, int id)
     this->operate = std::make_unique<ServoOperate>(name, id);
 }
 
-void DriveHandle::SetServoPosition(std::list<ServoDriveInfo> servoInfo)
+void DriveHandle::SetServoPosition(std::list<std::shared_ptr<ServoDriveInfo>> servoInfo)
 {
     std::list<std::future<void>> results;
-    for(auto it = servoInfo.begin(); it != servoInfo.end(); ++it)
+    /*for(auto it = servoInfo.begin(); it != servoInfo.end(); ++it)
     {
         results.push_back(std::async(std::launch::async, [&it](){
             it->servo->operate->SetServoPosition(it->position, it->time);
@@ -69,5 +69,11 @@ void DriveHandle::SetServoPosition(std::list<ServoDriveInfo> servoInfo)
     for(auto& resule : results)
     {
         resule.wait();
+    }*/
+
+    for(auto it = servoInfo.begin(); it != servoInfo.end(); ++it)
+    {       
+        it->get()->servo->operate->SetServoPosition(it->get()->position, it->get()->time);      
     }
+
 }

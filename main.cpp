@@ -14,6 +14,8 @@ public:
     {
         SERVE_DRIVE_NODE_LISTENER = "serve_drive_node_listener";
         URDF_PUBLISHER = "urdf_publisher";
+
+        DEGREE_TO_ROTATE_PARAMETER = 1000 / 240;
     }
 };
 

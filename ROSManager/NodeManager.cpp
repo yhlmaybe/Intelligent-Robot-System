@@ -20,14 +20,14 @@ void ServoDriveNodeListenerNode::DoListen(const std_msgs::msg::String::SharedPtr
     std::stringstream msgString;
     msgString << msg->data.c_str();
     auto ServoMsgs = MsgConvertHandle::StringToServos(msgString.str());
-    std::list<ServoDriveInfo> servoInof;
+    std::list<std::shared_ptr<ServoDriveInfo>> servoInof;
     for (ServoMsg servoMsg : ServoMsgs)
     {
         std::map<int, std::shared_ptr<Servo>>::iterator servoIter = idServoKeyValues.find(servoMsg.id);
         if (servoIter != idServoKeyValues.end())
         {
             auto servo = servoIter->second;
-            ServoDriveInfo info = {servo, servoMsg.position, servoMsg.time};
+            std::shared_ptr<ServoDriveInfo> info = std::make_shared<ServoDriveInfo>(servo, servoMsg.position, servoMsg.time);
             servoInof.push_back(info);
         }
     }

@@ -165,9 +165,6 @@ void MainWindow::ROSNodeInitiate()
 
 void MainWindow::ServosInitiate()
 {
-    if(!isInitServo)
-    {
-        servos = ServoInitiate::Initiate();
-        isInitServo = true;
-    }
+    servos.clear();
+    servos = ServoInitiate::Initiate();
 }
