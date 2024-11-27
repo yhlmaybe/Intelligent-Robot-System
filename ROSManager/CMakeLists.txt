@@ -10,6 +10,9 @@ find_package(urdf REQUIRED)
 find_package(orocos_kdl REQUIRED)
 find_package(kdl_parser REQUIRED)
 
+find_package(rclcpp_components REQUIRED)
+find_package(robot_state_publisher REQUIRED)
+
 
 message("CMAKElujing: ${CMAKE_MODULE_PATH}")
 
@@ -17,14 +20,16 @@ include_directories(/usr/lib/aarch64-linux-gnu)
 
 ament_target_dependencies(ROSMANAGER_LIST "rclcpp" "std_msgs" "rviz_common" "urdf" "visualization_msgs")
 
+ament_target_dependencies(ROSMANAGER_LIST robot_state_publisher)
+
 if(BUILD_TESTING)
     find_package(ament_lint_auto REQUIRED)
     set(ament_cmake_copyright_FOUND TRUE)
     set(ament_cmake_cpplint_FOUND TRUE)
-    ament_lint_auto_find_test_dependencies()
+    #ament_lint_auto_find_test_dependencies()
 endif()
 
-ament_package()
+#ament_package()
 
 target_link_libraries(ROSMANAGER_LIST SC_LIST)
 
@@ -33,7 +38,6 @@ target_link_libraries(ROSMANAGER_LIST pugixml)
 target_link_libraries(ROSMANAGER_LIST rviz_common::rviz_common)
 
 target_link_libraries(ROSMANAGER_LIST ${orocos_kdl_LIBRARIES} ${kdl_parser_LIBRARIES})
-
 
 #install dir, use cmake.. and make install
 install(DIRECTORY rviz urdf

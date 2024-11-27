@@ -1,7 +1,6 @@
 file(REMOVE_RECURSE
-  "IRSGUI_LIST_autogen"
-  "CMakeFiles/IRSGUI_LIST_autogen.dir/AutogenOldSettings.cmake"
   "CMakeFiles/IRSGUI_LIST_autogen"
+  "IRSGUI_LIST_autogen/mocs_compilation.cpp"
 )
 
 # Per-language clean rules from dependency scanning.

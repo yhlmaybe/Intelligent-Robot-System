@@ -1,4 +1,4 @@
-#include <python3.6/Python.h>
+#include <python3.10/Python.h>
 #include <memory>
 #include <list>
 #include <thread>

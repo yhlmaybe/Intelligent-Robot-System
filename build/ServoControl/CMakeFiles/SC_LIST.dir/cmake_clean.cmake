@@ -1,9 +1,12 @@
 file(REMOVE_RECURSE
   "CMakeFiles/SC_LIST.dir/SCDrive.cpp.o"
+  "CMakeFiles/SC_LIST.dir/SCDrive.cpp.o.d"
   "CMakeFiles/SC_LIST.dir/ServoID.cpp.o"
+  "CMakeFiles/SC_LIST.dir/ServoID.cpp.o.d"
   "CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o"
-  "libSC_LIST.pdb"
+  "CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o.d"
   "libSC_LIST.a"
+  "libSC_LIST.pdb"
 )
 
 # Per-language clean rules from dependency scanning.

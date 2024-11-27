@@ -13,7 +13,7 @@ if(PYTHON_EXECUTABLE)
     aux_source_directory(. SC_LIST)
     add_library(SC_LIST ${SC_LIST})
 
-    target_link_libraries(SC_LIST python)
+#    target_link_libraries(SC_LIST python)
 #   target_link_libraries(SC_LIST /usr/lib/python3.6/config-3.6m-aarch64-linux-gnu/libpython3.6.so)
 
     target_include_directories(SC_LIST PRIVATE ${Python_INCLUDE_DIRS})

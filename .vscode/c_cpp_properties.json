@@ -4,8 +4,9 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "/usr/include/aarch64-linux-gnu/qt5/**",
-                "/opt/ros/eloquent/include/**"
+                //"/usr/include/aarch64-linux-gnu/qt5/**",
+                "/usr/include/x86_64-linux-gnu/qt5/**",
+                "/opt/ros/humble/include/**"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/clang",

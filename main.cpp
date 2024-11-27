@@ -1,5 +1,5 @@
 #include <iostream>
-#include <python3.6/Python.h>
+#include <python3.10/Python.h>
 #include "mainwindow.h"
 #include <QApplication>
 #include <rclcpp/rclcpp.hpp>
@@ -23,8 +23,10 @@ public:
 int main(int argc, char *argv[])
 {
     InitiateManager::Initial();
-    QApplication a(argc, argv);
+
     rclcpp::init(argc, argv);
+    QApplication a(argc, argv);
+
 
     MainWindow *w = MainWindow::GetInstance();
     w->show();

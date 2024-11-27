@@ -1,4 +1,4 @@
-# Install script for directory: /home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager
+# Install script for directory: /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -37,77 +37,23 @@ if(NOT DEFINED CMAKE_CROSSCOMPILING)
   set(CMAKE_CROSSCOMPILING "FALSE")
 endif()
 
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/ament_index/resource_index/package_run_dependencies" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ament_cmake_index/share/ament_index/resource_index/package_run_dependencies/intelligent_robot_system")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/ament_index/resource_index/parent_prefix_path" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ament_cmake_index/share/ament_index/resource_index/parent_prefix_path/intelligent_robot_system")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/intelligent_robot_system/environment" TYPE FILE FILES "/opt/ros/eloquent/share/ament_cmake_core/cmake/environment_hooks/environment/ament_prefix_path.sh")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/intelligent_robot_system/environment" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ament_cmake_environment_hooks/ament_prefix_path.dsv")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/intelligent_robot_system/environment" TYPE FILE FILES "/opt/ros/eloquent/share/ament_cmake_core/cmake/environment_hooks/environment/path.sh")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/intelligent_robot_system/environment" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ament_cmake_environment_hooks/path.dsv")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/intelligent_robot_system" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ament_cmake_environment_hooks/local_setup.bash")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/intelligent_robot_system" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ament_cmake_environment_hooks/local_setup.sh")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/intelligent_robot_system" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ament_cmake_environment_hooks/local_setup.zsh")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/intelligent_robot_system" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ament_cmake_environment_hooks/local_setup.dsv")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/intelligent_robot_system" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ament_cmake_environment_hooks/package.dsv")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/ament_index/resource_index/packages" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ament_cmake_index/share/ament_index/resource_index/packages/intelligent_robot_system")
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/intelligent_robot_system/cmake" TYPE FILE FILES
-    "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/ament_cmake_core/intelligent_robot_systemConfig.cmake"
-    "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/ROSManager/ament_cmake_core/intelligent_robot_systemConfig-version.cmake"
-    )
-endif()
-
-if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
-  file(INSTALL DESTINATION "${CMAKE_INSTALL_PREFIX}/share/intelligent_robot_system" TYPE FILE FILES "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/package.xml")
+# Set default install directory permissions.
+if(NOT DEFINED CMAKE_OBJDUMP)
+  set(CMAKE_OBJDUMP "/usr/bin/objdump")
 endif()
 
 if("x${CMAKE_INSTALL_COMPONENT}x" STREQUAL "xUnspecifiedx" OR NOT CMAKE_INSTALL_COMPONENT)
   list(APPEND CMAKE_ABSOLUTE_DESTINATION_FILES
-   "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/install/rviz;/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/install/urdf")
+   "/home/yhlmaybe/Documents/Intelligent-Robot-System/build/install/install/rviz;/home/yhlmaybe/Documents/Intelligent-Robot-System/build/install/install/urdf")
   if(CMAKE_WARN_ON_ABSOLUTE_INSTALL_DESTINATION)
     message(WARNING "ABSOLUTE path INSTALL DESTINATION : ${CMAKE_ABSOLUTE_DESTINATION_FILES}")
   endif()
   if(CMAKE_ERROR_ON_ABSOLUTE_INSTALL_DESTINATION)
     message(FATAL_ERROR "ABSOLUTE path INSTALL DESTINATION forbidden (by caller): ${CMAKE_ABSOLUTE_DESTINATION_FILES}")
   endif()
-file(INSTALL DESTINATION "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/build/install/install" TYPE DIRECTORY FILES
-    "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/rviz"
-    "/home/yhlmaybe/Documents/HLIRS/Intelligent-Robot-System/ROSManager/urdf"
+  file(INSTALL DESTINATION "/home/yhlmaybe/Documents/Intelligent-Robot-System/build/install/install" TYPE DIRECTORY FILES
+    "/home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager/rviz"
+    "/home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager/urdf"
     )
 endif()
 

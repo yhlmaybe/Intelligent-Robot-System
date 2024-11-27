@@ -13,8 +13,9 @@
 #include "../include/ROSParametersData.h"
 #include "../include/IRSFunction.h"
 
-#include <rclcpp_components/register_node_macro.hpp>
-#include <robot_state_publisher/robot_state_publisher.h>
+//#include <rclcpp_components/register_node_macro.hpp>
+//#include <robot_state_publisher/robot_state_publisher.h>
+#include <robot_state_publisher/robot_state_publisher.hpp>
 
 #include <urdf/model.h>
 #include <urdf_parser/urdf_parser.h>

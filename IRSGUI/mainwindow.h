@@ -1,7 +1,7 @@
 #ifndef MAINWINDOW_H
 #define MAINWINDOW_H
 
-#include <python3.6/Python.h>//it must be placed before <QMainWindow>, otherwise an error will be reported
+#include <python3.10/Python.h>//it must be placed before <QMainWindow>, otherwise an error will be reported
 #include <QMainWindow>
 #include <rclcpp/rclcpp.hpp>
 #include <QScrollBar>
