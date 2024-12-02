@@ -33,6 +33,8 @@ private:
 
     bool isInitROSNode = false;
 
+    bool isInitServos = false;
+
     std::list<std::shared_ptr<Servo>> servos;
 
     std::shared_ptr<ServoDriveNodeListenerNode> servoDriveNodeListenerNode;
@@ -40,8 +42,6 @@ private:
     void Initiate();
 
     void Message(std::string message);
-
-    void StartROSServoDriveNode();
 
 private slots:
 
@@ -51,8 +51,9 @@ private slots:
 
     void ROSNodeInitiate();
 
-    void ServosInitiate();
+    void ROSNodeEnd();
 
+    void ServosInitiate();
 };
 
 #endif // MAINWINDOW_H

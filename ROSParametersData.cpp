@@ -8,3 +8,4 @@ std::string URDF_PUBLISHER = "";
 std::string URDF_XML = "";
 
 double DEGREE_TO_ROTATE_PARAMETER = 0;
+

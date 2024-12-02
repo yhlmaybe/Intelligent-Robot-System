@@ -48,12 +48,14 @@ MainWindow::MainWindow(QWidget *parent) :
 }
 
 MainWindow::~MainWindow()
-{
+{  
+    ROSNodeManager::EndNodes();
     rclcpp::shutdown();
     delete ui; 
     QSharedMemory sharedMemory("IRSUniqueKey");
     sharedMemory.detach();
     Py_Finalize();
+
 }
 
 void MainWindow::Initiate()
@@ -73,17 +75,6 @@ void MainWindow::Message(std::string message)
     {
         scrollbar->setSliderPosition(scrollbar->maximum());
     }  
-}
-
-void MainWindow::StartROSServoDriveNode()
-{
-    std::thread([this]()
-    {
-        servoDriveNodeListenerNode = std::make_shared<ServoDriveNodeListenerNode>(servos);
-        rclcpp::spin(servoDriveNodeListenerNode);
-    }).detach();
-
-    ROSNodeManager::UrdfInitial();   
 }
 
 void MainWindow::SetServoNo()
@@ -155,16 +146,29 @@ void MainWindow::GetServoNo()
 
 void MainWindow::ROSNodeInitiate()
 {
-    if(!isInitROSNode)
+    if (isInitServos)
     {
-        StartROSServoDriveNode();
-        isInitROSNode = true;
+        if (!isInitROSNode)
+        {
+            ROSNodeManager::StartNodes(servos);
+            isInitROSNode = true;
+        }
     }
+    else
+    {
+        Message("The servo must be initialized first");     
+    }
+}
 
+void MainWindow::ROSNodeEnd()
+{
+    ROSNodeManager::EndNodes();
+    isInitROSNode = false;
 }
 
 void MainWindow::ServosInitiate()
 {
     servos.clear();
     servos = ServoInitiate::Initiate();
+    isInitServos = true;
 }

@@ -1,5 +1,11 @@
 #include "NodeManager.h"
 
+std::atomic<bool> IsNodeRunning(true);
+
+std::shared_ptr<ServoDriveNodeListenerNode> ROSNodeManager::servoDriveNodeListenerNode = nullptr;
+std::shared_ptr<UrdfPublisherNode> ROSNodeManager::urdfPublisherNode = nullptr;
+
+
 ServoDriveNodeListenerNode::ServoDriveNodeListenerNode(std::list<std::shared_ptr<Servo>> servos)
     : Node(SERVE_DRIVE_NODE_LISTENER), servoList(std::move(servos))
 {
@@ -55,7 +61,7 @@ UrdfPublisherNode::UrdfPublisherNode() : Node(URDF_PUBLISHER)
         IRS_MESSAGE("get urdf cwd() error");
         return;
     }
-    std::string urdf_file = std::string(cwd) + "/ROSManager/urdf/text.urdf";
+    std::string urdf_file = std::string(cwd) + "/ROSManager/urdf/Arm_R.SLDASM.urdf";
     std::ifstream in(urdf_file);
     if (in)
     {
@@ -74,11 +80,11 @@ UrdfPublisherNode::UrdfPublisherNode() : Node(URDF_PUBLISHER)
 
     auto subscriber_options = rclcpp::SubscriptionOptions();
     // subscribe to joint state
-     joint_state_sub = this->create_subscription<sensor_msgs::msg::JointState>(
-      "joint_states",
-      rclcpp::SensorDataQoS(),
-      std::bind(&UrdfPublisherNode::CallbackJointState, this, std::placeholders::_1),
-      subscriber_options);
+    joint_state_sub = this->create_subscription<sensor_msgs::msg::JointState>(
+        "joint_states",
+        rclcpp::SensorDataQoS(),
+        std::bind(&UrdfPublisherNode::CallbackJointState, this, std::placeholders::_1),
+        subscriber_options);
 
     PublishFixedTransforms();
 }
@@ -169,7 +175,7 @@ void UrdfPublisherNode::PublishTransforms(const std::map<std::string, double> &j
 
     std::vector<geometry_msgs::msg::TransformStamped> tf_transforms;
 
-    for (const std::pair<std::string, double> &jnt : joint_positions)
+    for (const std::pair<const std::string, double> &jnt : joint_positions)
     {
         std::map<std::string, SegmentPair>::iterator seg = segment_dynamic.find(jnt.first);
         if (seg != segment_dynamic.end())
@@ -235,14 +241,50 @@ void UrdfPublisherNode::CallbackJointState(const sensor_msgs::msg::JointState::C
     PublishTransforms(joint_positions, state->header.stamp);
 }
 
+void ROSNodeManager::StartNodes(std::list<std::shared_ptr<Servo>> servos)
+{
+    if(!urdfPublisherNode)
+    {
+        UrdfInitial();
+    }
+    if(!servoDriveNodeListenerNode)
+    {
+        StartROSServoDriveListenerNode(servos);
+    }
+
+}
+
+void ROSNodeManager::EndNodes()
+{
+    IsNodeRunning.store(false, std::memory_order_release);
+}
+
 std::string ROSNodeManager::UrdfInitial()
 {
+    urdfPublisherNode  = std::make_shared<UrdfPublisherNode>();
     std::thread([]()
     {
-        auto urdf_node = std::make_shared<UrdfPublisherNode>();
-        rclcpp::spin(urdf_node);
+        while (IsNodeRunning.load())
+        {
+            rclcpp::spin_some(urdfPublisherNode);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }).detach();
-    return "urdf_publisher";
+    return "urdf publisher start";
+}
+
+std::string ROSNodeManager::StartROSServoDriveListenerNode(std::list<std::shared_ptr<Servo>> servos)
+{ 
+    servoDriveNodeListenerNode = std::make_shared<ServoDriveNodeListenerNode>(servos);
+    std::thread([servos]()
+    {
+        while (IsNodeRunning.load())
+        {
+            rclcpp::spin_some(servoDriveNodeListenerNode);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }).detach();
+    return "servoDrive listener start";
 }
 
 std::vector<std::string> ROSNodeManager::GetActiveNodeName()

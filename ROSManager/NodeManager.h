@@ -35,7 +35,6 @@ class ServoDriveNodeListenerNode : public rclcpp::Node
 public:
      ServoDriveNodeListenerNode(std::list<std::shared_ptr<Servo>> servoList);
     
-
 private:
 
     std::map<int, std::shared_ptr<Servo>> idServoKeyValues;
@@ -93,11 +92,22 @@ protected:
 class ROSNodeManager
 {
 public:
+    static void StartNodes(std::list<std::shared_ptr<Servo>> servos);
+
+    static void EndNodes();
+
     static std::string UrdfInitial();
 
     static std::vector<std::string> GetActiveNodeName();
 
     static bool IsActiveNode(std::string name);
+
+    static std::string StartROSServoDriveListenerNode(std::list<std::shared_ptr<Servo>> servos);
+
+private:
+    static std::shared_ptr<ServoDriveNodeListenerNode> servoDriveNodeListenerNode;
+
+    static std::shared_ptr<UrdfPublisherNode> urdfPublisherNode;
 };
 
 
