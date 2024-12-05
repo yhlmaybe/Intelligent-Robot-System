@@ -7,7 +7,7 @@ std::shared_ptr<UrdfPublisherNode> ROSNodeManager::urdfPublisherNode = nullptr;
 
 
 ServoDriveNodeListenerNode::ServoDriveNodeListenerNode(std::list<std::shared_ptr<Servo>> servos)
-    : Node(SERVE_DRIVE_NODE_LISTENER), servoList(std::move(servos))
+    : Node(SERVE_DRIVE_LISTENER), servoList(std::move(servos))
 {
     for (auto &it : servoList)
     {
@@ -40,6 +40,7 @@ void ServoDriveNodeListenerNode::DoListen(const std_msgs::msg::String::SharedPtr
 
     DriveHandle::SetServoPosition(servoInof);
 }
+
 
 geometry_msgs::msg::TransformStamped UrdfPublisherNode::KDLToTransform(const KDL::Frame &k)
 {
@@ -79,6 +80,7 @@ UrdfPublisherNode::UrdfPublisherNode() : Node(URDF_PUBLISHER)
     SetupURDF();
 
     auto subscriber_options = rclcpp::SubscriptionOptions();
+    subscriber_options.qos_overriding_options = rclcpp::QosOverridingOptions::with_default_policies();
     // subscribe to joint state
     joint_state_sub = this->create_subscription<sensor_msgs::msg::JointState>(
         "joint_states",
@@ -127,6 +129,13 @@ void UrdfPublisherNode::SetupURDF()
             mimic[i.first] = jm;
         }
     }
+
+    KDL::SegmentMap segments_map = tree.getSegments();
+    for (const std::pair<const std::string, KDL::TreeElement> &segment : segments_map)
+    {
+        IRS_MESSAGE("Got segment " + segment.first);
+    }
+
     // walk the tree and add segments to segments_
     segment_dynamic.clear();
     segment_fixed.clear();
@@ -240,6 +249,13 @@ void UrdfPublisherNode::CallbackJointState(const sensor_msgs::msg::JointState::C
 
     PublishTransforms(joint_positions, state->header.stamp);
 }
+
+
+ComponentRotationPublisherNode::ComponentRotationPublisherNode() : Node(COMPONENT_ROTATE_PUBLISHER)
+{
+
+}
+
 
 void ROSNodeManager::StartNodes(std::list<std::shared_ptr<Servo>> servos)
 {

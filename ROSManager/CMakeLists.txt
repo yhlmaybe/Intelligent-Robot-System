@@ -13,7 +13,6 @@ find_package(kdl_parser REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(robot_state_publisher REQUIRED)
 
-
 message("CMAKElujing: ${CMAKE_MODULE_PATH}")
 
 include_directories(/usr/lib/aarch64-linux-gnu)

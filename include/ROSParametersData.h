@@ -5,9 +5,11 @@
 
 extern double DEGREE_TO_ROTATE_PARAMETER;
 
-extern std::string SERVE_DRIVE_NODE_LISTENER;
+extern std::string SERVE_DRIVE_LISTENER;
 
 extern std::string URDF_PUBLISHER;
+
+extern std::string COMPONENT_ROTATE_PUBLISHER;
 
 extern std::string URDF_XML;
 

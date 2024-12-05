@@ -12,8 +12,9 @@ class InitiateManager
 public:
     static void Initial()
     {
-        SERVE_DRIVE_NODE_LISTENER = "serve_drive_node_listener";
+        SERVE_DRIVE_LISTENER = "serve_drive_listener";
         URDF_PUBLISHER = "urdf_publisher";
+        COMPONENT_ROTATE_PUBLISHER = "component_rotate_publisher";
 
         DEGREE_TO_ROTATE_PARAMETER = 1000 / 240;
     }

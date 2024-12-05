@@ -89,6 +89,21 @@ protected:
 };
 
 
+class ComponentRotationPublisherNode : public rclcpp::Node
+{
+public: 
+    ComponentRotationPublisherNode();
+
+protected:
+
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr servoRotate_pub;
+
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr jointState_pub;
+
+
+};
+
+
 class ROSNodeManager
 {
 public:

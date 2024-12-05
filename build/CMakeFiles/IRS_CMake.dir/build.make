@@ -132,6 +132,7 @@ IRS_CMake: /opt/ros/humble/lib/librviz_common.so
 IRS_CMake: /opt/ros/humble/lib/librviz_rendering.so
 IRS_CMake: /opt/ros/humble/opt/rviz_ogre_vendor/lib/libOgreOverlay.so
 IRS_CMake: /opt/ros/humble/opt/rviz_ogre_vendor/lib/libOgreMain.so
+IRS_CMake: /usr/lib/x86_64-linux-gnu/libfreeimage.so
 IRS_CMake: /usr/lib/x86_64-linux-gnu/libfreetype.so
 IRS_CMake: /usr/lib/x86_64-linux-gnu/libOpenGL.so
 IRS_CMake: /usr/lib/x86_64-linux-gnu/libGLX.so
