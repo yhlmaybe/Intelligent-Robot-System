@@ -86,7 +86,7 @@
   </link>
   <joint
     name="WristArth_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.035 -0.0225"
       rpy="0 0 0" />
@@ -139,7 +139,7 @@
   </link>
   <joint
     name="Palm_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.0270002381763959 0"
       rpy="0 0 0" />
@@ -154,16 +154,16 @@
     name="ThumbArth_4_Link">
     <inertial>
       <origin
-        xyz="6.96318031268989E-05 0.000551691623959905 -2.08554645775294E-10"
+        xyz="6.96318031268989E-05 0.000551691623959905 -2.08554631897506E-10"
         rpy="0 0 0" />
       <mass
         value="0.00132367611281594" />
       <inertia
         ixx="3.39364411704363E-08"
         ixy="1.7336474626544E-11"
-        ixz="4.23651156346704E-13"
+        ixz="4.23651156346756E-13"
         iyy="1.2396729929759E-08"
-        iyz="2.88502584973477E-16"
+        iyz="2.88502585800658E-16"
         izz="3.94087806481275E-08" />
     </inertial>
     <visual>
@@ -192,10 +192,10 @@
   </link>
   <joint
     name="ThumbArth_4_Joint"
-    type="continuous">
+    type="fixed">
     <origin
-      xyz="-0.0373776216869401 0.0282396610156985 -0.0104250544729608"
-      rpy="-0.0173509972223506 0.277828062025534 1.54690272268651" />
+      xyz="-0.037378 0.02824 -0.010425"
+      rpy="-0.017351 0.27783 1.5469" />
     <parent
       link="Palm_Link" />
     <child
@@ -245,7 +245,7 @@
   </link>
   <joint
     name="ThumbArth_3_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0.000159939498480935 0.00918364455238352 0"
       rpy="3.14159265358979 -1.5707963267949 0" />
@@ -298,7 +298,7 @@
   </link>
   <joint
     name="ThumbArth_2_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.0486709159350182 0"
       rpy="0 0 0" />
@@ -351,7 +351,7 @@
   </link>
   <joint
     name="ThumbArth_1_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.0333689103147325 0"
       rpy="0 0 0" />
@@ -404,7 +404,7 @@
   </link>
   <joint
     name="IndexFingerArth_4_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="-0.0246155312110056 0.0880171234273368 0.00423706647925437"
       rpy="0 -0.016688636846923 0" />
@@ -457,7 +457,7 @@
   </link>
   <joint
     name="IndexFingerArth_3_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.025758853392147 0"
       rpy="0 0 0" />
@@ -510,7 +510,7 @@
   </link>
   <joint
     name="IndexFingerArth_2_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.0421689103147312 0"
       rpy="0 0 0" />
@@ -563,7 +563,7 @@
   </link>
   <joint
     name="IndexFingerArth_1_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.0333280500386343 0"
       rpy="0 0 0" />
@@ -616,7 +616,7 @@
   </link>
   <joint
     name="MidFingerArth_4_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="-0.0246155312110056 0.0880171234273368 0.00423706647925437"
       rpy="0 -0.016688636846923 0" />
@@ -669,7 +669,7 @@
   </link>
   <joint
     name="MidFingerArth_3_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0.0204834452846029 0.0257588533921481 0.00109576112089106"
       rpy="0 0.0250958943237956 0" />
@@ -722,7 +722,7 @@
   </link>
   <joint
     name="MidFingerArth_2_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.0481999999999999 0"
       rpy="0 0 0" />
@@ -775,7 +775,7 @@
   </link>
   <joint
     name="MidFingerArth_1_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.0333280500386328 0"
       rpy="0 0 0" />
@@ -828,7 +828,7 @@
   </link>
   <joint
     name="FourthFingerArth_4_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0.0158413525411462 0.0862362561371976 -0.00255995620301221"
       rpy="0 0.227050271472169 0" />
@@ -881,7 +881,7 @@
   </link>
   <joint
     name="FourthFingerArth_3_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.025758853392147 0"
       rpy="0 0 0" />
@@ -934,7 +934,7 @@
   </link>
   <joint
     name="FourthFingerArth_2_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.0421689103147308 0"
       rpy="0 0 0" />
@@ -987,7 +987,7 @@
   </link>
   <joint
     name="FourthFingerArth_1_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.0333280500386341 0"
       rpy="0 0 0" />
@@ -1040,7 +1040,7 @@
   </link>
   <joint
     name="LittleFingerArth_4_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0.0380834548483633 0.0869571538128283 -0.0101752596541082"
       rpy="-0.0626625298576056 0.390601949010417 -0.163326502886668" />
@@ -1093,7 +1093,7 @@
   </link>
   <joint
     name="LittleFingerArth_3_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.0257588533921475 0"
       rpy="0 0 0" />
@@ -1146,7 +1146,7 @@
   </link>
   <joint
     name="LittleFingerArth_2_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.0338342375518586 0"
       rpy="0 0 0" />
@@ -1199,7 +1199,7 @@
   </link>
   <joint
     name="LittleFingerArth_1_Joint"
-    type="continuous">
+    type="fixed">
     <origin
       xyz="0 0.0333280500386338 0"
       rpy="0 0 0" />

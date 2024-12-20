@@ -14,7 +14,7 @@ public:
     {
         SERVE_DRIVE_LISTENER = "serve_drive_listener";
         URDF_PUBLISHER = "urdf_publisher";
-        COMPONENT_ROTATE_PUBLISHER = "component_rotate_publisher";
+        COMPONENT_ROTATE_STATE_PUBLISHER = "component_rotate_state_publisher";
 
         DEGREE_TO_ROTATE_PARAMETER = 1000 / 240;
     }

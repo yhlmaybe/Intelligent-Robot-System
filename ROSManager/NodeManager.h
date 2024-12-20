@@ -89,18 +89,19 @@ protected:
 };
 
 
-class ComponentRotationPublisherNode : public rclcpp::Node
+class ComponentRotationStatePublisherNode : public rclcpp::Node
 {
 public: 
-    ComponentRotationPublisherNode();
+    ComponentRotationStatePublisherNode();
 
 protected:
+    void PublishJointStates();
 
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr servoRotate_pub;
 
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr jointState_pub;
 
-
+    rclcpp::TimerBase::SharedPtr timer;
 };
 
 

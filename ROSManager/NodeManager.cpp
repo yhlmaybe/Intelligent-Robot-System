@@ -251,11 +251,26 @@ void UrdfPublisherNode::CallbackJointState(const sensor_msgs::msg::JointState::C
 }
 
 
-ComponentRotationPublisherNode::ComponentRotationPublisherNode() : Node(COMPONENT_ROTATE_PUBLISHER)
+ComponentRotationStatePublisherNode::ComponentRotationStatePublisherNode() : Node(COMPONENT_ROTATE_STATE_PUBLISHER)
 {
+        jointState_pub = this->create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
 
+        timer = this->create_wall_timer(std::chrono::milliseconds(100),std::bind(&ComponentRotationStatePublisherNode::PublishJointStates, this));
 }
 
+void ComponentRotationStatePublisherNode::PublishJointStates()
+{
+    auto msg = sensor_msgs::msg::JointState();
+
+    msg.header.stamp = this->get_clock()->now();
+
+    msg.name = {"RComp_Thumb_Arth_1", "joint2", "joint3"}; // 关节的名称
+    msg.position = {1.0, 0.5, -0.3};           // 关节的当前位置（单位：弧度）
+    msg.velocity = {0.1, 0.2, -0.1};           // 关节的速度（单位：rad/s）
+    msg.effort = {0.5, 0.2, 0.1};              // 关节的努力（单位：力矩 N·m）
+
+    jointState_pub->publish(msg);
+}
 
 void ROSNodeManager::StartNodes(std::list<std::shared_ptr<Servo>> servos)
 {

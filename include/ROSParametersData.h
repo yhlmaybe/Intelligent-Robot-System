@@ -9,7 +9,7 @@ extern std::string SERVE_DRIVE_LISTENER;
 
 extern std::string URDF_PUBLISHER;
 
-extern std::string COMPONENT_ROTATE_PUBLISHER;
+extern std::string COMPONENT_ROTATE_STATE_PUBLISHER;
 
 extern std::string URDF_XML;
 
