@@ -6,7 +6,8 @@
                 "${workspaceFolder}/**",
                 //"/usr/include/aarch64-linux-gnu/qt5/**",
                 "/usr/include/x86_64-linux-gnu/qt5/**",
-                "/opt/ros/humble/include/**"
+                "/opt/ros/humble/include/**",
+                "/usr/include/eigen3"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/clang",

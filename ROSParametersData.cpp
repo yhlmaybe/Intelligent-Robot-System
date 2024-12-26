@@ -7,6 +7,8 @@ std::string URDF_PUBLISHER = "";
 
 std::string URDF_XML = "";
 
+std::string SRDF_XML = "";
+
 std::string COMPONENT_ROTATE_STATE_PUBLISHER = "";
 
 double DEGREE_TO_ROTATE_PARAMETER = 0;

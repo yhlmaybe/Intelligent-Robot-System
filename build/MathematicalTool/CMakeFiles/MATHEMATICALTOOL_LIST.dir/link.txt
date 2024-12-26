@@ -1,0 +1,2 @@
+/usr/bin/ar qc libMATHEMATICALTOOL_LIST.a CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o
+/usr/bin/ranlib libMATHEMATICALTOOL_LIST.a

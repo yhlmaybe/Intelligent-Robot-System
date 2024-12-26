@@ -47,6 +47,7 @@ if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   include("/home/yhlmaybe/Documents/Intelligent-Robot-System/build/ServoControl/cmake_install.cmake")
   include("/home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/cmake_install.cmake")
   include("/home/yhlmaybe/Documents/Intelligent-Robot-System/build/ROSManager/cmake_install.cmake")
+  include("/home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool/cmake_install.cmake")
 
 endif()
 

@@ -59,18 +59,34 @@ UrdfPublisherNode::UrdfPublisherNode() : Node(URDF_PUBLISHER)
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)) == NULL)
     {
-        IRS_MESSAGE("get urdf cwd() error");
+        IRS_MESSAGE("get urdf and srdf cwd() error");
         return;
     }
-    std::string urdf_file = std::string(cwd) + "/ROSManager/urdf/Arm_R.SLDASM.urdf";
-    std::ifstream in(urdf_file);
-    if (in)
+    std::string urdf_file = std::string(cwd) + "/Configure/Arm_R_SLDASM.urdf";
+    std::ifstream inurdf(urdf_file);
+    if (inurdf)
     {
-        in.seekg(0, std::ios::end);
-        URDF_XML.resize(in.tellg());
-        in.seekg(0, std::ios::beg);
-        in.read(&URDF_XML[0], URDF_XML.size());
-        in.close();
+        inurdf.seekg(0, std::ios::end);
+        URDF_XML.resize(inurdf.tellg());
+        inurdf.seekg(0, std::ios::beg);
+        inurdf.read(&URDF_XML[0], URDF_XML.size());
+        inurdf.close();
+    }
+
+    std::string oldMeshPath = "${URDF_MESH_PATH}"; 
+    std::string newMeshPath = std::string(cwd) + "/Configure/meshes"; 
+
+    ReplacePathsInUrdf(URDF_XML, oldMeshPath, newMeshPath);
+
+    std::string srdf_file = std::string(cwd) + "/Configure/Arm_R_SLDASM.srdf";
+    std::ifstream insrdf(srdf_file);
+    if (insrdf)
+    {
+        insrdf.seekg(0, std::ios::end);
+        SRDF_XML.resize(insrdf.tellg());
+        insrdf.seekg(0, std::ios::beg);
+        insrdf.read(&SRDF_XML[0], SRDF_XML.size());
+        insrdf.close();
     }
 
     tf_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(this);
@@ -89,6 +105,19 @@ UrdfPublisherNode::UrdfPublisherNode() : Node(URDF_PUBLISHER)
         subscriber_options);
 
     PublishFixedTransforms();
+}
+
+bool UrdfPublisherNode::ReplacePathsInUrdf(std::string &urdfContent, const std::string &oldKey, const std::string &newKey)
+{
+    size_t pos = 0;
+    bool modified = false;
+    while ((pos = urdfContent.find(oldKey, pos)) != std::string::npos) 
+    {
+        urdfContent.replace(pos, oldKey.length(), newKey);
+        pos += newKey.length(); 
+        modified = true;
+    }
+    return modified;
 }
 
 KDL::Tree UrdfPublisherNode::ParseURDF(urdf::Model &model)

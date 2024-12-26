@@ -40,6 +40,57 @@ AMENT_TEST_RESULTS_DIR:PATH=/home/yhlmaybe/Documents/Intelligent-Robot-System/bu
 //Build the testing tree.
 BUILD_TESTING:BOOL=ON
 
+//Path to a library.
+BULLET_COLLISION_LIBRARY:FILEPATH=/usr/lib/x86_64-linux-gnu/libBulletCollision.so
+
+//Path to a library.
+BULLET_COLLISION_LIBRARY_DEBUG:FILEPATH=BULLET_COLLISION_LIBRARY_DEBUG-NOTFOUND
+
+//Path to a library.
+BULLET_DYNAMICS_LIBRARY:FILEPATH=/usr/lib/x86_64-linux-gnu/libBulletDynamics.so
+
+//Path to a library.
+BULLET_DYNAMICS_LIBRARY_DEBUG:FILEPATH=BULLET_DYNAMICS_LIBRARY_DEBUG-NOTFOUND
+
+//Path to a file.
+BULLET_INCLUDE_DIR:PATH=/usr/include/bullet
+
+//Path to a library.
+BULLET_MATH_LIBRARY:FILEPATH=/usr/lib/x86_64-linux-gnu/libLinearMath.so
+
+//Path to a library.
+BULLET_MATH_LIBRARY_DEBUG:FILEPATH=BULLET_MATH_LIBRARY_DEBUG-NOTFOUND
+
+//Path to a library.
+BULLET_SOFTBODY_LIBRARY:FILEPATH=/usr/lib/x86_64-linux-gnu/libBulletSoftBody.so
+
+//Path to a library.
+BULLET_SOFTBODY_LIBRARY_DEBUG:FILEPATH=BULLET_SOFTBODY_LIBRARY_DEBUG-NOTFOUND
+
+Boost_CHRONO_LIBRARY_RELEASE:STRING=/usr/lib/x86_64-linux-gnu/libboost_chrono.so.1.74.0
+
+Boost_DATE_TIME_LIBRARY_RELEASE:STRING=/usr/lib/x86_64-linux-gnu/libboost_date_time.so.1.74.0
+
+//The directory containing a CMake configuration file for Boost.
+Boost_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/Boost-1.74.0
+
+Boost_FILESYSTEM_LIBRARY_RELEASE:STRING=/usr/lib/x86_64-linux-gnu/libboost_filesystem.so.1.74.0
+
+//Path to a file.
+Boost_INCLUDE_DIR:PATH=/usr/include
+
+Boost_IOSTREAMS_LIBRARY_RELEASE:STRING=/usr/lib/x86_64-linux-gnu/libboost_iostreams.so.1.74.0
+
+Boost_PROGRAM_OPTIONS_LIBRARY_RELEASE:STRING=/usr/lib/x86_64-linux-gnu/libboost_program_options.so.1.74.0
+
+Boost_REGEX_LIBRARY_RELEASE:STRING=/usr/lib/x86_64-linux-gnu/libboost_regex.so.1.74.0
+
+Boost_SERIALIZATION_LIBRARY_RELEASE:STRING=/usr/lib/x86_64-linux-gnu/libboost_serialization.so.1.74.0
+
+Boost_SYSTEM_LIBRARY_RELEASE:STRING=/usr/lib/x86_64-linux-gnu/libboost_system.so.1.74.0
+
+Boost_THREAD_LIBRARY_RELEASE:STRING=/usr/lib/x86_64-linux-gnu/libboost_thread.so.1.74.0
+
 //Path to a program.
 CMAKE_ADDR2LINE:FILEPATH=/usr/bin/addr2line
 
@@ -374,11 +425,17 @@ IRSGUI_LIST_LIB_DEPENDS:STATIC=general;Qt5::Core;general;Qt5::Gui;general;Qt5::W
 //Command to build the project
 MAKECOMMAND:STRING=/usr/bin/cmake --build . --config "${CTEST_CONFIGURATION_TYPE}" -- -i
 
+//Dependencies for the target
+MATHEMATICALTOOL_LIST_LIB_DEPENDS:STATIC=general;rclcpp_action::rclcpp_action;general;rcl_action::rcl_action;general;tf2_msgs::tf2_msgs__rosidl_generator_c;general;tf2_msgs::tf2_msgs__rosidl_typesupport_fastrtps_c;general;tf2_msgs::tf2_msgs__rosidl_typesupport_introspection_c;general;tf2_msgs::tf2_msgs__rosidl_typesupport_c;general;tf2_msgs::tf2_msgs__rosidl_typesupport_fastrtps_cpp;general;tf2_msgs::tf2_msgs__rosidl_typesupport_introspection_cpp;general;tf2_msgs::tf2_msgs__rosidl_typesupport_cpp;general;tf2_msgs::tf2_msgs__rosidl_generator_py;general;urdf::urdf;general;rclcpp::rclcpp;general;std_msgs::std_msgs__rosidl_generator_c;general;std_msgs::std_msgs__rosidl_typesupport_fastrtps_c;general;std_msgs::std_msgs__rosidl_typesupport_fastrtps_cpp;general;std_msgs::std_msgs__rosidl_typesupport_introspection_c;general;std_msgs::std_msgs__rosidl_typesupport_c;general;std_msgs::std_msgs__rosidl_typesupport_introspection_cpp;general;std_msgs::std_msgs__rosidl_typesupport_cpp;general;std_msgs::std_msgs__rosidl_generator_py;general;visualization_msgs::visualization_msgs__rosidl_generator_c;general;visualization_msgs::visualization_msgs__rosidl_typesupport_fastrtps_c;general;visualization_msgs::visualization_msgs__rosidl_typesupport_fastrtps_cpp;general;visualization_msgs::visualization_msgs__rosidl_typesupport_introspection_c;general;visualization_msgs::visualization_msgs__rosidl_typesupport_c;general;visualization_msgs::visualization_msgs__rosidl_typesupport_introspection_cpp;general;visualization_msgs::visualization_msgs__rosidl_typesupport_cpp;general;visualization_msgs::visualization_msgs__rosidl_generator_py;general;unique_identifier_msgs::unique_identifier_msgs__rosidl_generator_c;general;unique_identifier_msgs::unique_identifier_msgs__rosidl_typesupport_fastrtps_c;general;unique_identifier_msgs::unique_identifier_msgs__rosidl_typesupport_introspection_c;general;unique_identifier_msgs::unique_identifier_msgs__rosidl_typesupport_c;general;unique_identifier_msgs::unique_identifier_msgs__rosidl_typesupport_fastrtps_cpp;general;unique_identifier_msgs::unique_identifier_msgs__rosidl_typesupport_introspection_cpp;general;unique_identifier_msgs::unique_identifier_msgs__rosidl_typesupport_cpp;general;unique_identifier_msgs::unique_identifier_msgs__rosidl_generator_py;
+
 //Path to the memory checking command, used for memory error detection.
 MEMORYCHECK_COMMAND:FILEPATH=MEMORYCHECK_COMMAND-NOTFOUND
 
 //File that contains suppressions for the memory checker
 MEMORYCHECK_SUPPRESSIONS_FILE:FILEPATH=
+
+//The directory containing a CMake configuration file for OCTOMAP.
+OCTOMAP_DIR:PATH=/opt/ros/humble/share/octomap
 
 //Path to a file.
 OPENGL_EGL_INCLUDE_DIR:PATH=/usr/include
@@ -696,7 +753,7 @@ ZLIB_LIBRARY_DEBUG:FILEPATH=ZLIB_LIBRARY_DEBUG-NOTFOUND
 ZLIB_LIBRARY_RELEASE:FILEPATH=/usr/lib/x86_64-linux-gnu/libz.so
 
 //Path to a library.
-_lib:FILEPATH=/opt/ros/humble/lib/librviz_common.so
+_lib:FILEPATH=/opt/ros/humble/lib/libstd_srvs__rosidl_typesupport_fastrtps_cpp.so
 
 //Path to a library.
 _ogre_main_static_library_abs:FILEPATH=/opt/ros/humble/opt/rviz_ogre_vendor/lib/libOgreMain.so
@@ -767,8 +824,44 @@ ament_index_cpp_DIR:PATH=/opt/ros/humble/share/ament_index_cpp/cmake
 //The directory containing a CMake configuration file for ament_lint_auto.
 ament_lint_auto_DIR:PATH=/opt/ros/humble/share/ament_lint_auto/cmake
 
+//The directory containing a CMake configuration file for angles.
+angles_DIR:PATH=/opt/ros/humble/share/angles/cmake
+
 //The directory containing a CMake configuration file for assimp.
 assimp_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/assimp-5.2
+
+//The directory containing a CMake configuration file for boost_atomic.
+boost_atomic_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/boost_atomic-1.74.0
+
+//The directory containing a CMake configuration file for boost_chrono.
+boost_chrono_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/boost_chrono-1.74.0
+
+//The directory containing a CMake configuration file for boost_date_time.
+boost_date_time_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/boost_date_time-1.74.0
+
+//The directory containing a CMake configuration file for boost_filesystem.
+boost_filesystem_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/boost_filesystem-1.74.0
+
+//The directory containing a CMake configuration file for boost_headers.
+boost_headers_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/boost_headers-1.74.0
+
+//The directory containing a CMake configuration file for boost_iostreams.
+boost_iostreams_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/boost_iostreams-1.74.0
+
+//The directory containing a CMake configuration file for boost_program_options.
+boost_program_options_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/boost_program_options-1.74.0
+
+//The directory containing a CMake configuration file for boost_regex.
+boost_regex_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/boost_regex-1.74.0
+
+//The directory containing a CMake configuration file for boost_serialization.
+boost_serialization_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/boost_serialization-1.74.0
+
+//The directory containing a CMake configuration file for boost_system.
+boost_system_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/boost_system-1.74.0
+
+//The directory containing a CMake configuration file for boost_thread.
+boost_thread_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/boost_thread-1.74.0
 
 //The directory containing a CMake configuration file for builtin_interfaces.
 builtin_interfaces_DIR:PATH=/opt/ros/humble/share/builtin_interfaces/cmake
@@ -776,17 +869,26 @@ builtin_interfaces_DIR:PATH=/opt/ros/humble/share/builtin_interfaces/cmake
 //The directory containing a CMake configuration file for class_loader.
 class_loader_DIR:PATH=/opt/ros/humble/share/class_loader/cmake
 
+//The directory containing a CMake configuration file for common_interfaces.
+common_interfaces_DIR:PATH=/opt/ros/humble/share/common_interfaces/cmake
+
 //The directory containing a CMake configuration file for composition_interfaces.
 composition_interfaces_DIR:PATH=/opt/ros/humble/share/composition_interfaces/cmake
 
 //The directory containing a CMake configuration file for console_bridge.
 console_bridge_DIR:PATH=/usr/lib/x86_64-linux-gnu/console_bridge/cmake
 
+//The directory containing a CMake configuration file for console_bridge_vendor.
+console_bridge_vendor_DIR:PATH=/opt/ros/humble/share/console_bridge_vendor/cmake
+
 //The directory containing a CMake configuration file for draco.
 draco_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/draco
 
 //The directory containing a CMake configuration file for eigen3_cmake_module.
 eigen3_cmake_module_DIR:PATH=/opt/ros/humble/share/eigen3_cmake_module/cmake
+
+//The directory containing a CMake configuration file for eigen_stl_containers.
+eigen_stl_containers_DIR:PATH=/opt/ros/humble/share/eigen_stl_containers/cmake
 
 //The directory containing a CMake configuration file for fastcdr.
 fastcdr_DIR:PATH=/opt/ros/humble/lib/cmake/fastcdr
@@ -797,11 +899,20 @@ fastrtps_DIR:PATH=/opt/ros/humble/share/fastrtps/cmake
 //The directory containing a CMake configuration file for fastrtps_cmake_module.
 fastrtps_cmake_module_DIR:PATH=/opt/ros/humble/share/fastrtps_cmake_module/cmake
 
+//The directory containing a CMake configuration file for fcl.
+fcl_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/fcl
+
 //The directory containing a CMake configuration file for fmt.
 fmt_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/fmt
 
 //The directory containing a CMake configuration file for foonathan_memory.
 foonathan_memory_DIR:PATH=/opt/ros/humble/lib/foonathan_memory/cmake
+
+//The directory containing a CMake configuration file for generate_parameter_library.
+generate_parameter_library_DIR:PATH=/opt/ros/humble/share/generate_parameter_library/cmake
+
+//The directory containing a CMake configuration file for geometric_shapes.
+geometric_shapes_DIR:PATH=/opt/ros/humble/share/geometric_shapes/cmake
 
 //The directory containing a CMake configuration file for geometry_msgs.
 geometry_msgs_DIR:PATH=/opt/ros/humble/share/geometry_msgs/cmake
@@ -827,8 +938,44 @@ libstatistics_collector_DIR:PATH=/opt/ros/humble/share/libstatistics_collector/c
 //The directory containing a CMake configuration file for libyaml_vendor.
 libyaml_vendor_DIR:PATH=/opt/ros/humble/share/libyaml_vendor/cmake
 
+//The directory containing a CMake configuration file for lifecycle_msgs.
+lifecycle_msgs_DIR:PATH=/opt/ros/humble/share/lifecycle_msgs/cmake
+
 //The directory containing a CMake configuration file for message_filters.
 message_filters_DIR:PATH=/opt/ros/humble/share/message_filters/cmake
+
+//The directory containing a CMake configuration file for moveit_commander.
+moveit_commander_DIR:PATH=moveit_commander_DIR-NOTFOUND
+
+//The directory containing a CMake configuration file for moveit_core.
+moveit_core_DIR:PATH=/opt/ros/humble/share/moveit_core/cmake
+
+//The directory containing a CMake configuration file for moveit_msgs.
+moveit_msgs_DIR:PATH=/opt/ros/humble/share/moveit_msgs/cmake
+
+//The directory containing a CMake configuration file for moveit_ros_move_group.
+moveit_ros_move_group_DIR:PATH=/opt/ros/humble/share/moveit_ros_move_group/cmake
+
+//The directory containing a CMake configuration file for moveit_ros_occupancy_map_monitor.
+moveit_ros_occupancy_map_monitor_DIR:PATH=/opt/ros/humble/share/moveit_ros_occupancy_map_monitor/cmake
+
+//The directory containing a CMake configuration file for moveit_ros_planning.
+moveit_ros_planning_DIR:PATH=/opt/ros/humble/share/moveit_ros_planning/cmake
+
+//The directory containing a CMake configuration file for moveit_ros_planning_interface.
+moveit_ros_planning_interface_DIR:PATH=/opt/ros/humble/share/moveit_ros_planning_interface/cmake
+
+//The directory containing a CMake configuration file for moveit_ros_warehouse.
+moveit_ros_warehouse_DIR:PATH=/opt/ros/humble/share/moveit_ros_warehouse/cmake
+
+//The directory containing a CMake configuration file for object_recognition_msgs.
+object_recognition_msgs_DIR:PATH=/opt/ros/humble/share/object_recognition_msgs/cmake
+
+//The directory containing a CMake configuration file for octomap.
+octomap_DIR:PATH=/opt/ros/humble/share/octomap
+
+//The directory containing a CMake configuration file for octomap_msgs.
+octomap_msgs_DIR:PATH=/opt/ros/humble/share/octomap_msgs/cmake
 
 //Path to a library.
 onelib:FILEPATH=/opt/ros/humble/lib/x86_64-linux-gnu/liburdfdom_world.so
@@ -844,6 +991,9 @@ orocos_kdl_LIBRARY:FILEPATH=/usr/lib/x86_64-linux-gnu/liborocos-kdl.so
 
 //The directory containing a CMake configuration file for orocos_kdl_vendor.
 orocos_kdl_vendor_DIR:PATH=/opt/ros/humble/share/orocos_kdl_vendor/cmake
+
+//The directory containing a CMake configuration file for parameter_traits.
+parameter_traits_DIR:PATH=/opt/ros/humble/share/parameter_traits/cmake
 
 //Path to a library.
 pkgcfg_lib_PC_CURL_curl:FILEPATH=/usr/lib/x86_64-linux-gnu/libcurl.so
@@ -863,6 +1013,9 @@ pkgcfg_lib__OPENSSL_ssl:FILEPATH=/usr/lib/x86_64-linux-gnu/libssl.so
 //The directory containing a CMake configuration file for pluginlib.
 pluginlib_DIR:PATH=/opt/ros/humble/share/pluginlib/cmake
 
+//The directory containing a CMake configuration file for random_numbers.
+random_numbers_DIR:PATH=/opt/ros/humble/share/random_numbers/cmake
+
 //The directory containing a CMake configuration file for rcl.
 rcl_DIR:PATH=/opt/ros/humble/share/rcl/cmake
 
@@ -871,6 +1024,9 @@ rcl_action_DIR:PATH=/opt/ros/humble/share/rcl_action/cmake
 
 //The directory containing a CMake configuration file for rcl_interfaces.
 rcl_interfaces_DIR:PATH=/opt/ros/humble/share/rcl_interfaces/cmake
+
+//The directory containing a CMake configuration file for rcl_lifecycle.
+rcl_lifecycle_DIR:PATH=/opt/ros/humble/share/rcl_lifecycle/cmake
 
 //The directory containing a CMake configuration file for rcl_logging_interface.
 rcl_logging_interface_DIR:PATH=/opt/ros/humble/share/rcl_logging_interface/cmake
@@ -889,6 +1045,9 @@ rclcpp_action_DIR:PATH=/opt/ros/humble/share/rclcpp_action/cmake
 
 //The directory containing a CMake configuration file for rclcpp_components.
 rclcpp_components_DIR:PATH=/opt/ros/humble/share/rclcpp_components/cmake
+
+//The directory containing a CMake configuration file for rclcpp_lifecycle.
+rclcpp_lifecycle_DIR:PATH=/opt/ros/humble/share/rclcpp_lifecycle/cmake
 
 //The directory containing a CMake configuration file for rcpputils.
 rcpputils_DIR:PATH=/opt/ros/humble/share/rcpputils/cmake
@@ -965,6 +1124,12 @@ rosidl_typesupport_introspection_c_DIR:PATH=/opt/ros/humble/share/rosidl_typesup
 //The directory containing a CMake configuration file for rosidl_typesupport_introspection_cpp.
 rosidl_typesupport_introspection_cpp_DIR:PATH=/opt/ros/humble/share/rosidl_typesupport_introspection_cpp/cmake
 
+//The directory containing a CMake configuration file for rsl.
+rsl_DIR:PATH=/opt/ros/humble/share/rsl/cmake
+
+//The directory containing a CMake configuration file for ruckig.
+ruckig_DIR:PATH=/opt/ros/humble/lib/x86_64-linux-gnu/cmake/ruckig
+
 //The directory containing a CMake configuration file for rviz_assimp_vendor.
 rviz_assimp_vendor_DIR:PATH=/opt/ros/humble/share/rviz_assimp_vendor/cmake
 
@@ -980,11 +1145,17 @@ rviz_rendering_DIR:PATH=/opt/ros/humble/share/rviz_rendering/cmake
 //The directory containing a CMake configuration file for sensor_msgs.
 sensor_msgs_DIR:PATH=/opt/ros/humble/share/sensor_msgs/cmake
 
+//The directory containing a CMake configuration file for shape_msgs.
+shape_msgs_DIR:PATH=/opt/ros/humble/share/shape_msgs/cmake
+
 //The directory containing a CMake configuration file for spdlog.
 spdlog_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/spdlog
 
 //The directory containing a CMake configuration file for spdlog_vendor.
 spdlog_vendor_DIR:PATH=/opt/ros/humble/share/spdlog_vendor/cmake
+
+//The directory containing a CMake configuration file for srdfdom.
+srdfdom_DIR:PATH=/opt/ros/humble/share/srdfdom/cmake
 
 //The directory containing a CMake configuration file for statistics_msgs.
 statistics_msgs_DIR:PATH=/opt/ros/humble/share/statistics_msgs/cmake
@@ -992,11 +1163,23 @@ statistics_msgs_DIR:PATH=/opt/ros/humble/share/statistics_msgs/cmake
 //The directory containing a CMake configuration file for std_msgs.
 std_msgs_DIR:PATH=/opt/ros/humble/share/std_msgs/cmake
 
+//The directory containing a CMake configuration file for std_srvs.
+std_srvs_DIR:PATH=/opt/ros/humble/share/std_srvs/cmake
+
+//The directory containing a CMake configuration file for tcb_span.
+tcb_span_DIR:PATH=/opt/ros/humble/share/tcb_span/cmake
+
 //The directory containing a CMake configuration file for tf2.
 tf2_DIR:PATH=/opt/ros/humble/share/tf2/cmake
 
+//The directory containing a CMake configuration file for tf2_eigen.
+tf2_eigen_DIR:PATH=/opt/ros/humble/share/tf2_eigen/cmake
+
 //The directory containing a CMake configuration file for tf2_geometry_msgs.
 tf2_geometry_msgs_DIR:PATH=/opt/ros/humble/share/tf2_geometry_msgs/cmake
+
+//The directory containing a CMake configuration file for tf2_kdl.
+tf2_kdl_DIR:PATH=/opt/ros/humble/share/tf2_kdl/cmake
 
 //The directory containing a CMake configuration file for tf2_msgs.
 tf2_msgs_DIR:PATH=/opt/ros/humble/share/tf2_msgs/cmake
@@ -1007,8 +1190,14 @@ tf2_ros_DIR:PATH=/opt/ros/humble/share/tf2_ros/cmake
 //The directory containing a CMake configuration file for tinyxml2_vendor.
 tinyxml2_vendor_DIR:PATH=/opt/ros/humble/share/tinyxml2_vendor/cmake
 
+//The directory containing a CMake configuration file for tl_expected.
+tl_expected_DIR:PATH=/opt/ros/humble/share/tl_expected/cmake
+
 //The directory containing a CMake configuration file for tracetools.
 tracetools_DIR:PATH=/opt/ros/humble/share/tracetools/cmake
+
+//The directory containing a CMake configuration file for trajectory_msgs.
+trajectory_msgs_DIR:PATH=/opt/ros/humble/share/trajectory_msgs/cmake
 
 //The directory containing a CMake configuration file for unique_identifier_msgs.
 unique_identifier_msgs_DIR:PATH=/opt/ros/humble/share/unique_identifier_msgs/cmake
@@ -1028,6 +1217,9 @@ urdfdom_headers_DIR:PATH=/opt/ros/humble/lib/x86_64-linux-gnu/urdfdom_headers/cm
 //The directory containing a CMake configuration file for visualization_msgs.
 visualization_msgs_DIR:PATH=/opt/ros/humble/share/visualization_msgs/cmake
 
+//The directory containing a CMake configuration file for warehouse_ros.
+warehouse_ros_DIR:PATH=/opt/ros/humble/share/warehouse_ros/cmake
+
 //The directory containing a CMake configuration file for yaml-cpp.
 yaml-cpp_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/yaml-cpp
 
@@ -1042,6 +1234,24 @@ yaml_cpp_vendor_DIR:PATH=/opt/ros/humble/share/yaml_cpp_vendor/cmake
 # INTERNAL cache entries
 ########################
 
+//ADVANCED property for variable: BULLET_COLLISION_LIBRARY
+BULLET_COLLISION_LIBRARY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: BULLET_COLLISION_LIBRARY_DEBUG
+BULLET_COLLISION_LIBRARY_DEBUG-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: BULLET_DYNAMICS_LIBRARY
+BULLET_DYNAMICS_LIBRARY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: BULLET_DYNAMICS_LIBRARY_DEBUG
+BULLET_DYNAMICS_LIBRARY_DEBUG-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: BULLET_MATH_LIBRARY
+BULLET_MATH_LIBRARY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: BULLET_MATH_LIBRARY_DEBUG
+BULLET_MATH_LIBRARY_DEBUG-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: BULLET_SOFTBODY_LIBRARY
+BULLET_SOFTBODY_LIBRARY-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: BULLET_SOFTBODY_LIBRARY_DEBUG
+BULLET_SOFTBODY_LIBRARY_DEBUG-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: Boost_DIR
+Boost_DIR-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_ADDR2LINE
 CMAKE_ADDR2LINE-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_AR
@@ -1158,7 +1368,7 @@ CMAKE_MODULE_LINKER_FLAGS_RELWITHDEBINFO-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_NM
 CMAKE_NM-ADVANCED:INTERNAL=1
 //number of local generators
-CMAKE_NUMBER_OF_MAKEFILES:INTERNAL=4
+CMAKE_NUMBER_OF_MAKEFILES:INTERNAL=5
 //ADVANCED property for variable: CMAKE_OBJCOPY
 CMAKE_OBJCOPY-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_OBJDUMP
@@ -1251,6 +1461,8 @@ CURL_LIBRARY_DEBUG-ADVANCED:INTERNAL=1
 CURL_LIBRARY_RELEASE-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: DART_TESTING_TIMEOUT
 DART_TESTING_TIMEOUT-ADVANCED:INTERNAL=1
+//Details about finding Boost
+FIND_PACKAGE_MESSAGE_DETAILS_Boost:INTERNAL=[/usr/lib/x86_64-linux-gnu/cmake/Boost-1.74.0/BoostConfig.cmake][cfound components: system filesystem date_time program_options thread ][v1.74.0()]
 //Details about finding Eigen3
 FIND_PACKAGE_MESSAGE_DETAILS_Eigen3:INTERNAL=[1][v3.4.0()]
 //Details about finding FastRTPS
@@ -1596,6 +1808,28 @@ __pkg_config_arguments__OPENSSL:INTERNAL=QUIET;openssl
 __pkg_config_checked_PC_CURL:INTERNAL=1
 __pkg_config_checked_PKG_FONTCONFIG:INTERNAL=1
 __pkg_config_checked__OPENSSL:INTERNAL=1
+//ADVANCED property for variable: boost_atomic_DIR
+boost_atomic_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: boost_chrono_DIR
+boost_chrono_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: boost_date_time_DIR
+boost_date_time_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: boost_filesystem_DIR
+boost_filesystem_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: boost_headers_DIR
+boost_headers_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: boost_iostreams_DIR
+boost_iostreams_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: boost_program_options_DIR
+boost_program_options_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: boost_regex_DIR
+boost_regex_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: boost_serialization_DIR
+boost_serialization_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: boost_system_DIR
+boost_system_DIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: boost_thread_DIR
+boost_thread_DIR-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: pkgcfg_lib_PC_CURL_curl
 pkgcfg_lib_PC_CURL_curl-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: pkgcfg_lib_PKG_FONTCONFIG_fontconfig

@@ -13,4 +13,6 @@ extern std::string COMPONENT_ROTATE_STATE_PUBLISHER;
 
 extern std::string URDF_XML;
 
+extern std::string SRDF_XML;
+
 #endif

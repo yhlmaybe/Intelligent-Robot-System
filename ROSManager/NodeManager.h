@@ -74,6 +74,7 @@ protected:
     rcl_interfaces::msg::SetParametersResult parameterUpdate(const std::vector<rclcpp::Parameter> &parameters); 
     void OnParameterEvent(std::shared_ptr<rcl_interfaces::msg::ParameterEvent> event);
     geometry_msgs::msg::TransformStamped KDLToTransform(const KDL::Frame & k);
+    bool ReplacePathsInUrdf(std::string& urdfContent, const std::string& oldKey, const std::string& newKey);
 
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr description_pub;
 

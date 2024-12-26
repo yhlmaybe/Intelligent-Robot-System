@@ -646,6 +646,19 @@ intelligent_robot_system_uninstall/fast:
 	$(MAKE) $(MAKESILENT) -f ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build.make ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build
 .PHONY : intelligent_robot_system_uninstall/fast
 
+#=============================================================================
+# Target rules for targets named MATHEMATICALTOOL_LIST
+
+# Build rule for target.
+MATHEMATICALTOOL_LIST: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 MATHEMATICALTOOL_LIST
+.PHONY : MATHEMATICALTOOL_LIST
+
+# fast build rule for target.
+MATHEMATICALTOOL_LIST/fast:
+	$(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build
+.PHONY : MATHEMATICALTOOL_LIST/fast
+
 IRSFunction.o: IRSFunction.cpp.o
 .PHONY : IRSFunction.o
 
@@ -766,6 +779,7 @@ help:
 	@echo "... uninstall"
 	@echo "... IRSGUI_LIST"
 	@echo "... IRS_CMake"
+	@echo "... MATHEMATICALTOOL_LIST"
 	@echo "... ROSMANAGER_LIST"
 	@echo "... SC_LIST"
 	@echo "... IRSFunction.o"

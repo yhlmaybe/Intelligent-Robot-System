@@ -7,3 +7,4 @@
 subdirs("ServoControl")
 subdirs("IRSGUI")
 subdirs("ROSManager")
+subdirs("MathematicalTool")

@@ -69,3 +69,13 @@
 /home/yhlmaybe/Documents/Intelligent-Robot-System/build/ROSManager/CMakeFiles/install.dir
 /home/yhlmaybe/Documents/Intelligent-Robot-System/build/ROSManager/CMakeFiles/install/local.dir
 /home/yhlmaybe/Documents/Intelligent-Robot-System/build/ROSManager/CMakeFiles/install/strip.dir
+/home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir
+/home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool/CMakeFiles/package.dir
+/home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool/CMakeFiles/package_source.dir
+/home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool/CMakeFiles/test.dir
+/home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool/CMakeFiles/edit_cache.dir
+/home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool/CMakeFiles/rebuild_cache.dir
+/home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool/CMakeFiles/list_install_components.dir
+/home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool/CMakeFiles/install.dir
+/home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool/CMakeFiles/install/local.dir
+/home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool/CMakeFiles/install/strip.dir

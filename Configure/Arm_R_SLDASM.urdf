@@ -1,0 +1,1323 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot
+  name="Arm_R_SLDASM">
+  <link
+    name="base_link">
+    <inertial>
+      <origin
+        xyz="-4.922E-11 -0.094153 -0.0225"
+        rpy="0 0 0" />
+      <mass
+        value="0.28027" />
+      <inertia
+        ixx="0.0011698"
+        ixy="-8.9272E-15"
+        ixz="1.7146E-14"
+        iyy="0.00037872"
+        iyz="-6.5553E-08"
+        izz="0.0014721" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/base_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="WristArth_Link">
+    <inertial>
+      <origin
+        xyz="-0.000142377306747571 0.00759314044893073 -4.93080523633616E-09"
+        rpy="0 0 0" />
+      <mass
+        value="0.00943638652052924" />
+      <inertia
+        ixx="1.63505742558257E-06"
+        ixy="-1.24526596499329E-08"
+        ixz="3.1371198431422E-14"
+        iyy="1.99767615625521E-06"
+        iyz="-8.43286343809729E-13"
+        izz="3.00085540468486E-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/WristArth_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/WristArth_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="WristArth_Joint"
+    type="continuous">
+    <origin
+      xyz="0 0.035 -0.0225"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="WristArth_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-0.7854"
+      upper="0.7854"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="Palm_Link">
+    <inertial>
+      <origin
+        xyz="0.00232 0.032109 -0.00099676"
+        rpy="0 0 0" />
+      <mass
+        value="0.043011" />
+      <inertia
+        ixx="1.1453E-05"
+        ixy="-5.7881E-08"
+        ixz="-8.6427E-08"
+        iyy="7.3171E-06"
+        iyz="1.6874E-06"
+        izz="5.5404E-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/Palm_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/Palm_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="Palm_Joint"
+    type="continuous">
+    <origin
+      xyz="0 0.027 0"
+      rpy="0 1.5708 0" />
+    <parent
+      link="WristArth_Link" />
+    <child
+      link="Palm_Link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-1.5708"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="ThumbArth_4_Link">
+    <inertial>
+      <origin
+        xyz="-2.085546388364E-10 0.000551691623959905 -6.96318031269128E-05"
+        rpy="0 0 0" />
+      <mass
+        value="0.00132367611281594" />
+      <inertia
+        ixx="3.94087806481275E-08"
+        ixy="2.88502584353092E-16"
+        ixz="-4.23651156359164E-13"
+        iyy="1.2396729929759E-08"
+        iyz="-1.73364746265432E-11"
+        izz="3.39364411704363E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/ThumbArth_4_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/ThumbArth_4_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="ThumbArth_4_Joint"
+    type="continuous">
+    <origin
+      xyz="0.010425 0.02824 -0.037378"
+      rpy="-1.5938 0.010794 2.8634" />
+    <parent
+      link="Palm_Link" />
+    <child
+      link="ThumbArth_4_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-0.174533"
+      upper="2.967061"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="ThumbArth_3_Link">
+    <inertial>
+      <origin
+        xyz="-0.030289 -0.00050805 -1.3878E-17"
+        rpy="0 0 0" />
+      <mass
+        value="0.0027656" />
+      <inertia
+        ixx="2.4476E-08"
+        ixy="-1.2279E-08"
+        ixz="-5.2526E-23"
+        iyy="3.2145E-07"
+        iyz="-1.1787E-22"
+        izz="3.3587E-07" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/ThumbArth_3_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/ThumbArth_3_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="ThumbArth_3_Joint"
+    type="continuous">
+    <origin
+      xyz="0 0.0091836 -0.00015994"
+      rpy="1.5708 0 -1.5708" />
+    <parent
+      link="ThumbArth_4_Link" />
+    <child
+      link="ThumbArth_3_Link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="ThumbArth_2_Link">
+    <inertial>
+      <origin
+        xyz="0.0189743467679021 9.36971367435646E-05 -9.26177745608214E-11"
+        rpy="0 0 0" />
+      <mass
+        value="0.00106939241736521" />
+      <inertia
+        ixx="5.7969779481806E-09"
+        ixy="1.50343763359219E-09"
+        ixz="4.01078602287247E-16"
+        iyy="3.2611931035073E-08"
+        iyz="-1.99462569823446E-15"
+        izz="3.62692417645527E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/ThumbArth_2_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/ThumbArth_2_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="ThumbArth_2_Joint"
+    type="continuous">
+    <origin
+      xyz="-0.048671 0 0"
+      rpy="0 0 3.1416" />
+    <parent
+      link="ThumbArth_3_Link" />
+    <child
+      link="ThumbArth_2_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="ThumbArth_1_Link">
+    <inertial>
+      <origin
+        xyz="0.0110135159135918 0.000448017410163384 1.8817586378006E-13"
+        rpy="0 0 0" />
+      <mass
+        value="0.000597070725003369" />
+      <inertia
+        ixx="2.87028655287057E-09"
+        ixy="8.14659698928998E-10"
+        ixz="2.95564143971962E-19"
+        iyy="1.54498142000569E-08"
+        iyz="-4.47924893292971E-19"
+        izz="1.70838339763329E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/ThumbArth_1_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/ThumbArth_1_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="ThumbArth_1_Joint"
+    type="continuous">
+    <origin
+      xyz="0.033369 0 0"
+      rpy="0 0 0.0029994" />
+    <parent
+      link="ThumbArth_2_Link" />
+    <child
+      link="ThumbArth_1_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="IndexFingerArth_4_Link">
+    <inertial>
+      <origin
+        xyz="-5.55111512312578E-17 0.00322769309742316 -5.55111512312578E-17"
+        rpy="0 0 0" />
+      <mass
+        value="0.00248334722292415" />
+      <inertia
+        ixx="1.31432778272595E-07"
+        ixy="2.55805604432024E-22"
+        ixz="-2.20115564315457E-15"
+        iyy="1.43571997745869E-08"
+        iyz="-3.09830838189393E-22"
+        izz="1.3546798750571E-07" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/IndexFingerArth_4_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/IndexFingerArth_4_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="IndexFingerArth_4_Joint"
+    type="continuous">
+    <origin
+      xyz="-0.0042371 0.088017 -0.024616"
+      rpy="-3.1416 -1.5541 3.1416" />
+    <parent
+      link="Palm_Link" />
+    <child
+      link="IndexFingerArth_4_Link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-0.17453"
+      upper="0.17453"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="IndexFingerArth_3_Link">
+    <inertial>
+      <origin
+        xyz="0.0234739049177997 7.94326312575783E-05 4.62579974325195E-11"
+        rpy="0 0 0" />
+      <mass
+        value="0.00137270639177356" />
+      <inertia
+        ixx="7.98401749249834E-09"
+        ixy="3.23131590533246E-09"
+        ixz="-4.33250962033355E-16"
+        iyy="7.96698726226064E-08"
+        iyz="-2.34496997334682E-15"
+        izz="8.47026500171895E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/IndexFingerArth_3_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/IndexFingerArth_3_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="IndexFingerArth_3_Joint"
+    type="continuous">
+    <origin
+      xyz="0 0.025759 0"
+      rpy="-1.5708 0 1.5708" />
+    <parent
+      link="IndexFingerArth_4_Link" />
+    <child
+      link="IndexFingerArth_3_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="IndexFingerArth_2__Link">
+    <inertial>
+      <origin
+        xyz="0.0188555769430923 0.000107309572158099 7.67428898207356E-11"
+        rpy="0 0 0" />
+      <mass
+        value="0.0011671336534887" />
+      <inertia
+        ixx="7.28265779581941E-09"
+        ixy="7.06578250519233E-10"
+        ixz="-4.08250812615887E-16"
+        iyy="3.53794849032281E-08"
+        iyz="-2.36087071281992E-15"
+        izz="4.02569090202593E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/IndexFingerArth_2__Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/IndexFingerArth_2__Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="IndexFingerArth_2_Joint"
+    type="continuous">
+    <origin
+      xyz="0.042169 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="IndexFingerArth_3_Link" />
+    <child
+      link="IndexFingerArth_2__Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="IndexFingerArth_1_Link">
+    <inertial>
+      <origin
+        xyz="0.00945540701335396 0.000533336842366922 -5.55111512312578E-17"
+        rpy="0 0 0" />
+      <mass
+        value="0.000565670175158323" />
+      <inertia
+        ixx="3.34879997123183E-09"
+        ixy="4.92081655953572E-10"
+        ixz="-4.29099942761883E-24"
+        iyy="9.84103347236071E-09"
+        iyz="1.65436122510606E-24"
+        izz="1.20373014708609E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/IndexFingerArth_1_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/IndexFingerArth_1_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="IndexFingerArth_1_Joint"
+    type="continuous">
+    <origin
+      xyz="0.033328 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="IndexFingerArth_2__Link" />
+    <child
+      link="IndexFingerArth_1_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="MidFingerArth_4_Link">
+    <inertial>
+      <origin
+        xyz="3.19744231092045E-14 0.0036640554350911 -4.21884749357559E-15"
+        rpy="0 0 0" />
+      <mass
+        value="0.00256257204253557" />
+      <inertia
+        ixx="1.3475513165677E-07"
+        ixy="-2.7021922660576E-21"
+        ixz="-7.48277942552641E-15"
+        iyy="1.46941514784362E-08"
+        iyz="-1.08974583355326E-19"
+        izz="1.38659520752241E-07" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/MidFingerArth_4_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/MidFingerArth_4_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="MidFingerArth_4_Joint"
+    type="continuous">
+    <origin
+      xyz="-0.0056745 0.088017 -0.0041532"
+      rpy="0 -1.5624 0" />
+    <parent
+      link="Palm_Link" />
+    <child
+      link="MidFingerArth_4_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-0.17453"
+      upper="0.17453"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="MidFingerArth_3_Link">
+    <inertial>
+      <origin
+        xyz="0.027203 6.8289E-05 5.6019E-11"
+        rpy="0 0 0" />
+      <mass
+        value="0.0015967" />
+      <inertia
+        ixx="8.9502E-09"
+        ixy="4.7179E-09"
+        ixz="-7.9354E-16"
+        iyy="1.3165E-07"
+        iyz="-7.6892E-15"
+        izz="1.3705E-07" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/MidFingerArth_3_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/MidFingerArth_3_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="MidFingerArth_3_Joint"
+    type="continuous">
+    <origin
+      xyz="0 0.025759 0"
+      rpy="-1.5708 0 1.5708" />
+    <parent
+      link="MidFingerArth_4_Link" />
+    <child
+      link="MidFingerArth_3_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="MidFingerArth_2_Link">
+    <inertial>
+      <origin
+        xyz="0.0192405078371579 0.000100488434520762 7.72736874488089E-11"
+        rpy="0 0 0" />
+      <mass
+        value="0.0012463584706168" />
+      <inertia
+        ixx="7.61960950484379E-09"
+        ixy="7.06578261570178E-10"
+        ixz="-4.34177961115364E-16"
+        iyy="3.85710180743476E-08"
+        iyz="-7.65384994750924E-15"
+        izz="4.35792623326026E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/MidFingerArth_2_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/MidFingerArth_2_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="MidFingerArth_2_Joint"
+    type="continuous">
+    <origin
+      xyz="0.0482 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="MidFingerArth_3_Link" />
+    <child
+      link="MidFingerArth_2_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="MidFingerArth_1_Link">
+    <inertial>
+      <origin
+        xyz="0.00945540701335418 0.000533336842367366 0"
+        rpy="0 0 0" />
+      <mass
+        value="0.000565670175158326" />
+      <inertia
+        ixx="3.34879997123185E-09"
+        ixy="4.92081655953572E-10"
+        ixz="3.98080669791145E-24"
+        iyy="9.84103347236076E-09"
+        iyz="-6.20385459414771E-25"
+        izz="1.20373014708609E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/MidFingerArth_1_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/MidFingerArth_1_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="MidFingerArth_1_Joint"
+    type="continuous">
+    <origin
+      xyz="0.033328 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="MidFingerArth_2_Link" />
+    <child
+      link="MidFingerArth_1_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="FourthFingerArth_4_Link">
+    <inertial>
+      <origin
+        xyz="3.05311331771918E-16 0.00322769309742257 5.55111512312578E-17"
+        rpy="0 0 0" />
+      <mass
+        value="0.00248334722292415" />
+      <inertia
+        ixx="1.31432778272594E-07"
+        ixy="3.83811804224605E-22"
+        ixz="-2.20115562826532E-15"
+        iyy="1.4357199774587E-08"
+        iyz="-4.02888657101609E-22"
+        izz="1.3546798750571E-07" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/FourthFingerArth_4_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/FourthFingerArth_4_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="FourthFingerArth_4_Joint"
+    type="continuous">
+    <origin
+      xyz="0.00256 0.086236 0.015841"
+      rpy="0 -1.3437 0" />
+    <parent
+      link="Palm_Link" />
+    <child
+      link="FourthFingerArth_4_Link" />
+    <axis
+      xyz="0 0 -1" />
+    <limit
+      lower="-0.17453"
+      upper="0.17453"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="FourthFingerArth_3_Link">
+    <inertial>
+      <origin
+        xyz="0.023474 7.9433E-05 8.062E-11"
+        rpy="0 0 0" />
+      <mass
+        value="0.0013727" />
+      <inertia
+        ixx="7.984E-09"
+        ixy="3.2313E-09"
+        ixz="-7.3543E-16"
+        iyy="7.967E-08"
+        iyz="-2.431E-15"
+        izz="8.4703E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/FourthFingerArth_3_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/FourthFingerArth_3_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="FourthFingerArth_3_Joint"
+    type="continuous">
+    <origin
+      xyz="0 0.025759 0"
+      rpy="-1.5708 0 1.5708" />
+    <parent
+      link="FourthFingerArth_4_Link" />
+    <child
+      link="FourthFingerArth_3_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="FourthFingerArth_2_Link">
+    <inertial>
+      <origin
+        xyz="0.0190543601725274 0.000103783132783447 0.00011323523727147"
+        rpy="0 0 0" />
+      <mass
+        value="0.00120674604010847" />
+      <inertia
+        ixx="7.45113368949661E-09"
+        ixy="7.06556112444637E-10"
+        ixz="-1.76423907882516E-10"
+        iyy="3.69752507842939E-08"
+        iyz="-5.03623178049156E-15"
+        izz="4.19180849917177E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/FourthFingerArth_2_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/FourthFingerArth_2_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="FourthFingerArth_2_Joint"
+    type="continuous">
+    <origin
+      xyz="0.042169 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="FourthFingerArth_3_Link" />
+    <child
+      link="FourthFingerArth_2_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="FourthFingerArth_1_Link">
+    <inertial>
+      <origin
+        xyz="0.00945540701335471 0.000533336842367338 8.32667268468867E-17"
+        rpy="0 0 0" />
+      <mass
+        value="0.000565670175158327" />
+      <inertia
+        ixx="3.34879997123188E-09"
+        ixy="4.9208165595357E-10"
+        ixz="7.67210018142933E-23"
+        iyy="9.84103347236081E-09"
+        iyz="-3.43693544515783E-22"
+        izz="1.2037301470861E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/FourthFingerArth_1_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/FourthFingerArth_1_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="FourthFingerArth_1_Joint"
+    type="continuous">
+    <origin
+      xyz="0.033328 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="FourthFingerArth_2_Link" />
+    <child
+      link="FourthFingerArth_1_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="LittleFingerArth_4_Link">
+    <inertial>
+      <origin
+        xyz="-1.9429E-16 0.0032277 1.3878E-16"
+        rpy="0 0 0" />
+      <mass
+        value="0.0024833" />
+      <inertia
+        ixx="1.3143E-07"
+        ixy="5.0717E-22"
+        ixz="-2.2012E-15"
+        iyy="1.4357E-08"
+        iyz="-1.5649E-22"
+        izz="1.3547E-07" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/LittleFingerArth_4_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/LittleFingerArth_4_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="LittleFingerArth_4_Joint"
+    type="continuous">
+    <origin
+      xyz="0.010175 0.086957 0.038083"
+      rpy="0.34581 -1.149 -0.3761" />
+    <parent
+      link="Palm_Link" />
+    <child
+      link="LittleFingerArth_4_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="-0.17453"
+      upper="0.17453"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="LittleFingerArth_3_Link">
+    <inertial>
+      <origin
+        xyz="0.0192053552439189 9.29838725036991E-05 -1.08981185187318E-10"
+        rpy="0 0 0" />
+      <mass
+        value="0.00117267506447727" />
+      <inertia
+        ixx="7.11298389437238E-09"
+        ixy="1.18298592345558E-09"
+        ixz="6.73844427503567E-16"
+        iyy="3.73310439147629E-08"
+        iyz="-1.88931238206831E-15"
+        izz="4.20262066334895E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/LittleFingerArth_3_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/LittleFingerArth_3_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="LittleFingerArth_3_Joint"
+    type="continuous">
+    <origin
+      xyz="0 0.025759 0"
+      rpy="-1.5708 0 1.5708" />
+    <parent
+      link="LittleFingerArth_4_Link" />
+    <child
+      link="LittleFingerArth_3_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="LittleFingerArth_2_Link">
+    <inertial>
+      <origin
+        xyz="0.0188555768821962 0.000107309537622113 -8.20985224248005E-11"
+        rpy="0 0 0" />
+      <mass
+        value="0.00116713362770389" />
+      <inertia
+        ixx="7.28265773571736E-09"
+        ixy="7.06578489202691E-10"
+        ixz="2.95333655238303E-16"
+        iyy="3.53794841200505E-08"
+        iyz="-2.05161547198209E-15"
+        izz="4.02569081680199E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/LittleFingerArth_2_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/LittleFingerArth_2_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="LittleFingerArth_2_Joint"
+    type="continuous">
+    <origin
+      xyz="0.033834 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="LittleFingerArth_3_Link" />
+    <child
+      link="LittleFingerArth_2_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+  <link
+    name="LittleFingerArth_1_Link">
+    <inertial>
+      <origin
+        xyz="0.00945540701335396 0.000533336842366977 5.55111512312578E-17"
+        rpy="0 0 0" />
+      <mass
+        value="0.000565670175158326" />
+      <inertia
+        ixx="3.34879997123184E-09"
+        ixy="4.92081655953564E-10"
+        ixz="3.03730381171815E-24"
+        iyy="9.84103347236078E-09"
+        iyz="-1.73707928636136E-23"
+        izz="1.20373014708609E-08" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/LittleFingerArth_1_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="file://${URDF_MESH_PATH}/LittleFingerArth_1_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="LittleFingerArth_1_Joint"
+    type="continuous">
+    <origin
+      xyz="0.033328 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="LittleFingerArth_2_Link" />
+    <child
+      link="LittleFingerArth_1_Link" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="1.5708"
+      effort="1.67"
+      velocity="7.48" />
+  </joint>
+</robot>
