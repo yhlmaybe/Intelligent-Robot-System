@@ -43,6 +43,8 @@ target_link_libraries(ROSMANAGER_LIST rviz_common::rviz_common)
 
 target_link_libraries(ROSMANAGER_LIST ${orocos_kdl_LIBRARIES} ${kdl_parser_LIBRARIES})
 
+target_link_libraries(ROSMANAGER_LIST MATHEMATICALTOOL_LIST)
+
 #install dir, use cmake.. and make install
 install(DIRECTORY rviz urdf
     DESTINATION ${INSTALL_DIR}/install

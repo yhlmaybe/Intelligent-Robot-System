@@ -5,6 +5,8 @@
 
 extern double DEGREE_TO_ROTATE_PARAMETER;
 
+extern int TIMEINTERVAL;
+
 extern std::string SERVE_DRIVE_LISTENER;
 
 extern std::string URDF_PUBLISHER;

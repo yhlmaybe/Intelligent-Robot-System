@@ -12,5 +12,24 @@ MotionPlanning::MotionPlanning(std::string urdf, std::string srdf)
     if(!robot_model)
     {
         IRS_MESSAGE("set robot model error");
+        return;
     }
+    robot_state = std::make_shared<moveit::core::RobotState>(robot_model);
+
+    std::vector<srdf::Model::EndEffector> endEffectors = srdf_model->getEndEffectors();
+    for (srdf::Model::EndEffector& endEffector : endEffectors)
+    {
+        
+    }
+    robot_state->setToDefaultValues();
+}
+
+sensor_msgs::msg::JointState MotionPlanning::GetCurrentJointStateMsg()
+{
+    sensor_msgs::msg::JointState jointStateMSgs = sensor_msgs::msg::JointState();
+    std::vector<std::string> jointNames = robot_model->getVariableNames();
+    double* jointPositions = robot_state->getVariablePositions();
+    std::vector<double> jointPositionsVec(jointPositions, jointPositions + jointNames.size());
+    jointStateMSgs.name = jointNames;
+    jointStateMSgs.position = jointPositionsVec;
 }

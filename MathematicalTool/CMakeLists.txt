@@ -2,6 +2,7 @@ aux_source_directory(. MATHEMATICALTOOL_LIST)
 add_library(MATHEMATICALTOOL_LIST ${MATHEMATICALTOOL_LIST})
 
 find_package(ament_cmake REQUIRED)
+find_package(moveit REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
@@ -16,6 +17,7 @@ find_package(urdf REQUIRED)
 find_package(rcl_action REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(tf2_msgs REQUIRED)
+find_package(geometric_shapes REQUIRED)
 
 target_include_directories (MATHEMATICALTOOL_LIST
     PRIVATE
@@ -34,4 +36,12 @@ ament_target_dependencies(MATHEMATICALTOOL_LIST
     std_msgs
     visualization_msgs
     unique_identifier_msgs
+    geometric_shapes
+    moveit_msgs
+)
+
+target_link_libraries(MATHEMATICALTOOL_LIST
+    moveit_core
+    moveit_planning_interface
+    moveit_ros_planning_interface
 )

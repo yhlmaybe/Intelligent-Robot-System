@@ -2,6 +2,7 @@
 
 #include <urdf/model.h>
 #include <urdf_parser/urdf_parser.h>
+#include <sensor_msgs/msg/joint_state.hpp>
 
 #include <moveit/planning_interface/planning_interface.h>
 #include <moveit/robot_trajectory/robot_trajectory.h>
@@ -36,10 +37,14 @@ public:
 
     MotionPlanning(std::string urdf, std::string srdf);
     bool EndEffectorPlan(std::shared_ptr<EndEffector> endEffector, Point3D goalPoint);
+    sensor_msgs::msg::JointState GetCurrentJointStateMsg();
 
 private:
+    std::string overallGroupName = "r_arm";
+    std::string overallInitPosdName = "r_arm_home";
 
     std::shared_ptr<moveit::core::RobotModel> robot_model;
+    std::shared_ptr<moveit::core::RobotState> robot_state;
 };
 
 

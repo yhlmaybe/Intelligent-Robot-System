@@ -356,6 +356,8 @@ set(CMAKE_MAKEFILE_DEPENDS
   "/opt/ros/humble/share/message_filters/cmake/message_filtersConfig.cmake"
   "/opt/ros/humble/share/message_filters/cmake/message_filtersExport-none.cmake"
   "/opt/ros/humble/share/message_filters/cmake/message_filtersExport.cmake"
+  "/opt/ros/humble/share/moveit/cmake/moveitConfig-version.cmake"
+  "/opt/ros/humble/share/moveit/cmake/moveitConfig.cmake"
   "/opt/ros/humble/share/moveit_core/cmake/ConfigExtras.cmake"
   "/opt/ros/humble/share/moveit_core/cmake/ament_cmake_export_dependencies-extras.cmake"
   "/opt/ros/humble/share/moveit_core/cmake/ament_cmake_export_targets-extras.cmake"

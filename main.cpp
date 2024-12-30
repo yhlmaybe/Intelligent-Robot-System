@@ -17,6 +17,7 @@ public:
         COMPONENT_ROTATE_STATE_PUBLISHER = "component_rotate_state_publisher";
 
         DEGREE_TO_ROTATE_PARAMETER = 1000 / 240;
+        TIMEINTERVAL = 100;
     }
 };
 

@@ -66,6 +66,8 @@
 	"MOC_COMPILATION_FILE" : "/home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/mocs_compilation.cpp",
 	"MOC_DEFINITIONS" : 
 	[
+		"BOOST_ALL_NO_LIB",
+		"BOOST_FILESYSTEM_DYN_LINK",
 		"DEFAULT_RMW_IMPLEMENTATION=rmw_fastrtps_cpp",
 		"QT_CORE_LIB",
 		"QT_GUI_LIB",
@@ -142,6 +144,13 @@
 		"/opt/ros/humble/include/kdl_parser",
 		"/opt/ros/humble/include/rclcpp_components",
 		"/opt/ros/humble/include/composition_interfaces",
+		"/opt/ros/humble/include/geometric_shapes",
+		"/opt/ros/humble/include",
+		"/opt/ros/humble/include/shape_msgs",
+		"/opt/ros/humble/include/moveit_msgs",
+		"/opt/ros/humble/include/object_recognition_msgs",
+		"/opt/ros/humble/include/octomap_msgs",
+		"/opt/ros/humble/include/trajectory_msgs",
 		"/usr/include",
 		"/usr/include/x86_64-linux-gnu",
 		"/usr/include/c++/11",

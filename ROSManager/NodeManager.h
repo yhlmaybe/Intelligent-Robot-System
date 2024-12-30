@@ -12,6 +12,7 @@
 #include "../ServoControl/ServoInitiate.h"
 #include "../include/ROSParametersData.h"
 #include "../include/IRSFunction.h"
+#include "../MathematicalTool/MotionManager.h"
 
 //#include <rclcpp_components/register_node_macro.hpp>
 //#include <robot_state_publisher/robot_state_publisher.h>
@@ -90,10 +91,10 @@ protected:
 };
 
 
-class ComponentRotationStatePublisherNode : public rclcpp::Node
+class JointStatePublisherNode : public rclcpp::Node
 {
 public: 
-    ComponentRotationStatePublisherNode();
+    JointStatePublisherNode();
 
 protected:
     void PublishJointStates();
@@ -109,6 +110,8 @@ protected:
 class ROSNodeManager
 {
 public:
+    static std::shared_ptr<MotionPlanning> motionPlanning;
+
     static void StartNodes(std::list<std::shared_ptr<Servo>> servos);
 
     static void EndNodes();

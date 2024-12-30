@@ -11,6 +11,7 @@ struct ServoMsg
     std::string name;
     int position;
     double time;
+    double velocity;
 };
 
 

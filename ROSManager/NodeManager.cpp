@@ -4,7 +4,7 @@ std::atomic<bool> IsNodeRunning(true);
 
 std::shared_ptr<ServoDriveNodeListenerNode> ROSNodeManager::servoDriveNodeListenerNode = nullptr;
 std::shared_ptr<UrdfPublisherNode> ROSNodeManager::urdfPublisherNode = nullptr;
-
+std::shared_ptr<MotionPlanning> ROSNodeManager::motionPlanning = nullptr;
 
 ServoDriveNodeListenerNode::ServoDriveNodeListenerNode(std::list<std::shared_ptr<Servo>> servos)
     : Node(SERVE_DRIVE_LISTENER), servoList(std::move(servos))
@@ -279,26 +279,16 @@ void UrdfPublisherNode::CallbackJointState(const sensor_msgs::msg::JointState::C
     PublishTransforms(joint_positions, state->header.stamp);
 }
 
-
-ComponentRotationStatePublisherNode::ComponentRotationStatePublisherNode() : Node(COMPONENT_ROTATE_STATE_PUBLISHER)
+JointStatePublisherNode::JointStatePublisherNode() : Node(COMPONENT_ROTATE_STATE_PUBLISHER)
 {
-        jointState_pub = this->create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
-
-        timer = this->create_wall_timer(std::chrono::milliseconds(100),std::bind(&ComponentRotationStatePublisherNode::PublishJointStates, this));
+    jointState_pub = this->create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
+    PublishJointStates();
+    //timer = this->create_wall_timer(std::chrono::milliseconds(TIMEINTERVAL),std::bind(&JointStatePublisherNode::PublishJointStates, this));
 }
 
-void ComponentRotationStatePublisherNode::PublishJointStates()
+void JointStatePublisherNode::PublishJointStates()
 {
-    auto msg = sensor_msgs::msg::JointState();
-
-    msg.header.stamp = this->get_clock()->now();
-
-    msg.name = {"RComp_Thumb_Arth_1", "joint2", "joint3"}; // 关节的名称
-    msg.position = {1.0, 0.5, -0.3};           // 关节的当前位置（单位：弧度）
-    msg.velocity = {0.1, 0.2, -0.1};           // 关节的速度（单位：rad/s）
-    msg.effort = {0.5, 0.2, 0.1};              // 关节的努力（单位：力矩 N·m）
-
-    jointState_pub->publish(msg);
+    jointState_pub->publish(ROSNodeManager::motionPlanning->GetCurrentJointStateMsg());
 }
 
 void ROSNodeManager::StartNodes(std::list<std::shared_ptr<Servo>> servos)
@@ -311,7 +301,11 @@ void ROSNodeManager::StartNodes(std::list<std::shared_ptr<Servo>> servos)
     {
         StartROSServoDriveListenerNode(servos);
     }
-
+        if(!motionPlanning)
+    {
+        motionPlanning = std::make_shared<MotionPlanning>(URDF_XML, SRDF_XML);
+    }
+    std::shared_ptr<JointStatePublisherNode> pub = std::make_shared<JointStatePublisherNode>();
 }
 
 void ROSNodeManager::EndNodes()

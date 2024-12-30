@@ -19,41 +19,46 @@
         <link name="ThumbArth_3_Link"/>
         <link name="ThumbArth_2_Link"/>
         <link name="ThumbArth_1_Link"/>
-    </group>
-    <group name="mid">
-        <link name="MidFingerArth_4_Link"/>
-        <link name="MidFingerArth_3_Link"/>
-        <link name="MidFingerArth_2_Link"/>
-        <link name="MidFingerArth_1_Link"/>
+        <link name="ThumbEnd_Link"/>
     </group>
     <group name="index">
         <link name="IndexFingerArth_4_Link"/>
         <link name="IndexFingerArth_3_Link"/>
         <link name="IndexFingerArth_2__Link"/>
         <link name="IndexFingerArth_1_Link"/>
+        <link name="IndexEnd_Link"/>
     </group>
     <group name="fourth">
         <link name="FourthFingerArth_4_Link"/>
         <link name="FourthFingerArth_3_Link"/>
         <link name="FourthFingerArth_2_Link"/>
         <link name="FourthFingerArth_1_Link"/>
+        <link name="FourthEnd_Link"/>
+    </group>
+    <group name="mid">
+        <link name="MidFingerArth_4_Link"/>
+        <link name="MidFingerArth_3_Link"/>
+        <link name="MidFingerArth_2_Link"/>
+        <link name="MidFingerArth_1_Link"/>
+        <link name="MidEnd_Link"/>
     </group>
     <group name="little">
         <link name="LittleFingerArth_4_Link"/>
         <link name="LittleFingerArth_3_Link"/>
         <link name="LittleFingerArth_2_Link"/>
         <link name="LittleFingerArth_1_Link"/>
+        <link name="LittleEnd_Link"/>
     </group>
     <group name="r_arm">
-        <group name="wrist"/>
         <group name="thumb"/>
-        <group name="mid"/>
         <group name="index"/>
         <group name="fourth"/>
+        <group name="mid"/>
         <group name="little"/>
+        <group name="wrist"/>
     </group>
     <!--GROUP STATES: Purpose: Define a named state for a particular group, in terms of joint values. This is useful to define states like 'folded arms'-->
-    <group_state name="home" group="r_arm">
+    <group_state name="r_arm_home" group="r_arm">
         <joint name="FourthFingerArth_1_Joint" value="0"/>
         <joint name="FourthFingerArth_2_Joint" value="0"/>
         <joint name="FourthFingerArth_3_Joint" value="0"/>
@@ -77,71 +82,300 @@
         <joint name="ThumbArth_4_Joint" value="0"/>
         <joint name="WristArth_Joint" value="0"/>
     </group_state>
-    <group_state name="cat" group="r_arm">
-        <joint name="FourthFingerArth_1_Joint" value="0.3992"/>
-        <joint name="FourthFingerArth_2_Joint" value="0.2256"/>
-        <joint name="FourthFingerArth_3_Joint" value="0.3298"/>
-        <joint name="FourthFingerArth_4_Joint" value="0.2256"/>
-        <joint name="IndexFingerArth_1_Joint" value="0.3298"/>
-        <joint name="IndexFingerArth_2_Joint" value="0.4913"/>
-        <joint name="IndexFingerArth_3_Joint" value="0.3645"/>
-        <joint name="IndexFingerArth_4_Joint" value="-0.1215"/>
-        <joint name="LittleFingerArth_1_Joint" value="1.2323"/>
-        <joint name="LittleFingerArth_2_Joint" value="0.7463"/>
-        <joint name="LittleFingerArth_3_Joint" value="0.2603"/>
-        <joint name="LittleFingerArth_4_Joint" value="-0.3992"/>
-        <joint name="MidFingerArth_1_Joint" value="0.781"/>
-        <joint name="MidFingerArth_2_Joint" value="0.5033"/>
-        <joint name="MidFingerArth_3_Joint" value="0.6769"/>
-        <joint name="MidFingerArth_4_Joint" value="-0.0174"/>
-        <joint name="Palm_Joint" value="0.538"/>
-        <joint name="ThumbArth_1_Joint" value="0.8852"/>
-        <joint name="ThumbArth_2_Joint" value="0.781"/>
-        <joint name="ThumbArth_3_Joint" value="-1.1976"/>
-        <joint name="ThumbArth_4_Joint" value="0.0868"/>
-        <joint name="WristArth_Joint" value="-0.3645"/>
+    <group_state name="r_arm_bend" group="r_arm">
+        <joint name="FourthFingerArth_1_Joint" value="0.1996"/>
+        <joint name="FourthFingerArth_2_Joint" value="0.4339"/>
+        <joint name="FourthFingerArth_3_Joint" value="0.703"/>
+        <joint name="FourthFingerArth_4_Joint" value="0.0935"/>
+        <joint name="IndexFingerArth_1_Joint" value="0.217"/>
+        <joint name="IndexFingerArth_2_Joint" value="0.486"/>
+        <joint name="IndexFingerArth_3_Joint" value="0.9373"/>
+        <joint name="IndexFingerArth_4_Joint" value="-0.0646"/>
+        <joint name="LittleFingerArth_1_Joint" value="0.3124"/>
+        <joint name="LittleFingerArth_2_Joint" value="0.6335"/>
+        <joint name="LittleFingerArth_3_Joint" value="1.0501"/>
+        <joint name="LittleFingerArth_4_Joint" value="-0.055"/>
+        <joint name="MidFingerArth_1_Joint" value="0.1389"/>
+        <joint name="MidFingerArth_2_Joint" value="0.3992"/>
+        <joint name="MidFingerArth_3_Joint" value="0.7724"/>
+        <joint name="MidFingerArth_4_Joint" value="0.0337"/>
+        <joint name="Palm_Joint" value="0.026"/>
+        <joint name="ThumbArth_1_Joint" value="0.3298"/>
+        <joint name="ThumbArth_2_Joint" value="0.5381"/>
+        <joint name="ThumbArth_3_Joint" value="-1.0067"/>
+        <joint name="ThumbArth_4_Joint" value="1.0588"/>
+        <joint name="WristArth_Joint" value="0"/>
     </group_state>
     <!--END EFFECTOR: Purpose: Represent information about an end effector.-->
-    <end_effector name="thumb" parent_link="Palm_Link" group="thumb" parent_group="wrist"/>
-    <end_effector name="mid" parent_link="Palm_Link" group="mid" parent_group="wrist"/>
-    <end_effector name="index" parent_link="Palm_Link" group="index" parent_group="wrist"/>
-    <end_effector name="fourth" parent_link="Palm_Link" group="fourth" parent_group="wrist"/>
-    <end_effector name="little" parent_link="Palm_Link" group="little" parent_group="wrist"/>
+    <end_effector name="thumb_end" parent_link="Palm_Link" group="thumb" parent_group="wrist"/>
+    <end_effector name="index_end" parent_link="Palm_Link" group="index" parent_group="wrist"/>
+    <end_effector name="fourth_end" parent_link="Palm_Link" group="fourth" parent_group="wrist"/>
+    <end_effector name="mid_end" parent_link="Palm_Link" group="mid" parent_group="wrist"/>
+    <end_effector name="little_end" parent_link="Palm_Link" group="little" parent_group="wrist"/>
     <!--VIRTUAL JOINT: Purpose: this element defines a virtual joint between a robot link and an external frame of reference (considered fixed with respect to the robot)-->
-    <virtual_joint name="virtual_joint" type="fixed" parent_frame="world" child_link="base_link"/>
+    <virtual_joint name="virtual_joint" type="fixed" parent_frame="r_arm" child_link="base_link"/>
     <!--DISABLE COLLISIONS: By default it is assumed that any link of the robot could potentially come into collision with any other link in the robot. This tag disables collision checking between a specified pair of links. -->
+    <disable_collisions link1="FourthEnd_Link" link2="FourthFingerArth_1_Link" reason="Adjacent"/>
+    <disable_collisions link1="FourthEnd_Link" link2="FourthFingerArth_2_Link" reason="Default"/>
+    <disable_collisions link1="FourthEnd_Link" link2="FourthFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthEnd_Link" link2="FourthFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthEnd_Link" link2="IndexFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthEnd_Link" link2="IndexFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthEnd_Link" link2="LittleFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthEnd_Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthEnd_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthEnd_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="FourthEnd_Link" link2="ThumbArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthEnd_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthEnd_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="FourthEnd_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="FourthFingerArth_1_Link" link2="FourthFingerArth_2_Link" reason="Adjacent"/>
+    <disable_collisions link1="FourthFingerArth_1_Link" link2="FourthFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_1_Link" link2="FourthFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_1_Link" link2="IndexFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_1_Link" link2="IndexFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_1_Link" link2="LittleFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_1_Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_1_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_1_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_1_Link" link2="ThumbArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_1_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_1_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_1_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="FourthFingerArth_2_Link" link2="FourthFingerArth_3_Link" reason="Adjacent"/>
+    <disable_collisions link1="FourthFingerArth_2_Link" link2="FourthFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_2_Link" link2="IndexFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_2_Link" link2="IndexFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_2_Link" link2="LittleFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_2_Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_2_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_2_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_2_Link" link2="ThumbArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_2_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_2_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_2_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="FourthFingerArth_3_Link" link2="FourthFingerArth_4_Link" reason="Adjacent"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="IndexEnd_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="IndexFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="IndexFingerArth_2__Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="IndexFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="IndexFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="LittleEnd_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="LittleFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="ThumbArth_2_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="ThumbArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_3_Link" link2="base_link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="IndexEnd_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="IndexFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="IndexFingerArth_2__Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="IndexFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="IndexFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="LittleEnd_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="LittleFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="LittleFingerArth_2_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="LittleFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="MidEnd_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="MidFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="MidFingerArth_2_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="MidFingerArth_3_Link" reason="Never"/>
     <disable_collisions link1="FourthFingerArth_4_Link" link2="Palm_Link" reason="Adjacent"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="ThumbArth_1_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="ThumbArth_2_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="ThumbArth_3_Link" reason="Never"/>
     <disable_collisions link1="FourthFingerArth_4_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="ThumbEnd_Link" reason="Never"/>
     <disable_collisions link1="FourthFingerArth_4_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="FourthFingerArth_4_Link" link2="base_link" reason="Never"/>
+    <disable_collisions link1="IndexEnd_Link" link2="IndexFingerArth_1_Link" reason="Adjacent"/>
+    <disable_collisions link1="IndexEnd_Link" link2="IndexFingerArth_2__Link" reason="Default"/>
+    <disable_collisions link1="IndexEnd_Link" link2="IndexFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="IndexEnd_Link" link2="IndexFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexEnd_Link" link2="LittleEnd_Link" reason="Never"/>
+    <disable_collisions link1="IndexEnd_Link" link2="LittleFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="IndexEnd_Link" link2="LittleFingerArth_2_Link" reason="Never"/>
+    <disable_collisions link1="IndexEnd_Link" link2="LittleFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="IndexEnd_Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexEnd_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexEnd_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="IndexEnd_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexEnd_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="IndexEnd_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="IndexFingerArth_1_Link" link2="IndexFingerArth_2__Link" reason="Adjacent"/>
+    <disable_collisions link1="IndexFingerArth_1_Link" link2="IndexFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_1_Link" link2="IndexFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_1_Link" link2="LittleEnd_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_1_Link" link2="LittleFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_1_Link" link2="LittleFingerArth_2_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_1_Link" link2="LittleFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_1_Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_1_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_1_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_1_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_1_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_1_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="IndexFingerArth_2__Link" link2="IndexFingerArth_3_Link" reason="Adjacent"/>
+    <disable_collisions link1="IndexFingerArth_2__Link" link2="IndexFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_2__Link" link2="LittleEnd_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_2__Link" link2="LittleFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_2__Link" link2="LittleFingerArth_2_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_2__Link" link2="LittleFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_2__Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_2__Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_2__Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_2__Link" link2="ThumbArth_3_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_2__Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_2__Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_2__Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="IndexFingerArth_3_Link" link2="IndexFingerArth_4_Link" reason="Adjacent"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="LittleEnd_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="LittleFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="LittleFingerArth_2_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="LittleFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="MidEnd_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="MidFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="ThumbArth_3_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_3_Link" link2="base_link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_4_Link" link2="LittleEnd_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_4_Link" link2="LittleFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_4_Link" link2="LittleFingerArth_2_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_4_Link" link2="LittleFingerArth_3_Link" reason="Never"/>
     <disable_collisions link1="IndexFingerArth_4_Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_4_Link" link2="MidEnd_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_4_Link" link2="MidFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_4_Link" link2="MidFingerArth_2_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_4_Link" link2="MidFingerArth_3_Link" reason="Never"/>
     <disable_collisions link1="IndexFingerArth_4_Link" link2="Palm_Link" reason="Adjacent"/>
+    <disable_collisions link1="IndexFingerArth_4_Link" link2="ThumbArth_3_Link" reason="Never"/>
     <disable_collisions link1="IndexFingerArth_4_Link" link2="ThumbArth_4_Link" reason="Never"/>
     <disable_collisions link1="IndexFingerArth_4_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="IndexFingerArth_4_Link" link2="base_link" reason="Never"/>
+    <disable_collisions link1="LittleEnd_Link" link2="LittleFingerArth_1_Link" reason="Adjacent"/>
+    <disable_collisions link1="LittleEnd_Link" link2="LittleFingerArth_2_Link" reason="Default"/>
+    <disable_collisions link1="LittleEnd_Link" link2="LittleFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="LittleEnd_Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="LittleEnd_Link" link2="MidEnd_Link" reason="Never"/>
+    <disable_collisions link1="LittleEnd_Link" link2="MidFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="LittleEnd_Link" link2="MidFingerArth_2_Link" reason="Never"/>
+    <disable_collisions link1="LittleEnd_Link" link2="MidFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="LittleEnd_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="LittleEnd_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="LittleEnd_Link" link2="ThumbArth_3_Link" reason="Never"/>
+    <disable_collisions link1="LittleEnd_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="LittleEnd_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="LittleEnd_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="LittleFingerArth_1_Link" link2="LittleFingerArth_2_Link" reason="Adjacent"/>
+    <disable_collisions link1="LittleFingerArth_1_Link" link2="LittleFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_1_Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_1_Link" link2="MidEnd_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_1_Link" link2="MidFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_1_Link" link2="MidFingerArth_2_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_1_Link" link2="MidFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_1_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_1_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_1_Link" link2="ThumbArth_3_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_1_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_1_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_1_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="LittleFingerArth_2_Link" link2="LittleFingerArth_3_Link" reason="Adjacent"/>
+    <disable_collisions link1="LittleFingerArth_2_Link" link2="LittleFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_2_Link" link2="MidEnd_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_2_Link" link2="MidFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_2_Link" link2="MidFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_2_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_2_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_2_Link" link2="ThumbArth_3_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_2_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_2_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_2_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="LittleFingerArth_3_Link" link2="LittleFingerArth_4_Link" reason="Adjacent"/>
+    <disable_collisions link1="LittleFingerArth_3_Link" link2="MidEnd_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_3_Link" link2="MidFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_3_Link" link2="MidFingerArth_2_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_3_Link" link2="MidFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_3_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_3_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_3_Link" link2="ThumbArth_1_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_3_Link" link2="ThumbArth_2_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_3_Link" link2="ThumbArth_3_Link" reason="Never"/>
     <disable_collisions link1="LittleFingerArth_3_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_3_Link" link2="ThumbEnd_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_3_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_3_Link" link2="base_link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_4_Link" link2="MidEnd_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_4_Link" link2="MidFingerArth_1_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_4_Link" link2="MidFingerArth_2_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_4_Link" link2="MidFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_4_Link" link2="MidFingerArth_4_Link" reason="Never"/>
     <disable_collisions link1="LittleFingerArth_4_Link" link2="Palm_Link" reason="Adjacent"/>
+    <disable_collisions link1="LittleFingerArth_4_Link" link2="ThumbArth_1_Link" reason="Never"/>
     <disable_collisions link1="LittleFingerArth_4_Link" link2="ThumbArth_3_Link" reason="Never"/>
     <disable_collisions link1="LittleFingerArth_4_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_4_Link" link2="ThumbEnd_Link" reason="Never"/>
     <disable_collisions link1="LittleFingerArth_4_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="LittleFingerArth_4_Link" link2="base_link" reason="Never"/>
+    <disable_collisions link1="MidEnd_Link" link2="MidFingerArth_1_Link" reason="Adjacent"/>
+    <disable_collisions link1="MidEnd_Link" link2="MidFingerArth_2_Link" reason="Default"/>
+    <disable_collisions link1="MidEnd_Link" link2="MidFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="MidEnd_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="MidEnd_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="MidEnd_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="MidEnd_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="MidEnd_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="MidFingerArth_1_Link" link2="MidFingerArth_2_Link" reason="Adjacent"/>
+    <disable_collisions link1="MidFingerArth_1_Link" link2="MidFingerArth_3_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_1_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_1_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_1_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_1_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_1_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="MidFingerArth_2_Link" link2="MidFingerArth_3_Link" reason="Adjacent"/>
+    <disable_collisions link1="MidFingerArth_2_Link" link2="MidFingerArth_4_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_2_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_2_Link" link2="ThumbArth_3_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_2_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_2_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_2_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="MidFingerArth_3_Link" link2="MidFingerArth_4_Link" reason="Adjacent"/>
+    <disable_collisions link1="MidFingerArth_3_Link" link2="Palm_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_3_Link" link2="ThumbArth_2_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_3_Link" link2="ThumbArth_3_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_3_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_3_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_3_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="MidFingerArth_4_Link" link2="Palm_Link" reason="Adjacent"/>
+    <disable_collisions link1="MidFingerArth_4_Link" link2="ThumbArth_2_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_4_Link" link2="ThumbArth_3_Link" reason="Never"/>
     <disable_collisions link1="MidFingerArth_4_Link" link2="ThumbArth_4_Link" reason="Never"/>
     <disable_collisions link1="MidFingerArth_4_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="MidFingerArth_4_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="Palm_Link" link2="ThumbArth_4_Link" reason="Adjacent"/>
     <disable_collisions link1="Palm_Link" link2="WristArth_Link" reason="Adjacent"/>
+    <disable_collisions link1="Palm_Link" link2="base_link" reason="Never"/>
     <disable_collisions link1="ThumbArth_1_Link" link2="ThumbArth_2_Link" reason="Adjacent"/>
+    <disable_collisions link1="ThumbArth_1_Link" link2="ThumbArth_3_Link" reason="Never"/>
+    <disable_collisions link1="ThumbArth_1_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="ThumbArth_1_Link" link2="ThumbEnd_Link" reason="Adjacent"/>
+    <disable_collisions link1="ThumbArth_1_Link" link2="WristArth_Link" reason="Never"/>
     <disable_collisions link1="ThumbArth_2_Link" link2="ThumbArth_3_Link" reason="Adjacent"/>
+    <disable_collisions link1="ThumbArth_2_Link" link2="ThumbArth_4_Link" reason="Never"/>
+    <disable_collisions link1="ThumbArth_2_Link" link2="ThumbEnd_Link" reason="Default"/>
+    <disable_collisions link1="ThumbArth_2_Link" link2="WristArth_Link" reason="Never"/>
     <disable_collisions link1="ThumbArth_3_Link" link2="ThumbArth_4_Link" reason="Adjacent"/>
+    <disable_collisions link1="ThumbArth_3_Link" link2="ThumbEnd_Link" reason="Never"/>
+    <disable_collisions link1="ThumbArth_3_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="ThumbArth_4_Link" link2="ThumbEnd_Link" reason="Never"/>
     <disable_collisions link1="ThumbArth_4_Link" link2="WristArth_Link" reason="Never"/>
+    <disable_collisions link1="ThumbEnd_Link" link2="WristArth_Link" reason="Never"/>
     <disable_collisions link1="WristArth_Link" link2="base_link" reason="Adjacent"/>
 </robot>
