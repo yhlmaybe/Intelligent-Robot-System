@@ -9,6 +9,7 @@ find_package(rviz_common REQUIRED)
 find_package(urdf REQUIRED)
 find_package(orocos_kdl REQUIRED)
 find_package(kdl_parser REQUIRED)
+find_package(moveit_msgs REQUIRED)
 
 find_package(rclcpp_components REQUIRED)
 find_package(robot_state_publisher REQUIRED)
@@ -22,9 +23,9 @@ ament_target_dependencies(ROSMANAGER_LIST
     std_msgs
     rviz_common
     urdf
-    visualization_msgs)
-
-ament_target_dependencies(ROSMANAGER_LIST robot_state_publisher)
+    visualization_msgs
+    robot_state_publisher
+    moveit_msgs)
 
 if(BUILD_TESTING)
     find_package(ament_lint_auto REQUIRED)

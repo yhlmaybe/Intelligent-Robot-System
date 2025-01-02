@@ -7,8 +7,6 @@ set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH}" "/usr/share/cmake-3.10/Modules")
 
 set(INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/install")
 
-set(ENV{URDF_MESH_PATH} "${CMAKE_SOURCE_DIR}/Configure/meshes")
-
 set(CMAKE_BUILD_TYPE Debug)
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)

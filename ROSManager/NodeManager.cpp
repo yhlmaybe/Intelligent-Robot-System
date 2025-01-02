@@ -301,7 +301,7 @@ void ROSNodeManager::StartNodes(std::list<std::shared_ptr<Servo>> servos)
     {
         StartROSServoDriveListenerNode(servos);
     }
-        if(!motionPlanning)
+    if(!motionPlanning)
     {
         motionPlanning = std::make_shared<MotionPlanning>(URDF_XML, SRDF_XML);
     }

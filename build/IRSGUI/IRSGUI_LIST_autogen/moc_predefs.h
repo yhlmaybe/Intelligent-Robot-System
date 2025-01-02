@@ -177,6 +177,7 @@
 #define __x86_64 1
 #define __cpp_lambdas 200907L
 #define __INT_FAST64_TYPE__ long int
+#define BOOST_ALL_NO_LIB 1
 #define __FLT64_DENORM_MIN__ 4.94065645841246544176568792868221372e-324F64
 #define __cpp_template_auto 201606L
 #define __DBL_MIN__ double(2.22507385850720138309023271733240406e-308L)
@@ -378,6 +379,7 @@
 #define DEFAULT_RMW_IMPLEMENTATION rmw_fastrtps_cpp
 #define __FLT_DENORM_MIN__ 1.40129846432481707092372958328991613e-45F
 #define __FLT128_IS_IEC_60559__ 2
+#define BOOST_FILESYSTEM_DYN_LINK 1
 #define __INT8_MAX__ 0x7f
 #define __LONG_WIDTH__ 64
 #define __PIC__ 2

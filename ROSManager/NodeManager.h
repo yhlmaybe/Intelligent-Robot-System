@@ -9,10 +9,6 @@
 #include <memory>
 
 #include "MsgManager.h"
-#include "../ServoControl/ServoInitiate.h"
-#include "../include/ROSParametersData.h"
-#include "../include/IRSFunction.h"
-#include "../MathematicalTool/MotionManager.h"
 
 //#include <rclcpp_components/register_node_macro.hpp>
 //#include <robot_state_publisher/robot_state_publisher.h>
@@ -28,6 +24,11 @@
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
+
+#include "../ServoControl/ServoInitiate.h"
+#include "../include/ROSParametersData.h"
+#include "../include/IRSFunction.h"
+#include "../MathematicalTool/MotionManager.h"
 
 using MimicMap = std::map<std::string, urdf::JointMimicSharedPtr>;
 
