@@ -4,6 +4,7 @@
 #include <urdf_parser/urdf_parser.h>
 #include <sensor_msgs/msg/joint_state.hpp>
 
+
 #include <moveit/planning_interface/planning_interface.h>
 #include <moveit/robot_trajectory/robot_trajectory.h>
 #include <moveit/robot_state/robot_state.h>
@@ -15,9 +16,9 @@
 
 #include "../include/ROSParametersData.h"
 #include "../include/IRSFunction.h"
+#include "../include/IRSFunction.h"
+
 #include "GeometricManager.h"
-
-
 
 class EndEffector
 {

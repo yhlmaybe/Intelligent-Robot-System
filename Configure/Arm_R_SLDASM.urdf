@@ -26,7 +26,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/base_link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/base_link.STL" />
       </geometry>
       <material
         name="">
@@ -40,7 +40,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/base_link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/base_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -66,7 +66,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/WristArth_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/WristArth_Link.STL" />
       </geometry>
       <material
         name="">
@@ -80,7 +80,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/WristArth_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/WristArth_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -124,7 +124,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/Palm_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/Palm_Link.STL" />
       </geometry>
       <material
         name="">
@@ -138,7 +138,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/Palm_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/Palm_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -182,7 +182,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/ThumbArth_4_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/ThumbArth_4_Link.STL" />
       </geometry>
       <material
         name="">
@@ -196,7 +196,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/ThumbArth_4_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/ThumbArth_4_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -240,7 +240,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/ThumbArth_3_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/ThumbArth_3_Link.STL" />
       </geometry>
       <material
         name="">
@@ -254,7 +254,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/ThumbArth_3_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/ThumbArth_3_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -298,7 +298,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/ThumbArth_2_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/ThumbArth_2_Link.STL" />
       </geometry>
       <material
         name="">
@@ -312,7 +312,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/ThumbArth_2_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/ThumbArth_2_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -356,7 +356,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/ThumbArth_1_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/ThumbArth_1_Link.STL" />
       </geometry>
       <material
         name="">
@@ -370,7 +370,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/ThumbArth_1_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/ThumbArth_1_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -414,7 +414,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/ThumbEnd_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/ThumbEnd_Link.STL" />
       </geometry>
       <material
         name="">
@@ -428,7 +428,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/ThumbEnd_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/ThumbEnd_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -467,7 +467,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/IndexFingerArth_4_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/IndexFingerArth_4_Link.STL" />
       </geometry>
       <material
         name="">
@@ -481,7 +481,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/IndexFingerArth_4_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/IndexFingerArth_4_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -525,7 +525,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/IndexFingerArth_3_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/IndexFingerArth_3_Link.STL" />
       </geometry>
       <material
         name="">
@@ -539,7 +539,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/IndexFingerArth_3_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/IndexFingerArth_3_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -583,7 +583,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/IndexFingerArth_2__Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/IndexFingerArth_2__Link.STL" />
       </geometry>
       <material
         name="">
@@ -597,7 +597,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/IndexFingerArth_2__Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/IndexFingerArth_2__Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -641,7 +641,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/IndexFingerArth_1_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/IndexFingerArth_1_Link.STL" />
       </geometry>
       <material
         name="">
@@ -655,7 +655,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/IndexFingerArth_1_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/IndexFingerArth_1_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -699,7 +699,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/IndexEnd_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/IndexEnd_Link.STL" />
       </geometry>
       <material
         name="">
@@ -713,7 +713,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/IndexEnd_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/IndexEnd_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -752,7 +752,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/MidFingerArth_4_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/MidFingerArth_4_Link.STL" />
       </geometry>
       <material
         name="">
@@ -766,7 +766,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/MidFingerArth_4_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/MidFingerArth_4_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -810,7 +810,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/MidFingerArth_3_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/MidFingerArth_3_Link.STL" />
       </geometry>
       <material
         name="">
@@ -824,7 +824,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/MidFingerArth_3_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/MidFingerArth_3_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -868,7 +868,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/MidFingerArth_2_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/MidFingerArth_2_Link.STL" />
       </geometry>
       <material
         name="">
@@ -882,7 +882,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/MidFingerArth_2_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/MidFingerArth_2_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -926,7 +926,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/MidFingerArth_1_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/MidFingerArth_1_Link.STL" />
       </geometry>
       <material
         name="">
@@ -940,7 +940,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/MidFingerArth_1_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/MidFingerArth_1_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -984,7 +984,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/MidEnd_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/MidEnd_Link.STL" />
       </geometry>
       <material
         name="">
@@ -998,7 +998,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/MidEnd_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/MidEnd_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1037,7 +1037,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/FourthFingerArth_4_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/FourthFingerArth_4_Link.STL" />
       </geometry>
       <material
         name="">
@@ -1051,7 +1051,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/FourthFingerArth_4_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/FourthFingerArth_4_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1095,7 +1095,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/FourthFingerArth_3_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/FourthFingerArth_3_Link.STL" />
       </geometry>
       <material
         name="">
@@ -1109,7 +1109,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/FourthFingerArth_3_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/FourthFingerArth_3_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1153,7 +1153,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/FourthFingerArth_2_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/FourthFingerArth_2_Link.STL" />
       </geometry>
       <material
         name="">
@@ -1167,7 +1167,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/FourthFingerArth_2_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/FourthFingerArth_2_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1211,7 +1211,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/FourthFingerArth_1_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/FourthFingerArth_1_Link.STL" />
       </geometry>
       <material
         name="">
@@ -1225,7 +1225,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/FourthFingerArth_1_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/FourthFingerArth_1_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1269,7 +1269,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/FourthEnd_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/FourthEnd_Link.STL" />
       </geometry>
       <material
         name="">
@@ -1283,7 +1283,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/FourthEnd_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/FourthEnd_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1322,7 +1322,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/LittleFingerArth_4_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/LittleFingerArth_4_Link.STL" />
       </geometry>
       <material
         name="">
@@ -1336,7 +1336,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/LittleFingerArth_4_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/LittleFingerArth_4_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1380,7 +1380,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/LittleFingerArth_3_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/LittleFingerArth_3_Link.STL" />
       </geometry>
       <material
         name="">
@@ -1394,7 +1394,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/LittleFingerArth_3_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/LittleFingerArth_3_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1438,7 +1438,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/LittleFingerArth_2_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/LittleFingerArth_2_Link.STL" />
       </geometry>
       <material
         name="">
@@ -1452,7 +1452,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/LittleFingerArth_2_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/LittleFingerArth_2_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1496,7 +1496,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/LittleFingerArth_1_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/LittleFingerArth_1_Link.STL" />
       </geometry>
       <material
         name="">
@@ -1510,7 +1510,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/LittleFingerArth_1_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/LittleFingerArth_1_Link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1554,7 +1554,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/LittleEnd_Link.STL" />
+          filename="${URDF_VISUAL_MESH_PATH}/LittleEnd_Link.STL" />
       </geometry>
       <material
         name="">
@@ -1568,7 +1568,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="${URDF_MESH_PATH}/LittleEnd_Link.STL" />
+          filename="${URDF_COLLISION_MESH_PATH}/LittleEnd_Link.STL" />
       </geometry>
     </collision>
   </link>

@@ -32,4 +32,5 @@ sensor_msgs::msg::JointState MotionPlanning::GetCurrentJointStateMsg()
     std::vector<double> jointPositionsVec(jointPositions, jointPositions + jointNames.size());
     jointStateMSgs.name = jointNames;
     jointStateMSgs.position = jointPositionsVec;
+    return jointStateMSgs;
 }

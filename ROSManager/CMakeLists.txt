@@ -49,4 +49,4 @@ target_link_libraries(ROSMANAGER_LIST MATHEMATICALTOOL_LIST)
 #install dir, use cmake.. and make install
 install(DIRECTORY rviz urdf
     DESTINATION ${INSTALL_DIR}/install
-    )   
+)   

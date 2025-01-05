@@ -15,18 +15,21 @@
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_info__struct.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_info__traits.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_info__type_support.h \
+  /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_info__type_support.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status__builder.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status__functions.h \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status__struct.h \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status__struct.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status__traits.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status__type_support.h \
+  /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status__type_support.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status_array__builder.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status_array__functions.h \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status_array__struct.h \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status_array__struct.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status_array__traits.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status_array__type_support.h \
+  /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_status_array__type_support.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/goal_info.h \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/goal_info.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/goal_status.h \
@@ -34,6 +37,7 @@
   /opt/ros/humble/include/action_msgs/action_msgs/msg/goal_status_array.h \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/goal_status_array.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/rosidl_generator_c__visibility_control.h \
+  /opt/ros/humble/include/action_msgs/action_msgs/msg/rosidl_generator_cpp__visibility_control.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/srv/cancel_goal.h \
   /opt/ros/humble/include/action_msgs/action_msgs/srv/cancel_goal.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/srv/detail/cancel_goal__builder.hpp \
@@ -42,6 +46,7 @@
   /opt/ros/humble/include/action_msgs/action_msgs/srv/detail/cancel_goal__struct.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/srv/detail/cancel_goal__traits.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/srv/detail/cancel_goal__type_support.h \
+  /opt/ros/humble/include/action_msgs/action_msgs/srv/detail/cancel_goal__type_support.hpp \
   /opt/ros/humble/include/builtin_interfaces/builtin_interfaces/msg/detail/duration__builder.hpp \
   /opt/ros/humble/include/builtin_interfaces/builtin_interfaces/msg/detail/duration__struct.hpp \
   /opt/ros/humble/include/builtin_interfaces/builtin_interfaces/msg/detail/duration__traits.hpp \
@@ -672,6 +677,7 @@
   /opt/ros/humble/include/trajectory_msgs/trajectory_msgs/msg/detail/joint_trajectory__builder.hpp \
   /opt/ros/humble/include/trajectory_msgs/trajectory_msgs/msg/detail/joint_trajectory__struct.hpp \
   /opt/ros/humble/include/trajectory_msgs/trajectory_msgs/msg/detail/joint_trajectory__traits.hpp \
+  /opt/ros/humble/include/trajectory_msgs/trajectory_msgs/msg/detail/joint_trajectory__type_support.hpp \
   /opt/ros/humble/include/trajectory_msgs/trajectory_msgs/msg/detail/joint_trajectory_point__struct.hpp \
   /opt/ros/humble/include/trajectory_msgs/trajectory_msgs/msg/detail/joint_trajectory_point__traits.hpp \
   /opt/ros/humble/include/trajectory_msgs/trajectory_msgs/msg/detail/multi_dof_joint_trajectory__struct.hpp \
@@ -679,6 +685,7 @@
   /opt/ros/humble/include/trajectory_msgs/trajectory_msgs/msg/detail/multi_dof_joint_trajectory_point__struct.hpp \
   /opt/ros/humble/include/trajectory_msgs/trajectory_msgs/msg/detail/multi_dof_joint_trajectory_point__traits.hpp \
   /opt/ros/humble/include/trajectory_msgs/trajectory_msgs/msg/joint_trajectory.hpp \
+  /opt/ros/humble/include/trajectory_msgs/trajectory_msgs/msg/rosidl_generator_cpp__visibility_control.hpp \
   /opt/ros/humble/include/unique_identifier_msgs/unique_identifier_msgs/msg/detail/uuid__struct.h \
   /opt/ros/humble/include/unique_identifier_msgs/unique_identifier_msgs/msg/detail/uuid__struct.hpp \
   /opt/ros/humble/include/unique_identifier_msgs/unique_identifier_msgs/msg/detail/uuid__traits.hpp \

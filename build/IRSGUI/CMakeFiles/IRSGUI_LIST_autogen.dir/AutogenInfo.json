@@ -149,7 +149,6 @@
 		"/opt/ros/humble/include/object_recognition_msgs",
 		"/opt/ros/humble/include/octomap_msgs",
 		"/opt/ros/humble/include/trajectory_msgs",
-		"/opt/ros/humble/include/lifecycle_msgs",
 		"/opt/ros/humble/include/geometric_shapes",
 		"/opt/ros/humble/include",
 		"/usr/include",

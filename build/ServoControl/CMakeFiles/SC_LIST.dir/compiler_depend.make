@@ -357,7 +357,11 @@ ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o: ../ServoControl/SCDrive.cpp \
   /usr/include/c++/11/bits/stl_map.h \
   /usr/include/c++/11/bits/stl_multimap.h \
   /usr/include/c++/11/bits/erase_if.h \
-  ../include/IRSFunction.h
+  ../include/IRSFunction.h \
+  /usr/include/c++/11/vector \
+  /usr/include/c++/11/bits/stl_vector.h \
+  /usr/include/c++/11/bits/stl_bvector.h \
+  /usr/include/c++/11/bits/vector.tcc
 
 ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o: ../ServoControl/ServoID.cpp \
   /usr/include/stdc-predef.h \
@@ -721,8 +725,14 @@ ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../ServoControl/ServoIn
   /usr/include/c++/11/bits/stl_multimap.h \
   /usr/include/c++/11/bits/erase_if.h \
   ../include/IRSFunction.h \
+  /usr/include/c++/11/vector \
+  /usr/include/c++/11/bits/stl_vector.h \
+  /usr/include/c++/11/bits/stl_bvector.h \
+  /usr/include/c++/11/bits/vector.tcc \
   ../ServoControl/ServoID.h
 
+
+/usr/include/c++/11/vector:
 
 /usr/include/c++/11/bits/stl_multimap.h:
 
@@ -1150,6 +1160,8 @@ ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../ServoControl/ServoIn
 
 /usr/include/x86_64-linux-gnu/sys/stat.h:
 
+/usr/include/c++/11/bits/stl_vector.h:
+
 /usr/local/include/python3.10/funcobject.h:
 
 /usr/include/c++/11/typeinfo:
@@ -1390,6 +1402,8 @@ ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../ServoControl/ServoIn
 
 /usr/include/x86_64-linux-gnu/bits/cpu-set.h:
 
+/usr/include/c++/11/bits/stl_bvector.h:
+
 /usr/include/x86_64-linux-gnu/bits/types/clockid_t.h:
 
 /usr/include/x86_64-linux-gnu/bits/types/struct___jmp_buf_tag.h:
@@ -1403,6 +1417,8 @@ ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o: ../ServoControl/ServoIn
 /usr/include/x86_64-linux-gnu/bits/types/mbstate_t.h:
 
 /usr/local/include/python3.10/cpython/compile.h:
+
+/usr/include/c++/11/bits/vector.tcc:
 
 /usr/local/include/python3.10/pythonrun.h:
 

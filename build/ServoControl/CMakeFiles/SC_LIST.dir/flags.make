@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/c++
 CXX_DEFINES = 
 
-CXX_INCLUDES = -I/home/yhlmaybe/Documents/Intelligent-Robot-System/build/ServoControl -I/home/yhlmaybe/Documents/Intelligent-Robot-System/ServoControl -I/home/yhlmaybe/Documents/Intelligent-Robot-System/include -I/home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI -I/usr/include/python3.10
+CXX_INCLUDES = -I/home/yhlmaybe/Documents/Intelligent-Robot-System/build/ServoControl -I/home/yhlmaybe/Documents/Intelligent-Robot-System/ServoControl -I/home/yhlmaybe/Documents/Intelligent-Robot-System/include -I/home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI -I/usr/local/include/python3.10
 
 CXX_FLAGS = -g -Wall -Wextra -Wpedantic -std=gnu++14
 

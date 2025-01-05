@@ -125,8 +125,12 @@ public:
 
     static std::string StartROSServoDriveListenerNode(std::list<std::shared_ptr<Servo>> servos);
 
+    static std::string StartJointStatePublisherNode();
+
 private:
     static std::shared_ptr<ServoDriveNodeListenerNode> servoDriveNodeListenerNode;
+
+    static std::shared_ptr<JointStatePublisherNode> jointStatePublisherNode;
 
     static std::shared_ptr<UrdfPublisherNode> urdfPublisherNode;
 };

@@ -5,6 +5,7 @@ std::atomic<bool> IsNodeRunning(true);
 std::shared_ptr<ServoDriveNodeListenerNode> ROSNodeManager::servoDriveNodeListenerNode = nullptr;
 std::shared_ptr<UrdfPublisherNode> ROSNodeManager::urdfPublisherNode = nullptr;
 std::shared_ptr<MotionPlanning> ROSNodeManager::motionPlanning = nullptr;
+std::shared_ptr<JointStatePublisherNode> ROSNodeManager::jointStatePublisherNode = nullptr;
 
 ServoDriveNodeListenerNode::ServoDriveNodeListenerNode(std::list<std::shared_ptr<Servo>> servos)
     : Node(SERVE_DRIVE_LISTENER), servoList(std::move(servos))
@@ -73,10 +74,13 @@ UrdfPublisherNode::UrdfPublisherNode() : Node(URDF_PUBLISHER)
         inurdf.close();
     }
 
-    std::string oldMeshPath = "${URDF_MESH_PATH}"; 
-    std::string newMeshPath = std::string(cwd) + "/Configure/meshes"; 
+    std::string oldMeshVisualPath = "${URDF_VISUAL_MESH_PATH}"; 
+    std::string newMeshVisualPath = "file://" + std::string(cwd) + "/Configure/meshes/visual"; 
+    std::string oldMeshcollisionPath = "${URDF_COLLISION_MESH_PATH}"; 
+    std::string newMeshcollisionPath = "file://" + std::string(cwd) + "/Configure/meshes/collision"; 
 
-    ReplacePathsInUrdf(URDF_XML, oldMeshPath, newMeshPath);
+    ReplacePathsInUrdf(URDF_XML, oldMeshVisualPath, newMeshVisualPath);
+    ReplacePathsInUrdf(URDF_XML, oldMeshcollisionPath, newMeshcollisionPath);
 
     std::string srdf_file = std::string(cwd) + "/Configure/Arm_R_SLDASM.srdf";
     std::ifstream insrdf(srdf_file);
@@ -282,13 +286,13 @@ void UrdfPublisherNode::CallbackJointState(const sensor_msgs::msg::JointState::C
 JointStatePublisherNode::JointStatePublisherNode() : Node(COMPONENT_ROTATE_STATE_PUBLISHER)
 {
     jointState_pub = this->create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
-    PublishJointStates();
-    //timer = this->create_wall_timer(std::chrono::milliseconds(TIMEINTERVAL),std::bind(&JointStatePublisherNode::PublishJointStates, this));
+    timer = this->create_wall_timer(std::chrono::milliseconds(TIMEINTERVAL),std::bind(&JointStatePublisherNode::PublishJointStates, this));
 }
 
 void JointStatePublisherNode::PublishJointStates()
 {
-    jointState_pub->publish(ROSNodeManager::motionPlanning->GetCurrentJointStateMsg());
+    sensor_msgs::msg::JointState msg = ROSNodeManager::motionPlanning->GetCurrentJointStateMsg();
+    jointState_pub->publish(msg);
 }
 
 void ROSNodeManager::StartNodes(std::list<std::shared_ptr<Servo>> servos)
@@ -305,7 +309,10 @@ void ROSNodeManager::StartNodes(std::list<std::shared_ptr<Servo>> servos)
     {
         motionPlanning = std::make_shared<MotionPlanning>(URDF_XML, SRDF_XML);
     }
-    std::shared_ptr<JointStatePublisherNode> pub = std::make_shared<JointStatePublisherNode>();
+    if(!jointStatePublisherNode)
+    {
+        StartJointStatePublisherNode();
+    }
 }
 
 void ROSNodeManager::EndNodes()
@@ -339,6 +346,20 @@ std::string ROSNodeManager::StartROSServoDriveListenerNode(std::list<std::shared
         }
     }).detach();
     return "servoDrive listener start";
+}
+
+std::string ROSNodeManager::StartJointStatePublisherNode()
+{ 
+    jointStatePublisherNode = std::make_shared<JointStatePublisherNode>();
+    std::thread([]()
+    {
+        while (IsNodeRunning.load())
+        {
+            rclcpp::spin_some(jointStatePublisherNode);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }).detach();
+    return "jointState publisher start";
 }
 
 std::vector<std::string> ROSNodeManager::GetActiveNodeName()
