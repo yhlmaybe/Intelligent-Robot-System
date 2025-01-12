@@ -5,22 +5,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 
-#include "include/ROSParametersData.h"
-
-class InitiateManager
-{
-public:
-    static void Initial()
-    {
-        SERVE_DRIVE_LISTENER = "serve_drive_listener";
-        URDF_PUBLISHER = "urdf_publisher";
-        COMPONENT_ROTATE_STATE_PUBLISHER = "component_rotate_state_publisher";
-
-        DEGREE_TO_ROTATE_PARAMETER = 1000 / 240;
-        TIMEINTERVAL = 100;
-    }
-};
-
+#include "include/IRSParametersData.h"
 
 int main(int argc, char *argv[])
 {

@@ -683,29 +683,29 @@ IRSFunction.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.s
 .PHONY : IRSFunction.cpp.s
 
-ROSParametersData.o: ROSParametersData.cpp.o
-.PHONY : ROSParametersData.o
+IRSParametersData.o: IRSParametersData.cpp.o
+.PHONY : IRSParametersData.o
 
 # target to build an object file
-ROSParametersData.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o
-.PHONY : ROSParametersData.cpp.o
+IRSParametersData.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o
+.PHONY : IRSParametersData.cpp.o
 
-ROSParametersData.i: ROSParametersData.cpp.i
-.PHONY : ROSParametersData.i
+IRSParametersData.i: IRSParametersData.cpp.i
+.PHONY : IRSParametersData.i
 
 # target to preprocess a source file
-ROSParametersData.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.i
-.PHONY : ROSParametersData.cpp.i
+IRSParametersData.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.i
+.PHONY : IRSParametersData.cpp.i
 
-ROSParametersData.s: ROSParametersData.cpp.s
-.PHONY : ROSParametersData.s
+IRSParametersData.s: IRSParametersData.cpp.s
+.PHONY : IRSParametersData.s
 
 # target to generate assembly for a file
-ROSParametersData.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.s
-.PHONY : ROSParametersData.cpp.s
+IRSParametersData.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.s
+.PHONY : IRSParametersData.cpp.s
 
 main.o: main.cpp.o
 .PHONY : main.o
@@ -785,9 +785,9 @@ help:
 	@echo "... IRSFunction.o"
 	@echo "... IRSFunction.i"
 	@echo "... IRSFunction.s"
-	@echo "... ROSParametersData.o"
-	@echo "... ROSParametersData.i"
-	@echo "... ROSParametersData.s"
+	@echo "... IRSParametersData.o"
+	@echo "... IRSParametersData.i"
+	@echo "... IRSParametersData.s"
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"

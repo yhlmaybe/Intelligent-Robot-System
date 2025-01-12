@@ -160,9 +160,10 @@ CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o
  /usr/include/c++/11/bits/stl_bvector.h
  /usr/include/c++/11/bits/vector.tcc
 
-CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o
- /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSParametersData.cpp
+CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSParametersData.cpp
  /usr/include/stdc-predef.h
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/include/IRSParametersData.h
  /usr/include/c++/11/string
  /usr/include/x86_64-linux-gnu/c++/11/bits/c++config.h
  /usr/include/x86_64-linux-gnu/c++/11/bits/os_defines.h
@@ -312,7 +313,6 @@ CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o
  /usr/include/x86_64-linux-gnu/bits/types/error_t.h
  /usr/include/c++/11/bits/charconv.h
  /usr/include/c++/11/bits/basic_string.tcc
- /home/yhlmaybe/Documents/Intelligent-Robot-System/include/ROSParametersData.h
 
 CMakeFiles/IRS_CMake.dir/main.cpp.o
  /home/yhlmaybe/Documents/Intelligent-Robot-System/main.cpp

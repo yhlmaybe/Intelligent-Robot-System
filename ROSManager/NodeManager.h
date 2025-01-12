@@ -1,3 +1,6 @@
+#ifndef NODEMANAGER_H
+#define NODEMANAGER_H
+
 #include <iostream>
 #include <fstream>
 
@@ -26,7 +29,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 
 #include "../ServoControl/ServoInitiate.h"
-#include "../include/ROSParametersData.h"
+#include "../include/IRSParametersData.h"
 #include "../include/IRSFunction.h"
 #include "../MathematicalTool/MotionManager.h"
 
@@ -135,5 +138,5 @@ private:
     static std::shared_ptr<UrdfPublisherNode> urdfPublisherNode;
 };
 
-
+#endif
 

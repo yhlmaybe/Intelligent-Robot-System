@@ -1,5 +1,5 @@
-#ifndef IRSFUNCTION
-#define IRSFUNCTION
+#ifndef IRSFUNCTION_H
+#define IRSFUNCTION_H
 
 #include <string>
 #include <vector>

@@ -909,7 +909,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../ServoControl/SCDrive.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../ServoControl/../include/IRSFunction.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../ServoControl/ServoID.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../include/ROSParametersData.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../include/IRSParametersData.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../include/IRSFunction.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../MathematicalTool/MotionManager.h \
  /opt/ros/humble/include/moveit/planning_interface/planning_interface.h \
@@ -1560,7 +1560,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: \
  /opt/ros/humble/include/tf2_msgs/tf2_msgs/srv/detail/frame_graph__traits.hpp \
  /opt/ros/humble/include/tf2_msgs/tf2_msgs/srv/detail/frame_graph__type_support.hpp \
  /opt/ros/humble/include/moveit_move_group_interface_export.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../MathematicalTool/../include/ROSParametersData.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../MathematicalTool/../include/IRSParametersData.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../MathematicalTool/../include/IRSFunction.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../MathematicalTool/GeometricManager.h \
  /usr/include/c++/11/complex.h /usr/include/c++/11/ccomplex \
@@ -1577,4 +1577,4 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: \
  /usr/include/x86_64-linux-gnu/qt5/QtCore/qlocale.h \
  /usr/include/x86_64-linux-gnu/qt5/QtCore/qvariant.h \
  /usr/include/x86_64-linux-gnu/qt5/QtCore/qmap.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/include/ROSParametersData.h
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/include/IRSParametersData.h

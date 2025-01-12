@@ -9,7 +9,7 @@ set(CMAKE_DEPENDS_LANGUAGES
 # The set of dependency files which are needed:
 set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/home/yhlmaybe/Documents/Intelligent-Robot-System/IRSFunction.cpp" "CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o" "gcc" "CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o.d"
-  "/home/yhlmaybe/Documents/Intelligent-Robot-System/ROSParametersData.cpp" "CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o" "gcc" "CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o.d"
+  "/home/yhlmaybe/Documents/Intelligent-Robot-System/IRSParametersData.cpp" "CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o" "gcc" "CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o.d"
   "/home/yhlmaybe/Documents/Intelligent-Robot-System/main.cpp" "CMakeFiles/IRS_CMake.dir/main.cpp.o" "gcc" "CMakeFiles/IRS_CMake.dir/main.cpp.o.d"
   )
 

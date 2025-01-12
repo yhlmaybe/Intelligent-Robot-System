@@ -57,6 +57,56 @@
         <group name="little"/>
         <group name="wrist"/>
     </group>
+    <group name="thumbWrist">
+        <link name="ThumbArth_4_Link"/>
+        <link name="ThumbArth_3_Link"/>
+        <link name="ThumbArth_2_Link"/>
+        <link name="ThumbArth_1_Link"/>
+        <link name="ThumbEnd_Link"/>
+        <link name="base_link"/>
+        <link name="WristArth_Link"/>
+        <link name="Palm_Link"/>
+    </group>
+    <group name="midWrist">
+        <link name="base_link"/>
+        <link name="WristArth_Link"/>
+        <link name="Palm_Link"/>
+        <link name="MidFingerArth_4_Link"/>
+        <link name="MidFingerArth_3_Link"/>
+        <link name="MidFingerArth_2_Link"/>
+        <link name="MidFingerArth_1_Link"/>
+        <link name="MidEnd_Link"/>
+    </group>
+    <group name="indexWrist">
+        <link name="base_link"/>
+        <link name="WristArth_Link"/>
+        <link name="Palm_Link"/>
+        <link name="IndexFingerArth_4_Link"/>
+        <link name="IndexFingerArth_3_Link"/>
+        <link name="IndexFingerArth_2__Link"/>
+        <link name="IndexFingerArth_1_Link"/>
+        <link name="IndexEnd_Link"/>
+    </group>
+    <group name="fourthWrist">
+        <link name="base_link"/>
+        <link name="WristArth_Link"/>
+        <link name="Palm_Link"/>
+        <link name="FourthFingerArth_4_Link"/>
+        <link name="FourthFingerArth_3_Link"/>
+        <link name="FourthFingerArth_2_Link"/>
+        <link name="FourthFingerArth_1_Link"/>
+        <link name="FourthEnd_Link"/>
+    </group>
+    <group name="littleWrist">
+        <link name="base_link"/>
+        <link name="WristArth_Link"/>
+        <link name="Palm_Link"/>
+        <link name="LittleFingerArth_4_Link"/>
+        <link name="LittleFingerArth_3_Link"/>
+        <link name="LittleFingerArth_2_Link"/>
+        <link name="LittleFingerArth_1_Link"/>
+        <link name="LittleEnd_Link"/>
+    </group>
     <!--GROUP STATES: Purpose: Define a named state for a particular group, in terms of joint values. This is useful to define states like 'folded arms'-->
     <group_state name="r_arm_home" group="r_arm">
         <joint name="FourthFingerArth_1_Joint" value="0"/>
@@ -107,11 +157,17 @@
         <joint name="WristArth_Joint" value="0"/>
     </group_state>
     <!--END EFFECTOR: Purpose: Represent information about an end effector.-->
-    <end_effector name="thumb_end" parent_link="Palm_Link" group="thumb" parent_group="wrist"/>
-    <end_effector name="index_end" parent_link="Palm_Link" group="index" parent_group="wrist"/>
-    <end_effector name="fourth_end" parent_link="Palm_Link" group="fourth" parent_group="wrist"/>
-    <end_effector name="mid_end" parent_link="Palm_Link" group="mid" parent_group="wrist"/>
-    <end_effector name="little_end" parent_link="Palm_Link" group="little" parent_group="wrist"/>
+    <end_effector name="thumb_end" parent_link="ThumbArth_1_Link" group="thumb"/>
+    <end_effector name="index_end" parent_link="IndexFingerArth_1_Link" group="index"/>
+    <end_effector name="fourth_end" parent_link="FourthFingerArth_1_Link" group="fourth"/>
+    <end_effector name="mid_end" parent_link="MidFingerArth_1_Link" group="mid"/>
+    <end_effector name="little_end" parent_link="LittleFingerArth_1_Link" group="little"/>
+    <end_effector name="thumbWrist_end" parent_link="ThumbArth_1_Link" group="thumbWrist"/>
+    <end_effector name="indexWrist_end" parent_link="IndexFingerArth_1_Link" group="indexWrist"/>
+    <end_effector name="fourthWrist_end" parent_link="FourthFingerArth_1_Link" group="fourthWrist"/>
+    <end_effector name="midWrist_end" parent_link="MidFingerArth_1_Link" group="midWrist"/>
+    <end_effector name="littleWrist_end" parent_link="LittleFingerArth_1_Link" group="littleWrist"/>
+    <end_effector name="wrist_end" parent_link="WristArth_Link" group="wrist"/>
     <!--VIRTUAL JOINT: Purpose: this element defines a virtual joint between a robot link and an external frame of reference (considered fixed with respect to the robot)-->
     <virtual_joint name="virtual_joint" type="fixed" parent_frame="r_arm" child_link="base_link"/>
     <!--DISABLE COLLISIONS: By default it is assumed that any link of the robot could potentially come into collision with any other link in the robot. This tag disables collision checking between a specified pair of links. -->

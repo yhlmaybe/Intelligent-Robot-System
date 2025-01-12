@@ -1,5 +1,5 @@
-#ifndef SERVOID
-#define SERVOID
+#ifndef SERVOID_H
+#define SERVOID_H
 
 extern const int RComp_Thumb_Arth_1;
 extern const int RComp_Thumb_Arth_2;

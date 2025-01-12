@@ -1,3 +1,6 @@
+#ifndef MSGMANAGER_H
+#define MSGMANAGER_H
+
 #include <string>
 #include <list>
 
@@ -23,3 +26,5 @@ public:
     static ServoMsg StringToServo(std::string msgXML);
     static std::list<ServoMsg> StringToServos(std::string msgXML);
 };
+
+#endif

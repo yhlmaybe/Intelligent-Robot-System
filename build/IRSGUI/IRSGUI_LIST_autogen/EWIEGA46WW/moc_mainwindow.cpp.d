@@ -8,7 +8,7 @@
   /home/yhlmaybe/Documents/Intelligent-Robot-System/ServoControl/ServoID.h \
   /home/yhlmaybe/Documents/Intelligent-Robot-System/ServoControl/ServoInitiate.h \
   /home/yhlmaybe/Documents/Intelligent-Robot-System/include/IRSFunction.h \
-  /home/yhlmaybe/Documents/Intelligent-Robot-System/include/ROSParametersData.h \
+  /home/yhlmaybe/Documents/Intelligent-Robot-System/include/IRSParametersData.h \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_info__builder.hpp \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_info__functions.h \
   /opt/ros/humble/include/action_msgs/action_msgs/msg/detail/goal_info__struct.h \

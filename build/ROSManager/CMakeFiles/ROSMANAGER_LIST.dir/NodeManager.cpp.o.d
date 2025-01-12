@@ -816,7 +816,7 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: \
  /usr/local/include/python3.10/tracemalloc.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager/../ServoControl/../include/IRSFunction.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager/../ServoControl/ServoID.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager/../include/ROSParametersData.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager/../include/IRSParametersData.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager/../include/IRSFunction.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager/../MathematicalTool/MotionManager.h \
  /opt/ros/humble/include/moveit/planning_interface/planning_interface.h \
@@ -1467,7 +1467,7 @@ ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/NodeManager.cpp.o: \
  /opt/ros/humble/include/tf2_msgs/tf2_msgs/srv/detail/frame_graph__traits.hpp \
  /opt/ros/humble/include/tf2_msgs/tf2_msgs/srv/detail/frame_graph__type_support.hpp \
  /opt/ros/humble/include/moveit_move_group_interface_export.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager/../MathematicalTool/../include/ROSParametersData.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager/../MathematicalTool/../include/IRSParametersData.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager/../MathematicalTool/../include/IRSFunction.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSManager/../MathematicalTool/GeometricManager.h \
  /usr/include/c++/11/complex.h /usr/include/c++/11/ccomplex \

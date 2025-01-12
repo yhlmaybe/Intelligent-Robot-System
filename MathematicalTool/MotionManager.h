@@ -1,3 +1,6 @@
+#ifndef MOTIONMANAGER_H
+#define MOTIONMANAGER_H
+
 #include <string>
 
 #include <urdf/model.h>
@@ -14,38 +17,55 @@
 #include <moveit/robot_model_loader/robot_model_loader.h>
 #include <moveit/move_group_interface/move_group_interface.h>
 
-#include "../include/ROSParametersData.h"
+#include "../include/IRSParametersData.h"
 #include "../include/IRSFunction.h"
 #include "../include/IRSFunction.h"
 
 #include "GeometricManager.h"
 
+enum EndEffectorType 
+{
+    None,
+    WristEnd,
+    ThumbEnd,
+    IndexEnd,
+    FourthEnd,
+    MidEnd,
+    LittleEnd,
+};
+
 class EndEffector
 {
 public:
-    std::string name = "";
+    const EndEffectorType type = EndEffectorType::None;
+    const std::string name = "";
+    const std::string partGroupName = "";
+    const std::string completeGroupName = "";
     bool IsUsed = false;
-    Point3D Coordinate;
-
-    EndEffector(std::string name, double x, double y, double z);
+    EndEffector(std::string name, std::string partGroupName, std::string completeGroupName, EndEffectorType type);
 };
 
 
 class MotionPlanning
 {
 public:
-    std::list<std::shared_ptr<EndEffector>> endEffectors;
-
     MotionPlanning(std::string urdf, std::string srdf);
-    bool EndEffectorPlan(std::shared_ptr<EndEffector> endEffector, Point3D goalPoint);
+    bool EndEffectorPlan(EndEffectorType endEffector, Point3D goalPointRelativeBaseLink);
+    Point3D ConvertPointFromBaseToEndEffector(EndEffectorType endEffector, Point3D point);
+    Point3D ConvertPointFromEndEffectorToBase(EndEffectorType endEffector, Point3D point);
     sensor_msgs::msg::JointState GetCurrentJointStateMsg();
 
+    bool PointInEndEffectorRange(EndEffectorType endEffector, Point3D pointRelativeBaseLink);
 private:
     std::string overallGroupName = "r_arm";
     std::string overallInitPosdName = "r_arm_home";
 
     std::shared_ptr<moveit::core::RobotModel> robot_model;
     std::shared_ptr<moveit::core::RobotState> robot_state;
+
+    std::map<EndEffectorType, std::shared_ptr<EndEffector>> endEffectorsMap;
 };
+
+#endif
 
 

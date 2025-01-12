@@ -1,5 +1,7 @@
-#include <complex.h>
+#ifndef GEOMETRICMANAGER_H
+#define GEOMETRICMANAGER_H
 
+#include <complex.h>
 
 class Vector3D
 {
@@ -24,3 +26,5 @@ public:
 
     double Distance(const Point3D& point) const;
 };
+
+#endif

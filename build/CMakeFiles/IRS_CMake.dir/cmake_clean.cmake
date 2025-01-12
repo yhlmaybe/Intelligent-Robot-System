@@ -1,8 +1,8 @@
 file(REMOVE_RECURSE
   "CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o"
   "CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o.d"
-  "CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o"
-  "CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o.d"
+  "CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o"
+  "CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o.d"
   "CMakeFiles/IRS_CMake.dir/main.cpp.o"
   "CMakeFiles/IRS_CMake.dir/main.cpp.o.d"
   "IRS_CMake"

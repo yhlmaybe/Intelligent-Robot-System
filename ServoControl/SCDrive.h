@@ -1,3 +1,6 @@
+#ifndef SCDRIVE_H
+#define SCDRIVE_H
+
 #include <python3.10/Python.h>
 #include <memory>
 #include <list>
@@ -50,3 +53,4 @@ public:
     static void SetServoPosition(std::list<std::shared_ptr<ServoDriveInfo>> servoInfo);
 };
 
+#endif

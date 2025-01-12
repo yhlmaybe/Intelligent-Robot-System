@@ -1,5 +1,12 @@
 #include "MotionManager.h"
 
+EndEffector::EndEffector(std::string name, std::string partGroupName, std::string completeGroupName, EndEffectorType type)
+{
+    name = name;
+    partGroupName = partGroupName;
+    completeGroupName = completeGroupName;
+    type = type;
+}
 
 MotionPlanning::MotionPlanning(std::string urdf, std::string srdf)
 {
@@ -19,7 +26,51 @@ MotionPlanning::MotionPlanning(std::string urdf, std::string srdf)
     std::vector<srdf::Model::EndEffector> endEffectors = srdf_model->getEndEffectors();
     for (srdf::Model::EndEffector& endEffector : endEffectors)
     {
-        
+        std::string partGroupName = "";
+        std::string completeGroupName = "";
+        EndEffectorType type = EndEffectorType::None;
+        if(endEffector.name_ == "thumb_end")
+        {
+            partGroupName = "thumb";
+            completeGroupName = "thumbWrist";
+            type = EndEffectorType::ThumbEnd;
+        }
+        else if(endEffector.name_ == "index_end")
+        {
+            partGroupName = "index";
+            completeGroupName = "indexWrist";
+            type = EndEffectorType::IndexEnd;
+        }
+        else if(endEffector.name_ == "fourth_end")
+        {
+            partGroupName = "fourth";
+            completeGroupName = "fourthWrist";
+            type = EndEffectorType::FourthEnd;
+        }
+        else if(endEffector.name_ == "mid_end")
+        {
+            partGroupName = "mid";
+            completeGroupName = "midWrist";
+            type = EndEffectorType::MidEnd;
+        }
+        else if(endEffector.name_ == "little_end")
+        {
+            partGroupName = "little";
+            completeGroupName = "littleWrist";
+            type = EndEffectorType::LittleEnd;
+        }
+        else if(endEffector.name_ == "wrist_end")
+        {
+            partGroupName = "wrist";
+            completeGroupName = "wrist";
+            type = EndEffectorType::WristEnd;
+        }
+        else
+        {
+            continue;
+        }
+        std::shared_ptr<EndEffector> endEff= std::make_shared<EndEffector>(endEffector.name_, partGroupName, completeGroupName, type);
+        endEffectorsMap[type] = endEff;
     }
     robot_state->setToDefaultValues();
 }
@@ -33,4 +84,14 @@ sensor_msgs::msg::JointState MotionPlanning::GetCurrentJointStateMsg()
     jointStateMSgs.name = jointNames;
     jointStateMSgs.position = jointPositionsVec;
     return jointStateMSgs;
+}
+
+Point3D MotionPlanning::ConvertPointFromBaseToEndEffector(EndEffectorType endEffector, Point3D point)
+{
+
+}
+
+bool MotionPlanning::EndEffectorPlan(EndEffectorType endEffector, Point3D goalPointRelativeBaseLink)
+{
+
 }

@@ -83,19 +83,19 @@ CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.s"
 	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSFunction.cpp -o CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.s
 
-CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o: CMakeFiles/IRS_CMake.dir/flags.make
-CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o: ../ROSParametersData.cpp
-CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o: CMakeFiles/IRS_CMake.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o -MF CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o.d -o CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o -c /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSParametersData.cpp
+CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o: CMakeFiles/IRS_CMake.dir/flags.make
+CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o: ../IRSParametersData.cpp
+CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o: CMakeFiles/IRS_CMake.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o -MF CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o.d -o CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o -c /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSParametersData.cpp
 
-CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.i"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSParametersData.cpp > CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.i
+CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.i"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSParametersData.cpp > CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.i
 
-CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.s"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/Intelligent-Robot-System/ROSParametersData.cpp -o CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.s
+CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.s"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSParametersData.cpp -o CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.s
 
 CMakeFiles/IRS_CMake.dir/main.cpp.o: CMakeFiles/IRS_CMake.dir/flags.make
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../main.cpp
@@ -114,14 +114,14 @@ CMakeFiles/IRS_CMake.dir/main.cpp.s: cmake_force
 # Object files for target IRS_CMake
 IRS_CMake_OBJECTS = \
 "CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o" \
-"CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o" \
+"CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o" \
 "CMakeFiles/IRS_CMake.dir/main.cpp.o"
 
 # External object files for target IRS_CMake
 IRS_CMake_EXTERNAL_OBJECTS =
 
 IRS_CMake: CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o
-IRS_CMake: CMakeFiles/IRS_CMake.dir/ROSParametersData.cpp.o
+IRS_CMake: CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o
 IRS_CMake: CMakeFiles/IRS_CMake.dir/main.cpp.o
 IRS_CMake: CMakeFiles/IRS_CMake.dir/build.make
 IRS_CMake: ServoControl/libSC_LIST.a

@@ -909,7 +909,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/../../../../IRSGUI/../ROSManager/../ServoControl/SCDrive.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/../../../../IRSGUI/../ROSManager/../ServoControl/../include/IRSFunction.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/../../../../IRSGUI/../ROSManager/../ServoControl/ServoID.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/../../../../IRSGUI/../ROSManager/../include/ROSParametersData.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/../../../../IRSGUI/../ROSManager/../include/IRSParametersData.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/../../../../IRSGUI/../ROSManager/../include/IRSFunction.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/../../../../IRSGUI/../ROSManager/../MathematicalTool/MotionManager.h \
  /opt/ros/humble/include/moveit/planning_interface/planning_interface.h \
@@ -1560,7 +1560,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o: \
  /opt/ros/humble/include/tf2_msgs/tf2_msgs/srv/detail/frame_graph__traits.hpp \
  /opt/ros/humble/include/tf2_msgs/tf2_msgs/srv/detail/frame_graph__type_support.hpp \
  /opt/ros/humble/include/moveit_move_group_interface_export.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/../../../../IRSGUI/../ROSManager/../MathematicalTool/../include/ROSParametersData.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/../../../../IRSGUI/../ROSManager/../MathematicalTool/../include/IRSParametersData.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/../../../../IRSGUI/../ROSManager/../MathematicalTool/../include/IRSFunction.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/EWIEGA46WW/../../../../IRSGUI/../ROSManager/../MathematicalTool/GeometricManager.h \
  /usr/include/c++/11/complex.h /usr/include/c++/11/ccomplex \
