@@ -79,6 +79,7 @@
         "stop_token": "cpp",
         "variant": "cpp",
         "regex": "cpp",
-        "any": "cpp"
+        "any": "cpp",
+        "valarray": "cpp"
     }
 }

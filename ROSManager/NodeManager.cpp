@@ -93,6 +93,8 @@ UrdfPublisherNode::UrdfPublisherNode() : Node(URDF_PUBLISHER)
         insrdf.close();
     }
 
+    ROSNodeManager::motionPlanning = std::make_shared<MotionPlanning>(URDF_XML, SRDF_XML);
+
     tf_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(this);
     static_tf_broadcaster = std::make_unique<tf2_ros::StaticTransformBroadcaster>(this);
 
@@ -304,11 +306,7 @@ void ROSNodeManager::StartNodes(std::list<std::shared_ptr<Servo>> servos)
     if(!servoDriveNodeListenerNode)
     {
         StartROSServoDriveListenerNode(servos);
-    }
-    if(!motionPlanning)
-    {
-        motionPlanning = std::make_shared<MotionPlanning>(URDF_XML, SRDF_XML);
-    }
+    }   
     if(!jointStatePublisherNode)
     {
         StartJointStatePublisherNode();

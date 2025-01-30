@@ -153,11 +153,11 @@
 		"/opt/ros/humble/include",
 		"/usr/include",
 		"/usr/include/x86_64-linux-gnu",
+		"/usr/local/include",
 		"/usr/include/c++/11",
 		"/usr/include/x86_64-linux-gnu/c++/11",
 		"/usr/include/c++/11/backward",
-		"/usr/lib/gcc/x86_64-linux-gnu/11/include",
-		"/usr/local/include"
+		"/usr/lib/gcc/x86_64-linux-gnu/11/include"
 	],
 	"MOC_MACRO_NAMES" : [ "Q_OBJECT", "Q_GADGET", "Q_NAMESPACE", "Q_NAMESPACE_EXPORT" ],
 	"MOC_OPTIONS" : [],

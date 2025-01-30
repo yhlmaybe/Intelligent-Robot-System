@@ -1,6 +1,6 @@
 file(REMOVE_RECURSE
-  "CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o"
-  "CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o.d"
+  "CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o"
+  "CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o.d"
   "CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o"
   "CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o.d"
   "libMATHEMATICALTOOL_LIST.a"

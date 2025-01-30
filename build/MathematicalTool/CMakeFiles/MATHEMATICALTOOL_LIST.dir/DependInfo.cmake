@@ -8,7 +8,7 @@ set(CMAKE_DEPENDS_LANGUAGES
 
 # The set of dependency files which are needed:
 set(CMAKE_DEPENDS_DEPENDENCY_FILES
-  "/home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/GeometricManager.cpp" "MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o" "gcc" "MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o.d"
+  "/home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/KinematicTool.cpp" "MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o" "gcc" "MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o.d"
   "/home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/MotionManager.cpp" "MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o" "gcc" "MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o.d"
   )
 

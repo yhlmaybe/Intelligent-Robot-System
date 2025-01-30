@@ -205,29 +205,29 @@ MATHEMATICALTOOL_LIST/fast:
 	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build
 .PHONY : MATHEMATICALTOOL_LIST/fast
 
-GeometricManager.o: GeometricManager.cpp.o
-.PHONY : GeometricManager.o
+KinematicTool.o: KinematicTool.cpp.o
+.PHONY : KinematicTool.o
 
 # target to build an object file
-GeometricManager.cpp.o:
-	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o
-.PHONY : GeometricManager.cpp.o
+KinematicTool.cpp.o:
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o
+.PHONY : KinematicTool.cpp.o
 
-GeometricManager.i: GeometricManager.cpp.i
-.PHONY : GeometricManager.i
+KinematicTool.i: KinematicTool.cpp.i
+.PHONY : KinematicTool.i
 
 # target to preprocess a source file
-GeometricManager.cpp.i:
-	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.i
-.PHONY : GeometricManager.cpp.i
+KinematicTool.cpp.i:
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.i
+.PHONY : KinematicTool.cpp.i
 
-GeometricManager.s: GeometricManager.cpp.s
-.PHONY : GeometricManager.s
+KinematicTool.s: KinematicTool.cpp.s
+.PHONY : KinematicTool.s
 
 # target to generate assembly for a file
-GeometricManager.cpp.s:
-	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.s
-.PHONY : GeometricManager.cpp.s
+KinematicTool.cpp.s:
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.s
+.PHONY : KinematicTool.cpp.s
 
 MotionManager.o: MotionManager.cpp.o
 .PHONY : MotionManager.o
@@ -269,9 +269,9 @@ help:
 	@echo "... rebuild_cache"
 	@echo "... test"
 	@echo "... MATHEMATICALTOOL_LIST"
-	@echo "... GeometricManager.o"
-	@echo "... GeometricManager.i"
-	@echo "... GeometricManager.s"
+	@echo "... KinematicTool.o"
+	@echo "... KinematicTool.i"
+	@echo "... KinematicTool.s"
 	@echo "... MotionManager.o"
 	@echo "... MotionManager.i"
 	@echo "... MotionManager.s"

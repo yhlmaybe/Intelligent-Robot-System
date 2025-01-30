@@ -16,6 +16,21 @@ void IRS_MESSAGE(std::string message)
     }  
 }
 
+void IRS_MESSAGE(const char* format, ...) 
+{
+    va_list args;
+    va_start(args, format);
+    int size = std::vsnprintf(nullptr, 0, format, args) + 1; 
+    va_end(args);
+    char* buffer = new char[size];
+    va_start(args, format);
+    std::vsnprintf(buffer, size, format, args);
+    va_end(args);
+    std::string result(buffer);
+    delete[] buffer;
+    IRS_MESSAGE(result);
+}
+
 MainWindow* MainWindow::GetInstance()
 {
     static MainWindow instance;

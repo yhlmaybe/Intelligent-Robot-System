@@ -69,19 +69,19 @@ include MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/progress.make
 # Include the compile flags for this target's objects.
 include MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/flags.make
 
-MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/flags.make
-MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o: ../MathematicalTool/GeometricManager.cpp
-MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o"
-	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o -MF CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o.d -o CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o -c /home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/GeometricManager.cpp
+MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/flags.make
+MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o: ../MathematicalTool/KinematicTool.cpp
+MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o"
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o -MF CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o.d -o CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o -c /home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/KinematicTool.cpp
 
-MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.i"
-	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/GeometricManager.cpp > CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.i
+MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.i"
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/KinematicTool.cpp > CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.i
 
-MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.s"
-	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/GeometricManager.cpp -o CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.s
+MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.s"
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/KinematicTool.cpp -o CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.s
 
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/flags.make
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o: ../MathematicalTool/MotionManager.cpp
@@ -99,13 +99,13 @@ MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.s: cmake
 
 # Object files for target MATHEMATICALTOOL_LIST
 MATHEMATICALTOOL_LIST_OBJECTS = \
-"CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o" \
+"CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o" \
 "CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o"
 
 # External object files for target MATHEMATICALTOOL_LIST
 MATHEMATICALTOOL_LIST_EXTERNAL_OBJECTS =
 
-MathematicalTool/libMATHEMATICALTOOL_LIST.a: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/GeometricManager.cpp.o
+MathematicalTool/libMATHEMATICALTOOL_LIST.a: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o
 MathematicalTool/libMATHEMATICALTOOL_LIST.a: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o
 MathematicalTool/libMATHEMATICALTOOL_LIST.a: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make
 MathematicalTool/libMATHEMATICALTOOL_LIST.a: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/link.txt
