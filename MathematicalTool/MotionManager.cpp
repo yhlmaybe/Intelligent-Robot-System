@@ -7,6 +7,7 @@ EndEffector::EndEffector(std::string URDF, std::string name, std::string partGro
     completeGroupName = completeGroupName;
     type = type;
     partGroupIkSolver = std::make_shared<IRS_IK::IRS_IK>(partGroupFirstLinkName, name, URDF);
+    completeGroupIkSolver = std::make_shared<IRS_IK::IRS_IK>(completeGroupFirstLinkName, name, URDF);
 }
 
 MotionPlanning::MotionPlanning(std::string urdf, std::string srdf)
@@ -166,7 +167,6 @@ bool MotionPlanning::JointIKCal(std::map<std::string, double>& result, EndEffect
 
 bool MotionPlanning::PlanAndExecute(std::map<std::string, double> goalNameAngles)
 {
-    
 
 }
 

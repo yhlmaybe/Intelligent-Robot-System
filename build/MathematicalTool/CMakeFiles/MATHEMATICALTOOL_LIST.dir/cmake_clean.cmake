@@ -3,6 +3,8 @@ file(REMOVE_RECURSE
   "CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o.d"
   "CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o"
   "CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o.d"
+  "CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.o"
+  "CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.o.d"
   "libMATHEMATICALTOOL_LIST.a"
   "libMATHEMATICALTOOL_LIST.pdb"
 )

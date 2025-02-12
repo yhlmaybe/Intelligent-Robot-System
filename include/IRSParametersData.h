@@ -17,6 +17,8 @@ extern std::string URDF_XML;
 
 extern std::string SRDF_XML;
 
+extern std::string IRS_GROUP_NAME;
+
 class InitiateManager
 {
 public:

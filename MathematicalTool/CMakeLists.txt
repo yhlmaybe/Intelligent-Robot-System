@@ -22,6 +22,7 @@ target_link_libraries(MATHEMATICALTOOL_LIST
     /opt/ros/humble/lib/libmoveit_exceptions.so
     /usr/local/lib/libnlopt.so)
 
+include_directories(/usr/include/ompl-1.5)
 
 ament_target_dependencies(MATHEMATICALTOOL_LIST 
     urdf

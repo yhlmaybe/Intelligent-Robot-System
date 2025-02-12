@@ -253,6 +253,30 @@ MotionManager.cpp.s:
 	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.s
 .PHONY : MotionManager.cpp.s
 
+PlanningTool.o: PlanningTool.cpp.o
+.PHONY : PlanningTool.o
+
+# target to build an object file
+PlanningTool.cpp.o:
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.o
+.PHONY : PlanningTool.cpp.o
+
+PlanningTool.i: PlanningTool.cpp.i
+.PHONY : PlanningTool.i
+
+# target to preprocess a source file
+PlanningTool.cpp.i:
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.i
+.PHONY : PlanningTool.cpp.i
+
+PlanningTool.s: PlanningTool.cpp.s
+.PHONY : PlanningTool.s
+
+# target to generate assembly for a file
+PlanningTool.cpp.s:
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.s
+.PHONY : PlanningTool.cpp.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -275,6 +299,9 @@ help:
 	@echo "... MotionManager.o"
 	@echo "... MotionManager.i"
 	@echo "... MotionManager.s"
+	@echo "... PlanningTool.o"
+	@echo "... PlanningTool.i"
+	@echo "... PlanningTool.s"
 .PHONY : help
 
 
