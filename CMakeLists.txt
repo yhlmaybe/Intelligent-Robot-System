@@ -33,7 +33,11 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/IRSGUI
 )
 
+include_directories(/usr/include/ompl-1.5)
+
 add_executable(IRS_CMake ${IRS_LIST})
+
+target_link_libraries(IRS_CMake /usr/lib/x86_64-linux-gnu/libccd.so.2)
 
 target_link_libraries(IRS_CMake SC_LIST)
 target_link_libraries(IRS_CMake IRSGUI_LIST)

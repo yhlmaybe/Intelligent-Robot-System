@@ -29,6 +29,10 @@ namespace PlanningTool
             }
         }
         allowSelfFclCollPairs = GetSelfAllowLinkFclColls();
+
+        robotManager = std::make_shared<fcl::DynamicAABBTreeCollisionManagerd>();
+        robotManager->registerObjects(collObjs);
+        robotManager->update();
     }
 
     FCLTool::~FCLTool()
@@ -89,12 +93,9 @@ namespace PlanningTool
 
     bool FCLTool::IsEnvCollision(std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager)
     {      
-        fcl::DynamicAABBTreeCollisionManagerd robotManager;
-        robotManager.registerObjects(collObjs);
-        robotManager.update();
-
+        robotManager->update();
         CollisionData cdata;
-        envManager->collide(&robotManager ,&cdata, fcl::DefaultCollisionFunction);
+        envManager->collide(robotManager.get() ,&cdata, fcl::DefaultCollisionFunction);
         if(cdata.result.isCollision()) return true;
         return false;
     }
@@ -129,7 +130,7 @@ namespace PlanningTool
         return collObjs;
     }
 
-    void FCLTool::UpdateLInkTF(std::vector<std::string> linkNames, std::vector<Eigen::Isometry3d> tfs)
+    void FCLTool::UpdateLinkTF(std::vector<std::string> linkNames, std::vector<Eigen::Isometry3d> tfs)
     {
         for (size_t i = 0; i < linkNames.size(); ++i)
         {      
@@ -137,7 +138,7 @@ namespace PlanningTool
         }
     }
 
-    void FCLTool::UpdateLInkTF(moveit::core::RobotState state)
+    void FCLTool::UpdateLinkTF(moveit::core::RobotState state)
     {
         std::vector<moveit::core::LinkModel *> linkModels = robotModel->getLinkModels();
         for (auto linkModel : linkModels)
@@ -147,7 +148,7 @@ namespace PlanningTool
         }
     }
 
-    void FCLTool::UpdateLInkTF(moveit::core::RobotState state, std::vector<std::string> linkNames)
+    void FCLTool::UpdateLinkTF(moveit::core::RobotState state, std::vector<std::string> linkNames)
     {
         for (auto name : linkNames)
         {
@@ -232,7 +233,7 @@ namespace PlanningTool
       
         robotState->updateLinkTransforms();
 
-        fclTool->UpdateLInkTF(*robotState, linkNames);
+        fclTool->UpdateLinkTF(*robotState, linkNames);
 
         bool isSelfColl = fclTool->IsSelfCollision();
 
@@ -268,7 +269,7 @@ namespace PlanningTool
 
     ompl::base::PathPtr OMPLTool::plan(std::shared_ptr<moveit::core::RobotState> robotState, std::vector<std::string> goalJointNames, std::vector<double> goalJointAngles)
     {   
-        fclTool->UpdateLInkTF(*robotState);
+        fclTool->UpdateLinkTF(*robotState);
 
         int dimsion = goalJointNames.size();
         size_t count = goalJointNames.size();

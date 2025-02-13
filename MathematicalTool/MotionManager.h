@@ -25,6 +25,7 @@
 
 #include "Math3D.h"
 #include "KinematicTool.h"
+#include "PlanningTool.h"
 
 enum EndEffectorType 
 {
@@ -64,6 +65,8 @@ public:
     bool JointIKCal(std::map<std::string, double>& result, EndEffectorType endEffector, Eigen::Isometry3d pointRelativeEndEff, bool isPart);
     bool PlanAndExecute(std::map<std::string, double> goalNameAngles);
 
+    void UpDateEnvironment(std::vector<Eigen::Vector3d> pointClouds);
+
 private:
     std::string overallGroupName = "r_arm";
     std::string overallInitPosdName = "r_arm_home";
@@ -75,6 +78,12 @@ private:
 
     Eigen::Isometry3d ConvertToIsometry3d(KDL::Frame frame);
     KDL::Frame ConvertToFrame(Eigen::Isometry3d Isometry3d);
+
+    std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager;
+    std::vector<std::shared_ptr<fcl::CollisionObjectd>> envCollObjs;
+    std::shared_ptr<fcl::Sphered> sharedSphere;
+
+    std::shared_ptr<PlanningTool::OMPLTool> omplTool;
 };
 
 #endif

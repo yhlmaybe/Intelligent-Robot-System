@@ -14,15 +14,19 @@ find_package(tf2_ros REQUIRED)
 find_package(moveit_msgs REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(kdl_parser REQUIRED)
+find_package(ompl REQUIRED)
+
+target_link_libraries(MATHEMATICALTOOL_LIST ${OMPL_LIBRARIES})
 
 target_link_libraries(MATHEMATICALTOOL_LIST 
     /opt/ros/humble/lib/libmoveit_robot_model.so
     /opt/ros/humble/lib/libsrdfdom.so
     /opt/ros/humble/lib/libmoveit_robot_state.so
     /opt/ros/humble/lib/libmoveit_exceptions.so
-    /usr/local/lib/libnlopt.so)
+    /usr/local/lib/libnlopt.so
+    /usr/local/lib/libfcl.so.0.7)
 
-include_directories(/usr/include/ompl-1.5)
+include_directories(/usr/lib/aarch64-linux-gnu)
 
 ament_target_dependencies(MATHEMATICALTOOL_LIST 
     urdf

@@ -47,9 +47,9 @@ namespace PlanningTool
         bool IsEnvCollision(std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager);
         void SetCollObjTF(std::string name, Eigen::Isometry3d tf);
         std::vector<fcl::CollisionObjectd*> GetCollObj();
-        void UpdateLInkTF(std::vector<std::string> names, std::vector<Eigen::Isometry3d> tfs);
-        void UpdateLInkTF(moveit::core::RobotState state);
-        void UpdateLInkTF(moveit::core::RobotState state, std::vector<std::string> names);
+        void UpdateLinkTF(std::vector<std::string> names, std::vector<Eigen::Isometry3d> tfs);
+        void UpdateLinkTF(moveit::core::RobotState state);
+        void UpdateLinkTF(moveit::core::RobotState state, std::vector<std::string> names);
 
     private:
         std::shared_ptr<fcl::CollisionGeometryd> CreateFCLGeometry(shapes::ShapeConstPtr& shape); 
@@ -57,6 +57,7 @@ namespace PlanningTool
 
         std::shared_ptr<moveit::core::RobotModel> robotModel;
         std::vector<fcl::CollisionObjectd*> collObjs;
+        std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> robotManager;
         std::vector<std::pair<std::vector<fcl::CollisionObjectd*>, std::vector<fcl::CollisionObjectd*>>> allowSelfFclCollPairs;
         std::unordered_map<std::string, std::vector<fcl::CollisionObjectd*>> linkFclCollisions;
         std::unordered_map<std::string, std::vector<LinkCollisionObject>> linkCollisions;
@@ -92,8 +93,6 @@ private:
         ompl::base::PathPtr plan(std::shared_ptr<moveit::core::RobotState> robotState, std::vector<std::string> goalJointNames, std::vector<double> goalJointAngles);
 
     private:
-        void UpdateCollisionTF();
-
         std::shared_ptr<moveit::core::RobotModel> robotModel;
         std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager;
         std::map<std::string, moveit::core::VariableBounds> jointBounds;

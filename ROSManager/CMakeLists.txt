@@ -16,7 +16,6 @@ find_package(robot_state_publisher REQUIRED)
 
 message("CMAKElujing: ${CMAKE_MODULE_PATH}")
 
-include_directories(/usr/lib/aarch64-linux-gnu)
 
 ament_target_dependencies(ROSMANAGER_LIST 
     rclcpp

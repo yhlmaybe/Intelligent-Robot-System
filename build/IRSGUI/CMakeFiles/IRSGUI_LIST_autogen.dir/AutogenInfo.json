@@ -86,6 +86,7 @@
 		"/home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI",
 		"/home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI",
 		"/home/yhlmaybe/Documents/Intelligent-Robot-System/include",
+		"/usr/include/ompl-1.5",
 		"/usr/include/x86_64-linux-gnu/qt5",
 		"/usr/include/x86_64-linux-gnu/qt5/QtCore",
 		"/usr/lib/x86_64-linux-gnu/qt5/mkspecs/linux-g++",

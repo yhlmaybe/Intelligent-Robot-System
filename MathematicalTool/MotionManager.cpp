@@ -90,6 +90,10 @@ MotionPlanning::MotionPlanning(std::string urdf, std::string srdf)
     }
 
     robotState->setToDefaultValues();
+
+    sharedSphere = std::make_shared<fcl::Sphered>(0.01);
+    envManager = std::make_shared<fcl::DynamicAABBTreeCollisionManagerd>();
+    omplTool = std::make_shared<PlanningTool::OMPLTool>(robotModel, envManager);
 }
 
 sensor_msgs::msg::JointState MotionPlanning::GetCurrentJointStateMsg()
@@ -158,9 +162,9 @@ bool MotionPlanning::JointIKCal(std::map<std::string, double>& result, EndEffect
     KDL::Frame endEffectorPose = ConvertToFrame(poseRelFirstLink);  
     KDL::JntArray angle(chain.getNrOfJoints());
     int rc = ik->CartToJnt(nominal, endEffectorPose, angle);
-    for (size_t i = 0; i < chain.getNrOfJoints(); ++i)
+    for (size_t i = 0; i < jointNames.size(); ++i)
     {
-        result[chain.getSegment(i).getName()] = (angle(i));
+        result[jointNames[i]] = (angle(i));
     }
     return rc == 0;
 }
@@ -168,6 +172,11 @@ bool MotionPlanning::JointIKCal(std::map<std::string, double>& result, EndEffect
 bool MotionPlanning::PlanAndExecute(std::map<std::string, double> goalNameAngles)
 {
 
+}
+
+void MotionPlanning::UpDateEnvironment(std::vector<Eigen::Vector3d> pointClouds)
+{
+    
 }
 
 Eigen::Isometry3d MotionPlanning::ConvertToIsometry3d(KDL::Frame frame)
