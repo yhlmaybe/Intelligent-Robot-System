@@ -253,29 +253,29 @@ ServoID.cpp.s:
 	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.s
 .PHONY : ServoID.cpp.s
 
-ServoInitiate.o: ServoInitiate.cpp.o
-.PHONY : ServoInitiate.o
+ServoManager.o: ServoManager.cpp.o
+.PHONY : ServoManager.o
 
 # target to build an object file
-ServoInitiate.cpp.o:
-	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o
-.PHONY : ServoInitiate.cpp.o
+ServoManager.cpp.o:
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoManager.cpp.o
+.PHONY : ServoManager.cpp.o
 
-ServoInitiate.i: ServoInitiate.cpp.i
-.PHONY : ServoInitiate.i
+ServoManager.i: ServoManager.cpp.i
+.PHONY : ServoManager.i
 
 # target to preprocess a source file
-ServoInitiate.cpp.i:
-	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.i
-.PHONY : ServoInitiate.cpp.i
+ServoManager.cpp.i:
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoManager.cpp.i
+.PHONY : ServoManager.cpp.i
 
-ServoInitiate.s: ServoInitiate.cpp.s
-.PHONY : ServoInitiate.s
+ServoManager.s: ServoManager.cpp.s
+.PHONY : ServoManager.s
 
 # target to generate assembly for a file
-ServoInitiate.cpp.s:
-	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.s
-.PHONY : ServoInitiate.cpp.s
+ServoManager.cpp.s:
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/ServoManager.cpp.s
+.PHONY : ServoManager.cpp.s
 
 # Help Target
 help:
@@ -299,9 +299,9 @@ help:
 	@echo "... ServoID.o"
 	@echo "... ServoID.i"
 	@echo "... ServoID.s"
-	@echo "... ServoInitiate.o"
-	@echo "... ServoInitiate.i"
-	@echo "... ServoInitiate.s"
+	@echo "... ServoManager.o"
+	@echo "... ServoManager.i"
+	@echo "... ServoManager.s"
 .PHONY : help
 
 

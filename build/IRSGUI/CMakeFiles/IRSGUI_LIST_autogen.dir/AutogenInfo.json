@@ -67,12 +67,20 @@
 	"MOC_DEFINITIONS" : 
 	[
 		"BOOST_ALL_NO_LIB",
+		"BOOST_DATE_TIME_DYN_LINK",
 		"BOOST_FILESYSTEM_DYN_LINK",
+		"BOOST_IOSTREAMS_DYN_LINK",
+		"BOOST_SERIALIZATION_DYN_LINK",
+		"BOOST_SYSTEM_DYN_LINK",
 		"DEFAULT_RMW_IMPLEMENTATION=rmw_fastrtps_cpp",
+		"DISABLE_PCAP",
 		"QT_CORE_LIB",
 		"QT_GUI_LIB",
+		"QT_OPENGL_LIB",
 		"QT_WIDGETS_LIB",
-		"RCUTILS_ENABLE_FAULT_INJECTION"
+		"RCUTILS_ENABLE_FAULT_INJECTION",
+		"TBB_USE_DEBUG",
+		"kiss_fft_scalar=double"
 	],
 	"MOC_DEPEND_FILTERS" : 
 	[
@@ -150,6 +158,13 @@
 		"/opt/ros/humble/include/object_recognition_msgs",
 		"/opt/ros/humble/include/octomap_msgs",
 		"/opt/ros/humble/include/trajectory_msgs",
+		"/usr/include/pcl-1.12",
+		"/usr/include/ni",
+		"/usr/include/openni2",
+		"/usr/include/vtk-9.1",
+		"/usr/include/jsoncpp",
+		"/usr/include/freetype2",
+		"/usr/include/x86_64-linux-gnu/qt5/QtOpenGL",
 		"/opt/ros/humble/include/geometric_shapes",
 		"/opt/ros/humble/include",
 		"/usr/include",

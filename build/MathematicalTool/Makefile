@@ -277,6 +277,30 @@ PlanningTool.cpp.s:
 	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.s
 .PHONY : PlanningTool.cpp.s
 
+PointCloudTool.o: PointCloudTool.cpp.o
+.PHONY : PointCloudTool.o
+
+# target to build an object file
+PointCloudTool.cpp.o:
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.o
+.PHONY : PointCloudTool.cpp.o
+
+PointCloudTool.i: PointCloudTool.cpp.i
+.PHONY : PointCloudTool.i
+
+# target to preprocess a source file
+PointCloudTool.cpp.i:
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.i
+.PHONY : PointCloudTool.cpp.i
+
+PointCloudTool.s: PointCloudTool.cpp.s
+.PHONY : PointCloudTool.s
+
+# target to generate assembly for a file
+PointCloudTool.cpp.s:
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build && $(MAKE) $(MAKESILENT) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.s
+.PHONY : PointCloudTool.cpp.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -302,6 +326,9 @@ help:
 	@echo "... PlanningTool.o"
 	@echo "... PlanningTool.i"
 	@echo "... PlanningTool.s"
+	@echo "... PointCloudTool.o"
+	@echo "... PointCloudTool.i"
+	@echo "... PointCloudTool.s"
 .PHONY : help
 
 

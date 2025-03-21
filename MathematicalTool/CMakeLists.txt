@@ -15,8 +15,10 @@ find_package(moveit_msgs REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(kdl_parser REQUIRED)
 find_package(ompl REQUIRED)
+find_package(PCL REQUIRED)
 
 target_link_libraries(MATHEMATICALTOOL_LIST ${OMPL_LIBRARIES})
+target_link_libraries(MATHEMATICALTOOL_LIST ${PCL_LIBRARIES})
 
 target_link_libraries(MATHEMATICALTOOL_LIST 
     /opt/ros/humble/lib/libmoveit_robot_model.so

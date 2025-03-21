@@ -6,5 +6,5 @@
 # testing this directory and lists subdirectories to be tested as well.
 subdirs("ServoControl")
 subdirs("IRSGUI")
-subdirs("ROSManager")
+subdirs("IRSManager")
 subdirs("MathematicalTool")

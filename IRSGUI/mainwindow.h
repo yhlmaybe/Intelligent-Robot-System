@@ -8,7 +8,7 @@
 #include <QSharedMemory>
 #include <QMessageBox>
 
-#include "../ROSManager/NodeManager.h"
+#include "../IRSManager/IRSCoreManager.h"
 #include "../include/IRSFunction.h"
 
 namespace Ui {
@@ -23,6 +23,8 @@ public:
     static MainWindow* GetInstance();
     Ui::MainWindow* GetUI();
 
+    void SetMessage(std::string message);
+
 private:
     explicit MainWindow(QWidget *parent = 0);
     ~MainWindow();
@@ -31,15 +33,9 @@ private:
 
     Ui::MainWindow *ui;
 
-    bool isInitROSNode = false;
+    std::shared_ptr<std::mutex> message_mtx;
 
-    bool isInitServos = false;
-
-    std::list<std::shared_ptr<Servo>> servos;
-
-    void Initiate();
-
-    void Message(std::string message);
+    bool is_running = false;
 
 private slots:
 
@@ -47,11 +43,17 @@ private slots:
 
     void GetServoNo();
 
-    void ROSNodeInitiate();
+    void Initiate();
 
-    void ROSNodeEnd();
+    void Start();
 
-    void ServosInitiate();
+    void End();
+
+    void StateReset();
+
+    void SetJointPosition();
+
+    void SetGoalPoint();
 };
 
 #endif // MAINWINDOW_H

@@ -608,17 +608,17 @@ IRSGUI_LIST_autogen/fast:
 .PHONY : IRSGUI_LIST_autogen/fast
 
 #=============================================================================
-# Target rules for targets named ROSMANAGER_LIST
+# Target rules for targets named IRSMANAGER_LIST
 
 # Build rule for target.
-ROSMANAGER_LIST: cmake_check_build_system
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 ROSMANAGER_LIST
-.PHONY : ROSMANAGER_LIST
+IRSMANAGER_LIST: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 IRSMANAGER_LIST
+.PHONY : IRSMANAGER_LIST
 
 # fast build rule for target.
-ROSMANAGER_LIST/fast:
-	$(MAKE) $(MAKESILENT) -f ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/build.make ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/build
-.PHONY : ROSMANAGER_LIST/fast
+IRSMANAGER_LIST/fast:
+	$(MAKE) $(MAKESILENT) -f IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/build.make IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/build
+.PHONY : IRSMANAGER_LIST/fast
 
 #=============================================================================
 # Target rules for targets named uninstall
@@ -630,7 +630,7 @@ uninstall: cmake_check_build_system
 
 # fast build rule for target.
 uninstall/fast:
-	$(MAKE) $(MAKESILENT) -f ROSManager/CMakeFiles/uninstall.dir/build.make ROSManager/CMakeFiles/uninstall.dir/build
+	$(MAKE) $(MAKESILENT) -f IRSManager/CMakeFiles/uninstall.dir/build.make IRSManager/CMakeFiles/uninstall.dir/build
 .PHONY : uninstall/fast
 
 #=============================================================================
@@ -643,7 +643,7 @@ intelligent_robot_system_uninstall: cmake_check_build_system
 
 # fast build rule for target.
 intelligent_robot_system_uninstall/fast:
-	$(MAKE) $(MAKESILENT) -f ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build.make ROSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build
+	$(MAKE) $(MAKESILENT) -f IRSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build.make IRSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/build
 .PHONY : intelligent_robot_system_uninstall/fast
 
 #=============================================================================
@@ -778,9 +778,9 @@ help:
 	@echo "... intelligent_robot_system_uninstall"
 	@echo "... uninstall"
 	@echo "... IRSGUI_LIST"
+	@echo "... IRSMANAGER_LIST"
 	@echo "... IRS_CMake"
 	@echo "... MATHEMATICALTOOL_LIST"
-	@echo "... ROSMANAGER_LIST"
 	@echo "... SC_LIST"
 	@echo "... IRSFunction.o"
 	@echo "... IRSFunction.i"

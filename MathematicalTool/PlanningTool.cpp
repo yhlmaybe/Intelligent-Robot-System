@@ -246,10 +246,9 @@ namespace PlanningTool
         return true;
     }
 
-    OMPLTool::OMPLTool(std::shared_ptr<moveit::core::RobotModel> robotModel, std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd>  envManager)
+    OMPLTool::OMPLTool(std::shared_ptr<moveit::core::RobotModel> robotModel)
     {   
         robotModel = robotModel;
-        envManager = envManager;
         fclTool = std::make_shared<FCLTool>(robotModel, IRS_GROUP_NAME);
 
         moveit::core::JointModelGroup* group = robotModel->getJointModelGroup(IRS_GROUP_NAME);
@@ -267,7 +266,7 @@ namespace PlanningTool
         }
     }
 
-    ompl::base::PathPtr OMPLTool::plan(std::shared_ptr<moveit::core::RobotState> robotState, std::vector<std::string> goalJointNames, std::vector<double> goalJointAngles)
+    ompl::base::PathPtr OMPLTool::Plan(std::shared_ptr<moveit::core::RobotState> robotState, std::vector<std::string> goalJointNames, std::vector<double> goalJointPositions, std::vector<Eigen::Vector3d> envPointClouds)
     {   
         fclTool->UpdateLinkTF(*robotState);
 
@@ -306,7 +305,7 @@ namespace PlanningTool
 
         ompl::base::ScopedState<> goal(space);
         for (size_t i = 0; i < count; ++i)
-            goal[i] = goalJointAngles[i];
+            goal[i] = goalJointPositions[i];
 
         pdef->setStartAndGoalStates(start, goal);
 
@@ -319,6 +318,7 @@ namespace PlanningTool
             linkNames.push_back(jm->getChildLinkModel()->getName());
         }
 
+        std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager = GetAABBEnvManager(envPointClouds);
         ss->setStateValidityChecker(std::make_shared<CustomStateValidator>(ss, linkNames, goalJointNames, planState, fclTool, envManager));
 
         std::shared_ptr<ompl::geometric::RRTConnect> planner(std::make_shared<ompl::geometric::RRTConnect>(ss));
@@ -336,5 +336,58 @@ namespace PlanningTool
             return path;
         }
         return nullptr;
+    }
+
+    std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> OMPLTool::GetAABBEnvManager(std::vector<Eigen::Vector3d> envPointClouds)
+    {
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloudPoints = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+
+        for (auto point : envPointClouds)
+        {
+            pcl::PointXYZ pclPoint;
+            pclPoint.x = point.x();
+            pclPoint.y = point.y();
+            pclPoint.z = point.z();
+            cloudPoints->points.push_back(pclPoint);
+        }
+
+        std::shared_ptr<pcl::PolygonMesh> mesh = PointCloudTool::Date::GenerateMesh(cloudPoints);
+
+        if (mesh->polygons.empty()) 
+        {
+            throw std::runtime_error("Mesh reconstruction failed");
+        }
+
+        pcl::PointCloud<pcl::PointXYZ> meshVertices;
+        pcl::fromPCLPointCloud2(mesh->cloud, meshVertices);
+
+        std::shared_ptr<fcl::BVHModel<fcl::AABBd>> bvhModel = std::make_shared<fcl::BVHModel<fcl::AABBd>>();
+        bvhModel->beginModel();
+
+        for (auto &polygon : mesh->polygons)
+        {
+            if (polygon.vertices.size() != 3)
+            {
+                continue; 
+            }
+
+            auto &p0 = meshVertices[polygon.vertices[0]];
+            auto &p1 = meshVertices[polygon.vertices[1]];
+            auto &p2 = meshVertices[polygon.vertices[2]];
+
+            bvhModel->addTriangle({p0.x, p0.y, p0.z}, {p1.x, p1.y, p1.z}, {p2.x, p2.y, p2.z});
+        }
+
+        if (!bvhModel->endModel())
+        {
+            throw std::runtime_error("Failed to build FCL BVH model");
+        }
+
+        std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager = std::make_shared<fcl::DynamicAABBTreeCollisionManagerd>();
+        
+        envManager->registerObject(std::make_shared<fcl::CollisionObjectd>(bvhModel).get());
+        envManager->update();
+
+        return envManager;
     }
 }

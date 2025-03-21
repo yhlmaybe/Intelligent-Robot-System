@@ -8,7 +8,7 @@ std::string URDF_XML = "";
 
 std::string SRDF_XML = "";
 
-std::string COMPONENT_ROTATE_STATE_PUBLISHER = "";
+std::string MOTION_MANAGER = "";
 
 std::string IRS_GROUP_NAME = "";
 
@@ -16,13 +16,39 @@ int TIMEINTERVAL = 0;
 
 double DEGREE_TO_ROTATE_PARAMETER = 0;
 
+double ANGLE_TO_RADIAN = 0;
+
+double SERVO_LINE_TO_ANGLE = 0;
+
+double SERVO_MAX_ANGLEVELOCITY = 0;
+
+double SERVO_MAX_POSITION = 0;
+
+double SERVO_MIN_POSITION = 0;
+
+double SERVO_INITIAL_POSITION = 0;
+
 void InitiateManager::Initial()
 {
     SERVE_DRIVE_LISTENER = "serve_drive_listener";
     URDF_PUBLISHER = "urdf_publisher";
-    COMPONENT_ROTATE_STATE_PUBLISHER = "component_rotate_state_publisher";
+    MOTION_MANAGER = "motion_manager";
     IRS_GROUP_NAME = "r_arm";
 
     DEGREE_TO_ROTATE_PARAMETER = 1000 / 240;
+
+    SERVO_LINE_TO_ANGLE = (1 / 7/*rervo r = 7mm*/) * (180 / 3.14159265358979323846);
+
     TIMEINTERVAL = 100;
+
+    ANGLE_TO_RADIAN = 3.14159265358979323846 / 180.0;
+
+    SERVO_MAX_ANGLEVELOCITY = 0.42857;// degree/ms
+
+    SERVO_MAX_POSITION = 240;
+
+    SERVO_MIN_POSITION = 0;
+
+    SERVO_INITIAL_POSITION = 120;
+
 }

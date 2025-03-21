@@ -10,7 +10,7 @@ set(CMAKE_DEPENDS_LANGUAGES
 set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/home/yhlmaybe/Documents/Intelligent-Robot-System/ServoControl/SCDrive.cpp" "ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o" "gcc" "ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o.d"
   "/home/yhlmaybe/Documents/Intelligent-Robot-System/ServoControl/ServoID.cpp" "ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o" "gcc" "ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o.d"
-  "/home/yhlmaybe/Documents/Intelligent-Robot-System/ServoControl/ServoInitiate.cpp" "ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o" "gcc" "ServoControl/CMakeFiles/SC_LIST.dir/ServoInitiate.cpp.o.d"
+  "/home/yhlmaybe/Documents/Intelligent-Robot-System/ServoControl/ServoManager.cpp" "ServoControl/CMakeFiles/SC_LIST.dir/ServoManager.cpp.o" "gcc" "ServoControl/CMakeFiles/SC_LIST.dir/ServoManager.cpp.o.d"
   )
 
 # Targets to which this target links.

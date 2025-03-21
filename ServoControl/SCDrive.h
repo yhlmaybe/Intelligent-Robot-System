@@ -14,7 +14,6 @@ class ServoOperate
 {
   
 public:
-
     ServoOperate(std::string name, int id);
     ~ServoOperate();
     void SetServoPosition(int position, double time);
@@ -44,7 +43,7 @@ struct ServoDriveInfo
     int position;
     double time;
 
-   ServoDriveInfo(std::shared_ptr<Servo> servo, int position, double time) : servo(servo), position(position), time(time) { }
+    ServoDriveInfo(std::shared_ptr<Servo> servo, int position, double time) : servo(servo), position(position), time(time) { }
 };
 
 class DriveHandle

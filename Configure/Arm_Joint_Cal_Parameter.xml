@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="utf-8" ?>
+
+<ArmJointConfig>
+    <Joint name="ThumbArth_1_Joint">
+        <wide>4.15</wide>
+        <high>7.86</high>
+        <fix_x>2.5</fix_x>
+        <fix_y>-11.45</fix_y>
+    </Joint>
+
+    <Joint name="ThumbArth_2_Joint">
+        <wide>4.12</wide>
+        <high>8.01</high>
+        <fix_x>5.69</fix_x>
+        <fix_y>-12.16</fix_y>
+    </Joint>
+
+    <Joint name="ThumbArth_3_Joint">
+        <wide>5.7</wide>
+        <high>25.55</high>
+        <fix_x>16.79</fix_x>
+        <fix_y>-9.18</fix_y>
+    </Joint>
+
+    <Joint name="ThumbArth_4_Joint">
+        <wide>9</wide>
+        <high>9.18</high>
+        <fix_x>-7.51</fix_x>
+        <fix_y>-14.73</fix_y>
+    </Joint>
+
+    <Joint name="IndexFingerArth_1_Joint">
+        <wide>4.69</wide>
+        <high>7.28</high>
+        <fix_x>3</fix_x>
+        <fix_y>-10.23</fix_y>
+    </Joint>
+
+    <Joint name="IndexFingerArth_2_Joint">
+        <wide>4.64</wide>
+        <high>10.69</high>
+        <fix_x>3</fix_x>
+        <fix_y>-9.67</fix_y>
+    </Joint>
+
+        <Joint name="IndexFingerArth_3_Joint">
+        <wide>4.62</wide>
+        <high>10.77</high>
+        <fix_x>8.45</fix_x>
+        <fix_y>-25.76</fix_y>
+    </Joint>
+
+    <Joint name="IndexFingerArth_4_Joint">
+        <wide>8.6</wide>
+        <high>25.76</high>
+        <fix_x>9.04</fix_x>
+        <fix_y>-11.45</fix_y>
+    </Joint>
+
+    <Joint name="MidFingerArth_1_Joint">
+        <wide>4.69</wide>
+        <high>7.28</high>
+        <fix_x>3</fix_x>
+        <fix_y>-10.23</fix_y>
+    </Joint>
+    
+    <Joint name="MidFingerArth_2_Joint">
+        <wide>4.64</wide>
+        <high>10.69</high>
+        <fix_x>3</fix_x>
+        <fix_y>-9.67</fix_y>
+    </Joint>
+
+    <Joint name="MidFingerArth_3_Joint">
+        <wide>4.62</wide>
+        <high>10.77</high>
+        <fix_x>8.45</fix_x>
+        <fix_y>-25.76</fix_y>
+    </Joint>
+
+    <Joint name="MidFingerArth_4_Joint">
+        <wide>8.6</wide>
+        <high>25.76</high>
+        <fix_x>9.04</fix_x>
+        <fix_y>-11.45</fix_y>
+    </Joint>
+
+        <Joint name="FourthFingerArth_1_Joint">
+        <wide>4.69</wide>
+        <high>7.28</high>
+        <fix_x>3</fix_x>
+        <fix_y>-10.23</fix_y>
+    </Joint>
+
+    <Joint name="FourthFingerArth_2_Joint">
+        <wide>4.64</wide>
+        <high>10.69</high>
+        <fix_x>3</fix_x>
+        <fix_y>-9.67</fix_y>
+    </Joint>
+
+    <Joint name="FourthFingerArth_3_Joint">
+        <wide>4.62</wide>
+        <high>10.77</high>
+        <fix_x>8.45</fix_x>
+        <fix_y>-25.76</fix_y>
+    </Joint>
+    
+    <Joint name="FourthFingerArth_4_Joint">
+        <wide>8.6</wide>
+        <high>25.76</high>
+        <fix_x>9.04</fix_x>
+        <fix_y>-11.45</fix_y>
+    </Joint>
+
+    <Joint name="LittleFingerArth_1_Joint">
+        <wide>4.69</wide>
+        <high>7.28</high>
+        <fix_x>3</fix_x>
+        <fix_y>-10.23</fix_y>
+    </Joint>
+
+    <Joint name="LittleFingerArth_2_Joint">
+        <wide>4.64</wide>
+        <high>10.69</high>
+        <fix_x>3</fix_x>
+        <fix_y>-9.67</fix_y>
+    </Joint>
+
+        <Joint name="LittleFingerArth_3_Joint">
+        <wide>4.62</wide>
+        <high>10.77</high>
+        <fix_x>8.45</fix_x>
+        <fix_y>-25.76</fix_y>
+    </Joint>
+
+    <Joint name="LittleFingerArth_4_Joint">
+        <wide>8.6</wide>
+        <high>25.76</high>
+        <fix_x>9.04</fix_x>
+        <fix_y>-11.45</fix_y>
+    </Joint>
+
+    <Joint name="Palm_Joint">
+        <radius>12.65</radius>
+    </Joint>
+
+    <Joint name="WristArth_Joint">
+        <radius>8.61</radius>
+    </Joint>
+
+</ArmJointConfig>
+

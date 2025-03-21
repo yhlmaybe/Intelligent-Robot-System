@@ -17,7 +17,7 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
 set(CMAKE_TARGET_LINKED_INFO_FILES
   "/home/yhlmaybe/Documents/Intelligent-Robot-System/build/ServoControl/CMakeFiles/SC_LIST.dir/DependInfo.cmake"
   "/home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSGUI/CMakeFiles/IRSGUI_LIST.dir/DependInfo.cmake"
-  "/home/yhlmaybe/Documents/Intelligent-Robot-System/build/ROSManager/CMakeFiles/ROSMANAGER_LIST.dir/DependInfo.cmake"
+  "/home/yhlmaybe/Documents/Intelligent-Robot-System/build/IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/DependInfo.cmake"
   "/home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/DependInfo.cmake"
   )
 

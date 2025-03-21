@@ -10,7 +10,7 @@ EndEffector::EndEffector(std::string URDF, std::string name, std::string partGro
     completeGroupIkSolver = std::make_shared<IRS_IK::IRS_IK>(completeGroupFirstLinkName, name, URDF);
 }
 
-MotionPlanning::MotionPlanning(std::string urdf, std::string srdf)
+MotionManager::MotionManager(std::string urdf, std::string srdf)
 {
     auto urdf_model = urdf::parseURDF(urdf);
 
@@ -30,7 +30,7 @@ MotionPlanning::MotionPlanning(std::string urdf, std::string srdf)
     {
         std::string partGroupName = "";
         std::string completeGroupName = "";
-        EndEffectorType type = EndEffectorType::None;
+        EndEffectorType type = EndEffectorType::NoneType;
         if(endEffector.name_ == "thumb_end")
         {
             partGroupName = "thumb";
@@ -89,37 +89,35 @@ MotionPlanning::MotionPlanning(std::string urdf, std::string srdf)
         endEffectorsMap[type] = endEff;
     }
 
-    robotState->setToDefaultValues();
+    InitialJointState();
 
-    sharedSphere = std::make_shared<fcl::Sphered>(0.01);
-    envManager = std::make_shared<fcl::DynamicAABBTreeCollisionManagerd>();
-    omplTool = std::make_shared<PlanningTool::OMPLTool>(robotModel, envManager);
+    omplTool = std::make_shared<PlanningTool::OMPLTool>(robotModel);
 }
 
-sensor_msgs::msg::JointState MotionPlanning::GetCurrentJointStateMsg()
+sensor_msgs::msg::JointState MotionManager::GetCurrentJointStateMsg()
 {
-    sensor_msgs::msg::JointState jointStateMSgs = sensor_msgs::msg::JointState();
+    sensor_msgs::msg::JointState jointStateMsgs = sensor_msgs::msg::JointState();
     std::vector<std::string> jointNames = robotModel->getVariableNames();
     double* jointPositions = robotState->getVariablePositions();
     std::vector<double> jointPositionsVec(jointPositions, jointPositions + jointNames.size());
-    jointStateMSgs.name = jointNames;
-    jointStateMSgs.position = jointPositionsVec;
-    return jointStateMSgs;
+    jointStateMsgs.name = jointNames;
+    jointStateMsgs.position = jointPositionsVec;
+    return jointStateMsgs;
 }
 
-Eigen::Isometry3d MotionPlanning::ConvertPoseFromRelBaseToRelEnd(EndEffectorType endEffector, Eigen::Isometry3d pose)
+Eigen::Isometry3d MotionManager::ConvertPoseFromRelBaseToRelEnd(EndEffectorType endEffector, Eigen::Isometry3d pose)
 {
     Eigen::Isometry3d endEffectorTF = robotState->getGlobalLinkTransform(endEffectorsMap[endEffector]->name);
     return (endEffectorTF.inverse() * pose);
 }
 
-Eigen::Isometry3d MotionPlanning::ConvertPoseFromRelEndToRelBase(EndEffectorType endEffector, Eigen::Isometry3d pose)
+Eigen::Isometry3d MotionManager::ConvertPoseFromRelEndToRelBase(EndEffectorType endEffector, Eigen::Isometry3d pose)
 {
     Eigen::Isometry3d endEffectorTF = robotState->getGlobalLinkTransform(endEffectorsMap[endEffector]->name);
     return endEffectorTF * pose;
 }
 
-Eigen::Isometry3d MotionPlanning::ConvertPoseFromRelEndToRelAny(EndEffectorType endEffector, std::string anyLinkName, Eigen::Isometry3d pose)
+Eigen::Isometry3d MotionManager::ConvertPoseFromRelEndToRelAny(EndEffectorType endEffector, std::string anyLinkName, Eigen::Isometry3d pose)
 {
     Eigen::Isometry3d endEffectorTF = robotState->getGlobalLinkTransform(endEffectorsMap[endEffector]->name);
     Eigen::Isometry3d linkTF = robotState->getGlobalLinkTransform(anyLinkName);
@@ -127,8 +125,124 @@ Eigen::Isometry3d MotionPlanning::ConvertPoseFromRelEndToRelAny(EndEffectorType 
     return TF * pose;
 }
 
-bool MotionPlanning::JointIKCal(std::map<std::string, double>& result, EndEffectorType endEffector, Eigen::Isometry3d pointRelativeEndEff, bool isPart)
+void MotionManager::InitialJointState()
 {
+    robotState->setToDefaultValues("r_arm", "r_arm_home");
+    robotState->update();
+}
+
+double MotionManager::CalGoalJointPosition(std::string jointName, double position)
+{
+    moveit::core::JointModel* joint_model = robotModel->getJointModel(jointName);
+    const moveit::core::VariableBounds& bounds = joint_model->getVariableBounds(jointName);
+
+    double limited_position = position;
+
+    if (position < bounds.min_position_) 
+    {
+        IRS_MESSAGE("the %s position is set beyond the boundary and the joint position is set to the upper boundary", jointName);
+        limited_position = bounds.min_position_;
+    }
+    else if (position > bounds.max_position_) 
+    {
+        IRS_MESSAGE("the %s position is set beyond the boundary and the joint position is set to the lower boundary", jointName);
+        limited_position = bounds.max_position_;
+    }
+
+    return limited_position;
+}
+
+std::shared_ptr<moveit::core::RobotState> MotionManager::GetCurrentRobotState()
+{
+    return std::make_shared<moveit::core::RobotState>(*robotState);
+}
+
+void MotionManager::UpdateState(std::shared_ptr<moveit::core::RobotState> state)
+{
+    robotState = state;
+}
+
+EndEffectorType MotionManager::GetClosestEndEffector(Eigen::Vector3d pointRelBase)
+{
+    int i = 0;
+    EndEffectorType type = EndEffectorType::NoneType;
+    double min_distance = 0;
+    for (auto endEff : endEffectorsMap)
+    {
+        Eigen::Isometry3d ee_pose = robotState->getGlobalLinkTransform(endEff.second->name);
+        Eigen::Vector3d position = ee_pose.translation(); // get (x,y,z)
+        double distance = (position - pointRelBase).norm();
+        if (i == 0)
+        {
+            min_distance = distance;
+            type = endEff.first;
+        }
+        else
+        {
+            if (distance < min_distance)
+            {
+                min_distance = distance;
+                type = endEff.first;
+            }
+        }
+    }
+    return type;
+}
+
+Eigen::Isometry3d MotionManager::GetDefaultTouchPoseFromPoint(EndEffectorType endEffector, Eigen::Vector3d pointRelBase, Eigen::Vector3d pointNormal, double fingerAngle)
+{
+    double eps = 1e-6;
+    Eigen::Vector3d op = pointRelBase;
+    Eigen::Vector3d x = pointNormal.normalized();
+    Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+    pose.translation() = pointRelBase;
+
+    Eigen::Vector3d y_proj = op - op.dot(x) * x;
+    if (y_proj.norm() < eps)
+    {
+        y_proj = Eigen::Vector3d::UnitY() - Eigen::Vector3d::UnitY().dot(x) * x;
+        if (y_proj.norm() < eps)
+        {
+            y_proj = Eigen::Vector3d::UnitZ() - Eigen::Vector3d::UnitZ().dot(x) * x;
+        }
+    }
+    Eigen::Vector3d y = y_proj.normalized();
+    Eigen::Vector3d z = x.cross(y);
+    pose.linear().col(0) = x;
+    pose.linear().col(1) = y;
+    pose.linear().col(2) = z;
+
+    //check pointNormal and op is parallel
+    Eigen::Vector3d cross = op.cross(pointNormal);
+    if (cross.norm() < eps) return pose;
+
+    Eigen::Vector3d n = cross.normalized();
+    double theta_rad = fingerAngle * M_PI / 180.0;
+    Eigen::AngleAxisd rotation(theta_rad, n);
+    Eigen::Vector3d x_new = rotation * x;
+
+    Eigen::Vector3d y_new_proj = op - op.dot(x_new) * x_new;
+    if (y_new_proj.norm() < eps)
+    {
+        y_new_proj = Eigen::Vector3d::UnitY() - Eigen::Vector3d::UnitY().dot(x_new) * x_new;
+        if (y_new_proj.norm() < eps)
+        {
+            y_new_proj = Eigen::Vector3d::UnitZ() - Eigen::Vector3d::UnitZ().dot(x_new) * x_new;
+        }
+    }
+    Eigen::Vector3d y_new = y_new_proj.normalized();
+    Eigen::Vector3d z_new = x_new.cross(y_new);
+
+    pose.linear().col(0) = x_new;
+    pose.linear().col(1) = y_new;
+    pose.linear().col(2) = z_new;
+    return pose;
+}
+
+bool MotionManager::JointIKCal(std::vector<std::string>& jointNameResult, std::vector<double>& jointValueResult, EndEffectorType endEffector, Eigen::Isometry3d pointRelativeEndEff, bool isPart)
+{
+    jointNameResult.clear();
+    jointValueResult.clear();
     auto eff = endEffectorsMap[endEffector];
     moveit::core::JointModelGroup* group;
     KDL::Chain chain;
@@ -162,24 +276,58 @@ bool MotionPlanning::JointIKCal(std::map<std::string, double>& result, EndEffect
     KDL::Frame endEffectorPose = ConvertToFrame(poseRelFirstLink);  
     KDL::JntArray angle(chain.getNrOfJoints());
     int rc = ik->CartToJnt(nominal, endEffectorPose, angle);
-    for (size_t i = 0; i < jointNames.size(); ++i)
+    if (rc == 0)
     {
-        result[jointNames[i]] = (angle(i));
+        for (size_t i = 0; i < jointNames.size(); ++i)
+        {
+            jointNameResult.push_back(jointNames[i]);
+            jointValueResult.push_back(angle(i));
+        }
     }
     return rc == 0;
 }
 
-bool MotionPlanning::PlanAndExecute(std::map<std::string, double> goalNameAngles)
+std::vector<TrajectoryPoint> MotionManager::Plan(std::vector<std::string> goalJointNames, std::vector<double> goalJointPositions, std::vector<Eigen::Vector3d> envPointClouds, double totalTime, int interpolateCount)
 {
+    std::vector<TrajectoryPoint> res;
+    ompl::base::PathPtr path = omplTool->Plan(robotState, goalJointNames, goalJointPositions, envPointClouds);
+    if (path == nullptr) return res;
+    if (ompl::geometric::PathGeometric *pathGeo = dynamic_cast<ompl::geometric::PathGeometric *>(path.get()))
+    {
+        int jointCount = goalJointNames.size();
+        int stateCount = pathGeo->getStateCount();
+        if (interpolateCount != 0)
+            pathGeo->interpolate(stateCount + interpolateCount);
+        for (size_t i = 0; i < pathGeo->getStateCount(); ++i)
+        {
+            ompl::base::State *state = pathGeo->getState(i);
+            ompl::base::RealVectorStateSpace::StateType *joint_angles = state->as<ompl::base::RealVectorStateSpace::StateType>();
 
+            TrajectoryPoint point;
+            point.positions.assign(joint_angles->values, joint_angles->values + jointCount);
+            point.time_from_start = totalTime * static_cast<double>(i) / (pathGeo->getStateCount() - 1);
+
+            res.push_back(point);
+        }
+    }
+    return res;
 }
 
-void MotionPlanning::UpDateEnvironment(std::vector<Eigen::Vector3d> pointClouds)
+sensor_msgs::msg::JointState MotionManager::UpdateRobotStateAndGetMsg(std::vector<std::string> goalJointNames, std::vector<double> goalJointPositions)
 {
-    
+    robotState->setVariablePositions(goalJointNames, goalJointPositions);
+    robotState->update();
+    return GetCurrentJointStateMsg();
 }
 
-Eigen::Isometry3d MotionPlanning::ConvertToIsometry3d(KDL::Frame frame)
+sensor_msgs::msg::JointState MotionManager::UpdateRobotStateAndGetMsg(std::string goalJointName, double goalJointPosition)
+{
+    robotState->setVariablePosition(goalJointName, goalJointPosition);
+    robotState->update();
+    return GetCurrentJointStateMsg();
+}
+
+Eigen::Isometry3d MotionManager::ConvertToIsometry3d(KDL::Frame frame)
 {
     Eigen::Isometry3d result = Eigen::Isometry3d::Identity();
     result.translation() = Eigen::Vector3d(frame.p.x(), frame.p.y(), frame.p.z());
@@ -190,7 +338,7 @@ Eigen::Isometry3d MotionPlanning::ConvertToIsometry3d(KDL::Frame frame)
     return result;
 }
 
-KDL::Frame MotionPlanning::ConvertToFrame(Eigen::Isometry3d Isometry3d)
+KDL::Frame MotionManager::ConvertToFrame(Eigen::Isometry3d Isometry3d)
 {
     Eigen::Matrix3d rotationMatrix = Isometry3d.linear();
     Eigen::Quaterniond quaternion(rotationMatrix);

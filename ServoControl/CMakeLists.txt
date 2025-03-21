@@ -13,13 +13,18 @@ if(PYTHON_EXECUTABLE)
     aux_source_directory(. SC_LIST)
     add_library(SC_LIST ${SC_LIST})
 
-#    target_link_libraries(SC_LIST python)
+#   target_link_libraries(SC_LIST python)
 #   target_link_libraries(SC_LIST /usr/lib/python3.6/config-3.6m-aarch64-linux-gnu/libpython3.6.so)
 
     target_include_directories(SC_LIST PRIVATE ${Python_INCLUDE_DIRS})
 
     message("lib : ${PYTHON_LIBRARY_DIR}")
     message("include : ${PYTHON_INCLUDE_DIR}")
+
+    find_path(TINYXML2_INCLUDE_DIR NAMES tinyxml2.h)
+    find_library(TINYXML2_LIBRARY NAMES tinyxml2)
+    target_include_directories(SC_LIST PRIVATE ${TINYXML2_INCLUDE_DIR})
+    target_link_libraries(SC_LIST PRIVATE ${TINYXML2_LIBRARY})
 
 else()
     message(FATAL_ERROR "python not found")

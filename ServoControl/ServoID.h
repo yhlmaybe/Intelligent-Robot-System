@@ -21,7 +21,7 @@ extern const int RComp_LittleFinger_Arth_1;
 extern const int RComp_LittleFinger_Arth_2;
 extern const int RComp_LittleFinger_Arth_3;
 extern const int RComp_LittleFinger_Arth_4;
-extern const int RComp_Wrist_Arth_YZ;
-extern const int RComp_Wrist_Arth_XY;
+extern const int RComp_Palm;
+extern const int RComp_Wrist_Arth;
 
 #endif

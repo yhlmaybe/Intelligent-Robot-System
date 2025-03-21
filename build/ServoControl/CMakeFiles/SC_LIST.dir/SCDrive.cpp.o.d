@@ -305,4 +305,7 @@ ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o: \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/ServoControl/../include/IRSFunction.h \
  /usr/include/c++/11/vector /usr/include/c++/11/bits/stl_vector.h \
  /usr/include/c++/11/bits/stl_bvector.h \
- /usr/include/c++/11/bits/vector.tcc
+ /usr/include/c++/11/bits/vector.tcc /usr/include/c++/11/queue \
+ /usr/include/c++/11/deque /usr/include/c++/11/bits/stl_deque.h \
+ /usr/include/c++/11/bits/deque.tcc /usr/include/c++/11/bits/stl_heap.h \
+ /usr/include/c++/11/bits/stl_queue.h

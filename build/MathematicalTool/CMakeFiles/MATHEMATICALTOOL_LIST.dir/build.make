@@ -111,11 +111,26 @@ MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.s: cmake_
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.s"
 	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/PlanningTool.cpp -o CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.s
 
+MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.o: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/flags.make
+MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.o: ../MathematicalTool/PointCloudTool.cpp
+MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.o: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhlmaybe/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building CXX object MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.o"
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.o -MF CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.o.d -o CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.o -c /home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/PointCloudTool.cpp
+
+MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.i"
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/PointCloudTool.cpp > CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.i
+
+MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.s"
+	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhlmaybe/Documents/Intelligent-Robot-System/MathematicalTool/PointCloudTool.cpp -o CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.s
+
 # Object files for target MATHEMATICALTOOL_LIST
 MATHEMATICALTOOL_LIST_OBJECTS = \
 "CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o" \
 "CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o" \
-"CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.o"
+"CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.o" \
+"CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.o"
 
 # External object files for target MATHEMATICALTOOL_LIST
 MATHEMATICALTOOL_LIST_EXTERNAL_OBJECTS =
@@ -123,9 +138,10 @@ MATHEMATICALTOOL_LIST_EXTERNAL_OBJECTS =
 MathematicalTool/libMATHEMATICALTOOL_LIST.a: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o
 MathematicalTool/libMATHEMATICALTOOL_LIST.a: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o
 MathematicalTool/libMATHEMATICALTOOL_LIST.a: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.o
+MathematicalTool/libMATHEMATICALTOOL_LIST.a: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.o
 MathematicalTool/libMATHEMATICALTOOL_LIST.a: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make
 MathematicalTool/libMATHEMATICALTOOL_LIST.a: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhlmaybe/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Linking CXX static library libMATHEMATICALTOOL_LIST.a"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhlmaybe/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Linking CXX static library libMATHEMATICALTOOL_LIST.a"
 	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool && $(CMAKE_COMMAND) -P CMakeFiles/MATHEMATICALTOOL_LIST.dir/cmake_clean_target.cmake
 	cd /home/yhlmaybe/Documents/Intelligent-Robot-System/build/MathematicalTool && $(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/MATHEMATICALTOOL_LIST.dir/link.txt --verbose=$(VERBOSE)
 

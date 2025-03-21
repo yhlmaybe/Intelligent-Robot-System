@@ -4,16 +4,8 @@
 void IRS_MESSAGE(std::string message)
 {
     MainWindow* mainWindow = MainWindow::GetInstance();
-    auto ui = mainWindow->GetUI();
+    mainWindow->SetMessage(message);
 
-    ui->MessageText->moveCursor(QTextCursor::End, QTextCursor::MoveAnchor);
-    QString QMessage = QString::fromStdString(message);
-    ui->MessageText->insertPlainText(QMessage);
-    QScrollBar *scrollbar = ui->MessageText->verticalScrollBar();
-    if(scrollbar)  
-    {
-        scrollbar->setSliderPosition(scrollbar->maximum());
-    }  
 }
 
 void IRS_MESSAGE(const char* format, ...) 
@@ -58,13 +50,15 @@ MainWindow::MainWindow(QWidget *parent) :
 
     connect(ui->SetServoNo_Button, SIGNAL(clicked()), this, SLOT(SetServoNo()));
     connect(ui->GetServoNo_Button, SIGNAL(clicked()), this, SLOT(GetServoNo()));
-    connect(ui->ROSNodeInitiate_Button, SIGNAL(clicked()), this, SLOT(ROSNodeInitiate()));
-    connect(ui->ServesInitiate_Button, SIGNAL(clicked()), this, SLOT(ServosInitiate()));
+    connect(ui->Initiate_Button, SIGNAL(clicked()), this, SLOT(Initiate()));
+    connect(ui->StateReset_Button, SIGNAL(clicked()), this, SLOT(StateReset()));
+    connect(ui->setJointPosition_Button, SIGNAL(clicked()), this, SLOT(SetJointPosition()));
+    connect(ui->setGoalPoint_Button, SIGNAL(clicked()), this, SLOT(SetGoalPoint()));
 }
 
 MainWindow::~MainWindow()
 {  
-    ROSNodeManager::EndNodes();
+    IRSCoreHandle::End();
     rclcpp::shutdown();
     delete ui; 
     QSharedMemory sharedMemory("IRSUniqueKey");
@@ -80,8 +74,9 @@ void MainWindow::Initiate()
     PyRun_SimpleString("sys.path.append('./ServoControl')");      
 }
 
-void MainWindow::Message(std::string message)
+void MainWindow::SetMessage(std::string message)
 {
+    std::lock_guard<std::mutex> lock(*message_mtx);
     ui->MessageText->moveCursor(QTextCursor::End, QTextCursor::MoveAnchor);
     QString QMessage = QString::fromStdString(message);
     ui->MessageText->insertPlainText(QMessage);
@@ -120,7 +115,7 @@ void MainWindow::SetServoNo()
                         }
                         catch(const std::exception& e)
                         {
-                            Message("id error");
+                            SetMessage("id error");
                         }
                     }
                 }
@@ -159,31 +154,109 @@ void MainWindow::GetServoNo()
     }
 }
 
-void MainWindow::ROSNodeInitiate()
+void MainWindow::Start()
 {
-    if (isInitServos)
+    if (!is_running)
     {
-        if (!isInitROSNode)
+        IRSCoreHandle::Start();
+        is_running = true;
+
+        ui->jointName_comboBox->clear();
+        std::vector<std::string> joint_names = IRSCoreHandle::GetCurrentRobotState()->getVariableNames();
+        for (std::string name : joint_names)
         {
-            ROSNodeManager::StartNodes(servos);
-            isInitROSNode = true;
+            ui->jointName_comboBox->addItem(QString::fromStdString(name));
         }
     }
     else
     {
-        Message("The servo must be initialized first");     
+        SetMessage("already initialized");     
     }
 }
 
-void MainWindow::ROSNodeEnd()
+void MainWindow::End()
 {
-    ROSNodeManager::EndNodes();
-    isInitROSNode = false;
+    IRSCoreHandle::End();
+    is_running = false;
 }
 
-void MainWindow::ServosInitiate()
+void MainWindow::StateReset()
 {
-    servos.clear();
-    servos = ServoInitiate::Initiate();
-    isInitServos = true;
+    if(is_running)
+    {
+        IRSCoreHandle::ResetServoState();
+    }
+    else 
+    {
+        IRS_MESSAGE("the state needs to be initialized before reset");
+    }
+}
+
+void MainWindow::SetJointPosition()
+{
+    if(is_running)
+    {
+        QString joint_name = ui->jointName_comboBox->currentText().trimmed();
+        QString position = ui->jointPosition_lineEdit->text().trimmed();
+
+        if(joint_name.isEmpty() || position.isEmpty()) 
+        {
+            IRS_MESSAGE("joint name or position is empty");
+            return;
+        }
+
+        bool ok;
+        double position_double = position.toDouble(&ok);
+        if(!ok)
+        {
+            IRS_MESSAGE("invalid position format");
+            return;
+        }
+
+        IRSCoreHandle::SetJointPosition(joint_name.toStdString(), position_double);
+    }
+    else 
+    {
+        IRS_MESSAGE("the joint needs to be initialized before set position");
+    }
+}
+
+void MainWindow::SetGoalPoint()
+{
+    if (is_running)
+    {
+        QString goal_point = ui->goalPoint_lineEdit->text().trimmed();
+
+        if (goal_point.isEmpty())
+        {
+            IRS_MESSAGE("goal point is empty");
+            return;
+        }
+
+        QStringList parts = goal_point.split(",", Qt::SkipEmptyParts);
+
+        if (parts.size() != 3)
+        {
+            IRS_MESSAGE("the number of numbers separated by commas is not three");
+            return;
+        }
+
+        bool ok1, ok2, ok3;
+        double x = parts[0].trimmed().toDouble(&ok1);
+        double y = parts[1].trimmed().toDouble(&ok2);
+        double z = parts[2].trimmed().toDouble(&ok3);
+
+        if (!ok1 || !ok2 || !ok3)
+        {
+            IRS_MESSAGE("requires input containing non-numeric characters");
+            return;
+        }
+
+        std::vector<Eigen::Vector3d> point_vec{Eigen::Vector3d(x, y, z)};
+        IRSCoreHandle::goal_points_queue->push(point_vec);
+    }
+    else
+    {
+        IRS_MESSAGE("the joint needs to be initialized before set position");
+    }
 }

@@ -41,12 +41,12 @@ target_link_libraries(IRS_CMake /usr/lib/x86_64-linux-gnu/libccd.so.2)
 
 target_link_libraries(IRS_CMake SC_LIST)
 target_link_libraries(IRS_CMake IRSGUI_LIST)
-target_link_libraries(IRS_CMake ROSMANAGER_LIST)
+target_link_libraries(IRS_CMake IRSMANAGER_LIST)
 target_link_libraries(IRS_CMake MATHEMATICALTOOL_LIST)
   
 add_subdirectory(ServoControl)
 add_subdirectory(IRSGUI)
-add_subdirectory(ROSManager)
+add_subdirectory(IRSManager)
 add_subdirectory(MathematicalTool)
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})

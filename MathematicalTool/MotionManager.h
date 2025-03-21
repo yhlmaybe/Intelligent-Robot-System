@@ -21,7 +21,6 @@
 
 #include "../include/IRSParametersData.h"
 #include "../include/IRSFunction.h"
-#include "../include/IRSFunction.h"
 
 #include "Math3D.h"
 #include "KinematicTool.h"
@@ -29,7 +28,7 @@
 
 enum EndEffectorType 
 {
-    None,
+    NoneType,
     WristEnd,
     ThumbEnd,
     IndexEnd,
@@ -38,10 +37,17 @@ enum EndEffectorType
     LittleEnd,
 };
 
+struct TrajectoryPoint 
+{
+    std::vector<double> positions; 
+    double time_from_start;
+    double time_interval;        
+};
+
 class EndEffector
 {
 public:
-    const EndEffectorType type = EndEffectorType::None;
+    const EndEffectorType type = EndEffectorType::NoneType;
     const std::string name = "";
     const std::string partGroupName = "";
     const std::string completeGroupName = "";
@@ -52,20 +58,30 @@ public:
 };
 
 
-class MotionPlanning
+class MotionManager
 {
 public:
-    MotionPlanning(std::string urdf, std::string srdf);
+    MotionManager(std::string urdf, std::string srdf);
 
     Eigen::Isometry3d ConvertPoseFromRelBaseToRelEnd(EndEffectorType endEffector, Eigen::Isometry3d pose);
     Eigen::Isometry3d ConvertPoseFromRelEndToRelBase(EndEffectorType endEffector, Eigen::Isometry3d pose);
     Eigen::Isometry3d ConvertPoseFromRelEndToRelAny(EndEffectorType endEffector, std::string anyLinkName, Eigen::Isometry3d pose);
     sensor_msgs::msg::JointState GetCurrentJointStateMsg();
+    Eigen::Isometry3d GetDefaultTouchPoseFromPoint(EndEffectorType endEffector, Eigen::Vector3d pointRelBase, Eigen::Vector3d pointNormal, double fingerAngle = 60);
+    void InitialJointState();
 
-    bool JointIKCal(std::map<std::string, double>& result, EndEffectorType endEffector, Eigen::Isometry3d pointRelativeEndEff, bool isPart);
-    bool PlanAndExecute(std::map<std::string, double> goalNameAngles);
+    double CalGoalJointPosition(std::string jointName, double position);
 
-    void UpDateEnvironment(std::vector<Eigen::Vector3d> pointClouds);
+    std::shared_ptr<moveit::core::RobotState> GetCurrentRobotState();
+
+    EndEffectorType GetClosestEndEffector(Eigen::Vector3d point);
+
+    void UpdateState(std::shared_ptr<moveit::core::RobotState> state);
+
+    bool JointIKCal(std::vector<std::string>& jointNameResult, std::vector<double>& jointValueResult, EndEffectorType endEffector, Eigen::Isometry3d pointRelativeEndEff, bool isPart);
+    std::vector<TrajectoryPoint> Plan(std::vector<std::string> goalJointNames, std::vector<double> goalJointPositions, std::vector<Eigen::Vector3d> envPointClouds, double totalTime, int interpolateCount = 0);
+    sensor_msgs::msg::JointState UpdateRobotStateAndGetMsg(std::vector<std::string> goalJointNames, std::vector<double> goalJointPositions);
+    sensor_msgs::msg::JointState UpdateRobotStateAndGetMsg(std::string goalJointName, double goalJointPosition);
 
 private:
     std::string overallGroupName = "r_arm";
@@ -78,10 +94,6 @@ private:
 
     Eigen::Isometry3d ConvertToIsometry3d(KDL::Frame frame);
     KDL::Frame ConvertToFrame(Eigen::Isometry3d Isometry3d);
-
-    std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager;
-    std::vector<std::shared_ptr<fcl::CollisionObjectd>> envCollObjs;
-    std::shared_ptr<fcl::Sphered> sharedSphere;
 
     std::shared_ptr<PlanningTool::OMPLTool> omplTool;
 };

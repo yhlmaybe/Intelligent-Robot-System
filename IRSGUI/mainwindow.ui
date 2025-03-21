@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>400</width>
-    <height>300</height>
+    <width>776</width>
+    <height>444</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -17,8 +17,8 @@
    <widget class="QPushButton" name="SetServoNo_Button">
     <property name="geometry">
      <rect>
-      <x>10</x>
-      <y>30</y>
+      <x>680</x>
+      <y>360</y>
       <width>89</width>
       <height>25</height>
      </rect>
@@ -30,46 +30,52 @@
    <widget class="QLabel" name="ServoNo_Lable">
     <property name="geometry">
      <rect>
-      <x>110</x>
-      <y>80</y>
-      <width>71</width>
+      <x>580</x>
+      <y>320</y>
+      <width>91</width>
       <height>21</height>
      </rect>
     </property>
+    <property name="layoutDirection">
+     <enum>Qt::LeftToRight</enum>
+    </property>
     <property name="text">
      <string>null</string>
+    </property>
+    <property name="alignment">
+     <set>Qt::AlignCenter</set>
     </property>
    </widget>
    <widget class="QLineEdit" name="ServoNo_LineEdit">
     <property name="geometry">
      <rect>
-      <x>110</x>
-      <y>30</y>
-      <width>71</width>
+      <x>580</x>
+      <y>360</y>
+      <width>91</width>
       <height>25</height>
      </rect>
     </property>
    </widget>
-   <widget class="QPushButton" name="ROSNodeInitiate_Button">
+   <widget class="QPushButton" name="StateReset_Button">
     <property name="geometry">
      <rect>
-      <x>260</x>
-      <y>70</y>
-      <width>121</width>
+      <x>680</x>
+      <y>10</y>
+      <width>91</width>
       <height>25</height>
      </rect>
     </property>
     <property name="text">
-     <string>ROSNodeInitiate</string>
+     <string>StateReset</string>
     </property>
    </widget>
    <widget class="QPlainTextEdit" name="MessageText">
     <property name="geometry">
      <rect>
       <x>10</x>
-      <y>120</y>
-      <width>381</width>
-      <height>111</height>
+      <y>10</y>
+      <width>561</width>
+      <height>381</height>
      </rect>
     </property>
     <property name="readOnly">
@@ -79,8 +85,8 @@
    <widget class="QPushButton" name="GetServoNo_Button">
     <property name="geometry">
      <rect>
-      <x>10</x>
-      <y>80</y>
+      <x>680</x>
+      <y>320</y>
       <width>89</width>
       <height>25</height>
      </rect>
@@ -89,17 +95,121 @@
      <string>GetServoNo</string>
     </property>
    </widget>
-   <widget class="QPushButton" name="ServesInitiate_Button">
+   <widget class="QPushButton" name="Initiate_Button">
     <property name="geometry">
      <rect>
-      <x>260</x>
-      <y>30</y>
-      <width>121</width>
+      <x>580</x>
+      <y>10</y>
+      <width>91</width>
       <height>25</height>
      </rect>
     </property>
     <property name="text">
-     <string>ServesInitiate</string>
+     <string>Initiate</string>
+    </property>
+   </widget>
+   <widget class="QComboBox" name="jointName_comboBox">
+    <property name="geometry">
+     <rect>
+      <x>580</x>
+      <y>70</y>
+      <width>181</width>
+      <height>25</height>
+     </rect>
+    </property>
+   </widget>
+   <widget class="QLabel" name="jointName_label">
+    <property name="geometry">
+     <rect>
+      <x>580</x>
+      <y>50</y>
+      <width>181</width>
+      <height>20</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>Joint Name</string>
+    </property>
+    <property name="alignment">
+     <set>Qt::AlignCenter</set>
+    </property>
+   </widget>
+   <widget class="QPushButton" name="setJointPosition_Button">
+    <property name="geometry">
+     <rect>
+      <x>580</x>
+      <y>160</y>
+      <width>181</width>
+      <height>25</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>Set Joint Position</string>
+    </property>
+   </widget>
+   <widget class="QLabel" name="jointPosition_label">
+    <property name="geometry">
+     <rect>
+      <x>580</x>
+      <y>100</y>
+      <width>181</width>
+      <height>20</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>Joint Position</string>
+    </property>
+    <property name="alignment">
+     <set>Qt::AlignCenter</set>
+    </property>
+   </widget>
+   <widget class="QLineEdit" name="jointPosition_lineEdit">
+    <property name="geometry">
+     <rect>
+      <x>580</x>
+      <y>120</y>
+      <width>181</width>
+      <height>25</height>
+     </rect>
+    </property>
+   </widget>
+   <widget class="QPushButton" name="setGoalPoint_Button">
+    <property name="geometry">
+     <rect>
+      <x>580</x>
+      <y>260</y>
+      <width>181</width>
+      <height>25</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>Set Goal Point</string>
+    </property>
+   </widget>
+   <widget class="QLabel" name="goalPoint_label">
+    <property name="geometry">
+     <rect>
+      <x>580</x>
+      <y>200</y>
+      <width>181</width>
+      <height>20</height>
+     </rect>
+    </property>
+    <property name="text">
+     <string>Goal Point</string>
+    </property>
+    <property name="alignment">
+     <set>Qt::AlignCenter</set>
+    </property>
+   </widget>
+   <widget class="QLineEdit" name="goalPoint_lineEdit">
+    <property name="geometry">
+     <rect>
+      <x>580</x>
+      <y>220</y>
+      <width>181</width>
+      <height>25</height>
+     </rect>
     </property>
    </widget>
   </widget>
@@ -108,7 +218,7 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>400</width>
+     <width>776</width>
      <height>22</height>
     </rect>
    </property>

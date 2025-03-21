@@ -1,2 +1,2 @@
-/usr/bin/ar qc libMATHEMATICALTOOL_LIST.a CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.o
+/usr/bin/ar qc libMATHEMATICALTOOL_LIST.a CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o CMakeFiles/MATHEMATICALTOOL_LIST.dir/PlanningTool.cpp.o CMakeFiles/MATHEMATICALTOOL_LIST.dir/PointCloudTool.cpp.o
 /usr/bin/ranlib libMATHEMATICALTOOL_LIST.a

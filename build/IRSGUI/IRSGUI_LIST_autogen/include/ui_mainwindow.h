@@ -11,6 +11,7 @@
 
 #include <QtCore/QVariant>
 #include <QtWidgets/QApplication>
+#include <QtWidgets/QComboBox>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QLineEdit>
 #include <QtWidgets/QMainWindow>
@@ -30,10 +31,18 @@ public:
     QPushButton *SetServoNo_Button;
     QLabel *ServoNo_Lable;
     QLineEdit *ServoNo_LineEdit;
-    QPushButton *ROSNodeInitiate_Button;
+    QPushButton *StateReset_Button;
     QPlainTextEdit *MessageText;
     QPushButton *GetServoNo_Button;
-    QPushButton *ServesInitiate_Button;
+    QPushButton *Initiate_Button;
+    QComboBox *jointName_comboBox;
+    QLabel *jointName_label;
+    QPushButton *setJointPosition_Button;
+    QLabel *jointPosition_label;
+    QLineEdit *jointPosition_lineEdit;
+    QPushButton *setGoalPoint_Button;
+    QLabel *goalPoint_label;
+    QLineEdit *goalPoint_lineEdit;
     QMenuBar *menuBar;
     QToolBar *mainToolBar;
     QStatusBar *statusBar;
@@ -42,35 +51,64 @@ public:
     {
         if (MainWindow->objectName().isEmpty())
             MainWindow->setObjectName(QString::fromUtf8("MainWindow"));
-        MainWindow->resize(400, 300);
+        MainWindow->resize(776, 444);
         centralWidget = new QWidget(MainWindow);
         centralWidget->setObjectName(QString::fromUtf8("centralWidget"));
         SetServoNo_Button = new QPushButton(centralWidget);
         SetServoNo_Button->setObjectName(QString::fromUtf8("SetServoNo_Button"));
-        SetServoNo_Button->setGeometry(QRect(10, 30, 89, 25));
+        SetServoNo_Button->setGeometry(QRect(680, 360, 89, 25));
         ServoNo_Lable = new QLabel(centralWidget);
         ServoNo_Lable->setObjectName(QString::fromUtf8("ServoNo_Lable"));
-        ServoNo_Lable->setGeometry(QRect(110, 80, 71, 21));
+        ServoNo_Lable->setGeometry(QRect(580, 320, 91, 21));
+        ServoNo_Lable->setLayoutDirection(Qt::LeftToRight);
+        ServoNo_Lable->setAlignment(Qt::AlignCenter);
         ServoNo_LineEdit = new QLineEdit(centralWidget);
         ServoNo_LineEdit->setObjectName(QString::fromUtf8("ServoNo_LineEdit"));
-        ServoNo_LineEdit->setGeometry(QRect(110, 30, 71, 25));
-        ROSNodeInitiate_Button = new QPushButton(centralWidget);
-        ROSNodeInitiate_Button->setObjectName(QString::fromUtf8("ROSNodeInitiate_Button"));
-        ROSNodeInitiate_Button->setGeometry(QRect(260, 70, 121, 25));
+        ServoNo_LineEdit->setGeometry(QRect(580, 360, 91, 25));
+        StateReset_Button = new QPushButton(centralWidget);
+        StateReset_Button->setObjectName(QString::fromUtf8("StateReset_Button"));
+        StateReset_Button->setGeometry(QRect(680, 10, 91, 25));
         MessageText = new QPlainTextEdit(centralWidget);
         MessageText->setObjectName(QString::fromUtf8("MessageText"));
-        MessageText->setGeometry(QRect(10, 120, 381, 111));
+        MessageText->setGeometry(QRect(10, 10, 561, 381));
         MessageText->setReadOnly(true);
         GetServoNo_Button = new QPushButton(centralWidget);
         GetServoNo_Button->setObjectName(QString::fromUtf8("GetServoNo_Button"));
-        GetServoNo_Button->setGeometry(QRect(10, 80, 89, 25));
-        ServesInitiate_Button = new QPushButton(centralWidget);
-        ServesInitiate_Button->setObjectName(QString::fromUtf8("ServesInitiate_Button"));
-        ServesInitiate_Button->setGeometry(QRect(260, 30, 121, 25));
+        GetServoNo_Button->setGeometry(QRect(680, 320, 89, 25));
+        Initiate_Button = new QPushButton(centralWidget);
+        Initiate_Button->setObjectName(QString::fromUtf8("Initiate_Button"));
+        Initiate_Button->setGeometry(QRect(580, 10, 91, 25));
+        jointName_comboBox = new QComboBox(centralWidget);
+        jointName_comboBox->setObjectName(QString::fromUtf8("jointName_comboBox"));
+        jointName_comboBox->setGeometry(QRect(580, 70, 181, 25));
+        jointName_label = new QLabel(centralWidget);
+        jointName_label->setObjectName(QString::fromUtf8("jointName_label"));
+        jointName_label->setGeometry(QRect(580, 50, 181, 20));
+        jointName_label->setAlignment(Qt::AlignCenter);
+        setJointPosition_Button = new QPushButton(centralWidget);
+        setJointPosition_Button->setObjectName(QString::fromUtf8("setJointPosition_Button"));
+        setJointPosition_Button->setGeometry(QRect(580, 160, 181, 25));
+        jointPosition_label = new QLabel(centralWidget);
+        jointPosition_label->setObjectName(QString::fromUtf8("jointPosition_label"));
+        jointPosition_label->setGeometry(QRect(580, 100, 181, 20));
+        jointPosition_label->setAlignment(Qt::AlignCenter);
+        jointPosition_lineEdit = new QLineEdit(centralWidget);
+        jointPosition_lineEdit->setObjectName(QString::fromUtf8("jointPosition_lineEdit"));
+        jointPosition_lineEdit->setGeometry(QRect(580, 120, 181, 25));
+        setGoalPoint_Button = new QPushButton(centralWidget);
+        setGoalPoint_Button->setObjectName(QString::fromUtf8("setGoalPoint_Button"));
+        setGoalPoint_Button->setGeometry(QRect(580, 260, 181, 25));
+        goalPoint_label = new QLabel(centralWidget);
+        goalPoint_label->setObjectName(QString::fromUtf8("goalPoint_label"));
+        goalPoint_label->setGeometry(QRect(580, 200, 181, 20));
+        goalPoint_label->setAlignment(Qt::AlignCenter);
+        goalPoint_lineEdit = new QLineEdit(centralWidget);
+        goalPoint_lineEdit->setObjectName(QString::fromUtf8("goalPoint_lineEdit"));
+        goalPoint_lineEdit->setGeometry(QRect(580, 220, 181, 25));
         MainWindow->setCentralWidget(centralWidget);
         menuBar = new QMenuBar(MainWindow);
         menuBar->setObjectName(QString::fromUtf8("menuBar"));
-        menuBar->setGeometry(QRect(0, 0, 400, 22));
+        menuBar->setGeometry(QRect(0, 0, 776, 22));
         MainWindow->setMenuBar(menuBar);
         mainToolBar = new QToolBar(MainWindow);
         mainToolBar->setObjectName(QString::fromUtf8("mainToolBar"));
@@ -89,9 +127,14 @@ public:
         MainWindow->setWindowTitle(QCoreApplication::translate("MainWindow", "MainWindow", nullptr));
         SetServoNo_Button->setText(QCoreApplication::translate("MainWindow", "SetServoNo", nullptr));
         ServoNo_Lable->setText(QCoreApplication::translate("MainWindow", "null", nullptr));
-        ROSNodeInitiate_Button->setText(QCoreApplication::translate("MainWindow", "ROSNodeInitiate", nullptr));
+        StateReset_Button->setText(QCoreApplication::translate("MainWindow", "StateReset", nullptr));
         GetServoNo_Button->setText(QCoreApplication::translate("MainWindow", "GetServoNo", nullptr));
-        ServesInitiate_Button->setText(QCoreApplication::translate("MainWindow", "ServesInitiate", nullptr));
+        Initiate_Button->setText(QCoreApplication::translate("MainWindow", "Initiate", nullptr));
+        jointName_label->setText(QCoreApplication::translate("MainWindow", "Joint Name", nullptr));
+        setJointPosition_Button->setText(QCoreApplication::translate("MainWindow", "Set Joint Position", nullptr));
+        jointPosition_label->setText(QCoreApplication::translate("MainWindow", "Joint Position", nullptr));
+        setGoalPoint_Button->setText(QCoreApplication::translate("MainWindow", "Set Goal Point", nullptr));
+        goalPoint_label->setText(QCoreApplication::translate("MainWindow", "Goal Point", nullptr));
     } // retranslateUi
 
 };

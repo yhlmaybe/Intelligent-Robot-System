@@ -835,7 +835,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: \
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QMessageBox \
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qmessagebox.h \
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qdialog.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/NodeManager.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/IRSCoreManager.h \
  /usr/include/c++/11/fstream \
  /usr/include/x86_64-linux-gnu/c++/11/bits/basic_file.h \
  /usr/include/x86_64-linux-gnu/c++/11/bits/c++io.h \
@@ -846,7 +846,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: \
  /opt/ros/humble/include/std_msgs/std_msgs/msg/detail/string__traits.hpp \
  /opt/ros/humble/include/std_msgs/std_msgs/msg/detail/string__type_support.hpp \
  /opt/ros/humble/include/std_msgs/std_msgs/msg/rosidl_generator_cpp__visibility_control.hpp \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/MsgManager.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/MsgManager.h \
  /usr/include/pugixml.hpp /usr/include/pugiconfig.hpp \
  /opt/ros/humble/include/robot_state_publisher/robot_state_publisher/robot_state_publisher.hpp \
  /usr/include/kdl/tree.hpp /usr/include/kdl/config.h \
@@ -932,13 +932,18 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: \
  /opt/ros/humble/include/visualization_msgs/visualization_msgs/msg/rosidl_generator_cpp__visibility_control.hpp \
  /opt/ros/humble/include/kdl_parser/kdl_parser/kdl_parser.hpp \
  /opt/ros/humble/include/kdl_parser/kdl_parser/visibility_control.hpp \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../ServoControl/ServoInitiate.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../ServoControl/SCDrive.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../ServoControl/../include/IRSFunction.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../ServoControl/ServoID.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../include/IRSParametersData.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../include/IRSFunction.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../MathematicalTool/MotionManager.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../ServoControl/ServoManager.h \
+ /usr/include/tinyxml2.h /usr/include/c++/11/climits \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../ServoControl/SCDrive.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../ServoControl/../include/IRSFunction.h \
+ /usr/include/c++/11/queue /usr/include/c++/11/deque \
+ /usr/include/c++/11/bits/stl_deque.h /usr/include/c++/11/bits/deque.tcc \
+ /usr/include/c++/11/bits/stl_queue.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../ServoControl/ServoID.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../ServoControl/../include/IRSParametersData.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../include/IRSParametersData.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../include/IRSFunction.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../MathematicalTool/MotionManager.h \
  /opt/ros/humble/include/pluginlib/pluginlib/class_loader.hpp \
  /opt/ros/humble/include/class_loader/class_loader/multi_library_class_loader.hpp \
  /usr/include/console_bridge/console.h \
@@ -952,7 +957,6 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: \
  /opt/ros/humble/include/pluginlib/pluginlib/class_desc.hpp \
  /opt/ros/humble/include/pluginlib/pluginlib/class_loader_base.hpp \
  /opt/ros/humble/include/pluginlib/pluginlib/exceptions.hpp \
- /usr/include/tinyxml2.h /usr/include/c++/11/climits \
  /opt/ros/humble/include/pluginlib/pluginlib/class_loader_imp.hpp \
  /opt/ros/humble/include/ament_index_cpp/ament_index_cpp/get_package_prefix.hpp \
  /opt/ros/humble/include/ament_index_cpp/ament_index_cpp/visibility_control.h \
@@ -962,9 +966,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: \
  /opt/ros/humble/include/pluginlib/pluginlib/class_loader.hpp \
  /opt/ros/humble/include/pluginlib/pluginlib/impl/split.hpp \
  /usr/include/c++/11/regex /usr/include/c++/11/bitset \
- /usr/include/c++/11/stack /usr/include/c++/11/deque \
- /usr/include/c++/11/bits/stl_deque.h /usr/include/c++/11/bits/deque.tcc \
- /usr/include/c++/11/bits/stl_stack.h \
+ /usr/include/c++/11/stack /usr/include/c++/11/bits/stl_stack.h \
  /usr/include/c++/11/bits/regex_constants.h \
  /usr/include/c++/11/bits/regex_error.h \
  /usr/include/c++/11/bits/regex_automaton.h \
@@ -2126,10 +2128,10 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: \
  /opt/ros/humble/include/moveit/moveit_cpp/planning_component.h \
  /opt/ros/humble/include/moveit/robot_state/conversions.h \
  /opt/ros/humble/include/moveit/utils/moveit_error_code.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../MathematicalTool/../include/IRSParametersData.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../MathematicalTool/../include/IRSFunction.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../MathematicalTool/Math3D.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../MathematicalTool/KinematicTool.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../MathematicalTool/../include/IRSParametersData.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../MathematicalTool/../include/IRSFunction.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../MathematicalTool/Math3D.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../MathematicalTool/KinematicTool.h \
  /usr/include/kdl/chainfksolverpos_recursive.hpp \
  /usr/include/kdl/chainiksolvervel_pinv.hpp \
  /usr/include/kdl/chainjnttojacsolver.hpp \
@@ -2463,7 +2465,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: \
  /usr/include/boost/algorithm/string/detail/find_iterator.hpp \
  /usr/include/boost/algorithm/string/join.hpp \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/include/IRSFunction.h \
- /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../ROSManager/../MathematicalTool/PlanningTool.h \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../MathematicalTool/PlanningTool.h \
  /usr/local/include/fcl/fcl.h /usr/local/include/fcl/config.h \
  /usr/local/include/fcl/export.h \
  /usr/local/include/fcl/broadphase/broadphase_SSaP.h \
@@ -2641,7 +2643,6 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: \
  /usr/local/include/fcl/narrowphase/distance_result-inl.h \
  /usr/local/include/fcl/narrowphase/detail/traversal/distance/distance_traversal_node_base-inl.h \
  /usr/local/include/fcl/narrowphase/detail/traversal/traversal_recurse-inl.h \
- /usr/include/c++/11/queue /usr/include/c++/11/bits/stl_queue.h \
  /usr/local/include/fcl/narrowphase/detail/traversal/collision_node-inl.h \
  /usr/local/include/fcl/narrowphase/detail/traversal/collision/bvh_shape_collision_traversal_node.h \
  /usr/local/include/fcl/narrowphase/detail/traversal/collision/bvh_shape_collision_traversal_node-inl.h \
@@ -2867,6 +2868,291 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: \
  /usr/include/ompl-1.5/ompl/base/goals/GoalSampleableRegion.h \
  /usr/include/ompl-1.5/ompl/base/goals/GoalRegion.h \
  /usr/include/ompl-1.5/ompl/base/samplers/ObstacleBasedValidStateSampler.h \
+ /usr/include/pcl-1.12/pcl/surface/mls.h \
+ /usr/include/pcl-1.12/pcl/memory.h \
+ /usr/include/pcl-1.12/pcl/type_traits.h \
+ /usr/include/pcl-1.12/pcl/point_struct_traits.h \
+ /usr/include/pcl-1.12/pcl/pcl_base.h \
+ /usr/include/pcl-1.12/pcl/pcl_macros.h \
+ /usr/include/pcl-1.12/pcl/pcl_config.h \
+ /usr/include/boost/preprocessor/comparison/equal.hpp \
+ /usr/include/boost/preprocessor/comparison/not_equal.hpp \
+ /usr/include/boost/preprocessor/comparison/less.hpp \
+ /usr/include/pcl-1.12/pcl/point_cloud.h \
+ /usr/include/pcl-1.12/pcl/PCLHeader.h \
+ /usr/include/pcl-1.12/pcl/exceptions.h /usr/include/pcl-1.12/pcl/types.h \
+ /usr/include/pcl-1.12/pcl/console/print.h \
+ /usr/include/pcl-1.12/pcl/pcl_exports.h \
+ /usr/include/pcl-1.12/pcl/PointIndices.h \
+ /usr/include/pcl-1.12/pcl/PCLPointCloud2.h \
+ /usr/include/pcl-1.12/pcl/PCLPointField.h \
+ /usr/include/pcl-1.12/pcl/search/search.h \
+ /usr/include/pcl-1.12/pcl/for_each_type.h \
+ /usr/include/boost/mpl/aux_/unwrap.hpp \
+ /usr/include/pcl-1.12/pcl/common/concatenate.h \
+ /usr/include/pcl-1.12/pcl/common/copy_point.h \
+ /usr/include/pcl-1.12/pcl/common/impl/copy_point.hpp \
+ /usr/include/pcl-1.12/pcl/point_types.h \
+ /usr/include/pcl-1.12/pcl/impl/point_types.hpp \
+ /usr/include/pcl-1.12/pcl/register_point_struct.h \
+ /usr/include/boost/preprocessor/seq/for_each.hpp \
+ /usr/include/pcl-1.12/pcl/surface/processing.h \
+ /usr/include/pcl-1.12/pcl/PolygonMesh.h \
+ /usr/include/pcl-1.12/pcl/Vertices.h \
+ /usr/include/pcl-1.12/pcl/surface/impl/processing.hpp \
+ /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../IRSManager/../MathematicalTool/PointCloudTool.h \
+ /usr/include/pcl-1.12/pcl/filters/statistical_outlier_removal.h \
+ /usr/include/pcl-1.12/pcl/filters/filter_indices.h \
+ /usr/include/pcl-1.12/pcl/filters/filter.h \
+ /usr/include/pcl-1.12/pcl/common/io.h \
+ /usr/include/pcl-1.12/pcl/common/impl/io.hpp \
+ /usr/include/pcl-1.12/pcl/conversions.h \
+ /usr/include/pcl-1.12/pcl/PCLImage.h /usr/include/boost/foreach.hpp \
+ /usr/include/boost/foreach_fwd.hpp \
+ /usr/include/pcl-1.12/pcl/filters/radius_outlier_removal.h \
+ /usr/include/pcl-1.12/pcl/filters/voxel_grid.h \
+ /usr/include/pcl-1.12/pcl/filters/uniform_sampling.h \
+ /usr/include/pcl-1.12/pcl/features/normal_3d.h \
+ /usr/include/pcl-1.12/pcl/features/feature.h \
+ /usr/include/pcl-1.12/pcl/features/impl/feature.hpp \
+ /usr/include/pcl-1.12/pcl/search/kdtree.h \
+ /usr/include/pcl-1.12/pcl/kdtree/kdtree_flann.h \
+ /usr/include/pcl-1.12/pcl/kdtree/kdtree.h \
+ /usr/include/pcl-1.12/pcl/point_representation.h \
+ /usr/include/flann/util/params.h /usr/include/flann/util/any.h \
+ /usr/include/flann/general.h /usr/include/flann/defines.h \
+ /usr/include/flann/config.h /usr/include/pcl-1.12/pcl/search/organized.h \
+ /usr/include/pcl-1.12/pcl/common/eigen.h \
+ /usr/include/pcl-1.12/pcl/ModelCoefficients.h \
+ /usr/include/eigen3/Eigen/LU \
+ /usr/include/pcl-1.12/pcl/common/impl/eigen.hpp \
+ /usr/include/pcl-1.12/pcl/common/centroid.h \
+ /usr/include/pcl-1.12/pcl/cloud_iterator.h \
+ /usr/include/pcl-1.12/pcl/correspondence.h \
+ /usr/include/pcl-1.12/pcl/impl/cloud_iterator.hpp \
+ /usr/include/pcl-1.12/pcl/common/impl/accumulators.hpp \
+ /usr/include/boost/mpl/filter_view.hpp \
+ /usr/include/boost/mpl/aux_/filter_iter.hpp \
+ /usr/include/boost/fusion/include/mpl.hpp \
+ /usr/include/boost/fusion/support/config.hpp \
+ /usr/include/boost/fusion/adapted/mpl.hpp \
+ /usr/include/boost/fusion/adapted/mpl/detail/begin_impl.hpp \
+ /usr/include/boost/fusion/adapted/mpl/mpl_iterator.hpp \
+ /usr/include/boost/fusion/support/detail/mpl_iterator_category.hpp \
+ /usr/include/boost/fusion/iterator/iterator_facade.hpp \
+ /usr/include/boost/fusion/support/iterator_base.hpp \
+ /usr/include/boost/fusion/iterator/detail/advance.hpp \
+ /usr/include/boost/fusion/iterator/next.hpp \
+ /usr/include/boost/fusion/support/tag_of.hpp \
+ /usr/include/boost/fusion/support/tag_of_fwd.hpp \
+ /usr/include/boost/fusion/support/detail/is_mpl_sequence.hpp \
+ /usr/include/boost/fusion/support/detail/is_native_fusion_sequence.hpp \
+ /usr/include/boost/fusion/support/sequence_base.hpp \
+ /usr/include/boost/config/no_tr1/utility.hpp \
+ /usr/include/boost/fusion/iterator/prior.hpp \
+ /usr/include/boost/fusion/iterator/detail/distance.hpp \
+ /usr/include/boost/fusion/iterator/equal_to.hpp \
+ /usr/include/boost/fusion/support/is_iterator.hpp \
+ /usr/include/boost/fusion/support/category_of.hpp \
+ /usr/include/boost/mpl/begin.hpp \
+ /usr/include/boost/fusion/adapted/mpl/detail/end_impl.hpp \
+ /usr/include/boost/mpl/end.hpp \
+ /usr/include/boost/fusion/adapted/mpl/detail/is_sequence_impl.hpp \
+ /usr/include/boost/fusion/adapted/mpl/detail/size_impl.hpp \
+ /usr/include/boost/fusion/adapted/mpl/detail/value_at_impl.hpp \
+ /usr/include/boost/fusion/adapted/mpl/detail/at_impl.hpp \
+ /usr/include/boost/fusion/adapted/mpl/detail/has_key_impl.hpp \
+ /usr/include/boost/mpl/has_key.hpp \
+ /usr/include/boost/mpl/aux_/has_key_impl.hpp \
+ /usr/include/boost/fusion/adapted/mpl/detail/category_of_impl.hpp \
+ /usr/include/boost/fusion/adapted/mpl/detail/is_view_impl.hpp \
+ /usr/include/boost/fusion/adapted/mpl/detail/empty_impl.hpp \
+ /usr/include/boost/fusion/mpl.hpp \
+ /usr/include/boost/fusion/iterator/mpl.hpp \
+ /usr/include/boost/fusion/iterator/mpl/convert_iterator.hpp \
+ /usr/include/boost/fusion/iterator/mpl/fusion_iterator.hpp \
+ /usr/include/boost/fusion/iterator/value_of.hpp \
+ /usr/include/boost/fusion/iterator/advance.hpp \
+ /usr/include/boost/fusion/iterator/distance.hpp \
+ /usr/include/boost/fusion/mpl/at.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic/value_at.hpp \
+ /usr/include/boost/mpl/empty_base.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic_fwd.hpp \
+ /usr/include/boost/fusion/support/is_sequence.hpp \
+ /usr/include/boost/fusion/mpl/back.hpp /usr/include/boost/mpl/back.hpp \
+ /usr/include/boost/mpl/aux_/back_impl.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic/end.hpp \
+ /usr/include/boost/fusion/support/is_segmented.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic/detail/segmented_end.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic/detail/segmented_end_impl.hpp \
+ /usr/include/boost/fusion/container/list/cons_fwd.hpp \
+ /usr/include/boost/fusion/iterator/segmented_iterator.hpp \
+ /usr/include/boost/fusion/iterator/detail/segmented_iterator.hpp \
+ /usr/include/boost/fusion/iterator/deref.hpp \
+ /usr/include/boost/fusion/iterator/deref_data.hpp \
+ /usr/include/boost/fusion/iterator/key_of.hpp \
+ /usr/include/boost/fusion/iterator/value_of_data.hpp \
+ /usr/include/boost/fusion/iterator/detail/segmented_equal_to.hpp \
+ /usr/include/boost/fusion/iterator/detail/segmented_next_impl.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic/begin.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic/detail/segmented_begin.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic/detail/segmented_begin_impl.hpp \
+ /usr/include/boost/fusion/support/detail/segmented_fold_until_impl.hpp \
+ /usr/include/boost/fusion/support/void.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic/segments.hpp \
+ /usr/include/boost/fusion/view/iterator_range.hpp \
+ /usr/include/boost/fusion/view/iterator_range/iterator_range.hpp \
+ /usr/include/boost/fusion/support/detail/access.hpp \
+ /usr/include/boost/fusion/view/iterator_range/detail/begin_impl.hpp \
+ /usr/include/boost/fusion/view/iterator_range/detail/end_impl.hpp \
+ /usr/include/boost/fusion/view/iterator_range/detail/at_impl.hpp \
+ /usr/include/boost/fusion/view/iterator_range/detail/size_impl.hpp \
+ /usr/include/boost/fusion/view/iterator_range/detail/value_at_impl.hpp \
+ /usr/include/boost/fusion/view/iterator_range/detail/is_segmented_impl.hpp \
+ /usr/include/boost/fusion/view/iterator_range/detail/segments_impl.hpp \
+ /usr/include/boost/fusion/view/iterator_range/detail/segmented_iterator_range.hpp \
+ /usr/include/boost/fusion/algorithm/transformation/push_back.hpp \
+ /usr/include/boost/fusion/support/detail/as_fusion_element.hpp \
+ /usr/include/boost/fusion/view/joint_view/joint_view.hpp \
+ /usr/include/boost/fusion/view/joint_view/joint_view_fwd.hpp \
+ /usr/include/boost/fusion/support/is_view.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic/size.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic/detail/segmented_size.hpp \
+ /usr/include/boost/fusion/mpl/begin.hpp \
+ /usr/include/boost/fusion/mpl/end.hpp \
+ /usr/include/boost/fusion/view/joint_view/joint_view_iterator.hpp \
+ /usr/include/boost/fusion/view/joint_view/detail/deref_impl.hpp \
+ /usr/include/boost/fusion/iterator/detail/adapt_deref_traits.hpp \
+ /usr/include/boost/fusion/view/joint_view/detail/next_impl.hpp \
+ /usr/include/boost/fusion/view/joint_view/detail/value_of_impl.hpp \
+ /usr/include/boost/fusion/iterator/detail/adapt_value_traits.hpp \
+ /usr/include/boost/fusion/view/joint_view/detail/deref_data_impl.hpp \
+ /usr/include/boost/fusion/view/joint_view/detail/value_of_data_impl.hpp \
+ /usr/include/boost/fusion/view/joint_view/detail/key_of_impl.hpp \
+ /usr/include/boost/fusion/view/joint_view/detail/begin_impl.hpp \
+ /usr/include/boost/fusion/view/joint_view/detail/end_impl.hpp \
+ /usr/include/boost/mpl/inherit.hpp \
+ /usr/include/boost/mpl/aux_/preprocessed/gcc/inherit.hpp \
+ /usr/include/boost/fusion/view/single_view/single_view.hpp \
+ /usr/include/boost/fusion/view/single_view/single_view_iterator.hpp \
+ /usr/include/boost/fusion/view/single_view/detail/deref_impl.hpp \
+ /usr/include/boost/fusion/view/single_view/detail/next_impl.hpp \
+ /usr/include/boost/fusion/view/single_view/detail/prior_impl.hpp \
+ /usr/include/boost/fusion/view/single_view/detail/advance_impl.hpp \
+ /usr/include/boost/fusion/view/single_view/detail/distance_impl.hpp \
+ /usr/include/boost/fusion/view/single_view/detail/equal_to_impl.hpp \
+ /usr/include/boost/fusion/view/single_view/detail/value_of_impl.hpp \
+ /usr/include/boost/fusion/view/single_view/detail/at_impl.hpp \
+ /usr/include/boost/fusion/view/single_view/detail/begin_impl.hpp \
+ /usr/include/boost/fusion/view/single_view/detail/end_impl.hpp \
+ /usr/include/boost/fusion/view/single_view/detail/size_impl.hpp \
+ /usr/include/boost/fusion/view/single_view/detail/value_at_impl.hpp \
+ /usr/include/boost/fusion/algorithm/transformation/push_front.hpp \
+ /usr/include/boost/fusion/container/list/detail/reverse_cons.hpp \
+ /usr/include/boost/fusion/iterator/detail/segment_sequence.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic/empty.hpp \
+ /usr/include/boost/fusion/container/list/cons.hpp \
+ /usr/include/boost/fusion/support/detail/enabler.hpp \
+ /usr/include/boost/fusion/container/list/nil.hpp \
+ /usr/include/boost/fusion/container/list/cons_iterator.hpp \
+ /usr/include/boost/fusion/container/list/detail/deref_impl.hpp \
+ /usr/include/boost/fusion/container/list/detail/next_impl.hpp \
+ /usr/include/boost/fusion/container/list/detail/value_of_impl.hpp \
+ /usr/include/boost/fusion/container/list/detail/equal_to_impl.hpp \
+ /usr/include/boost/fusion/container/list/list_fwd.hpp \
+ /usr/include/boost/fusion/container/list/detail/begin_impl.hpp \
+ /usr/include/boost/fusion/container/list/detail/end_impl.hpp \
+ /usr/include/boost/fusion/container/list/detail/at_impl.hpp \
+ /usr/include/boost/fusion/container/list/detail/value_at_impl.hpp \
+ /usr/include/boost/fusion/container/list/detail/empty_impl.hpp \
+ /usr/include/boost/fusion/mpl/clear.hpp \
+ /usr/include/boost/fusion/mpl/detail/clear.hpp \
+ /usr/include/boost/fusion/container/vector/vector_fwd.hpp \
+ /usr/include/boost/fusion/container/vector/detail/config.hpp \
+ /usr/include/boost/fusion/container/map/map_fwd.hpp \
+ /usr/include/boost/fusion/container/set/set_fwd.hpp \
+ /usr/include/boost/fusion/container/deque/deque_fwd.hpp \
+ /usr/include/boost/fusion/mpl/empty.hpp \
+ /usr/include/boost/fusion/mpl/erase.hpp /usr/include/boost/mpl/erase.hpp \
+ /usr/include/boost/mpl/erase_fwd.hpp \
+ /usr/include/boost/mpl/aux_/erase_impl.hpp \
+ /usr/include/boost/fusion/algorithm/transformation/erase.hpp \
+ /usr/include/boost/fusion/sequence/convert.hpp \
+ /usr/include/boost/fusion/mpl/erase_key.hpp \
+ /usr/include/boost/mpl/erase_key.hpp \
+ /usr/include/boost/mpl/erase_key_fwd.hpp \
+ /usr/include/boost/mpl/aux_/erase_key_impl.hpp \
+ /usr/include/boost/fusion/algorithm/transformation/erase_key.hpp \
+ /usr/include/boost/fusion/algorithm/query/find.hpp \
+ /usr/include/boost/fusion/algorithm/query/find_if_fwd.hpp \
+ /usr/include/boost/fusion/algorithm/query/detail/find_if.hpp \
+ /usr/include/boost/fusion/algorithm/query/detail/segmented_find.hpp \
+ /usr/include/boost/fusion/algorithm/query/find_fwd.hpp \
+ /usr/include/boost/fusion/support/segmented_fold_until.hpp \
+ /usr/include/boost/fusion/mpl/front.hpp \
+ /usr/include/boost/fusion/mpl/has_key.hpp \
+ /usr/include/boost/fusion/sequence/intrinsic/has_key.hpp \
+ /usr/include/boost/fusion/mpl/insert.hpp \
+ /usr/include/boost/fusion/algorithm/transformation/insert.hpp \
+ /usr/include/boost/fusion/mpl/insert_range.hpp \
+ /usr/include/boost/fusion/algorithm/transformation/insert_range.hpp \
+ /usr/include/boost/fusion/mpl/pop_back.hpp \
+ /usr/include/boost/mpl/pop_back.hpp \
+ /usr/include/boost/mpl/aux_/pop_back_impl.hpp \
+ /usr/include/boost/fusion/algorithm/transformation/pop_back.hpp \
+ /usr/include/boost/fusion/iterator/iterator_adapter.hpp \
+ /usr/include/boost/fusion/mpl/pop_front.hpp \
+ /usr/include/boost/mpl/pop_front.hpp \
+ /usr/include/boost/mpl/aux_/pop_front_impl.hpp \
+ /usr/include/boost/fusion/algorithm/transformation/pop_front.hpp \
+ /usr/include/boost/fusion/mpl/push_back.hpp \
+ /usr/include/boost/fusion/mpl/push_front.hpp \
+ /usr/include/boost/fusion/mpl/size.hpp \
+ /usr/include/boost/fusion/include/for_each.hpp \
+ /usr/include/boost/fusion/algorithm/iteration/for_each.hpp \
+ /usr/include/boost/fusion/algorithm/iteration/detail/for_each.hpp \
+ /usr/include/boost/fusion/algorithm/iteration/detail/segmented_for_each.hpp \
+ /usr/include/boost/fusion/algorithm/iteration/for_each_fwd.hpp \
+ /usr/include/boost/fusion/include/as_vector.hpp \
+ /usr/include/boost/fusion/container/vector/convert.hpp \
+ /usr/include/boost/fusion/container/vector/detail/as_vector.hpp \
+ /usr/include/boost/fusion/support/detail/index_sequence.hpp \
+ /usr/include/boost/fusion/container/vector/vector.hpp \
+ /usr/include/boost/fusion/support/detail/and.hpp \
+ /usr/include/boost/fusion/container/vector/detail/at_impl.hpp \
+ /usr/include/boost/fusion/container/vector/detail/value_at_impl.hpp \
+ /usr/include/boost/fusion/container/vector/detail/begin_impl.hpp \
+ /usr/include/boost/fusion/container/vector/vector_iterator.hpp \
+ /usr/include/boost/fusion/container/vector/detail/deref_impl.hpp \
+ /usr/include/boost/fusion/container/vector/detail/value_of_impl.hpp \
+ /usr/include/boost/fusion/container/vector/detail/next_impl.hpp \
+ /usr/include/boost/fusion/container/vector/detail/prior_impl.hpp \
+ /usr/include/boost/fusion/container/vector/detail/equal_to_impl.hpp \
+ /usr/include/boost/fusion/container/vector/detail/distance_impl.hpp \
+ /usr/include/boost/fusion/container/vector/detail/advance_impl.hpp \
+ /usr/include/boost/fusion/container/vector/detail/end_impl.hpp \
+ /usr/include/boost/fusion/container/vector/detail/convert_impl.hpp \
+ /usr/include/boost/fusion/include/filter_if.hpp \
+ /usr/include/boost/fusion/algorithm/transformation/filter_if.hpp \
+ /usr/include/boost/fusion/view/filter_view/filter_view.hpp \
+ /usr/include/boost/fusion/view/filter_view/filter_view_iterator.hpp \
+ /usr/include/boost/fusion/view/filter_view/detail/deref_impl.hpp \
+ /usr/include/boost/fusion/view/filter_view/detail/next_impl.hpp \
+ /usr/include/boost/fusion/view/filter_view/detail/value_of_impl.hpp \
+ /usr/include/boost/fusion/view/filter_view/detail/equal_to_impl.hpp \
+ /usr/include/boost/fusion/view/filter_view/detail/deref_data_impl.hpp \
+ /usr/include/boost/fusion/view/filter_view/detail/value_of_data_impl.hpp \
+ /usr/include/boost/fusion/view/filter_view/detail/key_of_impl.hpp \
+ /usr/include/boost/fusion/view/filter_view/detail/begin_impl.hpp \
+ /usr/include/boost/fusion/view/filter_view/detail/end_impl.hpp \
+ /usr/include/boost/fusion/view/filter_view/detail/size_impl.hpp \
+ /usr/include/pcl-1.12/pcl/common/impl/centroid.hpp \
+ /usr/include/pcl-1.12/pcl/common/point_tests.h \
+ /usr/include/pcl-1.12/pcl/filters/fast_bilateral.h \
+ /usr/include/pcl-1.12/pcl/filters/conditional_removal.h \
+ /usr/include/pcl-1.12/pcl/surface/gp3.h \
+ /usr/include/pcl-1.12/pcl/surface/reconstruction.h \
+ /usr/include/pcl-1.12/pcl/surface/impl/reconstruction.hpp \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/IRSGUI/../include/IRSFunction.h \
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QApplication \
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qapplication.h \

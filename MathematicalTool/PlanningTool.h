@@ -18,7 +18,11 @@
 #include <ompl/geometric/planners/rrt/RRTConnect.h>
 #include <ompl/base/samplers/ObstacleBasedValidStateSampler.h>
 
+#include <pcl/surface/mls.h>
+
 #include "../include/IRSParametersData.h"
+#include "PointCloudTool.h"
+
 
 namespace PlanningTool
 {   
@@ -88,13 +92,15 @@ private:
     class OMPLTool
     {
     public:
-        OMPLTool(std::shared_ptr<moveit::core::RobotModel> robotModel, std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd>  envManager);
+        OMPLTool(std::shared_ptr<moveit::core::RobotModel> robotModel);
 
-        ompl::base::PathPtr plan(std::shared_ptr<moveit::core::RobotState> robotState, std::vector<std::string> goalJointNames, std::vector<double> goalJointAngles);
+        ompl::base::PathPtr Plan(std::shared_ptr<moveit::core::RobotState> robotState, std::vector<std::string> goalJointNames, std::vector<double> goalJointPositions, std::vector<Eigen::Vector3d> envPointClouds);
 
     private:
+
+        std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> GetAABBEnvManager(std::vector<Eigen::Vector3d> envPointClouds);
+
         std::shared_ptr<moveit::core::RobotModel> robotModel;
-        std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager;
         std::map<std::string, moveit::core::VariableBounds> jointBounds;
         std::shared_ptr<FCLTool> fclTool;
     };

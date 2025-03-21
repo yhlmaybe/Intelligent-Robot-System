@@ -20,5 +20,5 @@ const int RComp_LittleFinger_Arth_1 = 17;
 const int RComp_LittleFinger_Arth_2 = 18;
 const int RComp_LittleFinger_Arth_3 = 19;
 const int RComp_LittleFinger_Arth_4 = 20;
-const int RComp_Wrist_Arth_YZ = 21;
-const int RComp_Wrist_Arth_XY = 22;
+const int RComp_Palm = 21;
+const int RComp_Wrist_Arth = 22;
