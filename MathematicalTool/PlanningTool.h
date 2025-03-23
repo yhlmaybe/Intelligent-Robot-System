@@ -59,12 +59,12 @@ namespace PlanningTool
         std::shared_ptr<fcl::CollisionGeometryd> CreateFCLGeometry(shapes::ShapeConstPtr& shape); 
         std::vector<fcl::CollisionObjectd*> ConvertToFclColl(std::vector<LinkCollisionObject> linkObjs);
 
-        std::shared_ptr<moveit::core::RobotModel> robotModel;
-        std::vector<fcl::CollisionObjectd*> collObjs;
-        std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> robotManager;
-        std::vector<std::pair<std::vector<fcl::CollisionObjectd*>, std::vector<fcl::CollisionObjectd*>>> allowSelfFclCollPairs;
-        std::unordered_map<std::string, std::vector<fcl::CollisionObjectd*>> linkFclCollisions;
-        std::unordered_map<std::string, std::vector<LinkCollisionObject>> linkCollisions;
+        std::shared_ptr<moveit::core::RobotModel> robot_model;
+        std::vector<fcl::CollisionObjectd*> coll_objs;
+        std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> robot_manager;
+        std::vector<std::pair<std::vector<fcl::CollisionObjectd*>, std::vector<fcl::CollisionObjectd*>>> allow_self_fcl_collPairs;
+        std::unordered_map<std::string, std::vector<fcl::CollisionObjectd*>> link_fcl_collisions;
+        std::unordered_map<std::string, std::vector<LinkCollisionObject>> link_collisions;
     };
 
     class CustomStateValidator : public ompl::base::StateValidityChecker 
@@ -81,11 +81,11 @@ namespace PlanningTool
     bool isValid(const ompl::base::State* state) const override ;
 
 private:
-    std::shared_ptr<moveit::core::RobotState> robotState;
-    std::shared_ptr<FCLTool> fclTool;
-    std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager;
-    std::vector<std::string> linkNames;
-    std::vector<std::string> jointNames;
+    std::shared_ptr<moveit::core::RobotState> robot_state;
+    std::shared_ptr<FCLTool> fcl_tool;
+    std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> env_manager;
+    std::vector<std::string> link_names;
+    std::vector<std::string> joint_names;
     size_t dimsion;
     };
 
@@ -100,9 +100,9 @@ private:
 
         std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> GetAABBEnvManager(std::vector<Eigen::Vector3d> envPointClouds);
 
-        std::shared_ptr<moveit::core::RobotModel> robotModel;
-        std::map<std::string, moveit::core::VariableBounds> jointBounds;
-        std::shared_ptr<FCLTool> fclTool;
+        std::shared_ptr<moveit::core::RobotModel> robot_model;
+        std::map<std::string, moveit::core::VariableBounds> joint_bounds;
+        std::shared_ptr<FCLTool> fcl_tool;
     };
 
 }

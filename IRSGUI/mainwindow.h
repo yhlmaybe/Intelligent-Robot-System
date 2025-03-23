@@ -33,9 +33,11 @@ private:
 
     Ui::MainWindow *ui;
 
-    std::shared_ptr<std::mutex> message_mtx;
+    mutable std::mutex message_mtx;
 
     bool is_running = false;
+
+    bool is_initial = false;
 
 private slots:
 

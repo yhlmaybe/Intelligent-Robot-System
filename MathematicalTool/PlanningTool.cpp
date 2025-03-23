@@ -4,12 +4,12 @@ namespace PlanningTool
 {
     FCLTool::FCLTool(std::shared_ptr<moveit::core::RobotModel> robotModel, std::string completePlanningGroupName)
     {   
-        robotModel = robotModel;
-        moveit::core::JointModelGroup *jointGroup = robotModel->getJointModelGroup(completePlanningGroupName);
+        robot_model = robotModel;
+        moveit::core::JointModelGroup *jointGroup = robot_model->getJointModelGroup(completePlanningGroupName);
         std::vector<std::string> linkNames = jointGroup->getLinkModelNames();
         for (auto &name : linkNames)
         {
-            moveit::core::LinkModel *link = robotModel->getLinkModel(name);         
+            moveit::core::LinkModel *link = robot_model->getLinkModel(name);         
             std::vector<shapes::ShapeConstPtr> shapes = link->getShapes();
             std::vector<LinkCollisionObject> collisionObjects;
             for (size_t i = 0; i < shapes.size(); ++i)
@@ -22,22 +22,22 @@ namespace PlanningTool
             }
             if (!collisionObjects.empty())
             {
-                linkCollisions[name] = std::move(collisionObjects);
+                link_collisions[name] = std::move(collisionObjects);
                 std::vector<fcl::CollisionObjectd*> fclColls = ConvertToFclColl(collisionObjects);
-                for (fcl::CollisionObjectd* obj : fclColls) { collObjs.push_back(obj); }
-                linkFclCollisions[name] = fclColls;
+                for (fcl::CollisionObjectd* obj : fclColls) { coll_objs.push_back(obj); }
+                link_fcl_collisions[name] = fclColls;
             }
         }
-        allowSelfFclCollPairs = GetSelfAllowLinkFclColls();
+        allow_self_fcl_collPairs = GetSelfAllowLinkFclColls();
 
-        robotManager = std::make_shared<fcl::DynamicAABBTreeCollisionManagerd>();
-        robotManager->registerObjects(collObjs);
-        robotManager->update();
+        robot_manager = std::make_shared<fcl::DynamicAABBTreeCollisionManagerd>();
+        robot_manager->registerObjects(coll_objs);
+        robot_manager->update();
     }
 
     FCLTool::~FCLTool()
     {
-        for(auto obj : collObjs) 
+        for(auto obj : coll_objs) 
         {
             delete obj;
         }
@@ -46,12 +46,12 @@ namespace PlanningTool
     std::vector<std::pair<std::vector<LinkCollisionObject>, std::vector<LinkCollisionObject>>> FCLTool::GetSelfAllowLinkColls()
     {
         std::vector<std::pair<std::vector<LinkCollisionObject>, std::vector<LinkCollisionObject>>> res;
-        std::vector<srdf::Model::CollisionPair> collisionPairs  = robotModel->getSRDF()->getEnabledCollisionPairs(); 
+        std::vector<srdf::Model::CollisionPair> collisionPairs  = robot_model->getSRDF()->getEnabledCollisionPairs(); 
         for(size_t i = 0; i < collisionPairs.size(); ++i)
         {   
             srdf::Model::CollisionPair pair = collisionPairs[i];
-            std::vector<LinkCollisionObject> obj1 = linkCollisions[pair.link1_];
-            std::vector<LinkCollisionObject> obj2 = linkCollisions[pair.link2_];
+            std::vector<LinkCollisionObject> obj1 = link_collisions[pair.link1_];
+            std::vector<LinkCollisionObject> obj2 = link_collisions[pair.link2_];
             res.push_back(std::pair<std::vector<LinkCollisionObject>, std::vector<LinkCollisionObject>>(obj1, obj2));
         }
         return res;
@@ -60,12 +60,13 @@ namespace PlanningTool
     std::vector<std::pair<std::vector<fcl::CollisionObjectd*>, std::vector<fcl::CollisionObjectd*>>> FCLTool::GetSelfAllowLinkFclColls()
     {
         std::vector<std::pair<std::vector<fcl::CollisionObjectd*>, std::vector<fcl::CollisionObjectd*>>> res;
-        std::vector<srdf::Model::CollisionPair> collisionPairs  = robotModel->getSRDF()->getEnabledCollisionPairs(); 
+        auto srdf = robot_model->getSRDF();
+        std::vector<srdf::Model::CollisionPair> collisionPairs  = srdf->getEnabledCollisionPairs(); 
         for(size_t i = 0; i < collisionPairs.size(); ++i)
         {   
             srdf::Model::CollisionPair pair = collisionPairs[i];
-            std::vector<fcl::CollisionObjectd*> obj1 = linkFclCollisions[pair.link1_];
-            std::vector<fcl::CollisionObjectd*> obj2 = linkFclCollisions[pair.link2_];
+            std::vector<fcl::CollisionObjectd*> obj1 = link_fcl_collisions[pair.link1_];
+            std::vector<fcl::CollisionObjectd*> obj2 = link_fcl_collisions[pair.link2_];
             res.push_back(std::pair<std::vector<fcl::CollisionObjectd*>, std::vector<fcl::CollisionObjectd*>>(obj1, obj2));
         }
         return res;
@@ -74,14 +75,14 @@ namespace PlanningTool
     bool FCLTool::IsSelfCollision()
     {
         fcl::CollisionRequestd req;
-        for (size_t i = 0; i < allowSelfFclCollPairs.size(); ++i)
+        for (size_t i = 0; i < allow_self_fcl_collPairs.size(); ++i)
         {
-            for (size_t j = 0; j < allowSelfFclCollPairs[i].first.size(); ++j)
+            for (size_t j = 0; j < allow_self_fcl_collPairs[i].first.size(); ++j)
             {
-                fcl::CollisionObjectd* obj1 = allowSelfFclCollPairs[i].first[j];
-                for (size_t k = 0; k < allowSelfFclCollPairs[i].second.size(); ++k)
+                fcl::CollisionObjectd* obj1 = allow_self_fcl_collPairs[i].first[j];
+                for (size_t k = 0; k < allow_self_fcl_collPairs[i].second.size(); ++k)
                 {
-                    fcl::CollisionObjectd* obj2 = allowSelfFclCollPairs[i].second[k];
+                    fcl::CollisionObjectd* obj2 = allow_self_fcl_collPairs[i].second[k];
                     fcl::CollisionResultd res;
                     fcl::collide(obj1, obj2, req, res);
                     if (res.isCollision()) return true;
@@ -93,9 +94,9 @@ namespace PlanningTool
 
     bool FCLTool::IsEnvCollision(std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager)
     {      
-        robotManager->update();
+        robot_manager->update();
         CollisionData cdata;
-        envManager->collide(robotManager.get() ,&cdata, fcl::DefaultCollisionFunction);
+        envManager->collide(robot_manager.get() ,&cdata, fcl::DefaultCollisionFunction);
         if(cdata.result.isCollision()) return true;
         return false;
     }
@@ -113,8 +114,8 @@ namespace PlanningTool
 
     void FCLTool::SetCollObjTF(std::string name, Eigen::Isometry3d tf)
     {
-        auto it = linkFclCollisions.find(name);
-        if(it != linkFclCollisions.end())
+        auto it = link_fcl_collisions.find(name);
+        if(it != link_fcl_collisions.end())
         {
             fcl::Transform3d fclTf(tf);
             std::vector<fcl::CollisionObjectd*> objs = it->second;
@@ -127,7 +128,7 @@ namespace PlanningTool
 
     std::vector<fcl::CollisionObjectd*> FCLTool::GetCollObj()
     {
-        return collObjs;
+        return coll_objs;
     }
 
     void FCLTool::UpdateLinkTF(std::vector<std::string> linkNames, std::vector<Eigen::Isometry3d> tfs)
@@ -140,7 +141,7 @@ namespace PlanningTool
 
     void FCLTool::UpdateLinkTF(moveit::core::RobotState state)
     {
-        std::vector<moveit::core::LinkModel *> linkModels = robotModel->getLinkModels();
+        std::vector<moveit::core::LinkModel *> linkModels = robot_model->getLinkModels();
         for (auto linkModel : linkModels)
         {
             Eigen::Isometry3d tf = state.getGlobalLinkTransform(linkModel);
@@ -214,13 +215,13 @@ namespace PlanningTool
                                                std::shared_ptr<moveit::core::RobotState> robotState,
                                                std::shared_ptr<FCLTool> fclTool,
                                                std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager) : ompl::base::StateValidityChecker(si),
-                                                                                                    robotState(robotState),
-                                                                                                    fclTool(fclTool),
-                                                                                                    envManager(envManager),
-                                                                                                    linkNames(linkNames),
-                                                                                                    jointNames(jointNames)
+                                                                                                    robot_state(robotState),
+                                                                                                    fcl_tool(fclTool),
+                                                                                                    env_manager(envManager),
+                                                                                                    link_names(linkNames),
+                                                                                                    joint_names(jointNames)
     {
-        dimsion = jointNames.size();
+        dimsion = joint_names.size();
     }
 
     bool CustomStateValidator::isValid(const ompl::base::State *state) const
@@ -228,18 +229,18 @@ namespace PlanningTool
         for (size_t i = 0; i < dimsion; ++i)
         {
             double angle = state->as<ompl::base::RealVectorStateSpace::StateType>()->values[i];
-            robotState->setVariablePosition(jointNames[i], angle);
+            robot_state->setVariablePosition(joint_names[i], angle);
         }
       
-        robotState->updateLinkTransforms();
+        robot_state->updateLinkTransforms();
 
-        fclTool->UpdateLinkTF(*robotState, linkNames);
+        fcl_tool->UpdateLinkTF(*robot_state, link_names);
 
-        bool isSelfColl = fclTool->IsSelfCollision();
+        bool isSelfColl = fcl_tool->IsSelfCollision();
 
         if(isSelfColl) return false;
 
-        bool isEnvColl = fclTool->IsEnvCollision(envManager);
+        bool isEnvColl = fcl_tool->IsEnvCollision(env_manager);
 
         if(isEnvColl) return false;
 
@@ -248,10 +249,10 @@ namespace PlanningTool
 
     OMPLTool::OMPLTool(std::shared_ptr<moveit::core::RobotModel> robotModel)
     {   
-        robotModel = robotModel;
-        fclTool = std::make_shared<FCLTool>(robotModel, IRS_GROUP_NAME);
+        robot_model = robotModel;
+        fcl_tool = std::make_shared<FCLTool>(robot_model, IRS_GROUP_NAME);
 
-        moveit::core::JointModelGroup* group = robotModel->getJointModelGroup(IRS_GROUP_NAME);
+        moveit::core::JointModelGroup* group = robot_model->getJointModelGroup(IRS_GROUP_NAME);
 
         std::vector<moveit::core::VariableBounds> variableBounds;
 
@@ -261,14 +262,14 @@ namespace PlanningTool
             for (const std::string &varName : jointNames)
             {
                 const moveit::core::VariableBounds &bounds = joint->getVariableBounds(varName);
-                jointBounds[varName] = bounds;
+                joint_bounds[varName] = bounds;
             }
         }
     }
 
     ompl::base::PathPtr OMPLTool::Plan(std::shared_ptr<moveit::core::RobotState> robotState, std::vector<std::string> goalJointNames, std::vector<double> goalJointPositions, std::vector<Eigen::Vector3d> envPointClouds)
     {   
-        fclTool->UpdateLinkTF(*robotState);
+        fcl_tool->UpdateLinkTF(*robotState);
 
         int dimsion = goalJointNames.size();
         size_t count = goalJointNames.size();
@@ -280,9 +281,9 @@ namespace PlanningTool
         for (size_t i = 0; i < count; ++i)
         {   
             std::string name = goalJointNames[i];
-            if(jointBounds.find(name) != jointBounds.end())
+            if(joint_bounds.find(name) != joint_bounds.end())
             {
-                auto bound = jointBounds[name];
+                auto bound = joint_bounds[name];
                 bounds.setLow(i, bound.min_position_);
                 bounds.setHigh(i, bound.max_position_);
                 const double* angle = robotState->getJointPositions(name);
@@ -314,12 +315,12 @@ namespace PlanningTool
         std::vector<std::string> linkNames;
         for(size_t i = 0; i < goalJointNames.size(); ++i)
         {
-            moveit::core::JointModel* jm = robotModel->getJointModel(goalJointNames[i]);
+            moveit::core::JointModel* jm = robot_model->getJointModel(goalJointNames[i]);
             linkNames.push_back(jm->getChildLinkModel()->getName());
         }
 
         std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager = GetAABBEnvManager(envPointClouds);
-        ss->setStateValidityChecker(std::make_shared<CustomStateValidator>(ss, linkNames, goalJointNames, planState, fclTool, envManager));
+        ss->setStateValidityChecker(std::make_shared<CustomStateValidator>(ss, linkNames, goalJointNames, planState, fcl_tool, envManager));
 
         std::shared_ptr<ompl::geometric::RRTConnect> planner(std::make_shared<ompl::geometric::RRTConnect>(ss));
         planner->setProblemDefinition(pdef);

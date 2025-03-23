@@ -77,8 +77,6 @@ geometry_msgs::msg::TransformStamped UrdfPublisherNode::KDLToTransform(const KDL
 
 UrdfPublisherNode::UrdfPublisherNode() : Node(URDF_PUBLISHER)
 {
-    
-
     tf_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(this);
     static_tf_broadcaster = std::make_unique<tf2_ros::StaticTransformBroadcaster>(this);
 
@@ -297,11 +295,14 @@ ServoManagerNode::ServoManagerNode() : Node(MOTION_MANAGER)
 
     motion_manager = std::make_shared<MotionManager>(URDF_XML, SRDF_XML);
     motion_manager->UpdateState(UpdateRobotstateBoundary());
+
+    sensor_msgs::msg::JointState msg = motion_manager->GetCurrentJointStateMsg();
+    jointState_pub->publish(msg);
 }
 
 void ServoManagerNode::Reset()
 {
-    std::lock_guard<std::mutex> lock(*motion_servo_mtx);
+    std::lock_guard<std::mutex> lock(motion_servo_mtx);
     for(auto it : joint_servos)
     {
         it.second->Reset();
@@ -330,8 +331,9 @@ std::vector<std::shared_ptr<ServoManager>> ServoManagerNode::GetServoManagerFrom
 
 void ServoManagerNode::ToGoalPoint()
 {
-    std::lock_guard<std::mutex> lock(*motion_servo_mtx);
     std::vector<Eigen::Vector3d> datas = IRSCoreHandle::goal_points_queue->pop();
+    if(datas.size() == 0) return;
+    std::lock_guard<std::mutex> lock(motion_servo_mtx);
     for (size_t i = 0; i < datas.size(); ++i)
     {
         EndEffectorType type = motion_manager->GetClosestEndEffector(datas[i]);
@@ -368,7 +370,7 @@ void ServoManagerNode::ToGoalPoint()
 
 void ServoManagerNode::SetJointPosition(std::string jointName, double position)
 {
-    std::lock_guard<std::mutex> lock(*motion_servo_mtx);
+    std::lock_guard<std::mutex> lock(motion_servo_mtx);
     double before_position = motion_manager->GetCurrentRobotState()->getVariablePosition(jointName);
     double after_position = motion_manager->CalGoalJointPosition(jointName, position);
 
@@ -383,7 +385,7 @@ void ServoManagerNode::SetJointPosition(std::string jointName, double position)
 
 std::shared_ptr<moveit::core::RobotState> ServoManagerNode::GetCurrentRobotState()
 {
-    std::lock_guard<std::mutex> lock(*motion_servo_mtx);
+    std::lock_guard<std::mutex> lock(motion_servo_mtx);
     return motion_manager->GetCurrentRobotState();
 }
 
@@ -435,29 +437,36 @@ void IRSCoreHandle::Start()
 
         IsNodeRunning.store(true, std::memory_order_release);
 
-        JointStateNodeInitial(servo_manager_node->GetCurrentRobotState());
+        auto state = servo_manager_node->GetCurrentRobotState();
+        JointStateNodeInitial(state);
     }
     else IRS_MESSAGE("IRS core already start");
 }
 
 void IRSCoreHandle::End()
 {
-    IsNodeRunning.store(false, std::memory_order_release);
-    env_perce->Stop();
-    servo_manager_node->Stop();
+    if(IsNodeRunning.load())
+    {
+        IsNodeRunning.store(false, std::memory_order_release);
+        env_perce->Stop();
+        servo_manager_node->Stop();
+    }
 }
 
 void IRSCoreHandle::ResetServoState()
-{   
-    env_perce->Stop();
-    servo_manager_node->Stop();
+{
+    if (IsNodeRunning.load())
+    {
+        env_perce->Stop();
+        servo_manager_node->Stop();
 
-    goal_points_queue->reset();
-    env_perce->Reset();
-    servo_manager_node->Reset();
-    
-    env_perce->Start();
-    servo_manager_node->Start();
+        goal_points_queue->reset();
+        env_perce->Reset();
+        servo_manager_node->Reset();
+
+        env_perce->Start();
+        servo_manager_node->Start();
+    }
 }
 
 void IRSCoreHandle::SetJointPosition(std::string name, double position)

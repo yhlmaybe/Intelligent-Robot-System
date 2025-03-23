@@ -135,7 +135,7 @@ private:
     std::map<std::string, std::shared_ptr<ServoManager>> joint_servos;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr jointState_pub;
     std::shared_ptr<MotionManager> motion_manager;
-    std::shared_ptr<std::mutex> motion_servo_mtx;
+    mutable std::mutex motion_servo_mtx;
 
     std::vector<std::shared_ptr<ServoManager>> GetServoManagerFromName(std::vector<std::string> names);
     std::shared_ptr<moveit::core::RobotState> UpdateRobotstateBoundary();

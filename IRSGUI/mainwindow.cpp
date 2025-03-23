@@ -54,29 +54,34 @@ MainWindow::MainWindow(QWidget *parent) :
     connect(ui->StateReset_Button, SIGNAL(clicked()), this, SLOT(StateReset()));
     connect(ui->setJointPosition_Button, SIGNAL(clicked()), this, SLOT(SetJointPosition()));
     connect(ui->setGoalPoint_Button, SIGNAL(clicked()), this, SLOT(SetGoalPoint()));
+    connect(ui->start_Button, SIGNAL(clicked()), this, SLOT(Start()));
+    connect(ui->end_Button, SIGNAL(clicked()), this, SLOT(End()));
 }
 
 MainWindow::~MainWindow()
 {  
     IRSCoreHandle::End();
     rclcpp::shutdown();
-    delete ui; 
     QSharedMemory sharedMemory("IRSUniqueKey");
     sharedMemory.detach();
     Py_Finalize();
-
+    delete ui; 
 }
 
 void MainWindow::Initiate()
 {
-    Py_Initialize();
-    PyRun_SimpleString("import sys");
-    PyRun_SimpleString("sys.path.append('./ServoControl')");      
+    if (!is_initial)
+    {
+        Py_Initialize();
+        PyRun_SimpleString("import sys");
+        PyRun_SimpleString("sys.path.append('./ServoControl')");
+    }
+    is_initial = true;
 }
 
 void MainWindow::SetMessage(std::string message)
 {
-    std::lock_guard<std::mutex> lock(*message_mtx);
+    std::lock_guard<std::mutex> lock(message_mtx);
     ui->MessageText->moveCursor(QTextCursor::End, QTextCursor::MoveAnchor);
     QString QMessage = QString::fromStdString(message);
     ui->MessageText->insertPlainText(QMessage);

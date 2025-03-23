@@ -88,7 +88,7 @@ protected:
 private:
     std::thread worker_thread_;
     std::atomic<bool> is_running_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 
     void Run();
 };
