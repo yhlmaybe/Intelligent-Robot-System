@@ -33,7 +33,10 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/IRSGUI
 )
 
-include_directories(/usr/include/ompl-1.5)
+find_package(ompl REQUIRED)
+include_directories(${OMPL_INCLUDE_DIRS})
+
+#include_directories(/usr/locate/include/ompl-1.6)
 
 add_executable(IRS_CMake ${IRS_LIST})
 

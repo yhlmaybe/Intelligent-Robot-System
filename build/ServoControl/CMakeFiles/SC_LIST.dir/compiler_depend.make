@@ -367,7 +367,8 @@ ServoControl/CMakeFiles/SC_LIST.dir/SCDrive.cpp.o: ../ServoControl/SCDrive.cpp \
   /usr/include/c++/11/bits/stl_deque.h \
   /usr/include/c++/11/bits/deque.tcc \
   /usr/include/c++/11/bits/stl_heap.h \
-  /usr/include/c++/11/bits/stl_queue.h
+  /usr/include/c++/11/bits/stl_queue.h \
+  /usr/include/c++/11/functional
 
 ServoControl/CMakeFiles/SC_LIST.dir/ServoID.cpp.o: ../ServoControl/ServoID.cpp \
   /usr/include/stdc-predef.h \
@@ -744,6 +745,7 @@ ServoControl/CMakeFiles/SC_LIST.dir/ServoManager.cpp.o: ../ServoControl/ServoMan
   /usr/include/c++/11/bits/deque.tcc \
   /usr/include/c++/11/bits/stl_heap.h \
   /usr/include/c++/11/bits/stl_queue.h \
+  /usr/include/c++/11/functional \
   ../ServoControl/ServoID.h \
   ../include/IRSParametersData.h
 
@@ -1059,6 +1061,8 @@ ServoControl/CMakeFiles/SC_LIST.dir/ServoManager.cpp.o: ../ServoControl/ServoMan
 /usr/include/x86_64-linux-gnu/c++/11/bits/c++config.h:
 
 /usr/include/x86_64-linux-gnu/bits/pthread_stack_min-dynamic.h:
+
+/usr/include/c++/11/functional:
 
 /usr/include/linux/errno.h:
 

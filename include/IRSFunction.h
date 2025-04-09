@@ -8,6 +8,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <functional>
 
 extern void IRS_MESSAGE(std::string message);
 
@@ -80,17 +81,20 @@ public:
 
     void Start();
     void Stop();
-    void Reset();
 
-protected:
-    virtual void ExecuteTask() = 0; 
+    void RegisterTask(std::function<void()> task);
+    void AddTaskAndStart(std::function<void()> task);
 
 private:
-    std::thread worker_thread_;
+    std::vector<std::thread> threads_;
     std::atomic<bool> is_running_;
     mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<std::function<void()>> tasks_;
 
-    void Run();
+    size_t startedTaskCount_;
+
+    void CreateThreadsForNewTasks();
 };
 
 

@@ -33,7 +33,7 @@ void ServoOperate::SetServoPosition(int position, double time)
     PyObject_CallMethod(instance, "set_servo_position", "iii", id, position, time);
     else
     {
-        IRS_MESSAGE("servo" + this->name + "error , could not set position");
+        IRS_MESSAGE("servo " + this->name + " error , could not set position");
     }
 }
 
@@ -43,7 +43,7 @@ void ServoOperate::SetServoStop()
     PyObject_CallMethod(instance, "stop", "i", id);
     else
     {
-        IRS_MESSAGE("servo" + this->name + "error , could not stop");
+        IRS_MESSAGE("servo " + this->name + " error , could not stop");
     }
 } 
 

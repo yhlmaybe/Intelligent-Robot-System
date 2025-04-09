@@ -47,12 +47,14 @@ struct TrajectoryPoint
 class EndEffector
 {
 public:
-    const EndEffectorType type = EndEffectorType::NoneType;
-    const std::string name = "";
-    const std::string partGroupName = "";
-    const std::string completeGroupName = "";
-    std::shared_ptr<IRS_IK::IRS_IK> partGroupIkSolver = nullptr;
-    std::shared_ptr<IRS_IK::IRS_IK> completeGroupIkSolver = nullptr;
+    EndEffectorType type_ = EndEffectorType::NoneType;
+    std::string name_ = "";
+    std::string part_group_name = "";
+    std::string complete_group_name = "";
+    std::string part_group_first_link_name = "";
+    std::string complete_group_first_link_name = "";
+    std::shared_ptr<IRS_IK::IRS_IK> part_group_IkSolver = nullptr;
+    std::shared_ptr<IRS_IK::IRS_IK> complete_group_IkSolver = nullptr;
     bool IsUsed = false;
     EndEffector(std::string URDF, std::string name, std::string partGroupName, std::string completeGroupName, std::string partGroupFirstLinkName, std::string completeGroupFirstLinkName, EndEffectorType type);
 };
@@ -66,6 +68,7 @@ public:
     Eigen::Isometry3d ConvertPoseFromRelBaseToRelEnd(EndEffectorType endEffector, Eigen::Isometry3d pose);
     Eigen::Isometry3d ConvertPoseFromRelEndToRelBase(EndEffectorType endEffector, Eigen::Isometry3d pose);
     Eigen::Isometry3d ConvertPoseFromRelEndToRelAny(EndEffectorType endEffector, std::string anyLinkName, Eigen::Isometry3d pose);
+    Eigen::Isometry3d ConvertPoseFromRelBaseToRelAny(std::string anyLinkName, Eigen::Isometry3d pose);
     sensor_msgs::msg::JointState GetCurrentJointStateMsg();
     Eigen::Isometry3d GetDefaultTouchPoseFromPoint(EndEffectorType endEffector, Eigen::Vector3d pointRelBase, Eigen::Vector3d pointNormal, double fingerAngle = 60);
     void InitialJointState();
@@ -74,28 +77,28 @@ public:
 
     std::shared_ptr<moveit::core::RobotState> GetCurrentRobotState();
 
-    EndEffectorType GetClosestEndEffector(Eigen::Vector3d point);
+    std::shared_ptr<EndEffector> GetClosestEndEffector(Eigen::Vector3d point);
 
     void UpdateState(std::shared_ptr<moveit::core::RobotState> state);
 
-    bool JointIKCal(std::vector<std::string>& jointNameResult, std::vector<double>& jointValueResult, EndEffectorType endEffector, Eigen::Isometry3d pointRelativeEndEff, bool isPart);
+    bool JointIKCal(std::vector<std::string>& jointNameResult, std::vector<double>& jointValueResult, EndEffectorType endEffector, Eigen::Isometry3d poseRelativeBaseLink, bool isPart, bool ignorePoseRotation = true);
     std::vector<TrajectoryPoint> Plan(std::vector<std::string> goalJointNames, std::vector<double> goalJointPositions, std::vector<Eigen::Vector3d> envPointClouds, double totalTime, int interpolateCount = 0);
     sensor_msgs::msg::JointState UpdateRobotStateAndGetMsg(std::vector<std::string> goalJointNames, std::vector<double> goalJointPositions);
     sensor_msgs::msg::JointState UpdateRobotStateAndGetMsg(std::string goalJointName, double goalJointPosition);
 
 private:
-    std::string overallGroupName = "r_arm";
-    std::string overallInitPosdName = "r_arm_home";
+    std::string overall_group_name = "r_arm";
+    std::string overall_init_posd_name = "r_arm_home";
 
-    std::shared_ptr<moveit::core::RobotModel> robotModel;
-    std::shared_ptr<moveit::core::RobotState> robotState;
+    std::shared_ptr<moveit::core::RobotModel> robot_model;
+    std::shared_ptr<moveit::core::RobotState> robot_state;
 
-    std::map<EndEffectorType, std::shared_ptr<EndEffector>> endEffectorsMap;
+    std::map<EndEffectorType, std::shared_ptr<EndEffector>> end_effectors_map;
 
     Eigen::Isometry3d ConvertToIsometry3d(KDL::Frame frame);
     KDL::Frame ConvertToFrame(Eigen::Isometry3d Isometry3d);
 
-    std::shared_ptr<PlanningTool::OMPLTool> omplTool;
+    std::shared_ptr<PlanningTool::OMPLTool> ompl_tool;
 };
 
 #endif

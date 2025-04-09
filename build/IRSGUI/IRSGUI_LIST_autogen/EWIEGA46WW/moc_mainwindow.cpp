@@ -22,8 +22,8 @@ QT_BEGIN_MOC_NAMESPACE
 QT_WARNING_PUSH
 QT_WARNING_DISABLE_DEPRECATED
 struct qt_meta_stringdata_MainWindow_t {
-    QByteArrayData data[10];
-    char stringdata0[94];
+    QByteArrayData data[12];
+    char stringdata0[114];
 };
 #define QT_MOC_LITERAL(idx, ofs, len) \
     Q_STATIC_BYTE_ARRAY_DATA_HEADER_INITIALIZER_WITH_OFFSET(len, \
@@ -33,20 +33,23 @@ struct qt_meta_stringdata_MainWindow_t {
 static const qt_meta_stringdata_MainWindow_t qt_meta_stringdata_MainWindow = {
     {
 QT_MOC_LITERAL(0, 0, 10), // "MainWindow"
-QT_MOC_LITERAL(1, 11, 10), // "SetServoNo"
+QT_MOC_LITERAL(1, 11, 10), // "SetMessage"
 QT_MOC_LITERAL(2, 22, 0), // ""
-QT_MOC_LITERAL(3, 23, 10), // "GetServoNo"
-QT_MOC_LITERAL(4, 34, 8), // "Initiate"
-QT_MOC_LITERAL(5, 43, 5), // "Start"
-QT_MOC_LITERAL(6, 49, 3), // "End"
-QT_MOC_LITERAL(7, 53, 10), // "StateReset"
-QT_MOC_LITERAL(8, 64, 16), // "SetJointPosition"
-QT_MOC_LITERAL(9, 81, 12) // "SetGoalPoint"
+QT_MOC_LITERAL(3, 23, 8), // "QMessage"
+QT_MOC_LITERAL(4, 32, 10), // "SetServoNo"
+QT_MOC_LITERAL(5, 43, 10), // "GetServoNo"
+QT_MOC_LITERAL(6, 54, 8), // "Initiate"
+QT_MOC_LITERAL(7, 63, 5), // "Start"
+QT_MOC_LITERAL(8, 69, 3), // "End"
+QT_MOC_LITERAL(9, 73, 10), // "StateReset"
+QT_MOC_LITERAL(10, 84, 16), // "SetJointPosition"
+QT_MOC_LITERAL(11, 101, 12) // "SetGoalPoint"
 
     },
-    "MainWindow\0SetServoNo\0\0GetServoNo\0"
-    "Initiate\0Start\0End\0StateReset\0"
-    "SetJointPosition\0SetGoalPoint"
+    "MainWindow\0SetMessage\0\0QMessage\0"
+    "SetServoNo\0GetServoNo\0Initiate\0Start\0"
+    "End\0StateReset\0SetJointPosition\0"
+    "SetGoalPoint"
 };
 #undef QT_MOC_LITERAL
 
@@ -56,7 +59,7 @@ static const uint qt_meta_data_MainWindow[] = {
        8,       // revision
        0,       // classname
        0,    0, // classinfo
-       8,   14, // methods
+       9,   14, // methods
        0,    0, // properties
        0,    0, // enums/sets
        0,    0, // constructors
@@ -64,16 +67,18 @@ static const uint qt_meta_data_MainWindow[] = {
        0,       // signalCount
 
  // slots: name, argc, parameters, tag, flags
-       1,    0,   54,    2, 0x08 /* Private */,
-       3,    0,   55,    2, 0x08 /* Private */,
-       4,    0,   56,    2, 0x08 /* Private */,
-       5,    0,   57,    2, 0x08 /* Private */,
-       6,    0,   58,    2, 0x08 /* Private */,
-       7,    0,   59,    2, 0x08 /* Private */,
-       8,    0,   60,    2, 0x08 /* Private */,
-       9,    0,   61,    2, 0x08 /* Private */,
+       1,    1,   59,    2, 0x0a /* Public */,
+       4,    0,   62,    2, 0x08 /* Private */,
+       5,    0,   63,    2, 0x08 /* Private */,
+       6,    0,   64,    2, 0x08 /* Private */,
+       7,    0,   65,    2, 0x08 /* Private */,
+       8,    0,   66,    2, 0x08 /* Private */,
+       9,    0,   67,    2, 0x08 /* Private */,
+      10,    0,   68,    2, 0x08 /* Private */,
+      11,    0,   69,    2, 0x08 /* Private */,
 
  // slots: parameters
+    QMetaType::Void, QMetaType::QString,    3,
     QMetaType::Void,
     QMetaType::Void,
     QMetaType::Void,
@@ -92,18 +97,18 @@ void MainWindow::qt_static_metacall(QObject *_o, QMetaObject::Call _c, int _id, 
         auto *_t = static_cast<MainWindow *>(_o);
         (void)_t;
         switch (_id) {
-        case 0: _t->SetServoNo(); break;
-        case 1: _t->GetServoNo(); break;
-        case 2: _t->Initiate(); break;
-        case 3: _t->Start(); break;
-        case 4: _t->End(); break;
-        case 5: _t->StateReset(); break;
-        case 6: _t->SetJointPosition(); break;
-        case 7: _t->SetGoalPoint(); break;
+        case 0: _t->SetMessage((*reinterpret_cast< QString(*)>(_a[1]))); break;
+        case 1: _t->SetServoNo(); break;
+        case 2: _t->GetServoNo(); break;
+        case 3: _t->Initiate(); break;
+        case 4: _t->Start(); break;
+        case 5: _t->End(); break;
+        case 6: _t->StateReset(); break;
+        case 7: _t->SetJointPosition(); break;
+        case 8: _t->SetGoalPoint(); break;
         default: ;
         }
     }
-    (void)_a;
 }
 
 QT_INIT_METAOBJECT const QMetaObject MainWindow::staticMetaObject = { {
@@ -135,13 +140,13 @@ int MainWindow::qt_metacall(QMetaObject::Call _c, int _id, void **_a)
     if (_id < 0)
         return _id;
     if (_c == QMetaObject::InvokeMetaMethod) {
-        if (_id < 8)
+        if (_id < 9)
             qt_static_metacall(this, _c, _id, _a);
-        _id -= 8;
+        _id -= 9;
     } else if (_c == QMetaObject::RegisterMethodArgumentMetaType) {
-        if (_id < 8)
+        if (_id < 9)
             *reinterpret_cast<int*>(_a[0]) = -1;
-        _id -= 8;
+        _id -= 9;
     }
     return _id;
 }

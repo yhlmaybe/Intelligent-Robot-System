@@ -105,8 +105,6 @@ private:
     unsigned interval_ms_;  
     std::vector<Eigen::Vector3d> cloud_points_;
     mutable std::mutex mtx_;
-
-    void ExecuteTask() override;
 };
 
 class VisualImageProcessing
@@ -124,7 +122,7 @@ public:
 
     void Reset();
 
-    void ToGoalPoint(); 
+    void ClickToGoalPoint(); 
 
     void SetJointPosition(std::string jointName, double position);
 
@@ -139,8 +137,7 @@ private:
 
     std::vector<std::shared_ptr<ServoManager>> GetServoManagerFromName(std::vector<std::string> names);
     std::shared_ptr<moveit::core::RobotState> UpdateRobotstateBoundary();
-
-    void ExecuteTask() override;
+    void PublishJointState();
 };
 
 

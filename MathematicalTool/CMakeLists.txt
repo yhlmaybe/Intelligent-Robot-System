@@ -14,8 +14,11 @@ find_package(tf2_ros REQUIRED)
 find_package(moveit_msgs REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(kdl_parser REQUIRED)
-find_package(ompl REQUIRED)
+#find_package(ompl REQUIRED)
 find_package(PCL REQUIRED)
+
+include_directories(/usr/lib/aarch64-linux-gnu)
+#include_directories(${OMPL_INCLUDE_DIRS})
 
 target_link_libraries(MATHEMATICALTOOL_LIST ${OMPL_LIBRARIES})
 target_link_libraries(MATHEMATICALTOOL_LIST ${PCL_LIBRARIES})
@@ -28,7 +31,6 @@ target_link_libraries(MATHEMATICALTOOL_LIST
     /usr/local/lib/libnlopt.so
     /usr/local/lib/libfcl.so.0.7)
 
-include_directories(/usr/lib/aarch64-linux-gnu)
 
 ament_target_dependencies(MATHEMATICALTOOL_LIST 
     urdf

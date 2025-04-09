@@ -312,6 +312,6 @@ ServoControl/CMakeFiles/SC_LIST.dir/ServoManager.cpp.o: \
  /usr/include/c++/11/bits/vector.tcc /usr/include/c++/11/queue \
  /usr/include/c++/11/deque /usr/include/c++/11/bits/stl_deque.h \
  /usr/include/c++/11/bits/deque.tcc /usr/include/c++/11/bits/stl_heap.h \
- /usr/include/c++/11/bits/stl_queue.h \
+ /usr/include/c++/11/bits/stl_queue.h /usr/include/c++/11/functional \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/ServoControl/ServoID.h \
  /home/yhlmaybe/Documents/Intelligent-Robot-System/ServoControl/../include/IRSParametersData.h

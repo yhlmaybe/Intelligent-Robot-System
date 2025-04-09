@@ -240,9 +240,12 @@ namespace PlanningTool
 
         if(isSelfColl) return false;
 
-        bool isEnvColl = fcl_tool->IsEnvCollision(env_manager);
+        if (env_manager->size() != 0)
+        {
+            bool isEnvColl = fcl_tool->IsEnvCollision(env_manager);
 
-        if(isEnvColl) return false;
+            if (isEnvColl) return false;
+        }
 
         return true;
     }
@@ -274,7 +277,8 @@ namespace PlanningTool
         int dimsion = goalJointNames.size();
         size_t count = goalJointNames.size();
 
-        std::shared_ptr<ompl::base::RealVectorStateSpace> space = std::make_shared<ompl::base::RealVectorStateSpace>(dimsion);
+        auto space(std::make_shared<ompl::base::RealVectorStateSpace>(dimsion));
+        //std::shared_ptr<ompl::base::RealVectorStateSpace> space = std::make_shared<ompl::base::RealVectorStateSpace>(dimsion);
 
         ompl::base::RealVectorBounds bounds(dimsion);
         std::vector<double> startJointValues;
@@ -294,7 +298,8 @@ namespace PlanningTool
 
         space->setBounds(bounds);
 
-        std::shared_ptr<ompl::base::SpaceInformation> ss(std::make_shared<ompl::base::SpaceInformation>(space));
+        auto ss(std::make_shared<ompl::base::SpaceInformation>(space));
+        //std::shared_ptr<ompl::base::SpaceInformation> ss = std::make_shared<ompl::base::SpaceInformation>(space);
         ss->setValidStateSamplerAllocator([](const ompl::base::SpaceInformation *si)
                                           { return std::make_shared<ompl::base::ObstacleBasedValidStateSampler>(si); });
 
@@ -321,8 +326,13 @@ namespace PlanningTool
 
         std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager = GetAABBEnvManager(envPointClouds);
         ss->setStateValidityChecker(std::make_shared<CustomStateValidator>(ss, linkNames, goalJointNames, planState, fcl_tool, envManager));
+        ss->setup();
 
-        std::shared_ptr<ompl::geometric::RRTConnect> planner(std::make_shared<ompl::geometric::RRTConnect>(ss));
+        //ompl::geometric::RRTConnect planner(ss);
+        //ompl::geometric::RRTConnect *planner = new ompl::geometric::RRTConnect(ss);
+        //delete planner;
+        //auto planner(std::make_shared<ompl::geometric::RRTConnect>(ss));
+        std::shared_ptr<ompl::geometric::RRTConnect> planner = std::make_shared<ompl::geometric::RRTConnect>(ss);
         planner->setProblemDefinition(pdef);
         planner->setup();
 
@@ -341,6 +351,9 @@ namespace PlanningTool
 
     std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> OMPLTool::GetAABBEnvManager(std::vector<Eigen::Vector3d> envPointClouds)
     {
+        std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager = std::make_shared<fcl::DynamicAABBTreeCollisionManagerd>();
+        if(envPointClouds.size() == 0) return envManager;
+        
         pcl::PointCloud<pcl::PointXYZ>::Ptr cloudPoints = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
 
         for (auto point : envPointClouds)
@@ -384,8 +397,6 @@ namespace PlanningTool
             throw std::runtime_error("Failed to build FCL BVH model");
         }
 
-        std::shared_ptr<fcl::DynamicAABBTreeCollisionManagerd> envManager = std::make_shared<fcl::DynamicAABBTreeCollisionManagerd>();
-        
         envManager->registerObject(std::make_shared<fcl::CollisionObjectd>(bvhModel).get());
         envManager->update();
 

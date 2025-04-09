@@ -158,7 +158,7 @@ std::map<std::string, std::shared_ptr<ServoManager>> ServoTools::Initiate()
         IRS_MESSAGE("get arm joint parameter error");
         return res;
     }
-    std::string file = std::string(cwd) + "/Arm_Joint_Cal_Parameter.xml";
+    std::string file = std::string(cwd) + "/Configure/Arm_Joint_Cal_Parameter.xml";
     tinyxml2::XMLDocument doc;
     tinyxml2::XMLError eResult = doc.LoadFile(file.c_str());
 
@@ -176,9 +176,9 @@ std::map<std::string, std::shared_ptr<ServoManager>> ServoTools::Initiate()
     }
 
     std::vector<JointParam> jointParams;
-    for (tinyxml2::XMLElement *jointElem = root->FirstChildElement("joint");
+    for (tinyxml2::XMLElement *jointElem = root->FirstChildElement("Joint");
          jointElem != nullptr;
-         jointElem = jointElem->NextSiblingElement("joint"))
+         jointElem = jointElem->NextSiblingElement("Joint"))
     {
         JointParam jp;
 

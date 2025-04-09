@@ -45,6 +45,8 @@ target_link_libraries(IRSMANAGER_LIST ${orocos_kdl_LIBRARIES} ${kdl_parser_LIBRA
 
 target_link_libraries(IRSMANAGER_LIST MATHEMATICALTOOL_LIST)
 
+#include_directories(${OMPL_INCLUDE_DIRS})
+
 #install dir, use cmake.. and make install
 install(DIRECTORY rviz urdf
     DESTINATION ${INSTALL_DIR}/install

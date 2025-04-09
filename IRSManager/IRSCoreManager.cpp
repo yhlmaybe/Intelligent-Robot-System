@@ -17,7 +17,9 @@ JointStateListenerNode::JointStateListenerNode(std::shared_ptr<moveit::core::Rob
 
     for(const moveit::core::JointModelGroup* eff : end_eff)
     {
-        end_eff_names.push_back(eff->getName());
+        std::vector<std::string> names = eff->getLinkModelNames();
+        std::string name = names.back();
+        end_eff_names.push_back(name);
     }
 
     subscription = this->create_subscription<sensor_msgs::msg::JointState>(
@@ -256,7 +258,7 @@ void UrdfPublisherNode::CallbackJointState(const sensor_msgs::msg::JointState::C
 
 EnvironmentalPerception::EnvironmentalPerception(unsigned interval_ms) : interval_ms_(interval_ms)
 {
-    Start();
+    
 }
 
 std::vector<Eigen::Vector3d> EnvironmentalPerception::GetPointClouds()
@@ -269,13 +271,6 @@ void EnvironmentalPerception::Reset()
 {
     std::lock_guard<std::mutex> lock(mtx_);
     cloud_points_.clear();
-}
-
-void EnvironmentalPerception::ExecuteTask()
-{
-    std::lock_guard<std::mutex> lock(mtx_);
-    // process
-    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_));
 }
 
 VisualImageProcessing::VisualImageProcessing()
@@ -295,9 +290,9 @@ ServoManagerNode::ServoManagerNode() : Node(MOTION_MANAGER)
 
     motion_manager = std::make_shared<MotionManager>(URDF_XML, SRDF_XML);
     motion_manager->UpdateState(UpdateRobotstateBoundary());
-
-    sensor_msgs::msg::JointState msg = motion_manager->GetCurrentJointStateMsg();
-    jointState_pub->publish(msg);
+    
+    RegisterTask([this] {ClickToGoalPoint();});
+    RegisterTask([this] {PublishJointState();});
 }
 
 void ServoManagerNode::Reset()
@@ -308,11 +303,6 @@ void ServoManagerNode::Reset()
         it.second->Reset();
     }
     motion_manager->InitialJointState();
-}
-
-void ServoManagerNode::ExecuteTask()
-{
-    ToGoalPoint();
 }
 
 std::vector<std::shared_ptr<ServoManager>> ServoManagerNode::GetServoManagerFromName(std::vector<std::string> names)
@@ -329,21 +319,35 @@ std::vector<std::shared_ptr<ServoManager>> ServoManagerNode::GetServoManagerFrom
     return res;
 }
 
-void ServoManagerNode::ToGoalPoint()
+void ServoManagerNode::ClickToGoalPoint()
 {
     std::vector<Eigen::Vector3d> datas = IRSCoreHandle::goal_points_queue->pop();
     if(datas.size() == 0) return;
     std::lock_guard<std::mutex> lock(motion_servo_mtx);
     for (size_t i = 0; i < datas.size(); ++i)
     {
-        EndEffectorType type = motion_manager->GetClosestEndEffector(datas[i]);
-        std::shared_ptr<Eigen::Vector3d> pose_nor = std::make_shared<Eigen::Vector3d>(0, 0, -1);
-        Eigen::Isometry3d pose = motion_manager->GetDefaultTouchPoseFromPoint(type, datas[i], *pose_nor);
+        std::shared_ptr<EndEffector> eff = motion_manager->GetClosestEndEffector(datas[i]);
+        //EndEffectorType type = EndEffectorType::LittleEnd;
+
+        //Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+
+        //pose.translation() = Eigen::Vector3d(0.033, 0.234, -0.079);
+
+        //Eigen::Quaterniond q(0.274, -0.548, -0.095, 0.784);
+        //pose.linear() = q.toRotationMatrix();
+
+        //std::shared_ptr<Eigen::Vector3d> pose_nor = std::make_shared<Eigen::Vector3d>(0, 0, -1);
+        //Eigen::Isometry3d pose = motion_manager->GetDefaultTouchPoseFromPoint(type, datas[i], *pose_nor);
+        
+        Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+        pose.translation() = datas[i];
+
         std::vector<std::string> joint_names;
         std::vector<double> joint_values;
-        if (!motion_manager->JointIKCal(joint_names, joint_values, type, pose, true))
+
+        if (!motion_manager->JointIKCal(joint_names, joint_values, eff->type_, pose, true))
         {
-            bool isSolution = motion_manager->JointIKCal(joint_names, joint_values, type, pose, false);
+            bool isSolution = motion_manager->JointIKCal(joint_names, joint_values, eff->type_, pose, false);
             if (!isSolution)
             {
                 IRS_MESSAGE("point x = %f, y = %f, z = %f is unreachable", datas[i].x(), datas[i].y(), datas[i].z());
@@ -363,8 +367,20 @@ void ServoManagerNode::ToGoalPoint()
         {
             ServoTools::SetServoPositions(servos, trace[j - 1].positions, trace[j].positions, servo_time);
             sensor_msgs::msg::JointState msg = motion_manager->UpdateRobotStateAndGetMsg(joint_names, trace[j].positions);
+            msg.header.stamp = this->get_clock()->now();
             jointState_pub->publish(msg);
         }
+
+        //The two positions of the backtrack simulate clicking the keyboard
+        /*size_t k = 0;
+        for (size_t j = trace.size() - 1; j > 0; --j)
+        {
+            if(k > 1) break;
+            ServoTools::SetServoPositions(servos, trace[j].positions, trace[j - 1].positions, servo_time);
+            sensor_msgs::msg::JointState msg = motion_manager->UpdateRobotStateAndGetMsg(joint_names, trace[j].positions);
+            jointState_pub->publish(msg);
+            k++;
+        }*/
     }
 }
 
@@ -379,13 +395,14 @@ void ServoManagerNode::SetJointPosition(std::string jointName, double position)
     {
         ServoTools::SetServoPosition(it->second, before_position, after_position, TIMEINTERVAL);
         sensor_msgs::msg::JointState msg = motion_manager->UpdateRobotStateAndGetMsg(jointName, after_position);
+        msg.header.stamp = this->get_clock()->now();
         jointState_pub->publish(msg);
     }
 }
 
 std::shared_ptr<moveit::core::RobotState> ServoManagerNode::GetCurrentRobotState()
 {
-    std::lock_guard<std::mutex> lock(motion_servo_mtx);
+    //std::lock_guard<std::mutex> lock(motion_servo_mtx);
     return motion_manager->GetCurrentRobotState();
 }
 
@@ -412,17 +429,33 @@ std::shared_ptr<moveit::core::RobotState> ServoManagerNode::UpdateRobotstateBoun
                 var_bounds[0].max_position_ = update_max;
             }
         }
-        joint_model->setVariableBounds(0, var_bounds[0]);
+        joint_model->setVariableBounds(it.first, var_bounds[0]);
     }
     std::shared_ptr<moveit::core::RobotState> robot_state = std::make_shared<moveit::core::RobotState>(robot_model);
     robot_state->setToDefaultValues();
     return robot_state;
 }
 
+void ServoManagerNode::PublishJointState()
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::lock_guard<std::mutex> lock(motion_servo_mtx);
+    sensor_msgs::msg::JointState msg = motion_manager->GetCurrentJointStateMsg();
+    msg.header.stamp = this->get_clock()->now();
+    /*if (!msg.name.empty()) 
+    {
+        IRS_MESSAGE("no message");
+    }
+    else IRS_MESSAGE("publish message");*/
+    jointState_pub->publish(msg);
+}
+
 void IRSCoreHandle::Start()
 {   
     if(!IsNodeRunning.load())
     {
+        IsNodeRunning.store(true, std::memory_order_release);
+
         UrdfSrdfXMLInitial();    
         
         UrdfNodeInitial();
@@ -435,9 +468,8 @@ void IRSCoreHandle::Start()
         servo_manager_node = std::make_shared<ServoManagerNode>();
         servo_manager_node->Start();
 
-        IsNodeRunning.store(true, std::memory_order_release);
-
         auto state = servo_manager_node->GetCurrentRobotState();
+
         JointStateNodeInitial(state);
     }
     else IRS_MESSAGE("IRS core already start");

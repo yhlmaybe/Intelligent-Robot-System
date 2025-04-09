@@ -23,8 +23,6 @@ public:
     static MainWindow* GetInstance();
     Ui::MainWindow* GetUI();
 
-    void SetMessage(std::string message);
-
 private:
     explicit MainWindow(QWidget *parent = 0);
     ~MainWindow();
@@ -38,6 +36,9 @@ private:
     bool is_running = false;
 
     bool is_initial = false;
+
+public slots:
+    void SetMessage(QString QMessage);
 
 private slots:
 

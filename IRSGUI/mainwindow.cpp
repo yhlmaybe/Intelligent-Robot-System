@@ -3,9 +3,13 @@
 
 void IRS_MESSAGE(std::string message)
 {
-    MainWindow* mainWindow = MainWindow::GetInstance();
-    mainWindow->SetMessage(message);
-
+    MainWindow *mainWindow = MainWindow::GetInstance();
+    QString QMessage = QString::fromStdString(message);
+    QMetaObject::invokeMethod(
+        mainWindow,
+        "SetMessage",
+        Qt::AutoConnection,
+        Q_ARG(QString, QMessage));
 }
 
 void IRS_MESSAGE(const char* format, ...) 
@@ -79,11 +83,10 @@ void MainWindow::Initiate()
     is_initial = true;
 }
 
-void MainWindow::SetMessage(std::string message)
+void MainWindow::SetMessage(QString QMessage)
 {
     std::lock_guard<std::mutex> lock(message_mtx);
     ui->MessageText->moveCursor(QTextCursor::End, QTextCursor::MoveAnchor);
-    QString QMessage = QString::fromStdString(message);
     ui->MessageText->insertPlainText(QMessage);
     QScrollBar *scrollbar = ui->MessageText->verticalScrollBar();
     if(scrollbar)  

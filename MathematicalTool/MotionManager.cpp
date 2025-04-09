@@ -2,12 +2,14 @@
 
 EndEffector::EndEffector(std::string URDF, std::string name, std::string partGroupName, std::string completeGroupName, std::string partGroupFirstLinkName, std::string completeGroupFirstLinkName, EndEffectorType type)
 {
-    name = name;
-    partGroupName = partGroupName;
-    completeGroupName = completeGroupName;
-    type = type;
-    partGroupIkSolver = std::make_shared<IRS_IK::IRS_IK>(partGroupFirstLinkName, name, URDF);
-    completeGroupIkSolver = std::make_shared<IRS_IK::IRS_IK>(completeGroupFirstLinkName, name, URDF);
+    name_ = name;
+    part_group_name = partGroupName;
+    complete_group_name = completeGroupName;
+    type_ = type;
+    part_group_first_link_name = partGroupFirstLinkName;
+    complete_group_first_link_name = completeGroupFirstLinkName;
+    part_group_IkSolver = std::make_shared<IRS_IK::IRS_IK>(partGroupFirstLinkName, name, URDF, 0.005, 1e-6);
+    complete_group_IkSolver = std::make_shared<IRS_IK::IRS_IK>(completeGroupFirstLinkName, name, URDF, 0.005, 1e-6);
 }
 
 MotionManager::MotionManager(std::string urdf, std::string srdf)
@@ -16,89 +18,86 @@ MotionManager::MotionManager(std::string urdf, std::string srdf)
 
     srdf::ModelSharedPtr srdf_model = std::make_shared<srdf::Model>();
     srdf_model->initString(*urdf_model, srdf);
-    robotModel = std::make_shared<moveit::core::RobotModel>(urdf_model, srdf_model);
+    robot_model = std::make_shared<moveit::core::RobotModel>(urdf_model, srdf_model);
     
-    if(!robotModel)
+    if(!robot_model)
     {
         IRS_MESSAGE("set robot model error");
         return;
     }
-    robotState = std::make_shared<moveit::core::RobotState>(robotModel);
+    robot_state = std::make_shared<moveit::core::RobotState>(robot_model);
 
-    std::vector<srdf::Model::EndEffector> endEffectors = srdf_model->getEndEffectors();
-    for (srdf::Model::EndEffector& endEffector : endEffectors)
+    std::vector<const moveit::core::JointModelGroup*> end_eff = robot_model->getEndEffectors();
+
+    for(const moveit::core::JointModelGroup* eff : end_eff)
     {
+        std::vector<std::string> names = eff->getLinkModelNames();
+        std::string name = names.back();
+
         std::string partGroupName = "";
         std::string completeGroupName = "";
         EndEffectorType type = EndEffectorType::NoneType;
-        if(endEffector.name_ == "thumb_end")
+        if(name == "ThumbEnd_Link")
         {
             partGroupName = "thumb";
             completeGroupName = "thumbWrist";
             type = EndEffectorType::ThumbEnd;
         }
-        else if(endEffector.name_ == "index_end")
+        else if(name == "IndexEnd_Link")
         {
             partGroupName = "index";
             completeGroupName = "indexWrist";
             type = EndEffectorType::IndexEnd;
         }
-        else if(endEffector.name_ == "fourth_end")
+        else if(name == "FourthEnd_Link")
         {
             partGroupName = "fourth";
             completeGroupName = "fourthWrist";
             type = EndEffectorType::FourthEnd;
         }
-        else if(endEffector.name_ == "mid_end")
+        else if(name == "MidEnd_Link")
         {
             partGroupName = "mid";
             completeGroupName = "midWrist";
             type = EndEffectorType::MidEnd;
         }
-        else if(endEffector.name_ == "little_end")
+        else if(name == "LittleEnd_Link")
         {
             partGroupName = "little";
             completeGroupName = "littleWrist";
             type = EndEffectorType::LittleEnd;
         }
-        else if(endEffector.name_ == "wrist_end")
-        {
-            partGroupName = "wrist";
-            completeGroupName = "wrist";
-            type = EndEffectorType::WristEnd;
-        }
         else
         {
             continue;
         }
-        moveit::core::JointModelGroup *partGroup = robotModel->getJointModelGroup(partGroupName);
+        moveit::core::JointModelGroup *partGroup = robot_model->getJointModelGroup(partGroupName);
         std::string partFirstLInkName = "";
         std::vector<const moveit::core::LinkModel *> partLinks = partGroup->getLinkModels();
         if (!partLinks.empty())
         {
-            partFirstLInkName = partLinks[0]->getName();
+            partFirstLInkName = partLinks[0]->getParentLinkModel()->getName();
         }
-        moveit::core::JointModelGroup *completeGroup = robotModel->getJointModelGroup(completeGroupName);
+        moveit::core::JointModelGroup *completeGroup = robot_model->getJointModelGroup(completeGroupName);
         std::string completeFirstLInkName = "";
         std::vector<const moveit::core::LinkModel *> completeLinks = completeGroup->getLinkModels();
         if (!completeLinks.empty())
         {
             completeFirstLInkName = completeLinks[0]->getName();
         }
-        std::shared_ptr<EndEffector> endEff = std::make_shared<EndEffector>(URDF_XML, endEffector.name_, partGroupName, completeGroupName, partFirstLInkName, completeFirstLInkName, type);
-        endEffectorsMap[type] = endEff;
+        std::shared_ptr<EndEffector> endEff = std::make_shared<EndEffector>(URDF_XML, name, partGroupName, completeGroupName, partFirstLInkName, completeFirstLInkName, type);
+        end_effectors_map[type] = endEff;
     }
-
     InitialJointState();
 
-    omplTool = std::make_shared<PlanningTool::OMPLTool>(robotModel);
+    ompl_tool = std::make_shared<PlanningTool::OMPLTool>(robot_model);
 }
 
 sensor_msgs::msg::JointState MotionManager::GetCurrentJointStateMsg()
 {
     sensor_msgs::msg::JointState jointStateMsgs = sensor_msgs::msg::JointState();
-    std::vector<std::string> jointNames = robotModel->getVariableNames();
-    double* jointPositions = robotState->getVariablePositions();
+    std::vector<std::string> jointNames = robot_model->getVariableNames();
+    double* jointPositions = robot_state->getVariablePositions();
     std::vector<double> jointPositionsVec(jointPositions, jointPositions + jointNames.size());
     jointStateMsgs.name = jointNames;
     jointStateMsgs.position = jointPositionsVec;
@@ -107,33 +106,39 @@ sensor_msgs::msg::JointState MotionManager::GetCurrentJointStateMsg()
 
 Eigen::Isometry3d MotionManager::ConvertPoseFromRelBaseToRelEnd(EndEffectorType endEffector, Eigen::Isometry3d pose)
 {
-    Eigen::Isometry3d endEffectorTF = robotState->getGlobalLinkTransform(endEffectorsMap[endEffector]->name);
-    return (endEffectorTF.inverse() * pose);
+    Eigen::Isometry3d endEffectorTF = robot_state->getGlobalLinkTransform(end_effectors_map[endEffector]->name_);
+    return endEffectorTF.inverse() * pose;
 }
 
 Eigen::Isometry3d MotionManager::ConvertPoseFromRelEndToRelBase(EndEffectorType endEffector, Eigen::Isometry3d pose)
 {
-    Eigen::Isometry3d endEffectorTF = robotState->getGlobalLinkTransform(endEffectorsMap[endEffector]->name);
+    Eigen::Isometry3d endEffectorTF = robot_state->getGlobalLinkTransform(end_effectors_map[endEffector]->name_);
     return endEffectorTF * pose;
 }
 
 Eigen::Isometry3d MotionManager::ConvertPoseFromRelEndToRelAny(EndEffectorType endEffector, std::string anyLinkName, Eigen::Isometry3d pose)
 {
-    Eigen::Isometry3d endEffectorTF = robotState->getGlobalLinkTransform(endEffectorsMap[endEffector]->name);
-    Eigen::Isometry3d linkTF = robotState->getGlobalLinkTransform(anyLinkName);
-    Eigen::Isometry3d TF = endEffectorTF * linkTF.inverse();
+    Eigen::Isometry3d endEffectorTF = robot_state->getGlobalLinkTransform(end_effectors_map[endEffector]->name_);
+    Eigen::Isometry3d linkTF = robot_state->getGlobalLinkTransform(anyLinkName);
+    Eigen::Isometry3d TF = linkTF.inverse() * endEffectorTF;
     return TF * pose;
+}
+
+Eigen::Isometry3d MotionManager::ConvertPoseFromRelBaseToRelAny(std::string anyLinkName, Eigen::Isometry3d pose)
+{
+    Eigen::Isometry3d linkTF = robot_state->getGlobalLinkTransform(anyLinkName);
+    return linkTF.inverse() * pose;
 }
 
 void MotionManager::InitialJointState()
 {
-    robotState->setToDefaultValues("r_arm", "r_arm_home");
-    robotState->update();
+    robot_state->setToDefaultValues("r_arm", "r_arm_home");
+    robot_state->update();
 }
 
 double MotionManager::CalGoalJointPosition(std::string jointName, double position)
 {
-    moveit::core::JointModel* joint_model = robotModel->getJointModel(jointName);
+    moveit::core::JointModel* joint_model = robot_model->getJointModel(jointName);
     const moveit::core::VariableBounds& bounds = joint_model->getVariableBounds(jointName);
 
     double limited_position = position;
@@ -154,39 +159,40 @@ double MotionManager::CalGoalJointPosition(std::string jointName, double positio
 
 std::shared_ptr<moveit::core::RobotState> MotionManager::GetCurrentRobotState()
 {
-    return std::make_shared<moveit::core::RobotState>(*robotState);
+    return std::make_shared<moveit::core::RobotState>(*robot_state);
 }
 
 void MotionManager::UpdateState(std::shared_ptr<moveit::core::RobotState> state)
 {
-    robotState = state;
+    robot_state = state;
 }
 
-EndEffectorType MotionManager::GetClosestEndEffector(Eigen::Vector3d pointRelBase)
+std::shared_ptr<EndEffector> MotionManager::GetClosestEndEffector(Eigen::Vector3d pointRelBase)
 {
     int i = 0;
-    EndEffectorType type = EndEffectorType::NoneType;
+    std::shared_ptr<EndEffector> eff;
     double min_distance = 0;
-    for (auto endEff : endEffectorsMap)
+    for (auto endEff : end_effectors_map)
     {
-        Eigen::Isometry3d ee_pose = robotState->getGlobalLinkTransform(endEff.second->name);
+        Eigen::Isometry3d ee_pose = robot_state->getGlobalLinkTransform(endEff.second->name_);
         Eigen::Vector3d position = ee_pose.translation(); // get (x,y,z)
         double distance = (position - pointRelBase).norm();
         if (i == 0)
         {
             min_distance = distance;
-            type = endEff.first;
+            eff = endEff.second;
         }
         else
         {
             if (distance < min_distance)
             {
                 min_distance = distance;
-                type = endEff.first;
+                eff = endEff.second;
             }
         }
+        i++;
     }
-    return type;
+    return eff;
 }
 
 Eigen::Isometry3d MotionManager::GetDefaultTouchPoseFromPoint(EndEffectorType endEffector, Eigen::Vector3d pointRelBase, Eigen::Vector3d pointNormal, double fingerAngle)
@@ -239,26 +245,33 @@ Eigen::Isometry3d MotionManager::GetDefaultTouchPoseFromPoint(EndEffectorType en
     return pose;
 }
 
-bool MotionManager::JointIKCal(std::vector<std::string>& jointNameResult, std::vector<double>& jointValueResult, EndEffectorType endEffector, Eigen::Isometry3d pointRelativeEndEff, bool isPart)
+bool MotionManager::JointIKCal(std::vector<std::string>& jointNameResult, std::vector<double>& jointValueResult, EndEffectorType endEffector, Eigen::Isometry3d poseRelativeBaseLink, bool isPart, bool ignorePoseRotation)
 {
     jointNameResult.clear();
     jointValueResult.clear();
-    auto eff = endEffectorsMap[endEffector];
+    auto eff = end_effectors_map[endEffector];
     moveit::core::JointModelGroup* group;
     KDL::Chain chain;
     bool valid;
     std::shared_ptr<IRS_IK::IRS_IK> ik = nullptr;
+    std::string first_link_name = "";
+    KDL::Frame endEffectorPose;
     if(isPart) 
     {
-        group = robotModel->getJointModelGroup(eff->partGroupName);
-        ik = eff->partGroupIkSolver;
+        group = robot_model->getJointModelGroup(eff->part_group_name);
+        ik = eff->part_group_IkSolver;
         valid = ik->getKDLChain(chain);    
+        first_link_name = eff->part_group_first_link_name;
+        Eigen::Isometry3d poseRelFirstLink = ConvertPoseFromRelBaseToRelAny(first_link_name, poseRelativeBaseLink);
+        endEffectorPose = ConvertToFrame(poseRelFirstLink);  
     }
     else 
     {
-        group = robotModel->getJointModelGroup(eff->completeGroupName);
-        ik = eff->completeGroupIkSolver;
+        group = robot_model->getJointModelGroup(eff->complete_group_name);
+        ik = eff->complete_group_IkSolver;
         valid = ik->getKDLChain(chain);
+        first_link_name = eff->complete_group_first_link_name;
+        endEffectorPose = ConvertToFrame(poseRelativeBaseLink); 
     }
     const std::vector<std::string>& jointNames = group->getVariableNames();   
     if (!valid)
@@ -268,15 +281,32 @@ bool MotionManager::JointIKCal(std::vector<std::string>& jointNameResult, std::v
     }
     KDL::JntArray nominal(chain.getNrOfJoints());
 
+    //KDL::Frame pp;
+    //KDL::JntArray q(chain.getNrOfJoints());
+    //for (uint j = 0; j < jointNames.size(); j++)
+    //{
+    //    if(jointNames[j] == "LittleFingerArth_2_Joint") q(j) = 1;
+    //    else q(j) = robot_state->getVariablePosition(jointNames[j]);
+    //}
+    //KDL::ChainFkSolverPos_recursive fk_solver(chain);
+    //fk_solver.JntToCart(q, pp);
+
     for (size_t i = 0; i < jointNames.size(); ++i)
     {
-        nominal(i) = robotState->getVariablePosition(jointNames[i]);
+        nominal(i) = robot_state->getVariablePosition(jointNames[i]);
     }
-    Eigen::Isometry3d poseRelFirstLink = ConvertPoseFromRelEndToRelAny(endEffector, jointNames.front(), pointRelativeEndEff);
-    KDL::Frame endEffectorPose = ConvertToFrame(poseRelFirstLink);  
+
     KDL::JntArray angle(chain.getNrOfJoints());
-    int rc = ik->CartToJnt(nominal, endEffectorPose, angle);
-    if (rc == 0)
+
+    KDL::Twist bounds = KDL::Twist::Zero();
+    if(ignorePoseRotation)
+    {
+        bounds.rot = KDL::Vector(M_PI, M_PI, M_PI);
+    }
+
+    int rc = ik->CartToJnt(nominal, endEffectorPose, angle, bounds);
+    //int rc = ik->CartToJnt(nominal, pp, angle);
+    if (rc >= 0)
     {
         for (size_t i = 0; i < jointNames.size(); ++i)
         {
@@ -284,13 +314,13 @@ bool MotionManager::JointIKCal(std::vector<std::string>& jointNameResult, std::v
             jointValueResult.push_back(angle(i));
         }
     }
-    return rc == 0;
+    return rc >= 0;
 }
 
 std::vector<TrajectoryPoint> MotionManager::Plan(std::vector<std::string> goalJointNames, std::vector<double> goalJointPositions, std::vector<Eigen::Vector3d> envPointClouds, double totalTime, int interpolateCount)
 {
     std::vector<TrajectoryPoint> res;
-    ompl::base::PathPtr path = omplTool->Plan(robotState, goalJointNames, goalJointPositions, envPointClouds);
+    ompl::base::PathPtr path = ompl_tool->Plan(robot_state, goalJointNames, goalJointPositions, envPointClouds);
     if (path == nullptr) return res;
     if (ompl::geometric::PathGeometric *pathGeo = dynamic_cast<ompl::geometric::PathGeometric *>(path.get()))
     {
@@ -315,15 +345,15 @@ std::vector<TrajectoryPoint> MotionManager::Plan(std::vector<std::string> goalJo
 
 sensor_msgs::msg::JointState MotionManager::UpdateRobotStateAndGetMsg(std::vector<std::string> goalJointNames, std::vector<double> goalJointPositions)
 {
-    robotState->setVariablePositions(goalJointNames, goalJointPositions);
-    robotState->update();
+    robot_state->setVariablePositions(goalJointNames, goalJointPositions);
+    robot_state->update();
     return GetCurrentJointStateMsg();
 }
 
 sensor_msgs::msg::JointState MotionManager::UpdateRobotStateAndGetMsg(std::string goalJointName, double goalJointPosition)
 {
-    robotState->setVariablePosition(goalJointName, goalJointPosition);
-    robotState->update();
+    robot_state->setVariablePosition(goalJointName, goalJointPosition);
+    robot_state->update();
     return GetCurrentJointStateMsg();
 }
 
@@ -340,10 +370,20 @@ Eigen::Isometry3d MotionManager::ConvertToIsometry3d(KDL::Frame frame)
 
 KDL::Frame MotionManager::ConvertToFrame(Eigen::Isometry3d Isometry3d)
 {
-    Eigen::Matrix3d rotationMatrix = Isometry3d.linear();
-    Eigen::Quaterniond quaternion(rotationMatrix);
-    KDL::Rotation rotation = KDL::Rotation::Quaternion(quaternion.x(), quaternion.y(), quaternion.z(), quaternion.w());
-    Eigen::Vector3d translation_vector = Isometry3d.translation();
-    KDL::Vector translation(translation_vector.x(), translation_vector.y(), translation_vector.z());
-    return KDL::Frame(rotation, translation);
+    Eigen::Matrix3d eigen_rot = Isometry3d.linear();
+    Eigen::Vector3d eigen_trans = Isometry3d.translation();
+
+    KDL::Rotation kdl_rot(
+        eigen_rot(0,0), eigen_rot(0,1), eigen_rot(0,2),
+        eigen_rot(1,0), eigen_rot(1,1), eigen_rot(1,2),
+        eigen_rot(2,0), eigen_rot(2,1), eigen_rot(2,2)
+    );
+
+    KDL::Vector kdl_trans(
+        eigen_trans.x(), 
+        eigen_trans.y(), 
+        eigen_trans.z()
+    );
+
+    return KDL::Frame(kdl_rot, kdl_trans);
 }
