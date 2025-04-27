@@ -1,7 +1,7 @@
 #ifndef SCDRIVE_H
 #define SCDRIVE_H
 
-#include <python3.10/Python.h>
+#include <python3.8/Python.h>
 #include <memory>
 #include <list>
 #include <thread>

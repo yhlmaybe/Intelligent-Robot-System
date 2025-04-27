@@ -7,7 +7,7 @@
 #include <urdf_parser/urdf_parser.h>
 #include <sensor_msgs/msg/joint_state.hpp>
 
-#include <pluginlib/pluginlib/class_loader.hpp>
+#include <pluginlib/class_loader.hpp>
 #include <moveit/planning_interface/planning_interface.h>
 #include <moveit/robot_trajectory/robot_trajectory.h>
 #include <moveit/robot_state/robot_state.h>

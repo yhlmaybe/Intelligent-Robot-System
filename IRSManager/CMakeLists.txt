@@ -11,6 +11,8 @@ find_package(orocos_kdl REQUIRED)
 find_package(kdl_parser REQUIRED)
 find_package(moveit_msgs REQUIRED)
 
+#find_package(Python REQUIRED COMPONENTS Development)
+
 find_package(rclcpp_components REQUIRED)
 find_package(robot_state_publisher REQUIRED)
 

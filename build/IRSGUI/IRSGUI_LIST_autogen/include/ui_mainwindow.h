@@ -1,7 +1,7 @@
 /********************************************************************************
 ** Form generated from reading UI file 'mainwindow.ui'
 **
-** Created by: Qt User Interface Compiler version 5.15.3
+** Created by: Qt User Interface Compiler version 5.12.8
 **
 ** WARNING! All changes made in this file will be lost when recompiling UI file!
 ********************************************************************************/
@@ -132,19 +132,19 @@ public:
 
     void retranslateUi(QMainWindow *MainWindow)
     {
-        MainWindow->setWindowTitle(QCoreApplication::translate("MainWindow", "MainWindow", nullptr));
-        SetServoNo_Button->setText(QCoreApplication::translate("MainWindow", "SetServoNo", nullptr));
-        ServoNo_Lable->setText(QCoreApplication::translate("MainWindow", "null", nullptr));
-        StateReset_Button->setText(QCoreApplication::translate("MainWindow", "StateReset", nullptr));
-        GetServoNo_Button->setText(QCoreApplication::translate("MainWindow", "GetServoNo", nullptr));
-        Initiate_Button->setText(QCoreApplication::translate("MainWindow", "Initiate", nullptr));
-        jointName_label->setText(QCoreApplication::translate("MainWindow", "Joint Name", nullptr));
-        setJointPosition_Button->setText(QCoreApplication::translate("MainWindow", "Set Joint Position", nullptr));
-        jointPosition_label->setText(QCoreApplication::translate("MainWindow", "Joint Position", nullptr));
-        setGoalPoint_Button->setText(QCoreApplication::translate("MainWindow", "Set Goal Point", nullptr));
-        goalPoint_label->setText(QCoreApplication::translate("MainWindow", "Goal Point", nullptr));
-        start_Button->setText(QCoreApplication::translate("MainWindow", "Start", nullptr));
-        end_Button->setText(QCoreApplication::translate("MainWindow", "End", nullptr));
+        MainWindow->setWindowTitle(QApplication::translate("MainWindow", "MainWindow", nullptr));
+        SetServoNo_Button->setText(QApplication::translate("MainWindow", "SetServoNo", nullptr));
+        ServoNo_Lable->setText(QApplication::translate("MainWindow", "null", nullptr));
+        StateReset_Button->setText(QApplication::translate("MainWindow", "StateReset", nullptr));
+        GetServoNo_Button->setText(QApplication::translate("MainWindow", "GetServoNo", nullptr));
+        Initiate_Button->setText(QApplication::translate("MainWindow", "Initiate", nullptr));
+        jointName_label->setText(QApplication::translate("MainWindow", "Joint Name", nullptr));
+        setJointPosition_Button->setText(QApplication::translate("MainWindow", "Set Joint Position", nullptr));
+        jointPosition_label->setText(QApplication::translate("MainWindow", "Joint Position", nullptr));
+        setGoalPoint_Button->setText(QApplication::translate("MainWindow", "Set Goal Point", nullptr));
+        goalPoint_label->setText(QApplication::translate("MainWindow", "Goal Point", nullptr));
+        start_Button->setText(QApplication::translate("MainWindow", "Start", nullptr));
+        end_Button->setText(QApplication::translate("MainWindow", "End", nullptr));
     } // retranslateUi
 
 };

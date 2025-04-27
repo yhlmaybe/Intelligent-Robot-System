@@ -38,9 +38,27 @@ include_directories(${OMPL_INCLUDE_DIRS})
 
 #include_directories(/usr/locate/include/ompl-1.6)
 
+find_program(PYTHON_EXECUTABLE python)
+
+if(PYTHON_EXECUTABLE)
+    message(STATUS "python executable found at ${PYTHON_EXECUTABLE}")
+    
+    execute_process(COMMAND ${PYTHON_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_paths()['include'])" OUTPUT_VARIABLE PYTHON_INCLUDE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+    include_directories(${PYTHON_INCLUDE_DIR})
+
+    execute_process(COMMAND ${PYTHON_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_paths()['stdlib'])" OUTPUT_VARIABLE PYTHON_LIBRARY_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+    link_directories(${PYTHON_LIBRARY_DIR})
+
+    message("lib : ${PYTHON_LIBRARY_DIR}")
+    message("include : ${PYTHON_INCLUDE_DIR}")
+else()
+    message(FATAL_ERROR "python not found")
+endif()
+
+
 add_executable(IRS_CMake ${IRS_LIST})
 
-target_link_libraries(IRS_CMake /usr/lib/x86_64-linux-gnu/libccd.so.2)
+target_link_libraries(IRS_CMake /usr/lib/aarch64-linux-gnu/libccd.so.2)
 
 target_link_libraries(IRS_CMake SC_LIST)
 target_link_libraries(IRS_CMake IRSGUI_LIST)

@@ -132,7 +132,8 @@ Eigen::Isometry3d MotionManager::ConvertPoseFromRelBaseToRelAny(std::string anyL
 
 void MotionManager::InitialJointState()
 {
-    robot_state->setToDefaultValues("r_arm", "r_arm_home");
+    const moveit::core::JointModelGroup* group = robot_model->getJointModelGroup("r_arm");
+    robot_state->setToDefaultValues(group, "r_arm_home");
     robot_state->update();
 }
 

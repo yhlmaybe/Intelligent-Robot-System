@@ -29,7 +29,7 @@
             ],
             "preLaunchTask": "Build",
             "miDebuggerPath": "/usr/bin/gdb",
-            "visualizerFile": "/home/yhlmaybe/.config/Code/User/workspaceStorage/94514940a753352c301eff3f3ed85b1c/tonka3000.qtvsctools/qt.natvis.xml"
+            "visualizerFile": "/home/yhl/.config/Code/User/workspaceStorage/94514940a753352c301eff3f3ed85b1c/tonka3000.qtvsctools/qt.natvis.xml"
         }
     ]
 }

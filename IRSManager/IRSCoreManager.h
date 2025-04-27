@@ -48,7 +48,7 @@ private:
 
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr subscription;
 
-    void DoListen(const sensor_msgs::msg::JointState msg);
+    void DoListen(const sensor_msgs::msg::JointState::SharedPtr msg);
 
 };
 

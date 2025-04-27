@@ -46,12 +46,13 @@ namespace PlanningTool
     std::vector<std::pair<std::vector<LinkCollisionObject>, std::vector<LinkCollisionObject>>> FCLTool::GetSelfAllowLinkColls()
     {
         std::vector<std::pair<std::vector<LinkCollisionObject>, std::vector<LinkCollisionObject>>> res;
-        std::vector<srdf::Model::CollisionPair> collisionPairs  = robot_model->getSRDF()->getEnabledCollisionPairs(); 
+
+        std::vector<std::pair<std::string, std::string>> collisionPairs  = GetEnableCollsisonPairs(); 
         for(size_t i = 0; i < collisionPairs.size(); ++i)
         {   
-            srdf::Model::CollisionPair pair = collisionPairs[i];
-            std::vector<LinkCollisionObject> obj1 = link_collisions[pair.link1_];
-            std::vector<LinkCollisionObject> obj2 = link_collisions[pair.link2_];
+            std::pair<std::string, std::string> pair = collisionPairs[i];
+            std::vector<LinkCollisionObject> obj1 = link_collisions[pair.first];
+            std::vector<LinkCollisionObject> obj2 = link_collisions[pair.second];
             res.push_back(std::pair<std::vector<LinkCollisionObject>, std::vector<LinkCollisionObject>>(obj1, obj2));
         }
         return res;
@@ -61,12 +62,12 @@ namespace PlanningTool
     {
         std::vector<std::pair<std::vector<fcl::CollisionObjectd*>, std::vector<fcl::CollisionObjectd*>>> res;
         auto srdf = robot_model->getSRDF();
-        std::vector<srdf::Model::CollisionPair> collisionPairs  = srdf->getEnabledCollisionPairs(); 
+        std::vector<std::pair<std::string, std::string>>  collisionPairs  = GetEnableCollsisonPairs(); 
         for(size_t i = 0; i < collisionPairs.size(); ++i)
         {   
-            srdf::Model::CollisionPair pair = collisionPairs[i];
-            std::vector<fcl::CollisionObjectd*> obj1 = link_fcl_collisions[pair.link1_];
-            std::vector<fcl::CollisionObjectd*> obj2 = link_fcl_collisions[pair.link2_];
+            std::pair<std::string, std::string> pair = collisionPairs[i];
+            std::vector<fcl::CollisionObjectd*> obj1 = link_fcl_collisions[pair.first];
+            std::vector<fcl::CollisionObjectd*> obj2 = link_fcl_collisions[pair.second];
             res.push_back(std::pair<std::vector<fcl::CollisionObjectd*>, std::vector<fcl::CollisionObjectd*>>(obj1, obj2));
         }
         return res;
@@ -110,6 +111,37 @@ namespace PlanningTool
             res.push_back(obj);
         }
         return res;
+    }
+
+    std::vector<std::pair<std::string, std::string>> FCLTool::GetEnableCollsisonPairs()
+    {
+        std::vector<std::string> all_links = robot_model->getLinkModelNames();
+
+        std::set<std::pair<std::string, std::string>> disable_pairs;
+        for(auto pair : robot_model->getSRDF()->getDisabledCollisionPairs())
+        {
+            std::string a = pair.link1_;
+            std::string b = pair.link2_;
+            if(a > b) std::swap(a, b);
+            disable_pairs.insert({a, b});
+        }
+
+        std::vector<std::pair<std::string, std::string>> enable_pairs;
+        for(size_t i = 0; i < all_links.size(); ++i)
+        {
+            for(size_t j = i + 1; j < all_links.size(); ++j)
+            {
+                std::string a = all_links[i];
+                std::string b = all_links[j];
+                if(a > b) std::swap(a, b);
+
+                if(disable_pairs.find({a, b}) == disable_pairs.end())
+                {
+                    enable_pairs.emplace_back(a, b);
+                }
+            }
+        }
+        return enable_pairs;
     }
 
     void FCLTool::SetCollObjTF(std::string name, Eigen::Isometry3d tf)

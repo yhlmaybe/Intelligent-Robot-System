@@ -1,8 +1,9 @@
 #ifndef PLANNINGTOOL_H
 #define PLANNINGTOOL_H
 
+#include <set>
 #include <fcl/fcl.h>
-#include <geometric_shapes/geometric_shapes/shapes.h>
+#include <geometric_shapes/shapes.h>
 #include <fcl/geometry/bvh/BVH_model.h>
 #include <fcl/narrowphase/collision.h>
 #include <fcl/narrowphase/collision_object.h>
@@ -58,6 +59,7 @@ namespace PlanningTool
     private:
         std::shared_ptr<fcl::CollisionGeometryd> CreateFCLGeometry(shapes::ShapeConstPtr& shape); 
         std::vector<fcl::CollisionObjectd*> ConvertToFclColl(std::vector<LinkCollisionObject> linkObjs);
+        std::vector<std::pair<std::string, std::string>> GetEnableCollsisonPairs();
 
         std::shared_ptr<moveit::core::RobotModel> robot_model;
         std::vector<fcl::CollisionObjectd*> coll_objs;

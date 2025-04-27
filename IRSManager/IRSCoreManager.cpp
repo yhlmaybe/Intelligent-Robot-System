@@ -23,17 +23,21 @@ JointStateListenerNode::JointStateListenerNode(std::shared_ptr<moveit::core::Rob
     }
 
     subscription = this->create_subscription<sensor_msgs::msg::JointState>(
-        "joint_states", 10, std::bind(&JointStateListenerNode::DoListen, this, std::placeholders::_1));
+        "joint_states", 
+        rclcpp::QoS(10),
+        [this](const sensor_msgs::msg::JointState::SharedPtr msg){this->DoListen(msg);} 
+        //std::bind(&JointStateListenerNode::DoListen, this, std::placeholders::_1)
+    );
     // subscription = this->create_subscription<std_msgs::msg::String>(
     //    "ServeMsg", 10, [this](const std_msgs::msg::String::SharedPtr msg){this->DoListen(msg);});
 }
 
-void JointStateListenerNode::DoListen(const sensor_msgs::msg::JointState msg)
+void JointStateListenerNode::DoListen(const sensor_msgs::msg::JointState::SharedPtr msg)
 {
-    for (size_t i = 0; i < msg.name.size(); ++i)
+    for (size_t i = 0; i < msg->name.size(); ++i)
     {
-        const std::string &joint_name = msg.name[i];
-        double joint_position = msg.position[i];
+        const std::string &joint_name = msg->name[i];
+        double joint_position = msg->position[i];
 
         robot_state->setVariablePosition(joint_name, joint_position);
     }
@@ -86,12 +90,13 @@ UrdfPublisherNode::UrdfPublisherNode() : Node(URDF_PUBLISHER)
     SetupURDF();
 
     auto subscriber_options = rclcpp::SubscriptionOptions();
-    subscriber_options.qos_overriding_options = rclcpp::QosOverridingOptions::with_default_policies();
+    //subscriber_options.qos_overriding_options = rclcpp::QosOverridingOptions::with_default_policies();
     // subscribe to joint state
     joint_state_sub = this->create_subscription<sensor_msgs::msg::JointState>(
         "joint_states",
         rclcpp::SensorDataQoS(),
-        std::bind(&UrdfPublisherNode::CallbackJointState, this, std::placeholders::_1),
+        [this](const sensor_msgs::msg::JointState::ConstSharedPtr state){this->CallbackJointState(state);},
+        //std::bind(&UrdfPublisherNode::CallbackJointState, this, std::placeholders::_1),
         subscriber_options);
 
     PublishFixedTransforms();

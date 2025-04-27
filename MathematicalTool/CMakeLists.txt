@@ -24,10 +24,10 @@ target_link_libraries(MATHEMATICALTOOL_LIST ${OMPL_LIBRARIES})
 target_link_libraries(MATHEMATICALTOOL_LIST ${PCL_LIBRARIES})
 
 target_link_libraries(MATHEMATICALTOOL_LIST 
-    /opt/ros/humble/lib/libmoveit_robot_model.so
-    /opt/ros/humble/lib/libsrdfdom.so
-    /opt/ros/humble/lib/libmoveit_robot_state.so
-    /opt/ros/humble/lib/libmoveit_exceptions.so
+    /opt/ros/foxy/lib/libmoveit_robot_model.so
+    /opt/ros/foxy/lib/libsrdfdom.so
+    /opt/ros/foxy/lib/libmoveit_robot_state.so
+    /opt/ros/foxy/lib/libmoveit_exceptions.so
     /usr/local/lib/libnlopt.so
     /usr/local/lib/libfcl.so.0.7)
 

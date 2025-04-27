@@ -241,7 +241,7 @@ void MainWindow::SetGoalPoint()
             return;
         }
 
-        QStringList parts = goal_point.split(",", Qt::SkipEmptyParts);
+        QStringList parts = goal_point.split(",", QString::SkipEmptyParts);
 
         if (parts.size() != 3)
         {

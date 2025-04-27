@@ -4,12 +4,10 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                //"/usr/include/aarch64-linux-gnu/qt5/**",
-                "/usr/include/x86_64-linux-gnu/qt5/**",
-                "/opt/ros/humble/include/**",
+                "/usr/include/aarch64-linux-gnu/qt5/**",
+                "/opt/ros/foxy/include/**",
                 "/usr/include/eigen3",
-                "/usr/include/ompl-1.5",
-                "/usr/include/pcl-1.12"
+                "/usr/include/pcl-1.10"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/clang",
