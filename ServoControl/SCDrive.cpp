@@ -10,13 +10,17 @@ ServoOperate::ServoOperate(std::string name, int id)
         class_obj = PyObject_GetAttrString(pModule, "ServoController");
         if (class_obj)
         {
-            PyObject *pArgs = PyTuple_Pack(2, Py_BuildValue("s", "/dev/ttyTHS1"), Py_BuildValue("i", 115200));
+            PyObject *pArgs = PyTuple_Pack(2, Py_BuildValue("s", "/dev/ttyTHS0"), Py_BuildValue("i", 115200));
             instance = PyObject_CallObject(class_obj, pArgs);
             if(instance)
             {
                 isAvaiable = true;
             }
         }
+    }
+    else
+    {
+        PyErr_Print();
     }
 }
 
@@ -33,7 +37,7 @@ void ServoOperate::SetServoPosition(int position, double time)
     PyObject_CallMethod(instance, "set_servo_position", "iii", id, position, time);
     else
     {
-        IRS_MESSAGE("servo " + this->name + " error , could not set position");
+        IRS_MESSAGE("servo" + this->name + " error , python script error, possibly due to the port not being open, could not set position");
     }
 }
 

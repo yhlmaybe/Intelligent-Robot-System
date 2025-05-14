@@ -5,7 +5,7 @@ import time
 sys.path.append("..")
 import ServoManager
 
-servo_control = ServoManager.ServoController('/dev/ttyTHS1', 115200)
+servo_control = ServoManager.ServoController('/dev/ttyTHS0', 115200)
 
 print('set serial servo status')
 

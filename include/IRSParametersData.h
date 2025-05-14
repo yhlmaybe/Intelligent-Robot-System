@@ -17,7 +17,7 @@ extern std::string SERVE_DRIVE_LISTENER;
 
 extern std::string URDF_PUBLISHER;
 
-extern std::string MOTION_MANAGER;
+extern std::string MOTION_SERVO_MANAGER;
 
 extern std::string URDF_XML;
 

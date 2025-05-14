@@ -2,11 +2,48 @@
 
 std::atomic<bool> IsNodeRunning(false);
 
-std::shared_ptr<UrdfPublisherNode> IRSCoreHandle::urdf_publisher_node = nullptr;
-std::shared_ptr<ServoManagerNode> IRSCoreHandle::servo_manager_node = nullptr;
-std::shared_ptr<JointStateListenerNode> IRSCoreHandle::joint_state_listen_node = nullptr;
-std::shared_ptr<ThreadSafeQueue<std::vector<Eigen::Vector3d>>> IRSCoreHandle::goal_points_queue = nullptr;
-std::shared_ptr<EnvironmentalPerception> IRSCoreHandle::env_perce = nullptr;
+ROSNodeExecutor& ROSNodeExecutor::GetInstance()
+{
+    static ROSNodeExecutor instance;
+    return instance;
+}
+
+void ROSNodeExecutor::AddNode(rclcpp::Node::SharedPtr node)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    executor_->add_node(node);
+    nodes_.push_back(node);
+}
+
+void ROSNodeExecutor::Start()
+{
+    if (running_) return;
+    running_ = true;
+    executor_thread_ = std::thread([this]()
+    {
+      while (running_ && rclcpp::ok()) 
+      {
+        executor_->spin_once(std::chrono::milliseconds(100));
+      } 
+    });
+}
+
+void ROSNodeExecutor::Stop()
+{
+    running_ = false;
+    if (executor_thread_.joinable())
+    {
+        executor_thread_.join();
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto &node : nodes_)
+    {
+        executor_->remove_node(node);
+    }
+    nodes_.clear();
+    executor_.reset();
+}
 
 JointStateListenerNode::JointStateListenerNode(std::shared_ptr<moveit::core::RobotState> robotState)
     : Node(SERVE_DRIVE_LISTENER)
@@ -34,6 +71,7 @@ JointStateListenerNode::JointStateListenerNode(std::shared_ptr<moveit::core::Rob
 
 void JointStateListenerNode::DoListen(const sensor_msgs::msg::JointState::SharedPtr msg)
 {
+    return;
     for (size_t i = 0; i < msg->name.size(); ++i)
     {
         const std::string &joint_name = msg->name[i];
@@ -266,6 +304,12 @@ EnvironmentalPerception::EnvironmentalPerception(unsigned interval_ms) : interva
     
 }
 
+EnvironmentalPerception& EnvironmentalPerception::GetInstance()
+{
+    static EnvironmentalPerception instance(100);
+    return instance;
+}
+
 std::vector<Eigen::Vector3d> EnvironmentalPerception::GetPointClouds()
 {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -288,16 +332,25 @@ void VisualImageProcessing::CalGoalPoints()
     //IRSCoreHandle::goal_points_queue->push();
 }
 
-ServoManagerNode::ServoManagerNode() : Node(MOTION_MANAGER)
+ServoManagerNode::ServoManagerNode() 
 {
-    jointState_pub = this->create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
-    joint_servos = ServoTools::Initiate();;
+    node = std::make_shared<rclcpp::Node>(MOTION_SERVO_MANAGER);
+    jointState_pub = node->create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
+    ROSNodeExecutor::GetInstance().AddNode(node);
+    
+    joint_servos = ServoTools::Initiate();
 
     motion_manager = std::make_shared<MotionManager>(URDF_XML, SRDF_XML);
     motion_manager->UpdateState(UpdateRobotstateBoundary());
     
     RegisterTask([this] {ClickToGoalPoint();});
     RegisterTask([this] {PublishJointState();});
+}
+
+ServoManagerNode& ServoManagerNode::GetInstance()
+{
+    static ServoManagerNode instance;
+    return instance;
 }
 
 void ServoManagerNode::Reset()
@@ -326,7 +379,7 @@ std::vector<std::shared_ptr<ServoManager>> ServoManagerNode::GetServoManagerFrom
 
 void ServoManagerNode::ClickToGoalPoint()
 {
-    std::vector<Eigen::Vector3d> datas = IRSCoreHandle::goal_points_queue->pop();
+    std::vector<Eigen::Vector3d> datas = IRSCoreHandle::GetGoalPointsQueue().pop();
     if(datas.size() == 0) return;
     std::lock_guard<std::mutex> lock(motion_servo_mtx);
     for (size_t i = 0; i < datas.size(); ++i)
@@ -372,7 +425,7 @@ void ServoManagerNode::ClickToGoalPoint()
         {
             ServoTools::SetServoPositions(servos, trace[j - 1].positions, trace[j].positions, servo_time);
             sensor_msgs::msg::JointState msg = motion_manager->UpdateRobotStateAndGetMsg(joint_names, trace[j].positions);
-            msg.header.stamp = this->get_clock()->now();
+            msg.header.stamp = node->get_clock()->now();
             jointState_pub->publish(msg);
         }
 
@@ -400,14 +453,14 @@ void ServoManagerNode::SetJointPosition(std::string jointName, double position)
     {
         ServoTools::SetServoPosition(it->second, before_position, after_position, TIMEINTERVAL);
         sensor_msgs::msg::JointState msg = motion_manager->UpdateRobotStateAndGetMsg(jointName, after_position);
-        msg.header.stamp = this->get_clock()->now();
+        msg.header.stamp = node->get_clock()->now();
         jointState_pub->publish(msg);
     }
 }
 
 std::shared_ptr<moveit::core::RobotState> ServoManagerNode::GetCurrentRobotState()
 {
-    //std::lock_guard<std::mutex> lock(motion_servo_mtx);
+    std::lock_guard<std::mutex> lock(motion_servo_mtx);
     return motion_manager->GetCurrentRobotState();
 }
 
@@ -446,13 +499,19 @@ void ServoManagerNode::PublishJointState()
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     std::lock_guard<std::mutex> lock(motion_servo_mtx);
     sensor_msgs::msg::JointState msg = motion_manager->GetCurrentJointStateMsg();
-    msg.header.stamp = this->get_clock()->now();
+    msg.header.stamp = node->get_clock()->now();
     /*if (!msg.name.empty()) 
     {
         IRS_MESSAGE("no message");
     }
     else IRS_MESSAGE("publish message");*/
     jointState_pub->publish(msg);
+}
+
+ThreadSafeQueue<std::vector<Eigen::Vector3d>>& IRSCoreHandle::GetGoalPointsQueue()
+{
+    static ThreadSafeQueue<std::vector<Eigen::Vector3d>> instance;
+    return instance;
 }
 
 void IRSCoreHandle::Start()
@@ -462,20 +521,18 @@ void IRSCoreHandle::Start()
         IsNodeRunning.store(true, std::memory_order_release);
 
         UrdfSrdfXMLInitial();    
+
+        GetGoalPointsQueue().reset();
+
+        EnvironmentalPerception::GetInstance().Start();
         
-        UrdfNodeInitial();
+        ServoManagerNode::GetInstance().Start();
 
-        goal_points_queue = std::make_shared<ThreadSafeQueue<std::vector<Eigen::Vector3d>>>();
-        goal_points_queue->reset();
+        auto state = ServoManagerNode::GetInstance().GetCurrentRobotState();
 
-        env_perce = std::make_shared<EnvironmentalPerception>(100);
-        env_perce->Start();
-        servo_manager_node = std::make_shared<ServoManagerNode>();
-        servo_manager_node->Start();
+        ROSNodeInitial(state);
 
-        auto state = servo_manager_node->GetCurrentRobotState();
-
-        JointStateNodeInitial(state);
+        ROSNodeExecutor::GetInstance().Start();
     }
     else IRS_MESSAGE("IRS core already start");
 }
@@ -483,10 +540,12 @@ void IRSCoreHandle::Start()
 void IRSCoreHandle::End()
 {
     if(IsNodeRunning.load())
-    {
+    {   
         IsNodeRunning.store(false, std::memory_order_release);
-        env_perce->Stop();
-        servo_manager_node->Stop();
+        EnvironmentalPerception::GetInstance().Stop();
+        GetGoalPointsQueue().stop();
+        ServoManagerNode::GetInstance().Stop();
+        ROSNodeExecutor::GetInstance().Stop();
     }
 }
 
@@ -494,31 +553,32 @@ void IRSCoreHandle::ResetServoState()
 {
     if (IsNodeRunning.load())
     {
-        env_perce->Stop();
-        servo_manager_node->Stop();
+        EnvironmentalPerception::GetInstance().Stop();
+        GetGoalPointsQueue().stop();
+        ServoManagerNode::GetInstance().Stop();
 
-        goal_points_queue->reset();
-        env_perce->Reset();
-        servo_manager_node->Reset();
+        GetGoalPointsQueue().reset();
+        EnvironmentalPerception::GetInstance().Reset();
+        ServoManagerNode::GetInstance().Reset();
 
-        env_perce->Start();
-        servo_manager_node->Start();
+        EnvironmentalPerception::GetInstance().Start();
+        ServoManagerNode::GetInstance().Start();
     }
 }
 
 void IRSCoreHandle::SetJointPosition(std::string name, double position)
 {
-    servo_manager_node->SetJointPosition(name, position);
+    ServoManagerNode::GetInstance().SetJointPosition(name, position);
 }
 
 std::shared_ptr<moveit::core::RobotState> IRSCoreHandle::GetCurrentRobotState()
 {
-    return servo_manager_node->GetCurrentRobotState();
+    return ServoManagerNode::GetInstance().GetCurrentRobotState();
 }
 
 std::vector<Eigen::Vector3d> IRSCoreHandle::GetEnvironmentPoints()
 {
-    return env_perce->GetPointClouds();
+    return EnvironmentalPerception::GetInstance().GetPointClouds();
 }
 
 void IRSCoreHandle::UrdfSrdfXMLInitial()
@@ -573,32 +633,15 @@ bool IRSCoreHandle::ReplacePathsInUrdf(std::string &urdfContent, const std::stri
     return modified;
 }
 
-std::string IRSCoreHandle::UrdfNodeInitial()
+std::string IRSCoreHandle::ROSNodeInitial(std::shared_ptr<moveit::core::RobotState> robotState)
 {
-    urdf_publisher_node  = std::make_shared<UrdfPublisherNode>();
-    std::thread([]()
-    {
-        while (IsNodeRunning.load())
-        {
-            rclcpp::spin_some(urdf_publisher_node);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }).detach();
-    return "urdf publisher start";
-}
+    std::shared_ptr<UrdfPublisherNode> urdf_publisher_node  = std::make_shared<UrdfPublisherNode>();
+    ROSNodeExecutor::GetInstance().AddNode(urdf_publisher_node);
 
-std::string IRSCoreHandle::JointStateNodeInitial(std::shared_ptr<moveit::core::RobotState> robotState)
-{
-    joint_state_listen_node = std::make_shared<JointStateListenerNode>(robotState);
-    std::thread([]()
-    {
-        while (IsNodeRunning.load())
-        {
-            rclcpp::spin_some(joint_state_listen_node);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }).detach();
-    return "joint state listener start";
+    std::shared_ptr<JointStateListenerNode> joint_state_listen_node = std::make_shared<JointStateListenerNode>(robotState);
+    ROSNodeExecutor::GetInstance().AddNode(joint_state_listen_node);
+
+    return "ros node initial";
 }
 
 std::vector<std::string> IRSCoreHandle::GetActiveNodeName()

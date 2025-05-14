@@ -26,6 +26,9 @@ public:
 private:
     explicit MainWindow(QWidget *parent = 0);
     ~MainWindow();
+
+    void closeEvent(QCloseEvent *event) override;
+
     MainWindow(const MainWindow&) = delete;
     MainWindow& operator = (const MainWindow&);
 

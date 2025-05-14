@@ -26,7 +26,7 @@ def port_init():
     GPIO.setup(rx_pin, GPIO.OUT)  # 配置RX_CON 即 GPIO17 为输出
     GPIO.output(rx_pin, 0)
     GPIO.setup(tx_pin, GPIO.OUT)  # 配置TX_CON 即 GPIO27 为输出
-    GPIO.output(tx_pin, 1)
+    GPIO.output(tx_pin, 1)  
 
 port_init()
 port_as_write()

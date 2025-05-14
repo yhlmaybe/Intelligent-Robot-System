@@ -36,6 +36,31 @@
 
 using MimicMap = std::map<std::string, urdf::JointMimicSharedPtr>;
 
+class ROSNodeExecutor
+{
+public:
+    static ROSNodeExecutor &GetInstance();
+
+    void AddNode(rclcpp::Node::SharedPtr node);
+
+    void Start();
+
+    void Stop();
+
+    ROSNodeExecutor(const ROSNodeExecutor&) = delete;
+    ROSNodeExecutor& operator = (const ROSNodeExecutor&) = delete;
+
+private:
+    ROSNodeExecutor() : executor_(std::make_shared<rclcpp::executors::MultiThreadedExecutor>()) {}
+    ~ROSNodeExecutor() { Stop(); }
+
+    std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
+    std::vector<rclcpp::Node::SharedPtr> nodes_;
+    std::thread executor_thread_;
+    std::atomic<bool> running_{false};
+    std::mutex mutex_;
+};
+
 class JointStateListenerNode : public rclcpp::Node
 {
 public:
@@ -49,7 +74,6 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr subscription;
 
     void DoListen(const sensor_msgs::msg::JointState::SharedPtr msg);
-
 };
 
 
@@ -97,9 +121,14 @@ class EnvironmentalPerception : public IRSThreadBase
 public:
     EnvironmentalPerception(unsigned interval_ms = 100);
 
+    static EnvironmentalPerception &GetInstance();
+
     std::vector<Eigen::Vector3d> GetPointClouds();
 
     void Reset();
+
+    EnvironmentalPerception(const EnvironmentalPerception&) = delete;
+    EnvironmentalPerception& operator = (const EnvironmentalPerception&) = delete;
 
 private:
     unsigned interval_ms_;  
@@ -115,10 +144,12 @@ public:
     void CalGoalPoints();
 };
 
-class ServoManagerNode : public rclcpp::Node , public IRSThreadBase
+class ServoManagerNode : public IRSThreadBase
 {
 public: 
     ServoManagerNode();
+
+    static ServoManagerNode &GetInstance();
 
     void Reset();
 
@@ -128,8 +159,11 @@ public:
 
     std::shared_ptr<moveit::core::RobotState> GetCurrentRobotState();
 
-private:
+    ServoManagerNode(const ServoManagerNode&) = delete;
+    ServoManagerNode& operator = (const ServoManagerNode&) = delete;
 
+private:
+    std::shared_ptr<rclcpp::Node> node;
     std::map<std::string, std::shared_ptr<ServoManager>> joint_servos;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr jointState_pub;
     std::shared_ptr<MotionManager> motion_manager;
@@ -144,7 +178,7 @@ private:
 class IRSCoreHandle
 {
 public:
-    static std::shared_ptr<ThreadSafeQueue<std::vector<Eigen::Vector3d>>> goal_points_queue; 
+    static ThreadSafeQueue<std::vector<Eigen::Vector3d>>& GetGoalPointsQueue();
 
     static void Start();
 
@@ -163,18 +197,11 @@ public:
     static bool IsActiveNode(std::string name);
 
 private:
-    static std::shared_ptr<UrdfPublisherNode> urdf_publisher_node;
-    static std::shared_ptr<JointStateListenerNode> joint_state_listen_node;
-    static std::shared_ptr<ServoManagerNode> servo_manager_node;
-    static std::shared_ptr<EnvironmentalPerception> env_perce;  
-
     static void UrdfSrdfXMLInitial();
 
     static bool ReplacePathsInUrdf(std::string& urdfContent, const std::string& oldKey, const std::string& newKey);
 
-    static std::string UrdfNodeInitial();
-
-    static std::string JointStateNodeInitial(std::shared_ptr<moveit::core::RobotState> robotState);
+    static std::string ROSNodeInitial(std::shared_ptr<moveit::core::RobotState> robotState);
 };
 
 #endif

@@ -725,18 +725,6 @@ PYTHON_EXECUTABLE:FILEPATH=/usr/bin/python
 PYTHON_VERSION:STRING=
 
 //Path to a library.
-Python3_LIBRARY_DEBUG:FILEPATH=
-
-//Path to a library.
-Python3_LIBRARY_RELEASE:FILEPATH=/usr/lib/aarch64-linux-gnu/libpython3.8.so
-
-//Path to a library.
-Python_LIBRARY_DEBUG:FILEPATH=
-
-//Path to a library.
-Python_LIBRARY_RELEASE:FILEPATH=/usr/lib/aarch64-linux-gnu/libpython3.8.so
-
-//Path to a library.
 QHULL_LIBRARY:FILEPATH=/usr/lib/aarch64-linux-gnu/libqhull.so
 
 //Path to a library.
@@ -988,18 +976,6 @@ ZLIB_LIBRARY_DEBUG:FILEPATH=ZLIB_LIBRARY_DEBUG-NOTFOUND
 //Path to a library.
 ZLIB_LIBRARY_RELEASE:FILEPATH=/usr/lib/aarch64-linux-gnu/libz.so
 
-//Path to a file.
-_Python3_INCLUDE_DIR:PATH=/usr/include/python3.8
-
-//Path to a library.
-_Python3_LIBRARY_RELEASE:FILEPATH=/usr/lib/aarch64-linux-gnu/libpython3.8.so
-
-//Path to a file.
-_Python_INCLUDE_DIR:PATH=/usr/include/python3.8
-
-//Path to a library.
-_Python_LIBRARY_RELEASE:FILEPATH=/usr/lib/aarch64-linux-gnu/libpython3.8.so
-
 //Path to a library.
 _lib:FILEPATH=/opt/ros/foxy/lib/libkdl_parser.so
 
@@ -1206,9 +1182,6 @@ pkgcfg_lib__OPENSSL_ssl:FILEPATH=/usr/lib/aarch64-linux-gnu/libssl.so
 
 //The directory containing a CMake configuration file for pluginlib.
 pluginlib_DIR:PATH=/opt/ros/foxy/share/pluginlib/cmake
-
-//The directory containing a CMake configuration file for python.
-python_DIR:PATH=python_DIR-NOTFOUND
 
 //The directory containing a CMake configuration file for random_numbers.
 random_numbers_DIR:PATH=/opt/ros/foxy/share/random_numbers/cmake
@@ -1700,10 +1673,6 @@ FIND_PACKAGE_MESSAGE_DETAILS_PCL_SURFACE:INTERNAL=[/usr/lib/aarch64-linux-gnu/li
 FIND_PACKAGE_MESSAGE_DETAILS_PCL_TRACKING:INTERNAL=[/usr/lib/aarch64-linux-gnu/libpcl_tracking.so][/usr/include/pcl-1.10][v()]
 //Details about finding PCL_VISUALIZATION
 FIND_PACKAGE_MESSAGE_DETAILS_PCL_VISUALIZATION:INTERNAL=[/usr/lib/aarch64-linux-gnu/libpcl_visualization.so][/usr/include/pcl-1.10][v()]
-//Details about finding Python
-FIND_PACKAGE_MESSAGE_DETAILS_Python:INTERNAL=[/usr/lib/aarch64-linux-gnu/libpython3.8.so][/usr/include/python3.8][cfound components: Development ][v3.8()]
-//Details about finding Python3
-FIND_PACKAGE_MESSAGE_DETAILS_Python3:INTERNAL=[/usr/lib/aarch64-linux-gnu/libpython3.8.so][/usr/include/python3.8][cfound components: Development ][v3.8()]
 //Details about finding PythonInterp
 FIND_PACKAGE_MESSAGE_DETAILS_PythonInterp:INTERNAL=[/usr/bin/python][v3.8.10(3)]
 //Details about finding Qhull
@@ -2143,16 +2112,6 @@ PKG_FONTCONFIG_fontconfig_PREFIX:INTERNAL=
 PKG_FONTCONFIG_fontconfig_VERSION:INTERNAL=
 //ADVANCED property for variable: PYTHON_EXECUTABLE
 PYTHON_EXECUTABLE-ADVANCED:INTERNAL=1
-PYTHON_INCLUDE_DIRS:INTERNAL=/usr/include/python3.8
-PYTHON_LIBRARIES:INTERNAL=/usr/lib/aarch64-linux-gnu/libpython3.8.so
-//ADVANCED property for variable: Python3_LIBRARY_DEBUG
-Python3_LIBRARY_DEBUG-ADVANCED:INTERNAL=1
-//ADVANCED property for variable: Python3_LIBRARY_RELEASE
-Python3_LIBRARY_RELEASE-ADVANCED:INTERNAL=1
-//ADVANCED property for variable: Python_LIBRARY_DEBUG
-Python_LIBRARY_DEBUG-ADVANCED:INTERNAL=1
-//ADVANCED property for variable: Python_LIBRARY_RELEASE
-Python_LIBRARY_RELEASE-ADVANCED:INTERNAL=1
 //QHull header
 QHULL_HEADER:INTERNAL=/usr/include/libqhull/libqhull.h
 //ADVANCED property for variable: SITE
@@ -2350,16 +2309,6 @@ _OPENSSL_openssl_INCLUDEDIR:INTERNAL=
 _OPENSSL_openssl_LIBDIR:INTERNAL=
 _OPENSSL_openssl_PREFIX:INTERNAL=
 _OPENSSL_openssl_VERSION:INTERNAL=
-_Python3_DEVELOPMENT_SIGNATURE:INTERNAL=a994a58ac51b5f283fe9360d3f49e4cc
-//ADVANCED property for variable: _Python3_INCLUDE_DIR
-_Python3_INCLUDE_DIR-ADVANCED:INTERNAL=1
-//ADVANCED property for variable: _Python3_LIBRARY_RELEASE
-_Python3_LIBRARY_RELEASE-ADVANCED:INTERNAL=1
-_Python_DEVELOPMENT_SIGNATURE:INTERNAL=a994a58ac51b5f283fe9360d3f49e4cc
-//ADVANCED property for variable: _Python_INCLUDE_DIR
-_Python_INCLUDE_DIR-ADVANCED:INTERNAL=1
-//ADVANCED property for variable: _Python_LIBRARY_RELEASE
-_Python_LIBRARY_RELEASE-ADVANCED:INTERNAL=1
 __pkg_config_arguments_PC_CURL:INTERNAL=QUIET;libcurl
 __pkg_config_arguments_PC_EIGEN:INTERNAL=eigen3
 __pkg_config_arguments_PC_FLANN:INTERNAL=flann

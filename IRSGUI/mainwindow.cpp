@@ -64,12 +64,17 @@ MainWindow::MainWindow(QWidget *parent) :
 
 MainWindow::~MainWindow()
 {  
-    IRSCoreHandle::End();
-    rclcpp::shutdown();
     QSharedMemory sharedMemory("IRSUniqueKey");
     sharedMemory.detach();
     Py_Finalize();
     delete ui; 
+}
+
+void MainWindow::closeEvent(QCloseEvent *event) 
+{
+    IRSCoreHandle::End();
+    rclcpp::shutdown();
+    event->accept();
 }
 
 void MainWindow::Initiate()
@@ -87,6 +92,7 @@ void MainWindow::SetMessage(QString QMessage)
 {
     std::lock_guard<std::mutex> lock(message_mtx);
     ui->MessageText->moveCursor(QTextCursor::End, QTextCursor::MoveAnchor);
+    ui->MessageText->insertPlainText("\n");
     ui->MessageText->insertPlainText(QMessage);
     QScrollBar *scrollbar = ui->MessageText->verticalScrollBar();
     if(scrollbar)  
@@ -105,7 +111,7 @@ void MainWindow::SetServoNo()
         PyObject *class_obj = PyObject_GetAttrString(pModule, "ServoController");
         if (class_obj)
         {
-            PyObject *pArgs = PyTuple_Pack(2, Py_BuildValue("s", "/dev/ttyTHS1"), Py_BuildValue("i", 115200));
+            PyObject *pArgs = PyTuple_Pack(2, Py_BuildValue("s", "/dev/ttyTHS0"), Py_BuildValue("i", 115200));
             if (pArgs)
             {
                 PyObject *instance = PyObject_CallObject(class_obj, pArgs);
@@ -142,7 +148,7 @@ void MainWindow::GetServoNo()
         PyObject *class_obj = PyObject_GetAttrString(pModule, "ServoController");
         if (class_obj)
         {
-            PyObject *pArgs = PyTuple_Pack(2, Py_BuildValue("s", "/dev/ttyTHS1"), Py_BuildValue("i", 115200));
+            PyObject *pArgs = PyTuple_Pack(2, Py_BuildValue("s", "/dev/ttyTHS0"), Py_BuildValue("i", 115200));
             if (pArgs)
             {
                 PyObject *instance = PyObject_CallObject(class_obj, pArgs);
@@ -261,7 +267,7 @@ void MainWindow::SetGoalPoint()
         }
 
         std::vector<Eigen::Vector3d> point_vec{Eigen::Vector3d(x, y, z)};
-        IRSCoreHandle::goal_points_queue->push(point_vec);
+        IRSCoreHandle::GetGoalPointsQueue().push(point_vec);
     }
     else
     {
