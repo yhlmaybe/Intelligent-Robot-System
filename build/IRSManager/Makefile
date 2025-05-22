@@ -261,32 +261,32 @@ IRSCoreManager.cpp.s:
 	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/build.make IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreManager.cpp.s
 .PHONY : IRSCoreManager.cpp.s
 
-MsgManager.o: MsgManager.cpp.o
+IRSCoreModule.o: IRSCoreModule.cpp.o
 
-.PHONY : MsgManager.o
+.PHONY : IRSCoreModule.o
 
 # target to build an object file
-MsgManager.cpp.o:
-	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/build.make IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.o
-.PHONY : MsgManager.cpp.o
+IRSCoreModule.cpp.o:
+	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/build.make IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.o
+.PHONY : IRSCoreModule.cpp.o
 
-MsgManager.i: MsgManager.cpp.i
+IRSCoreModule.i: IRSCoreModule.cpp.i
 
-.PHONY : MsgManager.i
+.PHONY : IRSCoreModule.i
 
 # target to preprocess a source file
-MsgManager.cpp.i:
-	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/build.make IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.i
-.PHONY : MsgManager.cpp.i
+IRSCoreModule.cpp.i:
+	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/build.make IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.i
+.PHONY : IRSCoreModule.cpp.i
 
-MsgManager.s: MsgManager.cpp.s
+IRSCoreModule.s: IRSCoreModule.cpp.s
 
-.PHONY : MsgManager.s
+.PHONY : IRSCoreModule.s
 
 # target to generate assembly for a file
-MsgManager.cpp.s:
-	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/build.make IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.s
-.PHONY : MsgManager.cpp.s
+IRSCoreModule.cpp.s:
+	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/build.make IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.s
+.PHONY : IRSCoreModule.cpp.s
 
 # Help Target
 help:
@@ -309,9 +309,9 @@ help:
 	@echo "... IRSCoreManager.o"
 	@echo "... IRSCoreManager.i"
 	@echo "... IRSCoreManager.s"
-	@echo "... MsgManager.o"
-	@echo "... MsgManager.i"
-	@echo "... MsgManager.s"
+	@echo "... IRSCoreModule.o"
+	@echo "... IRSCoreModule.i"
+	@echo "... IRSCoreModule.s"
 .PHONY : help
 
 

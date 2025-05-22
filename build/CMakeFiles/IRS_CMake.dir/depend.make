@@ -3,13 +3,19 @@
 
 CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o: ../IRSFunction.cpp
 CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o: ../include/IRSFunction.h
+CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o: ../include/MsgManager.h
 
 CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o: ../IRSParametersData.cpp
 CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o: ../include/IRSParametersData.h
 
+CMakeFiles/IRS_CMake.dir/MsgManager.cpp.o: ../MsgManager.cpp
+CMakeFiles/IRS_CMake.dir/MsgManager.cpp.o: ../include/MsgManager.h
+
+CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSGUI/EndEffectorDatasForm.h
+CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSGUI/JointDatasForm.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSGUI/mainwindow.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSManager/IRSCoreManager.h
-CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSManager/MsgManager.h
+CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSManager/IRSCoreModule.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../MathematicalTool/KinematicTool.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../MathematicalTool/Math3D.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../MathematicalTool/MotionManager.h
@@ -20,6 +26,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: ../ServoControl/ServoID.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../ServoControl/ServoManager.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../include/IRSFunction.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../include/IRSParametersData.h
+CMakeFiles/IRS_CMake.dir/main.cpp.o: ../include/MsgManager.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../include/IRSParametersData.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../main.cpp
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /opt/ros/foxy/include/ament_index_cpp/get_package_prefix.hpp
@@ -777,6 +784,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: /opt/ros/foxy/include/visualization_msgs/ms
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /opt/ros/foxy/include/visualization_msgs/msg/detail/marker_array__type_support.hpp
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /opt/ros/foxy/include/visualization_msgs/msg/marker_array.hpp
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /opt/ros/foxy/include/visualization_msgs/msg/rosidl_generator_cpp__visibility_control.hpp
+CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/QPointer
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/QSharedMemory
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qalgorithms.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qarraydata.h
@@ -824,6 +832,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/q
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qobjectdefs_impl.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qpair.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qpoint.h
+CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qpointer.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qprocessordetection.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qrect.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtCore/qrefcount.h
@@ -886,6 +895,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidget
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMainWindow
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMessageBox
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QScrollBar
+CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QWidget
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qabstractslider.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qapplication.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdesktopwidget.h

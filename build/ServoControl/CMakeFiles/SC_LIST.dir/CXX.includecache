@@ -6,6 +6,10 @@
 
 #IncludeRegexTransform: 
 
+/home/yhl/Documents/Intelligent-Robot-System/ServoControl/SCDrive.cpp
+SCDrive.h
+/home/yhl/Documents/Intelligent-Robot-System/ServoControl/SCDrive.h
+
 /home/yhl/Documents/Intelligent-Robot-System/ServoControl/SCDrive.h
 python3.8/Python.h
 -
@@ -30,6 +34,8 @@ ServoManager.h
 
 /home/yhl/Documents/Intelligent-Robot-System/ServoControl/ServoManager.h
 tinyxml2.h
+-
+pugixml.hpp
 -
 SCDrive.h
 /home/yhl/Documents/Intelligent-Robot-System/ServoControl/SCDrive.h
@@ -57,8 +63,26 @@ mutex
 -
 functional
 -
+map
+-
+type_traits
+-
+tuple
+-
+MsgManager.h
+/home/yhl/Documents/Intelligent-Robot-System/include/MsgManager.h
 
 /home/yhl/Documents/Intelligent-Robot-System/include/IRSParametersData.h
 string
+-
+
+/home/yhl/Documents/Intelligent-Robot-System/include/MsgManager.h
+string
+-
+list
+-
+sstream
+-
+pugixml.hpp
 -
 

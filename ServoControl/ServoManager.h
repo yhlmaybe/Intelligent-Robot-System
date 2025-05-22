@@ -2,6 +2,7 @@
 #define SERVOMANAGER_H
 
 #include <tinyxml2.h>
+#include <pugixml.hpp>
 
 #include "SCDrive.h"
 #include "ServoID.h"

@@ -80,6 +80,10 @@
         "variant": "cpp",
         "regex": "cpp",
         "any": "cpp",
-        "valarray": "cpp"
+        "valarray": "cpp",
+        "qmessagebox": "cpp",
+        "qsharedmemory": "cpp",
+        "qpointer": "cpp",
+        "qcloseevent": "cpp"
     }
 }

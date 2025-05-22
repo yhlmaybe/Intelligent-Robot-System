@@ -7,9 +7,12 @@
 #include <QScrollBar>
 #include <QSharedMemory>
 #include <QMessageBox>
+#include <QPointer>
 
 #include "../IRSManager/IRSCoreManager.h"
 #include "../include/IRSFunction.h"
+#include "JointDatasForm.h"
+#include "EndEffectorDatasForm.h"
 
 namespace Ui {
 class MainWindow;
@@ -22,6 +25,10 @@ class MainWindow : public QMainWindow
 public:
     static MainWindow* GetInstance();
     Ui::MainWindow* GetUI();
+    
+signals:
+    void SetJointDatasFormDatas(QString QMessage);
+    void SetEndEffectorDatasFormDatas(QString QMessage);
 
 private:
     explicit MainWindow(QWidget *parent = 0);
@@ -34,6 +41,12 @@ private:
 
     Ui::MainWindow *ui;
 
+    std::vector<QWidget*> forms;
+
+    JointDatasForm *joint_datas_form;
+
+    EndEffectorDatasForm *end_effector_datas_form;
+
     mutable std::mutex message_mtx;
 
     bool is_running = false;
@@ -41,9 +54,14 @@ private:
     bool is_initial = false;
 
 public slots:
+
     void SetMessage(QString QMessage);
 
 private slots:
+
+    void OpenJointDatasForm();
+
+    void OpenEndEffectDatasForm();
 
     void SetServoNo();
 

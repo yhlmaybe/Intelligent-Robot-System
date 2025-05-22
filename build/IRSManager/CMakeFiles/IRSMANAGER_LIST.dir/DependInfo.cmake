@@ -5,7 +5,7 @@ set(CMAKE_DEPENDS_LANGUAGES
 # The set of files for implicit dependencies of each language:
 set(CMAKE_DEPENDS_CHECK_CXX
   "/home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreManager.cpp" "/home/yhl/Documents/Intelligent-Robot-System/build/IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreManager.cpp.o"
-  "/home/yhl/Documents/Intelligent-Robot-System/IRSManager/MsgManager.cpp" "/home/yhl/Documents/Intelligent-Robot-System/build/IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.o"
+  "/home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreModule.cpp" "/home/yhl/Documents/Intelligent-Robot-System/build/IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.o"
   )
 set(CMAKE_CXX_COMPILER_ID "GNU")
 

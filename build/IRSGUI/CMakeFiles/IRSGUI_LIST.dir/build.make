@@ -70,9 +70,35 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.s: cm
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.s"
 	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI/IRSGUI_LIST_autogen/mocs_compilation.cpp -o CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.s
 
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.o: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/flags.make
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.o: ../IRSGUI/EndEffectorDatasForm.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object IRSGUI/CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.o"
+	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.o -c /home/yhl/Documents/Intelligent-Robot-System/IRSGUI/EndEffectorDatasForm.cpp
+
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.i"
+	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhl/Documents/Intelligent-Robot-System/IRSGUI/EndEffectorDatasForm.cpp > CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.i
+
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.s"
+	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhl/Documents/Intelligent-Robot-System/IRSGUI/EndEffectorDatasForm.cpp -o CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.s
+
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.o: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/flags.make
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.o: ../IRSGUI/JointDatasForm.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CXX object IRSGUI/CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.o"
+	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.o -c /home/yhl/Documents/Intelligent-Robot-System/IRSGUI/JointDatasForm.cpp
+
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.i"
+	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhl/Documents/Intelligent-Robot-System/IRSGUI/JointDatasForm.cpp > CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.i
+
+IRSGUI/CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.s"
+	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhl/Documents/Intelligent-Robot-System/IRSGUI/JointDatasForm.cpp -o CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.s
+
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/flags.make
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o: ../IRSGUI/mainwindow.cpp
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building CXX object IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o"
 	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI && /usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o -c /home/yhl/Documents/Intelligent-Robot-System/IRSGUI/mainwindow.cpp
 
 IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.i: cmake_force
@@ -86,16 +112,20 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.s: cmake_force
 # Object files for target IRSGUI_LIST
 IRSGUI_LIST_OBJECTS = \
 "CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o" \
+"CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.o" \
+"CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.o" \
 "CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o"
 
 # External object files for target IRSGUI_LIST
 IRSGUI_LIST_EXTERNAL_OBJECTS =
 
 IRSGUI/libIRSGUI_LIST.a: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.o
+IRSGUI/libIRSGUI_LIST.a: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.o
+IRSGUI/libIRSGUI_LIST.a: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.o
 IRSGUI/libIRSGUI_LIST.a: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/mainwindow.cpp.o
 IRSGUI/libIRSGUI_LIST.a: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make
 IRSGUI/libIRSGUI_LIST.a: IRSGUI/CMakeFiles/IRSGUI_LIST.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Linking CXX static library libIRSGUI_LIST.a"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Linking CXX static library libIRSGUI_LIST.a"
 	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI && $(CMAKE_COMMAND) -P CMakeFiles/IRSGUI_LIST.dir/cmake_clean_target.cmake
 	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI && $(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/IRSGUI_LIST.dir/link.txt --verbose=$(VERBOSE)
 

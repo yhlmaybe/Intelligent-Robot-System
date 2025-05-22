@@ -6,6 +6,7 @@ set(CMAKE_DEPENDS_LANGUAGES
 set(CMAKE_DEPENDS_CHECK_CXX
   "/home/yhl/Documents/Intelligent-Robot-System/IRSFunction.cpp" "/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o"
   "/home/yhl/Documents/Intelligent-Robot-System/IRSParametersData.cpp" "/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o"
+  "/home/yhl/Documents/Intelligent-Robot-System/MsgManager.cpp" "/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles/IRS_CMake.dir/MsgManager.cpp.o"
   "/home/yhl/Documents/Intelligent-Robot-System/main.cpp" "/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles/IRS_CMake.dir/main.cpp.o"
   )
 set(CMAKE_CXX_COMPILER_ID "GNU")

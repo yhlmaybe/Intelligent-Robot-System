@@ -23,12 +23,20 @@ mutex
 -
 functional
 -
+map
+-
+type_traits
+-
+tuple
+-
+MsgManager.h
+../include/MsgManager.h
 
-/home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreManager.cpp
-IRSCoreManager.h
-/home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreManager.h
+/home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreModule.cpp
+IRSCoreModule.h
+/home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreModule.h
 
-/home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreManager.h
+/home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreModule.h
 iostream
 -
 fstream
@@ -47,8 +55,6 @@ map
 -
 memory
 -
-MsgManager.h
-/home/yhl/Documents/Intelligent-Robot-System/IRSManager/MsgManager.h
 robot_state_publisher/robot_state_publisher.hpp
 -
 urdf/model.h
@@ -79,16 +85,6 @@ tf2_ros/transform_broadcaster.h
 /home/yhl/Documents/Intelligent-Robot-System/include/IRSFunction.h
 ../MathematicalTool/MotionManager.h
 /home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/MotionManager.h
-
-/home/yhl/Documents/Intelligent-Robot-System/IRSManager/MsgManager.h
-string
--
-list
--
-sstream
--
-pugixml.hpp
--
 
 /home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/KinematicTool.h
 kdl/chainfksolverpos_recursive.hpp
@@ -271,6 +267,8 @@ map
 /home/yhl/Documents/Intelligent-Robot-System/ServoControl/ServoManager.h
 tinyxml2.h
 -
+pugixml.hpp
+-
 SCDrive.h
 /home/yhl/Documents/Intelligent-Robot-System/ServoControl/SCDrive.h
 ServoID.h
@@ -297,9 +295,27 @@ mutex
 -
 functional
 -
+map
+-
+type_traits
+-
+tuple
+-
+MsgManager.h
+/home/yhl/Documents/Intelligent-Robot-System/include/MsgManager.h
 
 /home/yhl/Documents/Intelligent-Robot-System/include/IRSParametersData.h
 string
+-
+
+/home/yhl/Documents/Intelligent-Robot-System/include/MsgManager.h
+string
+-
+list
+-
+sstream
+-
+pugixml.hpp
 -
 
 /opt/ros/foxy/include/ament_index_cpp/get_package_prefix.hpp

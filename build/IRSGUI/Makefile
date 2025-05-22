@@ -219,6 +219,33 @@ IRSGUI_LIST_autogen/fast:
 	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/build
 .PHONY : IRSGUI_LIST_autogen/fast
 
+EndEffectorDatasForm.o: EndEffectorDatasForm.cpp.o
+
+.PHONY : EndEffectorDatasForm.o
+
+# target to build an object file
+EndEffectorDatasForm.cpp.o:
+	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.o
+.PHONY : EndEffectorDatasForm.cpp.o
+
+EndEffectorDatasForm.i: EndEffectorDatasForm.cpp.i
+
+.PHONY : EndEffectorDatasForm.i
+
+# target to preprocess a source file
+EndEffectorDatasForm.cpp.i:
+	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.i
+.PHONY : EndEffectorDatasForm.cpp.i
+
+EndEffectorDatasForm.s: EndEffectorDatasForm.cpp.s
+
+.PHONY : EndEffectorDatasForm.s
+
+# target to generate assembly for a file
+EndEffectorDatasForm.cpp.s:
+	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/EndEffectorDatasForm.cpp.s
+.PHONY : EndEffectorDatasForm.cpp.s
+
 IRSGUI_LIST_autogen/mocs_compilation.o: IRSGUI_LIST_autogen/mocs_compilation.cpp.o
 
 .PHONY : IRSGUI_LIST_autogen/mocs_compilation.o
@@ -245,6 +272,33 @@ IRSGUI_LIST_autogen/mocs_compilation.s: IRSGUI_LIST_autogen/mocs_compilation.cpp
 IRSGUI_LIST_autogen/mocs_compilation.cpp.s:
 	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/IRSGUI_LIST_autogen/mocs_compilation.cpp.s
 .PHONY : IRSGUI_LIST_autogen/mocs_compilation.cpp.s
+
+JointDatasForm.o: JointDatasForm.cpp.o
+
+.PHONY : JointDatasForm.o
+
+# target to build an object file
+JointDatasForm.cpp.o:
+	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.o
+.PHONY : JointDatasForm.cpp.o
+
+JointDatasForm.i: JointDatasForm.cpp.i
+
+.PHONY : JointDatasForm.i
+
+# target to preprocess a source file
+JointDatasForm.cpp.i:
+	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.i
+.PHONY : JointDatasForm.cpp.i
+
+JointDatasForm.s: JointDatasForm.cpp.s
+
+.PHONY : JointDatasForm.s
+
+# target to generate assembly for a file
+JointDatasForm.cpp.s:
+	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/JointDatasForm.cpp.s
+.PHONY : JointDatasForm.cpp.s
 
 mainwindow.o: mainwindow.cpp.o
 
@@ -290,9 +344,15 @@ help:
 	@echo "... package"
 	@echo "... IRSGUI_LIST"
 	@echo "... IRSGUI_LIST_autogen"
+	@echo "... EndEffectorDatasForm.o"
+	@echo "... EndEffectorDatasForm.i"
+	@echo "... EndEffectorDatasForm.s"
 	@echo "... IRSGUI_LIST_autogen/mocs_compilation.o"
 	@echo "... IRSGUI_LIST_autogen/mocs_compilation.i"
 	@echo "... IRSGUI_LIST_autogen/mocs_compilation.s"
+	@echo "... JointDatasForm.o"
+	@echo "... JointDatasForm.i"
+	@echo "... JointDatasForm.s"
 	@echo "... mainwindow.o"
 	@echo "... mainwindow.i"
 	@echo "... mainwindow.s"

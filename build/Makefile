@@ -711,6 +711,33 @@ IRSParametersData.cpp.s:
 	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.s
 .PHONY : IRSParametersData.cpp.s
 
+MsgManager.o: MsgManager.cpp.o
+
+.PHONY : MsgManager.o
+
+# target to build an object file
+MsgManager.cpp.o:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/MsgManager.cpp.o
+.PHONY : MsgManager.cpp.o
+
+MsgManager.i: MsgManager.cpp.i
+
+.PHONY : MsgManager.i
+
+# target to preprocess a source file
+MsgManager.cpp.i:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/MsgManager.cpp.i
+.PHONY : MsgManager.cpp.i
+
+MsgManager.s: MsgManager.cpp.s
+
+.PHONY : MsgManager.s
+
+# target to generate assembly for a file
+MsgManager.cpp.s:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/MsgManager.cpp.s
+.PHONY : MsgManager.cpp.s
+
 main.o: main.cpp.o
 
 .PHONY : main.o
@@ -795,6 +822,9 @@ help:
 	@echo "... IRSParametersData.o"
 	@echo "... IRSParametersData.i"
 	@echo "... IRSParametersData.s"
+	@echo "... MsgManager.o"
+	@echo "... MsgManager.i"
+	@echo "... MsgManager.s"
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"

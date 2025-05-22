@@ -5,6 +5,7 @@ MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o
  ../MathematicalTool/KinematicTool.h
  ../MathematicalTool/Math3D.h
  ../include/IRSFunction.h
+ ../include/MsgManager.h
  /home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/KinematicTool.cpp
  /opt/ros/foxy/include/kdl/chain.hpp
  /opt/ros/foxy/include/kdl/chainfksolver.hpp
@@ -250,6 +251,7 @@ MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o
  /home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/PointCloudTool.h
  /home/yhl/Documents/Intelligent-Robot-System/include/IRSFunction.h
  /home/yhl/Documents/Intelligent-Robot-System/include/IRSParametersData.h
+ /home/yhl/Documents/Intelligent-Robot-System/include/MsgManager.h
  /opt/ros/foxy/include/ament_index_cpp/get_package_prefix.hpp
  /opt/ros/foxy/include/ament_index_cpp/get_package_share_directory.hpp
  /opt/ros/foxy/include/ament_index_cpp/get_resource.hpp

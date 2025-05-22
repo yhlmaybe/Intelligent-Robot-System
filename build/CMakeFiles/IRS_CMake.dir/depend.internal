@@ -4,13 +4,19 @@
 CMakeFiles/IRS_CMake.dir/IRSFunction.cpp.o
  /home/yhl/Documents/Intelligent-Robot-System/IRSFunction.cpp
  /home/yhl/Documents/Intelligent-Robot-System/include/IRSFunction.h
+ /home/yhl/Documents/Intelligent-Robot-System/include/MsgManager.h
 CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o
  /home/yhl/Documents/Intelligent-Robot-System/IRSParametersData.cpp
  /home/yhl/Documents/Intelligent-Robot-System/include/IRSParametersData.h
+CMakeFiles/IRS_CMake.dir/MsgManager.cpp.o
+ /home/yhl/Documents/Intelligent-Robot-System/MsgManager.cpp
+ /home/yhl/Documents/Intelligent-Robot-System/include/MsgManager.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o
+ ../IRSGUI/EndEffectorDatasForm.h
+ ../IRSGUI/JointDatasForm.h
  ../IRSGUI/mainwindow.h
  ../IRSManager/IRSCoreManager.h
- ../IRSManager/MsgManager.h
+ ../IRSManager/IRSCoreModule.h
  ../MathematicalTool/KinematicTool.h
  ../MathematicalTool/Math3D.h
  ../MathematicalTool/MotionManager.h
@@ -21,6 +27,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o
  ../ServoControl/ServoManager.h
  ../include/IRSFunction.h
  ../include/IRSParametersData.h
+ ../include/MsgManager.h
  /home/yhl/Documents/Intelligent-Robot-System/include/IRSParametersData.h
  /home/yhl/Documents/Intelligent-Robot-System/main.cpp
  /opt/ros/foxy/include/ament_index_cpp/get_package_prefix.hpp
@@ -778,6 +785,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o
  /opt/ros/foxy/include/visualization_msgs/msg/detail/marker_array__type_support.hpp
  /opt/ros/foxy/include/visualization_msgs/msg/marker_array.hpp
  /opt/ros/foxy/include/visualization_msgs/msg/rosidl_generator_cpp__visibility_control.hpp
+ /usr/include/aarch64-linux-gnu/qt5/QtCore/QPointer
  /usr/include/aarch64-linux-gnu/qt5/QtCore/QSharedMemory
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qalgorithms.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qarraydata.h
@@ -825,6 +833,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qobjectdefs_impl.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qpair.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qpoint.h
+ /usr/include/aarch64-linux-gnu/qt5/QtCore/qpointer.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qprocessordetection.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qrect.h
  /usr/include/aarch64-linux-gnu/qt5/QtCore/qrefcount.h
@@ -887,6 +896,7 @@ CMakeFiles/IRS_CMake.dir/main.cpp.o
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMainWindow
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QMessageBox
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QScrollBar
+ /usr/include/aarch64-linux-gnu/qt5/QtWidgets/QWidget
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qabstractslider.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qapplication.h
  /usr/include/aarch64-linux-gnu/qt5/QtWidgets/qdesktopwidget.h

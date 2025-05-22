@@ -4,6 +4,7 @@
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o: ../MathematicalTool/KinematicTool.h
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o: ../MathematicalTool/Math3D.h
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o: ../include/IRSFunction.h
+MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o: ../include/MsgManager.h
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o: ../MathematicalTool/KinematicTool.cpp
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o: /opt/ros/foxy/include/kdl/chain.hpp
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/KinematicTool.cpp.o: /opt/ros/foxy/include/kdl/chainfksolver.hpp
@@ -249,6 +250,7 @@ MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o: ../Ma
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o: ../MathematicalTool/PointCloudTool.h
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o: ../include/IRSFunction.h
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o: ../include/IRSParametersData.h
+MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o: ../include/MsgManager.h
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o: /opt/ros/foxy/include/ament_index_cpp/get_package_prefix.hpp
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o: /opt/ros/foxy/include/ament_index_cpp/get_package_share_directory.hpp
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/MotionManager.cpp.o: /opt/ros/foxy/include/ament_index_cpp/get_resource.hpp

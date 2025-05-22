@@ -16,7 +16,7 @@ if(NOT CMAKE_C_STANDARD)
 endif()
 
 if(NOT CMAKE_CXX_STANDARD)
-    set(CMAKE_CXX_STANDARD 14)
+    set(CMAKE_CXX_STANDARD 17)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -59,6 +59,8 @@ endif()
 add_executable(IRS_CMake ${IRS_LIST})
 
 target_link_libraries(IRS_CMake /usr/lib/aarch64-linux-gnu/libccd.so.2)
+
+target_link_libraries(IRS_CMake pugixml)
 
 target_link_libraries(IRS_CMake SC_LIST)
 target_link_libraries(IRS_CMake IRSGUI_LIST)

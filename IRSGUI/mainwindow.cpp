@@ -12,6 +12,29 @@ void IRS_MESSAGE(std::string message)
         Q_ARG(QString, QMessage));
 }
 
+void IRS_XML_MESSAGE(std::string message, MessageFunction fun)
+{
+    MainWindow *mainWindow = MainWindow::GetInstance();
+    QString QMessage = QString::fromStdString(message);
+    std::string functionName = "";
+    switch (fun)
+    {
+    case MessageFunction::JointDatas:
+        functionName = "SetJointDatasFormDatas";
+        break;
+    case MessageFunction::EndEffectorDatas:
+        functionName = "SetEndEffectorDatasFormDatas";
+        break;
+    default:
+        functionName = "SetMessage";
+    }
+    QMetaObject::invokeMethod(
+        mainWindow,
+        functionName.c_str(),
+        Qt::AutoConnection,
+        Q_ARG(QString, QMessage));
+}
+
 void IRS_MESSAGE(const char* format, ...) 
 {
     va_list args;
@@ -29,8 +52,8 @@ void IRS_MESSAGE(const char* format, ...)
 
 MainWindow* MainWindow::GetInstance()
 {
-    static MainWindow instance;
-    return &instance;
+    static MainWindow* instance = new MainWindow();
+    return instance;
 }
 
 Ui::MainWindow* MainWindow::GetUI()
@@ -40,7 +63,9 @@ Ui::MainWindow* MainWindow::GetUI()
 
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
-    ui(new Ui::MainWindow)
+    ui(new Ui::MainWindow),
+    joint_datas_form(new JointDatasForm()),
+    end_effector_datas_form(new EndEffectorDatasForm())
 {
     if(!QSharedMemory("IRSUniqueKey").create(1))
     {
@@ -50,7 +75,16 @@ MainWindow::MainWindow(QWidget *parent) :
     }
     ui->setupUi(this);
 
+    forms.push_back(joint_datas_form);
+    forms.push_back(end_effector_datas_form);
+
     Initiate();
+
+    connect(this, &MainWindow::SetJointDatasFormDatas, joint_datas_form, &JointDatasForm::AddData);
+    connect(this, &MainWindow::SetEndEffectorDatasFormDatas, end_effector_datas_form, &EndEffectorDatasForm::AddData);
+
+    connect(ui->actionJoint_Datas, &QAction::triggered, this, &MainWindow::OpenJointDatasForm);
+    connect(ui->actionEnd_Effector_Datas, &QAction::triggered, this, &MainWindow::OpenEndEffectDatasForm);
 
     connect(ui->SetServoNo_Button, SIGNAL(clicked()), this, SLOT(SetServoNo()));
     connect(ui->GetServoNo_Button, SIGNAL(clicked()), this, SLOT(GetServoNo()));
@@ -74,6 +108,13 @@ void MainWindow::closeEvent(QCloseEvent *event)
 {
     IRSCoreHandle::End();
     rclcpp::shutdown();
+    for(QWidget *form : forms)
+    {
+        if(form->isVisible())
+        {
+            form->close();
+        }
+    }
     event->accept();
 }
 
@@ -100,6 +141,17 @@ void MainWindow::SetMessage(QString QMessage)
         scrollbar->setSliderPosition(scrollbar->maximum());
     }  
 }
+
+void MainWindow::OpenJointDatasForm()
+{
+    joint_datas_form->show();
+}
+
+void MainWindow::OpenEndEffectDatasForm()
+{
+    end_effector_datas_form->show();
+}
+
 
 void MainWindow::SetServoNo()
 {

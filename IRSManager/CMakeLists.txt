@@ -39,8 +39,6 @@ endif()
 
 target_link_libraries(IRSMANAGER_LIST SC_LIST)
 
-target_link_libraries(IRSMANAGER_LIST pugixml)
-
 target_link_libraries(IRSMANAGER_LIST rviz_common::rviz_common)
 
 target_link_libraries(IRSMANAGER_LIST ${orocos_kdl_LIBRARIES} ${kdl_parser_LIBRARIES})

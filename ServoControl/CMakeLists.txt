@@ -38,7 +38,6 @@ add_library(SC_LIST ${SC_LIST})
 target_link_libraries(SC_LIST PUBLIC python3.8)
 target_include_directories(SC_LIST PUBLIC ${Python_INCLUDE_DIRS})
 
-find_path(TINYXML2_INCLUDE_DIR NAMES tinyxml2.h)
-find_library(TINYXML2_LIBRARY NAMES tinyxml2)
-target_include_directories(SC_LIST PUBLIC ${TINYXML2_INCLUDE_DIR})
-target_link_libraries(SC_LIST PUBLIC ${TINYXML2_LIBRARY})
+target_link_libraries(SC_LIST PUBLIC pugixml)
+
+

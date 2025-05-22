@@ -159,60 +159,31 @@ std::map<std::string, std::shared_ptr<ServoManager>> ServoTools::Initiate()
         return res;
     }
     std::string file = std::string(cwd) + "/Configure/Arm_Joint_Cal_Parameter.xml";
-    tinyxml2::XMLDocument doc;
-    tinyxml2::XMLError eResult = doc.LoadFile(file.c_str());
 
-    if (eResult != tinyxml2::XML_SUCCESS) 
-    {
-        IRS_MESSAGE("Error: Failed to load Arm_Joint_Cal_Parameter file"); 
+    pugi::xml_document doc;
+    pugi::xml_parse_result eResult = doc.load_file(file.c_str());
+    if (!eResult) 
+    {  
+        IRS_MESSAGE("Error: Failed to load Arm_Joint_Cal_Parameter file");
         return res;
     }
 
-    tinyxml2::XMLElement* root = doc.FirstChildElement("ArmJointConfig");
-    if (root == nullptr) 
-    {
-        IRS_MESSAGE("Error: No <ArmJointConfig> root element found in"); 
+    pugi::xml_node root = doc.child("ArmJointConfig");
+    if (!root) 
+    { 
+        IRS_MESSAGE("Error: No <ArmJointConfig> root element found");
         return res;
     }
 
     std::vector<JointParam> jointParams;
-    for (tinyxml2::XMLElement *jointElem = root->FirstChildElement("Joint");
-         jointElem != nullptr;
-         jointElem = jointElem->NextSiblingElement("Joint"))
+    for (pugi::xml_node jointNode : root.children("Joint")) 
     {
         JointParam jp;
-
-        const char *nameAttr = jointElem->Attribute("name");
-        if (nameAttr)
-        {
-            jp.name = std::string(nameAttr);
-        }
-
-        tinyxml2::XMLElement *wideElem = jointElem->FirstChildElement("wide");
-        if (wideElem)
-        {
-            wideElem->QueryDoubleText(&jp.wide);
-        }
-
-        tinyxml2::XMLElement *highElem = jointElem->FirstChildElement("high");
-        if (highElem)
-        {
-            highElem->QueryDoubleText(&jp.high);
-        }
-
-        tinyxml2::XMLElement *fixxElem = jointElem->FirstChildElement("fix_x");
-        if (fixxElem)
-        {
-            fixxElem->QueryDoubleText(&jp.fix_x);
-        }
-
-        tinyxml2::XMLElement *fixyElem = jointElem->FirstChildElement("fix_y");
-        if (fixyElem)
-        {
-            fixyElem->QueryDoubleText(&jp.fix_y);
-        }
-
-        std::make_shared<Servo>("RComp_Thumb_Arth_1", RComp_Thumb_Arth_1);
+        jp.name = jointNode.attribute("name").as_string(""); 
+        jp.wide = jointNode.child("wide").text().as_double(0.0);
+        jp.high = jointNode.child("high").text().as_double(0.0);
+        jp.fix_x = jointNode.child("fix_x").text().as_double(0.0);
+        jp.fix_y = jointNode.child("fix_y").text().as_double(0.0);
         jointParams.push_back(jp);
     }
 

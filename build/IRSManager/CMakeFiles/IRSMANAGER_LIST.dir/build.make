@@ -70,29 +70,29 @@ IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreManager.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreManager.cpp.s"
 	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSManager && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreManager.cpp -o CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreManager.cpp.s
 
-IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.o: IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/flags.make
-IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.o: ../IRSManager/MsgManager.cpp
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.o"
-	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSManager && /usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.o -c /home/yhl/Documents/Intelligent-Robot-System/IRSManager/MsgManager.cpp
+IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.o: IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/flags.make
+IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.o: ../IRSManager/IRSCoreModule.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.o"
+	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSManager && /usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.o -c /home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreModule.cpp
 
-IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.i"
-	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSManager && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhl/Documents/Intelligent-Robot-System/IRSManager/MsgManager.cpp > CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.i
+IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.i"
+	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSManager && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreModule.cpp > CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.i
 
-IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.s"
-	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSManager && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhl/Documents/Intelligent-Robot-System/IRSManager/MsgManager.cpp -o CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.s
+IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.s"
+	cd /home/yhl/Documents/Intelligent-Robot-System/build/IRSManager && /usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreModule.cpp -o CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.s
 
 # Object files for target IRSMANAGER_LIST
 IRSMANAGER_LIST_OBJECTS = \
 "CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreManager.cpp.o" \
-"CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.o"
+"CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.o"
 
 # External object files for target IRSMANAGER_LIST
 IRSMANAGER_LIST_EXTERNAL_OBJECTS =
 
 IRSManager/libIRSMANAGER_LIST.a: IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreManager.cpp.o
-IRSManager/libIRSMANAGER_LIST.a: IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/MsgManager.cpp.o
+IRSManager/libIRSMANAGER_LIST.a: IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.o
 IRSManager/libIRSMANAGER_LIST.a: IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/build.make
 IRSManager/libIRSMANAGER_LIST.a: IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Linking CXX static library libIRSMANAGER_LIST.a"

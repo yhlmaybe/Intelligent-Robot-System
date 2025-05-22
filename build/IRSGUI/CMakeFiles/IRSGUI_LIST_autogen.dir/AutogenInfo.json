@@ -8,6 +8,16 @@
 	"HEADERS" : 
 	[
 		[
+			"/home/yhl/Documents/Intelligent-Robot-System/IRSGUI/EndEffectorDatasForm.h",
+			"MU",
+			"EWIEGA46WW/moc_EndEffectorDatasForm.cpp"
+		],
+		[
+			"/home/yhl/Documents/Intelligent-Robot-System/IRSGUI/JointDatasForm.h",
+			"MU",
+			"EWIEGA46WW/moc_JointDatasForm.cpp"
+		],
+		[
 			"/home/yhl/Documents/Intelligent-Robot-System/IRSGUI/mainwindow.h",
 			"MU",
 			"EWIEGA46WW/moc_mainwindow.cpp"
@@ -91,6 +101,14 @@
 	"SETTINGS_FILE" : "/home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/AutogenUsed.txt",
 	"SOURCES" : 
 	[
+		[
+			"/home/yhl/Documents/Intelligent-Robot-System/IRSGUI/EndEffectorDatasForm.cpp",
+			"MU"
+		],
+		[
+			"/home/yhl/Documents/Intelligent-Robot-System/IRSGUI/JointDatasForm.cpp",
+			"MU"
+		],
 		[
 			"/home/yhl/Documents/Intelligent-Robot-System/IRSGUI/mainwindow.cpp",
 			"MU"
