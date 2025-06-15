@@ -8,24 +8,41 @@ from einops import rearrange
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, embedDim: int, numHeads: int, hebbianRate: float = 0.01, attnDropout: float = 0.1):
+    """
+    Parameters
+    ----------
+    embedDim : int
+        Token embedding dimension `E`.
+    numHeads : int
+        Number of attention heads `H`.
+    hebbianRate : float, optional
+        Base Hebbian learning-rate α₀.  (default 0.01)
+    attnDropout : float, optional
+        Drop probability applied to attention weights.  (default 0.1)
+    tdScale : float, optional
+        Scale factor dividing TD-error before tanh.  (default 5.0)
+    """
+    def __init__(self, embedDim: int, numHeads: int, hebbianRate: float = 0.01, attnDropout: float = 0.1, tdScale : float = 5.0):
         super().__init__()
         assert embedDim % numHeads == 0, "AttentionModule embed_dim must be divisible by num_heads"
         self.embed_dim = embedDim
         self.num_heads = numHeads
         self.head_dim = embedDim // numHeads
-        self.hebbian_rate = hebbianRate
-        self.attn_dropout = attnDropout
+        self.base_hebbian_rate = hebbianRate
+        self.attn_dropout_p = attnDropout
+        self.td_scale = tdScale
 
         self.q_proj = nn.Linear(embedDim, embedDim)
         self.k_proj = nn.Linear(embedDim, embedDim)
         self.v_proj = nn.Linear(embedDim, embedDim)
         self.out_proj = nn.Linear(embedDim, embedDim)
 
-        self.register_buffer("hebbian_weights", torch.zeros(numHeads, self.head_dim, self.head_dim))
+        eye : torch.Tensor = torch.eye(self.head_dim)
+
+        self.register_buffer("hebbian_weights", eye.unsqueeze(0).repeat(numHeads, 1, 1))
         self.ResetParameters()
 
-    def ResetParameters(self):
+    def ResetParameters(self) -> None:
         for mod in (self.q_proj, self.k_proj, self.v_proj, self.out_proj):
             nn.init.xavier_uniform_(mod.weight)
             if mod.bias is not None:
@@ -33,71 +50,104 @@ class MultiHeadAttention(nn.Module):
         self.ResetHebbianMemory()
 
     def ResetHebbianMemory(self):
-        eye = torch.eye(self.head_dim, device=self.hebbian_weights.device)
+        eye: torch.Tensor = torch.eye(self.head_dim, device=self.hebbian_weights.device)
         self.hebbian_weights.copy_(eye.unsqueeze(0).repeat(self.num_heads, 1, 1))
 
-    def ScaledDotProductAttention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor], p: float) -> Tuple[torch.Tensor, torch.Tensor]:
-        attn_mask = mask
+    def ScaledDotAttn(
+        self,
+        q: torch.Tensor,               # (B, H, Lq, D)
+        k: torch.Tensor,               # (B, H, Lk, D)
+        v: torch.Tensor,               # (B, H, Lk, D)
+        mask: Optional[torch.Tensor],  # (B, 1, 1, Lk)
+        dropoutP: float,) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        if hasattr(F, "scaled_dot_product_attention"):
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=p, is_causal=False)
-            return out, None
-        else:
-            d = q.size(-1)
-            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
-            if mask is not None:
-                scores = scores.masked_fill(mask, float("-1e4"))
-            weights = F.softmax(scores, dim=-1)
-            weights = F.dropout(weights, p=p, training=self.training)
-            out = torch.matmul(weights, v)
-            return out, weights
+        d = q.size(-1)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
+        if mask is not None:
+            scores = scores.masked_fill(mask, float("-1e4"))
+        weights = F.softmax(scores, dim=-1)
+        weights = F.dropout(weights, p=dropoutP, training=q.requires_grad)
+        context = torch.matmul(weights, v)
+        return context, weights
 
-    def forward(self,query: torch.Tensor,key: torch.Tensor,value: torch.Tensor, keyPaddingMask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, S, _ = query.shape
+    def forward(
+        self,
+        query: torch.Tensor,                              # (B, Sq, E)
+        key: torch.Tensor,                                # (B, Sk, E)
+        value: torch.Tensor,                              # (B, Sk, E)
+        keyPaddingMask: Optional[torch.Tensor] = None,    # (B, Sk)
+        tdError: Optional[torch.Tensor] = None,           # (B,) or scalar
+        ) -> torch.Tensor:
+        B, Sq, _ = query.shape
+        Sk: int = key.shape[1]
 
-        def _proj(layer, x):
-            return layer(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        neuromod: float = 1.0
+        if tdError is not None:
+            td_norm: torch.Tensor = (tdError - tdError.mean()) / (tdError.std() + 1e-8)
+            neuromod = 1.0 + 0.5 * torch.tanh(td_norm.mean() / self.td_scale).item()
 
-        q = _proj(self.q_proj, query)
-        k = _proj(self.k_proj, key)
-        v = _proj(self.v_proj, value)
+        def _proj(layer: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+            B_, L_, _ = x.shape
+            return (layer(x).view(B_, L_, self.num_heads, self.head_dim).transpose(1, 2))  # (B,H,L,D)
 
-        mask = keyPaddingMask.view(B, 1, 1, S) if keyPaddingMask is not None else None
+        q: torch.Tensor = _proj(self.q_proj, query)   # (B,H,Sq,D)
+        k: torch.Tensor = _proj(self.k_proj, key)     # (B,H,Sk,D)
+        v: torch.Tensor = _proj(self.v_proj, value)   # (B,H,Sk,D)
 
-        attn_out, attn_weights = self.ScaledDotProductAttention(q, k, v, mask, self.attn_dropout)
+        mask: Optional[torch.Tensor] = None
+        if keyPaddingMask is not None:
+            mask = keyPaddingMask.bool().view(B, 1, 1, Sk)
 
         if self.training:
+            alpha: float = self.base_hebbian_rate * neuromod
             with torch.no_grad():
-                hebb_term = torch.einsum("bhse,bhsd->hde", v, q) / self.head_dim
-                hebb_term.clamp_(-1, 1)
-                self.hebbian_weights.mul_(1 - self.hebbian_rate).add_(self.hebbian_rate * hebb_term)
+                hebb_term: torch.Tensor = torch.einsum(
+                    "bhse,bhsd->hde", v, q
+                ) / (B * Sq * self.head_dim)          # outer product avg
+                hebb_term = torch.tanh(hebb_term)     # bound to [-1,1]
+                self.hebbian_weights.mul_(1 - alpha).add_(alpha * hebb_term)
+                # simple clamp for stability
+                self.hebbian_weights.clamp_(-3.0, 3.0)
 
-        v_mod = torch.einsum("bhse,hde->bhsd", v, self.hebbian_weights)
+        v_fast: torch.Tensor = torch.einsum("bhse,hde->bhsd", v, self.hebbian_weights)
 
-        if attn_weights is None:
-            attn_out = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if mask is not None:
-                attn_out = attn_out.masked_fill(mask, float("-1e4"))
-            attn_weights = F.softmax(attn_out, dim=-1)
-            attn_weights = F.dropout(attn_weights, p=self.attn_dropout, training=self.training)
+        q_mod: torch.Tensor = q * neuromod
 
-        out = torch.matmul(attn_weights, v_mod)           # [B, H, S, D]
-        out = out.transpose(1, 2).contiguous().view(B, S, self.embed_dim)
+        if hasattr(F, "scaled_dot_product_attention"):
+            context: torch.Tensor = F.scaled_dot_product_attention(
+                q_mod,
+                k,
+                v_fast,
+                attn_mask=mask,
+                dropout_p=self.attn_dropout_p,
+                is_causal=False)
+        else:
+            context, _ = self.ScaledDotAttn(q_mod, k, v_fast, mask, self.attn_dropout_p)
+
+        out: torch.Tensor = (context.transpose(1, 2).contiguous().view(B, Sq, self.embed_dim))
+
         return self.out_proj(out)
 
 class TemporalAttention(nn.Module):
-    def __init__(self, embedDim: int, numHeads: int):
+    def __init__(self, embedDim: int, numHeads: int, layerIdx: int = 0):
         super().__init__()
-        self.attn = MultiHeadAttention(embedDim, numHeads)
-        self.norm = nn.LayerNorm(embedDim)
-        self.dropout = nn.Dropout(0.1)
+        td_scale = 5.0 / (layerIdx + 1)
+        self.attn: MultiHeadAttention = MultiHeadAttention(embedDim, numHeads, tdScale=td_scale)
+        self.norm: nn.LayerNorm = nn.LayerNorm(embedDim)
+        self.dropout: nn.Dropout = nn.Dropout(0.1)
 
-    def forward(self, x: torch.Tensor, keyPaddingMask: Optional[torch.Tensor] = None):
-        return self.norm(x + self.dropout(self.attn(x, x, x, keyPaddingMask)))
+
+    def forward(
+        self,
+        x: torch.Tensor,                               # (B,S,E)
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        tdError: Optional[torch.Tensor] = None) -> torch.Tensor:
+
+        attn_out = self.attn(x, x, x, keyPaddingMask, tdError)
+        return self.norm(x + self.dropout(attn_out))
 
 
 class DynamicRouting(nn.Module):
-
     def __init__(self, inCaps: int, inDim: int, outCaps: int, outDim: int, iterations: int = 3):
         super().__init__()
         self.I = inCaps
@@ -120,7 +170,11 @@ class DynamicRouting(nn.Module):
         scale = squared_norm / (1.0 + squared_norm) / (torch.sqrt(squared_norm + 1e-8))
         return scale * vectors
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        x: torch.Tensor,                              # (B,I,D)
+        mask: Optional[torch.Tensor] = None,          # (B,I) bool
+        ) -> torch.Tensor:                            # (B,O,out_dim)
         # x: [B, I, in_dim]
         B, I, D = x.shape
         assert I == self.I and D == self.in_dim, "AttentionModule capsule input dim mismatch"
@@ -148,7 +202,6 @@ class DynamicRouting(nn.Module):
 
 
 class HebbianFusion(nn.Module):
-
     def __init__(self, numModes: int, embedDim: int, hebbianRate: float = 0.01):
         super().__init__()
         self.num_modes = numModes
@@ -157,6 +210,8 @@ class HebbianFusion(nn.Module):
 
         self.register_buffer("weights", torch.empty(numModes, embedDim, embedDim))
         self.register_buffer("hebbian_memory", torch.zeros_like(self.weights))
+        self.register_buffer("momentum", torch.tensor(0.9, dtype=torch.float32))
+
         self.ResetParameters()
 
         self.gate = nn.Sequential(
@@ -183,11 +238,12 @@ class HebbianFusion(nn.Module):
 
         if self.training:
             with torch.no_grad():
-                mode_act = inputs.mean(dim=0)          # [M, E]
-                fused_act = fused.mean(dim=0)          # [E]
-                hebb_term = torch.einsum("me,f->mef", mode_act, fused_act) / (E**0.5)
+                hebb_term: torch.Tensor = torch.einsum("bme,bf->bmef", inputs, fused).mean(0) / math.sqrt(E)            # (M,E,E)
                 self.hebbian_memory.mul_(1 - self.hebbian_rate).add_(self.hebbian_rate * hebb_term)
-                self.weights.copy_(torch.clamp(self.weights * 0.95 + 0.05 * self.hebbian_memory, -3, 3))
+
+                m = float(self.momentum)
+                self.weights.copy_(torch.clamp(m * self.weights + (1 - m) * self.hebbian_memory, -3.0, 3.0))
+
         return fused  # [B, E]
 
 class MetaStrategySelector(nn.Module):
@@ -214,7 +270,7 @@ class MetaStrategySelector(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def ResetHebbianMemory(self):
-        nn.init.normal_(self.strategy_weights, std = 0.02)
+        nn.init.normal_(self.strategy_weights, std = 0.01)
 
     def forward(self, x: torch.Tensor):  # x: [B, E]
         offsets = self.generator(x).view(-1, self.num_heads, self.num_strategies)
@@ -231,12 +287,13 @@ class AttentionExtractor(nn.Module):
     def __init__(self,embedDim: int = 512,numHeads: int = 8,temporalLayers: int = 3,routingIterations: int = 3,hebbianRate: float = 0.01,useMetaLearning: bool = True,):
         super().__init__()
         assert embedDim % 16 == 0, "AttentionModule embed_dim must be divisible by 16 (for 16 capsules)"
-        self.embed_dim = embedDim
+
+        self.E = embedDim
         self.use_meta_learning = useMetaLearning
 
-        self.temporal_blocks : List[TemporalAttention] = nn.ModuleList(
-            [TemporalAttention(embedDim, numHeads) for _ in range(temporalLayers)]
-        )
+        self.temporal_blocks : List[TemporalAttention] = nn.ModuleList([
+                TemporalAttention(embedDim, numHeads, idx)
+                for idx in range(temporalLayers)])
 
         in_dim = embedDim // 16
         self.routing = DynamicRouting(16, in_dim, 4, embedDim, iterations=routingIterations)
@@ -245,10 +302,8 @@ class AttentionExtractor(nn.Module):
 
         if useMetaLearning:
             self.meta_selector = MetaStrategySelector(embedDim, numStrategies=3)
-            self.context_proj = nn.Sequential(
-                nn.Linear(embedDim * 2, embedDim),
-                nn.GELU(),
-            )
+
+            self.context_proj = nn.Sequential(nn.Linear(embedDim * 2, embedDim), nn.GELU())
         else:
             self.register_parameter("meta_selector", None)
 
@@ -257,46 +312,59 @@ class AttentionExtractor(nn.Module):
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(embedDim * 2, embedDim),
-            nn.LayerNorm(embedDim),
-        )
+            nn.LayerNorm(embedDim))
 
-    def forward(self, x: torch.Tensor, keyPaddingMask: Optional[torch.Tensor] = None):
-        # x: [B, S, E]
+    def forward(
+        self,
+        x: torch.Tensor,                                # (B,S,E)
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        tdError: Optional[torch.Tensor] = None,        # (B,) or scalar
+        ) -> torch.Tensor:
+
         B, S, E = x.shape
-
         h = x
-        for block in self.temporal_blocks:
-            h = block(h, keyPaddingMask)
+        for blk in self.temporal_blocks:
+            h = blk(h, keyPaddingMask, tdError)
+
+        caps_mask: Optional[torch.Tensor] = None
+
+        if keyPaddingMask is not None:          
+            group_size = math.ceil(S / 16)
+            pad_len = group_size * 16 - S
+            if pad_len:
+                h = F.pad(h, (0, 0, 0, pad_len))  
+                keyPaddingMask = F.pad(keyPaddingMask, (0, pad_len), value=False)  
 
         caps = rearrange(h, "b s (c d) -> b c s d", c=16)
-        caps = caps.mean(dim=2)  
-        caps_mask = None
-        if keyPaddingMask is not None:
-            caps_mask = keyPaddingMask.float().unsqueeze(1)          # [B, 1, S]
-            caps_mask = F.adaptive_avg_pool1d(caps_mask, 16).squeeze(1) > 0.5  # [B, 16]
+        caps = caps.mean(dim=2)          # (B,16,in_dim)
 
-        routed = self.routing(caps, caps_mask)  # [B, 4, E]
-        routed_mean = routed.mean(dim=1)        # [B, E]
-        temp_mean = h.mean(dim=1)               # [B, E]
+        caps_mask = keyPaddingMask.view(B, 16, group_size).any(dim=2)  # (B,16)
 
-        fusion_in = torch.stack([temp_mean, routed_mean, temp_mean + routed_mean], dim=1)  # [B, 3, E]
-        fused = self.fusion(fusion_in)  # [B, E]
+        routed = self.routing(caps, caps_mask)            # (B,4,E)
+
+        routed_mean = routed.mean(dim=1)                  # (B,E)
+        temp_mean = h.mean(dim=1)                         # (B,E)
+
+        fusion_in = torch.stack([temp_mean, routed_mean, temp_mean + routed_mean], dim=1)  
+                                                                     # (B,3,E)
+        fused = self.fusion(fusion_in)                    # (B,E)
 
         if self.use_meta_learning:
-            context = self.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))  # [B, E]
-            strat_w = self.meta_selector(context)  # [B, H, S(=3)]
-            feats = torch.stack([temp_mean, routed_mean, fused.detach()], dim=1)  # [B, 3, E]
-            mixed_per_head = torch.einsum("bhs,bse->bhe", strat_w, feats)  # [B, H, E]
+            context = self.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))
+
+            strat_w = self.meta_selector(context)         # (B,H=4,S=3)
+            feats = torch.stack([temp_mean, routed_mean, fused.detach()], dim=1)     # (B,3,E)
+            mixed_per_head = torch.einsum("bhs,bse->bhe", strat_w, feats)  # (B,H,E)
             out = mixed_per_head.mean(dim=1)
         else:
             out = fused
 
-        return self.output_proj(out)  # [B, E]
-    
-    def ResetHebbianMemory(self):
+        return self.output_proj(out)
+
+    def ResetHebbianMemory(self) -> None:
         for blk in self.temporal_blocks:
             blk.attn.ResetHebbianMemory()
         self.fusion.ResetHebbianMemory()
-        if self.use_meta_learning and self.meta_selector is not None:
+        if self.use_meta_learning:
             self.meta_selector.ResetHebbianMemory()
 
