@@ -161,12 +161,12 @@ class MemoryExtractor(nn.Module):
         self,
         x: torch.Tensor,                            # Input features [B, inputDim]
         *,
-        tdError: Optional[torch.Tensor] = None,    # Temporal difference error [B]
+        tdError: Optional[torch.Tensor] = None,     # Temporal difference error [B]
         entropy:   Optional[torch.Tensor] = None,   # Policy entropy [B]
         reward:    Optional[torch.Tensor] = None,   # Immediate reward [B]
         uncertainty: Optional[torch.Tensor] = None, # Agent uncertainty [B]
         reset: bool = False,                        # All reset 
-        softReset: bool = False,                   # Soft(Part) reset 
+        softReset: bool = False,                    # Soft(Part) reset 
         ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         amp_enable = self.use_amp and x.is_cuda
