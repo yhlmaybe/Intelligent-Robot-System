@@ -6,6 +6,9 @@ from torch.utils.data import Dataset, DataLoader
 
 import PerceptionModule
 import AttentionModule
+import MemoryModule
+import DecisionModule
+import ValueEstimationModule
 
 
 class BrainDeepLearnModule(nn.Module):
@@ -15,6 +18,12 @@ class BrainDeepLearnModule(nn.Module):
         self.perception = PerceptionModule.PerceiveExtractor(imgSize=imgSize,useHebbian=useHebbian)
 
         self.attention = AttentionModule.AttentionExtractor()
+
+        self.memory = MemoryModule.MemoryExtractor()
+
+        self.decision = DecisionModule.DecisionExtractor()
+
+        self.value = ValueEstimationModule.ValueEstimationExtractor()
 
         #another module
 

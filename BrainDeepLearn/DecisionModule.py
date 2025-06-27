@@ -2,32 +2,27 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from typing import Dict, Tuple, Optional
 
 KEYBOARD_LAYOUT: Dict[str, Dict[str, int]] = {
     "base_keys": {
         "W": 17, "A": 30, "S": 31, "D": 32,
-        "Space": 57, "Shift": 42, "Ctrl": 29, "Esc": 1,
-    },
+        "Space": 57, "Shift": 42, "Ctrl": 29, "Esc": 1},
     "skill_keys": {
         "1": 2, "2": 3, "3": 4, "4": 5, "5": 6,
         "Q": 16, "E": 18, "R": 19, "F": 33,
         "F1": 59, "F2": 60, "F3": 61, "F4": 62,
         "Mouse4": 110, "Mouse5": 111,
-        "G": 34, "T": 20, "V": 47, "B": 48,
-    },
+        "G": 34, "T": 20, "V": 47, "B": 48},
     "menu_keys": {
         "Tab": 15, "I": 23, "M": 50, "J": 36, "K": 37,
         "L": 38, "U": 22, "O": 24, "P": 25,
         "F5": 63, "F6": 64,
-        "Insert": 110, "Delete": 111, "Home": 102, "End": 107,
-    },
+        "Insert": 110, "Delete": 111, "Home": 102, "End": 107},
     "system_keys": {
-        "Enter": 28, "Backspace": 14, "CapsLock": 58, "Win": 125, "Alt": 56,
-    },
-    "alpha_keys": {chr(i): i - 93 for i in range(97, 123)},  # a‑z
-}
-
+        "Enter": 28, "Backspace": 14, "CapsLock": 58, "Win": 125, "Alt": 56},
+    "alpha_keys": {chr(i): i - 93 for i in range(97, 123)}} # a‑z
 
 
 class HebbianPlasticityLayer(nn.Module):
@@ -39,7 +34,7 @@ class HebbianPlasticityLayer(nn.Module):
         self.hebb = nn.Parameter(torch.zeros(outDim, inDim), requires_grad=False)
 
     def forward(self, x: torch.Tensor, update: bool = True):
-        """x: [B, inDim]"""
+        #x: [B, inDim]
         weight = self.base + self.hebb
         out = F.linear(x, weight)  # [B, outDim]
 
@@ -49,8 +44,7 @@ class HebbianPlasticityLayer(nn.Module):
             # ΔW_b = η (postᵀ · pre − (post ⊙ post) ⊙ W)
             delta = self.rate * (
                 torch.einsum("bo,bi->oi", post, pre) / x.size(0)
-                - (post.pow(2).mean(0, keepdim=True).t() * self.hebb)
-            )
+                - (post.pow(2).mean(0, keepdim=True).t() * self.hebb))
             with torch.no_grad():
                 self.hebb.mul_(self.decay).add_(delta)
                 self.hebb.data = F.layer_norm(self.hebb.data, (self.hebb.size(1),))
@@ -58,29 +52,23 @@ class HebbianPlasticityLayer(nn.Module):
 
 
 class MetaLearnerBlock(nn.Module):
-    def __init__(self, featDim: int, contextDim: int = 128):
+    def __init__(self, featDim: int, contextDim: int = 128, maxLen: int = 16):
         super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=featDim,
-            hidden_size=contextDim,
-            num_layers=2,
-            batch_first=True,
-            bidirectional=True,
-        )
+        self.max_len = maxLen
+        self.rnn = nn.LSTM(featDim, contextDim, num_layers=2, batch_first=True, bidirectional=True)
         self.to_meta = nn.Sequential(
-            nn.Linear(2 * contextDim, 256), nn.GELU(), nn.Linear(256, 2 * featDim)
-        )
-
+            nn.Linear(2*contextDim, 2*featDim),
+            nn.GELU())
+        
     def forward(self, x: torch.Tensor, mem: Optional[torch.Tensor]):
-        """x: [B, F] ; mem: [B, T, F] or None"""
         if mem is None:
-            ctx = x.unsqueeze(1)
+            seq = x.unsqueeze(1)                                 # (B,1,F)
         else:
-            ctx = torch.cat([mem, x.unsqueeze(1)], dim=1)
-        out, _ = self.lstm(ctx)
-        last = out[:, -1]
-        meta = self.to_meta(last)  # [B, 2F]
-        return meta, ctx  
+            seq = torch.cat([mem, x.unsqueeze(1)], dim=1)        # append
+            seq = seq[:, -self.max_len:]                         # truncate
+        out, _ = self.rnn(seq)
+        meta = self.to_meta(out[:, -1])                          # last hidden
+        return meta, seq.detach()                                # return new memory (no grad)
 
 class TextInputDecoder(nn.Module):
     def __init__(self, inDim: int, hidden: int = 64, maxLen: int = 10):
@@ -92,7 +80,7 @@ class TextInputDecoder(nn.Module):
         self.to_char = nn.Linear(hidden, 128)
 
     def forward(self, feat: torch.Tensor, prev: Optional[torch.Tensor]):
-        """feat: [B, F]"""
+        #feat: [B, F]
         batch = feat.size(0)
         mode_prob = torch.sigmoid(self.mode_detector(feat)).squeeze(-1)  # [B]
         char_logits = None
@@ -145,51 +133,65 @@ class KeyboardActionModel(nn.Module):
         self.fc2 = nn.Linear(512, 256)
 
         self.base_heads = nn.ModuleList([
-            nn.Sequential(nn.Linear(256, 64), nn.ReLU(), nn.Linear(64, 1)) for _ in range(8)
-        ])
+            nn.Sequential(nn.Linear(256, 64), 
+                          nn.ReLU(), 
+                          nn.Linear(64, 1)) for _ in range(8)])
+        self.dynamic = DynamicKeySelector(256, numKeys=96, topK=4)
+        self.text    = TextInputDecoder(256)
 
-        self.dynamic = DynamicKeySelector(256, num_keys=96, top_k=4)
+        self.meta_blk = MetaLearnerBlock(256)
 
-        self.text = TextInputDecoder(256)
-
-    def forward(self, feat: torch.Tensor, memory: Optional[torch.Tensor], prevTxt: Optional[torch.Tensor]):
+    def forward(self,
+                feat: torch.Tensor,               # (B,256)
+                memory: Optional[torch.Tensor],   # (B,T,256) or None
+                prevTxt: Optional[torch.Tensor]):
         x = F.relu(self.fc1(feat))
         x = self.hebb(x)
         x = F.relu(self.fc2(x))
 
-        meta, new_mem = None, None  
+        meta_vec, new_mem = self.meta_blk(x, memory)     # (B,512) split as [Δfast, Δgate]
+        delta = torch.tanh(meta_vec[:, :256])            # residual additive term
+        gate  = torch.sigmoid(meta_vec[:, 256:])         # gating term
+        x = x + gate * delta
 
-        base_probs = [torch.sigmoid(h(x)) for h in self.base_heads]  # list[Tensor([B,1])]
+        base_probs = [torch.sigmoid(h(x)) for h in self.base_heads]  # 8 Bernoulli
+        base_H = torch.stack([
+            -(p * (p+1e-8).log() + (1-p) * (1-p+1e-8).log()).squeeze(1)
+            for p in base_probs], dim=1).mean(1)                     # (B)
+
         dyn_idx, dyn_p = self.dynamic(x)
+        dyn_H = -(dyn_p * (dyn_p+1e-8).log()).sum(1) / math.log(dyn_p.size(1)+1e-8)
+
         tm_prob, char_logits, next_txt = self.text(x, prevTxt)
+        text_H = -(tm_prob * (tm_prob+1e-8).log() + (1-tm_prob) * (1-tm_prob+1e-8).log())
+
+        entropy = (base_H + dyn_H + text_H) / 3.0
+
         return {
             "base_probs": base_probs,
-            "dyn_idx": dyn_idx,
-            "dyn_p": dyn_p,
-            "text_mode": tm_prob,
+            "dyn_idx":    dyn_idx,
+            "dyn_p":      dyn_p,
+            "text_mode":  tm_prob,
             "char_logits": char_logits,
-            "memory": new_mem,
-            "next_text": next_txt,
-        }
-
+            "next_text":  next_txt,
+            "memory":     new_mem,   # <-- feed back to outer loop
+            "entropy":    entropy}
+        
 
     @staticmethod
-    def SampleBinary(prob: torch.Tensor, det: bool):
+    def SampleBinary(prob: torch.Tensor, det=False):
         return (prob > 0.5).float() if det else torch.bernoulli(prob)
 
-    def ToKeyboardVector(self, out: Dict, det: bool = False) -> torch.Tensor:
+    def ToKeyboardVector(self, out: Dict, det: bool=False) -> torch.Tensor:
         vec = torch.zeros(104, device=out["base_probs"][0].device)
-        for i, p in enumerate(out["base_probs"]):
+        for i,p in enumerate(out["base_probs"]):
             act = self.SampleBinary(p.squeeze(), det)
-            key = list(KEYBOARD_LAYOUT["base_keys"].values())[i]
-            vec[key] = act
-        B_idx = out["dyn_idx"][0]
-        B_p = out["dyn_p"][0]
-        for j in range(B_idx.size(0)):
-            act = self.SampleBinary(B_p[j], det)
-            vec[B_idx[j] + 8] = act
-        if out["text_mode"][0] > 0.5:
-            vec[KEYBOARD_LAYOUT["system_keys"]["Enter"]] = 1.0
+            vec[list(KEYBOARD_LAYOUT["base_keys"].values())[i]] = act
+        idx, prob = out["dyn_idx"], out["dyn_p"]
+        for j in range(idx.size(1)):
+            vec[idx[:,j]+8] = self.SampleBinary(prob[:,j], det)
+        enter_code = KEYBOARD_LAYOUT["system_keys"]["Enter"]
+        vec[enter_code] = (out["text_mode"] > 0.5).float()
         return vec
 
 
@@ -218,35 +220,39 @@ class MouseActionModel(nn.Module):
         return {"delta": delta.tolist(), "clicks": [l.item(), r.item()]}
 
 
-class DecisionModule(nn.Module):
+class DecisionExtractor(nn.Module):
     def __init__(self, stateDim: int = 768):
         super().__init__()
-        self.feat_net = nn.Sequential(
-            nn.Linear(stateDim, 512), nn.ReLU(), nn.Linear(512, 512), nn.ReLU()
-        )
-        self.hebb_meta = nn.Sequential(HebbianPlasticityLayer(512, 512), nn.ReLU(), nn.Linear(512, 256))
-        # Actor sub‑heads
+
+        self.feature_net = nn.Sequential(
+            nn.Linear(stateDim, 512), nn.ReLU(),
+            nn.Linear(512, 512), nn.ReLU())
+        
+        self.hebb_meta  = nn.Sequential(
+            HebbianPlasticityLayer(512,512), 
+            nn.ReLU(), 
+            nn.Linear(512,256))
+
         self.kb = KeyboardActionModel(256)
         self.mouse = MouseActionModel(256)
-        # Critic
-        self.value_head = nn.Linear(256, 1)
-        # Memory cache
-        self.memory = None
-        self.prev_text = None
 
-    def GetValue(self, state: torch.Tensor):
-        f = self.feat_net(state)
-        f = self.hebb_meta(f)
-        return self.value_head(f).squeeze(-1)
+        self.kb_memory: Optional[torch.Tensor] = None
+        self.prev_text: Optional[torch.Tensor] = None
 
-    def forward(self, state: torch.Tensor):
-        feat = self.feat_net(state)
+    def forward(self, state_feat: torch.Tensor):
+        feat = self.feature_net(state_feat)
         feat = self.hebb_meta(feat)
-        kb_out = self.kb(feat, self.memory, self.prev_text)
-        self.memory = kb_out["memory"]
+
+        kb_out = self.kb(feat, self.kb_memory, self.prev_text)
+        self.kb_memory = kb_out["memory"]
         self.prev_text = kb_out["next_text"]
+
         mouse_out = self.mouse(feat)
-        return {"keyboard": kb_out, "mouse": mouse_out, "value": self.value_head(feat).squeeze(-1)}
+
+        mouse_entropy = -((mouse_out[1] * (mouse_out[1]+1e-8).log() + (1-mouse_out[1])*(1-mouse_out[1]+1e-8).log()).sum(1)/2)
+        entropy = (kb_out["entropy"] + mouse_entropy) / 2
+
+        return {"keyboard": kb_out, "mouse":     mouse_out, "entropy":   entropy}
 
     def Act(self, state: torch.Tensor, det: bool = False):
         with torch.no_grad():
@@ -267,61 +273,3 @@ class DecisionModule(nn.Module):
         if (vec > 0.5).sum() > 6:
             active = torch.where(vec > 0.5)[0]
             vec[active[6:]] = 0
-
-
-class HybridPolicyTrainer:
-    def __init__(self, model: DecisionModule, lr: float = 1e-4, inner_lr: float = 1e-2, gamma: float = 0.99):
-        self.model = model
-        self.gamma = gamma
-        self.opt = torch.optim.AdamW(model.parameters(), lr=lr)
-        self.inner_lr = inner_lr
-
-    def Value(self, s):
-        return self.model.GetValue(s)
-    
-
-    def ComputeLoss(self, batch: Dict, weights: Optional[Dict[str, torch.Tensor]] = None):
-        states = batch["state"]
-        actions = batch["action"]
-        rewards = batch["reward"]
-        next_s = batch["next_state"]
-        dones = batch["done"]
-
-        if weights is not None:
-            out = self.FwdWithWeights(states, weights)
-            val = self.ValueWithWeights(states, weights)
-            next_val = self.ValueWithWeights(next_s, weights)
-        else:
-            out = self.model(states)
-            val = out["value"]
-            next_val = self.model.GetValue(next_s)
-
-        logp = self.LogProb(actions, out)
-        adv = rewards + self.gamma * next_val * (1 - dones) - val
-        policy_loss = -(logp * adv.detach()).mean()
-        value_loss = F.mse_loss(val, rewards + self.gamma * next_val * (1 - dones))
-        return policy_loss + 0.5 * value_loss
-
-    def LogProb(self, acts: Dict, out: Dict):
-        logp = 0.0
-        kb_out = out["keyboard"]
-        for i, prob in enumerate(kb_out["base_probs"]):
-            key_code = list(KEYBOARD_LAYOUT["base_keys"].values())[i]
-            a = acts["keys"][:, key_code]
-            p = prob.squeeze(1)
-            logp = logp + a * torch.log(p + 1e-7) + (1 - a) * torch.log(1 - p + 1e-7)
-        return logp.mean()
-
-    def FwdWithWeights(self, s, w):
-        orig = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
-        self.model.load_state_dict(w, strict=False)
-        out = self.model(s)
-        self.model.load_state_dict(orig, strict=False)
-        return out
-
-    def ValueWithWeights(self, s, w):
-        orig = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
-        self.model.load_state_dict(w, strict=False)
-        v = self.model.GetValue(s)
-        self.model.load_state_dict(orig, strict=False)
-        return v

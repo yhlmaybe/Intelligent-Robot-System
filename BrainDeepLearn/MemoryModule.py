@@ -70,8 +70,8 @@ class MemoryExtractor(nn.Module):
         useAmp: bool = True,              # Whether to use automatic mixed precision
         svdInterval: int = 10,            # Steps between SVD normalizations
         svdMin: float = 0.1,              # Minimum value for singular value clipping
-        svdMax: float = 1.5               # Maximum value for singular value clipping
-    ) -> None:
+        svdMax: float = 1.5) -> None:               # Maximum value for singular value clipping
+
         super().__init__()
         self.ssm_state_dim = ssmStateDim
         self.memory_dim = memoryDim
