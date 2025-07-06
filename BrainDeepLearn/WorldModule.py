@@ -74,6 +74,22 @@ class WorldModelExtractor(nn.Module):
             nn.Linear(deterDim + latentDim, stateDim),
             nn.LayerNorm(stateDim))
 
+        self.dec_fc1 = nn.Linear(256, 4096)
+        self.dec_fc2 = nn.Linear(4096, 12*56*56) 
+        
+        self.pixel_shuffle = nn.PixelShuffle(2)  
+        
+        self.refine_conv = nn.Sequential(
+            nn.Conv2d(3, 16, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 3, 3, padding=1))
+        
+        nn.init.kaiming_normal_(self.dec_fc1.weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.dec_fc2.weight, nonlinearity='linear')
+        nn.init.kaiming_normal_(self.refine_conv[0].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.refine_conv[2].weight, nonlinearity='linear')
+
+
         self.InitWeights()
         self.ResetHidden()
 
@@ -153,6 +169,24 @@ class WorldModelExtractor(nn.Module):
         self._h = self._h.detach()
         self._z_prev = self._z_prev.detach()
 
+    def DecodeState(self, z: torch.Tensor) -> torch.Tensor:
+         B = z.size(0)
+        
+         x = F.relu(self.dec_fc1(z))
+         x = self.dec_fc2(x)
+         x = x.view(B, 12, 56, 56)  
+         
+         x = self.pixel_shuffle(x)   # [B, 3, 112, 112]
+         
+         low_freq = F.interpolate(z.view(B, 1, 16, 16), size=112, mode="bilinear")
+         x = x + low_freq.repeat(1, 3, 1, 1) * 0.2
+         
+         x = F.interpolate(x, size=224, mode="bilinear", align_corners=False)
+        
+         x = self.refine_conv(x)
+        
+         return torch.sigmoid(x)
+
     @torch.no_grad()
     def ImagineStep(
         self, 
@@ -192,3 +226,51 @@ class WorldModelExtractor(nn.Module):
         self._h, self._z_prev = orig_h, orig_z
         
         return torch.stack(states, dim=1)
+    
+
+class WorldModelSeqRNN(WorldModelExtractor):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.obs_gru: nn.GRU = nn.GRU(input_size=self.latent_dim,hidden_size=self.latent_dim,batch_first=True)
+
+    def EncodeSeq(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, D = x.shape  
+        x_flat = x.reshape(B * S, D)
+        lat_flat = self.obs_enc(x_flat)
+        lat = lat_flat.view(B, S, self.latent_dim)
+        _, hT = self.obs_gru(lat)
+        return hT.squeeze(0)
+
+    def forward(self,visionSeq: torch.Tensor,actionPrev: torch.Tensor,reset: bool = False) -> torch.Tensor:
+
+        
+        B = visionSeq.size(0)  
+        dev = visionSeq.device  
+        
+        if reset or self._h is None or self._h.size(0) != B:
+            self.ResetHidden(B, dev)  
+        
+        h_prev = self._h.clone()
+        
+        e_t = self.EncodeSeq(visionSeq)
+        
+        a_t = self.act_enc(actionPrev)
+        
+        gru_input = torch.cat([self._z_prev, a_t], dim=-1)
+        self._h = self.gru(gru_input, self._h)
+        
+        post_in = torch.cat([self._h, e_t, h_prev], dim=-1)
+        
+        post_out = self.post_net(post_in)
+        mu, loga = post_out.chunk(2, dim=-1)
+        
+        a = F.softplus(loga) + 1e-4
+        
+        z = mu + torch.randn_like(a) * a
+        
+        state_input = torch.cat([self._h, z], dim=-1)
+        state = self.state_proj(state_input)
+        
+        self._z_prev = z.detach()
+        
+        return state

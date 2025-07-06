@@ -9,16 +9,11 @@ import torch.utils.checkpoint
 
 class MultiHeadAttention(nn.Module):
     """
-    embedDim : int
-        Token embedding dimension E.
-    numHeads : int
-        Number of attention heads H.
-    hebbianRate : float, optional
-        Base Hebbian learning-rate α₀. (default 0.01)
-    attnDropout : float, optional
-        Drop probability applied to attention weights. (default 0.1)
-    tdScale : float, optional
-        Scale factor dividing TD-error before tanh. (default 5.0)
+    embedDim : Token embedding dimension E.
+    numHeads : Number of attention heads H.
+    hebbianRate : Base Hebbian learning-rate α₀. (default 0.01)
+    attnDropout : Drop probability applied to attention weights. (default 0.1)
+    tdScale : Scale factor dividing TD-error before tanh. (default 5.0)
     """
     def __init__(self, embedDim: int, numHeads: int, hebbianRate: float = 0.01, 
                  attnDropout: float = 0.1, tdScale: float = 5.0, lowRank: bool = True, 
@@ -154,8 +149,8 @@ class MultiHeadAttention(nn.Module):
         key: torch.Tensor,                                # (B, Sk, E)
         value: torch.Tensor,                              # (B, Sk, E)
         keyPaddingMask: Optional[torch.Tensor] = None,    # (B, Sk)
-        tdError: Optional[torch.Tensor] = None,           # (B,) or scalar
-    ) -> torch.Tensor:
+        tdError: Optional[torch.Tensor] = None,) -> torch.Tensor:           # (B,) or scalar
+
         B, Sq, _ = query.shape
         Sk: int = key.shape[1]
 
@@ -242,7 +237,7 @@ class DynamicRouting(nn.Module):
         self,
         x: torch.Tensor,                              # (B,I,D)
         mask: Optional[torch.Tensor] = None,          # (B,I) bool
-    ) -> torch.Tensor:                                # (B,O,out_dim)
+        ) -> torch.Tensor:                                # (B,O,out_dim)
         
         B, I, D = x.shape
         assert I == self.I and D == self.in_dim, "AttentionModule capsule input dim mismatch"
@@ -298,8 +293,7 @@ class HebbianFusion(nn.Module):
             nn.Linear(embedDim, embedDim * 2),
             nn.GELU(),
             nn.Linear(embedDim * 2, numModes),
-            nn.Softmax(dim=-1),
-        )
+            nn.Softmax(dim=-1),)
 
     def ResetParameters(self):
         eye = torch.eye(self.embed_dim, device=self.weights.device).unsqueeze(0).repeat(self.num_modes, 1, 1)
@@ -438,13 +432,13 @@ class AttentionExtractor(nn.Module):
         h = x
         
         # Use detached version of tdError for checkpointing
-        td_error_detached = tdError.detach() if tdError is not None else None
+        #td_error_detached = tdError.detach() if tdError is not None else None
 
         for blk in self.temporal_blocks:
             if self.use_check_point and self.training:
-                h = torch.utils.checkpoint.checkpoint(blk, h, keyPaddingMask, td_error_detached)
+                h = torch.utils.checkpoint.checkpoint(blk, h, keyPaddingMask, tdError)
             else:
-                h = blk(h, keyPaddingMask, td_error_detached)
+                h = blk(h, keyPaddingMask, tdError)
 
         # Create capsule mask
         caps_mask: Optional[torch.Tensor] = None

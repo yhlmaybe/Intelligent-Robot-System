@@ -8,7 +8,7 @@ import torch.nn.functional as F
 class CriticForward(NamedTuple):
     value:       torch.Tensor            # [B]
     tdError:     Optional[torch.Tensor]  # [B] or None
-    advantage:   Optional[torch.Tensor]  # [B] or None (detach)
+    tdErrorDe:   Optional[torch.Tensor]  # [B] or None (detach)
     entropy:     Optional[torch.Tensor]  # Actor‑side entropy, for logging
     uncertainty: Optional[torch.Tensor]  # σ_V (if head enabled)
 
@@ -68,9 +68,9 @@ class ValueEstimationExtractor(nn.Module):
         if self.uncert_head is not None:
             uncert = F.softplus(self.uncert_head(x).squeeze(-1))
 
-        td_error, advantage = self.TdAdvantage(value, reward, nextValue, done)
+        td_error, td_error_de = self.TdAdvantage(value, reward, nextValue, done)
 
-        return CriticForward(value=value,tdError=td_error,advantage=advantage,entropy=policyEntropy,uncertainty=uncert)
+        return CriticForward(value=value,tdError=td_error,tdErrorDe=td_error_de,entropy=policyEntropy,uncertainty=uncert)
 
     def ValueLoss(self, vPred: torch.Tensor, target: torch.Tensor, *, clipDelta: Optional[float] = None) -> torch.Tensor:
         if self.value_loss_type == "huber":
@@ -89,7 +89,7 @@ class ValueEstimationExtractor(nn.Module):
                     reward: Optional[torch.Tensor],
                     nextValue: Optional[torch.Tensor],
                     done: Optional[torch.Tensor]) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        #Computes δ and detached advantage; returns (None,None) if reward None
+        #Computes tdError and detached tdError; returns (None,None) if reward None
         if reward is None:
             return None, None
         device = value.device
