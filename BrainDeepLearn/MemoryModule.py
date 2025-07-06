@@ -487,3 +487,50 @@ class MemoryExtractor(nn.Module):
         
         if self.meta_ctrl:
             self.meta_ctrl.Reset()
+
+    @torch.no_grad()
+    def GetState(self) -> dict:
+        """Return a shallow copy of all mutable tensors needed to restore the module."""
+        return {
+            "h_state": self.h_state.clone(),
+            "fast_weights": self.fast_weights.clone(),
+            "memory_keys": self.memory_keys.clone(),
+            "memory_values": self.memory_values.clone(),
+            "memory_importance": self.memory_importance.clone(),
+            "memory_corr": self.memory_corr.clone(),
+            "memory_steps": self.memory_steps.clone(),
+            "mem_ptr": torch.tensor(self.mem_ptr),
+            "time_step": torch.tensor(self.time_step),
+            "memory_filled": torch.tensor(self.memory_filled),
+            "meta_ctrl": self.meta_ctrl.h_state.clone() if self.meta_ctrl else None,}
+
+    @torch.no_grad()
+    def SetState(self, state: dict):
+        """Load a state produced by `get_state`."""
+        self.h_state.copy_(state["h_state"])
+        self.fast_weights.copy_(state["fast_weights"])
+        self.memory_keys.copy_(state["memory_keys"])
+        self.memory_values.copy_(state["memory_values"])
+        self.memory_importance.copy_(state["memory_importance"])
+        self.memory_corr.copy_(state["memory_corr"])
+        self.memory_steps.copy_(state["memory_steps"])
+        self.mem_ptr       = int(state["mem_ptr"].item())
+        self.time_step     = int(state["time_step"].item())
+        self.memory_filled = int(state["memory_filled"].item())
+        if self.meta_ctrl and state["meta_ctrl"] is not None:
+            self.meta_ctrl.h_state.copy_(state["meta_ctrl"])
+
+    def Step(self, x: torch.Tensor, state: Optional[dict] = None, tdError=None, entropy=None, reward=None, uncertainty=None):
+
+        if state is not None:
+            orig = self.get_state()             
+            self.set_state(state)               
+
+        out, _ = self.forward(x,tdError=tdError,entropy=entropy,reward=reward,uncertainty=uncertainty,reset=False,softReset=False,)
+
+        new_state = self.get_state() if state is not None else None
+
+        if state is not None:
+            self.set_state(orig)           
+
+        return out, new_state

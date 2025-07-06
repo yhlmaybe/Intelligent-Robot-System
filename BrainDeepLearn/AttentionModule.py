@@ -379,10 +379,10 @@ class AttentionExtractor(nn.Module):
         super().__init__()
         assert embedDim % 16 == 0, "AttentionModule embed_dim must be divisible by 16 (for 16 capsules)"
 
-        self.E = embedDim
         self.use_meta_learning = useMetaLearning
         self.gradient_clip_val = gradientClipVal
         self.use_check_point = checkPoint
+        self.output_dim = embedDim
 
         self.temporal_blocks: nn.ModuleList = nn.ModuleList([
             TemporalAttention(embedDim, numHeads, idx)
