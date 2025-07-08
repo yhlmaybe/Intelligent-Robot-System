@@ -46,48 +46,71 @@ class BrainCore(nn.Module):
         self.act_enc= ActionEncoder()
         self.ResetBuffers()
 
-    def ResetBuffers(self, B:int=1, device="cpu"):
-        z=lambda *s: torch.zeros(B,*s,device=device)
-        self.prev_mem=z(768); self.prev_attn=z(512); self.prev_state=z(256)
-        self.prev_act=z(128); self.prev_rew=z(());  self.prev_done=z(())
-        self.prev_ent=z(()); self.prev_unc=z(())
-        self.perc_buf=z(self.SEQ_LEN,512); self.ptr=0; self.have_prev=False
+    def ResetBuffers(self, B: int = 1, device: Optional[torch.device] = None):
+        device = device or next(self.parameters()).device         
+        z = lambda *s, dtype=torch.float32: torch.zeros(B, *s, device=device, dtype=dtype)
 
-    def Write(self, feat):
-        if feat.size(0)!=self.perc_buf.size(0):
-            self.perc_buf=torch.zeros(feat.size(0),self.SEQ_LEN,512,
-                                      device=feat.device); self.ptr=0
-        self.perc_buf[:,self.ptr]=feat; self.ptr=(self.ptr+1)%self.SEQ_LEN
+        self.prev_mem = z(768) 
+        self.prev_attn = z(512)        
+        self.prev_state = z(256)    
+        self.prev_act = z(128)        
+
+        self.prev_rew = z(1)       
+        self.prev_done = z(1)
+        self.prev_ent = z(1)
+        self.prev_unc = z(1)
+
+        self.perc_buf = z(self.SEQ_LEN, 512) 
+        self.ptr = 0
+        self.have_prev = False
+
+    def Write(self, feat: torch.Tensor):
+        if feat.size(0) != self.perc_buf.size(0):
+            self.perc_buf = self.perc_buf.new_zeros(feat.size(0), self.SEQ_LEN, 512)
+            self.ptr = 0
+            
+        self.perc_buf[:, self.ptr] = feat
+        self.ptr = (self.ptr + 1) % self.SEQ_LEN
 
     def Seq(self):
         idx=[(self.ptr+i)%self.SEQ_LEN for i in range(self.SEQ_LEN)]
         return self.perc_buf[:,idx]  # [B,S,512]
 
     def Step(self, frame, reward, done):
-        B,dev=frame.size(0),frame.device
-        if not self.have_prev or self.prev_mem.size(0)!=B:
-            self.ResetBuffers(B,dev)
+        B, dev = frame.size(0), frame.device
+        if not self.have_prev or self.prev_mem.size(0) != B:
+            self.ResetBuffers(B, dev)
 
-        feat_p=self.perc(frame)             # [B,512]
-        self.Write(feat_p); seq=self.Seq()  # [B,S,512]
+        feat_p = self.perc(frame) # [B, 512]
+        self.Write(feat_p)
+        seq = self.Seq()
 
-        state=self.world(seq.detach(), self.prev_act.detach())
+        state = self.world(seq.detach(), self.prev_act.detach())
 
         if self.have_prev:
-            cf = self.critic(self.prev_mem, 
-                             self.prev_attn, 
-                             self.prev_state,
-                             reward=self.prev_rew,
-                             nextValue=None, done=self.prev_done,
-                             policyEntropy=self.prev_ent)
+            cf = self.critic(
+                self.prev_mem,
+                self.prev_attn,
+                self.prev_state,
+                reward=self.prev_rew,
+                nextValue=None,
+                done=self.prev_done,
+                policyEntropy=self.prev_ent)
+            
             td_prev = cf.tdErrorDe
             ent_prev = cf.entropy
             unc_prev = cf.uncertainty
-        else:
-            td_prev=ent_prev=unc_prev=None
+        else:                             
+            td_prev = ent_prev = unc_prev = torch.zeros(
+                B, 1, device=dev)
 
         feat_a = self.attn(seq, tdError=td_prev)
-        feat_m,_ = self.mem(feat_a, tdError = td_prev, entropy = ent_prev, reward = self.prev_rew, uncertainty = unc_prev)
+        feat_m, _ = self.mem(
+            feat_a,
+            tdError=td_prev,
+            entropy=ent_prev,
+            reward=self.prev_rew,
+            uncertainty=unc_prev,)
 
         out = self.actor(feat_m)
 
@@ -163,92 +186,107 @@ class Agent:
         img = F.interpolate(img.unsqueeze(0), (outHw, outHw), mode='bilinear', align_corners=False).squeeze(0)
         return img   # 3×224×224
 
-    def Prep(self, imgs_np: List[np.ndarray], device: torch.device) -> torch.Tensor:
-        return torch.stack([self.PreprocessRgb(i) for i in imgs_np]).to(device)
+    def Prep(self, imgs_np: Union[np.ndarray, List[np.ndarray]],device: Optional[torch.device] = None) -> torch.Tensor:
+        if isinstance(imgs_np, np.ndarray):
+            imgs_np = [imgs_np]
+        tensor = torch.stack([self.PreprocessRgb(i) for i in imgs_np])
+        return tensor.to(device or self.device)
 
-    def Act(self, frame_np, reward=0., done=False):
-        fr=self.Prep(frame_np).to(self.device)
-        out,s,v=self.brain.Step(fr,
-                 torch.tensor([reward],device=self.device),
-                 torch.tensor([done],  device=self.device))
-        kb=self.brain.actor.kb.ToKeyboardVector(out["keyboard"],False).cpu().numpy()[0]
-        mouse=out["mouse"].squeeze(0).cpu().numpy()
+    def Act(self, frame_np, reward: float = 0.0, done: bool = False):
+        fr = self.Prep(frame_np)                   
+        out, s, v = self.brain.Step(fr,torch.tensor([reward], device=self.device),torch.tensor([done],   device=self.device))
+
+        kb = self.brain.actor.kb.ToKeyboardVector(out["keyboard"], False).cpu().numpy()[0].astype(np.float32)  
+
+        mouse = out["mouse"].squeeze(0).cpu().numpy().astype(np.float32)
+
         self.buf.push(fr.squeeze(0).cpu(), kb.copy(), mouse.copy(),reward, done, s.cpu(), v.cpu())
+
         return kb, mouse, out["entropy"].item()
     
 
 
     @staticmethod
-    def Lam(v, y=0.99, λ=0.95):
-        B,T=v.shape; ret=torch.zeros_like(v); fut=torch.zeros(B,device=v.device)
+    def Lam(rw: torch.Tensor, v: torch.Tensor, y: float = 0.99, lmbda: float = 0.95):
+        """
+        rw, v: [B, T]  —— r_t  &  V_t
+        return: [B, T] —— GAE/λ-return
+        """
+        B, T = v.shape
+        ret = torch.zeros_like(v)
+        fut = torch.zeros(B, device=v.device)
+
         for t in reversed(range(T)):
-            fut = v[:,t] + y*λ*fut
-            ret[:,t]=fut
+            fut = rw[:, t] + v[:, t] + y * lmbda * fut
+            ret[:, t] = fut
+
         return ret
 
     def Update(self, batch: int = 64):
-
         if len(self.buf) < batch or not self.online_imagine:
             return
 
         fr, kb, ms, rw, dn, st, _ = map(list, zip(*self.buf.Sample(batch)))
 
-        fr = torch.stack(fr).to(self.device) # [B, 3, 224, 224]
-        kb = torch.from_numpy(np.stack(kb)).float().to(self.device) # [B, 104]
-        ms = torch.from_numpy(np.stack(ms)).float().to(self.device) # [B, 2]
-        st = torch.stack(st).to(self.device) # [B, state_dim]
-        rw = torch.tensor(rw, device=self.device).unsqueeze(1) # [B, 1]
-        dn = torch.tensor(dn, device=self.device).unsqueeze(1).float() # [B, 1]
+        fr = torch.stack(fr).to(self.device)
+        kb = torch.from_numpy(np.stack(kb)).float().to(self.device)
+        ms = torch.from_numpy(np.stack(ms)).float().to(self.device)
+        st = torch.stack(st).to(self.device)
+        rw = torch.tensor(rw, device=self.device).unsqueeze(1).float()
+        dn = torch.tensor(dn, device=self.device).unsqueeze(1).float()
 
+        with torch.no_grad():                  
+            s_enc = self.brain.perc(fr)
+        act_emb = self.brain.act_enc(kb, ms)
 
-        act_emb = self.brain.act_enc(kb, ms) # [B, emb_dim]
-        pred_s, pred_r, pred_d = self.brain.world.forward_train(
-            fr, act_emb, return_predictions=True)
-
-        w_loss = (F.mse_loss(pred_s, st) +F.mse_loss(pred_r, rw) + 0.1 * F.binary_cross_entropy_with_logits(pred_d, dn))
+        pred_s, pred_r, pred_d = self.brain.world.ForwardTrain(s_enc.detach(), act_emb, return_predictions=True)
+        
+        w_loss = (F.mse_loss(pred_s, st) + F.mse_loss(pred_r, rw) + 0.1 * F.binary_cross_entropy_with_logits(pred_d, dn))
+        
         self.opt_w.zero_grad()
         w_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.brain.world.parameters(), 1.0)
         self.opt_w.step()
 
-
         with torch.no_grad():
-            feat_p = self.brain.perc(fr)# [B, 512]
-            seq = feat_p.unsqueeze(1).repeat(1, self.brain.SEQ_LEN, 1)
-            feat_a = self.brain.attn(seq)[:, -1] 
-            feat_m, _ = self.brain.mem(feat_a) # [B, 768]
+            feat_a = self.brain.attn(s_enc.unsqueeze(1).repeat(1, self.brain.SEQ_LEN, 1))[:, -1]
+            
+            feat_m, _ = self.brain.mem(feat_a)
 
-            _, im_v = self.brain.Imagine(
-                feat_m0 = feat_m,
-                state0 = st,
-                horizon = self.horizon) # [B, H]
+            _, im_v = self.brain.Imagine(featM0=feat_m, state0=st, horizon=self.horizon)
+            
+        target = self.Lam(rw.repeat(1, self.horizon), im_v)[:, 0] # [B]
 
-        target = self.Lam(im_v)[:, 0] # [B]
-
-
-        pred, _, _ = self.brain.critic(st, st, st) # pred → [B]
+        pred, _, _ = self.brain.critic(st, st, st) # [B,1]
         c_loss = F.mse_loss(pred.squeeze(), target.detach())
 
         self.opt_c.zero_grad()
         c_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.brain.critic.parameters(), 1.0)
         self.opt_c.step()
 
-
-        feat_m_detached = feat_m.detach()                   
+        feat_m_detached = feat_m.detach()
         out_pol = self.brain.actor(feat_m_detached)
         logits = out_pol["logits_kb"] # [B, 8]
 
         dist = torch.distributions.Bernoulli(logits=logits)
-        logp = dist.log_prob(kb[:, :8]).sum(dim=1)                      
-        entropy = dist.entropy().sum(dim=1)                               
+        logp = dist.log_prob(kb[:, :8]).sum(dim=1)
+        entropy = dist.entropy().sum(dim=1)
 
-        adv = (target - pred.detach().squeeze())                     
+        adv = (target - pred.detach().squeeze())
         a_loss = -(logp * adv).mean() - 0.01 * entropy.mean()
 
         self.opt_a.zero_grad()
         a_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(self.brain.perc.parameters()) +
+            list(self.brain.attn.parameters()) +
+            list(self.brain.mem.parameters()) +
+            list(self.brain.actor.parameters()), 1.0)
         self.opt_a.step()
 
-        return {"w": w_loss.item(),"c": c_loss.item(),"a": a_loss.item()}
+        return {"w": w_loss.item(),"c": c_loss.item(),"a": a_loss.item(),
+    }
 
 
 class OfflineGameDataset(Dataset):
@@ -271,6 +309,7 @@ class OfflineGameDataset(Dataset):
 class ManagerFunction():
     def __init__(self, device: Optional[str] = None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.original_lr: Optional[float] = None
 
     def Train(self, root: str, epochs: int = 5, batchSize: int = 32, val_split: float = 0.1, imagine_horizon: int = 5) -> None:
         """
@@ -308,21 +347,23 @@ class ManagerFunction():
                 
                 brain.have_prev = False
                 
-                pred_k, pred_m, states = [], [], []
+                pred_k, pred_m, states, values = [], [], [], []
                 for i in range(imgs.size(0)):
                     frame = imgs[i].unsqueeze(0)
                     out, state, value = brain.Step(
                         frame, 
                         torch.zeros(1, device=self.device), 
-                        torch.zeros(1, device=self.device)
-                    )
+                        torch.zeros(1, device=self.device))
+                    
                     pred_k.append(brain.actor.kb.ToKeyboardVector(out["keyboard"], False))
                     pred_m.append(out["mouse"].squeeze(0))
                     states.append(state.squeeze(0))
+                    values.append(value.squeeze(0))
                 
                 pred_k = torch.stack(pred_k)
                 pred_m = torch.stack(pred_m)
                 states = torch.stack(states)
+                values = torch.stack(values)
                 
                 bc_loss = bce(pred_k, keys) + 0.05 * mse(pred_m, mouse)
                 
@@ -339,7 +380,7 @@ class ManagerFunction():
                         0.0,  # reward
                         False, # done
                         states[i].detach().cpu(), 
-                        value[i].detach().cpu() if value.dim() > 0 else value.detach().cpu())
+                        values[i].detach().cpu())
                 
                 agent.Update(batch=batchSize)
                 
@@ -439,6 +480,10 @@ class ManagerFunction():
                                 g["lr"] = self.original_lr * safety_lr
                             
                             agent.Update(batch=32)
+
+                            for g in agent.opt_a.param_groups:
+                                g["lr"] = self.original_lr     
+
                             last_update = current_time
                             print(f"• 在线更新 | 学习率: {self.original_lr * safety_lr:.6f}")
                     

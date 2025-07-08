@@ -89,6 +89,11 @@ class WorldModelExtractor(nn.Module):
         nn.init.kaiming_normal_(self.refine_conv[0].weight, nonlinearity='relu')
         nn.init.kaiming_normal_(self.refine_conv[2].weight, nonlinearity='linear')
 
+        self.rew_head  = nn.Linear(stateDim, 1)   # Prediction r_t
+        self.done_head = nn.Linear(stateDim, 1)   # Prediction d_t (logits)
+
+        nn.init.zeros_(self.rew_head.bias)
+        nn.init.zeros_(self.done_head.bias)
 
         self.InitWeights()
         self.ResetHidden()
@@ -138,6 +143,19 @@ class WorldModelExtractor(nn.Module):
                         nn.init.zeros_(param)
                 if hasattr(m, "bias_hh"):
                     m.bias_hh.data[m.hidden_size:2*m.hidden_size].fill_(-1.0)
+
+    def ForwardTrain(self,visionIn: torch.Tensor, 
+                     actionPrev: torch.Tensor, 
+                     return_predictions: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        state_feat = self.forward(visionIn, actionPrev, reset=False)
+        pred_r = self.rew_head(state_feat)  # [B, 1]
+        pred_d = self.done_head(state_feat)  # [B, 1]  logits
+
+        if return_predictions:
+            return state_feat, pred_r, pred_d
+        else:
+            return state_feat, pred_r, pred_d
 
     @staticmethod
     def PackAction(
