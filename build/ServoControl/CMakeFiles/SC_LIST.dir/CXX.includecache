@@ -26,26 +26,6 @@ map
 ../include/IRSFunction.h
 /home/yhl/Documents/Intelligent-Robot-System/include/IRSFunction.h
 
-/home/yhl/Documents/Intelligent-Robot-System/ServoControl/ServoID.h
-
-/home/yhl/Documents/Intelligent-Robot-System/ServoControl/ServoManager.cpp
-ServoManager.h
-/home/yhl/Documents/Intelligent-Robot-System/ServoControl/ServoManager.h
-
-/home/yhl/Documents/Intelligent-Robot-System/ServoControl/ServoManager.h
-tinyxml2.h
--
-pugixml.hpp
--
-SCDrive.h
-/home/yhl/Documents/Intelligent-Robot-System/ServoControl/SCDrive.h
-ServoID.h
-/home/yhl/Documents/Intelligent-Robot-System/ServoControl/ServoID.h
-../include/IRSFunction.h
-/home/yhl/Documents/Intelligent-Robot-System/include/IRSFunction.h
-../include/IRSParametersData.h
-/home/yhl/Documents/Intelligent-Robot-System/include/IRSParametersData.h
-
 /home/yhl/Documents/Intelligent-Robot-System/include/IRSFunction.h
 string
 -
@@ -71,10 +51,6 @@ tuple
 -
 MsgManager.h
 /home/yhl/Documents/Intelligent-Robot-System/include/MsgManager.h
-
-/home/yhl/Documents/Intelligent-Robot-System/include/IRSParametersData.h
-string
--
 
 /home/yhl/Documents/Intelligent-Robot-System/include/MsgManager.h
 string

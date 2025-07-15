@@ -123,8 +123,11 @@ void MainWindow::Initiate()
     if (!is_initial)
     {
         Py_Initialize();
+        PyEval_InitThreads();
+
         PyRun_SimpleString("import sys");
         PyRun_SimpleString("sys.path.append('./ServoControl')");
+        PyRun_SimpleString("sys.path.append('./BrainDeepLearn')");
     }
     is_initial = true;
 }

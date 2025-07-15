@@ -20,12 +20,16 @@ import pathlib, imageio.v3 as iio
 import time
 import torch.utils
 import torch.utils.data
+import threading
+import math
 
 
 class BrainCore(nn.Module):
     SEQ_LEN = 16
     def __init__(self, plastic_hebbian: bool = True, plastic_meta: bool = True):
         super().__init__()
+
+        self.perc_seq = None
 
         base = PerceiveExtractor(useHebbian=plastic_hebbian)
         self.perc = (PerceiveExtractorMetaWrapper(base) if plastic_meta else base)
@@ -64,17 +68,24 @@ class BrainCore(nn.Module):
         self.ptr = 0
         self.have_prev = False
 
-    def Write(self, feat: torch.Tensor):
-        if feat.size(0) != self.perc_buf.size(0):
-            self.perc_buf = self.perc_buf.new_zeros(feat.size(0), self.SEQ_LEN, 512)
-            self.ptr = 0
-            
-        self.perc_buf[:, self.ptr] = feat
-        self.ptr = (self.ptr + 1) % self.SEQ_LEN
+    def Write(self, feats: torch.Tensor):
+        self.perc_seq = feats  
 
-    def Seq(self):
-        idx=[(self.ptr+i)%self.SEQ_LEN for i in range(self.SEQ_LEN)]
-        return self.perc_buf[:,idx]  # [B,S,512]
+    def Seq(self, seq_len: int) -> torch.Tensor:
+        N, D = self.perc_seq.shape
+        num_chunks = math.ceil(N / seq_len) 
+        chunks = []
+        
+        for i in range(num_chunks):
+            start = i * seq_len
+            if start + seq_len <= N:
+                block = self.perc_seq[start : start + seq_len]
+            else:
+                block = self.perc_seq[max(N - seq_len, 0) : N]
+            chunks.append(block)
+        
+        return torch.stack(chunks, dim=0)  
+    
 
     def Step(self, frame, reward, done):
         B, dev = frame.size(0), frame.device
@@ -83,7 +94,7 @@ class BrainCore(nn.Module):
 
         feat_p = self.perc(frame) # [B, 512]
         self.Write(feat_p)
-        seq = self.Seq()
+        seq = self.Seq(self.SEQ_LEN)
 
         state = self.world(seq.detach(), self.prev_act.detach())
 
@@ -285,8 +296,7 @@ class Agent:
             list(self.brain.actor.parameters()), 1.0)
         self.opt_a.step()
 
-        return {"w": w_loss.item(),"c": c_loss.item(),"a": a_loss.item(),
-    }
+        return {"w": w_loss.item(),"c": c_loss.item(),"a": a_loss.item()}
 
 
 class OfflineGameDataset(Dataset):
@@ -306,150 +316,350 @@ class OfflineGameDataset(Dataset):
         mouse: np.ndarray = np.load(self.mouse[idx]).astype(np.float32)  # (2,)
         return img, keys, mouse
 
-class ManagerFunction():
+class ManagerFunction:
     def __init__(self, device: Optional[str] = None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.original_lr: Optional[float] = None
-
-    def Train(self, root: str, epochs: int = 5, batchSize: int = 32, val_split: float = 0.1, imagine_horizon: int = 5) -> None:
-        """
-        root: Root directory of the dataset
-        epochs: Number of training rounds
-        batch_size: Batch size
-        val_split: Validation set ratio (0-1)
-        imagine_horizon: Imagine and deduce the step size
-        """
-        ds = OfflineGameDataset(root)
-        n_train = int(len(ds) * (1 - val_split))
-        train_ds, val_ds = torch.utils.data.random_split(ds, [n_train, len(ds)-n_train])
+        self.checkpoint_path = "training_checkpoint.pth"
+        self.status_file = "training_status.json"
+        self.command_file = "training_command.json"
         
-        train_dl = DataLoader(train_ds, batch_size=batchSize, shuffle=True, num_workers=4, pin_memory=True)
-        val_dl = DataLoader(val_ds, batch_size=batchSize, shuffle=False, num_workers=2)
-
-        brain = BrainCore(plastic_hebbian=True, plastic_meta=True).to(self.device)
-        agent = Agent(brain, device=self.device, horizon=imagine_horizon, online_imagine=True)
+        self.controller = TrainingController()
         
-        self.original_lr = agent.opt_a.param_groups[0]["lr"]
+        self.training_thread = None
+        self.is_training = False
+    
+    def StartTraining(self, root: str, epochs: int = 5, batchSize: int = 32,  valSplit: float = 0.1, imagineHorizon: int = 5, resume: bool = True):
+        if self.is_training:
+            self.controller.SetStatus("error", "The training is already running")
+            return False
         
-        bce = torch.nn.BCELoss()
-        mse = torch.nn.MSELoss()
-        best_val = float('inf')
-
-        for ep in range(epochs):
-            brain.train()
-            loss_sum = 0.0
-            n = 0
+        self.is_training = True
+        self.training_thread = threading.Thread(
+            target=self.Train,
+            args=(root, epochs, batchSize, valSplit, imagineHorizon, resume),
+            daemon=True)
+        self.training_thread.start()
+        return True
+    
+    def StopTraining(self):
+        if self.is_training:
+            self.controller.RequestStop()
+            if self.training_thread is not None:
+                self.training_thread.join()
+            return True
+        return False
+    
+    def PauseTraining(self):
+        if self.is_training:
+            self.controller.RequestPause()
+            return True
+        return False
+    
+    def ResumeTraining(self):
+        if self.is_training:
+            self.controller.RequestResume()
+            return True
+        return False
+    
+    def GetTrainingStatus(self):
+        return self.controller.GetStatus()
+    
+    def Train(self, root: str, epochs: int, batchSize: int, valSplit: float, imagineHorizon: int, resume: bool):
+        try:
+            ds = OfflineGameDataset(root)
             
-            for imgs_np, keys_np, mouse_np in train_dl:
-                imgs = agent.Prep(imgs_np).to(self.device) 
-                keys = torch.from_numpy(keys_np).to(self.device)
-                mouse = torch.from_numpy(mouse_np).to(self.device)
+            brain = BrainCore(plastic_hebbian=True, plastic_meta=True).to(self.device)
+            agent = Agent(brain, device=self.device, horizon=imagineHorizon, online_imagine=True)
+            self.opt_w = agent.opt_w
+            self.opt_c = agent.opt_c
+            self.opt_a = agent.opt_a
+            
+            start_epoch = 0
+            start_batch = 0
+            best_val = float('inf')
+            train_ds, val_ds = None, None
+            
+            if resume:
+                start_epoch, start_batch, best_val, train_ds, val_ds = self.LoadCheckpoint(brain, agent, ds)
+            
+            if train_ds is None:
+                n_train = int(len(ds) * (1 - valSplit))
+                train_ds, val_ds = torch.utils.data.random_split(ds, [n_train, len(ds)-n_train])
+            
+            train_dl = DataLoader(train_ds, batch_size=batchSize, shuffle=True, num_workers=4, pin_memory=True)
+            val_dl = DataLoader(val_ds, batch_size=batchSize, shuffle=False, num_workers=2)
+            
+            bce = torch.nn.BCELoss()
+            mse = torch.nn.MSELoss()
+            
+            total_batches = len(train_dl)
+            self.controller.SetStatus(
+                "training", 
+                "Training is in progress",
+                epoch=start_epoch,
+                total_epochs=epochs,
+                batch=start_batch,
+                total_batches=total_batches)
+            
+            for ep in range(start_epoch, epochs):
+                if self.controller.ShouldStop():
+                    self.controller.SetStatus("stopped", "The training has stopped")
+                    break
                 
-                brain.have_prev = False
+                while self.controller.ShouldPause():
+                    self.controller.SetStatus("paused", "The training has been suspended")
+                    time.sleep(0.5)
                 
-                pred_k, pred_m, states, values = [], [], [], []
-                for i in range(imgs.size(0)):
-                    frame = imgs[i].unsqueeze(0)
-                    out, state, value = brain.Step(
-                        frame, 
-                        torch.zeros(1, device=self.device), 
-                        torch.zeros(1, device=self.device))
+                brain.train()
+                loss_sum = 0.0
+                n = 0
+                
+                train_iter = iter(train_dl)
+                
+                for _ in range(start_batch):
+                    next(train_iter)
+                
+                for batch_idx, (imgs_np, keys_np, mouse_np) in enumerate(train_iter, start=start_batch):
+                    if self.controller.ShouldStop():
+                        self.controller.SetStatus("stopped", "The training has stopped")
+                        break
                     
-                    pred_k.append(brain.actor.kb.ToKeyboardVector(out["keyboard"], False))
-                    pred_m.append(out["mouse"].squeeze(0))
-                    states.append(state.squeeze(0))
-                    values.append(value.squeeze(0))
-                
-                pred_k = torch.stack(pred_k)
-                pred_m = torch.stack(pred_m)
-                states = torch.stack(states)
-                values = torch.stack(values)
-                
-                bc_loss = bce(pred_k, keys) + 0.05 * mse(pred_m, mouse)
-                
-                agent.opt_a.zero_grad()
-                bc_loss.backward()
-                torch.nn.utils.clip_grad_norm_(brain.parameters(), 1.0)
-                agent.opt_a.step()
-                
-                for i in range(len(imgs_np)):
-                    agent.buf.push(
-                        imgs_np[i], 
-                        keys_np[i], 
-                        mouse_np[i],
-                        0.0,  # reward
-                        False, # done
-                        states[i].detach().cpu(), 
-                        values[i].detach().cpu())
-                
-                agent.Update(batch=batchSize)
-                
-                loss_sum += bc_loss.item()
-                n += 1
-            
-            avg_loss = loss_sum / n
-            print(f"[Epoch {ep+1}/{epochs}] Train Loss: {avg_loss:.4f}")
-            
-            brain.eval()
-            val_loss = 0.0
-            m = 0
-            
-            with torch.no_grad():
-                for imgs_np, keys_np, mouse_np in val_dl:
-                    imgs = agent.Prep(imgs_np).to(self.device)
+                    while self.controller.ShouldPause():
+                        self.controller.SetStatus("paused", "The training has been suspended")
+                        time.sleep(0.5)
+                    
+                    self.controller.SetStatus(
+                        "training", 
+                        "Training is in progress",
+                        epoch=ep+1,
+                        total_epochs=epochs,
+                        batch=batch_idx+1,
+                        total_batches=total_batches)
+                    
+                    imgs = agent.Prep(imgs_np).to(self.device) 
                     keys = torch.from_numpy(keys_np).to(self.device)
                     mouse = torch.from_numpy(mouse_np).to(self.device)
                     
                     brain.have_prev = False
                     
-                    pred_k, pred_m = [], []
+                    pred_k, pred_m, states, values = [], [], [], []
                     for i in range(imgs.size(0)):
                         frame = imgs[i].unsqueeze(0)
-                        out, _, _ = brain.Step(
+                        out, state, value = brain.Step(
                             frame, 
                             torch.zeros(1, device=self.device), 
-                            torch.zeros(1, device=self.device)
-                        )
+                            torch.zeros(1, device=self.device))
+                        
                         pred_k.append(brain.actor.kb.ToKeyboardVector(out["keyboard"], False))
                         pred_m.append(out["mouse"].squeeze(0))
+                        states.append(state.squeeze(0))
+                        values.append(value.squeeze(0))
                     
                     pred_k = torch.stack(pred_k)
                     pred_m = torch.stack(pred_m)
+                    states = torch.stack(states)
+                    values = torch.stack(values)
                     
-                    val_loss += (bce(pred_k, keys) + 0.05 * mse(pred_m, mouse)).item()
-                    m += 1
+                    bc_loss = bce(pred_k, keys) + 0.05 * mse(pred_m, mouse)
+                    
+                    agent.opt_a.zero_grad()
+                    bc_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(brain.parameters(), 1.0)
+                    agent.opt_a.step()
+                    
+                    for i in range(len(imgs_np)):
+                        agent.buf.push(
+                            imgs_np[i], 
+                            keys_np[i], 
+                            mouse_np[i],
+                            0.0,  # reward
+                            False, # done
+                            states[i].detach().cpu(), 
+                            values[i].detach().cpu())
+                    
+                    agent.Update(batch=batchSize)
+                    
+                    loss_sum += bc_loss.item()
+                    n += 1
+                    self.controller.SetStatus(
+                        "training", 
+                        "Training is in progress",
+                        train_loss=bc_loss.item())
+                
+                start_batch = 0
+                
+                if self.controller.ShouldStop():
+                    break
+                
+                avg_loss = loss_sum / n
+                
+                self.controller.SetStatus("validating", "Verification in progress...")
+                brain.eval()
+                val_loss = 0.0
+                m = 0
+                
+                with torch.no_grad():
+                    for imgs_np, keys_np, mouse_np in val_dl:
+                        imgs = agent.Prep(imgs_np).to(self.device)
+                        keys = torch.from_numpy(keys_np).to(self.device)
+                        mouse = torch.from_numpy(mouse_np).to(self.device)
+                        
+                        brain.have_prev = False
+                        
+                        pred_k, pred_m = [], []
+                        for i in range(imgs.size(0)):
+                            frame = imgs[i].unsqueeze(0)
+                            out, _, _ = brain.Step(
+                                frame, 
+                                torch.zeros(1, device=self.device), 
+                                torch.zeros(1, device=self.device))
+                            
+                            pred_k.append(brain.actor.kb.ToKeyboardVector(out["keyboard"], False))
+                            pred_m.append(out["mouse"].squeeze(0))
+                        
+                        pred_k = torch.stack(pred_k)
+                        pred_m = torch.stack(pred_m)
+                        
+                        val_loss += (bce(pred_k, keys) + 0.05 * mse(pred_m, mouse)).item()
+                        m += 1
+                
+                avg_val = val_loss / m
+                
+                checkpoint = {
+                    'epoch': ep+1,
+                    'brain_state_dict': brain.state_dict(),
+                    'optimizer_w_state': agent.opt_w.state_dict(),
+                    'optimizer_c_state': agent.opt_c.state_dict(),
+                    'optimizer_a_state': agent.opt_a.state_dict(),
+                    'best_val': min(best_val, avg_val),
+                    'train_indices': train_ds.indices,
+                    'val_indices': val_ds.indices,
+                    'agent_buf': list(agent.buf),
+                    'random_state': random.getstate(),
+                    'torch_rng_state': torch.get_rng_state(),
+                    'numpy_rng_state': np.random.get_state(),
+                    'brain_buffers': {
+                        'prev_mem': brain.prev_mem,
+                        'prev_attn': brain.prev_attn,
+                        'prev_state': brain.prev_state,
+                        'prev_act': brain.prev_act,
+                        'prev_rew': brain.prev_rew,
+                        'prev_done': brain.prev_done,
+                        'prev_ent': brain.prev_ent,
+                        'prev_unc': brain.prev_unc,
+                        'perc_buf': brain.perc_buf,
+                        'ptr': brain.ptr,
+                        'have_prev': brain.have_prev}}
+                
+                torch.save(checkpoint, self.checkpoint_path)
+                
+                if avg_val < best_val:
+                    best_val = avg_val
+                    torch.save(brain.state_dict(), "brain_deep_learn_best.pth")
+                    self.controller.SetStatus("saving", f"Save the best model: val_loss={avg_val:.4f}")
+                else:
+                    self.controller.SetStatus(
+                        "training", 
+                        f"Epoch {ep+1}/{epochs} Completed | Loss: {avg_loss:.4f} | Val Loss: {avg_val:.4f}",
+                        val_loss=avg_val)
             
-            avg_val = val_loss / m
-            print(f"Val Loss: {avg_val:.4f}")
+            if self.controller.ShouldStop():
+                self.controller.SetStatus("stopped", "The training has stopped")
+            else:
+                self.controller.SetStatus("completed", "Training completed")
+                torch.save(brain.state_dict(), "brain_deep_learn_final.pth")
             
-            if avg_val < best_val:
-                best_val = avg_val
-                torch.save(brain.state_dict(), "brain_game_best.pth")
-                print("保存最佳模型")
-        
-        torch.save(brain.state_dict(), "brain_game_final.pth")
-        print("训练完成")
-
+        except Exception as e:
+            self.controller.SetStatus("error", f"Training error: {str(e)}")
+        finally:
+            self.is_training = False
     
-    def Deploy(self, ckpt: str, camera_index: int = 0, fps: int = 30, online_learn: bool = False, online_every: float = 2.0, safety_lr: float = 0.1) -> None:
+    def LoadCheckpoint(self, brain, agent, dataset):
+        if not Path(self.checkpoint_path).exists():
+            return 0, 0, float('inf'), None, None
+        
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        
+        brain.load_state_dict(checkpoint['brain_state_dict'])
+        
+        agent.opt_w.load_state_dict(checkpoint['optimizer_w_state'])
+        agent.opt_c.load_state_dict(checkpoint['optimizer_c_state'])
+        agent.opt_a.load_state_dict(checkpoint['optimizer_a_state'])
+        
+        brain.prev_mem = checkpoint['brain_buffers']['prev_mem'].to(self.device)
+        brain.prev_attn = checkpoint['brain_buffers']['prev_attn'].to(self.device)
+        brain.prev_state = checkpoint['brain_buffers']['prev_state'].to(self.device)
+        brain.prev_act = checkpoint['brain_buffers']['prev_act'].to(self.device)
+        brain.prev_rew = checkpoint['brain_buffers']['prev_rew'].to(self.device)
+        brain.prev_done = checkpoint['brain_buffers']['prev_done'].to(self.device)
+        brain.prev_ent = checkpoint['brain_buffers']['prev_ent'].to(self.device)
+        brain.prev_unc = checkpoint['brain_buffers']['prev_unc'].to(self.device)
+        brain.perc_buf = checkpoint['brain_buffers']['perc_buf'].to(self.device)
+        brain.ptr = checkpoint['brain_buffers']['ptr']
+        brain.have_prev = checkpoint['brain_buffers']['have_prev']
+        
+        random.setstate(checkpoint['random_state'])
+        torch.set_rng_state(checkpoint['torch_rng_state'].cpu())
+        np.random.set_state(checkpoint['numpy_rng_state'])
+        
+        agent.buf = collections.deque(checkpoint['agent_buf'], maxlen=100_000)
+        
+        train_ds = torch.utils.data.Subset(dataset, checkpoint['train_indices'])
+        val_ds = torch.utils.data.Subset(dataset, checkpoint['val_indices'])
+        
+        return (checkpoint['epoch'], 
+                checkpoint.get('current_batch', 0), 
+                checkpoint['best_val'], 
+                train_ds, 
+                val_ds)
+    
+    def StartDeployment(self, ckpt: str, cameraIndex: int = 0, fps: int = 30, onlineLearn: bool = False, onlineEvery: float = 2.0, safetyLr: float = 0.1):
 
-        brain = BrainCore(plastic_hebbian=False, plastic_meta=False).to(self.device)
-        brain.load_state_dict(torch.load(ckpt, map_location=self.device))
-        agent = Agent(brain, device=self.device, online_imagine=online_learn)
+        if hasattr(self, 'deploying') and self.deploying:
+            return False
         
-        if self.original_lr is None:
-            self.original_lr = agent.opt_a.param_groups[0]["lr"]
+        self.deploying = True
+        self.deploy_thread = threading.Thread(
+            target=self.Deploy,
+            args=(ckpt, cameraIndex, fps, onlineLearn, onlineEvery, safetyLr),
+            daemon=True)
         
-        last_update = time.time()
-        frame_count = 0
-        total_processing_time = 0
-        
+        self.deploy_thread.start()
+        return True
+    
+    def StopDeployment(self):
+        if hasattr(self, 'deploying') and self.deploying:
+            self.controller.RequestStop()
+            return True
+        return False
+    
+    
+    def Deploy(self, ckpt: str, cameraIndex: int, fps: int, onlineLearn: bool, online_every: float, safety_lr: float):
         try:
-            with iio.imopen(f"<video{camera_index}>", "r") as cam:
+            brain = BrainCore(plastic_hebbian=False, plastic_meta=False).to(self.device)
+            brain.load_state_dict(torch.load(ckpt, map_location=self.device))
+            agent = Agent(brain, device=self.device, online_imagine=onlineLearn)
+            
+            if self.original_lr is None:
+                self.original_lr = agent.opt_a.param_groups[0]["lr"]
+            
+            last_update = time.time()
+            frame_count = 0
+            total_processing_time = 0
+            
+            self.controller.SetStatus("deploying", "Deployment startup...")
+            
+            with iio.imopen(f"<video{cameraIndex}>", "r") as cam:
                 cam_shape = cam.properties().shape
-                print(f"摄像头已启动 | 分辨率: {cam_shape[1]}x{cam_shape[0]} | 目标FPS: {fps}")
+                self.controller.SetStatus(
+                    "deploying", 
+                    f"The camera has been activated | Resolution: {cam_shape[1]}x{cam_shape[0]} | FPS: {fps}")
                 
                 for frame in cam:
+                    if self.controller.ShouldStop():
+                        break
+                    
                     start_time = time.time()
                     frame_count += 1
                     
@@ -464,7 +674,7 @@ class ManagerFunction():
                         kb_vec = brain.actor.kb.ToKeyboardVector(out["keyboard"], False).cpu().numpy()
                         mouse = out["mouse"].squeeze(0).cpu().numpy()
                     
-                    if online_learn:
+                    if onlineLearn:
                         agent.buf.push(
                             frame,
                             kb_vec.copy(),
@@ -485,30 +695,92 @@ class ManagerFunction():
                                 g["lr"] = self.original_lr     
 
                             last_update = current_time
-                            print(f"• 在线更新 | 学习率: {self.original_lr * safety_lr:.6f}")
+                            self.controller.SetStatus(
+                                "deploying", 
+                                f"Online update | Learning rate: {self.original_lr * safety_lr:.6f}")
                     
                     process_time = time.time() - start_time
                     total_processing_time += process_time
                     
-                    if frame_count % fps == 0:
-                        avg_process_time = total_processing_time / fps
-                        real_fps = 1.0 / avg_process_time if avg_process_time > 0 else fps
-                        
-                        keys_status = "".join("1" if k > 0.5 else "0" for k in kb_vec[:8])
-                        print(f"[帧 {frame_count}] FPS≈{real_fps:.1f} "
-                              f"按键: {keys_status} "
-                              f"鼠标: Δx={mouse[0]:.2f}, Δy={mouse[1]:.2f}")
-                        
-                        total_processing_time = 0
+                    keys_status = "".join("1" if k > 0.5 else "0" for k in kb_vec[:8])
+                    self.controller.SetStatus(
+                        "deploying",
+                        f"[FPS {frame_count}] "
+                        f"keyboard: {keys_status} "
+                        f"mouse: Δx={mouse[0]:.2f}, Δy={mouse[1]:.2f}")
                     
                     target_delay = 1.0 / fps
                     sleep_time = max(0, target_delay - process_time)
                     time.sleep(sleep_time)
-                    
-        except KeyboardInterrupt:
-            print("操作已停止")
+                
+                if onlineLearn and hasattr(agent, 'buf') and len(agent.buf) > 0:
+                    torch.save(brain.state_dict(), "brain_deep_learn_online.pth")
+                    self.controller.SetStatus("deploying", "The online learning model has been saved")
+            
+            self.controller.SetStatus("stopped", "The deployment has been stopped")
+            
+        except Exception as e:
+            self.controller.SetStatus("error", f"Deployment error: {str(e)}")
         finally:
-            if online_learn and hasattr(agent, 'buf') and len(agent.buf) > 0:
-                torch.save(brain.state_dict(), "brain_game_online.pth")
-                print("✓ 在线学习模型已保存")
+            self.deploying = False
 
+
+
+class TrainingController:
+    def __init__(self):
+        self.command_queue = collections.deque(maxlen=10)
+        self.status = {
+            "state": "idle", 
+            "epoch": 0,
+            "total_epochs": 0,
+            "batch": 0,
+            "total_batches": 0,
+            "train_loss": 0.0,
+            "val_loss": 0.0,
+            "message": "Wait for the training to start"}
+        
+        self.lock = threading.Lock()
+        self.stop_requested = False
+        self.pause_requested = False
+    
+    def SetStatus(self, state, message, **kwargs):
+        with self.lock:
+            self.status["state"] = state
+            self.status["message"] = message
+            for key, value in kwargs.items():
+                if key in self.status:
+                    self.status[key] = value
+    
+    def GetStatus(self):
+        with self.lock:
+            return self.status.copy()
+    
+    def AddCommand(self, command):
+        with self.lock:
+            self.command_queue.append(command)
+    
+    def CheckCommand(self):
+        with self.lock:
+            if self.command_queue:
+                return self.command_queue.popleft()
+            return None
+    
+    def ShouldStop(self):
+        with self.lock:
+            return self.stop_requested
+    
+    def ShouldPause(self):
+        with self.lock:
+            return self.pause_requested
+    
+    def RequestStop(self):
+        with self.lock:
+            self.stop_requested = True
+    
+    def RequestPause(self):
+        with self.lock:
+            self.pause_requested = True
+    
+    def RequestResume(self):
+        with self.lock:
+            self.pause_requested = False
