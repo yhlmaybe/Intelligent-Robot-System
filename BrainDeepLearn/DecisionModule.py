@@ -137,7 +137,7 @@ class KeyboardActionModel(nn.Module):
                           nn.ReLU(), 
                           nn.Linear(64, 1)) for _ in range(8)])
         self.dynamic = DynamicKeySelector(256, numKeys=96, topK=4)
-        self.text    = TextInputDecoder(256)
+        self.text = TextInputDecoder(256)
 
         self.meta_blk = MetaLearnerBlock(256)
 
@@ -162,7 +162,7 @@ class KeyboardActionModel(nn.Module):
         dyn_idx, dyn_p = self.dynamic(x)
         dyn_H = -(dyn_p * (dyn_p+1e-8).log()).sum(1) / math.log(dyn_p.size(1)+1e-8)
 
-        tm_prob, char_logits, next_txt = self.text(x, prevTxt)
+        tm_prob, char_logits, next_txt = self.text(x, prevTxt.clone())
         text_H = -(tm_prob * (tm_prob+1e-8).log() + (1-tm_prob) * (1-tm_prob+1e-8).log())
 
         entropy = (base_H + dyn_H + text_H) / 3.0
@@ -183,16 +183,43 @@ class KeyboardActionModel(nn.Module):
         return (prob > 0.5).float() if det else torch.bernoulli(prob)
 
     def ToKeyboardVector(self, out: Dict, det: bool=False) -> torch.Tensor:
-        vec = torch.zeros(104, device=out["base_probs"][0].device)
-        for i,p in enumerate(out["base_probs"]):
-            act = self.SampleBinary(p.squeeze(), det)
-            vec[list(KEYBOARD_LAYOUT["base_keys"].values())[i]] = act
-        idx, prob = out["dyn_idx"], out["dyn_p"]
-        for j in range(idx.size(1)):
-            vec[idx[:,j]+8] = self.SampleBinary(prob[:,j], det)
+        all_codes = []
+        for grp in KEYBOARD_LAYOUT.values():
+            all_codes += list(grp.values())
+        max_code = max(all_codes)
+
+        B = out["base_probs"][0].size(0)
+        device = out["base_probs"][0].device
+        vec = torch.zeros(B, max_code+1, device=device)
+
+        base_codes = list(KEYBOARD_LAYOUT["base_keys"].values())  
+        for i, code in enumerate(base_codes):
+            p   = out["base_probs"][i].squeeze(-1) # [B]
+            act = (p>0.5).float() if det else torch.bernoulli(p)
+            vec[:, code] = act
+
+        skill_codes = torch.tensor(list(KEYBOARD_LAYOUT["skill_keys"].values()),device=device)                                              
+        dyn_idx, dyn_p = out["dyn_idx"], out["dyn_p"]  # [B, topK], [B, topK]
+        sel_codes = skill_codes[dyn_idx] # [B, topK]
+        acts      = (dyn_p>0.5).float() if det else torch.bernoulli(dyn_p)
+        B_idx     = torch.arange(B, device=device).unsqueeze(1).expand_as(sel_codes)
+        vec[B_idx, sel_codes] = acts
+
+        for _, code in KEYBOARD_LAYOUT["menu_keys"].items():
+            vec[:, code] = 0.0
+
         enter_code = KEYBOARD_LAYOUT["system_keys"]["Enter"]
-        vec[enter_code] = (out["text_mode"] > 0.5).float()
-        return vec
+        tm = out["text_mode"]   
+        tm_act = (tm>0.5).float() if det else torch.bernoulli(tm)
+        vec[:, enter_code] = tm_act
+        for keyname, code in KEYBOARD_LAYOUT["system_keys"].items():
+            if keyname != "Enter":
+                vec[:, code] = 0.0
+
+        for _, code in KEYBOARD_LAYOUT["alpha_keys"].items():
+            vec[:, code] = 0.0
+
+        return vec  # shape [B, max_code+1]
 
 
 class MouseActionModel(nn.Module):
@@ -252,7 +279,7 @@ class DecisionExtractor(nn.Module):
         mouse_entropy = -((mouse_out[1] * (mouse_out[1]+1e-8).log() + (1-mouse_out[1])*(1-mouse_out[1]+1e-8).log()).sum(1)/2)
         entropy = (kb_out["entropy"] + mouse_entropy) / 2
 
-        return {"keyboard": kb_out, "mouse":     mouse_out, "entropy":   entropy}
+        return {"keyboard": kb_out, "mouse": mouse_out, "entropy": entropy}
 
     def Act(self, state: torch.Tensor, det: bool = False):
         with torch.no_grad():

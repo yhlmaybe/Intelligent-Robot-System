@@ -43,8 +43,8 @@ class HebbianConv2d(nn.Module):
 
                 delta_w = delta_w.view(self.conv.weight.shape)
 
-                self.hebb_memory = 0.9 * self.hebb_memory + 0.1 * delta_w
-                self.conv.weight.data += self.hebb_memory
+                self.hebb_memory.mul_(0.9).add_(delta_w, alpha=0.1)
+                self.conv.weight.data.add_(self.hebb_memory) 
         return out
     
     def ResetHebbianMemory(self):
@@ -56,9 +56,9 @@ class HebbianLinear(nn.Module):
         self.weight = nn.Parameter(torch.randn(outFeatures, inFeatures) * 0.01)
         self.bias   = nn.Parameter(torch.zeros(outFeatures))
 
-        self.hebb_rate   = hebbRate
-        self.ema_alpha   = emaMomentum
-        self.normalize   = normalize
+        self.hebb_rate = hebbRate
+        self.ema_alpha = emaMomentum
+        self.normalize = normalize
         self.weight_constraint = weightConstraint
         
         self.register_buffer("hebb_memory", torch.zeros_like(self.weight))
@@ -73,9 +73,12 @@ class HebbianLinear(nn.Module):
 
         if self.training:
             with torch.no_grad():
-                hebb_term  = torch.einsum('bi,bj->ij', x, y)        
-                decay_term = torch.einsum('bj,bj,ij->ij', y, y, self.weight)
-                delta_w    = self.hebb_rate * (hebb_term - decay_term)
+                hebb_term = torch.einsum('bi,bj->ij', y, x)      
+
+                y_sq_sum = (y ** 2).sum(dim = 0)
+                decay_term = torch.einsum('i,ij->ij', y_sq_sum, self.weight)
+
+                delta_w = self.hebb_rate * (hebb_term - decay_term)
 
                 self.hebb_memory.mul_(self.ema_alpha).add_(delta_w, alpha=(1 - self.ema_alpha))
                 
@@ -143,13 +146,12 @@ class ResidualBlock(nn.Module):
             self.downsample = nn.Sequential(
                 nn.Conv2d(inChannels, outChannels, kernel_size=1, 
                          stride=stride, bias=False),
-                nn.BatchNorm2d(outChannels)
-            )
+                nn.BatchNorm2d(outChannels))
         
         conv_layer = HebbianConv2d if useHebbian else nn.Conv2d
-        self.conv1 = conv_layer(inChannels, outChannels, kernelSize=3, stride=stride, padding=1, bias=False)
+        self.conv1 = conv_layer(inChannels, outChannels, 3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(outChannels)
-        self.conv2 = conv_layer(outChannels, outChannels, kernelSize=3, stride=1, padding=1, bias=False)
+        self.conv2 = conv_layer(outChannels, outChannels, 3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(outChannels)
         self.relu = nn.ReLU(inplace=True)
     
@@ -173,7 +175,7 @@ class CNNFeatureExtractor(nn.Module):
     def __init__(self, inChannels : int = 3, baseChannels : int = 64, useHebbian : bool = True):
         super().__init__()
         conv_layer = HebbianConv2d if useHebbian else nn.Conv2d
-        self.conv1 = conv_layer(inChannels, baseChannels, kernelSize=7, stride=2, padding=3)
+        self.conv1 = conv_layer(inChannels, baseChannels, 7, stride=2, padding=3)
         
         self.bn1 = nn.BatchNorm2d(baseChannels)
         self.relu = nn.ReLU(inplace=True)
@@ -184,7 +186,7 @@ class CNNFeatureExtractor(nn.Module):
         self.layer3 = self.MakeLayer(baseChannels*2, baseChannels*4, 2, stride=2, use_hebbian=useHebbian)
         self.layer4 = self.MakeLayer(baseChannels*4, baseChannels*8, 2, stride=2, use_hebbian=useHebbian)
         
-        self.conv2 = conv_layer(baseChannels*8, baseChannels*16, kernelSize=3, stride=1, padding=1)
+        self.conv2 = conv_layer(baseChannels*8, baseChannels*16, 3, stride=1, padding=1)
         self.bn2 = nn.BatchNorm2d(baseChannels*16)
     
     def MakeLayer(self, in_channels : int, out_channels : int, blocks : int, stride : int = 1, use_hebbian : bool = False) -> nn.Sequential:
@@ -238,37 +240,31 @@ class PerceiveExtractor(nn.Module):
             TransformerEncode(
                 modelDim=embedDim, 
                 headNum=numHeads,
-                dimFeedforward=embedDim*4
-            ) for _ in range(numLayers)
-        ])
+                dimFeedforward=embedDim*4)
+                for _ in range(numLayers)])
         
         if useHebbian:
             self.hebb_fc1 = nn.Sequential(
                 nn.Linear(embedDim, embedDim * 2),
                 nn.GELU(),
-                HebbianLinear(embedDim * 2, embedDim * 2, hebbRate=hebbRate)
-            )
+                HebbianLinear(embedDim * 2, embedDim * 2, hebbRate=hebbRate))
             self.hebb_fc2 = nn.Sequential(
                 nn.Linear(embedDim * 2, embedDim),
                 nn.GELU(),
-                HebbianLinear(embedDim, embedDim, hebbRate=hebbRate)
-            )
+                HebbianLinear(embedDim, embedDim, hebbRate=hebbRate))
         else:
             self.hebb_fc1 = nn.Sequential(
                 nn.Linear(embedDim, embedDim * 2),
-                nn.GELU()
-            )
+                nn.GELU())
             self.hebb_fc2 = nn.Sequential(
                 nn.Linear(embedDim * 2, embedDim),
-                nn.GELU()
-            )
+                nn.GELU())
         
         self.adaptive_gate = nn.Sequential(
             nn.Linear(embedDim, embedDim // 4),
             nn.ReLU(),
             nn.Linear(embedDim // 4, 1),
-            nn.Sigmoid()
-        )
+            nn.Sigmoid())
         
         self.output_norm = nn.LayerNorm(embedDim)
         

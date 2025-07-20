@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 
 class ActionEncoder(nn.Module):
-    def __init__(self, numDiscrete: int = 104, contDim: int = 2, outDim: int = 128):
+    def __init__(self, numDiscrete: int = 128, contDim: int = 2, outDim: int = 128):
         super().__init__()
         self.disc_proj = nn.Linear(numDiscrete, outDim, bias=False)
         self.cont_net = nn.Sequential(
@@ -45,6 +45,12 @@ class WorldModelExtractor(nn.Module):
         self.latent_dim = latentDim
         self.deter_dim = deterDim
         self.state_dim = stateDim
+
+        self.action_encoder = ActionEncoder(
+            numDiscrete = 128,
+            contDim = 2,
+            outDim = actionDim )
+        
 
         self.obs_enc = nn.Sequential(
             nn.LayerNorm(visionDim),
@@ -101,18 +107,21 @@ class WorldModelExtractor(nn.Module):
     def forward(
         self,
         visionIn: torch.Tensor,  # (B, vision_dim)
-        actionPrev: torch.Tensor,  # (B, action_dim)
+        keysOnehot: torch.Tensor,  # (B,128)
+        mouseDelta: torch.Tensor,  # (B,2)
         reset: bool = False) -> torch.Tensor:  # (B, state_dim)
 
         B, device = visionIn.shape[0], visionIn.device
         
-        if reset or self._h is None or self._h.shape[0] != B:
+        if self._h is None or self._h.device != device or self._h.shape[0] != B or reset:
             self.ResetHidden(B, device)
 
         h_prev = self._h.clone() 
         
         e_t = self.obs_enc(visionIn)  # (B, latent)
-        a_t = self.act_enc(actionPrev)  # (B, latent)
+
+        a128 = self.action_encoder(keysOnehot, mouseDelta) # [B,128]
+        a_t = self.act_enc(a128) # [B,256]
         
         gru_input = torch.cat([self._z_prev, a_t], dim=-1)
         self._h = self.gru(gru_input, self._h)
@@ -158,20 +167,15 @@ class WorldModelExtractor(nn.Module):
             return state_feat, pred_r, pred_d
 
     @staticmethod
-    def PackAction(
-        actOut: Dict[str, List], 
-        device: str | torch.device = "cuda") -> Tuple[torch.Tensor, torch.Tensor]:
-
+    def PackAction(actOut: Dict[str, List], device="cuda") -> Tuple[torch.Tensor,torch.Tensor]:
         key_tensor = torch.tensor(
             actOut["keys"] + actOut["mouse_clicks"],
-            dtype=torch.float32, 
-            device=device).unsqueeze(0)
-        
+            dtype=torch.float32, device=device).unsqueeze(0)  # [1,128]
+
         mouse_tensor = torch.tensor(
             actOut["mouse_delta"],
-            dtype=torch.float32,
-            device=device).unsqueeze(0)
-        
+            dtype=torch.float32, device=device).unsqueeze(0)# [1,2]
+
         return key_tensor, mouse_tensor
 
     def ResetHidden(

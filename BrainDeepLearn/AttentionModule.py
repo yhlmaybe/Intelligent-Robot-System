@@ -242,7 +242,7 @@ class DynamicRouting(nn.Module):
         B, I, D = x.shape
         assert I == self.I and D == self.in_dim, "AttentionModule capsule input dim mismatch"
 
-        u_hat = torch.einsum("bid,iocd->bioc", x, self.transformation)  # (B,I,O,C)
+        u_hat = torch.einsum("bid,iodc->bioc", x, self.transformation)  # (B,I,O,C)
 
         logits = self.routing_logits.expand(B, -1, -1)  # (B,I,O)
         
@@ -452,7 +452,7 @@ class AttentionExtractor(nn.Module):
             caps_mask = padded_mask.reshape(B, 16, -1).any(dim=2)  # (B,16)
 
         # Extract capsules
-        caps = h.view(B, S, 16, -1).mean(dim=1)  # (B,16,in_dim)
+        caps = h.view(B, 16, S//16, -1).mean(dim=2)  # [B,16,E]
         routed = self.routing(caps, caps_mask)  # (B,4,E)
 
         # Fusion of different representations

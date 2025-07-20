@@ -2,6 +2,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from typing import Optional, Tuple
 
 class MetaPlasticityController(nn.Module):
@@ -88,6 +89,9 @@ class MemoryExtractor(nn.Module):
         self.svd_interval = max(1, svdInterval)
         self.svd_min = svdMin
         self.svd_max = svdMax
+
+        self.svd_threshold = 5.0  
+        self.fro_norm_history = []  
         
         # State transition matrix (orthogonal initialization)
         A_init = torch.empty(ssmStateDim, ssmStateDim)
@@ -121,35 +125,36 @@ class MemoryExtractor(nn.Module):
         # Correlation scores
         self.register_buffer("memory_corr", torch.zeros(memorySize))
 
-        self.mem_ptr = 0                  # Current write pointer
-        self.time_step = 0                # Global timestep counter
-        self.memory_filled = 0            # Number of filled memory slots
-        self.memory_usage = 0.0           # Current memory utilization rate
-        self.last_compress_step = 0       # Last timestep when compression occurred
-        self._steps_since_svd = 0         # Counter for SVD interval
+        self.register_buffer("h_state", torch.zeros(1, ssmStateDim))
+
+        self.mem_ptr = 0 # Current write pointer
+        self.time_step = 0 # Global timestep counter
+        self.memory_filled = 0 # Number of filled memory slots
+        self.memory_usage = 0.0 # Current memory utilization rate
+        self.last_compress_step = 0 # Last timestep when compression occurred
+        self._steps_since_svd = 0 # Counter for SVD interval
 
         self.state2mem = nn.Linear(ssmStateDim, memoryDim)
         self.state2val = nn.Linear(ssmStateDim, memoryDim)
         self.importance_net = nn.Sequential(
             nn.Linear(ssmStateDim, 128), nn.ReLU(),
             nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, 1), nn.Sigmoid()
-        )
+            nn.Linear(64, 1), nn.Sigmoid())
+        
         self.local_gate = nn.Sequential(
             nn.Linear(ssmStateDim, 128), nn.ReLU(),
-            nn.Linear(128, 1), nn.Sigmoid()
-        )
+            nn.Linear(128, 1), nn.Sigmoid())
+        
         self.fusion_gate_net = nn.Sequential(
             nn.Linear(memoryDim * 3, 128), nn.ReLU(),
-            nn.Linear(128, 1), nn.Sigmoid()
-        )
+            nn.Linear(128, 1), nn.Sigmoid())
 
         self.meta_ctrl = MetaPlasticityController(hidden_dim=96) if useMeta else None
 
         self.fusion = nn.Sequential(
             nn.Linear(outputDim + memoryDim, 1024), nn.GELU(),
-            nn.Linear(1024, outputDim)
-        )
+            nn.Linear(1024, outputDim))
+        
         self.norm = nn.LayerNorm(outputDim)
         self.grad_bridge = nn.Parameter(torch.tensor(0.3))
 
@@ -176,8 +181,8 @@ class MemoryExtractor(nn.Module):
 
             B, device = x.size(0), x.device
             
-            if self.h_state.device != device:
-                self.h_state = self.h_state.to(device)
+            if self.h_state.device != B:
+                self.h_state = self.h_state.new_zeros(B, self.ssm_state_dim)
             
             if reset:
                 self.ResetAll()
@@ -304,22 +309,33 @@ class MemoryExtractor(nn.Module):
         self.fast_weights.mul_(self.decay * b.mean()).add_(update)
         
         self._steps_since_svd += 1
+
+        current_fro = torch.norm(self.fast_weights, p='fro').item()
+
+        if len(self.fro_norm_history) >= 100 and self.time_step % 100 == 0:
+            mean_fro = np.mean(self.fro_norm_history)
+            std_fro  = np.std(self.fro_norm_history)
+            self.svd_threshold = mean_fro + 2 * std_fro
+            self.fro_norm_history.clear()
+
+        self.fro_norm_history.append(current_fro)
+
+        need_svd = (
+            self._steps_since_svd >= self.svd_interval
+            or current_fro > self.svd_threshold)
         
-        if self._steps_since_svd >= self.svd_interval:
-            self._steps_since_svd = 0  
-            
-            with torch.autocast(device_type=self.fast_weights.device.type, enabled=False):
-                fw_fp32 = self.fast_weights.float()
+        if need_svd:
 
-                fw_fp32 = fw_fp32 + 1e-4 * torch.eye(fw_fp32.size(0), device=fw_fp32.device,dtype=fw_fp32.dtype)
+            self._steps_since_svd = 0
 
-                U, S, Vh = torch.linalg.svd(fw_fp32, full_matrices=False)
-                
-                S_clamped = torch.clamp(S, self.svd_min, self.svd_max)
-                diag_S = torch.diag(S_clamped)
-                
-                fw_proj = U @ diag_S @ Vh
-                self.fast_weights.copy_(fw_proj.to(self.fast_weights.dtype))
+            fw = self.fast_weights.float()
+
+            fw += 1e-6 * torch.eye(fw.size(0), device=fw.device)
+
+            U, S, Vh = torch.linalg.svd(fw, full_matrices=False)
+            S = torch.clamp(S, self.svd_min, self.svd_max)
+            fw_proj = U @ torch.diag(S) @ Vh
+            self.fast_weights.copy_(fw_proj.to(self.fast_weights.dtype))
 
     @torch.no_grad()
     def KvWrite(self, key: torch.Tensor, val: torch.Tensor, importance: torch.Tensor) -> None:
@@ -399,8 +415,9 @@ class MemoryExtractor(nn.Module):
             top_sim, top_idx = torch.topk(sim, k, dim=-1)
             
             th = top_sim.mean(dim=-1, keepdim=True) - 0.5 * top_sim.std(dim=-1, keepdim=True)
-            th = torch.where(torch.isfinite(th), th, torch.zeros_like(th))  
-            top_sim = top_sim * (top_sim > th)
+            th = torch.clamp(th, max=top_sim.min(dim=-1, keepdim = True).values)  
+            mask = top_sim > th
+            top_sim = top_sim * mask
             
             attn_weights = F.softmax(top_sim, dim=-1)
             vals = values[top_idx]
@@ -419,15 +436,13 @@ class MemoryExtractor(nn.Module):
         accessed = (
             (self.memory_steps >= min_step) & 
             (self.memory_steps > 0) &
-            (torch.arange(self.memory_size, device=self.memory_steps.device) < self.memory_filled)
-            )
+            (torch.arange(self.memory_size, device=self.memory_steps.device) < self.memory_filled))
         
         accessed_count = accessed.sum().item()
         
         self.memory_usage = (
             min(1.0, accessed_count / self.memory_filled) 
-            if self.memory_filled > 0 else 0.0
-        )
+            if self.memory_filled > 0 else 0.0)
         
         if self.meta_ctrl:
             self.meta_ctrl.UpdateMemoryUtilization(self.memory_usage)
