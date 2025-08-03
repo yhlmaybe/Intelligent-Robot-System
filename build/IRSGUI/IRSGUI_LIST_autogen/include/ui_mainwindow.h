@@ -30,6 +30,7 @@ class Ui_MainWindow
 public:
     QAction *actionJoint_Datas;
     QAction *actionEnd_Effector_Datas;
+    QAction *actionBrainDeepLearn_Setting;
     QWidget *centralWidget;
     QGridLayout *gridLayout;
     QPushButton *start_Button;
@@ -51,6 +52,7 @@ public:
     QLineEdit *ServoNo_LineEdit;
     QMenuBar *menuBar;
     QMenu *menuTools;
+    QMenu *menuDeepLearn;
 
     void setupUi(QMainWindow *MainWindow)
     {
@@ -61,6 +63,8 @@ public:
         actionJoint_Datas->setObjectName(QString::fromUtf8("actionJoint_Datas"));
         actionEnd_Effector_Datas = new QAction(MainWindow);
         actionEnd_Effector_Datas->setObjectName(QString::fromUtf8("actionEnd_Effector_Datas"));
+        actionBrainDeepLearn_Setting = new QAction(MainWindow);
+        actionBrainDeepLearn_Setting->setObjectName(QString::fromUtf8("actionBrainDeepLearn_Setting"));
         centralWidget = new QWidget(MainWindow);
         centralWidget->setObjectName(QString::fromUtf8("centralWidget"));
         gridLayout = new QGridLayout(centralWidget);
@@ -179,12 +183,16 @@ public:
         menuBar->setGeometry(QRect(0, 0, 809, 22));
         menuTools = new QMenu(menuBar);
         menuTools->setObjectName(QString::fromUtf8("menuTools"));
+        menuDeepLearn = new QMenu(menuBar);
+        menuDeepLearn->setObjectName(QString::fromUtf8("menuDeepLearn"));
         MainWindow->setMenuBar(menuBar);
 
         menuBar->addAction(menuTools->menuAction());
+        menuBar->addAction(menuDeepLearn->menuAction());
         menuTools->addSeparator();
         menuTools->addAction(actionJoint_Datas);
         menuTools->addAction(actionEnd_Effector_Datas);
+        menuDeepLearn->addAction(actionBrainDeepLearn_Setting);
 
         retranslateUi(MainWindow);
 
@@ -196,6 +204,7 @@ public:
         MainWindow->setWindowTitle(QApplication::translate("MainWindow", "MainWindow", nullptr));
         actionJoint_Datas->setText(QApplication::translate("MainWindow", "Joint Datas", nullptr));
         actionEnd_Effector_Datas->setText(QApplication::translate("MainWindow", "End Effector Datas", nullptr));
+        actionBrainDeepLearn_Setting->setText(QApplication::translate("MainWindow", "Setting", nullptr));
         start_Button->setText(QApplication::translate("MainWindow", "Start", nullptr));
         SetServoNo_Button->setText(QApplication::translate("MainWindow", "SetServoNo", nullptr));
         jointName_label->setText(QApplication::translate("MainWindow", "Joint Name", nullptr));
@@ -209,6 +218,7 @@ public:
         Initiate_Button->setText(QApplication::translate("MainWindow", "Initiate", nullptr));
         jointPosition_label->setText(QApplication::translate("MainWindow", "Joint Position", nullptr));
         menuTools->setTitle(QApplication::translate("MainWindow", "Tools", nullptr));
+        menuDeepLearn->setTitle(QApplication::translate("MainWindow", "DeepLearn", nullptr));
     } // retranslateUi
 
 };

@@ -6,11 +6,11 @@ import torch.nn.functional as F
 
 
 class CriticForward(NamedTuple):
-    value:       torch.Tensor            # [B]
-    tdError:     Optional[torch.Tensor]  # [B] or None
-    tdErrorDe:   Optional[torch.Tensor]  # [B] or None (detach)
-    entropy:     Optional[torch.Tensor]  # Actor‑side entropy, for logging
-    uncertainty: Optional[torch.Tensor]  # σ_V (if head enabled)
+    value: torch.Tensor  # [B]
+    tdError: Optional[torch.Tensor] # [B] or None
+    tdErrorDe: Optional[torch.Tensor] # [B] or None (detach)
+    entropy: Optional[torch.Tensor] # Actor‑side entropy, for logging
+    uncertainty: Optional[torch.Tensor] # σ_V (if head enabled)
 
 
 
@@ -18,8 +18,8 @@ class ValueEstimationExtractor(nn.Module):
     #Evaluate the value of the previous step based on the data of the previous step, and thereby regulate the current step 
     def __init__(self,
                  memoryDim: int = 768,
-                 attnDim:   int = 512,
-                 stateDim:  int = 256,
+                 attnDim: int = 512,
+                 stateDim: int = 256,
                  *,
                  hiddenDim: int = 512,
                  gamma: float = 0.99,
@@ -46,11 +46,11 @@ class ValueEstimationExtractor(nn.Module):
 
     #returns CriticForward
     def forward(self,
-                memoryOut: torch.Tensor,      # (B,768)  from pre-menory
-                attnOut:   torch.Tensor,      # (B,512)  from pre-attn
-                stateFeat: torch.Tensor,      # (B,256)  from world state
+                memoryOut: torch.Tensor, # (B,768)  from pre-menory
+                attnOut: torch.Tensor, # (B,512)  from pre-attn
+                stateFeat: torch.Tensor, # (B,256)  from world state
                 *,
-                policyEntropy: Optional[torch.Tensor] = None,  # from pre-decision
+                policyEntropy: Optional[torch.Tensor] = None, # from pre-decision
                 reward: Optional[torch.Tensor] = None,
                 nextValue: Optional[torch.Tensor] = None,
                 done: Optional[torch.Tensor] = None) -> CriticForward:
@@ -77,10 +77,12 @@ class ValueEstimationExtractor(nn.Module):
             loss_elem = F.smooth_l1_loss(vPred, target, reduction="none")
         else:
             loss_elem = F.mse_loss(vPred, target, reduction="none")
+
         if clipDelta is not None:
             v_clip = vPred + (vPred - vPred.detach()).clamp(-clipDelta, clipDelta)
             loss_clip = F.mse_loss(v_clip, target, reduction="none")
             loss_elem = torch.max(loss_elem, loss_clip)
+            
         return loss_elem.mean()
 
 
@@ -118,7 +120,7 @@ class ValueEstimationExtractor(nn.Module):
     @classmethod
     def Load(cls, path: str, mapLocation: Optional[str] = None) -> "ValueEstimationExtractor":
         ckpt = torch.load(path, map_location=mapLocation)
-        model = cls(gamma=ckpt["gamma"], use_layer_norm=ckpt["use_layer_norm"], value_loss_type=ckpt["value_loss_type"],
-                    memory_dim=768, attn_dim=512, state_dim=256)  # supply dims as used
+        model = cls(gamma=ckpt["gamma"], useLayerNorm=ckpt["use_layer_norm"], valueLossType=ckpt["value_loss_type"],
+                    memoryDim=768, attnDim=512, stateDim=256)  # supply dims as used
         model.load_state_dict(ckpt["state_dict"], strict=False)
         return model

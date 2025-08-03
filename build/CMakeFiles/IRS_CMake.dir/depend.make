@@ -11,6 +11,8 @@ CMakeFiles/IRS_CMake.dir/IRSParametersData.cpp.o: ../include/IRSParametersData.h
 CMakeFiles/IRS_CMake.dir/MsgManager.cpp.o: ../MsgManager.cpp
 CMakeFiles/IRS_CMake.dir/MsgManager.cpp.o: ../include/MsgManager.h
 
+CMakeFiles/IRS_CMake.dir/main.cpp.o: ../BrainDeepLearn/Interface.h
+CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSGUI/BrainDeepLearnForm.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSGUI/EndEffectorDatasForm.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSGUI/JointDatasForm.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o: ../IRSGUI/mainwindow.h

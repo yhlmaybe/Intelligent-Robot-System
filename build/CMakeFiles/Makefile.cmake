@@ -7,6 +7,7 @@ set(CMAKE_DEPENDS_GENERATOR "Unix Makefiles")
 # The top level Makefile was generated from the following files:
 set(CMAKE_MAKEFILE_DEPENDS
   "CMakeCache.txt"
+  "../BrainDeepLearn/CMakeLists.txt"
   "../CMakeLists.txt"
   "../IRSGUI/CMakeLists.txt"
   "../IRSManager/CMakeLists.txt"
@@ -1080,6 +1081,7 @@ set(CMAKE_MAKEFILE_PRODUCTS
   "CPackSourceConfig.cmake"
   "CMakeFiles/CMakeDirectoryInformation.cmake"
   "ServoControl/CMakeFiles/CMakeDirectoryInformation.cmake"
+  "BrainDeepLearn/CMakeFiles/CMakeDirectoryInformation.cmake"
   "IRSGUI/CMakeFiles/CMakeDirectoryInformation.cmake"
   "IRSManager/CMakeFiles/CMakeDirectoryInformation.cmake"
   "MathematicalTool/CMakeFiles/CMakeDirectoryInformation.cmake"
@@ -1117,6 +1119,7 @@ set(CMAKE_DEPEND_INFO_FILES
   "CMakeFiles/ContinuousSubmit.dir/DependInfo.cmake"
   "CMakeFiles/IRS_CMake.dir/DependInfo.cmake"
   "ServoControl/CMakeFiles/SC_LIST.dir/DependInfo.cmake"
+  "BrainDeepLearn/CMakeFiles/BRAINDEEPLEARN_LIST.dir/DependInfo.cmake"
   "IRSGUI/CMakeFiles/IRSGUI_LIST.dir/DependInfo.cmake"
   "IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/DependInfo.cmake"
   "IRSManager/CMakeFiles/intelligent_robot_system_uninstall.dir/DependInfo.cmake"

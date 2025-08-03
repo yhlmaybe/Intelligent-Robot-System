@@ -580,6 +580,19 @@ SC_LIST/fast:
 .PHONY : SC_LIST/fast
 
 #=============================================================================
+# Target rules for targets named BRAINDEEPLEARN_LIST
+
+# Build rule for target.
+BRAINDEEPLEARN_LIST: cmake_check_build_system
+	$(MAKE) -f CMakeFiles/Makefile2 BRAINDEEPLEARN_LIST
+.PHONY : BRAINDEEPLEARN_LIST
+
+# fast build rule for target.
+BRAINDEEPLEARN_LIST/fast:
+	$(MAKE) -f BrainDeepLearn/CMakeFiles/BRAINDEEPLEARN_LIST.dir/build.make BrainDeepLearn/CMakeFiles/BRAINDEEPLEARN_LIST.dir/build
+.PHONY : BRAINDEEPLEARN_LIST/fast
+
+#=============================================================================
 # Target rules for targets named IRSGUI_LIST
 
 # Build rule for target.
@@ -810,6 +823,7 @@ help:
 	@echo "... ContinuousSubmit"
 	@echo "... IRS_CMake"
 	@echo "... SC_LIST"
+	@echo "... BRAINDEEPLEARN_LIST"
 	@echo "... IRSGUI_LIST"
 	@echo "... IRSGUI_LIST_autogen"
 	@echo "... intelligent_robot_system_uninstall"

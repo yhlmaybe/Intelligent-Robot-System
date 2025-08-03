@@ -219,6 +219,33 @@ IRSGUI_LIST_autogen/fast:
 	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/build
 .PHONY : IRSGUI_LIST_autogen/fast
 
+BrainDeepLearnForm.o: BrainDeepLearnForm.cpp.o
+
+.PHONY : BrainDeepLearnForm.o
+
+# target to build an object file
+BrainDeepLearnForm.cpp.o:
+	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/BrainDeepLearnForm.cpp.o
+.PHONY : BrainDeepLearnForm.cpp.o
+
+BrainDeepLearnForm.i: BrainDeepLearnForm.cpp.i
+
+.PHONY : BrainDeepLearnForm.i
+
+# target to preprocess a source file
+BrainDeepLearnForm.cpp.i:
+	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/BrainDeepLearnForm.cpp.i
+.PHONY : BrainDeepLearnForm.cpp.i
+
+BrainDeepLearnForm.s: BrainDeepLearnForm.cpp.s
+
+.PHONY : BrainDeepLearnForm.s
+
+# target to generate assembly for a file
+BrainDeepLearnForm.cpp.s:
+	cd /home/yhl/Documents/Intelligent-Robot-System/build && $(MAKE) -f IRSGUI/CMakeFiles/IRSGUI_LIST.dir/build.make IRSGUI/CMakeFiles/IRSGUI_LIST.dir/BrainDeepLearnForm.cpp.s
+.PHONY : BrainDeepLearnForm.cpp.s
+
 EndEffectorDatasForm.o: EndEffectorDatasForm.cpp.o
 
 .PHONY : EndEffectorDatasForm.o
@@ -344,6 +371,9 @@ help:
 	@echo "... package"
 	@echo "... IRSGUI_LIST"
 	@echo "... IRSGUI_LIST_autogen"
+	@echo "... BrainDeepLearnForm.o"
+	@echo "... BrainDeepLearnForm.i"
+	@echo "... BrainDeepLearnForm.s"
 	@echo "... EndEffectorDatasForm.o"
 	@echo "... EndEffectorDatasForm.i"
 	@echo "... EndEffectorDatasForm.s"

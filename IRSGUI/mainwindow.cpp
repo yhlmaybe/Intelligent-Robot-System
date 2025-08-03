@@ -25,6 +25,9 @@ void IRS_XML_MESSAGE(std::string message, MessageFunction fun)
     case MessageFunction::EndEffectorDatas:
         functionName = "SetEndEffectorDatasFormDatas";
         break;
+    case MessageFunction::BrainDeepLearnFormDatas:
+        functionName = "SetBrainDeepLearnFormDatas";
+        break;
     default:
         functionName = "SetMessage";
     }
@@ -63,9 +66,8 @@ Ui::MainWindow* MainWindow::GetUI()
 
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
-    ui(new Ui::MainWindow),
-    joint_datas_form(new JointDatasForm()),
-    end_effector_datas_form(new EndEffectorDatasForm())
+    ui(new Ui::MainWindow)
+
 {
     if(!QSharedMemory("IRSUniqueKey").create(1))
     {
@@ -75,16 +77,24 @@ MainWindow::MainWindow(QWidget *parent) :
     }
     ui->setupUi(this);
 
-    forms.push_back(joint_datas_form);
-    forms.push_back(end_effector_datas_form);
-
     Initiate();
 
+    joint_datas_form = new JointDatasForm();
+    end_effector_datas_form = new EndEffectorDatasForm();
+    brain_deep_learn_form = new BrainDeepLearnForm();
+
+    forms.push_back(joint_datas_form);
+    forms.push_back(end_effector_datas_form);
+    forms.push_back(brain_deep_learn_form);
+
+    
     connect(this, &MainWindow::SetJointDatasFormDatas, joint_datas_form, &JointDatasForm::AddData);
     connect(this, &MainWindow::SetEndEffectorDatasFormDatas, end_effector_datas_form, &EndEffectorDatasForm::AddData);
+    connect(this, &MainWindow::SetBrainDeepLearnFormDatas, brain_deep_learn_form, &BrainDeepLearnForm::AddData);
 
     connect(ui->actionJoint_Datas, &QAction::triggered, this, &MainWindow::OpenJointDatasForm);
     connect(ui->actionEnd_Effector_Datas, &QAction::triggered, this, &MainWindow::OpenEndEffectDatasForm);
+    connect(ui->actionBrainDeepLearn_Setting, &QAction::triggered, this, &MainWindow::OpenBrainDeepLearnForm);
 
     connect(ui->SetServoNo_Button, SIGNAL(clicked()), this, SLOT(SetServoNo()));
     connect(ui->GetServoNo_Button, SIGNAL(clicked()), this, SLOT(GetServoNo()));
@@ -155,6 +165,10 @@ void MainWindow::OpenEndEffectDatasForm()
     end_effector_datas_form->show();
 }
 
+void MainWindow::OpenBrainDeepLearnForm()
+{
+    brain_deep_learn_form->show();
+}
 
 void MainWindow::SetServoNo()
 {

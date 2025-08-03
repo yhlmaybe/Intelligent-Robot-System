@@ -12,6 +12,8 @@ CMakeFiles/IRS_CMake.dir/MsgManager.cpp.o
  /home/yhl/Documents/Intelligent-Robot-System/MsgManager.cpp
  /home/yhl/Documents/Intelligent-Robot-System/include/MsgManager.h
 CMakeFiles/IRS_CMake.dir/main.cpp.o
+ ../BrainDeepLearn/Interface.h
+ ../IRSGUI/BrainDeepLearnForm.h
  ../IRSGUI/EndEffectorDatasForm.h
  ../IRSGUI/JointDatasForm.h
  ../IRSGUI/mainwindow.h

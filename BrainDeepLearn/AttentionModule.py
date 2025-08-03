@@ -338,8 +338,8 @@ class MetaStrategySelector(nn.Module):
         self.generator = nn.Sequential(
             nn.Linear(embedDim, embedDim * 2),
             nn.GELU(),
-            nn.Linear(embedDim * 2, numHeads * numStrategies),
-        )
+            nn.Linear(embedDim * 2, numHeads * numStrategies),)
+        
         self.register_buffer("strategy_weights", torch.zeros(numHeads, numStrategies))
         self.ResetParameters()
 
@@ -377,6 +377,7 @@ class AttentionExtractor(nn.Module):
                  gradientClipVal: float = 1.0,
                  checkPoint: bool = True):
         super().__init__()
+
         assert embedDim % 16 == 0, "AttentionModule embed_dim must be divisible by 16 (for 16 capsules)"
 
         self.use_meta_learning = useMetaLearning
@@ -414,10 +415,10 @@ class AttentionExtractor(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                                # (B,S,E)
+        x: torch.Tensor, # (B,S,E)
         keyPaddingMask: Optional[torch.Tensor] = None,
-        tdError: Optional[torch.Tensor] = None,         # (B,) or scalar
-        ) -> torch.Tensor:
+        tdError: Optional[torch.Tensor] = None,) -> torch.Tensor: # (B,) or scalar
+        
 
         B, S, E = x.shape
 
@@ -456,8 +457,8 @@ class AttentionExtractor(nn.Module):
         routed = self.routing(caps, caps_mask)  # (B,4,E)
 
         # Fusion of different representations
-        routed_mean = routed.mean(dim=1)        # (B,E)
-        temp_mean = h.mean(dim=1)               # (B,E)
+        routed_mean = routed.mean(dim=1) # (B,E)
+        temp_mean = h.mean(dim=1) # (B,E)
         
         fusion_in = torch.stack([
             temp_mean, 

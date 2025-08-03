@@ -32,6 +32,14 @@ tuple
 MsgManager.h
 ../include/MsgManager.h
 
+/home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreManager.cpp
+IRSCoreManager.h
+/home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreManager.h
+
+/home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreManager.h
+IRSCoreModule.h
+/home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreModule.h
+
 /home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreModule.cpp
 IRSCoreModule.h
 /home/yhl/Documents/Intelligent-Robot-System/IRSManager/IRSCoreModule.h

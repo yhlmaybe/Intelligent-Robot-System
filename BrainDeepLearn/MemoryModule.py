@@ -56,22 +56,22 @@ class MemoryExtractor(nn.Module):
     """State-Space backbone + Hebbian fast weights + KV memory + optional meta-controller."""
     def __init__(
         self,
-        inputDim: int = 512,              # Dimension of input features
-        ssmStateDim: int = 512,           # Dimension of SSM hidden state
-        memoryDim: int = 768,             # Dimension of memory keys/values
-        memorySize: int = 200,            # Capacity of the key-value memory
-        outputDim: int = 768,             # Dimension of output features
-        hebbAlpha: float = 0.15,          # Base learning rate for Hebbian updates
-        decayFactor: float = 0.95,        # Base decay rate for fast weights
-        topk: int = 8,                    # Number of top memories to retrieve
-        tdScale: float = 5.0,             # Scaling factor for TD-error neuromodulation
-        softBeta: float = 0.2,            # Decay factor for soft reset
-        useMeta: bool = True,             # Whether to use meta-plasticity controller
-        compressThreshold: float = 0.75,  # Memory fill ratio threshold for compression
-        useAmp: bool = True,              # Whether to use automatic mixed precision
-        svdInterval: int = 10,            # Steps between SVD normalizations
-        svdMin: float = 0.1,              # Minimum value for singular value clipping
-        svdMax: float = 1.5) -> None:     # Maximum value for singular value clipping
+        inputDim: int = 512, # Dimension of input features
+        ssmStateDim: int = 512, # Dimension of SSM hidden state
+        memoryDim: int = 768, # Dimension of memory keys/values
+        memorySize: int = 200, # Capacity of the key-value memory
+        outputDim: int = 768, # Dimension of output features
+        hebbAlpha: float = 0.15, # Base learning rate for Hebbian updates
+        decayFactor: float = 0.95, # Base decay rate for fast weights
+        topk: int = 8, # Number of top memories to retrieve
+        tdScale: float = 5.0, # Scaling factor for TD-error neuromodulation
+        softBeta: float = 0.2, # Decay factor for soft reset
+        useMeta: bool = True, # Whether to use meta-plasticity controller
+        compressThreshold: float = 0.75, # Memory fill ratio threshold for compression
+        useAmp: bool = True, # Whether to use automatic mixed precision
+        svdInterval: int = 10, # Steps between SVD normalizations
+        svdMin: float = 0.1, # Minimum value for singular value clipping
+        svdMax: float = 1.5) -> None: # Maximum value for singular value clipping
 
         super().__init__()
         self.ssm_state_dim = ssmStateDim
@@ -164,14 +164,14 @@ class MemoryExtractor(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                            # Input features [B, inputDim]
+        x: torch.Tensor,  # Input features [B, inputDim]
         *,
-        tdError: Optional[torch.Tensor] = None,     # Temporal difference error [B]
-        entropy:   Optional[torch.Tensor] = None,   # Policy entropy [B]
-        reward:    Optional[torch.Tensor] = None,   # Immediate reward [B]
+        tdError: Optional[torch.Tensor] = None, # Temporal difference error [B]
+        entropy: Optional[torch.Tensor] = None, # Policy entropy [B]
+        reward: Optional[torch.Tensor] = None, # Immediate reward [B]
         uncertainty: Optional[torch.Tensor] = None, # Agent uncertainty [B]
-        reset: bool = False,                        # All reset 
-        softReset: bool = False,                    # Soft(Part) reset 
+        reset: bool = False, # All reset 
+        softReset: bool = False, # Soft(Part) reset 
         ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         amp_enable = self.use_amp and x.is_cuda
@@ -529,8 +529,8 @@ class MemoryExtractor(nn.Module):
         self.memory_importance.copy_(state["memory_importance"])
         self.memory_corr.copy_(state["memory_corr"])
         self.memory_steps.copy_(state["memory_steps"])
-        self.mem_ptr       = int(state["mem_ptr"].item())
-        self.time_step     = int(state["time_step"].item())
+        self.mem_ptr = int(state["mem_ptr"].item())
+        self.time_step = int(state["time_step"].item())
         self.memory_filled = int(state["memory_filled"].item())
         if self.meta_ctrl and state["meta_ctrl"] is not None:
             self.meta_ctrl.h_state.copy_(state["meta_ctrl"])

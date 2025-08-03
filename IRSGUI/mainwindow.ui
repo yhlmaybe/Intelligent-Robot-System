@@ -192,7 +192,14 @@
     <addaction name="actionJoint_Datas"/>
     <addaction name="actionEnd_Effector_Datas"/>
    </widget>
+   <widget class="QMenu" name="menuDeepLearn">
+    <property name="title">
+     <string>DeepLearn</string>
+    </property>
+    <addaction name="actionBrainDeepLearn_Setting"/>
+   </widget>
    <addaction name="menuTools"/>
+   <addaction name="menuDeepLearn"/>
   </widget>
   <action name="actionJoint_Datas">
    <property name="text">
@@ -202,6 +209,11 @@
   <action name="actionEnd_Effector_Datas">
    <property name="text">
     <string>End Effector Datas</string>
+   </property>
+  </action>
+  <action name="actionBrainDeepLearn_Setting">
+   <property name="text">
+    <string>Setting</string>
    </property>
   </action>
  </widget>

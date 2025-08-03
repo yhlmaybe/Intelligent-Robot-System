@@ -1,0 +1,2 @@
+/usr/bin/ar qc libBRAINDEEPLEARN_LIST.a  CMakeFiles/BRAINDEEPLEARN_LIST.dir/Interface.cpp.o
+/usr/bin/ranlib libBRAINDEEPLEARN_LIST.a

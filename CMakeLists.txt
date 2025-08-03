@@ -63,11 +63,13 @@ target_link_libraries(IRS_CMake /usr/lib/aarch64-linux-gnu/libccd.so.2)
 target_link_libraries(IRS_CMake pugixml)
 
 target_link_libraries(IRS_CMake SC_LIST)
+target_link_libraries(IRS_CMake BRAINDEEPLEARN_LIST)
 target_link_libraries(IRS_CMake IRSGUI_LIST)
 target_link_libraries(IRS_CMake IRSMANAGER_LIST)
 target_link_libraries(IRS_CMake MATHEMATICALTOOL_LIST)
   
 add_subdirectory(ServoControl)
+add_subdirectory(BrainDeepLearn)
 add_subdirectory(IRSGUI)
 add_subdirectory(IRSManager)
 add_subdirectory(MathematicalTool)

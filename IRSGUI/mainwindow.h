@@ -13,6 +13,7 @@
 #include "../include/IRSFunction.h"
 #include "JointDatasForm.h"
 #include "EndEffectorDatasForm.h"
+#include "BrainDeepLearnForm.h"
 
 namespace Ui {
 class MainWindow;
@@ -29,6 +30,7 @@ public:
 signals:
     void SetJointDatasFormDatas(QString QMessage);
     void SetEndEffectorDatasFormDatas(QString QMessage);
+    void SetBrainDeepLearnFormDatas(QString QMessage);
 
 private:
     explicit MainWindow(QWidget *parent = 0);
@@ -47,6 +49,8 @@ private:
 
     EndEffectorDatasForm *end_effector_datas_form;
 
+    BrainDeepLearnForm *brain_deep_learn_form;
+
     mutable std::mutex message_mtx;
 
     bool is_running = false;
@@ -62,6 +66,8 @@ private slots:
     void OpenJointDatasForm();
 
     void OpenEndEffectDatasForm();
+
+    void OpenBrainDeepLearnForm();
 
     void SetServoNo();
 

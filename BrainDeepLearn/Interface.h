@@ -1,3 +1,6 @@
+#ifndef BRAINDEEPLEARNINTERFACE_H
+#define BRAINDEEPLEARNINTERFACE_H
+
 #include <python3.8/Python.h>
 #include <string>
 #include <thread>
@@ -7,6 +10,9 @@
 #include <stdexcept>
 #include <memory>
 #include <cstdio>
+#include <mutex>
+#include <atomic>
+#include <string_view>
 
 #define CALL_METHOD_RET_BOOL(name, fmt, ...) \
     ([&]{ \
@@ -36,7 +42,7 @@ class BrainDeepLearnInterface
 public:
     using StatusValue = boost::variant<int, double, std::string>;
     using StatusMap = std::map<std::string, StatusValue>;
-    using PrintCB = std::function<void(std::string&)>;
+    using PrintCB = std::function<void(std::string)>;
 
     BrainDeepLearnInterface();
     ~BrainDeepLearnInterface();
@@ -50,13 +56,22 @@ public:
 
     bool GetTrainingStatus(StatusMap& status);
 
+    bool TestPerceptionModule();
+
 private:
+
     PyObject* pModule = nullptr;
     PyObject* pManagerObj = nullptr;
     PrintCB printCb;
     PyObject* pRedirectObj = nullptr;
 
+    PyObject* originalStdout = nullptr;  
+    PyObject* originalStderr = nullptr;  
+
     void Init();
     bool InstallRedirect();
     void UninstallRedirect();
 };
+
+
+#endif  

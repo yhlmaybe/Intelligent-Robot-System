@@ -46,6 +46,16 @@
 /home/yhl/Documents/Intelligent-Robot-System/build/ServoControl/CMakeFiles/rebuild_cache.dir
 /home/yhl/Documents/Intelligent-Robot-System/build/ServoControl/CMakeFiles/package.dir
 /home/yhl/Documents/Intelligent-Robot-System/build/ServoControl/CMakeFiles/SC_LIST.dir
+/home/yhl/Documents/Intelligent-Robot-System/build/BrainDeepLearn/CMakeFiles/install/local.dir
+/home/yhl/Documents/Intelligent-Robot-System/build/BrainDeepLearn/CMakeFiles/edit_cache.dir
+/home/yhl/Documents/Intelligent-Robot-System/build/BrainDeepLearn/CMakeFiles/test.dir
+/home/yhl/Documents/Intelligent-Robot-System/build/BrainDeepLearn/CMakeFiles/package_source.dir
+/home/yhl/Documents/Intelligent-Robot-System/build/BrainDeepLearn/CMakeFiles/install.dir
+/home/yhl/Documents/Intelligent-Robot-System/build/BrainDeepLearn/CMakeFiles/list_install_components.dir
+/home/yhl/Documents/Intelligent-Robot-System/build/BrainDeepLearn/CMakeFiles/rebuild_cache.dir
+/home/yhl/Documents/Intelligent-Robot-System/build/BrainDeepLearn/CMakeFiles/package.dir
+/home/yhl/Documents/Intelligent-Robot-System/build/BrainDeepLearn/CMakeFiles/install/strip.dir
+/home/yhl/Documents/Intelligent-Robot-System/build/BrainDeepLearn/CMakeFiles/BRAINDEEPLEARN_LIST.dir
 /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI/CMakeFiles/install/strip.dir
 /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI/CMakeFiles/install/local.dir
 /home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI/CMakeFiles/edit_cache.dir

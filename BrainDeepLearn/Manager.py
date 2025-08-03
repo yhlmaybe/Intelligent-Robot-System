@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Tuple, List, Dict, Any, Optional, Union
-from PerceptionModule import PerceiveExtractor, PerceiveExtractorMetaWrapper
+from PerceptionModule import PerceiveExtractor, TestPerceptionModule
 from AttentionModule import AttentionExtractor
 from MemoryModule import MemoryExtractor
 from DecisionModule import DecisionExtractor, KEYBOARD_LAYOUT
@@ -32,7 +32,7 @@ class BrainCore(nn.Module):
         self.perc_seq = None
 
         base = PerceiveExtractor(useHebbian=plastic_hebbian)
-        self.perc = (PerceiveExtractorMetaWrapper(base) if plastic_meta else base)
+        self.perc = base
         if hasattr(self.perc, "plastic_on"):
             self.perc.plastic_on = plastic_meta
 
@@ -45,9 +45,9 @@ class BrainCore(nn.Module):
             if hasattr(m, "hebbian_on"):
                 m.hebbian_on = plastic_hebbian
 
-        self.world  = WorldModelSeqRNN()
+        self.world = WorldModelSeqRNN()
         self.critic = ValueEstimationExtractor()
-        self.act_enc= ActionEncoder()
+
         self.ResetBuffers()
 
     def ResetBuffers(self, B: int = 1, device: Optional[torch.device] = None):
@@ -56,8 +56,10 @@ class BrainCore(nn.Module):
 
         self.prev_mem = z(768) 
         self.prev_attn = z(512)        
-        self.prev_state = z(256)    
-        self.prev_act = z(128)        
+        self.prev_state = z(256)
+
+        self.prev_keysOnehot = z(128)
+        self.prev_mouseDelta = z(2)  
 
         self.prev_rew = z(1)       
         self.prev_done = z(1)
@@ -96,7 +98,7 @@ class BrainCore(nn.Module):
         self.Write(feat_p)
         seq = self.Seq(self.SEQ_LEN)
 
-        state = self.world(seq.detach(), self.prev_act.detach())
+        state = self.world(seq.detach(), self.prev_keysOnehot.detach(), self.prev_mouseDelta.detach(), reset = not self.have_prev)
 
         if self.have_prev:
             cf = self.critic(
@@ -124,16 +126,18 @@ class BrainCore(nn.Module):
             uncertainty=unc_prev,)
 
         out = self.actor(feat_m)
-
-        kb_vec = self.actor.kb.ToKeyboardVector(out["keyboard"],False).to(dev)
-        act_emb= self.act_enc(kb_vec, out["mouse"])
         
-        value,_,_ = self.critic(feat_m, feat_a, state)
+        kb_vec = self.actor.kb.ToKeyboardVector(out["keyboard"],False).to(dev)
+        mouse_delta, mouse_click_p = self.actor.mouse.ToMouseAction(out["mouse"],False).to(dev)
+
+        key_mouse_act = torch.cat([kb_vec, mouse_click_p], dim = 1)
+        
+        value = self.critic(feat_m, feat_a, state)
 
         self.prev_mem,self.prev_attn,self.prev_state = feat_m.detach(), feat_a.detach(), state.detach()
-        self.prev_act,self.prev_rew,self.prev_done = act_emb.detach(), reward.detach(), done.float()
+        self.prev_keysOnehot,self. prev_mouseDelta,self.prev_rew,self.prev_done = key_mouse_act.detach(),mouse_delta.detach() , reward.detach(), done.float()
 
-        self.prev_ent  = out["entropy"].detach()
+        self.prev_ent = out["entropy"].detach()
         self.have_prev=True
         return out, state.detach(), value.detach()
 
@@ -250,7 +254,7 @@ class Agent:
             s_enc = self.brain.perc(fr)
         act_emb = self.brain.act_enc(kb, ms)
 
-        pred_s, pred_r, pred_d = self.brain.world.ForwardTrain(s_enc.detach(), act_emb, return_predictions=True)
+        pred_s, pred_r, pred_d = self.brain.world.ForwardTrain(s_enc.detach(), act_emb)
         
         w_loss = (F.mse_loss(pred_s, st) + F.mse_loss(pred_r, rw) + 0.1 * F.binary_cross_entropy_with_logits(pred_d, dn))
         
@@ -328,6 +332,8 @@ class ManagerFunction:
         
         self.training_thread = None
         self.is_training = False
+
+        self.test = Test()
     
     def StartTraining(self, root: str, epochs: int = 5, batchSize: int = 32,  valSplit: float = 0.1, imagineHorizon: int = 5, resume: bool = True):
         if self.is_training:
@@ -723,6 +729,14 @@ class ManagerFunction:
             self.controller.SetStatus("error", f"Deployment error: {str(e)}")
         finally:
             self.deploying = False
+        
+
+    def TestPerceptionModule(self):
+        #self.test.PerceptionModule()
+        print("Hello from Python!")
+        return 10
+
+        
 
 
 
@@ -784,3 +798,13 @@ class TrainingController:
     def RequestResume(self):
         with self.lock:
             self.pause_requested = False
+
+class Test:
+    def __init__(self):
+        pass
+
+    def PerceptionModule():
+        module = TestPerceptionModule()
+        module.TestHebbianConv2d()
+        module.TestHebbianLinear()
+        module.TestPerceiveExtractor()

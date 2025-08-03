@@ -1,0 +1,3 @@
+file(REMOVE_RECURSE
+  "libBRAINDEEPLEARN_LIST.a"
+)

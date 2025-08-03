@@ -1,0 +1,38 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/yhl/Documents/Intelligent-Robot-System/BrainDeepLearn/Interface.cpp
+Interface.h
+/home/yhl/Documents/Intelligent-Robot-System/BrainDeepLearn/Interface.h
+
+/home/yhl/Documents/Intelligent-Robot-System/BrainDeepLearn/Interface.h
+python3.8/Python.h
+-
+string
+-
+thread
+-
+map
+-
+boost/variant.hpp
+-
+functional
+-
+stdexcept
+-
+memory
+-
+cstdio
+-
+mutex
+-
+atomic
+-
+string_view
+-
+

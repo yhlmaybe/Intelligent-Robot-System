@@ -62,13 +62,13 @@ class MetaLearnerBlock(nn.Module):
         
     def forward(self, x: torch.Tensor, mem: Optional[torch.Tensor]):
         if mem is None:
-            seq = x.unsqueeze(1)                                 # (B,1,F)
+            seq = x.unsqueeze(1) # (B,1,F)
         else:
-            seq = torch.cat([mem, x.unsqueeze(1)], dim=1)        # append
-            seq = seq[:, -self.max_len:]                         # truncate
+            seq = torch.cat([mem, x.unsqueeze(1)], dim=1) # append
+            seq = seq[:, -self.max_len:] # truncate
         out, _ = self.rnn(seq)
-        meta = self.to_meta(out[:, -1])                          # last hidden
-        return meta, seq.detach()                                # return new memory (no grad)
+        meta = self.to_meta(out[:, -1]) # last hidden
+        return meta, seq.detach() # return new memory (no grad)
 
 class TextInputDecoder(nn.Module):
     def __init__(self, inDim: int, hidden: int = 64, maxLen: int = 10):
@@ -174,7 +174,7 @@ class KeyboardActionModel(nn.Module):
             "text_mode":  tm_prob,
             "char_logits": char_logits,
             "next_text":  next_txt,
-            "memory":     new_mem,   # <-- feed back to outer loop
+            "memory":     new_mem, 
             "entropy":    entropy}
         
 

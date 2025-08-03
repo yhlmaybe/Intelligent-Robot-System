@@ -126,9 +126,11 @@ IRS_CMake: CMakeFiles/IRS_CMake.dir/main.cpp.o
 IRS_CMake: CMakeFiles/IRS_CMake.dir/build.make
 IRS_CMake: /usr/lib/aarch64-linux-gnu/libccd.so.2
 IRS_CMake: ServoControl/libSC_LIST.a
+IRS_CMake: BrainDeepLearn/libBRAINDEEPLEARN_LIST.a
 IRS_CMake: IRSGUI/libIRSGUI_LIST.a
 IRS_CMake: IRSManager/libIRSMANAGER_LIST.a
 IRS_CMake: MathematicalTool/libMATHEMATICALTOOL_LIST.a
+IRS_CMake: BrainDeepLearn/libBRAINDEEPLEARN_LIST.a
 IRS_CMake: ServoControl/libSC_LIST.a
 IRS_CMake: /opt/ros/foxy/lib/aarch64-linux-gnu/libompl.so
 IRS_CMake: /usr/lib/aarch64-linux-gnu/libpcl_apps.so

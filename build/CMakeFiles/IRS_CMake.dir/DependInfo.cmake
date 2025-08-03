@@ -55,6 +55,7 @@ set(CMAKE_CXX_TARGET_INCLUDE_PATH
 # Targets to which this target links.
 set(CMAKE_TARGET_LINKED_INFO_FILES
   "/home/yhl/Documents/Intelligent-Robot-System/build/ServoControl/CMakeFiles/SC_LIST.dir/DependInfo.cmake"
+  "/home/yhl/Documents/Intelligent-Robot-System/build/BrainDeepLearn/CMakeFiles/BRAINDEEPLEARN_LIST.dir/DependInfo.cmake"
   "/home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI/CMakeFiles/IRSGUI_LIST.dir/DependInfo.cmake"
   "/home/yhl/Documents/Intelligent-Robot-System/build/IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/DependInfo.cmake"
   "/home/yhl/Documents/Intelligent-Robot-System/build/MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/DependInfo.cmake"
