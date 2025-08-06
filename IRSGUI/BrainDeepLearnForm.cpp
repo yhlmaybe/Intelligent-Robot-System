@@ -14,6 +14,7 @@ BrainDeepLearnForm::BrainDeepLearnForm(QWidget *parent) :
 
 
     connect(ui->testPerceptionModule_pushButton, SIGNAL(clicked()), this, SLOT(TestPerceptionModule()));
+    connect(ui->close_pushButton, SIGNAL(clicked()), this, SLOT(CloseForm()));
 }
 
 BrainDeepLearnForm::~BrainDeepLearnForm()

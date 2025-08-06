@@ -342,8 +342,11 @@ void MainWindow::SetGoalPoint()
 void MainWindow::SetPythonMessageToTextBrowser(const char *data, std::size_t len, const std::string &mouduleName)
 {
     std::string str(data, len); 
-    if(mouduleName == "Manager")
+    if(mouduleName == "Manager" || mouduleName == "PerceptionModule")
     {
-        IRS_FORM_MESSAGE(str, MessageFunction::BrainDeepLearnFormDatas);
+        if(!brain_deep_learn_form->isHidden())
+        {
+            IRS_FORM_MESSAGE(str, MessageFunction::BrainDeepLearnFormDatas);
+        }
     }
 }

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Tuple, List, Dict, Any, Optional, Union
-from PerceptionModule import PerceiveExtractor, TestPerceptionModule
+from PerceptionModule import PerceiveExtractor, TestPerceptionMTool
 from AttentionModule import AttentionExtractor
 from MemoryModule import MemoryExtractor
 from DecisionModule import DecisionExtractor, KEYBOARD_LAYOUT
@@ -319,6 +319,78 @@ class OfflineGameDataset(Dataset):
         keys: np.ndarray = np.load(self.keys[idx]).astype(np.float32)  # (104,)
         mouse: np.ndarray = np.load(self.mouse[idx]).astype(np.float32)  # (2,)
         return img, keys, mouse
+
+
+class TrainingController:
+    def __init__(self):
+        self.command_queue = collections.deque(maxlen=10)
+        self.status = {
+            "state": "idle", 
+            "epoch": 0,
+            "total_epochs": 0,
+            "batch": 0,
+            "total_batches": 0,
+            "train_loss": 0.0,
+            "val_loss": 0.0,
+            "message": "Wait for the training to start"}
+        
+        self.lock = threading.Lock()
+        self.stop_requested = False
+        self.pause_requested = False
+    
+    def SetStatus(self, state, message, **kwargs):
+        with self.lock:
+            self.status["state"] = state
+            self.status["message"] = message
+            for key, value in kwargs.items():
+                if key in self.status:
+                    self.status[key] = value
+    
+    def GetStatus(self):
+        with self.lock:
+            return self.status.copy()
+    
+    def AddCommand(self, command):
+        with self.lock:
+            self.command_queue.append(command)
+    
+    def CheckCommand(self):
+        with self.lock:
+            if self.command_queue:
+                return self.command_queue.popleft()
+            return None
+    
+    def ShouldStop(self):
+        with self.lock:
+            return self.stop_requested
+    
+    def ShouldPause(self):
+        with self.lock:
+            return self.pause_requested
+    
+    def RequestStop(self):
+        with self.lock:
+            self.stop_requested = True
+    
+    def RequestPause(self):
+        with self.lock:
+            self.pause_requested = True
+    
+    def RequestResume(self):
+        with self.lock:
+            self.pause_requested = False
+
+class Test:
+    def __init__(self):
+        self.perception_module = TestPerceptionMTool()
+
+    def PerceptionModule(self):
+        if self.perception_module.TestHebbianConv2d() & self.perception_module.TestHebbianLinear() & self.perception_module.TestPerceiveExtractor():
+            return True
+        else:
+            return False  
+        
+
 
 class ManagerFunction:
     def __init__(self, device: Optional[str] = None):
@@ -732,78 +804,8 @@ class ManagerFunction:
         
 
     def TestPerceptionModule(self):
-        self.test.PerceptionModule()
+        return self.test.PerceptionModule()
 
 
 
-class TrainingController:
-    def __init__(self):
-        self.command_queue = collections.deque(maxlen=10)
-        self.status = {
-            "state": "idle", 
-            "epoch": 0,
-            "total_epochs": 0,
-            "batch": 0,
-            "total_batches": 0,
-            "train_loss": 0.0,
-            "val_loss": 0.0,
-            "message": "Wait for the training to start"}
-        
-        self.lock = threading.Lock()
-        self.stop_requested = False
-        self.pause_requested = False
-    
-    def SetStatus(self, state, message, **kwargs):
-        with self.lock:
-            self.status["state"] = state
-            self.status["message"] = message
-            for key, value in kwargs.items():
-                if key in self.status:
-                    self.status[key] = value
-    
-    def GetStatus(self):
-        with self.lock:
-            return self.status.copy()
-    
-    def AddCommand(self, command):
-        with self.lock:
-            self.command_queue.append(command)
-    
-    def CheckCommand(self):
-        with self.lock:
-            if self.command_queue:
-                return self.command_queue.popleft()
-            return None
-    
-    def ShouldStop(self):
-        with self.lock:
-            return self.stop_requested
-    
-    def ShouldPause(self):
-        with self.lock:
-            return self.pause_requested
-    
-    def RequestStop(self):
-        with self.lock:
-            self.stop_requested = True
-    
-    def RequestPause(self):
-        with self.lock:
-            self.pause_requested = True
-    
-    def RequestResume(self):
-        with self.lock:
-            self.pause_requested = False
 
-class Test:
-    def __init__(self):
-        self.perception_module = TestPerceptionModule()
-        if id(self.perception_module) is not None:
-            print(f"perception_module 实例已创建 (ID: {id(self.perception_module)})")
-        else:
-            print(" perception_module 实例未创建")
-
-    def PerceptionModule(self):
-        self.perception_module.TestHebbianConv2d()
-        #module.TestHebbianLinear()
-        #module.TestPerceiveExtractor()

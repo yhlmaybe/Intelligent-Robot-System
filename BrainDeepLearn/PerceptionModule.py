@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from typing import Dict, List   
-from torch.nn.utils.stateless import functional_call
 
 class HebbianConv2d(nn.Module):
     def __init__(self, inChannels : int, outChannels : int, kernelSize : int, stride : int = 1, padding :int = 0, hebbRate : float = 0.01, bias : bool = False):
@@ -352,7 +351,7 @@ class PerceiveExtractor(nn.Module):
 
 
 
-class TestPerceptionModule:
+class TestPerceptionMTool:
     def __init__(self):
         pass
 
@@ -363,8 +362,10 @@ class TestPerceptionModule:
         if y.shape == (4, 16, 32, 32):
             conv.ResetHebbianMemory()
             print("HebbianConv2d test passed.")
+            return True
         else:
             print(f"HebbianConv2d output shape mismatch: {y.shape}")
+            return False
         
 
     def TestHebbianLinear(self):
@@ -374,8 +375,10 @@ class TestPerceptionModule:
         if y.shape == (5, 64):
             lin.ResetHebbianMemory()
             print("HebbianLinear test passed.")
+            return True
         else:
             print(f"HebbianLinear output shape mismatch: {y.shape}")
+            return False
 
 
     def TestPerceiveExtractor(self):
@@ -391,8 +394,10 @@ class TestPerceptionModule:
         expected_dim = 512 * 2
         if out.shape == (2, expected_dim):
             print("PerceiveExtractor test passed. Output shape:", out.shape)
+            return True
         else:
             print(f"PerceiveExtractor output shape mismatch: {out.shape}")
+            return False
         
 
 

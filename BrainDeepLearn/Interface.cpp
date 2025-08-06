@@ -92,19 +92,5 @@ bool BrainDeepLearnInterface::GetTrainingStatus(StatusMap& status)
 bool BrainDeepLearnInterface::TestPerceptionModule()
 {
     bool success = CALL_METHOD_NOARG("TestPerceptionModule");
-    if (PyErr_Occurred()) 
-    {
-        PyObject *type, *value, *traceback;
-        PyErr_Fetch(&type, &value, &traceback);
-        
-        PyObject *str = PyObject_Str(value);
-        const char *errMsg = PyUnicode_AsUTF8(str);
-        printf("Python exception: %s\n", errMsg);
-        
-        Py_XDECREF(type);
-        Py_XDECREF(value);
-        Py_XDECREF(traceback);
-        Py_XDECREF(str);
-    }
     return success;
 }
