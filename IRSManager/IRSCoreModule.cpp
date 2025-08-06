@@ -106,7 +106,7 @@ void JointStateListenerNode::DoListen(const sensor_msgs::msg::JointState::Shared
             << quat.z() << ", "
             << quat.w() << "]\n";
 
-        IRS_XML_MESSAGE(oss.str(), MessageFunction::JointDatas);
+        IRS_FORM_MESSAGE(oss.str(), MessageFunction::JointDatas);
     }
 }
 

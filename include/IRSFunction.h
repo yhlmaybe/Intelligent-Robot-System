@@ -17,7 +17,7 @@
 
 extern void IRS_MESSAGE(std::string message);
 
-extern void IRS_XML_MESSAGE(std::string message, MessageFunction fun = MessageFunction::Default);
+extern void IRS_FORM_MESSAGE(std::string message, MessageFunction fun = MessageFunction::Default);
 
 extern void IRS_MESSAGE(const char *format, ...);
 

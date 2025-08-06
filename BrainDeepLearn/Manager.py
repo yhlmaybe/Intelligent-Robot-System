@@ -732,11 +732,7 @@ class ManagerFunction:
         
 
     def TestPerceptionModule(self):
-        #self.test.PerceptionModule()
-        print("Hello from Python!")
-        return 10
-
-        
+        self.test.PerceptionModule()
 
 
 
@@ -801,10 +797,13 @@ class TrainingController:
 
 class Test:
     def __init__(self):
-        pass
+        self.perception_module = TestPerceptionModule()
+        if id(self.perception_module) is not None:
+            print(f"perception_module 实例已创建 (ID: {id(self.perception_module)})")
+        else:
+            print(" perception_module 实例未创建")
 
-    def PerceptionModule():
-        module = TestPerceptionModule()
-        module.TestHebbianConv2d()
-        module.TestHebbianLinear()
-        module.TestPerceiveExtractor()
+    def PerceptionModule(self):
+        self.perception_module.TestHebbianConv2d()
+        #module.TestHebbianLinear()
+        #module.TestPerceiveExtractor()

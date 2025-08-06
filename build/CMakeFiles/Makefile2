@@ -969,12 +969,12 @@ CMakeFiles/IRS_CMake.dir/all: IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/all
 CMakeFiles/IRS_CMake.dir/all: MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/all
 	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/depend
 	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=13,14,15,16,17 "Built target IRS_CMake"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=13,14,15,16,17,18 "Built target IRS_CMake"
 .PHONY : CMakeFiles/IRS_CMake.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/IRS_CMake.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles 26
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles 27
 	$(MAKE) -f CMakeFiles/Makefile2 CMakeFiles/IRS_CMake.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start /home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles 0
 .PHONY : CMakeFiles/IRS_CMake.dir/rule
@@ -996,7 +996,7 @@ CMakeFiles/IRS_CMake.dir/clean:
 ServoControl/CMakeFiles/SC_LIST.dir/all:
 	$(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/depend
 	$(MAKE) -f ServoControl/CMakeFiles/SC_LIST.dir/build.make ServoControl/CMakeFiles/SC_LIST.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=23,24,25,26 "Built target SC_LIST"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=24,25,26,27 "Built target SC_LIST"
 .PHONY : ServoControl/CMakeFiles/SC_LIST.dir/all
 
 # Build rule for subdir invocation for target.
@@ -1191,7 +1191,7 @@ IRSManager/CMakeFiles/IRSMANAGER_LIST.dir/clean:
 MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/all:
 	$(MAKE) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/depend
 	$(MAKE) -f MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build.make MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=18,19,20,21,22 "Built target MATHEMATICALTOOL_LIST"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/home/yhl/Documents/Intelligent-Robot-System/build/CMakeFiles --progress-num=19,20,21,22,23 "Built target MATHEMATICALTOOL_LIST"
 .PHONY : MathematicalTool/CMakeFiles/MATHEMATICALTOOL_LIST.dir/all
 
 # Build rule for subdir invocation for target.

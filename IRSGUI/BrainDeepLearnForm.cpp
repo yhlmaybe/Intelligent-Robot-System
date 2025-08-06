@@ -12,7 +12,6 @@ BrainDeepLearnForm::BrainDeepLearnForm(QWidget *parent) :
 
     brainDeepLearn = std::make_shared<BrainDeepLearnInterface>();
 
-    brainDeepLearn->SetPrintCallback([this](std::string data) {this->SetMessageToTextBrowser(data);});
 
     connect(ui->testPerceptionModule_pushButton, SIGNAL(clicked()), this, SLOT(TestPerceptionModule()));
 }
@@ -22,16 +21,10 @@ BrainDeepLearnForm::~BrainDeepLearnForm()
     delete ui;
 }
 
-void BrainDeepLearnForm::SetMessageToTextBrowser(std::string message)
-{
-    std::lock_guard<std::mutex> lock(message_mtx);
-    QString qstr = QString::fromStdString(message);
-    AddData(qstr);
-}
-
 void BrainDeepLearnForm::AddData(QString data)
 {
     if(this->isHidden()) return;
+    std::lock_guard<std::mutex> lock(message_mtx);
     
     ui->message_textBrowser->moveCursor(QTextCursor::End, QTextCursor::MoveAnchor);
     ui->message_textBrowser->insertPlainText("\n");

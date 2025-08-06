@@ -29,8 +29,6 @@ private:
 
     std::shared_ptr<BrainDeepLearnInterface> brainDeepLearn;
 
-    void SetMessageToTextBrowser(std::string message);
-
 public slots:    
     void AddData(QString data);
 

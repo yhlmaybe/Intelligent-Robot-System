@@ -196,7 +196,7 @@ std::shared_ptr<EndEffector> MotionManager::GetClosestEndEffector(Eigen::Vector3
     return eff;
 }
 
-Eigen::Isometry3d MotionManager::GetDefaultTouchPoseFromPoint(EndEffectorType endEffector, Eigen::Vector3d pointRelBase, Eigen::Vector3d pointNormal, double fingerAngle)
+Eigen::Isometry3d MotionManager::GetDefaultTouchPoseFromPoint(Eigen::Vector3d pointRelBase, Eigen::Vector3d pointNormal, double fingerAngle)
 {
     double eps = 1e-6;
     Eigen::Vector3d op = pointRelBase;

@@ -751,6 +751,33 @@ MsgManager.cpp.s:
 	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/MsgManager.cpp.s
 .PHONY : MsgManager.cpp.s
 
+PythonInteraction.o: PythonInteraction.cpp.o
+
+.PHONY : PythonInteraction.o
+
+# target to build an object file
+PythonInteraction.cpp.o:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/PythonInteraction.cpp.o
+.PHONY : PythonInteraction.cpp.o
+
+PythonInteraction.i: PythonInteraction.cpp.i
+
+.PHONY : PythonInteraction.i
+
+# target to preprocess a source file
+PythonInteraction.cpp.i:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/PythonInteraction.cpp.i
+.PHONY : PythonInteraction.cpp.i
+
+PythonInteraction.s: PythonInteraction.cpp.s
+
+.PHONY : PythonInteraction.s
+
+# target to generate assembly for a file
+PythonInteraction.cpp.s:
+	$(MAKE) -f CMakeFiles/IRS_CMake.dir/build.make CMakeFiles/IRS_CMake.dir/PythonInteraction.cpp.s
+.PHONY : PythonInteraction.cpp.s
+
 main.o: main.cpp.o
 
 .PHONY : main.o
@@ -839,6 +866,9 @@ help:
 	@echo "... MsgManager.o"
 	@echo "... MsgManager.i"
 	@echo "... MsgManager.s"
+	@echo "... PythonInteraction.o"
+	@echo "... PythonInteraction.i"
+	@echo "... PythonInteraction.s"
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"

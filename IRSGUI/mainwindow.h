@@ -11,6 +11,7 @@
 
 #include "../IRSManager/IRSCoreManager.h"
 #include "../include/IRSFunction.h"
+#include "../include/PythonInteraction.h"
 #include "JointDatasForm.h"
 #include "EndEffectorDatasForm.h"
 #include "BrainDeepLearnForm.h"
@@ -42,6 +43,8 @@ private:
     MainWindow& operator = (const MainWindow&);
 
     Ui::MainWindow *ui;
+
+    std::shared_ptr<PythonInteraction::Manager> py_manager;
 
     std::vector<QWidget*> forms;
 
@@ -84,6 +87,8 @@ private slots:
     void SetJointPosition();
 
     void SetGoalPoint();
+
+    void SetPythonMessageToTextBrowser(const char* data, std::size_t len, const std::string& mouduleName);
 };
 
 #endif // MAINWINDOW_H

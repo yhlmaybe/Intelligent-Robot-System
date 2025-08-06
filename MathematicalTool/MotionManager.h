@@ -70,7 +70,7 @@ public:
     Eigen::Isometry3d ConvertPoseFromRelEndToRelAny(EndEffectorType endEffector, std::string anyLinkName, Eigen::Isometry3d pose);
     Eigen::Isometry3d ConvertPoseFromRelBaseToRelAny(std::string anyLinkName, Eigen::Isometry3d pose);
     sensor_msgs::msg::JointState GetCurrentJointStateMsg();
-    Eigen::Isometry3d GetDefaultTouchPoseFromPoint(EndEffectorType endEffector, Eigen::Vector3d pointRelBase, Eigen::Vector3d pointNormal, double fingerAngle = 60);
+    Eigen::Isometry3d GetDefaultTouchPoseFromPoint(Eigen::Vector3d pointRelBase, Eigen::Vector3d pointNormal, double fingerAngle = 60);
     void InitialJointState();
 
     double CalGoalJointPosition(std::string jointName, double position);

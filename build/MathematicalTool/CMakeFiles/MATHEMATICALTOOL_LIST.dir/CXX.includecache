@@ -196,6 +196,10 @@ KinematicTool.h
 PlanningTool.h
 /home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/PlanningTool.h
 
+/home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/PlanningTool.cpp
+PlanningTool.h
+/home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/PlanningTool.h
+
 /home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/PlanningTool.h
 set
 -
@@ -235,6 +239,10 @@ pcl/surface/mls.h
 -
 ../include/IRSParametersData.h
 /home/yhl/Documents/Intelligent-Robot-System/include/IRSParametersData.h
+PointCloudTool.h
+/home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/PointCloudTool.h
+
+/home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/PointCloudTool.cpp
 PointCloudTool.h
 /home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/PointCloudTool.h
 

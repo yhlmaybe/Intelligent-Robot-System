@@ -12,7 +12,7 @@ void IRS_MESSAGE(std::string message)
         Q_ARG(QString, QMessage));
 }
 
-void IRS_XML_MESSAGE(std::string message, MessageFunction fun)
+void IRS_FORM_MESSAGE(std::string message, MessageFunction fun)
 {
     MainWindow *mainWindow = MainWindow::GetInstance();
     QString QMessage = QString::fromStdString(message);
@@ -110,7 +110,6 @@ MainWindow::~MainWindow()
 {  
     QSharedMemory sharedMemory("IRSUniqueKey");
     sharedMemory.detach();
-    Py_Finalize();
     delete ui; 
 }
 
@@ -132,12 +131,8 @@ void MainWindow::Initiate()
 {
     if (!is_initial)
     {
-        Py_Initialize();
-        PyEval_InitThreads();
-
-        PyRun_SimpleString("import sys");
-        PyRun_SimpleString("sys.path.append('./ServoControl')");
-        PyRun_SimpleString("sys.path.append('./BrainDeepLearn')");
+        py_manager = std::make_shared<PythonInteraction::Manager>();
+        py_manager->SetPrintCallback([this](const char* p, std::size_t n, const std::string& name) {this->SetPythonMessageToTextBrowser(p, int(n), name);});
     }
     is_initial = true;
 }
@@ -341,5 +336,14 @@ void MainWindow::SetGoalPoint()
     else
     {
         IRS_MESSAGE("the joint needs to be initialized before set position");
+    }
+}
+
+void MainWindow::SetPythonMessageToTextBrowser(const char *data, std::size_t len, const std::string &mouduleName)
+{
+    std::string str(data, len); 
+    if(mouduleName == "Manager")
+    {
+        IRS_FORM_MESSAGE(str, MessageFunction::BrainDeepLearnFormDatas);
     }
 }

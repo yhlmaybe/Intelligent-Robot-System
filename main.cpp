@@ -1,11 +1,11 @@
 #include <iostream>
 #include <python3.8/Python.h>
-#include "mainwindow.h"
 #include <QApplication>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 
 #include "include/IRSParametersData.h"
+#include "IRSGUI/mainwindow.h"
 
 int main(int argc, char *argv[])
 {

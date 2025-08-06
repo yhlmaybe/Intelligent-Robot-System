@@ -177,10 +177,10 @@ class CNNFeatureExtractor(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         
-        self.layer1 = self.MakeLayer(baseChannels, baseChannels, 2, stride=1, use_hebbian=useHebbian)
-        self.layer2 = self.MakeLayer(baseChannels, baseChannels*2, 2, stride=2, use_hebbian=useHebbian)
-        self.layer3 = self.MakeLayer(baseChannels*2, baseChannels*4, 2, stride=2, use_hebbian=useHebbian)
-        self.layer4 = self.MakeLayer(baseChannels*4, baseChannels*8, 2, stride=2, use_hebbian=useHebbian)
+        self.layer1 = self.MakeLayer(baseChannels, baseChannels, 2, stride=1, useHebbian=useHebbian)
+        self.layer2 = self.MakeLayer(baseChannels, baseChannels*2, 2, stride=2, useHebbian=useHebbian)
+        self.layer3 = self.MakeLayer(baseChannels*2, baseChannels*4, 2, stride=2, useHebbian=useHebbian)
+        self.layer4 = self.MakeLayer(baseChannels*4, baseChannels*8, 2, stride=2, useHebbian=useHebbian)
         
         self.conv2 = conv_layer(baseChannels*8, baseChannels*16, 3, stride=1, padding=1, bias= False)
         self.bn2 = nn.BatchNorm2d(baseChannels*16)
@@ -356,7 +356,7 @@ class TestPerceptionModule:
     def __init__(self):
         pass
 
-    def TestHebbianConv2d():
+    def TestHebbianConv2d(self):
         conv = HebbianConv2d(inChannels=3, outChannels=16, kernelSize=3, stride=1, padding=1)
         x = torch.randn(4, 3, 32, 32)
         y = conv(x)
@@ -367,7 +367,7 @@ class TestPerceptionModule:
             print(f"HebbianConv2d output shape mismatch: {y.shape}")
         
 
-    def TestHebbianLinear():
+    def TestHebbianLinear(self):
         lin = HebbianLinear(inFeatures=32, outFeatures=64)
         x = torch.randn(5, 32)
         y = lin(x)
@@ -378,7 +378,7 @@ class TestPerceptionModule:
             print(f"HebbianLinear output shape mismatch: {y.shape}")
 
 
-    def TestPerceiveExtractor():
+    def TestPerceiveExtractor(self):
         model = PerceiveExtractor(
             imgSize=224,
             patchSize=1,

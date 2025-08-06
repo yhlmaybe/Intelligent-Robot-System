@@ -12,7 +12,6 @@
 #include <cstdio>
 #include <mutex>
 #include <atomic>
-#include <string_view>
 
 #define CALL_METHOD_RET_BOOL(name, fmt, ...) \
     ([&]{ \
@@ -42,12 +41,10 @@ class BrainDeepLearnInterface
 public:
     using StatusValue = boost::variant<int, double, std::string>;
     using StatusMap = std::map<std::string, StatusValue>;
-    using PrintCB = std::function<void(std::string)>;
+    using PrintCB = std::function<void(const char*, std::size_t)>;
 
     BrainDeepLearnInterface();
     ~BrainDeepLearnInterface();
-
-    bool SetPrintCallback(PrintCB cb);
 
     bool StartTraining(std::string& root, int epochs = 5, int batchSize = 32, double valSplit = 0.1, int imagineHorizon = 5, bool resume = true);
     bool StopTraining();
@@ -62,15 +59,8 @@ private:
 
     PyObject* pModule = nullptr;
     PyObject* pManagerObj = nullptr;
-    PrintCB printCb;
-    PyObject* pRedirectObj = nullptr;
-
-    PyObject* originalStdout = nullptr;  
-    PyObject* originalStderr = nullptr;  
 
     void Init();
-    bool InstallRedirect();
-    void UninstallRedirect();
 };
 
 
