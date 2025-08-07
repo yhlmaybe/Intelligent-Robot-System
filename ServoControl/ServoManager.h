@@ -84,6 +84,20 @@ public:
     static bool SetServoPosition(std::shared_ptr<ServoManager> servoManager, double beforeJointPosition, double afterJointPosition, double time);
     
     static void ResetServo(std::vector<std::shared_ptr<ServoManager>> servoManagers);
+
+    ServoTools();
+    ~ServoTools();
+    
+    void SetServoNo(std::string idStr);
+
+    const char* GetServoNo();
+
+private:
+
+    PyObject* pModule = nullptr;
+    PyObject* pInstance = nullptr;
+
+    void Init();
 };
 
 #endif

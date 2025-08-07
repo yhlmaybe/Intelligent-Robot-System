@@ -46,6 +46,8 @@ private:
 
     std::shared_ptr<PythonInteraction::Manager> py_manager;
 
+    std::shared_ptr<ServoTools> servo_manager;
+
     std::vector<QWidget*> forms;
 
     JointDatasForm *joint_datas_form;

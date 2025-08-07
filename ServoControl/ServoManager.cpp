@@ -269,3 +269,96 @@ void ServoTools::ResetServo(std::vector<std::shared_ptr<ServoManager>> servoMana
         it->Reset();
     }
 }
+
+
+ServoTools::ServoTools() 
+{
+    Init();
+}
+
+ServoTools::~ServoTools() 
+{
+    PyGILState_STATE g = PyGILState_Ensure();
+    Py_XDECREF(pInstance);
+    Py_XDECREF(pModule);
+    PyGILState_Release(g);
+}
+
+void ServoTools::SetServoNo(std::string idStr)
+{
+    if (pInstance)
+    {
+        PyObject *pRetvalue = PyObject_CallMethod(pInstance, "get_servo_id", "");
+        if (pRetvalue)
+        {
+            int id;
+            PyArg_Parse(pRetvalue, "i", &id);
+            try
+            {
+                int newIdInt = std::stoi(idStr);
+                pRetvalue = PyObject_CallMethod(pInstance, "set_servo_id", "ii", id, newIdInt);
+            }
+            catch (const std::exception &e)
+            {
+                IRS_MESSAGE("id error");
+            }
+        }
+    }
+    else
+    {
+        IRS_MESSAGE("Instantiate ServoController failed");
+    }
+}
+
+const char* ServoTools::GetServoNo()
+{
+    if (pInstance)
+    {
+        PyObject *pRetvalue = PyObject_CallMethod(pInstance, "get_servo_id", "");
+        if (pRetvalue)
+        {
+            int id;
+            PyArg_Parse(pRetvalue, "i", &id);
+            const char *idChar = std::to_string(id).c_str();
+            return idChar;
+        }
+    }
+    return "";
+}
+
+void ServoTools::Init()
+{
+    if (!Py_IsInitialized())
+        throw std::runtime_error("Failed to init Python");
+
+    PyGILState_STATE g = PyGILState_Ensure();
+
+    pModule = PyImport_ImportModule("ServoManager");
+
+    if (!pModule)
+    {
+        PyErr_Print();
+        throw std::runtime_error("Import ServoManager failed");
+    }
+
+    PyObject *pClass = PyObject_GetAttrString(pModule, "ServoController");
+    if (!pClass || !PyCallable_Check(pClass))
+    {
+        PyErr_Print();
+        throw std::runtime_error("ServoController class not callable");
+    }
+
+    PyObject *pArgs = PyTuple_Pack(2, Py_BuildValue("s", "/dev/ttyTHS0"), Py_BuildValue("i", 115200));
+
+    if (pArgs)
+    {
+        pInstance = PyObject_CallObject(pClass, pArgs);
+        if (!pInstance)
+        {
+            PyErr_Print();
+            throw std::runtime_error("Instantiate ServoController failed");
+        }
+    }
+
+    PyGILState_Release(g);
+}

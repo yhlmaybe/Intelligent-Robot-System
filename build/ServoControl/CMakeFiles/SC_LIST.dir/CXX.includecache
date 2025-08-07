@@ -6,10 +6,6 @@
 
 #IncludeRegexTransform: 
 
-/home/yhl/Documents/Intelligent-Robot-System/ServoControl/SCDrive.cpp
-SCDrive.h
-/home/yhl/Documents/Intelligent-Robot-System/ServoControl/SCDrive.h
-
 /home/yhl/Documents/Intelligent-Robot-System/ServoControl/SCDrive.h
 python3.8/Python.h
 -
@@ -25,10 +21,6 @@ map
 -
 ../include/IRSFunction.h
 /home/yhl/Documents/Intelligent-Robot-System/include/IRSFunction.h
-
-/home/yhl/Documents/Intelligent-Robot-System/ServoControl/ServoID.cpp
-ServoID.h
-/home/yhl/Documents/Intelligent-Robot-System/ServoControl/ServoID.h
 
 /home/yhl/Documents/Intelligent-Robot-System/ServoControl/ServoID.h
 

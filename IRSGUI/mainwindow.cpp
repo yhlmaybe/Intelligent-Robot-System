@@ -133,6 +133,8 @@ void MainWindow::Initiate()
     {
         py_manager = std::make_shared<PythonInteraction::Manager>();
         py_manager->SetPrintCallback([this](const char* p, std::size_t n, const std::string& name) {this->SetPythonMessageToTextBrowser(p, int(n), name);});
+
+        servo_manager = std::make_shared<ServoTools>();
     }
     is_initial = true;
 }
@@ -167,69 +169,12 @@ void MainWindow::OpenBrainDeepLearnForm()
 
 void MainWindow::SetServoNo()
 {
-    PyObject *pModule;
-    pModule = PyImport_ImportModule("ServoManager");
-    if (pModule)
-    {
-
-        PyObject *class_obj = PyObject_GetAttrString(pModule, "ServoController");
-        if (class_obj)
-        {
-            PyObject *pArgs = PyTuple_Pack(2, Py_BuildValue("s", "/dev/ttyTHS0"), Py_BuildValue("i", 115200));
-            if (pArgs)
-            {
-                PyObject *instance = PyObject_CallObject(class_obj, pArgs);
-                if (instance)
-                {
-                    PyObject *pRetvalue = PyObject_CallMethod(instance, "get_servo_id", "");
-                    if (pRetvalue)
-                    {
-                        int id;
-                        PyArg_Parse(pRetvalue, "i", &id);
-                        try
-                        {    
-                            int newIdInt = std::stoi(ui->ServoNo_LineEdit->text().toStdString());    
-                            pRetvalue = PyObject_CallMethod(instance, "set_servo_id", "ii", id, newIdInt);
-                        }
-                        catch(const std::exception& e)
-                        {
-                            SetMessage("id error");
-                        }
-                    }
-                }
-            }
-        }
-    }
+    servo_manager->SetServoNo(ui->ServoNo_LineEdit->text().toStdString());
 }
 
 void MainWindow::GetServoNo()
 {
-    PyObject *pModule;
-    pModule = PyImport_ImportModule("ServoManager");
-    if (pModule)
-    {
-
-        PyObject *class_obj = PyObject_GetAttrString(pModule, "ServoController");
-        if (class_obj)
-        {
-            PyObject *pArgs = PyTuple_Pack(2, Py_BuildValue("s", "/dev/ttyTHS0"), Py_BuildValue("i", 115200));
-            if (pArgs)
-            {
-                PyObject *instance = PyObject_CallObject(class_obj, pArgs);
-                if (instance)
-                {
-                    PyObject *pRetvalue = PyObject_CallMethod(instance, "get_servo_id", "");
-                    if (pRetvalue)
-                    {
-                        int id;
-                        PyArg_Parse(pRetvalue, "i", &id);
-                        const char *idChar = std::to_string(id).c_str();
-                        ui->ServoNo_Lable->setText(idChar);
-                    }
-                }
-            }
-        }
-    }
+    ui->ServoNo_Lable->setText(servo_manager->GetServoNo());
 }
 
 void MainWindow::Start()
