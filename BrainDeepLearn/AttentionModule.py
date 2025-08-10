@@ -67,10 +67,10 @@ class MultiHeadAttention(nn.Module):
 
     def ScaledDotAttn(
         self,
-        q: torch.Tensor,               # (B, H, Lq, D)
-        k: torch.Tensor,               # (B, H, Lk, D)
-        v: torch.Tensor,               # (B, H, Lk, D)
-        mask: Optional[torch.Tensor],  # (B, 1, 1, Lk)
+        q: torch.Tensor, # (B, H, Lq, D)
+        k: torch.Tensor, # (B, H, Lk, D)
+        v: torch.Tensor, # (B, H, Lk, D)
+        mask: Optional[torch.Tensor], # (B, 1, 1, Lk)
         dropoutP: float,) -> Tuple[torch.Tensor, torch.Tensor]:
         
         d = q.size(-1)
@@ -145,24 +145,24 @@ class MultiHeadAttention(nn.Module):
 
     def forward(
         self,
-        query: torch.Tensor,                              # (B, Sq, E)
-        key: torch.Tensor,                                # (B, Sk, E)
-        value: torch.Tensor,                              # (B, Sk, E)
-        keyPaddingMask: Optional[torch.Tensor] = None,    # (B, Sk)
-        tdError: Optional[torch.Tensor] = None,) -> torch.Tensor:           # (B,) or scalar
+        query: torch.Tensor, # (B, L, E)
+        key: torch.Tensor, # (B, L, E)
+        value: torch.Tensor, # (B, L, E)
+        keyPaddingMask: Optional[torch.Tensor] = None, # (B, L)
+        tdError: Optional[torch.Tensor] = None,) -> torch.Tensor: # (B,) or scalar
 
-        B, Sq, _ = query.shape
-        Sk: int = key.shape[1]
+        B, L, _ = query.shape
 
         neuromod = self.ComputeNeuromodulation(tdError, B)
 
-        q: torch.Tensor = self.ProJ(self.q_proj, query)   # (B,H,Sq,D)
-        k: torch.Tensor = self.ProJ(self.k_proj, key)     # (B,H,Sk,D)
-        v: torch.Tensor = self.ProJ(self.v_proj, value)   # (B,H,Sk,D)
+        q: torch.Tensor = self.ProJ(self.q_proj, query) # (B,H,L,D)
+        k: torch.Tensor = self.ProJ(self.k_proj, key) # (B,H,L,D)
+        v: torch.Tensor = self.ProJ(self.v_proj, value) # (B,H,L,D)
 
-        if self.training and self.base_hebbian_rate > 0:
+        if self.base_hebbian_rate > 0:
             self.hebb_step.add_(1)
-            if (self.hebb_step % self.hebb_period) == 0:
+            step_int = int(self.hebb_step.item())
+            if (step_int % self.hebb_period) == 0:
                 alpha = self.base_hebbian_rate * neuromod.mean()
                 self.UpdateHebbianWeights(v, q, alpha)
         
@@ -184,10 +184,9 @@ class MultiHeadAttention(nn.Module):
             q, k, v_fast, 
             attn_mask=attn_mask, 
             dropout_p=self.attn_dropout_p if self.training else 0.0,
-            is_causal=False
-        )
+            is_causal=False)
 
-        out: torch.Tensor = context.transpose(1, 2).reshape(B, Sq, self.embed_dim)
+        out: torch.Tensor = context.transpose(1, 2).reshape(B, L, self.embed_dim)
         return self.out_proj(out)
 
 
@@ -201,7 +200,7 @@ class TemporalAttention(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                               # (B,S,E)
+        x: torch.Tensor, # (B,S,E)
         keyPaddingMask: Optional[torch.Tensor] = None,
         tdError: Optional[torch.Tensor] = None) -> torch.Tensor:
         
@@ -235,16 +234,16 @@ class DynamicRouting(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                              # (B,I,D)
-        mask: Optional[torch.Tensor] = None,          # (B,I) bool
-        ) -> torch.Tensor:                                # (B,O,out_dim)
+        x: torch.Tensor, # (B,I,D)
+        mask: Optional[torch.Tensor] = None, # (B,I) bool
+        ) -> torch.Tensor: # (B,O,out_dim)
         
         B, I, D = x.shape
         assert I == self.I and D == self.in_dim, "AttentionModule capsule input dim mismatch"
 
-        u_hat = torch.einsum("bid,iodc->bioc", x, self.transformation)  # (B,I,O,C)
+        u_hat = torch.einsum("bid,iodc->bioc", x, self.transformation) # (B,I,O,C)
 
-        logits = self.routing_logits.expand(B, -1, -1)  # (B,I,O)
+        logits = self.routing_logits.expand(B, -1, -1) # (B,I,O)
         
         if mask is not None:
             logits = logits.masked_fill(mask.unsqueeze(-1), -1e4)
@@ -253,7 +252,7 @@ class DynamicRouting(nn.Module):
         
         for r in range(self.iterations):
             # Stable softmax calculation
-            weights = F.log_softmax(logits + cumulative_weights, dim=-1).exp()  # (B,I,O)
+            weights = F.log_softmax(logits + cumulative_weights, dim=-1).exp() # (B,I,O)
             
             if mask is not None:
                 weights = weights.masked_fill(mask.unsqueeze(-1), 0.0)
@@ -262,7 +261,7 @@ class DynamicRouting(nn.Module):
             weight_sum = weights.sum(dim=1, keepdim=True) + 1e-8
             weights = weights / weight_sum
             
-            s = torch.einsum("bioc,bio->boc", u_hat, weights)  # (B,O,C)
+            s = torch.einsum("bioc,bio->boc", u_hat, weights) # (B,O,C)
             v = self.Squash(s)
             
             if r < self.iterations - 1:
@@ -273,7 +272,7 @@ class DynamicRouting(nn.Module):
         
         self.last_weights = weights.detach().mean(0, keepdim=True)
             
-        return v  # (B,O,C)
+        return v # (B,O,C)
 
 
 class HebbianFusion(nn.Module):
@@ -305,10 +304,10 @@ class HebbianFusion(nn.Module):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         # inputs: (B,M,E)
         B, M, E = inputs.shape
-        weighted = torch.einsum("bme,mef->bmf", inputs, self.weights)  # (B,M,E)
-        context = inputs.mean(dim=1)  # (B,E)
-        gate_w = self.gate(context)   # (B,M)
-        fused = torch.einsum("bmf,bm->bf", weighted, gate_w)  # (B,E)
+        weighted = torch.einsum("bme,mef->bmf", inputs, self.weights) # (B,M,E)
+        context = inputs.mean(dim=1) # (B,E)
+        gate_w = self.gate(context) # (B,M)
+        fused = torch.einsum("bmf,bm->bf", weighted, gate_w) # (B,E)
 
         if self.training:
             with torch.no_grad():
