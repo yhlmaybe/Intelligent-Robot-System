@@ -87,30 +87,28 @@ class MultiHeadAttention(nn.Module):
 
     def ComputeNeuromodulation(self, tdError: Optional[torch.Tensor], B: int) -> torch.Tensor:
         device = self.hebbian_weights.device
-        
+
         if tdError is None:
             return torch.ones(B, 1, 1, 1, device=device)
-        
-        # Detach tdError to prevent gradient flow into this module
-        tdError = tdError.detach()
-        
-        # Handle scalar tdError
-        if tdError.dim() == 0:
-            tdError = tdError.view(1)
-        
-        # Ensure batch size matches
-        if tdError.size(0) != B:
-            if tdError.size(0) == 1:
-                tdError = tdError.expand(B)
-            else:
-                raise ValueError(f"tdError size {tdError.size(0)} does not match batch size {B}")
-        
-        # Stable normalization
-        td_mean = tdError.mean()
-        td_std = tdError.std().clamp_min(1e-8)
-        td_norm = (tdError - td_mean) / td_std
-        
-        neuromod = 1.0 + 0.5 * torch.tanh(td_norm / self.td_scale)
+
+        td = tdError.detach().to(device)
+        if td.dim() == 0:
+            td = td.view(1)
+        if td.size(0) == 1 and B > 1:
+            td = td.expand(B)
+        if td.size(0) != B:
+            raise ValueError(f"tdError size {td.size(0)} != batch size {B}")
+
+        if B == 1:
+            td_scaled = td / self.td_scale
+            td_scaled = td_scaled.clamp(-10, 10)
+            neuromod = 1.0 + 0.5 * torch.tanh(td_scaled)
+        else:
+            td_mean = td.mean()
+            td_std  = td.std(unbiased=False).clamp_min(1e-8)
+            td_norm = (td - td_mean) / td_std
+            neuromod = 1.0 + 0.5 * torch.tanh(td_norm / self.td_scale)
+
         return neuromod.view(B, 1, 1, 1)
 
     @torch.no_grad()

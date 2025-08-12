@@ -385,10 +385,20 @@ class Test:
         self.perception_module = TestPerceptionMTool()
 
     def PerceptionModule(self):
-        if self.perception_module.TestHebbianConv2d() & self.perception_module.TestHebbianLinear() & self.perception_module.TestPerceiveExtractor():
-            return True
-        else:
-            return False  
+        try:
+            conv_ok = self.perception_module.TestHebbianConv2d()
+            linear_ok = self.perception_module.TestHebbianLinear()
+            extractor_ok = self.perception_module.TestPerceiveExtractor()
+        
+            if conv_ok and linear_ok and extractor_ok:
+                return True
+            else:
+                return False
+        except Exception as e:
+            import traceback
+            print(f"Test crash! Error type: {type(e).__name__}")
+            print(f"Wrong position: {traceback.format_exc()}")
+            return False
         
 
 

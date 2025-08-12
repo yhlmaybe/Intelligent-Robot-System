@@ -2,102 +2,154 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from typing import Dict, List   
+from typing import Dict, List, Optional   
+
+
+def ProjectFroNorm(tensor: torch.Tensor, maxNorm: Optional[float]):
+    if not maxNorm:
+        return
+    n = torch.linalg.vector_norm(tensor, ord=2)
+    
+    if torch.isfinite(n) and n > maxNorm:
+        tensor.mul_(float(maxNorm) / (n + 1e-12))
 
 class HebbianConv2d(nn.Module):
-    def __init__(self, inChannels : int, outChannels : int, kernelSize : int, stride : int = 1, padding :int = 0, hebbRate : float = 0.01, bias : bool = False):
+    def __init__(
+        self,
+        inChannels: int,
+        outChannels: int,
+        kernelSize: int,
+        stride: int = 1,
+        padding: int = 0,
+        hebbRate: float = 1e-3,        
+        emaMomentum: float = 0.995,     
+        applyScale: float = 0.25,      
+        memNormCap: Optional[float] = 1.0,  
+        bias: bool = False,
+        useHebbian = False):
         super().__init__()
 
-        self.conv = nn.Conv2d(inChannels, outChannels, kernelSize, stride = stride, padding = padding, bias = bias)
-        self.bn = nn.BatchNorm2d(outChannels)
-        self.hebb_rate = hebbRate
+        self.conv = nn.Conv2d(inChannels, outChannels, kernelSize, stride=stride, padding=padding, bias=bias)
+
+        self.hebb_rate = float(hebbRate)
+        self.ema_alpha = float(emaMomentum)
+        self.apply_scale = float(applyScale)
+        self.mem_norm_cap = memNormCap
+
+        self.enable_hebbian_updates = useHebbian  
+
         self.register_buffer("hebb_memory", torch.zeros_like(self.conv.weight))
-    
-    def forward(self, x : torch.Tensor) -> torch.Tensor:
-        out = self.conv(x)
-        out = F.relu(self.bn(out))
 
-        with torch.no_grad():
-            kH, kW = self.conv.kernel_size
-            stride = self.conv.stride
-            padding = self.conv.padding
-                
-            x_unfold = F.unfold(x, kernel_size=(kH, kW), padding=padding, stride=stride)
-            out_unfold = out.view(out.size(0), out.size(1), -1)
-                
-            hebb_term = torch.einsum('bik,bjk->ij', out_unfold, x_unfold)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight_eff = self.conv.weight
+        if self.enable_hebbian_updates:
+            weight_eff = weight_eff + self.apply_scale * self.hebb_memory  
 
-            outC = self.conv.weight.size(0)
-            weight_flat = self.conv.weight.view(outC, -1) # [outC, D]
-            y2_sum = out_unfold.square().sum(dim=[0,2]) # [outC]
-            decay_term = y2_sum.unsqueeze(1) * weight_flat  # [outC, D]
+        out = F.conv2d(
+            x, weight_eff, self.conv.bias,
+            stride=self.conv.stride, padding=self.conv.padding,
+            dilation=self.conv.dilation, groups=self.conv.groups)
+        
+        if self.enable_hebbian_updates:
+            with torch.no_grad():
+                kH, kW = self.conv.kernel_size
+                stride = self.conv.stride
+                padding = self.conv.padding
 
-            delta_w = self.hebb_rate * (hebb_term - decay_term)
+                x_unfold = F.unfold(x, kernel_size=(kH, kW), padding=padding, stride=stride)
 
-            delta_w = delta_w.view(self.conv.weight.shape)
+                out_unfold = out.view(out.size(0), out.size(1), -1)
 
-            self.hebb_memory.mul_(0.9).add_(delta_w, alpha=0.1)
-            self.conv.weight.data.add_(self.hebb_memory) 
+                hebb_term = torch.einsum('bik,bjk->ij', out_unfold, x_unfold)
+
+                outC = self.conv.weight.size(0)
+
+                weight_flat = self.conv.weight.view(outC, -1) 
+
+                y2_sum = out_unfold.square().sum(dim=[0, 2])
+
+                decay_term = y2_sum.unsqueeze(1) * weight_flat
+
+                delta_w = self.hebb_rate * (hebb_term - decay_term) # [Cout, Cin*kH*kW]
+                delta_w = delta_w.view_as(self.hebb_memory)
+
+                self.hebb_memory.mul_(self.ema_alpha).add_(delta_w, alpha=(1.0 - self.ema_alpha))
+
+                ProjectFroNorm(self.hebb_memory, self.mem_norm_cap) 
+
         return out
-    
+
     def ResetHebbianMemory(self):
         self.hebb_memory.zero_()
 
 class HebbianLinear(nn.Module):
-    def __init__(self, inFeatures: int, outFeatures: int, hebbRate: float = 0.01, emaMomentum: float = 0.9, normalize: bool = True, weightConstraint: str = 'clip'):
+    def __init__(
+        self,
+        inFeatures: int,
+        outFeatures: int,
+        hebbRate: float = 1e-3,       
+        emaMomentum: float = 0.995,    
+        applyScale: float = 0.2,        
+        memNormCap: Optional[float] = 1.0,   
+        normalize: bool = False,        
+        weightConstraint: Optional[str] = None,  
+        bias: bool = True,
+        useHebbian = False):
+
         super().__init__()
-        
         self.weight = nn.Parameter(torch.randn(outFeatures, inFeatures) * 0.01)
+        self.bias = nn.Parameter(torch.zeros(outFeatures)) if bias else None
 
-        self.bias = nn.Parameter(torch.zeros(outFeatures))
+        self.hebb_rate = float(hebbRate)
+        self.ema_alpha = float(emaMomentum)
+        self.apply_scale = float(applyScale)
+        self.mem_norm_cap = memNormCap
 
-        self.hebb_rate = hebbRate
-        self.ema_alpha = emaMomentum
         self.normalize = normalize
-        self.weight_constraint = weightConstraint
-        
-        self.register_buffer("hebb_memory", torch.zeros_like(self.weight))
-
         if normalize:
             self.register_buffer("running_mean", torch.zeros(outFeatures))
-            self.register_buffer("running_var",  torch.ones(outFeatures))
+            self.register_buffer("running_var", torch.ones(outFeatures))
             self.momentum = 0.1
 
+        self.weight_constraint = weightConstraint
+
+        self.enable_hebbian_updates = useHebbian  
+
+        self.register_buffer("hebb_memory", torch.zeros_like(self.weight))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias)  # [B, out]
-
-        with torch.no_grad():
-            hebb_term = torch.einsum('bi,bj->ij', y, x)      
-
-            y_sq_sum = (y ** 2).sum(dim = 0)
-            decay_term = torch.einsum('i,ij->ij', y_sq_sum, self.weight)
-
-            delta_w = self.hebb_rate * (hebb_term - decay_term)
-
-            self.hebb_memory.mul_(self.ema_alpha).add_(delta_w, alpha=(1 - self.ema_alpha))
-                
-            self.weight.data.add_(self.hebb_memory)
-                
-            self.ApplyWeightConstraint()
-                
-            if self.normalize:
-                mean, var = y.mean(0), y.var(0)
-                self.running_mean.mul_(1 - self.momentum).add_(mean, alpha=self.momentum)
-                self.running_var.mul_(1 - self.momentum).add_(var, alpha=self.momentum)
+        w_eff = self.weight + (self.apply_scale * self.hebb_memory if self.enable_hebbian_updates else 0.0)
+        y = F.linear(x, w_eff, self.bias)  # [B, out]
 
         if self.normalize:
+            if self.training:
+                with torch.no_grad():
+                    mean, var = y.mean(0), y.var(0, unbiased=False)
+                    self.running_mean.mul_(1 - self.momentum).add_(mean, alpha=self.momentum)
+                    self.running_var.mul_(1 - self.momentum).add_(var, alpha=self.momentum)
             y_hat = (y - self.running_mean) / torch.sqrt(self.running_var + 1e-5)
         else:
             y_hat = y
-            
+
+        if self.enable_hebbian_updates:
+            with torch.no_grad():
+                hebb_term = torch.einsum('bi,bj->ij', y_hat, x)   
+                y_sq_sum = (y_hat ** 2).sum(dim=0)             
+                decay_term = torch.einsum('i,ij->ij', y_sq_sum, self.weight)  
+
+                delta_w = self.hebb_rate * (hebb_term - decay_term) 
+
+                self.hebb_memory.mul_(self.ema_alpha).add_(delta_w, alpha=(1.0 - self.ema_alpha))
+
+                if self.weight_constraint == 'clip':
+                    self.hebb_memory.copy_(torch.clamp(self.hebb_memory, -1.0, 1.0))
+                elif self.weight_constraint == 'norm':
+                    self.hebb_memory.copy_(F.normalize(self.hebb_memory, dim=1))
+
+                ProjectFroNorm(self.hebb_memory, self.mem_norm_cap)
+
         return y_hat
 
-    def ApplyWeightConstraint(self):
-        if self.weight_constraint == 'clip':
-            self.weight.data = torch.clamp(self.weight.data, -1.0, 1.0)
-        elif self.weight_constraint == 'norm':
-            self.weight.data = F.normalize(self.weight.data, dim=1)
-        
     def ResetHebbianMemory(self) -> None:
         self.hebb_memory.zero_()
 
@@ -117,7 +169,7 @@ class TransformerEncode(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.activation = nn.GELU()
 
-    def forward(self, src: torch.Tensor,srcMask: torch.Optional[torch.Tensor] = None, srcKeyPaddingMask: torch.Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, src: torch.Tensor,srcMask: Optional[torch.Tensor] = None, srcKeyPaddingMask: Optional[torch.Tensor] = None) -> torch.Tensor:
 
         src_norm1 = self.norm1(src)
         src2, _ = self.self_atten(
@@ -143,10 +195,9 @@ class ResidualBlock(nn.Module):
                 nn.Conv2d(inChannels, outChannels, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(outChannels))
         
-        conv_layer = HebbianConv2d if useHebbian else nn.Conv2d
-        self.conv1 = conv_layer(inChannels, outChannels, 3, stride=stride, padding=1, bias=False)
+        self.conv1 = HebbianConv2d(inChannels, outChannels, 3, stride=stride, padding=1, bias=False, useHebbian = useHebbian)
         self.bn1 = nn.BatchNorm2d(outChannels)
-        self.conv2 = conv_layer(outChannels, outChannels, 3, stride=1, padding=1, bias=False)
+        self.conv2 = HebbianConv2d(outChannels, outChannels, 3, stride=1, padding=1, bias=False, useHebbian = useHebbian)
         self.bn2 = nn.BatchNorm2d(outChannels)
         self.relu = nn.ReLU(inplace=True)
     
@@ -169,8 +220,8 @@ class ResidualBlock(nn.Module):
 class CNNFeatureExtractor(nn.Module):
     def __init__(self, inChannels : int = 3, baseChannels : int = 64, useHebbian : bool = True):
         super().__init__()
-        conv_layer = HebbianConv2d if useHebbian else nn.Conv2d
-        self.conv1 = conv_layer(inChannels, baseChannels, 7, stride=2, padding=3, bias= False)
+
+        self.conv1 = HebbianConv2d(inChannels, baseChannels, 7, stride=2, padding=3, bias= False, useHebbian = useHebbian)
         
         self.bn1 = nn.BatchNorm2d(baseChannels)
         self.relu = nn.ReLU(inplace=True)
@@ -181,8 +232,8 @@ class CNNFeatureExtractor(nn.Module):
         self.layer3 = self.MakeLayer(baseChannels*2, baseChannels*4, 2, stride=2, useHebbian=useHebbian)
         self.layer4 = self.MakeLayer(baseChannels*4, baseChannels*8, 2, stride=2, useHebbian=useHebbian)
         
-        self.conv2 = conv_layer(baseChannels*8, baseChannels*16, 3, stride=1, padding=1, bias= False)
-        self.bn2 = nn.BatchNorm2d(baseChannels*16)
+        self.conv2 = HebbianConv2d(baseChannels*8, baseChannels*16, 3, stride=1, padding=1, bias= False, useHebbian = useHebbian)
+        self.bn2 = nn.BatchNorm2d(baseChannels*16)   
     
     def MakeLayer(self, inChannels : int, outChannels : int, blocks : int, stride : int = 1, useHebbian : bool = False) -> nn.Sequential:
         layers = []
@@ -271,14 +322,12 @@ class PerceiveExtractor(nn.Module):
 
         layers.append(nn.Linear(embedDim, hidden_dim, bias=True))
         layers.append(nn.GELU())
-        if useHebbian:
-            layers.append(HebbianLinear(hidden_dim, hidden_dim, hebbRate=hebbRate))
+        layers.append(HebbianLinear(hidden_dim, hidden_dim, hebbRate=hebbRate, useHebbian = useHebbian))
         layers.append(nn.Dropout(p=dropout))
 
         layers.append(nn.Linear(hidden_dim, embedDim, bias=True))
         layers.append(nn.GELU())
-        if useHebbian:
-            layers.append(HebbianLinear(embedDim, embedDim, hebbRate=hebbRate))
+        layers.append(HebbianLinear(embedDim, embedDim, hebbRate=hebbRate, useHebbian = useHebbian))
         layers.append(nn.Dropout(p=dropout))
         self.mlp = nn.Sequential(*layers)
 
@@ -356,7 +405,7 @@ class TestPerceptionMTool:
         pass
 
     def TestHebbianConv2d(self):
-        conv = HebbianConv2d(inChannels=3, outChannels=16, kernelSize=3, stride=1, padding=1)
+        conv = HebbianConv2d(inChannels=3, outChannels=16, kernelSize=3, stride=1, padding=1, useHebbian=True)
         x = torch.randn(4, 3, 32, 32)
         y = conv(x)
         if y.shape == (4, 16, 32, 32):
@@ -369,7 +418,7 @@ class TestPerceptionMTool:
         
 
     def TestHebbianLinear(self):
-        lin = HebbianLinear(inFeatures=32, outFeatures=64)
+        lin = HebbianLinear(inFeatures=32, outFeatures=64, useHebbian=True)
         x = torch.randn(5, 32)
         y = lin(x)
         if y.shape == (5, 64):
