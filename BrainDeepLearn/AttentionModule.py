@@ -307,6 +307,8 @@ class HebbianFusion(nn.Module):
         self.use_hebbian = useHebbian
         self.momentum = momentum
 
+        self.ctx_q = nn.Linear(self.embed_dim, 1, bias=False)
+
         self.base_weights = nn.Parameter(torch.empty(numModes, embedDim, embedDim))
         self.register_buffer("hebbian_memory", torch.zeros(numModes, embedDim, embedDim))
 
@@ -345,7 +347,8 @@ class HebbianFusion(nn.Module):
         effW = self.EffectiveWeights()  # (M,E,E)
         weighted = torch.einsum("bme,mef->bmf", inputs, effW) # (B,M,E)
 
-        context = inputs.mean(dim=1, keepdim=True).expand(-1, M, -1) # (B,M,E)
+        alpha = torch.softmax(self.ctx_q(inputs).squeeze(-1) / math.sqrt(self.embed_dim), dim=1) # (B,M)
+        context = torch.einsum("bme,bm->be", inputs, alpha).unsqueeze(1).expand(-1, M, -1)   
 
         gate_in = torch.cat([inputs, context, inputs - context, inputs * context], dim=-1) # (B,M,4E)
         gate_logits = self.gate_head(gate_in).squeeze(-1) # (B,M)
