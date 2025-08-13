@@ -11,7 +11,7 @@ BuildDirectory: /home/yhl/Documents/Intelligent-Robot-System/build
 CostDataFile: 
 
 # Site is something like machine.domain, i.e. pragmatic.crd
-Site: yhl
+Site: ubuntu
 
 # Build name is osname-revision-compiler, i.e. Linux-2.4.2-2smp-c++
 BuildName: Linux-c++

@@ -38,6 +38,8 @@ private slots:
     void CloseForm();
 
     void TestPerceptionModule();
+
+    void TestAttentionModule();
 };
 
 #endif // BRAINDEEPLEARNFORM_H

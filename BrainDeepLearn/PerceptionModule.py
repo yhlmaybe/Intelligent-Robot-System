@@ -393,7 +393,7 @@ class PerceiveExtractor(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def ResetHebbianMemory(self):
+    def ResetFastWeights(self):
         for module in self.modules():
             if hasattr(module, 'ResetHebbianMemory'):
                 module.ResetHebbianMemory()

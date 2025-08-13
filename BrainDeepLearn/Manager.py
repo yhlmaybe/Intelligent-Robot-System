@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Tuple, List, Dict, Any, Optional, Union
 from PerceptionModule import PerceiveExtractor, TestPerceptionMTool
-from AttentionModule import AttentionExtractor
+from AttentionModule import AttentionExtractor, TestAttentionMTool
 from MemoryModule import MemoryExtractor
 from DecisionModule import DecisionExtractor, KEYBOARD_LAYOUT
 from WorldModule import WorldModelExtractor, ActionEncoder, WorldModelSeqRNN
@@ -383,6 +383,7 @@ class TrainingController:
 class Test:
     def __init__(self):
         self.perception_module = TestPerceptionMTool()
+        self.attention_module = TestAttentionMTool()
 
     def PerceptionModule(self):
         try:
@@ -400,6 +401,24 @@ class Test:
             print(f"Wrong position: {traceback.format_exc()}")
             return False
         
+    def AttentionModule(self):
+        try:
+            rout_ok = self.attention_module.TestDynamicRouting()
+            hebbian_fusion_ok = self.attention_module.TestHebbianFusion()
+            atten_ok = self.attention_module.TestMultiHeadAttention()
+            meta_ok = self.attention_module.TestMetaStrategySelector()
+            temporal_ok = self.attention_module.TestTemporalAttention()
+            extractor_ok = self.attention_module.TestAttentionExtractor()
+        
+            if rout_ok and hebbian_fusion_ok and atten_ok and meta_ok and temporal_ok and extractor_ok:
+                return True
+            else:
+                return False
+        except Exception as e:
+            import traceback
+            print(f"Test crash! Error type: {type(e).__name__}")
+            print(f"Wrong position: {traceback.format_exc()}")
+            return False
 
 
 class ManagerFunction:
@@ -815,6 +834,9 @@ class ManagerFunction:
 
     def TestPerceptionModule(self):
         return self.test.PerceptionModule()
+    
+    def TestAttentionModule(self):
+        return self.test.AttentionModule()
 
 
 

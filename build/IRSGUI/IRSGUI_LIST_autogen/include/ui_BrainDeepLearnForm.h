@@ -29,6 +29,7 @@ public:
     QVBoxLayout *verticalLayout;
     QPushButton *trainModule_pushButton;
     QPushButton *testPerceptionModule_pushButton;
+    QPushButton *testAttentionModulel_pushButton;
     QPushButton *close_pushButton;
 
     void setupUi(QWidget *BrainDeepLearnForm)
@@ -60,6 +61,11 @@ public:
 
         verticalLayout->addWidget(testPerceptionModule_pushButton);
 
+        testAttentionModulel_pushButton = new QPushButton(BrainDeepLearnForm);
+        testAttentionModulel_pushButton->setObjectName(QString::fromUtf8("testAttentionModulel_pushButton"));
+
+        verticalLayout->addWidget(testAttentionModulel_pushButton);
+
 
         gridLayout->addLayout(verticalLayout, 0, 1, 1, 1);
 
@@ -79,6 +85,7 @@ public:
         BrainDeepLearnForm->setWindowTitle(QApplication::translate("BrainDeepLearnForm", "BrainDeepLearnForm", nullptr));
         trainModule_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TrainModule", nullptr));
         testPerceptionModule_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestPerceptionModule", nullptr));
+        testAttentionModulel_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestAttentionModule", nullptr));
         close_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "Close", nullptr));
     } // retranslateUi
 

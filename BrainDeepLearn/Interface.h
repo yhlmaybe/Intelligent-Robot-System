@@ -55,6 +55,8 @@ public:
 
     bool TestPerceptionModule();
 
+    bool TestAttentionModule();
+
 private:
 
     PyObject* pModule = nullptr;

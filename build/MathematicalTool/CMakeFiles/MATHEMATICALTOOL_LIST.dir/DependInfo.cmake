@@ -17,6 +17,8 @@ set(CMAKE_TARGET_DEFINITIONS_CXX
   "BOOST_FILESYSTEM_DYN_LINK"
   "DEFAULT_RMW_IMPLEMENTATION=rmw_fastrtps_cpp"
   "DISABLE_LIBUSB_1_0"
+  "DISABLE_OPENNI"
+  "DISABLE_OPENNI2"
   "DISABLE_PCAP"
   "DISABLE_PNG"
   "RCUTILS_ENABLE_FAULT_INJECTION"
@@ -41,8 +43,6 @@ set(CMAKE_CXX_TARGET_INCLUDE_PATH
   "/opt/ros/foxy/include"
   "/usr/include/libqhull_r"
   "/usr/include/pcl-1.10"
-  "/usr/include/ni"
-  "/usr/include/openni2"
   )
 
 # Targets to which this target links.
