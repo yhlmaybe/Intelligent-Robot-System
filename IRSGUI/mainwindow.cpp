@@ -134,7 +134,7 @@ void MainWindow::Initiate()
         py_manager = std::make_shared<PythonInteraction::Manager>();
         py_manager->SetPrintCallback([this](const char* p, std::size_t n, const std::string& name) {this->SetPythonMessageToTextBrowser(p, int(n), name);});
 
-        servo_manager = std::make_shared<ServoTools>();
+        //servo_manager = std::make_shared<ServoTools>();
     }
     is_initial = true;
 }
@@ -287,7 +287,7 @@ void MainWindow::SetGoalPoint()
 void MainWindow::SetPythonMessageToTextBrowser(const char *data, std::size_t len, const std::string &mouduleName)
 {
     std::string str(data, len); 
-    if(mouduleName == "Manager" || mouduleName == "PerceptionModule")
+    if(mouduleName == "Manager" || mouduleName == "PerceptionModule" || mouduleName == "AttentionModule")
     {
         if(!brain_deep_learn_form->isHidden())
         {

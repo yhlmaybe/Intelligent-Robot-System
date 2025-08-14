@@ -409,8 +409,9 @@ class Test:
             meta_ok = self.attention_module.TestMetaStrategySelector()
             temporal_ok = self.attention_module.TestTemporalAttention()
             extractor_ok = self.attention_module.TestAttentionExtractor()
+            ssm_ok = self.attention_module.TestSimpleSSM()
         
-            if rout_ok and hebbian_fusion_ok and atten_ok and meta_ok and temporal_ok and extractor_ok:
+            if rout_ok and hebbian_fusion_ok and atten_ok and meta_ok and temporal_ok and extractor_ok and ssm_ok:
                 return True
             else:
                 return False
