@@ -57,6 +57,8 @@ public:
 
     bool TestAttentionModule();
 
+    bool TestMemoryModule();
+
 private:
 
     PyObject* pModule = nullptr;

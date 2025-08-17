@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Tuple, List, Dict, Any, Optional, Union
 from PerceptionModule import PerceiveExtractor, TestPerceptionMTool
 from AttentionModule import AttentionExtractor, TestAttentionMTool
-from MemoryModule import MemoryExtractor
+from MemoryModule import MemoryExtractor, TestMemoryMTool
 from DecisionModule import DecisionExtractor, KEYBOARD_LAYOUT
 from WorldModule import WorldModelExtractor, ActionEncoder, WorldModelSeqRNN
 from ValueEstimationModule import ValueEstimationExtractor
@@ -384,6 +384,7 @@ class Test:
     def __init__(self):
         self.perception_module = TestPerceptionMTool()
         self.attention_module = TestAttentionMTool()
+        self.memory_module = TestMemoryMTool()
 
     def PerceptionModule(self):
         try:
@@ -421,6 +422,26 @@ class Test:
             print(f"Wrong position: {traceback.format_exc()}")
             return False
 
+
+    def MemoryModule(self):
+        try:
+            glo_ok = self.memory_module.TestGlobalWorkspace()
+            ltm_ok = self.memory_module.TestLongTermMemory()
+            mem_ok = self.memory_module.TestMemoryExtractorForward()
+            str_ok = self.memory_module.TestStateSaveRestore()
+            rea_ok = self.memory_module.TestReason()
+            res_ok = self.memory_module.TestResetAndSoftReset()
+            sta_ok = self.memory_module.TestNumericalStability()
+        
+            if glo_ok and ltm_ok and mem_ok and str_ok and rea_ok and res_ok and sta_ok:
+                return True
+            else:
+                return False
+        except Exception as e:
+            import traceback
+            print(f"Test crash! Error type: {type(e).__name__}")
+            print(f"Wrong position: {traceback.format_exc()}")
+            return False
 
 class ManagerFunction:
     def __init__(self, device: Optional[str] = None):
@@ -838,6 +859,9 @@ class ManagerFunction:
     
     def TestAttentionModule(self):
         return self.test.AttentionModule()
+    
+    def TestMemoryModule(self):
+        return self.test.MemoryModule()
 
 
 

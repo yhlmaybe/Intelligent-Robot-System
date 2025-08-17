@@ -100,3 +100,9 @@ bool BrainDeepLearnInterface::TestAttentionModule()
     bool success = CALL_METHOD_NOARG("TestAttentionModule");
     return success;
 }
+
+bool BrainDeepLearnInterface::TestMemoryModule()
+{
+    bool success = CALL_METHOD_NOARG("TestMemoryModule");
+    return success;
+}

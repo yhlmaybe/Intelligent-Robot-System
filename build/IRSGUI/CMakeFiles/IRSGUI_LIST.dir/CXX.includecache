@@ -56,12 +56,6 @@ mutex
 atomic
 -
 
-/home/yhl/Documents/Intelligent-Robot-System/IRSGUI/BrainDeepLearnForm.cpp
-BrainDeepLearnForm.h
-/home/yhl/Documents/Intelligent-Robot-System/IRSGUI/BrainDeepLearnForm.h
-ui_BrainDeepLearnForm.h
-/home/yhl/Documents/Intelligent-Robot-System/IRSGUI/ui_BrainDeepLearnForm.h
-
 /home/yhl/Documents/Intelligent-Robot-System/IRSGUI/BrainDeepLearnForm.h
 python3.8/Python.h
 -
@@ -13184,10 +13178,6 @@ qcombobox.h
 qgridlayout.h
 /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qgridlayout.h
 
-/usr/include/x86_64-linux-gnu/qt5/QtWidgets/QHBoxLayout
-qboxlayout.h
-/usr/include/x86_64-linux-gnu/qt5/QtWidgets/qboxlayout.h
-
 /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QLabel
 qlabel.h
 /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qlabel.h
@@ -13223,14 +13213,6 @@ qpushbutton.h
 /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QScrollBar
 qscrollbar.h
 /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qscrollbar.h
-
-/usr/include/x86_64-linux-gnu/qt5/QtWidgets/QTextBrowser
-qtextbrowser.h
-/usr/include/x86_64-linux-gnu/qt5/QtWidgets/qtextbrowser.h
-
-/usr/include/x86_64-linux-gnu/qt5/QtWidgets/QVBoxLayout
-qboxlayout.h
-/usr/include/x86_64-linux-gnu/qt5/QtWidgets/qboxlayout.h
 
 /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QWidget
 qwidget.h
@@ -13558,14 +13540,6 @@ QtWidgets/qwidget.h
 QtGui/qicon.h
 -
 
-/usr/include/x86_64-linux-gnu/qt5/QtWidgets/qtextbrowser.h
-QtWidgets/qtwidgetsglobal.h
--
-QtWidgets/qtextedit.h
--
-QtCore/qurl.h
--
-
 /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qtextedit.h
 QtWidgets/qtwidgetsglobal.h
 -
@@ -13618,24 +13592,6 @@ QtGui/qcursor.h
 QtGui/qkeysequence.h
 -
 QtGui/qevent.h
--
-
-IRSGUI/IRSGUI_LIST_autogen/include/ui_BrainDeepLearnForm.h
-QtCore/QVariant
--
-QtWidgets/QApplication
--
-QtWidgets/QGridLayout
--
-QtWidgets/QHBoxLayout
--
-QtWidgets/QPushButton
--
-QtWidgets/QTextBrowser
--
-QtWidgets/QVBoxLayout
--
-QtWidgets/QWidget
 -
 
 IRSGUI/IRSGUI_LIST_autogen/include/ui_mainwindow.h
