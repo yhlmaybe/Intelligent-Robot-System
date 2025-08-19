@@ -287,7 +287,7 @@ void MainWindow::SetGoalPoint()
 void MainWindow::SetPythonMessageToTextBrowser(const char *data, std::size_t len, const std::string &mouduleName)
 {
     std::string str(data, len); 
-    if(mouduleName == "Manager" || mouduleName == "PerceptionModule" || mouduleName == "AttentionModule" || "MemoryModule")
+    if(mouduleName == "Manager" ||  "PerceptionModule" || "AttentionModule" || "MemoryModule" || "DecisionModule" || "WorldModule")
     {
         if(!brain_deep_learn_form->isHidden())
         {

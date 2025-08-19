@@ -3,8 +3,8 @@ from typing import Tuple, List, Dict, Any, Optional, Union
 from PerceptionModule import PerceiveExtractor, TestPerceptionMTool
 from AttentionModule import AttentionExtractor, TestAttentionMTool
 from MemoryModule import MemoryExtractor, TestMemoryMTool
-from DecisionModule import DecisionExtractor, KEYBOARD_LAYOUT
-from WorldModule import WorldModelExtractor, ActionEncoder, WorldModelSeqRNN
+from DecisionModule import DecisionExtractor, KEYBOARD_LAYOUT, TestDecisionMTool
+from WorldModule import WMAdapterForPlanner, RSSMWorldModel , ActionEncoder, TestWorldMTool
 from ValueEstimationModule import ValueEstimationExtractor
 from pathlib import Path
 from torch.utils.data import Dataset
@@ -45,7 +45,7 @@ class BrainCore(nn.Module):
             if hasattr(m, "hebbian_on"):
                 m.hebbian_on = plastic_hebbian
 
-        self.world = WorldModelSeqRNN()
+        #self.world = WorldModelSeqRNN()
         self.critic = ValueEstimationExtractor()
 
         self.ResetBuffers()
@@ -385,6 +385,8 @@ class Test:
         self.perception_module = TestPerceptionMTool()
         self.attention_module = TestAttentionMTool()
         self.memory_module = TestMemoryMTool()
+        self.decision_module = TestDecisionMTool()
+        self.world_module = TestWorldMTool()
 
     def PerceptionModule(self):
         try:
@@ -434,6 +436,43 @@ class Test:
             sta_ok = self.memory_module.TestNumericalStability()
         
             if glo_ok and ltm_ok and mem_ok and str_ok and rea_ok and res_ok and sta_ok:
+                return True
+            else:
+                return False
+        except Exception as e:
+            import traceback
+            print(f"Test crash! Error type: {type(e).__name__}")
+            print(f"Wrong position: {traceback.format_exc()}")
+            return False
+        
+    def DecisionModule(self):
+        try:
+            hee_ok = self.decision_module.TestHebbianPlasticityLayer()
+            dec1_ok = self.decision_module.TestDecisionExtractorNoPrior()
+            cem_ok = self.decision_module.TestCEMPlanner()
+            dec2_ok = self.decision_module.TestDecisionExtractorWithPrior()
+            int_ok = self.decision_module.TestIntegrationEndToEnd()
+
+            if hee_ok and dec1_ok and cem_ok and dec2_ok and int_ok:
+                return True
+            else:
+                return False
+        except Exception as e:
+            import traceback
+            print(f"Test crash! Error type: {type(e).__name__}")
+            print(f"Wrong position: {traceback.format_exc()}")
+            return False
+        
+
+    def WorldModule(self):
+        try:
+            enc_ok = self.world_module.TestActionEncoder()
+            pos_ok = self.world_module.TestRSSMStepPosterior()
+            pri_ok = self.world_module.TestRSSMStepPriorOnly()
+            for_ok = self.world_module.TestForwardTrainSeq()
+            pla_ok = self.world_module.TestWMAdapterForPlanner()
+
+            if enc_ok and pos_ok and pri_ok and for_ok and pla_ok:
                 return True
             else:
                 return False
@@ -862,6 +901,12 @@ class ManagerFunction:
     
     def TestMemoryModule(self):
         return self.test.MemoryModule()
+    
+    def TestDecisionModule(self):
+        return self.test.DecisionModule()
+    
+    def TestWorldModule(self):
+        return self.test.WorldModule()
 
 
 

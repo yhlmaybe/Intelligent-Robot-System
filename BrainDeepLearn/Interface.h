@@ -59,6 +59,10 @@ public:
 
     bool TestMemoryModule();
 
+    bool TestDecisionModule();
+
+    bool TestWorldModule();
+
 private:
 
     PyObject* pModule = nullptr;

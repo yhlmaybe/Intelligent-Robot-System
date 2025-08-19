@@ -51,6 +51,23 @@
        </property>
       </widget>
      </item>
+     <item>
+      <widget class="QPushButton" name="testDecisionModule_pushButton">
+       <property name="text">
+        <string>TestDecisionModule</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="testWorldModule_pushButton">
+       <property name="text">
+        <string>TestWorldModule</string>
+       </property>
+       <property name="shortcut">
+        <string>Ctrl+S</string>
+       </property>
+      </widget>
+     </item>
     </layout>
    </item>
    <item row="1" column="0">

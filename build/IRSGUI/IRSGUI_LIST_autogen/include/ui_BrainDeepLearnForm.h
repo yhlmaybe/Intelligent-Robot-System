@@ -31,6 +31,8 @@ public:
     QPushButton *testPerceptionModule_pushButton;
     QPushButton *testAttentionModulel_pushButton;
     QPushButton *testMemoryModule_pushButton;
+    QPushButton *testDecisionModule_pushButton;
+    QPushButton *testWorldModule_pushButton;
     QPushButton *close_pushButton;
 
     void setupUi(QWidget *BrainDeepLearnForm)
@@ -72,6 +74,16 @@ public:
 
         verticalLayout->addWidget(testMemoryModule_pushButton);
 
+        testDecisionModule_pushButton = new QPushButton(BrainDeepLearnForm);
+        testDecisionModule_pushButton->setObjectName(QString::fromUtf8("testDecisionModule_pushButton"));
+
+        verticalLayout->addWidget(testDecisionModule_pushButton);
+
+        testWorldModule_pushButton = new QPushButton(BrainDeepLearnForm);
+        testWorldModule_pushButton->setObjectName(QString::fromUtf8("testWorldModule_pushButton"));
+
+        verticalLayout->addWidget(testWorldModule_pushButton);
+
 
         gridLayout->addLayout(verticalLayout, 0, 1, 1, 1);
 
@@ -93,6 +105,11 @@ public:
         testPerceptionModule_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestPerceptionModule", nullptr));
         testAttentionModulel_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestAttentionModule", nullptr));
         testMemoryModule_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestMemoryModule", nullptr));
+        testDecisionModule_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestDecisionModule", nullptr));
+        testWorldModule_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestWorldModule", nullptr));
+#ifndef QT_NO_SHORTCUT
+        testWorldModule_pushButton->setShortcut(QApplication::translate("BrainDeepLearnForm", "Ctrl+S", nullptr));
+#endif // QT_NO_SHORTCUT
         close_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "Close", nullptr));
     } // retranslateUi
 

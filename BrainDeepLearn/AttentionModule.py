@@ -58,17 +58,6 @@ class SimpleSSM(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """
-    embedDim : Token embedding dimension E.
-    numHeads : Number of attention heads H.
-    hebbianRate : Base Hebbian learning-rate α₀. (default 0.01)
-    attnDropout : Drop probability applied to attention weights. (default 0.1)
-    tdScale : Scale factor dividing TD-error before tanh. (default 5.0)
-    lowRank : Start with low-rank fast weights (can switch at runtime via use_low_rank).
-    rank : Low-rank dimension R.
-    hebbPeriod : Update Hebbian every N steps (N>=1).
-    useHebbian : Master switch for Hebbian updates.
-    """
     def __init__(self, embedDim: int, numHeads: int, hebbianRate: float = 0.01,
                  attnDropout: float = 0.1, tdScale: float = 5.0, lowRank: bool = True,
                  rank: int = 8, hebbPeriod: int = 4, useHebbian: bool = True,):

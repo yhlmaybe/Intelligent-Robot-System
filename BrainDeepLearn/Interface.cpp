@@ -106,3 +106,15 @@ bool BrainDeepLearnInterface::TestMemoryModule()
     bool success = CALL_METHOD_NOARG("TestMemoryModule");
     return success;
 }
+
+bool BrainDeepLearnInterface::TestDecisionModule()
+{
+    bool success = CALL_METHOD_NOARG("TestDecisionModule");
+    return success;
+}
+
+bool BrainDeepLearnInterface::TestWorldModule()
+{
+    bool success = CALL_METHOD_NOARG("TestWorldModule");
+    return success;
+}

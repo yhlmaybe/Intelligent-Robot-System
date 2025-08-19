@@ -42,6 +42,10 @@ private slots:
     void TestAttentionModule();
 
     void TestMemoryModule();
+
+    void TestDecisionModule();
+
+    void TestWorldModule();
 };
 
 #endif // BRAINDEEPLEARNFORM_H
