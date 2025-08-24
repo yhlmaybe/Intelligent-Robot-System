@@ -1,78 +1,290 @@
 from __future__ import annotations
-from typing import NamedTuple, Optional, Tuple, Dict
+from typing import Optional, Dict, NamedTuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class CriticForward(NamedTuple):
-    value: torch.Tensor  # [B]
-    tdError: Optional[torch.Tensor] # [B] or None
-    tdErrorDe: Optional[torch.Tensor] # [B] or None (detach)
-    entropy: Optional[torch.Tensor] # Actor‑side entropy, for logging
-    uncertainty: Optional[torch.Tensor] # σ_V (if head enabled)
+class RunningEMA(nn.Module):
+    def __init__(self, dim: int, momentum: float = 0.99, eps: float = 1e-6):
+        super().__init__()
+        self.momentum = momentum
+        self.eps = eps
+        self.register_buffer("mean", torch.zeros(dim))
+        self.register_buffer("var",  torch.ones(dim))
+
+    @torch.no_grad()
+    def Update(self, x: torch.Tensor):
+        m = x.mean(0)
+        v = x.var(0, unbiased=False)
+        self.mean.mul_(self.momentum).add_((1 - self.momentum) * m)
+        self.var.mul_(self.momentum).add_((1 - self.momentum) * v)
+
+    def Norm(self, x: torch.Tensor) -> torch.Tensor:
+        mean = self.mean.to(x.device)
+        std = (self.var.to(x.device) + self.eps).sqrt()
+        return (x - mean) / std.clamp_min(self.eps)
 
 
+class IntrinsicRewardOut(NamedTuple):
+    rInt: torch.Tensor
+    components: Dict[str, torch.Tensor]
+    eT: torch.Tensor
 
-class ValueEstimationExtractor(nn.Module):
-    #Evaluate the value of the previous step based on the data of the previous step, and thereby regulate the current step 
+
+class IntrinsicRewardGenerator(nn.Module):
     def __init__(self,
                  memoryDim: int = 768,
                  attnDim: int = 512,
                  stateDim: int = 256,
                  *,
-                 hiddenDim: int = 512,
-                 gamma: float = 0.99,
+                 hidden: int = 256,
+                 alphaNovelty: float = 1.0,
+                 alphaEntropy: float = 0.2,
+                 alphaProgress: float = 0.5,
+                 alphaUncertPenalty: float = 0.5,
+                 rClip: float = 5.0,
+                 tau0: float = 1.0, beta: float = 1.0, # temp = tau0 * exp(+beta * uncert_n)
+                 lr0: float = 1.0, kappa: float = 0.5,  # lr = lr0 * (1 + kappa * relu(novelty_n))
+                 gamma0: float = 0.99, delta: float = 0.02, # gamma = clip(gamma0 + delta * valence)
+                 tauMin: Optional[float] = None, tauMax: Optional[float] = None,
+                 lrMin: Optional[float]  = None, lrMax: Optional[float]  = None,
+                 gammaMin: float = 0.90, gammaMax: float = 0.9999,
+                 emaMomentum: float = 0.99):
+        super().__init__()
+        self.alpha_novelty = alphaNovelty
+        self.alpha_entropy = alphaEntropy
+        self.alpha_progress = alphaProgress
+        self.alpha_uncert_penalty = alphaUncertPenalty
+        self.r_clip = rClip
+
+        self.tau0, self.beta = tau0, beta
+        self.lr0, self.kappa = lr0, kappa
+        self.gamma0, self.delta = gamma0, delta
+
+        self.tau_min, self.tau_max = tauMin, tauMax
+        self.lr_min, self.lr_max = lrMin,  lrMax
+        self.gamma_min, self.gamma_max = gammaMin, gammaMax
+
+        self.affect_net = nn.Sequential(
+            nn.Linear(memoryDim + attnDim + stateDim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),)
+        
+        self.progress_head = nn.Linear(hidden, 1)
+
+        self.nov_ema = RunningEMA(dim=1, momentum=emaMomentum)
+        self.unc_ema = RunningEMA(dim=1, momentum=emaMomentum)
+        self.prog_ema = RunningEMA(dim=1, momentum=emaMomentum)
+        self.ent_ema = RunningEMA(dim=1, momentum=emaMomentum)
+
+        self.register_buffer("state_ema", torch.zeros(stateDim))
+        self.state_momentum = emaMomentum
+        self.eps = 1e-6
+
+        nn.init.zeros_(self.progress_head.bias)
+        for m in self.affect_net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight); nn.init.zeros_(m.bias)
+
+    @torch.no_grad()
+    def UpdateStateEma(self, s: torch.Tensor):
+        mean_s = s.mean(0)
+        self.state_ema.mul_(self.state_momentum).add_((1 - self.state_momentum) * mean_s)
+
+    def forward(self,
+                memoryPrev: torch.Tensor,
+                attnPrev: torch.Tensor,
+                stateCurr: torch.Tensor,
+                *,
+                policyEntropyPrev: Optional[torch.Tensor] = None,
+                uncertainty: Optional[torch.Tensor] = None, 
+                tdErrorPrev: Optional[torch.Tensor] = None ) -> IntrinsicRewardOut:
+
+        B = stateCurr.size(0)
+        device = stateCurr.device
+
+        with torch.no_grad():
+            self.UpdateStateEma(stateCurr)
+        novelty = (stateCurr - self.state_ema.to(device)).pow(2).mean(dim=-1).sqrt()
+
+        h = self.affect_net(torch.cat([memoryPrev, attnPrev, stateCurr], dim=-1)) 
+        if tdErrorPrev is not None:
+            progress = -tdErrorPrev.abs()
+        else:
+            progress = torch.tanh(self.progress_head(h).squeeze(-1))
+
+        entropy = policyEntropyPrev if policyEntropyPrev is not None else torch.zeros(B, device=device)
+
+        uncert = uncertainty if uncertainty is not None else torch.zeros(B, device=device)
+
+        with torch.no_grad():
+            self.nov_ema.Update(novelty)
+            self.prog_ema.Update(progress)
+            self.ent_ema.Update(entropy)
+            self.unc_ema.Update(uncert)
+
+        novelty_n = self.nov_ema.Norm(novelty)
+        progress_n = self.prog_ema.Norm(progress)
+        entropy_n = self.ent_ema.Norm(entropy)
+        uncert_n = self.unc_ema.Norm(uncert)
+
+        r_int = (self.alpha_novelty * novelty_n + self.alpha_progress * progress_n + self.alpha_entropy  * entropy_n - self.alpha_uncert_penalty * uncert_n).clamp(-self.r_clip, self.r_clip) 
+
+        temp_scale = self.tau0 * torch.exp(+ self.beta * uncert_n)
+        if self.tau_min is not None or self.tau_max is not None:
+            lo = self.tau_min if self.tau_min is not None else -float("inf")
+            hi = self.tau_max if self.tau_max is not None else +float("inf")
+            temp_scale = temp_scale.clamp(lo, hi)
+
+        lr_scale = self.lr0 * (1.0 + self.kappa * novelty_n.clamp_min(0.0))
+        if self.lr_min is not None or self.lr_max is not None:
+            lo = self.lr_min if self.lr_min is not None else -float("inf")
+            hi = self.lr_max if self.lr_max is not None else +float("inf")
+            lr_scale = lr_scale.clamp(lo, hi)
+
+        valence = torch.tanh(progress_n)
+        gamma_mod = (self.gamma0 + self.delta * valence).clamp(self.gamma_min, self.gamma_max)
+
+        e_t = torch.stack([temp_scale, lr_scale, gamma_mod], dim=-1)
+
+        comps: Dict[str, torch.Tensor] = {
+            "novelty": novelty,
+            "progress": progress,
+            "entropy": entropy,
+            "uncertainty": uncert,
+            "novelty_n": novelty_n,
+            "progress_n": progress_n,
+            "entropy_n": entropy_n,
+            "uncertainty_n": uncert_n,
+            "valence": valence,}
+
+        return IntrinsicRewardOut(rInt=r_int, components=comps, eT=e_t)
+
+
+class CriticOut(NamedTuple):
+    value: torch.Tensor
+    tdError: torch.Tensor
+    tdErrorDe: torch.Tensor
+    entropy: torch.Tensor
+    uncertainty: torch.Tensor
+    eT: torch.Tensor
+    rewardUsed: torch.Tensor
+    rInt: torch.Tensor
+    rComps: Dict[str, torch.Tensor]
+
+
+class ValueEstimationExtractor(nn.Module):
+    def __init__(self,
+                 memoryDim: int = 768,
+                 attnDim: int   = 512,
+                 stateDim: int  = 256,
+                 *,
+                 hidden: int = 512,
+                 gammaDefault: float = 0.99,
                  useLayerNorm: bool = False,
                  valueLossType: str = "mse",
-                 useUncertHead: bool = True) -> None:
+                 useUncertHead: bool = True,
+                 wExt: float = 1.0,
+                 wInt: float = 1.0,
+                 bootstrapIfMissing: bool = True,
+                 irgKwargs: Optional[dict] = None):
         super().__init__()
-        self.gamma           = gamma
+
+        self.gamma_default = gammaDefault
         self.value_loss_type = valueLossType.lower()
-        self.use_layer_norm  = useLayerNorm
-        self.use_uncert      = useUncertHead
+        self.use_uncert = useUncertHead
+        self.w_ext = wExt
+        self.w_int = wInt
+        self.bootstrap_if_missing = bootstrapIfMissing
 
         in_dim = memoryDim + attnDim + stateDim
-        self.fc1 = nn.Linear(in_dim, hiddenDim)
-        self.fc2 = nn.Linear(hiddenDim, hiddenDim)
+        self.fc1 = nn.Linear(in_dim, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+
         if useLayerNorm:
-            self.norm1 = nn.LayerNorm(hiddenDim)
-            self.norm2 = nn.LayerNorm(hiddenDim)
+            self.norm1 = nn.LayerNorm(hidden)
+            self.norm2 = nn.LayerNorm(hidden)
+        else:
+            self.norm1 = self.norm2 = None
 
-        self.value_head  = nn.Linear(hiddenDim, 1)
-        self.uncert_head = nn.Linear(hiddenDim, 1) if useUncertHead else None
+        self.value_head = nn.Linear(hidden, 1)
+        self.uncert_head = nn.Linear(hidden, 1) if useUncertHead else None
 
-        self.InitWeights()
+        self.rgen = IntrinsicRewardGenerator(memoryDim, attnDim, stateDim, **(irgKwargs or {}))
 
-    #returns CriticForward
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight)
+                nn.init.zeros_(m.bias)
+
     def forward(self,
-                memoryOut: torch.Tensor, # (B,768)  from pre-menory
-                attnOut: torch.Tensor, # (B,512)  from pre-attn
-                stateFeat: torch.Tensor, # (B,256)  from world state
+                memoryPrev: torch.Tensor,
+                attnPrev: torch.Tensor,
+                stateCurr: torch.Tensor,
                 *,
-                policyEntropy: Optional[torch.Tensor] = None, # from pre-decision
-                reward: Optional[torch.Tensor] = None,
+                rewardExt: Optional[torch.Tensor] = None,
                 nextValue: Optional[torch.Tensor] = None,
-                done: Optional[torch.Tensor] = None) -> CriticForward:
+                done: Optional[torch.Tensor] = None,
+                policyEntropyPrev: Optional[torch.Tensor] = None,
+                uncertainty: Optional[torch.Tensor] = None,
+                tdErrorPrev: Optional[torch.Tensor] = None) -> CriticOut:
 
-        x = torch.cat([memoryOut, attnOut, stateFeat], dim=-1)
-        x = F.relu(self.fc1(x))
-        if self.use_layer_norm:
-            x = self.norm1(x)
-        x = F.relu(self.fc2(x))
-        if self.use_layer_norm:
-            x = self.norm2(x)
+        B = stateCurr.size(0)
+        device = stateCurr.device
 
-        value = self.value_head(x).squeeze(-1)  # (B)
-        uncert = None
+        x = torch.cat([memoryPrev, attnPrev, stateCurr], dim=-1)
+        x = F.relu(self.fc1(x));  x = self.norm1(x) if self.norm1 is not None else x
+        x = F.relu(self.fc2(x));  x = self.norm2(x) if self.norm2 is not None else x
+
+        value = self.value_head(x).squeeze(-1) 
+        uncert_val = torch.zeros(B, device=device)
         if self.uncert_head is not None:
-            uncert = F.softplus(self.uncert_head(x).squeeze(-1))
+            uncert_val = F.softplus(self.uncert_head(x).squeeze(-1)) 
 
-        td_error, td_error_de = self.TdAdvantage(value, reward, nextValue, done)
+        r_int_out = self.rgen(
+            memoryPrev, attnPrev, stateCurr,
+            policyEntropyPrev=policyEntropyPrev,
+            uncertainty=(uncertainty if uncertainty is not None else uncert_val.detach()),
+            tdErrorPrev=tdErrorPrev)
+        
+        r_int, comps, e_t = r_int_out.rInt, r_int_out.components, r_int_out.eT
 
-        return CriticForward(value=value,tdError=td_error,tdErrorDe=td_error_de,entropy=policyEntropy,uncertainty=uncert)
+        if rewardExt is None:
+            reward_used = self.w_int * r_int
+        else:
+            reward_used = self.w_ext * rewardExt.to(device) + self.w_int * r_int
+        reward_used_det = reward_used.detach()
 
-    def ValueLoss(self, vPred: torch.Tensor, target: torch.Tensor, *, clipDelta: Optional[float] = None) -> torch.Tensor:
+        gamma = e_t[..., 2].detach() if e_t is not None else torch.full((B,), self.gamma_default, device=device)
+
+        if nextValue is None:
+            nextValue = value.detach() if self.bootstrap_if_missing else torch.zeros(B, device=device)
+        if done is None:
+            done = torch.zeros(B, device=device)
+
+        td_target = reward_used_det + gamma * nextValue.detach() * (1 - done.float())
+        td_error = td_target - value
+        td_error_de = td_error.detach()
+
+        entropy_out = policyEntropyPrev if policyEntropyPrev is not None else torch.zeros(B, device=device)
+
+        return CriticOut(
+            value=value,
+            tdError=td_error,
+            tdErrorDe=td_error_de,
+            entropy=entropy_out,
+            uncertainty=uncert_val,
+            eT=e_t,
+            rewardUsed=reward_used_det,
+            rInt=r_int.detach(),
+            rComps={k: v.detach() for k, v in comps.items()},)
+
+    def ValueLoss(self,
+                  vPred: torch.Tensor,
+                  target: torch.Tensor,
+                  *,
+                  clipDelta: Optional[float] = None) -> torch.Tensor:
+        
         if self.value_loss_type == "huber":
             loss_elem = F.smooth_l1_loss(vPred, target, reduction="none")
         else:
@@ -80,47 +292,136 @@ class ValueEstimationExtractor(nn.Module):
 
         if clipDelta is not None:
             v_clip = vPred + (vPred - vPred.detach()).clamp(-clipDelta, clipDelta)
-            loss_clip = F.mse_loss(v_clip, target, reduction="none")
-            loss_elem = torch.max(loss_elem, loss_clip)
-            
+            loss_alt = F.mse_loss(v_clip, target, reduction="none")
+            loss_elem = torch.max(loss_elem, loss_alt)
+
         return loss_elem.mean()
 
 
-    def TdAdvantage(self,
-                    value: torch.Tensor,
-                    reward: Optional[torch.Tensor],
-                    nextValue: Optional[torch.Tensor],
-                    done: Optional[torch.Tensor]) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        #Computes tdError and detached tdError; returns (None,None) if reward None
-        if reward is None:
-            return None, None
-        device = value.device
-        B = value.size(0)
 
-        r = reward.to(device).view(-1) if isinstance(reward, torch.Tensor) else torch.full((B,), reward, device=device)
-        d = done.to(device).float().view(-1) if isinstance(done, torch.Tensor) else torch.full((B,), float(done or 0), device=device)
-        nv = nextValue.to(device).view(-1) if nextValue is not None else torch.zeros(B, device=device)
+class TestValueEstimationMTool:
+    def __init__(self, device: str = None):
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.mem_dim = 768
+        self.attn_dim = 512
+        self.state_dim= 256
 
-        td_target = r + self.gamma * nv * (1 - d)
-        td_error  = td_target - value
-        return td_error, td_error.detach()
+    def RandBatch(self, B: int = 3):
+        mem = torch.randn(B, self.mem_dim,  device=self.device)
+        attn = torch.randn(B, self.attn_dim, device=self.device)
+        state = torch.randn(B, self.state_dim,device=self.device)
+        return mem, attn, state
 
-    def InitWeights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight)
-                nn.init.zeros_(m.bias)
+    def TestIntrinsicRewardGenerator(self) -> bool:
+        B = 4
+        mem, attn, state = self.RandBatch(B)
+        irg = IntrinsicRewardGenerator(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim).to(self.device)
 
-    def Save(self, path: str):
-        torch.save({"state_dict": self.state_dict(),
-                    "gamma": self.gamma,
-                    "use_layer_norm": self.use_layer_norm,
-                    "value_loss_type": self.value_loss_type}, path)
+        irg.train()
 
-    @classmethod
-    def Load(cls, path: str, mapLocation: Optional[str] = None) -> "ValueEstimationExtractor":
-        ckpt = torch.load(path, map_location=mapLocation)
-        model = cls(gamma=ckpt["gamma"], useLayerNorm=ckpt["use_layer_norm"], valueLossType=ckpt["value_loss_type"],
-                    memoryDim=768, attnDim=512, stateDim=256)  # supply dims as used
-        model.load_state_dict(ckpt["state_dict"], strict=False)
-        return model
+        entropy_prev = torch.rand(B, device=self.device)
+        uncert = F.softplus(torch.randn(B, device=self.device))
+        td_prev = torch.randn(B, device=self.device) * 0.1
+
+        out = irg(mem, attn, state,policyEntropyPrev=entropy_prev,uncertainty=uncert,tdErrorPrev=td_prev)
+
+        ok = True
+        ok &= (out.rInt.shape == (B,))
+        ok &= (out.eT.shape == (B,3))
+        needed = ["novelty","progress","entropy","uncertainty","novelty_n","progress_n","entropy_n","uncertainty_n","valence"]
+        ok &= all(k in out.components for k in needed)
+
+        print(f"IntrinsicRewardGenerator test {'passed' if ok else 'failed'}.")
+        return ok
+
+    def TestValueEstimationNoReward(self) -> bool:
+        B = 3
+        mem, attn, state = self.RandBatch(B)
+        critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=True, bootstrapIfMissing=True).to(self.device)
+        critic.train()
+
+        entropy_prev = torch.rand(B, device=self.device)
+
+        out = critic(
+            memoryPrev=mem, attnPrev=attn, stateCurr=state,
+            rewardExt=None,
+            nextValue=None,
+            done=None,    
+            policyEntropyPrev=entropy_prev,
+            uncertainty=None,
+            tdErrorPrev=None)
+
+        ok = True
+        ok &= (out.value.shape == (B,))
+        ok &= (out.tdError.shape == (B,))
+        ok &= (out.tdErrorDe.shape == (B,))
+        ok &= (out.entropy.shape == (B,))
+        ok &= (out.uncertainty.shape == (B,))
+        ok &= (out.eT.shape == (B,3))
+        ok &= (out.rewardUsed.shape == (B,))
+        ok &= (out.rInt.shape == (B,))
+
+        ok &= torch.allclose(out.rewardUsed, out.rInt, atol=1e-5, rtol=1e-5)
+
+        print(f"ValueEstimation (no external reward) test {'passed' if ok else 'failed'}.")
+        return ok
+
+    def TestValueEstimationWithReward(self) -> bool:
+        B = 5
+        mem, attn, state = self.RandBatch(B)
+        critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=True, wExt=1.0, wInt=1.0).to(self.device)
+
+        critic.eval()
+
+        reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
+        next_value = torch.randn(B, device=self.device)
+        done = torch.randint(0, 2, (B,), device=self.device).float()
+        entropy_prev = torch.rand(B, device=self.device)
+        uncert_opt = F.softplus(torch.randn(B, device=self.device))
+
+        out = critic(memoryPrev=mem, attnPrev=attn, stateCurr=state,rewardExt=reward_ext, nextValue=next_value, done=done,policyEntropyPrev=entropy_prev,uncertainty=uncert_opt,tdErrorPrev=None)
+
+        gamma = out.eT[..., 2]
+        td_target_expected = out.rewardUsed + gamma * next_value * (1.0 - done)
+        td_error_expected = td_target_expected - out.value
+
+        ok = True
+        ok &= torch.allclose(out.tdError, td_error_expected, atol=1e-5, rtol=1e-5)
+        ok &= (out.value.shape == (B,))
+        ok &= (out.entropy.shape == (B,))
+        ok &= (out.uncertainty.shape == (B,))
+        ok &= (out.eT.shape == (B,3))
+
+        print(f"ValueEstimation (with external reward) test {'passed' if ok else 'failed'}.")
+        return ok
+
+    def TestValueLossAndBackward(self) -> bool:
+        B = 6
+        mem, attn, state = self.RandBatch(B)
+        critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=False).to(self.device)
+        
+        critic.train()
+
+        out = critic(memoryPrev=mem, attnPrev=attn, stateCurr=state)
+        gamma = out.eT[..., 2].detach()
+        target = (out.rewardUsed + gamma * out.value.detach()) 
+        loss = critic.ValueLoss(out.value, target)
+
+        ok = True
+        ok &= (isinstance(loss, torch.Tensor) and loss.dim() == 0)
+        loss.backward()
+        has_grad = any((p.grad is not None and torch.isfinite(p.grad).all()) for p in critic.parameters() if p.requires_grad)
+        ok &= has_grad
+
+        print(f"ValueLoss & backward test {'passed' if ok else 'failed'}.")
+        return ok
+
+    def RunAll(self):
+        results = []
+        results.append(self.TestIntrinsicRewardGenerator())
+        results.append(self.TestValueEstimationNoReward())
+        results.append(self.TestValueEstimationWithReward())
+        results.append(self.TestValueLossAndBackward())
+        passed = sum(1 for x in results if x)
+        print(f"[ValueModule Tests] {passed}/{len(results)} passed.")
+        return all(results)

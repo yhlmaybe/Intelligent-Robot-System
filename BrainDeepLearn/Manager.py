@@ -5,7 +5,7 @@ from AttentionModule import AttentionExtractor, TestAttentionMTool
 from MemoryModule import MemoryExtractor, TestMemoryMTool
 from DecisionModule import DecisionExtractor, KEYBOARD_LAYOUT, TestDecisionMTool
 from WorldModule import WMAdapterForPlanner, RSSMWorldModel , ActionEncoder, TestWorldMTool
-from ValueEstimationModule import ValueEstimationExtractor
+from ValueEstimationModule import ValueEstimationExtractor, TestValueEstimationMTool
 from pathlib import Path
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
@@ -387,6 +387,7 @@ class Test:
         self.memory_module = TestMemoryMTool()
         self.decision_module = TestDecisionMTool()
         self.world_module = TestWorldMTool()
+        self.value_module = TestValueEstimationMTool()
 
     def PerceptionModule(self):
         try:
@@ -473,6 +474,23 @@ class Test:
             pla_ok = self.world_module.TestWMAdapterForPlanner()
 
             if enc_ok and pos_ok and pri_ok and for_ok and pla_ok:
+                return True
+            else:
+                return False
+        except Exception as e:
+            import traceback
+            print(f"Test crash! Error type: {type(e).__name__}")
+            print(f"Wrong position: {traceback.format_exc()}")
+            return False
+        
+    def ValueEstimationModule(self):
+        try:
+            irg_ok = self.value_module.TestIntrinsicRewardGenerator()
+            ven_ok = self.value_module.TestValueEstimationNoReward()
+            vew_ok = self.value_module.TestValueEstimationWithReward()
+            vb_ok = self.value_module.TestValueLossAndBackward()
+
+            if irg_ok and ven_ok and vew_ok and vb_ok:
                 return True
             else:
                 return False
@@ -907,6 +925,9 @@ class ManagerFunction:
     
     def TestWorldModule(self):
         return self.test.WorldModule()
+    
+    def TestValueEstimationModule(self):
+        return self.test.ValueEstimationModule()
 
 
 

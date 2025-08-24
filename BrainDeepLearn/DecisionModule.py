@@ -162,7 +162,16 @@ class OptionPolicy(nn.Module):
 
 
 class DecisionExtractor(nn.Module):
-    def __init__(self, stateDim: int = 768, includeNoSkill: bool = True, useHebbOnline: bool = False, optionNum: int = 8, psiDim: int = 32):
+    def __init__(
+        self,
+        stateDim: int = 768,
+        includeNoSkill: bool = True,
+        useHebbOnline: bool = False,
+        optionNum: int = 8,
+        psiDim: int = 32,
+        *,
+        entropyWeights: Tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25),
+        logstdBounds: Tuple[float, float] = (-5.0, 2.0),):
         super().__init__()
 
         self.feature_net = nn.Sequential(
@@ -192,6 +201,10 @@ class DecisionExtractor(nn.Module):
         self.keyboard = KeyboardActor(256, base_names, skill_names, includeNoSkill=includeNoSkill)
         self.mouse = MouseActor(256)
         self.option = OptionPolicy(zDim=256, numOptions=optionNum, psiDim=psiDim)
+
+        self.register_buffer("entropy_w", torch.tensor(entropyWeights, dtype=torch.float32))
+        self.logstd_low = float(logstdBounds[0])
+        self.logstd_high = float(logstdBounds[1])
 
     def Encode(self, stateFeat: torch.Tensor, updateHebb: bool) -> torch.Tensor:
         x = self.feature_net(stateFeat)
@@ -237,6 +250,42 @@ class DecisionExtractor(nn.Module):
             if on.numel() > 6:
                 vec128[b, on[6:]] = 0.0
 
+    def EntropyComponents(
+        self,
+        baseLogits: torch.Tensor,
+        extraLogits: torch.Tensor,
+        skillLogits: torch.Tensor,
+        logstd: torch.Tensor,) -> Dict[str, torch.Tensor]:
+        
+        ent_base = EntropyBernoulliFromLogits(baseLogits)
+        ent_extra = EntropyBernoulliFromLogits(extraLogits)
+        ent_skill = torch.distributions.Categorical(logits=skillLogits).entropy()
+        ent_mouse = (0.5 * (1.0 + math.log(2 * math.pi)) + logstd).sum(-1)
+
+        n_base = max(1, baseLogits.size(-1))
+        n_extra = max(1, extraLogits.size(-1))
+        n_skill = max(2, skillLogits.size(-1)) 
+        base_norm  = ent_base / n_base
+        extra_norm = ent_extra / n_extra
+        skill_norm = ent_skill / math.log(n_skill)
+
+        l, h = self.logstd_low, self.logstd_high
+        mouse_norm = ((logstd.clamp(l, h) - l) / (h - l)).mean(-1)
+
+        return {
+            "ent_base": ent_base, "ent_extra": ent_extra,
+            "ent_skill": ent_skill, "ent_mouse": ent_mouse,
+            "base_norm": base_norm, "extra_norm": extra_norm,
+            "skill_norm": skill_norm, "mouse_norm": mouse_norm,}
+
+    def AggregateEntropy(self, comps: Dict[str, torch.Tensor]) -> torch.Tensor:
+        w = self.entropy_w 
+        return (
+            w[0] * comps["base_norm"]
+          + w[1] * comps["extra_norm"]
+          + w[2] * comps["skill_norm"]
+          + w[3] * comps["mouse_norm"])
+
     def forward(
         self,
         stateFeat: torch.Tensor,                            
@@ -259,72 +308,63 @@ class DecisionExtractor(nn.Module):
         mu, logstd, click_logits = self.mouse.Params(z)
 
         if prior is not None:
-            base_logits  = MixLogits(base_logits,  prior.get("base",  {}).get("logits", None),  mixW)
+            base_logits = MixLogits(base_logits,  prior.get("base",  {}).get("logits", None),  mixW)
             extra_logits = MixLogits(extra_logits, prior.get("extra", {}).get("logits", None),  mixW)
             skill_logits = MixLogits(skill_logits, prior.get("skill", {}).get("logits", None),  mixW)
-            mu, logstd = MixGauss(mu, logstd,prior.get("mouse", {}).get("mu",  None),prior.get("mouse", {}).get("var", None),mixW)
+            mu, logstd = MixGauss(mu, logstd, prior.get("mouse", {}).get("mu",  None), prior.get("mouse", {}).get("var", None), mixW)
             click_logits = MixLogits(click_logits, prior.get("click", {}).get("logits", None), mixW)
+
+        comps = self.EntropyComponents(base_logits, extra_logits, skill_logits, logstd)
+        entropy_scalar = self.AggregateEntropy(comps)  
 
         out: Dict[str, any] = {
             "z": z,
+            "entropy": entropy_scalar, 
             "option": {"logits": option_logits, "psi": psi, "beta": beta},
-            "keyboard": {
-                "base_logits":  base_logits,
-                "skill_logits": skill_logits,
-                "extra_logits": extra_logits,
-            },
-            "mouse": {
-                "mu": mu, "logstd": logstd, "click_logits": click_logits
-            }}
-
+            "keyboard": {"base_logits":  base_logits,"skill_logits": skill_logits,"extra_logits": extra_logits,},
+            "mouse": {"mu": mu, "logstd": logstd, "click_logits": click_logits},
+            "entropy_components": {
+                "base": comps["ent_base"], "extra": comps["ent_extra"],
+                "skill": comps["ent_skill"], "mouse": comps["ent_mouse"],
+                "base_norm": comps["base_norm"], "extra_norm": comps["extra_norm"],
+                "skill_norm": comps["skill_norm"], "mouse_norm": comps["mouse_norm"],},}
 
         if sample:
             if deterministic:
-                base_act  = (torch.sigmoid(base_logits)  > 0.5).float()
+                base_act = (torch.sigmoid(base_logits)  > 0.5).float()
                 extra_act = (torch.sigmoid(extra_logits) > 0.5).float()
                 skill_idx = torch.argmax(skill_logits, dim=-1)
-            
-                mouse_a   = mu
-                clicks    = (torch.sigmoid(click_logits) > 0.5).float()
+                mouse_a = mu
+                clicks = (torch.sigmoid(click_logits) > 0.5).float()
 
                 logp_base = StableLogProbBernoulli(base_logits, base_act)
-                logp_extra= StableLogProbBernoulli(extra_logits, extra_act)
-                logp_skill= torch.distributions.Categorical(logits=skill_logits).log_prob(skill_idx)
-                logp_mouse= -0.5 * (((mouse_a - mu) / torch.exp(logstd)).pow(2) + 2 * logstd + math.log(2 * math.pi)).sum(-1)
-                ent_base  = EntropyBernoulliFromLogits(base_logits)
-                ent_extra = EntropyBernoulliFromLogits(extra_logits)
-                ent_skill = torch.distributions.Categorical(logits=skill_logits).entropy()
-                ent_mouse = (0.5 * (1.0 + math.log(2 * math.pi)) + logstd).sum(-1)
-            else:  
-                base_prob  = torch.sigmoid(base_logits)
+                logp_extra = StableLogProbBernoulli(extra_logits, extra_act)
+                logp_skill = torch.distributions.Categorical(logits=skill_logits).log_prob(skill_idx)
+                logp_mouse = -0.5 * (((mouse_a - mu) / torch.exp(logstd)).pow(2) + 2 * logstd + math.log(2 * math.pi)).sum(-1)
+            else:
+                base_prob = torch.sigmoid(base_logits)
                 extra_prob = torch.sigmoid(extra_logits)
                 base_act = torch.bernoulli(base_prob)
-                extra_act  = torch.bernoulli(extra_prob)
-                skill_idx  = torch.distributions.Categorical(logits=skill_logits).sample()
-          
+                extra_act = torch.bernoulli(extra_prob)
+                skill_idx = torch.distributions.Categorical(logits=skill_logits).sample()
+
                 std = torch.exp(logstd)
                 eps = torch.randn_like(std)
                 mouse_a = mu + eps * std
-               
+
                 click_prob = torch.sigmoid(click_logits)
                 clicks = torch.bernoulli(click_prob)
-             
+
                 logp_base = StableLogProbBernoulli(base_logits, base_act)
                 logp_extra = StableLogProbBernoulli(extra_logits, extra_act)
                 logp_skill = torch.distributions.Categorical(logits=skill_logits).log_prob(skill_idx)
                 logp_mouse = -0.5 * (((mouse_a - mu) / std).pow(2) + 2 * logstd + math.log(2 * math.pi)).sum(-1)
-                ent_base = EntropyBernoulliFromLogits(base_logits)
-                ent_extra = EntropyBernoulliFromLogits(extra_logits)
-                ent_skill = torch.distributions.Categorical(logits=skill_logits).entropy()
-                ent_mouse = (0.5 * (1.0 + math.log(2 * math.pi)) + logstd).sum(-1)
 
             out["keyboard"].update({
                 "base_act": base_act, "extra_act": extra_act, "skill_idx": skill_idx,
-                "logp_base": logp_base, "logp_extra": logp_extra, "logp_skill": logp_skill,
-                "ent_base": ent_base, "ent_extra": ent_extra, "ent_skill": ent_skill})
+                "logp_base": logp_base, "logp_extra": logp_extra, "logp_skill": logp_skill,})
             
-            out["mouse"].update({
-                "a": mouse_a, "logp": logp_mouse, "ent": ent_mouse, "click_sample": clicks})
+            out["mouse"].update({"a": mouse_a, "logp": logp_mouse, "click_sample": clicks})
 
             if returnKeys128:
                 keys128_raw = self.ToKeys128(base_act, extra_act, skill_idx, clicks)
@@ -333,15 +373,14 @@ class DecisionExtractor(nn.Module):
                     keys128 = keys128_raw.clone()
                     self.ApplyConstraints(keys128)
                     out["keys128"] = keys128
-
         return out
-
 
     def ResetHebbianMemory(self, value: float = 0.0):
         with torch.no_grad():
             for m in self.modules():
                 if isinstance(m, HebbianPlasticityLayer):
                     m.hebb.fill_(value)
+
 
 
 class CEMPlanner(nn.Module):

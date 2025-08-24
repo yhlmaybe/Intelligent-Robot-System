@@ -118,3 +118,9 @@ bool BrainDeepLearnInterface::TestWorldModule()
     bool success = CALL_METHOD_NOARG("TestWorldModule");
     return success;
 }
+
+bool BrainDeepLearnInterface::TestValueEstimationModule()
+{
+    bool success = CALL_METHOD_NOARG("TestValueEstimationModule");
+    return success;
+}

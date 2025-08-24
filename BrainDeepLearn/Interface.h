@@ -63,6 +63,8 @@ public:
 
     bool TestWorldModule();
 
+    bool TestValueEstimationModule();
+
 private:
 
     PyObject* pModule = nullptr;

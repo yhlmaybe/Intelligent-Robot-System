@@ -33,6 +33,7 @@ public:
     QPushButton *testMemoryModule_pushButton;
     QPushButton *testDecisionModule_pushButton;
     QPushButton *testWorldModule_pushButton;
+    QPushButton *testValueEstimationModule_pushButton;
     QPushButton *close_pushButton;
 
     void setupUi(QWidget *BrainDeepLearnForm)
@@ -84,6 +85,11 @@ public:
 
         verticalLayout->addWidget(testWorldModule_pushButton);
 
+        testValueEstimationModule_pushButton = new QPushButton(BrainDeepLearnForm);
+        testValueEstimationModule_pushButton->setObjectName(QString::fromUtf8("testValueEstimationModule_pushButton"));
+
+        verticalLayout->addWidget(testValueEstimationModule_pushButton);
+
 
         gridLayout->addLayout(verticalLayout, 0, 1, 1, 1);
 
@@ -110,6 +116,7 @@ public:
 #ifndef QT_NO_SHORTCUT
         testWorldModule_pushButton->setShortcut(QApplication::translate("BrainDeepLearnForm", "Ctrl+S", nullptr));
 #endif // QT_NO_SHORTCUT
+        testValueEstimationModule_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestValueEstimationModule", nullptr));
         close_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "Close", nullptr));
     } // retranslateUi
 

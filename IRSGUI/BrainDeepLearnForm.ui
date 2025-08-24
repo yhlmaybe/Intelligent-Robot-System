@@ -68,6 +68,13 @@
        </property>
       </widget>
      </item>
+     <item>
+      <widget class="QPushButton" name="testValueEstimationModule_pushButton">
+       <property name="text">
+        <string>TestValueEstimationModule</string>
+       </property>
+      </widget>
+     </item>
     </layout>
    </item>
    <item row="1" column="0">
