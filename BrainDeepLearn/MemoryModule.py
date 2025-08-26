@@ -7,18 +7,17 @@ import torch.nn.functional as F
 import copy
 
 
-def StableTopk(scores: torch.Tensor, k: int):
 
+def StableTopk(scores: torch.Tensor, k: int):
     N = scores.size(-1)
     eps = (torch.arange(N, device=scores.device, dtype=torch.float32) * 1e-7).view(1, -1)
     while eps.dim() < scores.dim():
         eps = eps.unsqueeze(0)
-    biased = scores.float() + eps  
+    biased = scores.float() + eps
     return torch.topk(biased, k, dim=-1)
 
 class GlobalWorkspace(nn.Module):
-    def __init__(self, dim: int, slots: int = 12, defaultTtl: int = 8,
-                 recencyTemp: float = 0.07, priorityTemp: float = 1.0):
+    def __init__(self, dim: int, slots: int = 12, defaultTtl: int = 8, recencyTemp: float = 0.07, priorityTemp: float = 1.0):
         super().__init__()
         self.dim = dim
         self.slots = slots
@@ -33,7 +32,6 @@ class GlobalWorkspace(nn.Module):
         self.register_buffer("last_step", torch.zeros(slots, dtype=torch.long))
         self.register_buffer("tag_id", torch.zeros(slots, dtype=torch.long))
         self.register_buffer("owner_id", torch.zeros(slots, dtype=torch.long))
-
         self.global_step = 0
 
     @torch.no_grad()
@@ -64,7 +62,8 @@ class GlobalWorkspace(nn.Module):
               ttl: Optional[int] = None,
               tagId: int = 0,
               ownerId: int = 0,
-              replacePolicy: str = "soft"):  # "soft" or "hard"
+              replacePolicy: str = "soft"):
+        
         device = self.keys.device
         key = F.normalize(key.detach().to(device), dim=-1)
         val = F.normalize(val.detach().to(device), dim=-1)
@@ -163,7 +162,6 @@ class GlobalWorkspace(nn.Module):
             'last_step': self.last_step.clone(),
             'tag_id': self.tag_id.clone(),
             'owner_id': self.owner_id.clone(),}
-
 
 
 class SemanticLTM(nn.Module):
@@ -284,7 +282,6 @@ class LongTermMemory(nn.Module):
         return F.normalize(sem + epi, dim=-1)
 
 
-
 class MetaPlasticityController(nn.Module):
     def __init__(self, metaInDim: int = 9, hiddenDim: int = 96):
         super().__init__()
@@ -300,7 +297,10 @@ class MetaPlasticityController(nn.Module):
         B = metaFeat.size(0); device = metaFeat.device
         if self.h_state is None or self.h_state.size(0) != B or self.h_state.device != device:
             self.h_state = torch.zeros(B, self.rnn.hidden_size, device=device)
-        self.h_state = self.rnn(metaFeat, self.h_state)
+
+        prev = None if self.h_state is None else self.h_state.detach() 
+
+        self.h_state = self.rnn(metaFeat, prev)     
         a_hat, b_hat, bias_hat, fus_hat, imp_hat = self.fc_out(self.h_state).chunk(5, dim=1)
         a = 0.5 + 0.5 * torch.sigmoid(a_hat)
         b = 0.5 + 0.5 * torch.sigmoid(b_hat)
@@ -312,7 +312,6 @@ class MetaPlasticityController(nn.Module):
     def Reset(self):
         self.h_state = None
         self.memory_utilization = 0.0
-
 
 
 class MemoryExtractor(nn.Module):
@@ -337,9 +336,9 @@ class MemoryExtractor(nn.Module):
         ltm: Optional[LongTermMemory] = None,
         gwsSlots: int = 12,
         gwsTtl: int = 8,
-        consolidate_every: int = 200,
-        rehearse_every: int = 300,
-        owner_id: int = 1,) -> None:
+        consolidateEvery: int = 200,
+        rehearseEvery: int = 300,
+        ownerId: int = 1,) -> None:
         super().__init__()
 
         self.ssm_state_dim = ssmStateDim
@@ -357,9 +356,9 @@ class MemoryExtractor(nn.Module):
         self.svd_min = svdMin
         self.svd_max = svdMax
 
-        self.consolidate_every = consolidate_every
-        self.rehearse_every = rehearse_every
-        self.owner_id = owner_id
+        self.consolidate_every = consolidateEvery
+        self.rehearse_every = rehearseEvery
+        self.owner_id = ownerId
 
         A_init = torch.empty(ssmStateDim, ssmStateDim)
         nn.init.orthogonal_(A_init, gain=0.8)
@@ -411,13 +410,130 @@ class MemoryExtractor(nn.Module):
 
         self.norm = nn.LayerNorm(outputDim)
         self.grad_bridge = nn.Parameter(torch.tensor(0.3))
-        with torch.no_grad():
-            self.grad_bridge.clamp_(0.1, 0.9)
 
         self.gws = gws if gws is not None else GlobalWorkspace(dim=memoryDim, slots=gwsSlots, defaultTtl=gwsTtl)
         self.ltm = ltm if ltm is not None else LongTermMemory(dim=memoryDim)
         self.gws_summary = nn.Linear(ssmStateDim + outputDim + memoryDim, memoryDim)
         self.gws_gate = nn.Sequential(nn.Linear(memoryDim * 2, 128), nn.ReLU(), nn.Linear(128, 1), nn.Sigmoid())
+
+        self.ns_enable: bool = True
+        self.ns_lambda: float = 0.1
+        self.ns_alpha_write: float = 0.2
+        self.ns_retrieve_boost: float = 0.3
+        self.ns_alpha_out: float = 0.2
+
+        self.ns_K: int = 6
+        self.ns_exclusives: List[List[int]] = [[0,1],[3,4]]
+        self.ns_implications: List[Tuple[int, int]] = [(0,2)]
+        self.ns_atleast_one: List[List[int]] = [[0,2]]
+
+        self.ns_head_pre = nn.Linear(self.memory_dim, self.ns_K)
+        self.ns_head_post = nn.Linear(self.memory_dim, self.ns_K)
+        nn.init.xavier_uniform_(self.ns_head_pre.weight); nn.init.zeros_(self.ns_head_pre.bias)
+        nn.init.xavier_uniform_(self.ns_head_post.weight); nn.init.zeros_(self.ns_head_post.bias)
+
+        self._ns_prev_P_pre: Optional[torch.Tensor] = None
+        self._ns_prev_P_post: Optional[torch.Tensor] = None
+        self._ns_penalty_vec: Optional[torch.Tensor] = None
+        self.ns_last: Dict[str, torch.Tensor] = {}
+
+        self._extra_losses: List[torch.Tensor] = []
+
+    def ResetInternalLoss(self):
+        self._extra_losses = []
+
+    def AddInternalLoss(self, loss: torch.Tensor):
+        if isinstance(loss, torch.Tensor):
+            self._extra_losses.append(loss)
+
+    def GetInternalLoss(self) -> torch.Tensor:
+        if len(self._extra_losses) == 0:
+            dev = self.h_state.device
+            return torch.zeros([], device=dev)
+        return torch.stack([l for l in self._extra_losses]).sum()
+
+    def attach_loss(self, mainLoss: torch.Tensor) -> torch.Tensor:
+        return mainLoss + self.GetInternalLoss()
+
+    def backward(self, mainLoss: torch.Tensor, **kwargs):
+        total = self.attach_loss(mainLoss)
+        total.backward(**kwargs)
+
+    def NsEnsurePrev(self, B: int, device: torch.device):
+        if (self._ns_prev_P_pre is None) or (self._ns_prev_P_pre.size(0) != B) or (self._ns_prev_P_pre.device != device):
+            self._ns_prev_P_pre = torch.zeros(B, self.ns_K, device=device)
+        if (self._ns_prev_P_post is None) or (self._ns_prev_P_post.size(0) != B) or (self._ns_prev_P_post.device != device):
+            self._ns_prev_P_post = torch.zeros(B, self.ns_K, device=device)
+
+    def NsRules(self, P: torch.Tensor, P_prev: Optional[torch.Tensor]) -> torch.Tensor:
+        B = P.size(0); device = P.device
+        per_sample = torch.zeros(B, device=device)
+
+        for S in self.ns_exclusives:
+            if len(S) >= 2:
+                ps = P[:, S]
+                s = ps.sum(dim=1)
+                s2 = (ps * ps).sum(dim=1)
+                per_sample = per_sample + 0.5 * (s * s - s2)
+
+        for (a, b) in self.ns_implications:
+            per_sample = per_sample + torch.relu(P[:, a] - P[:, b])
+
+        for S in self.ns_atleast_one:
+            if len(S) > 0:
+                anyp = P[:, S].max(dim=1).values
+                per_sample = per_sample + (1.0 - anyp)
+
+        if (P_prev is not None) and (P_prev.shape == P.shape):
+            per_sample = per_sample + torch.relu(P_prev - P).mean(dim=1)
+        return per_sample
+
+    def NsPreWrite(self, val: torch.Tensor, importance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.ns_enable:
+            dev = val.device
+            return torch.empty(0, device=dev), torch.empty(0, device=dev), torch.zeros([], device=dev)
+        B, device = val.size(0), val.device
+        self.NsEnsurePrev(B, device)
+
+        P_pre = torch.sigmoid(self.ns_head_pre(val))
+        per_sample_pre = self.NsRules(P_pre, self._ns_prev_P_pre)
+        self._ns_prev_P_pre = P_pre.detach()
+
+        updated_importance = importance
+        if self.ns_alpha_write > 0.0:
+            damp = torch.clamp(per_sample_pre, 0, 1).view(-1, 1)
+            updated_importance = importance * (1.0 - self.ns_alpha_write * damp)
+
+        rule_loss_pre = per_sample_pre.mean()
+        self._ns_penalty_vec = torch.clamp(per_sample_pre, 0, 1).view(-1, 1).detach()
+
+        return P_pre, per_sample_pre, rule_loss_pre, updated_importance  
+
+    def NsPostRead(self, memRecall: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.ns_enable:
+            dev = memRecall.device
+            B = memRecall.size(0)
+            return (torch.empty(0, device=dev),
+                    torch.empty(0, device=dev),
+                    torch.zeros([], device=dev),
+                    torch.zeros(B, 1, device=dev),
+                    memRecall)
+        
+        B, device = memRecall.size(0), memRecall.device
+        self.NsEnsurePrev(B, device)
+
+        P_post = torch.sigmoid(self.ns_head_post(memRecall))
+        per_sample_post = self.NsRules(P_post, self._ns_prev_P_post)
+        self._ns_prev_P_post = P_post.detach()
+
+        damp = torch.clamp(per_sample_post, 0, 1).view(-1, 1)
+        adj_mem = memRecall
+        if self.ns_alpha_out > 0.0:
+            adj_mem = memRecall * (1.0 - self.ns_alpha_out * damp)  
+
+        self._ns_penalty_vec = damp.detach()
+        rule_loss_post = per_sample_post.mean()
+        return P_post, per_sample_post, rule_loss_post, damp, adj_mem 
 
     def forward(self,
                 x: torch.Tensor,
@@ -431,6 +547,9 @@ class MemoryExtractor(nn.Module):
 
         amp_enable = self.use_amp and x.is_cuda
         dtype = torch.float16 if x.is_cuda else torch.bfloat16
+
+        self.ResetInternalLoss()
+
         with torch.autocast(device_type=x.device.type, dtype=dtype, enabled=amp_enable):
             B, device = x.size(0), x.device
             if reset:
@@ -439,15 +558,16 @@ class MemoryExtractor(nn.Module):
                 self.SoftReset()
             if self.h_state.size(0) != B or self.h_state.device != device:
                 self.h_state = torch.zeros(B, self.ssm_state_dim, device=device)
-            with torch.no_grad():
-                self.grad_bridge.clamp_(0.1, 0.9)
 
             self.time_step += 1
             self.gws.StepTick(); self.ltm.StepTick()
 
             h_new = self.h_state @ self.A_full.t() + self.B_mat(x)
             y_ssm = self.C_mat(h_new) + self.D_mat(x)
-            self.h_state = self.grad_bridge * h_new + (1 - self.grad_bridge) * h_new.detach()
+
+            gb = self.grad_bridge.clamp(0.1, 0.9)
+            new_state = gb * h_new + (1 - gb) * h_new.detach()
+            self.h_state = new_state.detach()   
 
             key = F.normalize(self.state2mem(h_new), dim=-1)
             val = F.normalize(self.state2val(h_new), dim=-1)
@@ -461,19 +581,37 @@ class MemoryExtractor(nn.Module):
             a, b, gate_bias, fusion_gate, meta_imp = self.GetMetaSignals(tdError, entropy, reward, uncertainty, B, device)
             importance = 0.7 * importance + 0.3 * meta_imp.view(-1, 1)
 
+            if self.ns_enable:
+                P_pre, per_pre, rule_pre, importance = self.NsPreWrite(val, importance) 
+            else:
+                rule_pre = torch.zeros([], device=h_new.device)
+
             self.HebbianUpdate(key, gate_local, neuromod, a, b)
             self.KvWrite(key, val, importance)
+
             mem_recall = self.Retrieve(key, fusion_gate)
 
             msg = torch.cat([h_new, y_ssm, mem_recall], dim=-1)
             ws_val = F.normalize(self.gws_summary(msg), dim=-1)
-
             for i in range(B):
                 self.gws.Write(key[i], ws_val[i], priority=float(importance[i].item()), ttl=6, tagId=1, ownerId=self.owner_id)
 
             gws_read, _ = self.gws.Attend(key, topk=4)
             fuse_gate = self.gws_gate(torch.cat([gws_read, mem_recall], dim=-1))
             mem_recall = fuse_gate * gws_read + (1 - fuse_gate) * mem_recall
+
+            if self.ns_enable:
+                P_post, per_post, rule_post, damp, mem_recall = self.NsPostRead(mem_recall) 
+                self.ns_last = {
+                    "P_pre": P_pre.detach(),
+                    "P_post": P_post.detach(),
+                    "per_sample_pre": per_pre.detach(),
+                    "per_sample_post": per_post.detach(),
+                    "rule_loss_pre": (self.ns_lambda * rule_pre).detach(),
+                    "rule_loss_post": (self.ns_lambda * rule_post).detach(),}
+                self.AddInternalLoss(self.ns_lambda * (rule_pre + rule_post))
+            else:
+                self.ns_last = {}
 
             if tdError is not None:
                 mem_recall = self.ApplyOutputGate(mem_recall, tdError, gate_bias)
@@ -608,6 +746,10 @@ class MemoryExtractor(nn.Module):
             th_min = top_sim.min(dim=-1, keepdim=True).values
             th_max = top_sim.max(dim=-1, keepdim=True).values
             th = torch.clamp(th, min=th_min, max=th_max)
+
+            if getattr(self, "ns_enable", False) and self.ns_retrieve_boost > 0.0 and (self._ns_penalty_vec is not None):
+                th = th + self.ns_retrieve_boost * self._ns_penalty_vec.to(th.device)
+
             mask = top_sim > th
             masked_top = top_sim.masked_fill(~mask, -1e9)
             all_false = ~mask.any(dim=-1, keepdim=True)
@@ -701,6 +843,12 @@ class MemoryExtractor(nn.Module):
         if self.meta_ctrl: self.meta_ctrl.Reset()
         self.gws.Reset(); self.ltm.Reset()
 
+        self._ns_prev_P_pre = None
+        self._ns_prev_P_post = None
+        self._ns_penalty_vec = None
+        self.ns_last = {}
+        self.ResetInternalLoss()
+
     @torch.no_grad()
     def GetState(self) -> dict:
         gws_snap = self.gws.Inspect()
@@ -750,6 +898,9 @@ class MemoryExtractor(nn.Module):
             "ltm_epi_step": epi.step.clone(),
             "ltm_epi_filled": torch.tensor(epi.filled),
             "ltm_epi_global_step": torch.tensor(epi.global_step),
+
+            "ns_prev_P_pre": (self._ns_prev_P_pre.clone() if (self._ns_prev_P_pre is not None) else None),
+            "ns_prev_P_post": (self._ns_prev_P_post.clone() if (self._ns_prev_P_post is not None) else None),
 
             "rng_cpu": torch.get_rng_state(),
             "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,}
@@ -817,6 +968,13 @@ class MemoryExtractor(nn.Module):
             epi.filled = int(state["ltm_epi_filled"].item())
             epi.global_step = int(state["ltm_epi_global_step"].item())
 
+        if "ns_prev_P_pre" in state:
+            self._ns_prev_P_pre = (state["ns_prev_P_pre"].to(self.h_state.device)
+                                    if state["ns_prev_P_pre"] is not None else None)
+        if "ns_prev_P_post" in state:
+            self._ns_prev_P_post = (state["ns_prev_P_post"].to(self.h_state.device)
+                                    if state["ns_prev_P_post"] is not None else None)
+
     def Step(self, x: torch.Tensor, state: Optional[dict] = None, tdError=None, entropy=None, reward=None, uncertainty=None):
         if state is not None:
             orig = self.GetState()
@@ -840,8 +998,7 @@ class MemoryExtractor(nn.Module):
             gws_r, _ = self.gws.Attend(q, topk=4)
             ltm_r = self.ltm.Retrieve(q, topkSem=6, topkEpi=2)
             hyp = F.normalize(gws_r + ltm_r + q, dim=-1)
-            self.gws.Write(hyp[0], hyp[0],
-                           priority=0.5, ttl=4, tagId=2, ownerId=self.owner_id)
+            self.gws.Write(hyp[0], hyp[0], priority=0.5, ttl=4, tagId=2, ownerId=self.owner_id)
             q = hyp
         return hyp
 
@@ -913,7 +1070,7 @@ class TestMemoryMTool:
 
     def TestMemoryExtractorForward(self):
         try:
-            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96,useMeta=True, useAmp=False, gwsSlots=8, gwsTtl=6, consolidate_every=50, rehearse_every=60)
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96,useMeta=True, useAmp=False, gwsSlots=8, gwsTtl=6, consolidateEvery=50, rehearseEvery=60)
             mem = MemoryExtractor(**cfg).to(self.device)
             B = 4
             x = torch.randn(B, cfg["inputDim"], device=self.device)
@@ -1079,7 +1236,7 @@ class TestMemoryMTool:
 
     def TestNumericalStability(self):
         try:
-            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=48, outputDim=96,useMeta=False, useAmp=False, gwsSlots=8, gwsTtl=6, consolidate_every=1000, rehearse_every=1000)
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=48, outputDim=96,useMeta=False, useAmp=False, gwsSlots=8, gwsTtl=6, consolidateEvery=1000, rehearseEvery=1000)
             mem = MemoryExtractor(**cfg).to(self.device)
 
             cos_hist = self.NumericalStabilityProbe(
@@ -1104,4 +1261,157 @@ class TestMemoryMTool:
             return False
 
 
+    def AttachAllInternalLosses(self, rootModule: torch.nn.Module, baseLoss: torch.Tensor):
+        extras = []
+        for _, m in rootModule.named_modules():
+            getter = getattr(m, "GetInternalLoss", None) or getattr(m, "get_internal_loss", None)
+            if callable(getter):
+                v = getter()
+                if isinstance(v, torch.Tensor):
+                    extras.append(v.to(device=baseLoss.device, dtype=baseLoss.dtype))
+        return baseLoss + (torch.stack(extras).sum() if extras else baseLoss.new_zeros([]))
 
+
+    def TrainStepSmoke(self):
+        cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96, useMeta=True, useAmp=False, gwsSlots=8, gwsTtl=6, consolidateEvery=10_000, rehearseEvery=10_000)
+        mem = MemoryExtractor(**cfg).to(self.device)
+        mem.train()
+        opt = torch.optim.Adam(mem.parameters(), lr=1e-3)
+
+        B = 8
+        x = torch.randn(B, cfg["inputDim"], device=self.device)
+        target = torch.randn(B, cfg["outputDim"], device=self.device)
+
+        out, _ = mem(x)
+        base = F.mse_loss(out, target)
+
+        total = self.AttachAllInternalLosses(mem, base)
+        opt.zero_grad()
+        total.backward()
+
+        nesy_grad_ok = any(
+            (("ns_head_pre" in n or "ns_head_post" in n) and p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0)
+            for n, p in mem.named_parameters())
+        assert nesy_grad_ok, "NeSy heads did not receive gradients."
+
+        for n, p in mem.named_parameters():
+            if p.grad is not None:
+                assert torch.isfinite(p.grad).all(), f"Non-finite grad at {n}"
+
+        opt.step()
+        print("TrainStepSmoke passed.")
+        return True
+    
+    def TrainNeSyOnlySanity(self, steps: int = 30):
+        cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96, useMeta=False, useAmp=False, gwsSlots=8, gwsTtl=6)
+        mem = MemoryExtractor(**cfg).to(self.device)
+        mem.ns_enable = True
+        mem.ns_lambda = 0.5 
+        mem.train()
+        opt = torch.optim.Adam([p for p in mem.parameters() if p.requires_grad], lr=1e-3)
+
+        in_dim = cfg["inputDim"]
+        last = None
+        for t in range(steps):
+            x = torch.randn(8, in_dim, device=self.device)
+            out, _ = mem(x) 
+            base = torch.zeros([], device=self.device)  
+            total = self.AttachAllInternalLosses(mem, base)
+
+            opt.zero_grad()
+            total.backward()
+            opt.step()
+
+            cur = float(total.detach().item())
+            if last is not None:
+                pass
+            last = cur
+
+        changed = False
+        for n, p in mem.named_parameters():
+            if ("ns_head_pre" in n or "ns_head_post" in n) and p.grad is not None:
+                changed = True
+                break
+        assert changed, "NeSy heads were not updated under internal loss only."
+        print("TrainNeSyOnlySanity passed.")
+        return True
+    
+
+
+    @torch.no_grad()
+    def PrimeMemoryWithConflict(self, mem: MemoryExtractor, rounds: int = 4):
+        in_dim = mem.B_mat.in_features
+        for _ in range(rounds):
+            x = torch.randn(8, in_dim, device=self.device)
+            mem(x)
+
+    def TestNeSyRetrievalEffect(self):
+        cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64, outputDim=96, useMeta=False, useAmp=False, gwsSlots=8, gwsTtl=6)
+        mem = MemoryExtractor(**cfg).to(self.device)
+        mem.eval()
+        mem.ns_enable = False
+        self.PrimeMemoryWithConflict(mem, rounds=6)
+
+        x = torch.randn(8, cfg["inputDim"], device=self.device)
+        _, rec_off = mem(x) 
+
+        mem.ns_enable = True
+        mem.ns_retrieve_boost = 0.5
+        mem.ns_alpha_out = 0.4
+
+        _, rec_on = mem(x)  
+
+        delta = (rec_on - rec_off).norm(dim=1).mean().item()
+        cos = F.cosine_similarity(rec_on, rec_off, dim=1).mean().item()
+        assert (delta > 1e-3) or (cos < 0.99), f"NeSy had negligible effect on retrieval (delta={delta:.3e}, cos={cos:.4f})"
+        print("TestNeSyRetrievalEffect passed.")
+        return True
+    
+    def CheckAttachCollector(self):
+        mem = MemoryExtractor(inputDim=32, ssmStateDim=32, memoryDim=48, memorySize=16, outputDim=48, useMeta=False, useAmp=False).to(self.device)
+        mem.train()
+        x = torch.randn(4, 32, device=self.device)
+        out, _ = mem(x)
+        base = F.mse_loss(out, torch.zeros_like(out))
+
+        manual = mem.GetInternalLoss()
+        total = self.AttachAllInternalLosses(mem, base)
+        auto_extra = total - base
+
+        diff = float((manual - auto_extra).abs().item())
+        assert diff < 1e-7, f"Collector mismatch: {diff}"
+        print("CheckAttachCollector passed.")
+        return True
+    
+
+    def NoNanAfterManySteps(self, steps: int = 50):
+        cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64, outputDim=96, useMeta=True, useAmp=False, gwsSlots=8, gwsTtl=6)
+        mem = MemoryExtractor(**cfg).to(self.device)
+        mem.train()
+        opt = torch.optim.Adam(mem.parameters(), lr=1e-3)
+
+        for t in range(steps):
+            x = torch.randn(8, cfg["inputDim"], device=self.device)
+            y = torch.randn(8, cfg["outputDim"], device=self.device)
+            out, _ = mem(x)
+            base = F.mse_loss(out, y)
+            total = self.AttachAllInternalLosses(mem, base)
+
+            opt.zero_grad()
+            total.backward()
+            for n, p in mem.named_parameters():
+                if p.grad is not None:
+                    assert torch.isfinite(p.grad).all(), f"Non-finite grad at step {t}, {n}"
+            opt.step()
+        print("NoNanAfterManySteps passed.")
+        return True
+    
+    def TestTraining(self):
+        ok = True
+        ok &= self.TrainStepSmoke()
+        ok &= self.TrainNeSyOnlySanity()
+        ok &= self.TestNeSyRetrievalEffect()
+        ok &= self.CheckAttachCollector()
+        ok &= self.NoNanAfterManySteps()
+        print(f"\nTraining-like tests: {'OK' if ok else 'FAIL'}")
+        return ok

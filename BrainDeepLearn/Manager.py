@@ -435,8 +435,9 @@ class Test:
             rea_ok = self.memory_module.TestReason()
             res_ok = self.memory_module.TestResetAndSoftReset()
             sta_ok = self.memory_module.TestNumericalStability()
+            tr_ok = self.memory_module.TestTraining()
         
-            if glo_ok and ltm_ok and mem_ok and str_ok and rea_ok and res_ok and sta_ok:
+            if glo_ok and ltm_ok and mem_ok and str_ok and rea_ok and res_ok and sta_ok and tr_ok:
                 return True
             else:
                 return False
