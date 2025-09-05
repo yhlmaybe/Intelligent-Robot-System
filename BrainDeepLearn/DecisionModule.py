@@ -80,12 +80,13 @@ class HebbianPlasticityLayer(nn.Module):
         w = self.base + self.hebb
         out = F.linear(x, w)
         if update and not x.requires_grad:
-            pre = x.detach()
-            post = out.detach()
-            B = pre.size(0)
-            delta = self.rate * (torch.einsum("bo,bi->oi", post, pre) / max(1, B) - (post.pow(2).mean(0, keepdim=True).t() * self.hebb))
-            self.hebb.mul_(self.decay).add_(delta)
-            self.Project()
+            with torch.no_grad():
+                pre = x.detach()
+                post = out.detach()
+                B = pre.size(0)
+                delta = self.rate * (torch.einsum("bo,bi->oi", post, pre) / max(1, B) - (post.pow(2).mean(0, keepdim=True).t() * self.hebb))
+                self.hebb.copy_(self.hebb * self.decay + delta)
+                self.Project()
         return out
 
 
@@ -157,6 +158,7 @@ class OptionPolicy(nn.Module):
         psi = self.psi_head(h)
         beta = None
         if prevOOnehot is not None:
+            prevOOnehot = prevOOnehot.detach()
             beta = torch.sigmoid(self.beta_head(torch.cat([z, prevOOnehot], dim=-1)))
         return logits_o, psi, beta
 
@@ -235,20 +237,27 @@ class DecisionExtractor(nn.Module):
         return vec
 
     @staticmethod
-    def ApplyConstraints(vec128: torch.Tensor):
-        max_scan = vec128.size(1) - 2
+    def ApplyConstraints(vec128: torch.Tensor) -> torch.Tensor:
+        x = vec128
+        max_scan = x.size(1) - 2
+
         W = KEYBOARD_LAYOUT["base_keys"]["W"]
         S = KEYBOARD_LAYOUT["base_keys"]["S"]
         A = KEYBOARD_LAYOUT["base_keys"]["A"]
         D = KEYBOARD_LAYOUT["base_keys"]["D"]
-        conflict = (vec128[:, W] > 0.5) & (vec128[:, S] > 0.5)
-        vec128[conflict, S] = 0.0
-        conflict = (vec128[:, A] > 0.5) & (vec128[:, D] > 0.5)
-        vec128[conflict, D] = 0.0
-        for b in range(vec128.size(0)):
-            on = (vec128[b, :max_scan] > 0.5).nonzero(as_tuple=False).squeeze(1)
-            if on.numel() > 6:
-                vec128[b, on[6:]] = 0.0
+
+        ws_conf = ((x[:, W] > 0.5) & (x[:, S] > 0.5)).unsqueeze(1)
+        ad_conf = ((x[:, A] > 0.5) & (x[:, D] > 0.5)).unsqueeze(1)
+        x2 = x.clone()
+        x2[:, S:S+1] = torch.where(ws_conf, x2.new_zeros(x2[:, S:S+1].shape), x2[:, S:S+1])
+        x2[:, D:D+1] = torch.where(ad_conf, x2.new_zeros(x2[:, D:D+1].shape), x2[:, D:D+1])
+
+        if max_scan > 0:
+            pressed = (x2[:, :max_scan] > 0.5)
+            rank = torch.cumsum(pressed.to(torch.int16), dim=1)
+            keep = (rank <= 6) | (~pressed)
+            x2 = torch.cat([x2[:, :max_scan] * keep.float(), x2[:, max_scan:]], dim=1)
+        return x2
 
     def EntropyComponents(
         self,
@@ -301,6 +310,9 @@ class DecisionExtractor(nn.Module):
         B = stateFeat.size(0)
 
         z = self.Encode(stateFeat, updateHebb=updateHebb)
+
+        if prevOptionOnehot is not None:
+            prevOptionOnehot = prevOptionOnehot.detach().clone()
 
         option_logits, psi, beta = self.option(z, prevOptionOnehot)
 
@@ -370,9 +382,9 @@ class DecisionExtractor(nn.Module):
                 keys128_raw = self.ToKeys128(base_act, extra_act, skill_idx, clicks)
                 out["keys128_raw"] = keys128_raw
                 if applyConstraints:
-                    keys128 = keys128_raw.clone()
-                    self.ApplyConstraints(keys128)
-                    out["keys128"] = keys128
+                    out["keys128"] = self.ApplyConstraints(keys128_raw)
+                else:
+                    out["keys128"] = keys128_raw
         return out
 
     def ResetHebbianMemory(self, value: float = 0.0):
@@ -699,7 +711,7 @@ class TestDecisionMTool:
             all_codes += list(grp.values())
         self.max_code = max(all_codes) 
         self.keys128_dim = self.max_code + 1 + 2 
-        self.num_base  = len(self.base_codes) 
+        self.num_base = len(self.base_codes) 
         self.num_skill = len(self.skill_names) + 1
         self.num_extra = len(self.extra_codes)
 
@@ -722,21 +734,21 @@ class TestDecisionMTool:
         return ok
 
     def TestDecisionExtractorNoPrior(self) -> bool:
-        model = DecisionExtractor(stateDim=768, includeNoSkill=True, useHebbOnline=False).to(self.device)
+        model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=False).to(self.device)
         model.eval()
         B = 3
-        state_feat = torch.randn(B, 768, device=self.device)
+        state_feat = torch.randn(B, 1024, device=self.device)
 
-        out0 = model(state_feat,sample=False,prior=None,updateHebb=False)
+        out0 = model(state_feat, sample=False, prior=None, updateHebb=False)
         ok = True
         kb = out0["keyboard"]
         ms = out0["mouse"]
-        ok = ok and (kb["base_logits"].shape  == (B, self.num_base))
+        ok = ok and (kb["base_logits"].shape == (B, self.num_base))
         ok = ok and (kb["skill_logits"].shape == (B, self.num_skill))
         ok = ok and (kb["extra_logits"].shape == (B, self.num_extra))
         ok = ok and (ms["mu"].shape == (B, 2) and ms["logstd"].shape == (B, 2) and ms["click_logits"].shape == (B, 2))
 
-        out1 = model(state_feat,sample=True,deterministic=False,prior=None,updateHebb=False,returnKeys128=True,applyConstraints=True)
+        out1 = model(state_feat, sample=True, deterministic=False, prior=None, updateHebb=False, returnKeys128=True, applyConstraints=True)
         ok = ok and ("keys128_raw" in out1)
         ok = ok and ("keys128" in out1)
         ok = ok and (out1["keys128"].shape == (B, self.keys128_dim))
@@ -770,14 +782,22 @@ class TestDecisionMTool:
     def TestDecisionExtractorWithPrior(self) -> bool:
         wm = WorldModelSimulation().to(self.device)
         wm.ResetHidden(B=2, device=self.device)
-        planner = CEMPlanner(worldModel=wm,baseCodes=self.base_codes,skillCodes=self.skill_codes,extraCodes=self.extra_codes,maxCode=self.max_code,hasNoSkill=True,horizon=3, N=16, elite=4, iters=2).to(self.device)
+        planner = CEMPlanner(
+            worldModel=wm,
+            baseCodes=self.base_codes,
+            skillCodes=self.skill_codes,
+            extraCodes=self.extra_codes,
+            maxCode=self.max_code,
+            hasNoSkill=True,
+            horizon=3, N=16, elite=4, iters=2).to(self.device)
+        
         prior = planner.Plan(returnTrajectories=False)
 
-        model = DecisionExtractor(stateDim=768, includeNoSkill=True, useHebbOnline=True).to(self.device)
+        model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=True).to(self.device)
         model.eval()
-        state_feat = torch.randn(2, 768, device=self.device)
+        state_feat = torch.randn(2, 1024, device=self.device)
 
-        out = model(state_feat,sample=True,deterministic=False,prior=prior,mixW=0.3,updateHebb=True, returnKeys128=True,applyConstraints=True)
+        out = model(state_feat, sample=True, deterministic=False, prior=prior, mixW=0.3, updateHebb=True, returnKeys128=True, applyConstraints=True)
 
         ok = True
         ok = ok and ("keys128" in out and out["keys128"].shape == (2, self.keys128_dim))
@@ -792,17 +812,251 @@ class TestDecisionMTool:
         wm = WorldModelSimulation().to(self.device)
         wm.ResetHidden(B=1, device=self.device)
 
-        planner = CEMPlanner(worldModel=wm,baseCodes=self.base_codes,skillCodes=self.skill_codes,extraCodes=self.extra_codes,maxCode=self.max_code,hasNoSkill=True,horizon=3, N=8, elite=2, iters=2).to(self.device)
+        planner = CEMPlanner(
+            worldModel=wm,
+            baseCodes=self.base_codes,
+            skillCodes=self.skill_codes,
+            extraCodes=self.extra_codes,
+            maxCode=self.max_code,
+            hasNoSkill=True,
+            horizon=3, N=8, elite=2, iters=2).to(self.device)
+        
         prior = planner.Plan(returnTrajectories=False)
 
-        dec = DecisionExtractor(stateDim=768, includeNoSkill=True, useHebbOnline=False).to(self.device)
+        dec = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=False).to(self.device)
         dec.eval()
-        state_feat = torch.randn(1, 768, device=self.device)
+        state_feat = torch.randn(1, 1024, device=self.device)
 
-        out = dec(state_feat,sample=True,deterministic=True,prior=prior,mixW=0.5,updateHebb=False,returnKeys128=True,applyConstraints=True)
+        out = dec(state_feat, sample=True, deterministic=True, prior=prior, mixW=0.5, updateHebb=False, returnKeys128=True, applyConstraints=True)
         ok = ("keys128" in out and out["keys128"].shape == (1, self.keys128_dim))
         print("Integration (CEM -> Decision) test {}.".format("passed" if ok else "failed"))
         return ok
+
+    class Teacher(nn.Module):
+        def __init__(self, inDim, numBase, numSkill, numExtra):
+            super().__init__()
+            h = 384
+            self.backbone = nn.Sequential(
+                nn.Linear(inDim, h), nn.GELU(),
+                nn.Linear(h, h), nn.GELU(),)
+            
+            self.base_head = nn.Linear(h, numBase)
+            self.extra_head = nn.Linear(h, numExtra)
+            self.skill_head = nn.Linear(h, numSkill)
+            self.mouse_mu = nn.Linear(h, 2)
+            self.mouse_ls = nn.Linear(h, 2)
+            self.click_head = nn.Linear(h, 2)
+
+        def forward(self, x):
+            h = self.backbone(x)
+            return {
+                "base_logits":  self.base_head(h),
+                "extra_logits": self.extra_head(h),
+                "skill_logits": self.skill_head(h),
+                "mouse_mu":     self.mouse_mu(h),
+                "mouse_logstd": torch.clamp(self.mouse_ls(h), -5.0, 2.0),
+                "click_logits": self.click_head(h),}
+
+    def SupervisedLoss(self, out, tgt):
+        bce = nn.BCEWithLogitsLoss()
+        loss = 0.0
+        loss += bce(out["keyboard"]["base_logits"], torch.sigmoid(tgt["base_logits"]))
+        loss += bce(out["keyboard"]["extra_logits"], torch.sigmoid(tgt["extra_logits"]))
+        loss += bce(out["mouse"]["click_logits"], torch.sigmoid(tgt["click_logits"]))
+        labels = torch.argmax(tgt["skill_logits"], dim=-1)
+        loss += F.cross_entropy(out["keyboard"]["skill_logits"], labels)
+        loss += F.mse_loss(out["mouse"]["mu"], tgt["mouse_mu"])
+        loss += F.mse_loss(out["mouse"]["logstd"], tgt["mouse_logstd"])
+        return loss
+
+    def TrainStepSmoke(self):
+        model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=False).to(self.device)
+        model.train()
+
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        B = 8
+        state_feat = torch.randn(B, 1024, device=self.device)
+
+        num_options = model.option.num_options
+        prev_opt = torch.randint(0, num_options, (B,), device=self.device)
+        prev_onehot = F.one_hot(prev_opt, num_classes=num_options).float()
+
+        out = model(state_feat,sample=False,deterministic=False,prior=None,mixW=0.0,updateHebb=False,prevOptionOnehot=prev_onehot,returnKeys128=False,applyConstraints=False,)
+
+        kb = out["keyboard"]
+        ms = out["mouse"]
+
+        base_tgt = torch.rand_like(kb["base_logits"])
+        extra_tgt = torch.rand_like(kb["extra_logits"])
+        bce = torch.nn.BCEWithLogitsLoss()
+        loss_base = bce(kb["base_logits"],  base_tgt)
+        loss_extra = bce(kb["extra_logits"], extra_tgt)
+
+        num_skill = kb["skill_logits"].size(-1)
+        skill_tgt = torch.randint(0, num_skill, (B,), device=self.device)
+        loss_skill = F.cross_entropy(kb["skill_logits"], skill_tgt)
+
+        mu, logstd = ms["mu"], ms["logstd"]
+        std = torch.exp(logstd)
+        mouse_tgt = torch.randn_like(mu)
+
+        loss_mouse = 0.5 * (((mouse_tgt - mu) / std) ** 2 + 2 * logstd + math.log(2 * math.pi)).sum(dim=-1).mean()
+
+        click_tgt = torch.rand_like(ms["click_logits"])
+        loss_click = bce(ms["click_logits"], click_tgt)
+
+        main_loss = loss_base + loss_extra + loss_skill + loss_mouse + loss_click
+
+        opt_logits = out["option"]["logits"]
+        psi = out["option"]["psi"]
+        beta = out["option"]["beta"].squeeze(-1)
+
+        psi_dim = psi.size(-1)
+        opt_tgt = torch.randint(0, num_options, (B,), device=self.device)
+        psi_tgt = torch.randn(B, psi_dim, device=self.device)
+        beta_tgt = torch.rand(B, device=self.device)
+
+        loss_opt_ce = F.cross_entropy(opt_logits, opt_tgt)
+        loss_psi_mse = F.mse_loss(psi, psi_tgt)
+        loss_beta_bce = F.binary_cross_entropy(beta, beta_tgt)
+
+        aux_option_loss = 0.1 * loss_opt_ce + 0.05 * loss_psi_mse + 0.05 * loss_beta_bce
+
+        total = main_loss + aux_option_loss
+
+        opt.zero_grad(set_to_none=True)
+        total.backward()
+
+        bad = []
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                if (p.grad is None) or (not torch.isfinite(p.grad).all()) or (p.grad.abs().sum() == 0):
+                    bad.append(n)
+        if bad:
+            print("Decision TrainStepSmoke failed:\n\n Bad grad at:", bad)
+            return False
+
+        opt.step()
+        print("Decision TrainStepSmoke passed.")
+        return True
+    
+    def NoNanAfterManySteps(self, steps: int = 40) -> bool:
+        try:
+            in_dim = 512
+            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebbOnline=False).to(self.device)
+            teacher = self.Teacher(in_dim, self.num_base, self.num_skill, self.num_extra).to(self.device)
+            for p in teacher.parameters():
+                p.requires_grad_(False)
+            model.train()
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+            for t in range(steps):
+                x = torch.randn(16, in_dim, device=self.device)
+                with torch.no_grad():
+                    tgt = teacher(x)
+                out = model(x, sample=False, prior=None, updateHebb=False)
+                loss = self.SupervisedLoss(out, tgt)
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                for n, p in model.named_parameters():
+                    if p.grad is not None:
+                        assert torch.isfinite(p.grad).all(), f"Non-finite grad at step {t}, {n}"
+                opt.step()
+            print("Decision NoNanAfterManySteps passed.")
+            return True
+        except AssertionError as e:
+            print("Decision NoNanAfterManySteps failed:\n", e)
+            return False
+        except Exception as e:
+            print("Decision NoNanAfterManySteps error:\n", e)
+            return False
+
+    def ParamsActuallyChange(self, steps: int = 20) -> bool:
+        try:
+            in_dim = 512
+            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebbOnline=False).to(self.device)
+            teacher = self.Teacher(in_dim, self.num_base, self.num_skill, self.num_extra).to(self.device)
+            for p in teacher.parameters():
+                p.requires_grad_(False)
+            model.train()
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+            with torch.no_grad():
+                w0_feat = model.feature_net[0].weight.clone()
+                w0_kbd = model.keyboard.base_head.weight.clone()
+                w0_mu = model.mouse.mu_head.weight.clone()
+
+            for _ in range(steps):
+                x = torch.randn(16, in_dim, device=self.device)
+                with torch.no_grad():
+                    tgt = teacher(x)
+                out = model(x, sample=False, prior=None, updateHebb=False)
+                loss = self.SupervisedLoss(out, tgt)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+
+            with torch.no_grad():
+                d_feat = (w0_feat - model.feature_net[0].weight).norm().item()
+                d_kbd = (w0_kbd - model.keyboard.base_head.weight).norm().item()
+                d_mu = (w0_mu - model.mouse.mu_head.weight).norm().item()
+
+            changed = any(d > 1e-6 for d in [d_feat, d_kbd, d_mu])
+            assert changed, f"Parameters barely changed: feat={d_feat:.3e}, kbd={d_kbd:.3e}, mu={d_mu:.3e}"
+            print("Decision ParamsActuallyChange passed.")
+            return True
+        except AssertionError as e:
+            print("Decision ParamsActuallyChange failed:\n", e)
+            return False
+        except Exception as e:
+            print("Decision ParamsActuallyChange error:\n", e)
+            return False
+
+    def TestNormalTrainingConvergence(self, steps: int = 120, logEvery: int = 30) -> bool:
+        try:
+            in_dim = 512
+            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebbOnline=False).to(self.device)
+            teacher = self.Teacher(in_dim, self.num_base, self.num_skill, self.num_extra).to(self.device)
+            for p in teacher.parameters():
+                p.requires_grad_(False)
+            model.train()
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+            B = 32
+            xfix = torch.randn(B, in_dim, device=self.device)
+            with torch.no_grad():
+                tgtfix = teacher(xfix)
+
+            with torch.no_grad():
+                start = self.SupervisedLoss(model(xfix, sample=False, prior=None, updateHebb=False), tgtfix).item()
+
+            for t in range(1, steps+1):
+                out = model(xfix, sample=False, prior=None, updateHebb=False)
+                loss = self.SupervisedLoss(out, tgtfix)
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
+                if (t % logEvery) == 0 or t == 1:
+                    print(f"[DecisionTrain] step {t}/{steps} | loss={loss.item():.6f}")
+
+            with torch.no_grad():
+                end = self.SupervisedLoss(model(xfix, sample=False, prior=None, updateHebb=False), tgtfix).item()
+
+            print(f"\n[DecisionTrain] loss start={start:.6f} -> end={end:.6f}")
+            assert end <= 0.8 * start, "Training did not show sufficient convergence (drop < 20%)."
+            print("Decision TestNormalTrainingConvergence passed.")
+            return True
+        except AssertionError as e:
+            print("Decision TestNormalTrainingConvergence failed:\n", e)
+            return False
+        except Exception as e:
+            print("Decision TestNormalTrainingConvergence error:\n", e)
+            return False
 
     def RunAll(self):
         results = []
@@ -811,6 +1065,11 @@ class TestDecisionMTool:
         results.append(self.TestCEMPlanner())
         results.append(self.TestDecisionExtractorWithPrior())
         results.append(self.TestIntegrationEndToEnd())
+        results.append(self.TrainStepSmoke())
+        results.append(self.NoNanAfterManySteps())
+        results.append(self.ParamsActuallyChange())
+        results.append(self.TestNormalTrainingConvergence())
+
         passed = sum(1 for x in results if x)
         print(f"[DecisionModule Tests] {passed}/{len(results)} passed.")
         return all(results)

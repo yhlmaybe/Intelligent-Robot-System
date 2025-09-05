@@ -75,6 +75,13 @@
        </property>
       </widget>
      </item>
+     <item>
+      <widget class="QPushButton" name="testTrainAndDeploy_pushButton">
+       <property name="text">
+        <string>TestTrainAndDeploy</string>
+       </property>
+      </widget>
+     </item>
     </layout>
    </item>
    <item row="1" column="0">

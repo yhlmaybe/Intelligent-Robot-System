@@ -100,8 +100,8 @@ class RSSMWorldModel(nn.Module):
         return self._h, self._z
 
     def ImportState(self, h: torch.Tensor, z: torch.Tensor):
-        self._h = h.clone()
-        self._z = z.clone()
+        self._h = h.detach().clone()
+        self._z = z.detach().clone()
 
     @torch.no_grad()
     def StepPriorOnly(self,
@@ -268,29 +268,25 @@ class WMAdapterForPlanner(nn.Module):
                  skillCodes: torch.Tensor, # [n_skill]
                  extraCodes: torch.Tensor, # [n_extra]
                  noSkillId: Optional[int]) -> torch.Tensor:
-        B = baseAct.size(0)
-        device = baseAct.device
+        B, device = baseAct.size(0), baseAct.device
+        C = maxCode + 1
 
-        key_vec = torch.zeros(B, maxCode + 1, device=device)
-
-        for i, code in enumerate(baseCodes.tolist()):
-            key_vec[:, code] = baseAct[:, i]
-
-        for i, code in enumerate(extraCodes.tolist()):
-            key_vec[:, code] = extraAct[:, i]
+        base_M  = F.one_hot(baseCodes.to(device),  num_classes=C).float()
+        extra_M = F.one_hot(extraCodes.to(device), num_classes=C).float()
+        base_part  = baseAct  @ base_M
+        extra_part = extraAct @ extra_M
 
         if noSkillId is None:
             chosen = skillIdx
-            valid = torch.ones_like(chosen, dtype=torch.bool)
+            valid  = torch.ones_like(chosen, dtype=torch.bool)
         else:
-            valid = (skillIdx != noSkillId)
-            chosen = skillIdx.clamp(max=len(skillCodes) - 1)
-        if valid.any():
-            sel_codes = skillCodes[chosen[valid]]
-            key_vec[valid, sel_codes] = 1.0
+            valid  = (skillIdx != noSkillId)
+            chosen = skillIdx.clamp_max(skillCodes.numel() - 1)
+        sel_codes = skillCodes.to(device)[chosen.clamp_min(0)]
+        skill_onehot = F.one_hot(sel_codes, num_classes=C).float() * valid.view(-1,1).float()
 
-        keys128 = torch.cat([key_vec, clicks], dim=-1)
-        return keys128
+        key_vec = base_part + extra_part + skill_onehot
+        return torch.cat([key_vec, clicks], dim=-1)
 
     @torch.no_grad()
     def Step(self,
@@ -352,9 +348,10 @@ class TestWorldMTool:
         all_codes = []
         for grp in KEYBOARD_LAYOUT.values():
             all_codes += list(grp.values())
-        self.max_code = max(all_codes)  
+        self.max_code = max(all_codes)
 
         self.wm = RSSMWorldModel(visionDim=512, actionDim=128, deterDim=256, stochDim=32, stateDim=256, useDecoder=True).to(self.device)
+
         self.wm.ResetHidden(batchSize=4, device=self.device)
 
     def TestActionEncoder(self):
@@ -362,8 +359,8 @@ class TestWorldMTool:
             enc = ActionEncoder(numDiscrete=128, contDim=2, outDim=128).to(self.device)
             B = 3
             keys128 = torch.zeros(B, 128, device=self.device)
-            keys128[:, 17] = 1.0  
-            keys128[:, 57] = 1.0  
+            keys128[:, 17] = 1.0 
+            keys128[:, 57] = 1.0 
             mouse = torch.randn(B, 2, device=self.device)
 
             y1 = enc(keys128, mouse)
@@ -401,7 +398,6 @@ class TestWorldMTool:
 
             h1, z1 = self.wm.ExportState()
             changed = (not torch.allclose(h0, h1)) or (not torch.allclose(z0, z1))
-
             in_range = (out["d_prob"].min() >= 0.0) and (out["d_prob"].max() <= 1.0)
 
             if ok_shapes and changed and in_range:
@@ -478,7 +474,6 @@ class TestWorldMTool:
             print("RSSM ForwardTrainSeq test crash:", type(e).__name__, e)
             return False
 
-
     def TestWMAdapterForPlanner(self):
         try:
             adapter = WMAdapterForPlanner(
@@ -487,12 +482,12 @@ class TestWorldMTool:
                 baseCodes=self.base_codes,
                 skillCodes=self.skill_codes,
                 extraCodes=self.extra_codes,
-                noSkillId=None,          
+                noSkillId=None,
                 deterministicZ=True).to(self.device)
 
             B = 3
             a_mouse = torch.randn(B, 2, device=self.device)
-            a_base  = (torch.rand(B, len(self.base_codes),  device=self.device) > 0.5).float()
+            a_base = (torch.rand(B, len(self.base_codes),  device=self.device) > 0.5).float()
             a_extra = (torch.rand(B, len(self.extra_codes), device=self.device) > 0.5).float()
             a_click = (torch.rand(B, 2, device=self.device) > 0.5).float()
             a_skill = torch.randint(low=0, high=len(self.skill_codes), size=(B,), device=self.device)
@@ -510,6 +505,200 @@ class TestWorldMTool:
             print("WMAdapterForPlanner.Step test crash:", type(e).__name__, e)
             return False
 
+    def TrainStepSmoke(self):
+        try:
+            torch.manual_seed(123)
+
+            model = RSSMWorldModel(visionDim=512, actionDim=128, deterDim=256, stochDim=32, stateDim=256, useDecoder=True).to(self.device)
+
+            model.train()
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+            B, T = 4, 5
+            vision = torch.randn(B, T, 512, device=self.device)
+            keys128 = (torch.rand(B, T, 128, device=self.device) > 0.8).float()
+            mouse = torch.randn(B, T, 2, device=self.device)
+
+            out = model.ForwardTrainSeq(
+                visionSeq=vision,
+                keys128Seq=keys128,
+                mouseSeq=mouse,
+                rewardSeq=None,
+                doneSeq=None,
+                alphaKl=0.8,
+                freeNats=1.0,
+                reconCoef=1.0,
+                rewardCoef=1.0,
+                doneCoef=1.0,)
+
+            loss = out["loss"]
+            if not torch.isfinite(loss):
+                print("World TrainStepSmoke failed:\n\n Loss is not finite.")
+                return False
+
+            opt.zero_grad()
+            loss.backward()
+
+            bad = []
+            for n, p in model.named_parameters():
+                if p.requires_grad:
+                    if p.grad is None or not torch.isfinite(p.grad).all():
+                        bad.append(n)
+            if bad:
+                print("\nWorld TrainStepSmoke failed:\n\n Bad grad at:\n ", bad)
+                return False
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            print("World TrainStepSmoke passed.")
+            return True
+        except Exception as e:
+            print("World TrainStepSmoke crash:", type(e).__name__, e)
+            return False
+
+    def NoNanAfterManySteps(self, steps: int = 50):
+        try:
+            torch.manual_seed(321)
+            
+            model = RSSMWorldModel(visionDim=512, actionDim=128, deterDim=256, stochDim=32, stateDim=256, useDecoder=True).to(self.device)
+
+            model.train()
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+            for t in range(steps):
+                B, T = 4, 4
+                vision = torch.randn(B, T, 512, device=self.device)
+                keys128 = (torch.rand(B, T, 128, device=self.device) > 0.8).float()
+                mouse = torch.randn(B, T, 2, device=self.device)
+
+                out = model.ForwardTrainSeq(
+                    visionSeq=vision,
+                    keys128Seq=keys128,
+                    mouseSeq=mouse,
+                    rewardSeq=None,
+                    doneSeq=None,
+                    alphaKl=0.8,
+                    freeNats=1.0,
+                    reconCoef=1.0,
+                    rewardCoef=1.0,
+                    doneCoef=1.0,)
+                
+                loss = out["loss"]
+                if not torch.isfinite(loss):
+                    print(f"World NoNanAfterManySteps failed: non-finite loss at step {t}.")
+                    return False
+
+                opt.zero_grad()
+                loss.backward()
+                for n, p in model.named_parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        print(f"World NoNanAfterManySteps failed: non-finite grad at step {t}, {n}")
+                        return False
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
+            print("World NoNanAfterManySteps passed.")
+            return True
+        except Exception as e:
+            print("World NoNanAfterManySteps crash:", type(e).__name__, e)
+            return False
+
+    def ParamsActuallyChange(self):
+        try:
+            torch.manual_seed(777)
+            model = RSSMWorldModel(visionDim=512, actionDim=128, deterDim=256, stochDim=32, stateDim=256, useDecoder=True).to(self.device)
+            model.train()
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+            with torch.no_grad():
+                p0 = []
+                for n, p in model.named_parameters():
+                    if p.requires_grad and p.data.numel() > 0:
+                        p0.append(p.data.view(-1)[:64].clone())
+                p0 = torch.cat(p0) if p0 else torch.zeros(1, device=self.device)
+
+            for _ in range(10):
+                B, T = 4, 4
+                vision = torch.randn(B, T, 512, device=self.device)
+                keys128 = (torch.rand(B, T, 128, device=self.device) > 0.8).float()
+                mouse = torch.randn(B, T, 2, device=self.device)
+
+                out = model.ForwardTrainSeq(vision, keys128, mouse, None, None)
+                loss = out["loss"]
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
+            with torch.no_grad():
+                p1 = []
+                for n, p in model.named_parameters():
+                    if p.requires_grad and p.data.numel() > 0:
+                        p1.append(p.data.view(-1)[:64].clone())
+                p1 = torch.cat(p1) if p1 else torch.zeros(1, device=self.device)
+                delta = (p0 - p1).abs().mean().item()
+
+            ok = delta > 1e-6
+            print(f"World ParamsActuallyChange {'passed' if ok else 'failed'} (delta={delta:.3e}).")
+            return ok
+        except Exception as e:
+            print("World ParamsActuallyChange crash:", type(e).__name__, e)
+            return False
+
+    def TestNormalTrainingConvergence(self, steps: int = 120, B: int = 8, T: int = 6):
+        try:
+            torch.manual_seed(2025)
+            model = RSSMWorldModel(visionDim=512, actionDim=128, deterDim=256, stochDim=32, stateDim=256, useDecoder=True).to(self.device)
+            model.train()
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+            vision = torch.randn(B, T, 512, device=self.device)
+            keys128 = (torch.rand(B, T, 128, device=self.device) > 0.8).float()
+            mouse = torch.randn(B, T, 2, device=self.device)
+
+            losses = []
+            for t in range(steps):
+                out = model.ForwardTrainSeq(
+                    visionSeq=vision,
+                    keys128Seq=keys128,
+                    mouseSeq=mouse,
+                    rewardSeq=None,
+                    doneSeq=None,
+                    alphaKl=0.8,
+                    freeNats=1.0,
+                    reconCoef=1.0,
+                    rewardCoef=1.0,
+                    doneCoef=1.0,)
+                
+                loss = out["loss"]
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
+                losses.append(float(loss.detach().item()))
+                if (t + 1) % max(1, steps // 4) == 0:
+                    print(f"[WorldTrain] step {t+1}/{steps} | loss={losses[-1]:.6f}")
+
+            assert len(losses) >= 2, "No valid loss trajectory is generated"
+            start, end = losses[0], losses[-1]
+            print(f"\n[WorldTrain] loss start={start:.6f} -> end={end:.6f}\n")
+
+            rel_ok = end <= start * 0.8
+            abs_ok = (start - end) >= 0.05
+            ok = bool(rel_ok or abs_ok)
+            if ok:
+                print("World TestNormalTrainingConvergence passed.")
+            else:
+                print("World TestNormalTrainingConvergence failed: loss did not decrease sufficiently.")
+            return ok
+        except AssertionError as e:
+            print(f"World TestNormalTrainingConvergence failed: {e}")
+            return False
+        except Exception as e:
+            print("World TestNormalTrainingConvergence crash:", type(e).__name__, e)
+            return False
+
     def RunAll(self):
         results = []
         results.append(self.TestActionEncoder())
@@ -518,7 +707,13 @@ class TestWorldMTool:
         results.append(self.TestForwardTrainSeq())
         results.append(self.TestWMAdapterForPlanner())
 
+        results.append(self.TrainStepSmoke())
+        results.append(self.NoNanAfterManySteps())
+        results.append(self.ParamsActuallyChange())
+        results.append(self.TestNormalTrainingConvergence())
+
         passed = sum(1 for x in results if x)
         total = len(results)
         print(f"\nWorldModel test summary: {passed}/{total} passed.")
         return all(results)
+

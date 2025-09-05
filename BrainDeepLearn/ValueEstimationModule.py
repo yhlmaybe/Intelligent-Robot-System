@@ -17,8 +17,8 @@ class RunningEMA(nn.Module):
     def Update(self, x: torch.Tensor):
         m = x.mean(0)
         v = x.var(0, unbiased=False)
-        self.mean.mul_(self.momentum).add_((1 - self.momentum) * m)
-        self.var.mul_(self.momentum).add_((1 - self.momentum) * v)
+        self.mean.copy_(self.mean * self.momentum + (1 - self.momentum) * m)
+        self.var.copy_( self.var  * self.momentum + (1 - self.momentum) * v)
 
     def Norm(self, x: torch.Tensor) -> torch.Tensor:
         mean = self.mean.to(x.device)
@@ -35,7 +35,7 @@ class IntrinsicRewardOut(NamedTuple):
 class IntrinsicRewardGenerator(nn.Module):
     def __init__(self,
                  memoryDim: int = 768,
-                 attnDim: int = 512,
+                 attnDim: int = 1024,
                  stateDim: int = 256,
                  *,
                  hidden: int = 256,
@@ -89,7 +89,7 @@ class IntrinsicRewardGenerator(nn.Module):
     @torch.no_grad()
     def UpdateStateEma(self, s: torch.Tensor):
         mean_s = s.mean(0)
-        self.state_ema.mul_(self.state_momentum).add_((1 - self.state_momentum) * mean_s)
+        self.state_ema.copy_(self.state_ema * self.state_momentum + (1 - self.state_momentum) * mean_s)
 
     def forward(self,
                 memoryPrev: torch.Tensor,
@@ -176,7 +176,7 @@ class CriticOut(NamedTuple):
 class ValueEstimationExtractor(nn.Module):
     def __init__(self,
                  memoryDim: int = 768,
-                 attnDim: int   = 512,
+                 attnDim: int = 1024,
                  stateDim: int  = 256,
                  *,
                  hidden: int = 512,
@@ -312,109 +312,355 @@ class TestValueEstimationMTool:
         state = torch.randn(B, self.state_dim,device=self.device)
         return mem, attn, state
 
+    def AuxLossForIRG(self, critic, mem, attn, state, entropy_prev, uncert_opt, td_prev):
+
+        rgen_out = critic.rgen(mem, attn, state,policyEntropyPrev=entropy_prev,uncertainty=uncert_opt,tdErrorPrev=td_prev)
+        
+        w_r, w_e = 1e-2, 1e-2
+        loss_r = (rgen_out.rInt ** 2).mean() 
+
+        tau0 = critic.rgen.tau0
+        lr0 = critic.rgen.lr0
+        g0 = critic.rgen.gamma0
+        eT = rgen_out.eT
+        loss_e = ((eT[...,0] - tau0)**2 + (eT[...,1] - lr0)**2 + (eT[...,2] - g0)**2).mean()
+        return w_r * loss_r + w_e * loss_e
+
     def TestIntrinsicRewardGenerator(self) -> bool:
-        B = 4
-        mem, attn, state = self.RandBatch(B)
-        irg = IntrinsicRewardGenerator(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim).to(self.device)
+        try:
+            B = 4
+            mem, attn, state = self.RandBatch(B)
 
-        irg.train()
+            irg = IntrinsicRewardGenerator(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim).to(self.device)
 
-        entropy_prev = torch.rand(B, device=self.device)
-        uncert = F.softplus(torch.randn(B, device=self.device))
-        td_prev = torch.randn(B, device=self.device) * 0.1
+            irg.train()
 
-        out = irg(mem, attn, state,policyEntropyPrev=entropy_prev,uncertainty=uncert,tdErrorPrev=td_prev)
+            entropy_prev = torch.rand(B, device=self.device)
+            uncert = F.softplus(torch.randn(B, device=self.device))
+            td_prev = torch.randn(B, device=self.device) * 0.1
 
-        ok = True
-        ok &= (out.rInt.shape == (B,))
-        ok &= (out.eT.shape == (B,3))
-        needed = ["novelty","progress","entropy","uncertainty","novelty_n","progress_n","entropy_n","uncertainty_n","valence"]
-        ok &= all(k in out.components for k in needed)
+            out = irg(mem, attn, state,policyEntropyPrev=entropy_prev,uncertainty=uncert,tdErrorPrev=td_prev)
 
-        print(f"IntrinsicRewardGenerator test {'passed' if ok else 'failed'}.")
-        return ok
+            ok = True
+            ok &= (out.rInt.shape == (B,))
+            ok &= (out.eT.shape == (B,3))
+            needed = ["novelty","progress","entropy","uncertainty","novelty_n","progress_n","entropy_n","uncertainty_n","valence"]
+            ok &= all(k in out.components for k in needed)
+
+            print(f"IntrinsicRewardGenerator test {'passed' if ok else 'failed'}.")
+            return ok
+        except Exception as e:
+            print(f"IntrinsicRewardGenerator test error: {e}")
+            return False
 
     def TestValueEstimationNoReward(self) -> bool:
-        B = 3
-        mem, attn, state = self.RandBatch(B)
-        critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=True, bootstrapIfMissing=True).to(self.device)
-        critic.train()
+        try:
+            B = 3
+            mem, attn, state = self.RandBatch(B)
 
-        entropy_prev = torch.rand(B, device=self.device)
+            critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=True, bootstrapIfMissing=True).to(self.device)
 
-        out = critic(
-            memoryPrev=mem, attnPrev=attn, stateCurr=state,
-            rewardExt=None,
-            nextValue=None,
-            done=None,    
-            policyEntropyPrev=entropy_prev,
-            uncertainty=None,
-            tdErrorPrev=None)
+            critic.train()
 
-        ok = True
-        ok &= (out.value.shape == (B,))
-        ok &= (out.tdError.shape == (B,))
-        ok &= (out.tdErrorDe.shape == (B,))
-        ok &= (out.entropy.shape == (B,))
-        ok &= (out.uncertainty.shape == (B,))
-        ok &= (out.eT.shape == (B,3))
-        ok &= (out.rewardUsed.shape == (B,))
-        ok &= (out.rInt.shape == (B,))
+            entropy_prev = torch.rand(B, device=self.device)
 
-        ok &= torch.allclose(out.rewardUsed, out.rInt, atol=1e-5, rtol=1e-5)
+            out = critic(memoryPrev=mem, attnPrev=attn, stateCurr=state,rewardExt=None,nextValue=None,done=None,    policyEntropyPrev=entropy_prev,uncertainty=None,tdErrorPrev=None)
 
-        print(f"ValueEstimation (no external reward) test {'passed' if ok else 'failed'}.")
-        return ok
+            ok = True
+            ok &= (out.value.shape == (B,))
+            ok &= (out.tdError.shape == (B,))
+            ok &= (out.tdErrorDe.shape == (B,))
+            ok &= (out.entropy.shape == (B,))
+            ok &= (out.uncertainty.shape == (B,))
+            ok &= (out.eT.shape == (B,3))
+            ok &= (out.rewardUsed.shape == (B,))
+            ok &= (out.rInt.shape == (B,))
+
+            ok &= torch.allclose(out.rewardUsed, out.rInt, atol=1e-5, rtol=1e-5)
+
+            print(f"ValueEstimation (no external reward) test {'passed' if ok else 'failed'}.")
+            return ok
+        except Exception as e:
+            print(f"ValueEstimation (no external reward) test error: {e}")
+            return False
 
     def TestValueEstimationWithReward(self) -> bool:
-        B = 5
-        mem, attn, state = self.RandBatch(B)
-        critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=True, wExt=1.0, wInt=1.0).to(self.device)
+        try:
+            B = 5
+            mem, attn, state = self.RandBatch(B)
 
-        critic.eval()
+            critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=True, wExt=1.0, wInt=1.0).to(self.device)
 
-        reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
-        next_value = torch.randn(B, device=self.device)
-        done = torch.randint(0, 2, (B,), device=self.device).float()
-        entropy_prev = torch.rand(B, device=self.device)
-        uncert_opt = F.softplus(torch.randn(B, device=self.device))
+            critic.eval()
 
-        out = critic(memoryPrev=mem, attnPrev=attn, stateCurr=state,rewardExt=reward_ext, nextValue=next_value, done=done,policyEntropyPrev=entropy_prev,uncertainty=uncert_opt,tdErrorPrev=None)
+            reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
+            next_value = torch.randn(B, device=self.device)
+            done = torch.randint(0, 2, (B,), device=self.device).float()
+            entropy_prev = torch.rand(B, device=self.device)
+            uncert_opt = F.softplus(torch.randn(B, device=self.device))
 
-        gamma = out.eT[..., 2]
-        td_target_expected = out.rewardUsed + gamma * next_value * (1.0 - done)
-        td_error_expected = td_target_expected - out.value
+            out = critic(memoryPrev=mem, attnPrev=attn, stateCurr=state,rewardExt=reward_ext, nextValue=next_value, done=done,policyEntropyPrev=entropy_prev, uncertainty=uncert_opt, tdErrorPrev=None)
 
-        ok = True
-        ok &= torch.allclose(out.tdError, td_error_expected, atol=1e-5, rtol=1e-5)
-        ok &= (out.value.shape == (B,))
-        ok &= (out.entropy.shape == (B,))
-        ok &= (out.uncertainty.shape == (B,))
-        ok &= (out.eT.shape == (B,3))
+            gamma = out.eT[..., 2]
+            td_target_expected = out.rewardUsed + gamma * next_value * (1.0 - done)
+            td_error_expected = td_target_expected - out.value
 
-        print(f"ValueEstimation (with external reward) test {'passed' if ok else 'failed'}.")
-        return ok
+            ok = True
+            ok &= torch.allclose(out.tdError, td_error_expected, atol=1e-5, rtol=1e-5)
+            ok &= (out.value.shape == (B,))
+            ok &= (out.entropy.shape == (B,))
+            ok &= (out.uncertainty.shape == (B,))
+            ok &= (out.eT.shape == (B,3))
+
+            print(f"ValueEstimation (with external reward) test {'passed' if ok else 'failed'}.")
+            return ok
+        except Exception as e:
+            print(f"ValueEstimation (with external reward) test error: {e}")
+            return False
 
     def TestValueLossAndBackward(self) -> bool:
-        B = 6
-        mem, attn, state = self.RandBatch(B)
-        critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=False).to(self.device)
-        
-        critic.train()
+        try:
+            B = 6
+            mem, attn, state = self.RandBatch(B)
 
-        out = critic(memoryPrev=mem, attnPrev=attn, stateCurr=state)
-        gamma = out.eT[..., 2].detach()
-        target = (out.rewardUsed + gamma * out.value.detach()) 
-        loss = critic.ValueLoss(out.value, target)
+            critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=False).to(self.device)
 
-        ok = True
-        ok &= (isinstance(loss, torch.Tensor) and loss.dim() == 0)
-        loss.backward()
-        has_grad = any((p.grad is not None and torch.isfinite(p.grad).all()) for p in critic.parameters() if p.requires_grad)
-        ok &= has_grad
+            critic.train()
 
-        print(f"ValueLoss & backward test {'passed' if ok else 'failed'}.")
-        return ok
+            out = critic(memoryPrev=mem, attnPrev=attn, stateCurr=state)
+            gamma = out.eT[..., 2].detach()
+            target = (out.rewardUsed + gamma * out.value.detach()) 
+            loss = critic.ValueLoss(out.value, target)
+
+            ok = True
+            ok &= (isinstance(loss, torch.Tensor) and loss.dim() == 0)
+            loss.backward()
+            has_grad = any((p.grad is not None and torch.isfinite(p.grad).all()) for p in critic.parameters() if p.requires_grad)
+            ok &= has_grad
+
+            print(f"ValueLoss & backward test {'passed' if ok else 'failed'}.")
+            return ok
+        except Exception as e:
+            print(f"ValueLoss & backward test error: {e}")
+            return False
+
+    def TrainStepSmoke(self) -> bool:
+        try:
+            B = 8
+            mem, attn, state = self.RandBatch(B)
+
+            critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=True, useLayerNorm=True, wExt=1.0, wInt=1.0).to(self.device)
+
+            critic.train()
+            opt = torch.optim.Adam(critic.parameters(), lr=1e-3)
+
+            reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
+            next_value = torch.randn(B, device=self.device)
+            done = torch.randint(0, 2, (B,), device=self.device).float()
+            entropy_prev = torch.rand(B, device=self.device)
+            uncert_opt = F.softplus(torch.randn(B, device=self.device))
+
+            out = critic(memoryPrev=mem, attnPrev=attn, stateCurr=state,rewardExt=reward_ext, nextValue=next_value, done=done,policyEntropyPrev=entropy_prev, uncertainty=uncert_opt, tdErrorPrev=None)
+
+            main_loss = (out.tdError ** 2).mean()
+
+            aux_rgen = self.AuxLossForIRG(critic, mem, attn, state, entropy_prev, uncert_opt, None)
+
+            aux_uncert_w = 0.01
+            aux_uncert = aux_uncert_w * F.mse_loss(out.uncertainty, uncert_opt)
+
+            total = main_loss + aux_rgen + aux_uncert
+
+            opt.zero_grad(set_to_none=True)
+            total.backward()
+
+            bad = []
+            got_rgen_grad = False
+            got_uncert_grad = False
+            for n, p in critic.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if (p.grad is None) or (not torch.isfinite(p.grad).all()):
+                    bad.append(n)
+                if n.startswith("rgen.") and (p.grad is not None) and (p.grad.abs().sum() > 0):
+                    got_rgen_grad = True
+                if n.startswith("uncert_head") and (p.grad is not None) and (p.grad.abs().sum() > 0):
+                    got_uncert_grad = True
+
+            if bad or (not got_rgen_grad) or (not got_uncert_grad):
+                print("\nValue TrainStepSmoke failed:\n")
+                if bad:
+                    print("\n Bad grad at:\n", bad)
+                if not got_rgen_grad:
+                    print("\n rgen.* did not receive gradients.")
+                if not got_uncert_grad:
+                    print("\n uncert_head.* did not receive gradients.")
+                return False
+
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+            opt.step()
+            print("Value TrainStepSmoke passed.")
+            return True
+        except Exception as e:
+            print(f"Value TrainStepSmoke error: {e}")
+            return False
+
+    def NoNanAfterManySteps(self, steps: int = 50) -> bool:
+        try:
+            critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=True).to(self.device)
+            critic.train()
+            opt = torch.optim.Adam(critic.parameters(), lr=1e-3)
+
+            for t in range(steps):
+                B = 8
+                mem, attn, state = self.RandBatch(B)
+                reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
+                next_value = torch.randn(B, device=self.device)
+                done = torch.randint(0, 2, (B,), device=self.device).float()
+                entropy_prev = torch.rand(B, device=self.device)
+                uncert_opt = F.softplus(torch.randn(B, device=self.device))
+
+                out = critic(memoryPrev=mem, attnPrev=attn, stateCurr=state,rewardExt=reward_ext, nextValue=next_value, done=done,policyEntropyPrev=entropy_prev, uncertainty=uncert_opt, tdErrorPrev=None)
+
+                base = (out.tdError ** 2).mean()
+                aux = self.AuxLossForIRG(critic, mem, attn, state, entropy_prev, uncert_opt, None)
+                aux += 0.01 * F.mse_loss(out.uncertainty, uncert_opt)
+                total = base + aux
+
+                opt.zero_grad(set_to_none=True)
+                total.backward()
+                for n, p in critic.named_parameters():
+                    if p.grad is not None:
+                        assert torch.isfinite(p.grad).all(), f"Non-finite grad at step {t}, {n}"
+                opt.step()
+            print("Value NoNanAfterManySteps passed.")
+            return True
+        except AssertionError as e:
+            print(f"Value NoNanAfterManySteps failed: {e}")
+            return False
+        except Exception as e:
+            print(f"Value NoNanAfterManySteps error: {e}")
+            return False
+
+    def ParamsActuallyChange(self, steps: int = 30) -> bool:
+        try:
+            critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=True).to(self.device)
+            
+            critic.train()
+            opt = torch.optim.Adam(critic.parameters(), lr=1e-3)
+
+            with torch.no_grad():
+                p0 = []
+                for n, p in critic.named_parameters():
+                    if p.requires_grad and p.data.numel() > 0:
+                        p0.append(p.data.flatten()[:64].clone())
+                p0 = torch.cat(p0) if p0 else torch.zeros(1, device=self.device)
+
+            for _ in range(steps):
+                B = 8
+                mem, attn, state = self.RandBatch(B)
+                reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
+                next_value = torch.randn(B, device=self.device)
+                done = torch.randint(0, 2, (B,), device=self.device).float()
+                entropy_prev = torch.rand(B, device=self.device)
+                uncert_opt = F.softplus(torch.randn(B, device=self.device))
+
+                out = critic(memoryPrev=mem, attnPrev=attn, stateCurr=state,rewardExt=reward_ext, nextValue=next_value, done=done,policyEntropyPrev=entropy_prev, uncertainty=uncert_opt, tdErrorPrev=None)
+
+                base = (out.tdError ** 2).mean()
+                aux = self.AuxLossForIRG(critic, mem, attn, state, entropy_prev, uncert_opt, None)
+                aux += 0.01 * F.mse_loss(out.uncertainty, uncert_opt)
+                total = base + aux
+
+                opt.zero_grad(set_to_none=True)
+                total.backward()
+                opt.step()
+
+            with torch.no_grad():
+                p1 = []
+                for n, p in critic.named_parameters():
+                    if p.requires_grad and p.data.numel() > 0:
+                        p1.append(p.data.flatten()[:64].clone())
+                p1 = torch.cat(p1) if p1 else torch.zeros(1, device=self.device)
+                delta = (p0 - p1).abs().mean().item()
+
+            ok = delta > 1e-6
+            if ok:
+                print(f"Value ParamsActuallyChange passed (delta={delta:.3e}).")
+            else:
+                print(f"Value ParamsActuallyChange failed (delta={delta:.3e}).")
+            return ok
+        except Exception as e:
+            print(f"Value ParamsActuallyChange error: {e}")
+            return False
+
+    def TestNormalTrainingConvergence(self, steps: int = 120, batch_size: int = 16) -> bool:
+        try:
+            torch.manual_seed(2025)
+
+            critic = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useUncertHead=True, useLayerNorm=True).to(self.device)
+
+            critic.train()
+
+            in_dim = self.mem_dim + self.attn_dim + self.state_dim
+            teacher = nn.Sequential(
+                nn.Linear(in_dim, 256, bias=False),
+                nn.GELU(),
+                nn.Linear(256, 1, bias=False),
+            ).to(self.device)
+
+            for p in teacher.parameters():
+                p.requires_grad_(False)
+
+            opt = torch.optim.Adam(critic.parameters(), lr=1e-3)
+            losses = []
+
+            for t in range(steps):
+                mem = torch.randn(batch_size, self.mem_dim,  device=self.device)
+                attn = torch.randn(batch_size, self.attn_dim, device=self.device)
+                state = torch.randn(batch_size, self.state_dim,device=self.device)
+
+                with torch.no_grad():
+                    target = teacher(torch.cat([mem, attn, state], dim=-1)).squeeze(-1)
+
+                out = critic(memoryPrev=mem, attnPrev=attn, stateCurr=state)
+
+                base = F.mse_loss(out.value, target)
+
+                aux = self.AuxLossForIRG(critic, mem, attn, state, None, F.softplus(torch.randn(batch_size, device=self.device)), None)
+                aux += 0.01 * out.uncertainty.mean()
+
+                total = base + aux
+
+                opt.zero_grad(set_to_none=True)
+                total.backward()
+
+                for n, p in critic.named_parameters():
+                    if p.grad is not None:
+                        assert torch.isfinite(p.grad).all(), f"Non-finite grad at step {t}, {n}"
+
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+                opt.step()
+
+                losses.append(float(base.detach().item()))
+                if (t + 1) % max(1, steps // 4) == 0:
+                    print(f"[ValueTrain] step {t+1}/{steps} | loss={losses[-1]:.6f}")
+
+            assert len(losses) >= 2, "No valid loss trajectory is generated"
+            start, end = losses[0], losses[-1]
+            print(f"\n[ValueTrain] loss start={start:.6f} -> end={end:.6f}\n")
+
+            rel_ok = end <= start * 0.70
+            abs_ok = (start - end) >= 0.05
+            ok = rel_ok or abs_ok
+            print(f"Value TestNormalTrainingConvergence {'passed' if ok else 'failed'}.")
+            return ok
+        except AssertionError as e:
+            print(f"Value TestNormalTrainingConvergence failed: {e}")
+            return False
+        except Exception as e:
+            print(f"Value TestNormalTrainingConvergence error: {e}")
+            return False
 
     def RunAll(self):
         results = []
@@ -422,6 +668,10 @@ class TestValueEstimationMTool:
         results.append(self.TestValueEstimationNoReward())
         results.append(self.TestValueEstimationWithReward())
         results.append(self.TestValueLossAndBackward())
+        results.append(self.TrainStepSmoke())
+        results.append(self.NoNanAfterManySteps())
+        results.append(self.ParamsActuallyChange())
+        results.append(self.TestNormalTrainingConvergence())
         passed = sum(1 for x in results if x)
-        print(f"[ValueModule Tests] {passed}/{len(results)} passed.")
+        print(f"\n[ValueModule Tests] {passed}/{len(results)} passed.")
         return all(results)

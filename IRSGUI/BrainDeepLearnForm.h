@@ -48,6 +48,8 @@ private slots:
     void TestWorldModule();
 
     void TestValueEstimationModule();
+
+    void TestTrainAndDeploy();
 };
 
 #endif // BRAINDEEPLEARNFORM_H

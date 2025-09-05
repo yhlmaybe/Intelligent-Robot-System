@@ -19,6 +19,7 @@ BrainDeepLearnForm::BrainDeepLearnForm(QWidget *parent) :
     connect(ui->testDecisionModule_pushButton, SIGNAL(clicked()), this, SLOT(TestDecisionModule()));
     connect(ui->testWorldModule_pushButton, SIGNAL(clicked()), this, SLOT(TestWorldModule()));
     connect(ui->testValueEstimationModule_pushButton, SIGNAL(clicked()), this, SLOT(TestValueEstimationModule()));
+    connect(ui->testTrainAndDeploy_pushButton, SIGNAL(clicked()), this, SLOT(TestTrainAndDeploy()));
 
     connect(ui->close_pushButton, SIGNAL(clicked()), this, SLOT(CloseForm()));
 }
@@ -76,4 +77,9 @@ void BrainDeepLearnForm::TestWorldModule()
 void BrainDeepLearnForm::TestValueEstimationModule()
 {
     brainDeepLearn->TestValueEstimationModule();
+}
+
+void BrainDeepLearnForm::TestTrainAndDeploy()
+{
+    brainDeepLearn->TestTrainAndDeploy();
 }

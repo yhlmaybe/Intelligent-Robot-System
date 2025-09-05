@@ -65,6 +65,8 @@ public:
 
     bool TestValueEstimationModule();
 
+    bool TestTrainAndDeploy();
+
 private:
 
     PyObject* pModule = nullptr;
