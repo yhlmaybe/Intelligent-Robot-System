@@ -6,34 +6,65 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-KEYBOARD_LAYOUT: Dict[str, Dict[str, int]] = {
+KEYBOARD_LAYOUT = {
     "base_keys": {
-        "W": 17, "A": 30, "S": 31, "D": 32,
-        "Space": 57, "Shift": 42, "Ctrl": 29, "Esc": 1
+        "Esc": 0,
+        "W": 32, "A": 45, "S": 46, "D": 47,
+        "Space": 72,
+        "Shift": 57,
+        "Ctrl": 69 
     },
+
     "skill_keys": {
-        "1": 2, "2": 3, "3": 4, "4": 5, "5": 6,
-        "Q": 16, "E": 18, "R": 19, "F": 33,
-        "F1": 59, "F2": 60, "F3": 61, "F4": 62,
-        "G": 34, "T": 20, "V": 47, "B": 48
+        "1": 17, "2": 18, "3": 19, "4": 20, "5": 21,
+        "Q": 31, "E": 33, "R": 34, "F": 48,
+        "F1": 1, "F2": 2, "F3": 3, "F4": 4,
+        "G": 49, "T": 35, "V": 61, "B": 62
     },
+
     "menu_keys": {
-        "Tab": 15, "I": 23, "M": 50, "J": 36, "K": 37,
-        "L": 38, "U": 22, "O": 24, "P": 25,
-        "F5": 63, "F6": 64,
-        "Insert": 110, "Delete": 111, "Home": 102, "End": 107
+        "Tab": 30, "I": 38, "M": 64, "J": 51, "K": 52, "L": 53,
+        "U": 37, "O": 39, "P": 40,
+        "F5": 5, "F6": 6,
+        "Insert": 77, "Delete": 80, "Home": 78, "End": 81
     },
+
     "system_keys": {
-        "Enter": 28, "Backspace": 14, "CapsLock": 58, "Win": 125, "Alt": 56
+        "Enter": 56, "Backspace": 29, "CapsLock": 44,
+        "Win": 70, "Alt": 71, "RCtrl": 76, "RShift": 68, "RAlt": 73, "RWin": 74
     },
+
     "alpha_keys": {
-        "a": 70, "b": 71, "c": 72, "d": 73, "e": 74, "f": 75, "g": 76, "h": 77,
-        "i": 78, "j": 79, "k": 80, "l": 81, "m": 82, "n": 83, "o": 84, "p": 85,
-        "q": 86, "r": 87, "s": 88, "t": 89, "u": 90, "v": 91, "w": 92, "x": 93,
-        "y": 94, "z": 95
+        "F7": 7, "F8": 8, "F9": 9, "F10": 10, "F11": 11, "F12": 12,
+        "PrintScreen": 13, "ScrollLock": 14, "Pause": 15,
+
+        "Grave": 16,
+        "6": 22, "7": 23, "8": 24, "9": 25, "0": 26,
+        "Minus": 27, "Equal": 28,
+
+        "TildeBackslash": 43, 
+        "Y": 36,
+        "LeftBracket": 41, "RightBracket": 42,
+
+        "H": 50,
+        "Semicolon": 54, "Apostrophe": 55,
+
+        "Z": 58, "X": 59, "C": 60,
+        "N": 63,
+        "Comma": 65, "Dot": 66, "Slash": 67,
+
+        "PageUp": 79, "PageDown": 82,
+        "ArrowUp": 83, "ArrowLeft": 84, "ArrowDown": 85, "ArrowRight": 86,
+
+        "Menu": 75,
+
+        "NumLock": 87, "NumpadDivide": 88, "NumpadMultiply": 89, "NumpadMinus": 90,
+        "Numpad7": 91, "Numpad8": 92, "Numpad9": 93, "NumpadPlus": 94,
+        "Numpad4": 95, "Numpad5": 96, "Numpad6": 97,
+        "Numpad1": 98, "Numpad2": 99, "Numpad3": 100, "NumpadEnter": 101,
+        "Numpad0": 102, "NumpadDot": 103
     }
 }
-
 
 def ClampLogstd(logstd: torch.Tensor, low: float = -5.0, high: float = 2.0) -> torch.Tensor:
     return torch.clamp(logstd, low, high)
@@ -79,7 +110,7 @@ class HebbianPlasticityLayer(nn.Module):
     def forward(self, x: torch.Tensor, update: bool = False):
         w = self.base + self.hebb
         out = F.linear(x, w)
-        if update and not x.requires_grad:
+        if update:
             with torch.no_grad():
                 pre = x.detach()
                 post = out.detach()
@@ -143,24 +174,38 @@ class KeyboardActor(nn.Module):
 
 
 class OptionPolicy(nn.Module):
-    def __init__(self, zDim: int = 256, numOptions: int = 8, psiDim: int = 32, hidden: int = 256):
+    def __init__(self, zDim=256, numOptions=16, psiDim=128, hidden=256):
         super().__init__()
-        self.num_options = numOptions
-        self.psi_dim = psiDim
+        self.K = numOptions
         self.enc = nn.Sequential(nn.Linear(zDim, hidden), nn.ReLU())
-        self.pi_o = nn.Linear(hidden, numOptions)
-        self.psi_head = nn.Linear(hidden, psiDim)
-        self.beta_head = nn.Sequential(nn.Linear(zDim + numOptions, hidden), nn.ReLU(), nn.Linear(hidden, 1))
 
-    def forward(self, z: torch.Tensor, prevOOnehot: Optional[torch.Tensor] = None):
+        self.pi_o = nn.Linear(hidden, self.K)
+
+        self.trans = nn.Parameter(torch.zeros(self.K, self.K)) 
+
+        self.psi_head = nn.Linear(hidden, self.K * psiDim)
+        self.psiDim = psiDim
+
+        self.beta_head = nn.Sequential(
+            nn.Linear(hidden + self.K, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1))
+        
+        nn.init.constant_(self.beta_head[-1].bias, -2.2)
+
+    def forward(self, z, prevOnehot=None):
         h = self.enc(z)
-        logits_o = self.pi_o(h)
-        psi = self.psi_head(h)
-        beta = None
-        if prevOOnehot is not None:
-            prevOOnehot = prevOOnehot.detach()
-            beta = torch.sigmoid(self.beta_head(torch.cat([z, prevOOnehot], dim=-1)))
-        return logits_o, psi, beta
+        logits_base = self.pi_o(h)
+
+        if prevOnehot is not None:
+            prev = prevOnehot.detach()
+            logits_o = logits_base + prev @ self.trans
+            beta = torch.sigmoid(self.beta_head(torch.cat([h, prev], dim=-1)))
+        else:
+            logits_o = logits_base
+            beta = torch.sigmoid(self.beta_head(torch.cat([h, torch.zeros_like(logits_base)], dim=-1)))
+
+        psi_all = self.psi_head(h).view(-1, self.K, self.psiDim)
+        return logits_o, psi_all, beta
 
 
 class DecisionExtractor(nn.Module):
@@ -169,10 +214,10 @@ class DecisionExtractor(nn.Module):
         stateDim: int = 768,
         includeNoSkill: bool = True,
         useHebbOnline: bool = False,
-        optionNum: int = 8,
-        psiDim: int = 32,
+        optionNum: int = 16,
+        psiDim: int = 128,
         *,
-        entropyWeights: Tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25),
+        entropyWeights: Tuple[float, float, float, float] = (0.3, 0.2, 0.4, 0.1),
         logstdBounds: Tuple[float, float] = (-5.0, 2.0),):
         super().__init__()
 
@@ -200,6 +245,8 @@ class DecisionExtractor(nn.Module):
         self.max_code = max(all_codes)
         self.no_skill_id = len(self.skill_codes) if includeNoSkill else None
 
+        self.num_options = optionNum
+
         self.keyboard = KeyboardActor(256, base_names, skill_names, includeNoSkill=includeNoSkill)
         self.mouse = MouseActor(256)
         self.option = OptionPolicy(zDim=256, numOptions=optionNum, psiDim=psiDim)
@@ -214,8 +261,9 @@ class DecisionExtractor(nn.Module):
         z = F.relu(self.to_z(x))
         return z
 
-    def ToKeys128(self, baseAct: torch.Tensor, extraAct: torch.Tensor, skillIdx: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
-        B = baseAct.size(0); device = baseAct.device
+    def ToKeysVec(self, baseAct: torch.Tensor, extraAct: torch.Tensor, skillIdx: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
+        B = baseAct.size(0)
+        device = baseAct.device
         vec = torch.zeros(B, self.max_code + 1 + 2, device=device)
 
         for i, code in enumerate(self.base_codes):
@@ -225,7 +273,8 @@ class DecisionExtractor(nn.Module):
             vec[:, code] = extraAct[:, i]
 
         if self.no_skill_id is None:
-            chosen = skillIdx; valid = torch.ones_like(chosen, dtype=torch.bool)
+            chosen = skillIdx
+            valid = torch.ones_like(chosen, dtype=torch.bool)
         else:
             valid = (skillIdx != self.no_skill_id)
             chosen = skillIdx.clamp(max=len(self.skill_codes) - 1)
@@ -237,8 +286,8 @@ class DecisionExtractor(nn.Module):
         return vec
 
     @staticmethod
-    def ApplyConstraints(vec128: torch.Tensor) -> torch.Tensor:
-        x = vec128
+    def ApplyConstraints(keyVec: torch.Tensor) -> torch.Tensor:
+        x = keyVec
         max_scan = x.size(1) - 2
 
         W = KEYBOARD_LAYOUT["base_keys"]["W"]
@@ -274,6 +323,7 @@ class DecisionExtractor(nn.Module):
         n_base = max(1, baseLogits.size(-1))
         n_extra = max(1, extraLogits.size(-1))
         n_skill = max(2, skillLogits.size(-1)) 
+
         base_norm  = ent_base / n_base
         extra_norm = ent_extra / n_extra
         skill_norm = ent_skill / math.log(n_skill)
@@ -299,14 +349,15 @@ class DecisionExtractor(nn.Module):
         self,
         stateFeat: torch.Tensor,                            
         *,
-        sample: bool = False,                               
+        sample: bool = True,                               
         deterministic: bool = False,                           
         prevOptionOnehot: Optional[torch.Tensor] = None,     
         prior: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,  
         mixW: float = 0.25,                              
         updateHebb: bool = False,                      
-        returnKeys128: bool = True,                        
+        returnKeysVec: bool = True,                        
         applyConstraints: bool = True) -> Dict[str, torch.Tensor]:
+        
         B = stateFeat.size(0)
 
         z = self.Encode(stateFeat, updateHebb=updateHebb)
@@ -314,25 +365,27 @@ class DecisionExtractor(nn.Module):
         if prevOptionOnehot is not None:
             prevOptionOnehot = prevOptionOnehot.detach().clone()
 
-        option_logits, psi, beta = self.option(z, prevOptionOnehot)
+        option_logits, psi_all, beta = self.option(z, prevOptionOnehot)
 
         base_logits, skill_logits, extra_logits = self.keyboard.Logits(z)
+
         mu, logstd, click_logits = self.mouse.Params(z)
 
         if prior is not None:
-            base_logits = MixLogits(base_logits,  prior.get("base",  {}).get("logits", None),  mixW)
+            base_logits = MixLogits(base_logits,  prior.get("base", {}).get("logits", None),  mixW)
             extra_logits = MixLogits(extra_logits, prior.get("extra", {}).get("logits", None),  mixW)
             skill_logits = MixLogits(skill_logits, prior.get("skill", {}).get("logits", None),  mixW)
             mu, logstd = MixGauss(mu, logstd, prior.get("mouse", {}).get("mu",  None), prior.get("mouse", {}).get("var", None), mixW)
             click_logits = MixLogits(click_logits, prior.get("click", {}).get("logits", None), mixW)
 
         comps = self.EntropyComponents(base_logits, extra_logits, skill_logits, logstd)
+
         entropy_scalar = self.AggregateEntropy(comps)  
 
         out: Dict[str, any] = {
             "z": z,
             "entropy": entropy_scalar, 
-            "option": {"logits": option_logits, "psi": psi, "beta": beta},
+            "option": {"logits": option_logits, "psi_all": psi_all, "beta": beta},
             "keyboard": {"base_logits":  base_logits,"skill_logits": skill_logits,"extra_logits": extra_logits,},
             "mouse": {"mu": mu, "logstd": logstd, "click_logits": click_logits},
             "entropy_components": {
@@ -346,18 +399,21 @@ class DecisionExtractor(nn.Module):
                 base_act = (torch.sigmoid(base_logits)  > 0.5).float()
                 extra_act = (torch.sigmoid(extra_logits) > 0.5).float()
                 skill_idx = torch.argmax(skill_logits, dim=-1)
-                mouse_a = mu
                 clicks = (torch.sigmoid(click_logits) > 0.5).float()
+
+                mouse_a = mu
 
                 logp_base = StableLogProbBernoulli(base_logits, base_act)
                 logp_extra = StableLogProbBernoulli(extra_logits, extra_act)
                 logp_skill = torch.distributions.Categorical(logits=skill_logits).log_prob(skill_idx)
-                logp_mouse = -0.5 * (((mouse_a - mu) / torch.exp(logstd)).pow(2) + 2 * logstd + math.log(2 * math.pi)).sum(-1)
+                logp_mouse = -(logstd.sum(-1) + 0.5 * logstd.size(-1) * math.log(2 * math.pi))
             else:
                 base_prob = torch.sigmoid(base_logits)
                 extra_prob = torch.sigmoid(extra_logits)
+
                 base_act = torch.bernoulli(base_prob)
                 extra_act = torch.bernoulli(extra_prob)
+
                 skill_idx = torch.distributions.Categorical(logits=skill_logits).sample()
 
                 std = torch.exp(logstd)
@@ -378,13 +434,60 @@ class DecisionExtractor(nn.Module):
             
             out["mouse"].update({"a": mouse_a, "logp": logp_mouse, "click_sample": clicks})
 
-            if returnKeys128:
-                keys128_raw = self.ToKeys128(base_act, extra_act, skill_idx, clicks)
-                out["keys128_raw"] = keys128_raw
-                if applyConstraints:
-                    out["keys128"] = self.ApplyConstraints(keys128_raw)
+            device = z.device
+            if prevOptionOnehot is not None:
+                prev_idx = torch.argmax(prevOptionOnehot, dim=-1)
+            else:
+                prev_idx = torch.zeros(B, dtype=torch.long, device=device)
+
+            if deterministic:
+                if beta is None:
+                    terminate = torch.ones(B, 1, device=device)
                 else:
-                    out["keys128"] = keys128_raw
+                    terminate = (beta > 0.5).float()
+                new_idx = torch.argmax(option_logits, dim=-1)
+            else:
+                if beta is None:
+                    terminate = torch.ones(B, 1, device=device)
+                else:
+                    terminate = torch.bernoulli(beta.clamp(1e-6, 1-1e-6))
+                new_idx = torch.distributions.Categorical(logits=option_logits).sample()
+
+            term_mask = terminate.squeeze(-1).bool()
+
+            opt_idx = torch.where(term_mask, new_idx, prev_idx)
+
+            psi = psi_all[torch.arange(B, device=device), opt_idx]
+
+            dist_opt = torch.distributions.Categorical(logits=option_logits)
+            logp_new = dist_opt.log_prob(new_idx)
+            logp_opt = torch.where(term_mask, logp_new, torch.zeros_like(logp_new))
+
+            if beta is None:
+                log_beta = torch.zeros(B, device=device)
+            else:
+                b = beta.clamp(1e-6, 1-1e-6).squeeze(-1)
+                t = terminate.squeeze(-1)
+                log_beta = t * b.log() + (1 - t) * (1 - b).log()
+
+            out["option"].update({
+                "opt_idx": opt_idx,
+                "terminate": terminate,
+                "psi": psi,
+                "logp_option": logp_opt,
+                "logp_beta": log_beta,})
+            
+            if "opt_idx" in out["option"]:
+                opt_idx = out["option"]["opt_idx"]
+                opt_onehot = torch.nn.functional.one_hot(
+                    opt_idx, num_classes=self.num_options).float().to(opt_idx.device)
+                out["option"]["opt_onehot"] = opt_onehot.detach()  
+
+            if returnKeysVec:
+                keyvec_raw = self.ToKeysVec(base_act, extra_act, skill_idx, clicks)
+                out["keyvec_raw"] = keyvec_raw
+                out["key_vec"] = self.ApplyConstraints(keyvec_raw) if applyConstraints else keyvec_raw
+
         return out
 
     def ResetHebbianMemory(self, value: float = 0.0):
@@ -396,7 +499,7 @@ class DecisionExtractor(nn.Module):
 
 
 class CEMPlanner(nn.Module):
-    def __init__(self,worldModel: nn.Module,baseCodes: List[int],skillCodes: List[int],extraCodes: List[int],maxCode: int,hasNoSkill: bool = True,    horizon: int = 5, N: int = 64,
+    def __init__(self,worldModel: nn.Module,baseCodes: List[int],skillCodes: List[int],extraCodes: List[int],maxCode: int,hasNoSkill: bool = True, horizon: int = 5, N: int = 64,
                  elite: int = 8,iters: int = 3,gamma: float = 0.99,temperature: float = 1.0,momentum: float = 0.15,laplace: float = 1.0,minVar: float = 1e-4,epsBern: float = 1e-4):
         super().__init__()
         self.wm = worldModel
@@ -427,7 +530,7 @@ class CEMPlanner(nn.Module):
         return p.log() - (1.0 - p).log()
 
     @staticmethod
-    def AssembleKeys128(baseAct: torch.Tensor,extraAct: torch.Tensor,skillIdx: torch.Tensor,clickAct: torch.Tensor,baseCodes: torch.Tensor,
+    def AssembleKeyVec(baseAct: torch.Tensor,extraAct: torch.Tensor,skillIdx: torch.Tensor,clickAct: torch.Tensor,baseCodes: torch.Tensor,
                           skillCodes: torch.Tensor,extraCodes: torch.Tensor,maxCode: int,hasNoSkill: bool) -> torch.Tensor:
         B = baseAct.size(0)
         device = baseAct.device
@@ -450,8 +553,8 @@ class CEMPlanner(nn.Module):
             sel_codes = skillCodes[skillIdx]
             keys[torch.arange(B, device=device), sel_codes] = 1.0
 
-        keys128 = torch.cat([keys, clickAct], dim=-1)  
-        return keys128
+        key_vec = torch.cat([keys, clickAct], dim=-1)  
+        return key_vec
 
     @torch.no_grad()
     def Plan(self,
@@ -461,24 +564,23 @@ class CEMPlanner(nn.Module):
              baseLogits: Optional[torch.Tensor] = None,       
              extraLogits: Optional[torch.Tensor] = None,    
              clickLogits: Optional[torch.Tensor] = None,     
-             h0: Optional[torch.Tensor] = None,
-             z0: Optional[torch.Tensor] = None,
+             h0: Optional[torch.Tensor] = None, # Deterministic hidden states of the world model
+             z0: Optional[torch.Tensor] = None, # Random hidden states of the world model
              returnTrajectories: bool = False) -> Dict[str, Dict[str, torch.Tensor]]:
 
-        with torch.no_grad():
-            if mouseMu is not None:
-                B = mouseMu.size(0)
-                device = mouseMu.device
-            elif skillLogits is not None:
-                B = skillLogits.size(0)
-                device = skillLogits.device
-            elif baseLogits is not None:
-                B = baseLogits.size(0); device = baseLogits.device
-            else:
-                h_cur, z_cur = self.wm.ExportState()
-                if h_cur is None:
-                    raise ValueError("batch size/device cannot be inferred; Please provide at least one distributed parameter or (h0,z0)")
-                B = h_cur.size(0); device = h_cur.device
+        if mouseMu is not None:
+            B = mouseMu.size(0)
+            device = mouseMu.device
+        elif skillLogits is not None:
+            B = skillLogits.size(0)
+            device = skillLogits.device
+        elif baseLogits is not None:
+            B = baseLogits.size(0); device = baseLogits.device
+        else:
+            h_cur, z_cur = self.wm.ExportState()
+            if h_cur is None:
+                raise ValueError("batch size/device cannot be inferred; Please provide at least one distributed parameter or (h0,z0)")
+            B = h_cur.size(0); device = h_cur.device
 
         if mouseMu is None:
             mouseMu = torch.zeros(B, 2, device=device)
@@ -530,7 +632,7 @@ class CEMPlanner(nn.Module):
             z = z_prev.unsqueeze(1).expand(B, N, -1).reshape(B * N, -1).contiguous()
 
             score = torch.zeros(B, N, device=device)
-            cont  = torch.ones(B, N, device=device)
+            cont = torch.ones(B, N, device=device)
 
             for t in range(H):
                 a_mouse_t = mouse_seq[t].reshape(B * N, 2)
@@ -539,12 +641,12 @@ class CEMPlanner(nn.Module):
                 a_extra_t = extra_seq[t].reshape(B * N, self.n_extra)
                 a_click_t = click_seq[t].reshape(B * N, 2)
 
-                keys128 = self.AssembleKeys128(
+                key_vec = self.AssembleKeyVec(
                     a_base_t, a_extra_t, a_skill_t, a_click_t,
                     self.base_codes_buf, self.skill_codes_buf, self.extra_codes_buf,
                     self.max_code, self.has_no_skill)
 
-                a_enc = self.wm.action_encoder(keys128, a_mouse_t)
+                a_enc = self.wm.action_encoder(key_vec, a_mouse_t)
                 try:
                     h, z, s_next, r_t, d_t = self.wm.StepPriorOnly(h, z, a_enc, sample=False)
                 except TypeError:
@@ -625,7 +727,7 @@ class DecisionPlannerExtractor:
         pass
 
     def BuildPlanner(self, worldModel: nn.Module,KEYBOARD_LAYOUT: Dict[str, Dict[str, int]],includeNoSkill: bool = True,**cemKwargs) -> CEMPlanner:
-        base_codes  = [KEYBOARD_LAYOUT["base_keys"][k]  for k in KEYBOARD_LAYOUT["base_keys"].keys()]
+        base_codes = [KEYBOARD_LAYOUT["base_keys"][k] for k in KEYBOARD_LAYOUT["base_keys"].keys()]
         skill_codes = [KEYBOARD_LAYOUT["skill_keys"][k] for k in KEYBOARD_LAYOUT["skill_keys"].keys()]
         extra_codes = []
         for grp in ["menu_keys", "system_keys", "alpha_keys"]:
@@ -641,64 +743,12 @@ class DecisionPlannerExtractor:
 
 
 
-class ConstantActionEncoder(nn.Module):
-    def __init__(self, outDim=128):
-        super().__init__()
-        self.register_buffer("vec", torch.zeros(1, outDim))
-    def forward(self, keysOnehot, mouseDelta):
-        B = keysOnehot.size(0)
-        return self.vec.expand(B, -1).contiguous()
-
-class WorldModelSimulation(nn.Module):
-    def __init__(self, actionDim=128, deterDim=256, stochDim=32, stateDim=256):
-        super().__init__()
-        self.deter_dim = deterDim
-        self.stoch_dim = stochDim
-        self.state_dim = stateDim
-
-        self.action_encoder = ConstantActionEncoder(outDim=actionDim)
-
-        self.act_proj = nn.Sequential(nn.Linear(actionDim, stochDim), nn.Tanh())
-        self.gru = nn.GRUCell(input_size=stochDim + stochDim, hidden_size=deterDim)
-        self.prior_head = nn.Linear(deterDim, 2 * stochDim)  # -> mu, logstd
-        self.state_proj = nn.Sequential(nn.Linear(deterDim + stochDim, stateDim), nn.LayerNorm(stateDim))
-        self.rew_head = nn.Linear(stateDim, 1)
-        self.done_head = nn.Linear(stateDim, 1)
-
-        self.register_buffer("_h", torch.zeros(1, deterDim))
-        self.register_buffer("_z", torch.zeros(1, stochDim))
-
-    def ResetHidden(self, B: int = 1, device: Optional[torch.device] = None):
-        if device is None:
-            device = self._h.device
-        self._h = torch.zeros(B, self.deter_dim, device=device)
-        self._z = torch.zeros(B, self.stoch_dim, device=device)
-
-    def ExportState(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._h, self._z
-
-    @torch.no_grad()
-    def StepPriorOnly(self, hPrev: torch.Tensor, zPrev: torch.Tensor, aEnc: torch.Tensor, sample: bool = False):
-        a = self.act_proj(aEnc)
-        h_next = self.gru(torch.cat([zPrev, a], dim=-1), hPrev) 
-        mu_p, logstd_p = self.prior_head(h_next).chunk(2, dim=-1)
-        logstd_p = torch.clamp(logstd_p, -6.0, 2.0)
-        z_next = mu_p + torch.randn_like(mu_p) * torch.exp(logstd_p) if sample else mu_p
-
-        s_next = self.state_proj(torch.cat([h_next, z_next], dim=-1)) 
-        r_pred = self.rew_head(s_next).squeeze(-1)
-        d_prob = torch.sigmoid(self.done_head(s_next)).squeeze(-1) 
-
-        self._h = h_next.detach()
-        self._z = z_next.detach()
-        return h_next, z_next, s_next, r_pred, d_prob
-
 
 class TestDecisionMTool:
     def __init__(self, device: Optional[str] = None):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-        self.base_names  = list(KEYBOARD_LAYOUT["base_keys"].keys())
+        self.base_names = list(KEYBOARD_LAYOUT["base_keys"].keys())
         self.skill_names = list(KEYBOARD_LAYOUT["skill_keys"].keys())
         self.extra_groups = ["menu_keys", "system_keys", "alpha_keys"]
         self.base_codes  = [KEYBOARD_LAYOUT["base_keys"][k]  for k in self.base_names]
@@ -709,128 +759,196 @@ class TestDecisionMTool:
         all_codes = []
         for grp in KEYBOARD_LAYOUT.values():
             all_codes += list(grp.values())
-        self.max_code = max(all_codes) 
-        self.keys128_dim = self.max_code + 1 + 2 
-        self.num_base = len(self.base_codes) 
-        self.num_skill = len(self.skill_names) + 1
+        self.max_code = max(all_codes)
+        self.keyvec_dim = self.max_code + 1 + 2 
+        self.num_base = len(self.base_codes)
+        self.num_skill = len(self.skill_names) + 1 
         self.num_extra = len(self.extra_codes)
 
+    class MockActionEncoder(nn.Module):
+        def __init__(self, keyDim: int, outDim: int):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(keyDim + 2, 128), nn.ReLU(),
+                nn.Linear(128, outDim))
+            
+        def forward(self, keysOnehot: torch.Tensor, mouseDelta: torch.Tensor):
+            x = torch.cat([keysOnehot.float(), mouseDelta.float()], dim=-1)
+            return self.net(x)
+
+    class MockWorldModel(nn.Module):
+        def __init__(self, keyDim: int = 106, actionDim: int = 128, deterDim: int = 256, stochDim: int = 32, stateDim: int = 256):
+            super().__init__()
+            self.deter_dim = deterDim
+            self.stoch_dim = stochDim
+            self.state_dim = stateDim
+            self.action_dim = actionDim
+
+            self.action_encoder = TestDecisionMTool.MockActionEncoder(keyDim, actionDim)
+
+            self.act_proj = nn.Sequential(nn.Linear(actionDim, stochDim), nn.Tanh())
+            self.gru = nn.GRUCell(input_size=stochDim + stochDim, hidden_size=deterDim)
+            self.prior_head = nn.Linear(deterDim, 2 * stochDim)
+            self.state_proj = nn.Linear(deterDim + stochDim, stateDim)
+            self.rew_head = nn.Linear(stateDim, 1)
+            self.done_head = nn.Linear(stateDim, 1)
+
+            self.register_buffer("_h", torch.zeros(1, deterDim))
+            self.register_buffer("_z", torch.zeros(1, stochDim))
+
+        def ResetHidden(self, B: int = 1, device: Optional[torch.device] = None):
+            if device is None:
+                device = self._h.device
+            self._h = torch.zeros(B, self.deter_dim, device=device)
+            self._z = torch.zeros(B, self.stoch_dim, device=device)
+
+        def ExportState(self) -> Tuple[torch.Tensor, torch.Tensor]:
+            return self._h, self._z
+
+        @torch.no_grad()
+        def StepPriorOnly(self, hPrev: torch.Tensor, zPrev: torch.Tensor, aEnc: torch.Tensor, sample: bool = False):
+            a = self.act_proj(aEnc)
+            h_next = self.gru(torch.cat([zPrev, a], dim=-1), hPrev) 
+            mu_p, logstd_p = self.prior_head(h_next).chunk(2, dim=-1)
+            logstd_p = torch.clamp(logstd_p, -6.0, 2.0)
+            z_next = mu_p
+
+            s_next = self.state_proj(torch.cat([h_next, z_next], dim=-1))
+            r_pred = self.rew_head(s_next).squeeze(-1)
+            d_prob = torch.sigmoid(self.done_head(s_next)).squeeze(-1)
+            return h_next, z_next, s_next, r_pred, d_prob
+
     def ResetHebbianMemory(self, hebb_layer: nn.Module):
-        if hasattr(hebb_layer, "ResetHebbianMemory"):
-            hebb_layer.ResetHebbianMemory()
-        elif hasattr(hebb_layer, "hebb"):
-            with torch.no_grad():
-                hebb_layer.hebb.zero_()
+        try:
+            if hasattr(hebb_layer, "ResetHebbianMemory"):
+                hebb_layer.ResetHebbianMemory()
+            elif hasattr(hebb_layer, "hebb"):
+                with torch.no_grad():
+                    hebb_layer.hebb.zero_()
+        except Exception as e:
+            print("ResetHebbianMemory error:", type(e).__name__, e)
 
     def TestHebbianPlasticityLayer(self) -> bool:
-        layer = HebbianPlasticityLayer(inDim=512, outDim=512).to(self.device)
-        x = torch.randn(4, 512, device=self.device)
-        y = layer(x, update=False)
-        ok = (y.shape == (4, 512))
-        y2 = layer(x, update=True)
-        ok = ok and (y2.shape == (4, 512))
-        self.ResetHebbianMemory(layer)
-        print("HebbianPlasticityLayer test {}.".format("passed" if ok else "failed"))
-        return ok
+        try:
+            layer = HebbianPlasticityLayer(inDim=512, outDim=512).to(self.device)
+            x = torch.randn(4, 512, device=self.device)
+            y = layer(x, update=False)
+            ok = (y.shape == (4, 512))
+            y2 = layer(x, update=True)
+            ok = ok and (y2.shape == (4, 512))
+            self.ResetHebbianMemory(layer)
+            print("HebbianPlasticityLayer test {}.".format("passed" if ok else "failed"))
+            return ok
+        except Exception as e:
+            print("HebbianPlasticityLayer test crash:", type(e).__name__, e)
+            return False
 
     def TestDecisionExtractorNoPrior(self) -> bool:
-        model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=False).to(self.device)
-        model.eval()
-        B = 3
-        state_feat = torch.randn(B, 1024, device=self.device)
+        try:
+            model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=False).to(self.device)
+            model.eval()
+            B = 3
+            state_feat = torch.randn(B, 1024, device=self.device)
 
-        out0 = model(state_feat, sample=False, prior=None, updateHebb=False)
-        ok = True
-        kb = out0["keyboard"]
-        ms = out0["mouse"]
-        ok = ok and (kb["base_logits"].shape == (B, self.num_base))
-        ok = ok and (kb["skill_logits"].shape == (B, self.num_skill))
-        ok = ok and (kb["extra_logits"].shape == (B, self.num_extra))
-        ok = ok and (ms["mu"].shape == (B, 2) and ms["logstd"].shape == (B, 2) and ms["click_logits"].shape == (B, 2))
+            out0 = model(state_feat, sample=False, prior=None, updateHebb=False)
+            ok = True
+            kb = out0["keyboard"]; ms = out0["mouse"]
+            ok = ok and (kb["base_logits"].shape  == (B, self.num_base))
+            ok = ok and (kb["skill_logits"].shape == (B, self.num_skill))
+            ok = ok and (kb["extra_logits"].shape == (B, self.num_extra))
+            ok = ok and (ms["mu"].shape == (B, 2) and ms["logstd"].shape == (B, 2) and ms["click_logits"].shape == (B, 2))
 
-        out1 = model(state_feat, sample=True, deterministic=False, prior=None, updateHebb=False, returnKeys128=True, applyConstraints=True)
-        ok = ok and ("keys128_raw" in out1)
-        ok = ok and ("keys128" in out1)
-        ok = ok and (out1["keys128"].shape == (B, self.keys128_dim))
-        print("DecisionExtractor (no prior) test {}.".format("passed" if ok else "failed"))
-        return ok
+            out1 = model(state_feat, sample=True, deterministic=False, prior=None, updateHebb=False, returnKeysVec=True, applyConstraints=True)
+            ok = ok and ("keyvec_raw" in out1) and ("key_vec" in out1)
+            ok = ok and (out1["key_vec"].shape == (B, self.keyvec_dim))
+            print("DecisionExtractor (no prior) test {}.".format("passed" if ok else "failed"))
+            return ok
+        except Exception as e:
+            print("DecisionExtractorNoPrior test crash:", type(e).__name__, e)
+            return False
+
+    def _build_planner(self, horizon=3, N=16, elite=4, iters=2):
+        try:
+            wm = self.MockWorldModel(keyDim=self.keyvec_dim, actionDim=128, deterDim=256, stochDim=32, stateDim=256).to(self.device)
+            wm.ResetHidden(B=2, device=self.device)
+            planner = CEMPlanner(
+                worldModel=wm,
+                baseCodes=self.base_codes,
+                skillCodes=self.skill_codes,
+                extraCodes=self.extra_codes,
+                maxCode=self.max_code,
+                hasNoSkill=True,
+                horizon=horizon, N=N, elite=elite, iters=iters).to(self.device)
+            return wm, planner
+        except Exception as e:
+            print("_build_planner crash:", type(e).__name__, e)
+            return None, None
 
     def TestCEMPlanner(self) -> bool:
-        wm = WorldModelSimulation().to(self.device)
-        wm.ResetHidden(B=2, device=self.device)
-
-        planner = CEMPlanner(
-            worldModel=wm,
-            baseCodes=self.base_codes,
-            skillCodes=self.skill_codes,
-            extraCodes=self.extra_codes,
-            maxCode=self.max_code,
-            hasNoSkill=True,
-            horizon=3, N=16, elite=4, iters=2).to(self.device)
-
-        prior = planner.Plan(returnTrajectories=False)
-        ok = True
-        ok = ok and ("mouse" in prior and "mu" in prior["mouse"] and "var" in prior["mouse"])
-        ok = ok and (prior["mouse"]["mu"].shape == (2, 2) and prior["mouse"]["var"].shape == (2, 2))
-        ok = ok and (prior["skill"]["logits"].shape == (2, self.num_skill))
-        ok = ok and (prior["base"]["logits"].shape  == (2, self.num_base))
-        ok = ok and (prior["extra"]["logits"].shape == (2, self.num_extra))
-        ok = ok and (prior["click"]["logits"].shape == (2, 2))
-        print("CEMPlanner test {}.".format("passed" if ok else "failed"))
-        return ok
+        try:
+            _, planner = self._build_planner(horizon=3, N=16, elite=4, iters=2)
+            if planner is None:
+                return False
+            prior = planner.Plan(returnTrajectories=False)
+            ok = True
+            ok = ok and ("mouse" in prior and "mu" in prior["mouse"] and "var" in prior["mouse"])
+            ok = ok and (prior["mouse"]["mu"].shape == (2, 2) and prior["mouse"]["var"].shape == (2, 2))
+            ok = ok and (prior["skill"]["logits"].shape == (2, self.num_skill))
+            ok = ok and (prior["base"]["logits"].shape == (2, self.num_base))
+            ok = ok and (prior["extra"]["logits"].shape == (2, self.num_extra))
+            ok = ok and (prior["click"]["logits"].shape == (2, 2))
+            print("CEMPlanner test {}.".format("passed" if ok else "failed"))
+            return ok
+        except Exception as e:
+            print("CEMPlanner test crash:", type(e).__name__, e)
+            return False
 
     def TestDecisionExtractorWithPrior(self) -> bool:
-        wm = WorldModelSimulation().to(self.device)
-        wm.ResetHidden(B=2, device=self.device)
-        planner = CEMPlanner(
-            worldModel=wm,
-            baseCodes=self.base_codes,
-            skillCodes=self.skill_codes,
-            extraCodes=self.extra_codes,
-            maxCode=self.max_code,
-            hasNoSkill=True,
-            horizon=3, N=16, elite=4, iters=2).to(self.device)
-        
-        prior = planner.Plan(returnTrajectories=False)
+        try:
+            _, planner = self._build_planner(horizon=3, N=16, elite=4, iters=2)
+            if planner is None:
+                return False
+            prior = planner.Plan(returnTrajectories=False)
 
-        model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=True).to(self.device)
-        model.eval()
-        state_feat = torch.randn(2, 1024, device=self.device)
+            model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=True).to(self.device)
+            model.eval()
+            model.num_options = model.option.K
 
-        out = model(state_feat, sample=True, deterministic=False, prior=prior, mixW=0.3, updateHebb=True, returnKeys128=True, applyConstraints=True)
+            state_feat = torch.randn(2, 1024, device=self.device)
+            out = model(state_feat, sample=True, deterministic=False, prior=prior, mixW=0.3, updateHebb=True, returnKeysVec=True, applyConstraints=True)
 
-        ok = True
-        ok = ok and ("keys128" in out and out["keys128"].shape == (2, self.keys128_dim))
-        ok = ok and (out["keyboard"]["base_logits"].shape  == (2, self.num_base))
-        ok = ok and (out["keyboard"]["skill_logits"].shape == (2, self.num_skill))
-        ok = ok and (out["keyboard"]["extra_logits"].shape == (2, self.num_extra))
-        ok = ok and (out["mouse"]["mu"].shape == (2, 2))
-        print("DecisionExtractor (with prior) test {}.".format("passed" if ok else "failed"))
-        return ok
+            ok = True
+            ok = ok and ("key_vec" in out and out["key_vec"].shape == (2, self.keyvec_dim))
+            ok = ok and (out["keyboard"]["base_logits"].shape == (2, self.num_base))
+            ok = ok and (out["keyboard"]["skill_logits"].shape == (2, self.num_skill))
+            ok = ok and (out["keyboard"]["extra_logits"].shape == (2, self.num_extra))
+            ok = ok and (out["mouse"]["mu"].shape == (2, 2))
+            print("DecisionExtractor (with prior) test {}.".format("passed" if ok else "failed"))
+            return ok
+        except Exception as e:
+            print("DecisionExtractorWithPrior test crash:", type(e).__name__, e)
+            return False
 
     def TestIntegrationEndToEnd(self) -> bool:
-        wm = WorldModelSimulation().to(self.device)
-        wm.ResetHidden(B=1, device=self.device)
+        try:
+            _, planner = self._build_planner(horizon=3, N=8, elite=2, iters=2)
+            if planner is None:
+                return False
+            planner.wm.ResetHidden(B=1, device=self.device)
+            prior = planner.Plan(returnTrajectories=False)
 
-        planner = CEMPlanner(
-            worldModel=wm,
-            baseCodes=self.base_codes,
-            skillCodes=self.skill_codes,
-            extraCodes=self.extra_codes,
-            maxCode=self.max_code,
-            hasNoSkill=True,
-            horizon=3, N=8, elite=2, iters=2).to(self.device)
-        
-        prior = planner.Plan(returnTrajectories=False)
+            dec = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=False).to(self.device)
+            dec.eval()
+            dec.num_options = dec.option.K 
+            state_feat = torch.randn(1, 1024, device=self.device)
 
-        dec = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=False).to(self.device)
-        dec.eval()
-        state_feat = torch.randn(1, 1024, device=self.device)
-
-        out = dec(state_feat, sample=True, deterministic=True, prior=prior, mixW=0.5, updateHebb=False, returnKeys128=True, applyConstraints=True)
-        ok = ("keys128" in out and out["keys128"].shape == (1, self.keys128_dim))
-        print("Integration (CEM -> Decision) test {}.".format("passed" if ok else "failed"))
-        return ok
+            out = dec(state_feat, sample=True, deterministic=True, prior=prior, mixW=0.5, updateHebb=False, returnKeysVec=True, applyConstraints=True)
+            ok = ("key_vec" in out and out["key_vec"].shape == (1, self.keyvec_dim))
+            print("Integration (CEM -> Decision) test {}.".format("passed" if ok else "failed"))
+            return ok
+        except Exception as e:
+            print("IntegrationEndToEnd test crash:", type(e).__name__, e)
+            return False
 
     class Teacher(nn.Module):
         def __init__(self, inDim, numBase, numSkill, numExtra):
@@ -870,77 +988,83 @@ class TestDecisionMTool:
         return loss
 
     def TrainStepSmoke(self):
-        model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=False).to(self.device)
-        model.train()
+        try:
+            model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=False).to(self.device)
+            model.train()
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+            B = 8
+            state_feat = torch.randn(B, 1024, device=self.device)
 
-        B = 8
-        state_feat = torch.randn(B, 1024, device=self.device)
+            num_options = model.option.K
+            prev_opt = torch.randint(0, num_options, (B,), device=self.device)
+            prev_onehot = F.one_hot(prev_opt, num_classes=num_options).float()
 
-        num_options = model.option.num_options
-        prev_opt = torch.randint(0, num_options, (B,), device=self.device)
-        prev_onehot = F.one_hot(prev_opt, num_classes=num_options).float()
+            out = model(state_feat, sample=False, deterministic=False, prior=None, mixW=0.0, updateHebb=False, prevOptionOnehot=prev_onehot, returnKeysVec=False, applyConstraints=False)
 
-        out = model(state_feat,sample=False,deterministic=False,prior=None,mixW=0.0,updateHebb=False,prevOptionOnehot=prev_onehot,returnKeys128=False,applyConstraints=False,)
+            kb = out["keyboard"]; ms = out["mouse"]
+            base_tgt = torch.rand_like(kb["base_logits"])
+            extra_tgt = torch.rand_like(kb["extra_logits"])
+            bce = torch.nn.BCEWithLogitsLoss()
+            loss_base = bce(kb["base_logits"], base_tgt)
+            loss_extra = bce(kb["extra_logits"], extra_tgt)
 
-        kb = out["keyboard"]
-        ms = out["mouse"]
+            num_skill = kb["skill_logits"].size(-1)
+            skill_tgt = torch.randint(0, num_skill, (B,), device=self.device)
+            loss_skill = F.cross_entropy(kb["skill_logits"], skill_tgt)
 
-        base_tgt = torch.rand_like(kb["base_logits"])
-        extra_tgt = torch.rand_like(kb["extra_logits"])
-        bce = torch.nn.BCEWithLogitsLoss()
-        loss_base = bce(kb["base_logits"],  base_tgt)
-        loss_extra = bce(kb["extra_logits"], extra_tgt)
+            mu, logstd = ms["mu"], ms["logstd"]
+            std = torch.exp(logstd)
+            mouse_tgt = torch.randn_like(mu)
+            loss_mouse = 0.5 * (((mouse_tgt - mu) / std) ** 2 + 2 * logstd + math.log(2 * math.pi)).sum(dim=-1).mean()
 
-        num_skill = kb["skill_logits"].size(-1)
-        skill_tgt = torch.randint(0, num_skill, (B,), device=self.device)
-        loss_skill = F.cross_entropy(kb["skill_logits"], skill_tgt)
+            click_tgt = torch.rand_like(ms["click_logits"])
+            loss_click = bce(ms["click_logits"], click_tgt)
 
-        mu, logstd = ms["mu"], ms["logstd"]
-        std = torch.exp(logstd)
-        mouse_tgt = torch.randn_like(mu)
+            main_loss = loss_base + loss_extra + loss_skill + loss_mouse + loss_click
 
-        loss_mouse = 0.5 * (((mouse_tgt - mu) / std) ** 2 + 2 * logstd + math.log(2 * math.pi)).sum(dim=-1).mean()
+            opt_dict   = out["option"]
+            opt_logits = opt_dict["logits"]
 
-        click_tgt = torch.rand_like(ms["click_logits"])
-        loss_click = bce(ms["click_logits"], click_tgt)
+            if "psi" in opt_dict:
+                psi = opt_dict["psi"]
+            else:
+                psi_all = opt_dict["psi_all"] 
+                idx = torch.argmax(opt_logits, dim=-1)
+                b_idx = torch.arange(B, device=self.device)
+                psi = psi_all[b_idx, idx]
 
-        main_loss = loss_base + loss_extra + loss_skill + loss_mouse + loss_click
+            beta = opt_dict["beta"].squeeze(-1)
+            psi_dim = psi.size(-1)
+            opt_tgt = torch.randint(0, num_options, (B,), device=self.device)
+            psi_tgt = torch.randn(B, psi_dim, device=self.device)
+            beta_tgt = torch.rand(B, device=self.device)
 
-        opt_logits = out["option"]["logits"]
-        psi = out["option"]["psi"]
-        beta = out["option"]["beta"].squeeze(-1)
+            loss_opt_ce = F.cross_entropy(opt_logits, opt_tgt)
+            loss_psi_mse = F.mse_loss(psi, psi_tgt)
+            loss_beta_bce = F.binary_cross_entropy(beta, beta_tgt)
 
-        psi_dim = psi.size(-1)
-        opt_tgt = torch.randint(0, num_options, (B,), device=self.device)
-        psi_tgt = torch.randn(B, psi_dim, device=self.device)
-        beta_tgt = torch.rand(B, device=self.device)
+            total = main_loss + (0.1 * loss_opt_ce + 0.05 * loss_psi_mse + 0.05 * loss_beta_bce)
 
-        loss_opt_ce = F.cross_entropy(opt_logits, opt_tgt)
-        loss_psi_mse = F.mse_loss(psi, psi_tgt)
-        loss_beta_bce = F.binary_cross_entropy(beta, beta_tgt)
+            opt.zero_grad(set_to_none=True)
+            total.backward()
 
-        aux_option_loss = 0.1 * loss_opt_ce + 0.05 * loss_psi_mse + 0.05 * loss_beta_bce
+            bad = []
+            for n, p in model.named_parameters():
+                if p.requires_grad:
+                    if (p.grad is None) or (not torch.isfinite(p.grad).all()) or (p.grad.abs().sum() == 0):
+                        bad.append(n)
+            if bad:
+                print("Decision TrainStepSmoke failed:\n\n Bad grad at:", bad)
+                return False
 
-        total = main_loss + aux_option_loss
-
-        opt.zero_grad(set_to_none=True)
-        total.backward()
-
-        bad = []
-        for n, p in model.named_parameters():
-            if p.requires_grad:
-                if (p.grad is None) or (not torch.isfinite(p.grad).all()) or (p.grad.abs().sum() == 0):
-                    bad.append(n)
-        if bad:
-            print("Decision TrainStepSmoke failed:\n\n Bad grad at:", bad)
+            opt.step()
+            print("Decision TrainStepSmoke passed.")
+            return True
+        except Exception as e:
+            print("TrainStepSmoke crash:", type(e).__name__, e)
             return False
 
-        opt.step()
-        print("Decision TrainStepSmoke passed.")
-        return True
-    
     def NoNanAfterManySteps(self, steps: int = 40) -> bool:
         try:
             in_dim = 512
@@ -970,7 +1094,7 @@ class TestDecisionMTool:
             print("Decision NoNanAfterManySteps failed:\n", e)
             return False
         except Exception as e:
-            print("Decision NoNanAfterManySteps error:\n", e)
+            print("Decision NoNanAfterManySteps error:\n", type(e).__name__, e)
             return False
 
     def ParamsActuallyChange(self, steps: int = 20) -> bool:
@@ -1011,7 +1135,7 @@ class TestDecisionMTool:
             print("Decision ParamsActuallyChange failed:\n", e)
             return False
         except Exception as e:
-            print("Decision ParamsActuallyChange error:\n", e)
+            print("Decision ParamsActuallyChange error:\n", type(e).__name__, e)
             return False
 
     def TestNormalTrainingConvergence(self, steps: int = 120, logEvery: int = 30) -> bool:
@@ -1032,7 +1156,7 @@ class TestDecisionMTool:
             with torch.no_grad():
                 start = self.SupervisedLoss(model(xfix, sample=False, prior=None, updateHebb=False), tgtfix).item()
 
-            for t in range(1, steps+1):
+            for t in range(1, steps + 1):
                 out = model(xfix, sample=False, prior=None, updateHebb=False)
                 loss = self.SupervisedLoss(out, tgtfix)
 
@@ -1055,21 +1179,26 @@ class TestDecisionMTool:
             print("Decision TestNormalTrainingConvergence failed:\n", e)
             return False
         except Exception as e:
-            print("Decision TestNormalTrainingConvergence error:\n", e)
+            print("Decision TestNormalTrainingConvergence error:\n", type(e).__name__, e)
             return False
 
     def RunAll(self):
-        results = []
-        results.append(self.TestHebbianPlasticityLayer())
-        results.append(self.TestDecisionExtractorNoPrior())
-        results.append(self.TestCEMPlanner())
-        results.append(self.TestDecisionExtractorWithPrior())
-        results.append(self.TestIntegrationEndToEnd())
-        results.append(self.TrainStepSmoke())
-        results.append(self.NoNanAfterManySteps())
-        results.append(self.ParamsActuallyChange())
-        results.append(self.TestNormalTrainingConvergence())
+        try:
+            results = []
+            results.append(self.TestHebbianPlasticityLayer())
+            results.append(self.TestDecisionExtractorNoPrior())
+            results.append(self.TestCEMPlanner())
+            results.append(self.TestDecisionExtractorWithPrior())
+            results.append(self.TestIntegrationEndToEnd())
+            results.append(self.TrainStepSmoke())
+            results.append(self.NoNanAfterManySteps())
+            results.append(self.ParamsActuallyChange())
+            results.append(self.TestNormalTrainingConvergence())
 
-        passed = sum(1 for x in results if x)
-        print(f"[DecisionModule Tests] {passed}/{len(results)} passed.")
-        return all(results)
+            passed = sum(1 for x in results if x)
+            print(f"[DecisionModule Tests] {passed}/{len(results)} passed.")
+            return all(results)
+        except Exception as e:
+            print("RunAll crash:", type(e).__name__, e)
+            return False
+

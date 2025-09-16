@@ -489,6 +489,7 @@ class MemoryExtractor(nn.Module):
         tdScale: float = 5.0,
         softBeta: float = 0.2,
         useMeta: bool = True,
+        useHebbian: bool = True,
         useAmp: bool = True,
         svdInterval: int = 10,
         svdMin: float = 0.1,
@@ -512,6 +513,7 @@ class MemoryExtractor(nn.Module):
         self.td_scale = tdScale
         self.soft_beta = softBeta
         self.use_meta = useMeta
+        self.enable_hebb_update = useHebbian
         self.use_amp = useAmp
         self.svd_interval = max(1, svdInterval)
         self.svd_min = svdMin
@@ -785,6 +787,7 @@ class MemoryExtractor(nn.Module):
 
             self.LtmOnlineStore(key, val, importance, tdError=tdError, reward=reward)
 
+            
             self.HebbianUpdate(key, gate_local, neuromod, a, b)
             self.KvWrite(key, val, importance)
 
@@ -898,6 +901,9 @@ class MemoryExtractor(nn.Module):
 
     @torch.no_grad()
     def HebbianUpdate(self, key: torch.Tensor, gateLocal: torch.Tensor, neuromod: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
+        if self.enable_hebb_update is False: 
+            return
+        
         a = a.view(-1, 1, 1)
         b = b.view(-1, 1, 1)
 
