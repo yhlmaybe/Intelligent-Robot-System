@@ -656,7 +656,7 @@ class CEMPlanner(nn.Module):
                 d_t = d_t.view(B, N)
 
                 score = score + cont * (self.gamma ** t) * r_t
-                cont  = cont * (1.0 - d_t)
+                cont = cont * (1.0 - d_t)
 
 
             topk = torch.topk(score, k=E, dim=1).indices
