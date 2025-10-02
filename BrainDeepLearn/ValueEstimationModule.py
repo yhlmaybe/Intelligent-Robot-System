@@ -6,6 +6,64 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class HebbianLinearFW(nn.Module):
+    def __init__(self, inFeatures: int, outFeatures: int, bias: bool = True, *,initEta: float = 1e-3, initLambda: float = 0.1, cap: float = 1.0,useOja: bool = True, detachHebb: bool = True):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(outFeatures, inFeatures))
+        self.bias = nn.Parameter(torch.zeros(outFeatures)) if bias else None
+        nn.init.orthogonal_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+        self.register_buffer("H", torch.zeros(outFeatures, inFeatures))
+        self.init_eta = initEta
+        self.init_lambda = initLambda
+        self.cap = cap
+        self.use_oja = useOja
+        self.detach_hebb = detachHebb
+
+    @torch.no_grad()
+    def ResetHebbianMemory(self):
+        self.H.zero_()
+
+    @torch.no_grad()
+    def ProjectCap(self):
+        if self.cap is None:
+            return
+        n = self.H.norm(dim=1, keepdim=True)
+        scale = (self.cap / (n + 1e-12)).clamp_max(1.0)
+        self.H.mul_(scale)
+
+    def forward(self, x: torch.Tensor, *,
+                eta: Optional[torch.Tensor] = None,
+                lam: Optional[torch.Tensor] = None,
+                betaMix: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        scale = 0.0 if betaMix is None else betaMix.detach().mean()
+        W_eff = self.weight + scale * self.H
+        y = F.linear(x, W_eff, self.bias)
+        with torch.no_grad():
+            pre  = x
+            post = y
+            if self.detach_hebb:
+                pre = pre.detach()
+                post = post.detach()
+
+            pre_n = pre / (pre.norm(dim=-1, keepdim=True) + 1e-6)
+            post_n = post / (post.norm(dim=-1, keepdim=True) + 1e-6)
+
+            dH = torch.einsum('bo,bi->oi', post_n, pre_n) / max(1, x.size(0))
+            if self.use_oja:
+                post_sq = (post_n**2).mean(dim=0) 
+                dH = dH - torch.einsum('oi,o->oi', self.H, post_sq)
+
+            _eta = float(self.init_eta) if eta is None else float(eta.mean().item())
+            _lam = float(self.init_lambda) if lam is None else float(lam.mean().item())
+            self.H.mul_(1.0 - _lam).add_(_eta * dH)
+            self.ProjectCap()
+
+        extras = {"H_norm": self.H.norm().detach()}
+        return y, extras
+
 class RunningEMA(nn.Module):
     def __init__(self, dim: int, momentum: float = 0.99, eps: float = 1e-6):
         super().__init__()
@@ -206,10 +264,9 @@ class IntrinsicRewardGenerator(nn.Module):
             "valence": valence,}
         
         if self.training:
-            comps["reg_gate"] = 1e-3 * ((g_e - 0.5).pow(2) + (g_u - 0.5).pow(2))
-            comps["reg_eT"] = 1e-3 * ((temp_scale - self.tau0).pow(2)
-                                     + (lr_scale - self.lr0 ).pow(2)
-                                     + (gamma_mod - self.gamma0).pow(2))
+            comps["reg_gate"] = self.gate_reg * ((g_e - 0.5).pow(2) + (g_u - 0.5).pow(2))
+            comps["reg_eT"] = self.eT_anchor * ((temp_scale - self.tau0).pow(2) + (lr_scale - self.lr0 ).pow(2) + (gamma_mod - self.gamma0).pow(2))
+
         return IntrinsicRewardOut(rInt=r_int, components=comps, eT=e_t)
 
 class MaxPlusLinear(nn.Module):
@@ -352,19 +409,29 @@ def WeightedLeastSquaresCycleEnergy(valueInit: torch.Tensor, rEdge: torch.Tensor
     return energy, x.detach()
 
 class PersistentCohomologyRegularizer(nn.Module):
-    def __init__(self, numLevels: int = 5, temperature: float = 0.5, cgSteps: int = 0, weight: float = 1e-3, blend: float = 0.5):
+    def __init__(self,
+                 numLevels: int = 5,
+                 temperature: float = 0.5,
+                 cgSteps: int = 0,
+                 weight: float = 1e-3,
+                 blend: float = 0.5,
+                 alignWeight: float = 1e-3,
+                 alignUseDegree: bool = True):
         super().__init__()
         self.num_levels = numLevels
         self.temperature = temperature
         self.cg_steps = cgSteps
         self.weight = weight
         self.blend = blend
+        self.align_weight = alignWeight
+        self.align_use_degree = alignUseDegree
 
     def forward(self, valueNodes, rEdge, gammaEdge, edgeIndex):
         if edgeIndex is None or rEdge.numel() == 0:
             return torch.tensor(0.0, device=valueNodes.device)
 
         u, v = edgeIndex[0], edgeIndex[1]
+
         inst_res = rEdge - (valueNodes[u] - gammaEdge * valueNodes[v])
         inst_energy = (inst_res**2).mean()
 
@@ -375,15 +442,30 @@ class PersistentCohomologyRegularizer(nn.Module):
             Ts = torch.quantile(e0, qs).detach()
 
         proj_total = 0.0
+        align_total = 0.0
+
         for T in Ts:
             w = torch.sigmoid((e0 - T) / self.temperature)
-            energy_proj, _ = WeightedLeastSquaresCycleEnergy(
+            energy_proj, x_star = WeightedLeastSquaresCycleEnergy(
                 valueInit=valueNodes, rEdge=rEdge, gammaEdge=gammaEdge,
                 edgeIndex=edgeIndex, wEdge=w, cgSteps=self.cg_steps)
-            proj_total = proj_total + energy_proj
-        proj_total = proj_total / K
 
-        total = self.weight * ( self.blend * proj_total + (1.0 - self.blend) * inst_energy )
+            proj_total = proj_total + energy_proj
+
+            if self.align_use_degree:
+                deg = torch.zeros_like(valueNodes)
+                deg.index_add_(0, u, w)
+                deg.index_add_(0, v, w * (gammaEdge**2))
+                align = (deg * (valueNodes - x_star).pow(2)).sum() / deg.sum().clamp_min(1.0)
+            else:
+                align = (valueNodes - x_star).pow(2).mean()
+
+            align_total = align_total + align
+
+        proj_total  = proj_total  / K
+        align_total = align_total / K
+
+        total = (self.weight * ( self.blend * proj_total + (1.0 - self.blend) * inst_energy ) + self.align_weight * align_total)
         return total
 
 class GeoTropicalOut(NamedTuple):
@@ -396,11 +478,47 @@ class GeoTropicalOut(NamedTuple):
     uncertainty: torch.Tensor 
     extras: Dict[str, torch.Tensor]
 
+
+
+class MetaPlasticityController(nn.Module):
+    def __init__(self, hDim: int, mid: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hDim + 4, mid), nn.ReLU(),
+            nn.Linear(mid, mid), nn.ReLU(),
+            nn.Linear(mid, 1 + 1 + 1 + 2))
+        
+        with torch.no_grad():
+            for m in self.net:
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight); nn.init.zeros_(m.bias)
+
+    def forward(self, h: torch.Tensor, compsNorm: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        z = torch.stack([
+            compsNorm.get("novelty_n", torch.zeros_like(h[:,0])),
+            compsNorm.get("progress_n", torch.zeros_like(h[:,0])),
+            compsNorm.get("entropy_n", torch.zeros_like(h[:,0])),
+            compsNorm.get("uncertainty_n", torch.zeros_like(h[:,0])),], dim=-1)
+        
+        inp = torch.cat([h, z], dim=-1)
+        out = self.net(inp).squeeze(-1)
+
+        eta_raw, lam_raw, beta_raw, film_g_raw, film_b_raw = torch.split(out, [1,1,1,1,1], dim=-1)
+        eta = torch.sigmoid(eta_raw) * 0.01 
+        lam = torch.sigmoid(lam_raw) * 0.2 
+        beta = torch.tanh(beta_raw) 
+        film_g = 0.1 * torch.tanh(film_g_raw) 
+        film_b = 0.1 * torch.tanh(film_b_raw)
+        return {"eta": eta.squeeze(-1), "lam": lam.squeeze(-1),
+                "beta_mix": beta.squeeze(-1),
+                "film_gamma": film_g.squeeze(-1), "film_beta": film_b.squeeze(-1)}
+
+
 class ValueEstimationExtractor(nn.Module):
     def __init__(self,
                  memoryDim: int = 768,
-                 attnDim:   int = 1024,
-                 stateDim:  int = 256,
+                 attnDim: int = 1024,
+                 stateDim: int = 256,
                  *,
                  hidden: int = 512,
                  useLayerNorm: bool = False,
@@ -412,10 +530,15 @@ class ValueEstimationExtractor(nn.Module):
                  wUncertTeacher: float = 1e-2,
                  wEntropyTeacher: float = 1e-3,
                  persLevels: int = 5, persTemp: float = 0.5, persWeight: float = 1e-3,
-                 wGITScale: float = 1e-3, wGITShift: float = 1e-3, wGITSign: float = 1e-3):
+                 wGITScale: float = 1e-3, wGITShift: float = 1e-3, wGITSign: float = 1e-3,
+                 useHebb: bool = False, hebbCap: float = 1.0, hebbOja: bool = True, detachHebbGrad: bool = True,
+                 useMeta: bool = False):
         super().__init__()
         self.in_dim = memoryDim + attnDim + stateDim
         H = hidden
+
+        self.use_hebb = useHebb
+        self.use_meta = useMeta
 
         self.wEntropyTeacher = wEntropyTeacher
 
@@ -423,6 +546,11 @@ class ValueEstimationExtractor(nn.Module):
         self.fc2 = nn.Linear(H, H)
         self.norm1 = nn.LayerNorm(H) if useLayerNorm else None
         self.norm2 = nn.LayerNorm(H) if useLayerNorm else None
+
+        if self.use_hebb:
+            self.hebb_value = HebbianLinearFW(H, 1, bias=True,initEta=1e-3, initLambda=0.1,cap=hebbCap, useOja=hebbOja, detachHebb=detachHebbGrad)
+        if self.use_meta:
+            self.meta_ctrl = MetaPlasticityController(H)
 
         self.value_head  = nn.Linear(H, 1)
         self.uncert_head = nn.Linear(H, 1)
@@ -447,8 +575,8 @@ class ValueEstimationExtractor(nn.Module):
 
     def forward(self,
                 memory: torch.Tensor,
-                attn:   torch.Tensor,
-                state:  torch.Tensor,
+                attn: torch.Tensor,
+                state: torch.Tensor,
                 *,
                 rewardExt: Optional[torch.Tensor] = None,
                 policyEntropyPrev: Optional[torch.Tensor] = None,
@@ -463,14 +591,40 @@ class ValueEstimationExtractor(nn.Module):
         x = torch.cat([memory, attn, state], dim=-1)
         h = self.Trunk(x)
 
-        value = self.value_head(h).squeeze(-1)
-        uncert_pred = F.softplus(self.uncert_head(h).squeeze(-1))
+        uncert_pred_fallback = F.softplus(self.uncert_head(h).squeeze(-1)).detach()
 
         irg_out = self.rgen(memoryPrev=memory, attnPrev=attn, stateCurr=state,
                             policyEntropyPrev=policyEntropyPrev,
-                            uncertainty=(uncertaintyTeacher if uncertaintyTeacher is not None else uncert_pred.detach()),
+                            uncertainty=(uncertaintyTeacher if uncertaintyTeacher is not None else uncert_pred_fallback),
                             tdErrorPrev=tdErrorPrev)
         r_int, eT, comps = irg_out.rInt.detach(), irg_out.eT, irg_out.components
+
+        hebb_eta = hebb_lam = beta_mix = None
+        if self.use_meta:
+            ctrl = self.meta_ctrl(h, {
+                "novelty_n": comps.get("novelty_n"),
+                "progress_n": comps.get("progress_n"),
+                "entropy_n": comps.get("entropy_n"),
+                "uncertainty_n": comps.get("uncertainty_n"),})
+            
+            h = (1.0 + ctrl["film_gamma"]).unsqueeze(-1) * h + ctrl["film_beta"].unsqueeze(-1)
+            hebb_eta = ctrl["eta"]; hebb_lam = ctrl["lam"]; beta_mix = ctrl["beta_mix"]
+        else:
+            if self.use_hebb:
+                hebb_eta = eT[..., 1].clamp_min(0).tanh() * 0.01 
+                hebb_lam = torch.full((B,), 0.1, device=device)
+                beta_mix = torch.zeros(B, device=device)
+
+        uncert_pred = F.softplus(self.uncert_head(h).squeeze(-1))
+
+        if self.use_hebb:
+            v_hebb, hebb_extras = self.hebb_value(h, eta=hebb_eta, lam=hebb_lam, betaMix=beta_mix)
+            v_param = self.value_head(h).squeeze(-1)
+            mix = torch.sigmoid(beta_mix) if beta_mix is not None else 0.5
+            value = (1.0 - mix) * v_param + mix * v_hebb.squeeze(-1)
+        else:
+            value = self.value_head(h).squeeze(-1)
+            hebb_extras = {"H_norm": torch.tensor(0.0, device=device)}
 
         if rewardExt is None:
             r_used = self.wInt * r_int
@@ -565,7 +719,10 @@ class ValueEstimationExtractor(nn.Module):
             "trop_out": transp_extras.get("trop_out", torch.zeros_like(value)).detach(),
             "aff_out": transp_extras.get("aff_out", torch.zeros_like(value)).detach(),
             "a": transp_extras.get("a", torch.zeros_like(value)).detach(),
-            "b": transp_extras.get("b", torch.zeros_like(value)).detach(),}
+            "b": transp_extras.get("b", torch.zeros_like(value)).detach(),
+            "hebb_H_norm": hebb_extras.get("H_norm", torch.tensor(0.0, device=device)).detach(),
+            "meta_eta": (hebb_eta.mean().detach() if (hebb_eta is not None) else torch.tensor(0.0, device=device)),
+            "meta_lambda": (hebb_lam.mean().detach() if (hebb_lam is not None) else torch.tensor(0.0, device=device)),}
 
         return GeoTropicalOut(
             value=value,
@@ -587,6 +744,20 @@ class TestValueEstimationMTool:
         self.attn_dim = 512
         self.state_dim= 256
 
+    def MakeEstimatorHebbMeta(self, **overrides):
+        est = ValueEstimationExtractor(
+            memoryDim=self.mem_dim,
+            attnDim=self.attn_dim,
+            stateDim=self.state_dim,
+            useLayerNorm=True,
+            useHebb=True,
+            useMeta=True, 
+            irgKwargs={"teacherDropoutProb": 0.0}, 
+            **overrides
+        ).to(self.device)
+        est.train()
+        return est
+
     def RandBatch(self, B: int = 3):
         mem = torch.randn(B, self.mem_dim,  device=self.device)
         attn = torch.randn(B, self.attn_dim, device=self.device)
@@ -598,11 +769,11 @@ class TestValueEstimationMTool:
             idx = torch.zeros((2,0), dtype=torch.long, device=self.device)
             return idx
         src = torch.arange(0, B-1, device=self.device, dtype=torch.long)
-        dst = torch.arange(1, B,   device=self.device, dtype=torch.long)
+        dst = torch.arange(1, B, device=self.device, dtype=torch.long)
         if closed:
             src = torch.cat([src, torch.tensor([B-1], device=self.device)])
-            dst = torch.cat([dst, torch.tensor([0],   device=self.device)])
-        edgeIndex = torch.stack([src, dst], dim=0)  # [2, E]
+            dst = torch.cat([dst, torch.tensor([0], device=self.device)])
+        edgeIndex = torch.stack([src, dst], dim=0) 
         return edgeIndex
 
     def TestIntrinsicRewardGenerator(self) -> bool:
@@ -923,6 +1094,173 @@ class TestValueEstimationMTool:
             print(f"GeoTropical TestLossDecreases error: {e}")
             return False
 
+    def TestHebbMemoryUpdates(self) -> bool:
+        try:
+            torch.manual_seed(7)
+            B = 6
+            mem, attn, state = self.RandBatch(B)
+            est = self.MakeEstimatorHebbMeta()
+            H0 = est.hebb_value.H.detach().clone()
+
+            entropy_prev = torch.rand(B, device=self.device)
+            uncert_teacher = F.softplus(torch.randn(B, device=self.device))
+            out = est(memory=mem, attn=attn, state=state,
+                      rewardExt=None, policyEntropyPrev=entropy_prev,
+                      uncertaintyTeacher=uncert_teacher, tdErrorPrev=None,
+                      done=torch.zeros(B, device=self.device),
+                      edgeIndex=self.MakeChainEdges(B, closed=False), edgeWeight=None)
+
+            H1 = est.hebb_value.H.detach().clone()
+            changed = (H1 - H0).abs().sum().item()
+            ok = changed > 1e-9
+
+            print(f"Hebbian memory update {'passed' if ok else 'failed'} (|ΔH|={changed:.3e}).")
+            return ok
+        except Exception as e:
+            print(f"Hebbian memory update error: {e}")
+            return False
+
+    def TestMetaCtrlGetsGrad(self) -> bool:
+        try:
+            torch.manual_seed(11)
+            B = 8
+            mem, attn, state = self.RandBatch(B)
+            est = self.MakeEstimatorHebbMeta()
+            opt = torch.optim.Adam(est.parameters(), lr=1e-3)
+
+            entropy_prev = torch.rand(B, device=self.device)
+            uncert_teacher = F.softplus(torch.randn(B, device=self.device))
+            reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
+
+            out = est(memory=mem, attn=attn, state=state,
+                      rewardExt=reward_ext, policyEntropyPrev=entropy_prev,
+                      uncertaintyTeacher=uncert_teacher, tdErrorPrev=None,
+                      done=torch.zeros(B, device=self.device),
+                      edgeIndex=self.MakeChainEdges(B, closed=True), edgeWeight=None)
+
+            loss = out.loss
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+
+            has_meta_grad = True
+            bad = []
+            for n, p in est.named_parameters():
+                if 'meta_ctrl' in n and p.requires_grad:
+                    if (p.grad is None) or (not torch.isfinite(p.grad).all()):
+                        has_meta_grad = False
+                        bad.append(n)
+            if not has_meta_grad:
+                print("Meta controller missing/NaN grad:\n", bad)
+                return False
+
+            head_ok = (est.value_head.weight.grad is not None) and torch.isfinite(est.value_head.weight.grad).all()
+            print(f"MetaCtrl grad {'passed' if (has_meta_grad and head_ok) else 'failed'}.")
+            return has_meta_grad and head_ok
+        except Exception as e:
+            print(f"MetaCtrl grad error: {e}")
+            return False
+
+    def ParamsChange_WithHebbMeta(self, steps: int = 20) -> bool:
+        try:
+            torch.manual_seed(17)
+            est = self.MakeEstimatorHebbMeta()
+            est.train()
+            opt = torch.optim.Adam(est.parameters(), lr=1e-3)
+
+            with torch.no_grad():
+                p0 = []
+                for n, p in est.named_parameters():
+                    if p.requires_grad and p.data.numel() > 0:
+                        p0.append(p.data.flatten()[:64].clone())
+                p0 = torch.cat(p0) if p0 else torch.zeros(1, device=self.device)
+
+            for t in range(steps):
+                B = 10
+                mem, attn, state = self.RandBatch(B)
+                edgeIndex = self.MakeChainEdges(B, closed=(t % 2 == 0))
+                done = torch.zeros(B, device=self.device)
+                entropy_prev = torch.rand(B, device=self.device)
+                uncert_teacher = F.softplus(torch.randn(B, device=self.device))
+                reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
+
+                out = est(memory=mem, attn=attn, state=state,
+                          rewardExt=reward_ext, policyEntropyPrev=entropy_prev,
+                          uncertaintyTeacher=uncert_teacher, tdErrorPrev=None,
+                          done=done, edgeIndex=edgeIndex, edgeWeight=None)
+
+                opt.zero_grad(set_to_none=True)
+                out.loss.backward()
+                torch.nn.utils.clip_grad_norm_(est.parameters(), 1.0)
+                opt.step()
+
+            with torch.no_grad():
+                p1 = []
+                for n, p in est.named_parameters():
+                    if p.requires_grad and p.data.numel() > 0:
+                        p1.append(p.data.flatten()[:64].clone())
+                p1 = torch.cat(p1) if p1 else torch.zeros(1, device=self.device)
+                delta = (p0 - p1).abs().mean().item()
+
+            ok = delta > 1e-6
+            print(f"ParamsChange_WithHebbMeta {'passed' if ok else 'failed'} (delta={delta:.3e}).")
+            return ok
+        except Exception as e:
+            print(f"ParamsChange_WithHebbMeta error: {e}")
+            return False
+
+    def TestLossDecreases_WithHebbMeta(self, steps: int = 100, batch_size: int = 16) -> bool:
+        try:
+            torch.manual_seed(2025)
+            est = self.MakeEstimatorHebbMeta(wExt=1.0, wInt=0.1)
+            est.train()
+            opt = torch.optim.Adam(est.parameters(), lr=1e-3)
+
+            losses = []
+            for t in range(steps):
+                mem = torch.randn(batch_size, self.mem_dim,  device=self.device)
+                attn = torch.randn(batch_size, self.attn_dim, device=self.device)
+                state = torch.randn(batch_size, self.state_dim,device=self.device)
+
+                edgeIndex = self.MakeChainEdges(batch_size, closed=(t % 4 == 0))
+                done = torch.zeros(batch_size, device=self.device)
+
+                reward_ext = torch.randn(batch_size, device=self.device).clamp(-1, 1)
+                entropy_prev = torch.rand(batch_size, device=self.device)
+                uncert_teacher = F.softplus(torch.randn(batch_size, device=self.device))
+
+                out = est(memory=mem, attn=attn, state=state,
+                          rewardExt=reward_ext, policyEntropyPrev=entropy_prev,
+                          uncertaintyTeacher=uncert_teacher, tdErrorPrev=None,
+                          done=done, edgeIndex=edgeIndex, edgeWeight=None)
+
+                total = out.loss
+                opt.zero_grad(set_to_none=True)
+                total.backward()
+                torch.nn.utils.clip_grad_norm_(est.parameters(), 1.0)
+                opt.step()
+
+                losses.append(float(total.detach().item()))
+                if (t + 1) % max(1, steps // 4) == 0:
+                    print(f"[HebbMetaTrain] step {t+1}/{steps} | loss={losses[-1]:.6f}")
+
+            assert len(losses) >= 2, "No valid loss trajectory is generated"
+            start = losses[0]
+            end = min(losses[-1], sum(losses[-10:]) / max(1, len(losses[-10:])))
+            print(f"\n[HebbMetaTrain] loss start={start:.6f} -> end={end:.6f}\n")
+
+            rel_ok = end <= start * 0.85
+            abs_ok = (start - end) >= 0.05
+            ok = rel_ok or abs_ok
+            print(f"LossDecreases_WithHebbMeta {'passed' if ok else 'failed'}.")
+            return ok
+        except AssertionError as e:
+            print(f"LossDecreases_WithHebbMeta failed: {e}")
+            return False
+        except Exception as e:
+            print(f"LossDecreases_WithHebbMeta error: {e}")
+            return False
+
+
     def RunAll(self):
         results = []
         results.append(self.TestIntrinsicRewardGenerator())
@@ -932,6 +1270,10 @@ class TestValueEstimationMTool:
         results.append(self.NoNanAfterManySteps())
         results.append(self.ParamsActuallyChange())
         results.append(self.TestLossDecreases())
+        results.append(self.TestHebbMemoryUpdates())
+        results.append(self.TestMetaCtrlGetsGrad())
+        results.append(self.ParamsChange_WithHebbMeta())
+        results.append(self.TestLossDecreases_WithHebbMeta())
         passed = sum(1 for x in results if x)
         print(f"\n[ValueEstimationExtractor Tests] {passed}/{len(results)} passed.")
         return all(results)
