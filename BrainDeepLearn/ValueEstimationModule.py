@@ -753,8 +753,7 @@ class TestValueEstimationMTool:
             useHebb=True,
             useMeta=True, 
             irgKwargs={"teacherDropoutProb": 0.0}, 
-            **overrides
-        ).to(self.device)
+            **overrides).to(self.device)
         est.train()
         return est
 
@@ -895,8 +894,7 @@ class TestValueEstimationMTool:
                 memoryDim=self.mem_dim,
                 attnDim=self.attn_dim,
                 stateDim=self.state_dim,
-                useLayerNorm=True
-            ).to(self.device)
+                useLayerNorm=True).to(self.device)
             est.train()
             opt = torch.optim.Adam(est.parameters(), lr=1e-3)
 
