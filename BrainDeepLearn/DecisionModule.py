@@ -637,7 +637,7 @@ class CEMPlanner(nn.Module):
             for t in range(H):
                 a_mouse_t = mouse_seq[t].reshape(B * N, 2)
                 a_skill_t = skill_seq[t].reshape(B * N)
-                a_base_t  = base_seq[t].reshape(B * N, self.n_base)
+                a_base_t = base_seq[t].reshape(B * N, self.n_base)
                 a_extra_t = extra_seq[t].reshape(B * N, self.n_extra)
                 a_click_t = click_seq[t].reshape(B * N, 2)
 
@@ -670,11 +670,11 @@ class CEMPlanner(nn.Module):
 
             for t in range(H):
                 elite_mouse_t = mouse_seq[t][b_idx, topk, :]
-                mu_new  = (w_exp * elite_mouse_t).sum(dim=1)
-                diff    = elite_mouse_t - mu_new.unsqueeze(1)
+                mu_new = (w_exp * elite_mouse_t).sum(dim=1)
+                diff = elite_mouse_t - mu_new.unsqueeze(1)
                 var_new = (w_exp * (diff * diff)).sum(dim=1).clamp_min(self.min_var)
                 std_new = var_new.sqrt()
-                mu_t[t]  = self.momentum * mu_t[t]  + (1 - self.momentum) * mu_new
+                mu_t[t] = self.momentum * mu_t[t] + (1 - self.momentum) * mu_new
                 std_t[t] = self.momentum * std_t[t] + (1 - self.momentum) * std_new
 
 
@@ -703,7 +703,7 @@ class CEMPlanner(nn.Module):
                 logits_c[t] = self.momentum * logits_c[t] + (1 - self.momentum) * logits_new_c
 
 
-        mouse_mu0  = mu_t[0]
+        mouse_mu0 = mu_t[0]
         mouse_var0 = (std_t[0] * std_t[0])
         out = {
             "mouse": {"mu": mouse_mu0, "var": mouse_var0},

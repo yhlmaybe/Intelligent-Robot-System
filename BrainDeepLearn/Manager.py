@@ -5,8 +5,6 @@ import threading
 import collections
 import random
 import time
-import math
-import json
 
 import numpy as np
 import torch
@@ -14,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import shutil
 import traceback
+import os
 
 from torch.utils.data import Dataset, DataLoader
 
@@ -30,6 +29,12 @@ except Exception:
     iio = None  
 
 
+def ToDevice(x, device):
+    if isinstance(x, torch.Tensor):
+        return x.to(device)
+    return x
+
+
 def to_device(x, device):
     if isinstance(x, torch.Tensor):
         return x.to(device)
@@ -38,64 +43,87 @@ def to_device(x, device):
 
 class BrainCore(nn.Module):
     SEQ_LEN = 16
-    def __init__(self, device: Optional[torch.device] = None, plasticHebbian: bool = True, plasticMeta: bool = True, usePlanner: bool = True):
+    def __init__(
+        self,
+        device: Optional[torch.device] = None,
+        *,
+        plasticHebbian: bool = True,
+        plasticMeta: bool = True,
+        usePlanner: bool = True,):
         super().__init__()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.perc = PerceiveExtractor(useHebbian=plasticHebbian)
         if hasattr(self.perc, "plastic_on"):
             self.perc.plastic_on = plasticMeta
 
-        self.attn = AttentionExtractor(hebbianRate=0.01 if plasticHebbian else 0.0)
+        self.attn = AttentionExtractor(hebbianRate=(0.01 if plasticHebbian else 0.0))
+        self.mem = MemoryExtractor(hebbAlpha=(0.15 if plasticHebbian else 0.0), useMeta=plasticMeta)
 
-        self.mem = MemoryExtractor(hebbAlpha=0.15 if plasticHebbian else 0.0, useMeta=plasticMeta)
+        # 决策器输入维度对齐 Memory 输出：768
+        self.actor = DecisionExtractor(stateDim=768, includeNoSkill=True, useHebbOnline=plasticHebbian)
 
-        self.actor = DecisionExtractor(stateDim=768, useHebbOnline=plasticHebbian)
+        # 世界模型：视觉维度使用感知输出的 1024，内部状态 256
+        self.world = RSSMWorldModel(
+            visionDim=1024, actionDim=128, deterDim=256, stochDim=32, stateDim=256, useDecoder=True
+        )
+        self.world.ResetHidden(batchSize=1, device=self.device)
 
-        self.world = RSSMWorldModel(visionDim=1024, actionDim=128, deterDim=256, stochDim=32, stateDim=256, useDecoder=True)
-        self.world.ResetHidden(batchSize=1, device=self.device) 
-
+        # 价值估计：接收 prev memory(768) + prev attn(1024) + 当前世界状态(256)
         self.critic = ValueEstimationExtractor(memoryDim=768, attnDim=1024, stateDim=256)
 
+        # 规划器（CEM），用于生成 prior 混合到 actor
         self.use_planner = usePlanner
-        self.plan_horizon = 5
         self.planner = DecisionPlannerExtractor().BuildPlanner(
-            worldModel=self.world, 
+            worldModel=self.world,
             KEYBOARD_LAYOUT=KEYBOARD_LAYOUT,
             includeNoSkill=True,
-            horizon=self.plan_horizon,
-            N=64,elite=8,iters=3,       
+            horizon=5, N=64, elite=8, iters=3,
             gamma=0.99, temperature=1.0, momentum=0.15,
-            laplace=1.0, minVar=1e-4, epsBern=1e-4)
+            laplace=1.0, minVar=1e-4, epsBern=1e-4
+        )
 
+        # === 键盘向量长度：max_code+1(离散按键) + 2(左右键点击) ===
+        all_codes = []
+        for grp in KEYBOARD_LAYOUT.values():
+            all_codes += list(grp.values())
+        self.max_code = max(all_codes)
+        self.keyvec_dim = (self.max_code + 1) + 2  # 106
+
+        # 运行缓存
         self._buf_B = 0
         self.ResetBuffers(B=1, device=self.device)
-
         self.to(self.device)
 
+    # ----------------- 缓存管理 -----------------
     @torch.no_grad()
     def ResetBuffers(self, B: int = 1, device: Optional[torch.device] = None):
-        
         device = device or self.device
 
         def z(*s, dtype=torch.float32):
             return torch.zeros(B, *s, device=device, dtype=dtype)
 
+        # 上一时刻的 B 与 C
         self.prev_mem = z(768)
         self.prev_attn = z(1024)
+        # 世界隐藏状态的语义投影
         self.prev_state = z(256)
 
-        self.prev_keys128 = z(128)
+        # 上一时刻的动作（供世界模型使用）
+        self.prev_key_vec = z(self.keyvec_dim)  # [B,106]
         self.prev_mouse = z(2)
 
-        self.prev_reward = z()
-        self.prev_done = z()
+        # 教师信号（传给价值估计/注意力/记忆）
+        self.prev_reward = z()         # [B]
+        self.prev_done = z()           # [B]
+        self.prev_entropy = z()        # [B,1]   来自 actor 的策略熵聚合指标
+        self.prev_unc = z()            # [B,1]   来自 critic 的不确定性
+        self.prev_td = z()             # [B,1]   来自 critic 的 TD 误差
 
-        self.prev_entropy = z()
-        self.prev_unc = z()
-        self.prev_td = z()
-
-        self.perc_buf = z(self.SEQ_LEN, 1024)
+        # 感知帧序列（供注意力）
+        self.perc_buf = z(self.SEQ_LEN, 1024)  # [B,T,1024]
         self.tlen = torch.zeros(B, dtype=torch.long, device=device)
+
         self.have_prev = False
         self._buf_B = B
 
@@ -107,130 +135,140 @@ class BrainCore(nn.Module):
 
     @torch.no_grad()
     def PushPerc(self, feat_p: torch.Tensor):
-        B = feat_p.size(0)
+        # shift-left
         self.perc_buf[:, :-1] = self.perc_buf[:, 1:].clone()
         self.perc_buf[:, -1] = feat_p
         self.tlen = torch.clamp(self.tlen + 1, max=self.SEQ_LEN)
 
-    def Step(self, 
-             frame: torch.Tensor,
-             rewardExt: Optional[torch.Tensor] = None,
-             doneFlag: Optional[torch.Tensor] = None,
-             *,
-             sampleActions: bool = True,
-             deterministicActor: bool = False) -> Dict[str, Any]:
+    # ----------------- 核心一步 -----------------
+    def Step(
+        self,
+        frame: torch.Tensor,                      # [B,3,H,W]
+        rewardExt: Optional[torch.Tensor] = None, # [B] 或 None
+        doneFlag: Optional[torch.Tensor] = None,  # [B] 或 None
+        *,
+        sampleActions: bool = True,               # True=随机; False=确定性
+        deterministicActor: bool = False,
+    ) -> Dict[str, Any]:
         B, dev = frame.size(0), frame.device
         self.EnsureB(B, dev)
 
-        feat_p = self.perc(frame)
+        # 1) 感知 A
+        feat_p = self.perc(frame)                 # [B,1024]
         self.PushPerc(feat_p)
-        seq = self.perc_buf[:, -int(self.tlen.min().item() or 1):]
+        L = int(max(1, min(self.SEQ_LEN, int(self.tlen.min().item()))))
+        seq = self.perc_buf[:, -L:]               # [B,L,1024]
 
-        a_enc = self.world.action_encoder(self.prev_keys128, self.prev_mouse)
+        # 2) 世界模型（使用上一步动作）
+        a_enc_prev = self.world.action_encoder(self.prev_key_vec, self.prev_mouse)
         hPrev, zPrev = self.world.ExportState()
-        world_out = self.world.StepPosterior(hPrev, zPrev, visionIn=feat_p, actionEnc=a_enc, deterministicZ=False)
-        s_t = world_out["s_next"]
-        r_t = world_out["r_pred"]
-        d_t = world_out["d_prob"]
+        w_out = self.world.StepPosterior(hPrev, zPrev, visionIn=feat_p, actionEnc=a_enc_prev, sample=False)
+        s_t = w_out["s_next"]     # [B,256]
+        r_t = w_out["r_pred"]     # [B]
+        d_t = w_out["d_prob"]     # [B]
 
+        # 3) 价值估计（E + 上一帧 B/C）
         if self.have_prev:
-            critic_out = self.critic(
-                memoryPrev=self.prev_mem,
-                attnPrev=self.prev_attn,
-                stateCurr=s_t,
-                rewardExt=(self.prev_reward if rewardExt is None else rewardExt),
-                nextValue=None,
-                done=(self.prev_done if doneFlag is None else doneFlag).float(),
-                policyEntropyPrev=self.prev_entropy.squeeze(-1),
-                uncertainty=self.prev_unc.squeeze(-1),
-                tdErrorPrev=self.prev_td.squeeze(-1),)
+            rew_prev = (rewardExt if rewardExt is not None else self.prev_reward).view(B)
+            done_prev = (doneFlag if doneFlag is not None else self.prev_done).view(B)
+            pe_prev = self.prev_entropy.view(B)          # [B]
+            unc_teacher = self.prev_unc.view(B)          # [B]
+            td_prev = self.prev_td.view(B)               # [B]
+            mem_prev = self.prev_mem
+            attn_prev = self.prev_attn
         else:
             zeros = torch.zeros(B, device=dev)
-            critic_out = self.critic(
-                memoryPrev=self.prev_mem,
-                attnPrev=self.prev_attn,
-                stateCurr=s_t,
-                rewardExt=zeros,
-                nextValue=None,
-                done=zeros,
-                policyEntropyPrev=zeros,
-                uncertainty=zeros,
-                tdErrorPrev=zeros,)
+            rew_prev = zeros
+            done_prev = zeros
+            pe_prev = zeros
+            unc_teacher = zeros
+            td_prev = zeros
+            mem_prev = torch.zeros_like(self.prev_mem)
+            attn_prev = torch.zeros_like(self.prev_attn)
 
-        td_prev = critic_out.tdErrorDe.reshape(B, 1)
-        ent_prev = critic_out.entropy.reshape(B, 1)
-        unc_prev = critic_out.uncertainty.reshape(B, 1)
+        critic_out = self.critic(
+            memory=mem_prev,
+            attn=attn_prev,
+            state=s_t,
+            rewardExt=rew_prev,
+            policyEntropyPrev=pe_prev,
+            uncertaintyTeacher=unc_teacher,
+            tdErrorPrev=td_prev,
+            done=done_prev,
+            edgeIndex=None,
+            edgeWeight=None,
+        )
+        # 提取指导信号
+        td_sig = critic_out.tdError.view(B, 1)                      # [B,1]
+        ent_sig = critic_out.rComps.get("entropy", torch.zeros(B, device=dev)).view(B, 1)
+        unc_sig = critic_out.uncertainty.view(B, 1)
 
-        feat_a = self.attn(seq, tdError=td_prev)
+        # 4) 注意力 B（受 TD 影响）
+        feat_b = self.attn(seq, tdError=td_sig)                     # [B,1024]
 
-        feat_m, mem_recall = self.mem(
-            feat_a,
-            tdError=td_prev,
-            entropy=ent_prev,
-            reward=critic_out.rewardUsed.reshape(B, 1).detach(),
-            uncertainty=unc_prev,)
+        # 5) 记忆 C（受 TD/熵/奖励/不确定性影响）
+        # 这里作为奖励信号，使用内在奖励 rInt（与外部奖励无关，更稳定）
+        feat_c, mem_recall = self.mem(
+            feat_b,
+            tdError=td_sig,
+            entropy=ent_sig,
+            reward=critic_out.rInt.view(B, 1).detach(),
+            uncertainty=unc_sig,
+        )  # feat_c: [B,768]
 
-        if self.use_planner:
+        # 6) 决策 D（可混合规划器的 prior）
+        final_det = bool(deterministicActor or (not sampleActions))
+        prior = None
+        if self.use_planner and (self.planner is not None):
+            with torch.no_grad():
+                prior = self.planner.Plan(returnTrajectories=False)
 
-            prior = self.planner.Plan(returnTrajectories=False)
+        act_out = self.actor(
+            stateFeat=feat_c,
+            sample=True,                      # 始终 True，以生成 key_vec / mouse.a
+            deterministic=final_det,          # 由 sampleActions + deterministicActor 共同决定
+            prior=prior, mixW=0.30,
+            updateHebb=True,
+            returnKeysVec=True,
+            applyConstraints=True,
+        )
 
-            act_out = self.actor(
-                feat_m,
-                sample=sampleActions,
-                deterministic=deterministicActor,
-                prior=prior,mixW=0.30,
-                updateHebb=True,
-                returnKeys128=True,
-                applyConstraints=True)
-        else:
-            act_out = self.actor(
-                feat_m,
-                sample=sampleActions,
-                deterministic=deterministicActor,
-                prior=(self.planner.Plan(returnTrajectories=False) if self.use_planner else None),
-                mixW=0.30,
-                updateHebb=True,
-                returnKeys128=True,
-                applyConstraints=True)
-            
-        if sampleActions:
-            keys128 = act_out.get("keys128", act_out.get("keys128_raw"))
-            mouse_delta = act_out["mouse"]["a"]
-        else:
-            keys128 = None
-            mouse_delta = act_out["mouse"]["mu"]
-
+        key_vec = act_out["key_vec"]              # [B,106]
+        mouse_a = act_out["mouse"]["a"]           # [B,2]
         entropy_scalar = act_out["entropy"].view(B, 1)
 
-        self.prev_mem = feat_m.detach()
-        self.prev_attn = feat_a.detach()
+        # 7) 写回 “上一时刻” 缓存
+        self.prev_mem = feat_c.detach()
+        self.prev_attn = feat_b.detach()
         self.prev_state = s_t.detach()
+        self.prev_key_vec = key_vec.detach()
+        self.prev_mouse = mouse_a.detach()
 
-        if keys128 is not None:
-            self.prev_keys128 = keys128.detach()
-        self.prev_mouse = mouse_delta.detach()
-
-        self.prev_reward = (r_t.detach() if rewardExt is None else rewardExt.detach()).reshape(B)
-        self.prev_done = (d_t.detach() if doneFlag  is None else doneFlag.detach()).reshape(B)
+        # 这里做一个“上一时刻奖励/终止”的定义：
+        # 优先使用外部 reward/done，否则用世界模型回归的 r_t/d_t
+        self.prev_reward = (rewardExt.detach() if rewardExt is not None else r_t.detach()).view(B)
+        self.prev_done = (doneFlag.detach() if doneFlag is not None else d_t.detach()).view(B)
         self.prev_entropy = entropy_scalar.detach()
-        self.prev_unc = critic_out.uncertainty.view(B, 1).detach()
-        self.prev_td = critic_out.tdErrorDe.view(B, 1).detach()
+        self.prev_unc = unc_sig.detach()
+        self.prev_td = td_sig.detach()
         self.have_prev = True
 
         return {
             "decision": act_out,
             "world": {"state": s_t, "reward": r_t, "done": d_t},
             "critic": critic_out,
-            "features": {"perc": feat_p, "attn": feat_a, "mem": feat_m, "mem_recall": mem_recall},}
+            "features": {"perc": feat_p, "attn": feat_b, "mem": feat_c, "mem_recall": mem_recall},
+        }
 
-
+    # ----------------- 运行态保存/恢复 -----------------
     @torch.no_grad()
     def ExportBuffers(self) -> Dict[str, Any]:
+        h, z = self.world.ExportState()
         return {
             "prev_mem": self.prev_mem,
             "prev_attn": self.prev_attn,
             "prev_state": self.prev_state,
-            "prev_keys128": self.prev_keys128,
+            "prev_key_vec": self.prev_key_vec,
             "prev_mouse": self.prev_mouse,
             "prev_reward": self.prev_reward,
             "prev_done": self.prev_done,
@@ -239,20 +277,21 @@ class BrainCore(nn.Module):
             "prev_td": self.prev_td,
             "perc_buf": self.perc_buf,
             "tlen": self.tlen,
-            "have_prev": self.have_prev,
-            "world_h": self.world.ExportState()[0],
-            "world_z": self.world.ExportState()[1],}
+            "have_prev": torch.tensor([int(self.have_prev)], device=self.prev_mem.device),
+            "world_h": h, "world_z": z,
+        }
 
     @torch.no_grad()
     def ImportBuffers(self, state: Dict[str, Any]):
         device = next(self.parameters()).device
+        # 搬运到当前设备
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
                 state[k] = v.to(device)
         self.prev_mem = state["prev_mem"]
         self.prev_attn = state["prev_attn"]
         self.prev_state = state["prev_state"]
-        self.prev_keys128 = state["prev_keys128"]
+        self.prev_key_vec = state["prev_key_vec"]
         self.prev_mouse = state["prev_mouse"]
         self.prev_reward = state["prev_reward"]
         self.prev_done = state["prev_done"]
@@ -261,68 +300,113 @@ class BrainCore(nn.Module):
         self.prev_td = state["prev_td"]
         self.perc_buf = state["perc_buf"]
         self.tlen = state["tlen"]
-        self.have_prev = bool(state["have_prev"])
+        self.have_prev = bool(int(state["have_prev"].view(-1)[0].item()))
         self.world.ImportState(state["world_h"], state["world_z"])
+
+
+class Agent:
+    """
+    负责数据预处理、一步执行、保存/恢复（含优化器与随机种子）。
+    训练循环你可以在外层组织，此处仅提供基本接口。
+    """
+    def __init__(self, brain: BrainCore, device: Union[str, torch.device] = "cpu"):
+        self.device = torch.device(device)
+        self.brain = brain.to(self.device)
+
+        # 优化器划分（你也可以按需调整分组/学习率）
+        actor_params = (
+            list(self.brain.perc.parameters())
+            + list(self.brain.attn.parameters())
+            + list(self.brain.mem.parameters())
+            + list(self.brain.actor.parameters())
+        )
+        self.opt_actor = torch.optim.Adam(actor_params, lr=3e-4)
+        self.opt_critic = torch.optim.Adam(self.brain.critic.parameters(), lr=2e-4)
+        self.opt_world = torch.optim.Adam(self.brain.world.parameters(), lr=2e-4)
+
+    # --------- 简单图像预处理 ---------
+    def _preprocess_rgb(self, frame_np: np.ndarray, out_hw: int = 224) -> torch.Tensor:
+        if frame_np.ndim == 3 and frame_np.shape[2] == 3:
+            img = torch.from_numpy(frame_np).permute(2, 0, 1).float() / 255.0  # C,H,W
+            _, H, W = img.shape
+            side = min(H, W)
+            top = (H - side) // 2
+            left = (W - side) // 2
+            img = img[:, top:top + side, left:left + side]
+            img = F.interpolate(img.unsqueeze(0), (out_hw, out_hw), mode='bilinear', align_corners=False).squeeze(0)
+            return img
+        raise ValueError("Expected frame_np as HxWx3 array.")
+
+    def prep(self, imgs: Union[np.ndarray, List[np.ndarray]], device: Optional[torch.device] = None) -> torch.Tensor:
+        if isinstance(imgs, torch.Tensor):
+            return imgs.to(device or self.device)
+        if isinstance(imgs, np.ndarray):
+            imgs = [imgs]
+        t = torch.stack([self._preprocess_rgb(i) for i in imgs], dim=0)  # [B,3,H,W]
+        return t.to(device or self.device)
+
+    @torch.no_grad()
+    def act(
+        self,
+        frame_np: np.ndarray,
+        reward: float = 0.0,
+        done: bool = False,
+        *,
+        sample_actions: bool = True,
+        deterministic_actor: bool = False,
+    ):
+        frame = self.prep(frame_np)  # [1,3,H,W]
+        out = self.brain.Step(
+            frame,
+            rewardExt=torch.tensor([reward], device=self.device, dtype=torch.float32),
+            doneFlag=torch.tensor([float(done)], device=self.device, dtype=torch.float32),
+            sampleActions=sample_actions,
+            deterministicActor=deterministic_actor,
+        )
+        key_vec = out["decision"]["key_vec"].squeeze(0).cpu().numpy().astype(np.float32)  # (106,)
+        mouse = out["decision"]["mouse"]["a"].squeeze(0).cpu().numpy().astype(np.float32) # (2,)
+        entropy = float(out["decision"]["entropy"].mean().item())
+        return key_vec, mouse, entropy
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+        payload = {
+            "brain": self.brain.state_dict(),
+            "opt_actor": self.opt_actor.state_dict(),
+            "opt_critic": self.opt_critic.state_dict(),
+            "opt_world": self.opt_world.state_dict(),
+            "buffers": self.brain.ExportBuffers(),
+            "rng_py": random.getstate(),
+            "rng_np": np.random.get_state(),
+            "rng_torch": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            payload["rng_cuda_all"] = torch.cuda.get_rng_state_all()
+        torch.save(payload, path)
+
+    def load(self, path: str, strict: bool = True, map_location: Optional[Union[str, torch.device]] = None):
+        payload = torch.load(path, map_location=map_location or self.device)
+        self.brain.load_state_dict(payload["brain"], strict=strict)
+        self.opt_actor.load_state_dict(payload["opt_actor"])
+        self.opt_critic.load_state_dict(payload["opt_critic"])
+        self.opt_world.load_state_dict(payload["opt_world"])
+        self.brain.ImportBuffers(payload["buffers"])
+        try:
+            random.setstate(payload["rng_py"])
+            np.random.set_state(payload["rng_np"])
+            torch.set_rng_state(payload["rng_torch"])
+            if torch.cuda.is_available() and ("rng_cuda_all" in payload):
+                torch.cuda.set_rng_state_all(payload["rng_cuda_all"])
+        except Exception:
+            pass
+
 
 
 class ReplayBuf(collections.deque):
     push = collections.deque.append
     def Sample(self, n): return random.sample(self, n)
 
-
-class Agent:
-    def __init__(self, brain: BrainCore, device="cpu"):
-        self.brain = brain.to(device)
-        self.device = device
-
-        actor_p = list(brain.perc.parameters()) + list(brain.attn.parameters()) + \
-                  list(brain.mem.parameters()) + list(brain.actor.parameters())
-        self.opt_a = torch.optim.Adam(actor_p, lr=3e-4)
-        self.opt_c = torch.optim.Adam(brain.critic.parameters(), lr=2e-4)
-        self.opt_w = torch.optim.Adam(brain.world.parameters(), lr=2e-4)
-
-        self.buf = ReplayBuf(maxlen=100_000)
-
-    def PreprocessRgb(self, frameNp: np.ndarray, outHw: int = 224) -> torch.Tensor:
-        if frameNp.ndim == 3 and frameNp.shape[2] == 3:
-            img = torch.from_numpy(frameNp).permute(2, 0, 1).float() / 255.0  # C,H,W
-            _, H, W = img.shape
-            side = min(H, W)
-            top = (H - side) // 2
-            left = (W - side) // 2
-            img = img[:, top:top+side, left:left+side]
-            img = F.interpolate(img.unsqueeze(0), (outHw, outHw), mode='bilinear', align_corners=False).squeeze(0)
-            return img
-        raise ValueError("Expected frame_np as HxWx3 uint8/float array.")
-
-    def Prep(self, imgsNp: Union[np.ndarray, List[np.ndarray]], device: Optional[torch.device] = None) -> torch.Tensor:
-        if isinstance(imgsNp, torch.Tensor):
-            imgsNp = [x.cpu().numpy() for x in imgsNp]
-        elif isinstance(imgsNp, np.ndarray):
-            imgsNp = [imgsNp]
-        t = torch.stack([self.PreprocessRgb(i) for i in imgsNp])
-        return t.to(device or self.device)
-
-    @torch.no_grad()
-    def Act(self, frameNp: np.ndarray, reward: float = 0.0, done: bool = False):
-        fr = self.Prep(frameNp)
-        out = self.brain.Step(fr, 
-                              rewardExt=torch.tensor([reward], 
-                              device=self.device),
-                              doneFlag=torch.tensor([done], 
-                              device=self.device),
-                              sampleActions=True, 
-                              deterministicActor=False)
-
-        keys128 = out["decision"]["keys128"].squeeze(0).cpu().numpy().astype(np.float32)  # (128,)
-        mouse = out["decision"]["mouse"]["a"].squeeze(0).cpu().numpy().astype(np.float32)  # (2,)
-        entropy = float(out["decision"]["entropy"].mean().item())
-
-        self.buf.push(fr.squeeze(0).cpu(), keys128.copy(), mouse.copy(), reward, done,
-                      out["world"]["state"].squeeze(0).cpu(),
-                      out["critic"].value.detach().squeeze(0).cpu())
-
-        return keys128, mouse, entropy
 
 
 class OfflineGameDataset(Dataset):
