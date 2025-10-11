@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from typing import Dict, List, Optional, Iterable, Tuple, Any
-from contextlib import contextmanager
+from FunctionTools import SiteSpec, BaseOnlineWrapper
 
 
 
@@ -341,16 +341,16 @@ class CNNFeatureExtractor(nn.Module):
         self.relu = nn.ReLU(inplace=False) 
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        self.layer1 = self._make_layer(baseChannels, baseChannels, blocks=2, stride=1, useHebbian=useHebbian)
-        self.layer2 = self._make_layer(baseChannels, baseChannels*2, blocks=2, stride=2, useHebbian=useHebbian)
-        self.layer3 = self._make_layer(baseChannels*2, baseChannels*4, blocks=2, stride=2, useHebbian=useHebbian)
-        self.layer4 = self._make_layer(baseChannels*4, baseChannels*8, blocks=2, stride=2, useHebbian=useHebbian)
+        self.layer1 = self.make_layer(baseChannels, baseChannels, blocks=2, stride=1, useHebbian=useHebbian)
+        self.layer2 = self.make_layer(baseChannels, baseChannels*2, blocks=2, stride=2, useHebbian=useHebbian)
+        self.layer3 = self.make_layer(baseChannels*2, baseChannels*4, blocks=2, stride=2, useHebbian=useHebbian)
+        self.layer4 = self.make_layer(baseChannels*4, baseChannels*8, blocks=2, stride=2, useHebbian=useHebbian)
 
         self.conv2 = HebbianConv2d(baseChannels*8, baseChannels*16, 3, stride=1, padding=1,
                                    bias=False, useHebbian=useHebbian)
         self.bn2 = nn.BatchNorm2d(baseChannels*16)
 
-    def _make_layer(self, inC, outC, blocks, stride, useHebbian):
+    def make_layer(self, inC, outC, blocks, stride, useHebbian):
         layers = [ResidualBlock(inC, outC, stride=stride, useHebbian=useHebbian)]
         for _ in range(1, blocks):
             layers.append(ResidualBlock(outC, outC, stride=1, useHebbian=useHebbian))
@@ -522,445 +522,91 @@ class PerceiveExtractor(nn.Module):
 
 
 
-class PerceptionOnlineWrapper(nn.Module):
-    def __init__(self,
-                 base: nn.Module,
-                 initFeatRank: int = 8,
-                 initPatchRank: int = 8,
-                 initTokenRank: int = 8,
-                 autoRank: bool = True,
-                 evThreshold: float = 0.90,
-                 maxRank: int = 64,
-                 maxRankFeat: Optional[int] = None,
-                 maxRankPatch: Optional[int] = None,
-                 maxRankToken: Optional[int] = None,
-                 rankBootstrap: int = 1,
-                 gradEma: float = 0.9,
-                 verifyAtol: float = 1e-6,
-                 verifyRtol: float = 1e-4):
-        super().__init__()
-        self.base = base
-        self.device = next(self.base.parameters()).device
-        self.dtype  = next(self.base.parameters()).dtype
+class PerceptionOnlineWrapper(BaseOnlineWrapper):
+    def __init__(
+        self,
+        base: nn.Module, 
+        initRankEach: int = 4, 
+        autoRank: bool = True,
+        evThreshold: float = 0.90,
+        gradEma: float = 0.9,
+        maxRankFeat: int = 64,
+        maxRankPatch: int = 64,
+        maxRankToken: int = 64,):
+        self.maxRankFeat = int(maxRankFeat)
+        self.maxRankPatch = int(maxRankPatch)
+        self.maxRankToken = int(maxRankToken)
+        super().__init__(base, initRankEach=initRankEach, autoRank=autoRank, evThreshold=evThreshold, gradEma=gradEma)
 
-        self._C = self.base.patch_embed.weight.size(1)
-        self._E = self.base.patch_embed.weight.size(0)
-        self._kh, self._kw = self.base.patch_embed.weight.shape[2:]
-        self._D = self.base.pos_embed.size(-1)
-        self._L = len(self.base.transformer_layers)
+    def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
+        C = int(self.base.patch_embed.in_channels)
+        E = int(self.base.patch_embed.out_channels)
+        kh, kw = self.base.patch_embed.kernel_size
+        ksz = kh * kw
+        D = int(self.base.pos_embed.size(-1))
+        L = len(self.base.transformer_layers)
 
-        self.auto_rank = bool(autoRank)
-        self.ev_threshold = float(evThreshold)
-        self.max_rank = int(maxRank)
-        self.max_rank_feat = int(maxRankFeat) if maxRankFeat is not None else self.max_rank
-        self.max_rank_patch = int(maxRankPatch) if maxRankPatch is not None else self.max_rank
-        self.max_rank_token = int(maxRankToken) if maxRankToken is not None else self.max_rank
-        self.rank_bootstrap = int(rankBootstrap)
-        self.grad_ema = float(gradEma)
+        def alloc_feat(addRank: int, device: torch.device, dtype: torch.dtype):
+            A = nn.Parameter(torch.randn(addRank, C, 1, 1, device=device, dtype=dtype) * 1e-4)
+            B = nn.Parameter(torch.zeros(C, addRank, 1, 1, device=device, dtype=dtype))
+            s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
+            return A, B, s
 
-        self.verify_atol = float(verifyAtol)
-        self.verify_rtol = float(verifyRtol)
+        def compose_feat(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+            A2 = a.view(a.size(0), C)
+            B2 = b.view(C, a.size(0))
+            return float(s) * (B2 @ A2)
 
-        for p in self.base.parameters():
-            p.requires_grad_(False)
+        def alloc_patch(addRank: int, device: torch.device, dtype: torch.dtype):
+            A = nn.Parameter(torch.randn(addRank, C * ksz, device=device, dtype=dtype) * 1e-4)
+            B = nn.Parameter(torch.zeros(E, addRank, device=device, dtype=dtype))
+            s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
+            return A, B, s
 
-        self._cand = None
-        self._grad_ema_buf = None
-        self.InitCandidates(initFeatRank, initPatchRank, initTokenRank)
+        def compose_patch(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+            return float(s) * (b @ a)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ForwardWithCandidates(x, self._cand)
+        def alloc_token(addRank: int, device: torch.device, dtype: torch.dtype):
+            A = nn.Parameter(torch.randn(addRank, D, device=device, dtype=dtype) * 1e-4)
+            B = nn.Parameter(torch.zeros(D, addRank, device=device, dtype=dtype))
+            s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
+            return A, B, s
 
-    def train(self, mode: bool = True):
-        super().train(mode)
-        self.base.eval()
-        return self
+        def compose_token(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+            return float(s) * (b @ a)
 
-    @torch.no_grad()
-    def Update(self, action: str, **kwargs) -> Dict[str, Any]:
-        act = str(action).lower()
+        return {
+            "feat": SiteSpec("feat",  L, C * 1, C * 1, self.maxRankFeat,  alloc_feat,  compose_feat),
+            "patch":SiteSpec("patch", L, C * ksz, E,   self.maxRankPatch, alloc_patch, compose_patch),
+            "token":SiteSpec("token", L, D,       D,   self.maxRankToken, alloc_token, compose_token),}
 
-        if act == "reset":
-            self._cand = None
-            self._grad_ema_buf = None
-            feat = int(kwargs.get("featRank", 0))
-            patch = int(kwargs.get("patchRank", 0))
-            token = int(kwargs.get("tokenRankEach", 0))
-            self.InitCandidates(feat, patch, token)
-            return {"ok": True, "ranks": self.CurrentRanks()}
+    def ForwardWithDeltas(
+        self,
+        x: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor],
+        tdError: Optional[torch.Tensor],
+        uncertainty: Optional[torch.Tensor],
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],) -> torch.Tensor:
 
-        elif act == "ranks":
-            return {"ranks": self.CurrentRanks()}
+        featIn = self.base.cnn_extractor(x)
+        feat = self.base.cnn_feat_adapter(featIn)
 
-        elif act == "accumulategrads":
-            self.AccumulateGrads()
-            return {"ok": True}
+        deltaFeat2D = deltasPerLayer[0].get("feat", None)
+        if deltaFeat2D is not None:
+            C = deltaFeat2D.size(0)
+            w1x1 = deltaFeat2D.view(C, C, 1, 1)
+            feat = feat + F.conv2d(featIn, w1x1, bias=None, stride=1, padding=0)
 
-        elif act == "grow":
-            gf = float(kwargs.get("growFactor", 2.0))
-            add_feat = int(kwargs.get("addFeat",  0))
-            add_patch = int(kwargs.get("addPatch", 0))
-            add_token = int(kwargs.get("addTokenEach", 0))
-            self.GrowCandidates(growFactor=gf, addFeat=add_feat, addPatch=add_patch, addTokenEach=add_token)
-            return {"ok": True, "ranks": self.CurrentRanks()}
-
-        elif act == "autogrow":
-            self.CandidatesAuto()
-            return {"ok": True, "ranks": self.CurrentRanks()}
-
-        elif act == "commit":
-            stats = self.WritebackToBase(self._cand, sample=kwargs.get("sample", None))
-            self._cand = None
-            self._grad_ema_buf = None
-            self.InitCandidates(0, 0, 0)
-            return {"ok": True, "commit_stats": stats, "ranks": self.CurrentRanks()}
-
-        elif act == "rollback":
-            self._cand = None
-            self._grad_ema_buf = None
-            self.InitCandidates(0, 0, 0)
-            return {"ok": True, "ranks": self.CurrentRanks()}
-
-        elif act == "set":
-            if "evThreshold" in kwargs: self.ev_threshold = float(kwargs["evThreshold"])
-            if "maxRank" in kwargs: self.max_rank = int(kwargs["maxRank"])
-            if "maxRankFeat" in kwargs: self.max_rank_feat = int(kwargs["maxRankFeat"])
-            if "maxRankPatch" in kwargs: self.max_rank_patch = int(kwargs["maxRankPatch"])
-            if "maxRankToken" in kwargs: self.max_rank_token = int(kwargs["maxRankToken"])
-            if "gradEma" in kwargs: self.grad_ema = float(kwargs["gradEma"])
-            return {"ok": True, "settings": {
-                "evThreshold": self.ev_threshold,
-                "maxRank": self.max_rank,
-                "maxRankFeat": self.max_rank_feat,
-                "maxRankPatch": self.max_rank_patch,
-                "maxRankToken": self.max_rank_token,
-                "gradEma": self.grad_ema,}}
-
-        else:
-            raise ValueError(f"Unknown action for Update(): {action}")
-
-    def InitCandidates(self, featRank: int, patchRank: int, tokenRankEach: int):
-        dev, dt = self.device, self.dtype
-        def plist(): return nn.ParameterList()
-        def ml(n): return [nn.ParameterList() for _ in range(n)]
-        self._cand = {
-            "active": True,
-            "feat_A": plist(), "feat_B": plist(), "feat_s": plist(),
-            "patch_A": plist(), "patch_B": plist(), "patch_s": plist(),
-            "token_A": ml(self._L), "token_B": ml(self._L), "token_s": ml(self._L),}
-        if featRank > 0:
-            A = nn.Parameter(torch.randn(featRank, self._C, 1, 1, device=dev, dtype=dt) * 1e-4)
-            B = nn.Parameter(torch.zeros(self._C, featRank, 1, 1, device=dev, dtype=dt))
-            s = nn.Parameter(torch.tensor(1e-3, device=dev, dtype=dt))
-            self._cand["feat_A"].append(A); self._cand["feat_B"].append(B); self._cand["feat_s"].append(s)
-        if patchRank > 0:
-            ksz = self._kh * self._kw
-            A = nn.Parameter(torch.randn(patchRank, self._C * ksz, device=dev, dtype=dt) * 1e-4)
-            B = nn.Parameter(torch.zeros(self._E, patchRank, device=dev, dtype=dt))
-            s = nn.Parameter(torch.tensor(1e-3, device=dev, dtype=dt))
-            self._cand["patch_A"].append(A); self._cand["patch_B"].append(B); self._cand["patch_s"].append(s)
-        if tokenRankEach > 0:
-            for i in range(self._L):
-                A = nn.Parameter(torch.randn(tokenRankEach, self._D, device=dev, dtype=dt) * 1e-4)
-                B = nn.Parameter(torch.zeros(self._D, tokenRankEach, device=dev, dtype=dt))
-                s = nn.Parameter(torch.tensor(1e-3, device=dev, dtype=dt))
-                self._cand["token_A"][i].append(A); self._cand["token_B"][i].append(B); self._cand["token_s"][i].append(s)
-
-    def CurrentRanks(self) -> Dict[str, Any]:
-        eps = 1e-12
-        def _eff_rank(plist_A, plist_s):
-            r = 0
-            for A, s in zip(plist_A, plist_s):
-                sval = float(s.detach().item()) if torch.is_tensor(s) else float(s)
-                if abs(sval) > eps:
-                    r += int(A.size(0))
-            return r
-        fr = _eff_rank(self._cand["feat_A"],  self._cand["feat_s"])
-        pr = _eff_rank(self._cand["patch_A"], self._cand["patch_s"])
-        tr = []
-        for i in range(self._L):
-            tr.append(_eff_rank(self._cand["token_A"][i], self._cand["token_s"][i]))
-        return {"feat": fr, "patch": pr, "token": tr}
-
-    def CandParameters(self):
-        for k in ["feat_A","feat_B","feat_s","patch_A","patch_B","patch_s"]:
-            for p in self._cand[k]:
-                if p.requires_grad: yield p
-        for i in range(self._L):
-            for p in self._cand["token_A"][i]:
-                if p.requires_grad: yield p
-            for p in self._cand["token_B"][i]:
-                if p.requires_grad: yield p
-            for p in self._cand["token_s"][i]:
-                if p.requires_grad: yield p
-
-    @torch.no_grad()
-    def AccumulateGrads(self):
-        if self._grad_ema_buf is None:
-            self._grad_ema_buf = {"feat":{"A":[], "B":[]}, "patch":{"A":[], "B":[]}, "token":[{"A":[], "B":[]} for _ in range(self._L)]}
-        def _ema_store(dst_list, src_tensor_list):
-            if len(dst_list) < len(src_tensor_list):
-                dst_list.clear()
-            out = []
-            for i, t in enumerate(src_tensor_list):
-                if t is None:
-                    out.append(dst_list[i] if i < len(dst_list) else None)
-                else:
-                    val = t.detach()
-                    if i < len(dst_list) and dst_list[i] is not None:
-                        val = self.grad_ema * dst_list[i] + (1 - self.grad_ema) * val
-                    out.append(val)
-            return out
-        
-        gA = [p.grad.clone() if (p.grad is not None) else None for p in self._cand["feat_A"]]
-        gB = [p.grad.clone() if (p.grad is not None) else None for p in self._cand["feat_B"]]
-        self._grad_ema_buf["feat"]["A"] = _ema_store(self._grad_ema_buf["feat"]["A"], gA)
-        self._grad_ema_buf["feat"]["B"] = _ema_store(self._grad_ema_buf["feat"]["B"], gB)
-        gA = [p.grad.clone() if (p.grad is not None) else None for p in self._cand["patch_A"]]
-        gB = [p.grad.clone() if (p.grad is not None) else None for p in self._cand["patch_B"]]
-        self._grad_ema_buf["patch"]["A"] = _ema_store(self._grad_ema_buf["patch"]["A"], gA)
-        self._grad_ema_buf["patch"]["B"] = _ema_store(self._grad_ema_buf["patch"]["B"], gB)
-        for i in range(self._L):
-            gA = [p.grad.clone() if (p.grad is not None) else None for p in self._cand["token_A"][i]]
-            gB = [p.grad.clone() if (p.grad is not None) else None for p in self._cand["token_B"][i]]
-            self._grad_ema_buf["token"][i]["A"] = _ema_store(self._grad_ema_buf["token"][i]["A"], gA)
-            self._grad_ema_buf["token"][i]["B"] = _ema_store(self._grad_ema_buf["token"][i]["B"], gB)
-
-    @torch.no_grad()
-    def GrowCandidates(self, growFactor: float = 2.0, addFeat: int = 0, addPatch: int = 0, addTokenEach: int = 0):
-        def _maybe_grow(plist_A, plist_B, plist_s, unit, add_explicit):
-            cur = sum(p.size(0) for p in plist_A)
-            target = max(cur, cur if growFactor <= 1.0 else int(round(cur * growFactor)))
-            target += max(0, add_explicit)
-            if cur == 0 and target == 0:
-                return
-            if unit == "feat":
-                target = min(target, self.max_rank_feat)
-                add = max(0, target - cur)
-                if add <= 0: return
-                A = nn.Parameter(torch.randn(add, self._C, 1, 1, device=self.device, dtype=self.dtype) * 1e-4)
-                B = nn.Parameter(torch.zeros(self._C, add, 1, 1, device=self.device, dtype=self.dtype))
-            elif unit == "patch":
-                target = min(target, self.max_rank_patch)
-                add = max(0, target - cur)
-                if add <= 0: return
-                ksz = self._kh * self._kw
-                A = nn.Parameter(torch.randn(add, self._C*ksz, device=self.device, dtype=self.dtype) * 1e-4)
-                B = nn.Parameter(torch.zeros(self._E, add, device=self.device, dtype=self.dtype))
-            else:
-                raise ValueError
-            s = nn.Parameter(torch.tensor(1e-3, device=self.device, dtype=self.dtype))
-            plist_A.append(A); plist_B.append(B); plist_s.append(s)
-
-        _maybe_grow(self._cand["feat_A"], self._cand["feat_B"], self._cand["feat_s"], "feat", addFeat)
-        _maybe_grow(self._cand["patch_A"], self._cand["patch_B"], self._cand["patch_s"], "patch", addPatch)
-
-        for i in range(self._L):
-            cur = sum(p.size(0) for p in self._cand["token_A"][i])
-            target = max(cur, cur if growFactor <= 1.0 else int(round(cur * growFactor)))
-            target += max(0, addTokenEach)
-            if cur == 0 and target == 0: 
-                continue
-            target = min(target, self.max_rank_token)
-            add = max(0, target - cur)
-            if add <= 0: 
-                continue
-            A = nn.Parameter(torch.randn(add, self._D, device=self.device, dtype=self.dtype) * 1e-4)
-            B = nn.Parameter(torch.zeros(self._D, add, device=self.device, dtype=self.dtype))
-            s = nn.Parameter(torch.tensor(1e-3, device=self.device, dtype=self.dtype))
-            self._cand["token_A"][i].append(A)
-            self._cand["token_B"][i].append(B)
-            self._cand["token_s"][i].append(s)
-
-    def CandidatesAuto(self):
-        dev, dt = self.device, self.dtype
-
-        def _ensure_seed(plist_A, plist_B, plist_s, add, unit, D=None, E=None, C=None, kh=None, kw=None):
-            if add <= 0: return
-            if unit == "feat":
-                A = nn.Parameter(torch.randn(add, C, 1, 1, device=dev, dtype=dt) * 1e-4)
-                B = nn.Parameter(torch.zeros(C, add, 1, 1, device=dev, dtype=dt))
-            elif unit == "patch":
-                ksz = kh * kw
-                A = nn.Parameter(torch.randn(add, C * ksz, device=dev, dtype=dt) * 1e-4)
-                B = nn.Parameter(torch.zeros(E, add, device=dev, dtype=dt))
-            elif unit == "token":
-                A = nn.Parameter(torch.randn(add, D, device=dev, dtype=dt) * 1e-4)
-                B = nn.Parameter(torch.zeros(D, add, device=dev, dtype=dt))
-            else:
-                raise ValueError
-            s = nn.Parameter(torch.tensor(1e-3, device=dev, dtype=dt))
-            plist_A.append(A); plist_B.append(B); plist_s.append(s)
-
-        def _build_delta(plist_A, plist_B, plist_s, out_dim, in_dim):
-            if len(plist_A) == 0:
-                return torch.zeros(out_dim, in_dim, device=dev, dtype=dt)
-            Delta = torch.zeros(out_dim, in_dim, device=dev, dtype=dt)
-            for A, B, s in zip(plist_A, plist_B, plist_s):
-                A2 = A.reshape(A.shape[0], in_dim)
-                B2 = B.reshape(out_dim, A.shape[0])
-                Delta = Delta + float(s.detach()) * (B2 @ A2)
-            return Delta
-
-        def _svd_truncate(Delta, r_star):
-            U, S, Vh = torch.linalg.svd(Delta, full_matrices=False) 
-            r = int(min(r_star, S.numel()))
-            if r <= 0:
-                return None, None, None
-            U_r = U[:, :r].contiguous()
-            S_r = S[:r].contiguous()
-            Vh_r = Vh[:r, :].contiguous() 
-            return U_r, S_r, Vh_r
-
-        def _replace_site(plist_A, plist_B, plist_s,
-                  U_r, S_r, Vh_r, unit, D=None, E=None, C=None, kh=None, kw=None):
-            if U_r is None: 
-                for j in range(len(plist_s)):
-                    with torch.no_grad():
-                        if isinstance(plist_s[j], nn.Parameter):
-                            plist_s[j].data.zero_()
-                return
-
-            sqrtS = torch.sqrt(S_r).unsqueeze(0)
-            B_new_2D = U_r * sqrtS
-            A_new_2D = (sqrtS.t() @ Vh_r).contiguous()
-
-            if unit == "feat": 
-                A_new = A_new_2D.view(A_new_2D.size(0), C, 1, 1).contiguous()
-                B_new = B_new_2D.view(C, B_new_2D.size(1), 1, 1).contiguous()
-            elif unit == "patch": 
-                ksz = kh * kw
-                A_new = A_new_2D.view(A_new_2D.size(0), C * ksz).contiguous()
-                B_new = B_new_2D.view(E, B_new_2D.size(1)).contiguous()
-            elif unit == "token": 
-                A_new = A_new_2D.view(A_new_2D.size(0), D).contiguous()
-                B_new = B_new_2D.view(D, B_new_2D.size(1)).contiguous()
-            else:
-                raise ValueError
-
-            if len(plist_A) == 0:
-                plist_A.append(nn.Parameter(A_new))
-                plist_B.append(nn.Parameter(B_new))
-                plist_s.append(nn.Parameter(torch.tensor(1.0, device=A_new.device, dtype=A_new.dtype)))
-            else:
-                plist_A[0] = nn.Parameter(A_new)
-                plist_B[0] = nn.Parameter(B_new)
-                plist_s[0] = nn.Parameter(torch.tensor(1.0, device=A_new.device, dtype=A_new.dtype))
-                for j in range(1, len(plist_s)):
-                    with torch.no_grad():
-                        if isinstance(plist_s[j], nn.Parameter):
-                            plist_s[j].data.zero_()
-
-        def _suggest_rank_from_site(gradA_list, gradB_list, A_list, B_list, s_list, out_dim, in_dim, max_rank_site):
-            G_acc = None; cnt = 0
-            for gA, gB, A, B, s in zip(gradA_list, gradB_list, A_list, B_list, s_list):
-                if gA is None and gB is None:
-                    continue
-                s_val = float(s.detach().item()) if torch.is_tensor(s) else float(s)
-                s_val = s_val if abs(s_val) > 1e-12 else 1.0
-                A2 = A.reshape(A.shape[0], in_dim)
-                B2 = B.reshape(out_dim, A.shape[0])
-                Gs = []
-                if gA is not None:
-                    Bt = B2.t()
-                    G_A = (torch.linalg.pinv(Bt) @ gA.reshape_as(A2)) / s_val
-                    Gs.append(G_A)
-                if gB is not None:
-                    At = A2.t()
-                    G_B = (gB.reshape(out_dim, A.shape[0]) @ torch.linalg.pinv(At)) / s_val
-                    Gs.append(G_B)
-                if len(Gs) == 0:
-                    continue
-                G_est = sum(Gs) / len(Gs) 
-                G_acc = G_est if G_acc is None else (G_acc + G_est)
-                cnt += 1
-
-            if cnt == 0 or G_acc is None:
-                return 0
-            G = (G_acc / cnt).detach()
-            svals = torch.linalg.svdvals(G)
-            if svals.numel() == 0:
-                return 0
-            ev = (svals**2).cumsum(0) / (svals**2).sum()
-            r_need = int((ev < self.ev_threshold).sum().item() + 1)
-            r_need = max(0, min(r_need, max_rank_site, min(out_dim, in_dim)))
-            return r_need
-
-        ranks = self.CurrentRanks()
-
-        if self._grad_ema_buf is None:
-            if ranks["feat"] == 0:
-                _ensure_seed(self._cand["feat_A"], self._cand["feat_B"], self._cand["feat_s"],self.rank_bootstrap, unit="feat", C=self._C)
-            if ranks["patch"] == 0:
-                _ensure_seed(self._cand["patch_A"], self._cand["patch_B"], self._cand["patch_s"], self.rank_bootstrap, unit="patch", C=self._C, E=self._E, kh=self._kh, kw=self._kw)
-            for i in range(self._L):
-                if ranks["token"][i] == 0:
-                    _ensure_seed(self._cand["token_A"][i], self._cand["token_B"][i], self._cand["token_s"][i], self.rank_bootstrap, unit="token", D=self._D)
-            return
-
-        GB = self._grad_ema_buf 
-
-        cur_feat = ranks["feat"]
-        if cur_feat > 0 or (cur_feat == 0 and len(self._cand["feat_A"]) > 0):
-            r_target = _suggest_rank_from_site(
-                GB["feat"]["A"], GB["feat"]["B"],
-                list(self._cand["feat_A"]), list(self._cand["feat_B"]), list(self._cand["feat_s"]),out_dim=self._C, in_dim=self._C, max_rank_site=self.max_rank_feat)
-            if r_target > cur_feat:
-                add = r_target - cur_feat
-                _ensure_seed(self._cand["feat_A"], self._cand["feat_B"], self._cand["feat_s"],add, unit="feat", C=self._C)
-            elif 0 <= r_target < cur_feat:
-                Delta = _build_delta(self._cand["feat_A"], self._cand["feat_B"], self._cand["feat_s"],out_dim=self._C, in_dim=self._C)
-                U_r, S_r, Vh_r = _svd_truncate(Delta, r_target)
-                _replace_site(self._cand["feat_A"], self._cand["feat_B"], self._cand["feat_s"], U_r, S_r, Vh_r, unit="feat", C=self._C)
-
-        cur_patch = ranks["patch"]; ksz = self._kh * self._kw
-        if cur_patch > 0 or (cur_patch == 0 and len(self._cand["patch_A"]) > 0):
-            r_target = _suggest_rank_from_site(
-                GB["patch"]["A"], GB["patch"]["B"],
-                list(self._cand["patch_A"]), list(self._cand["patch_B"]), list(self._cand["patch_s"]),out_dim=self._E, in_dim=self._C * ksz, max_rank_site=self.max_rank_patch)
-            if r_target > cur_patch:
-                add = r_target - cur_patch
-                _ensure_seed(self._cand["patch_A"], self._cand["patch_B"], self._cand["patch_s"], add, unit="patch", C=self._C, E=self._E, kh=self._kh, kw=self._kw)
-            elif 0 <= r_target < cur_patch:
-                Delta = _build_delta(self._cand["patch_A"], self._cand["patch_B"], self._cand["patch_s"], out_dim=self._E, in_dim=self._C * ksz)
-                U_r, S_r, Vh_r = _svd_truncate(Delta, r_target)
-                _replace_site(self._cand["patch_A"], self._cand["patch_B"], self._cand["patch_s"],U_r, S_r, Vh_r, unit="patch", C=self._C, E=self._E, kh=self._kh, kw=self._kw)
-
-        for i in range(self._L):
-            cur_tok = ranks["token"][i]
-            if cur_tok > 0 or (cur_tok == 0 and len(self._cand["token_A"][i]) > 0):
-                r_target = _suggest_rank_from_site(
-                    GB["token"][i]["A"], GB["token"][i]["B"],
-                    list(self._cand["token_A"][i]), list(self._cand["token_B"][i]), list(self._cand["token_s"][i]),out_dim=self._D, in_dim=self._D, max_rank_site=self.max_rank_token)
-                if r_target > cur_tok:
-                    add = r_target - cur_tok
-                    _ensure_seed(self._cand["token_A"][i], self._cand["token_B"][i], self._cand["token_s"][i],add, unit="token", D=self._D)
-                elif 0 <= r_target < cur_tok:
-                    Delta = _build_delta(self._cand["token_A"][i], self._cand["token_B"][i], self._cand["token_s"][i],out_dim=self._D, in_dim=self._D)
-                    U_r, S_r, Vh_r = _svd_truncate(Delta, r_target)
-                    _replace_site(self._cand["token_A"][i], self._cand["token_B"][i], self._cand["token_s"][i],U_r, S_r, Vh_r, unit="token", D=self._D)
-
-    def ForwardWithCandidates(self, x: torch.Tensor, P: Dict[str, Any]) -> torch.Tensor:
-        feat_in = self.base.cnn_extractor(x)
-        feat = self.base.cnn_feat_adapter(feat_in)
-        if len(P["feat_A"]) > 0:
-            y = feat
-            for A, Bp, s in zip(P["feat_A"], P["feat_B"], P["feat_s"]):
-                z = F.conv2d(feat_in, A, bias=None, stride=1, padding=0)
-                z = F.conv2d(z, Bp, bias=None, stride=1, padding=0)
-                y = y + s * z
-            feat = y
-
-        W = self.base.patch_embed.weight
-        W_eff = W
-        base_delta = self.base.patch_adapter.DeltaWeight()
-        if base_delta is not None:
-            W_eff = W_eff + base_delta
-        if len(P["patch_A"]) > 0:
-            delta = W.new_zeros(self._E, self._C, self._kh, self._kw)
-            for A, Bp, s in zip(P["patch_A"], P["patch_B"], P["patch_s"]):
-                delta = delta + s * (Bp @ A).view(self._E, self._C, self._kh, self._kw)
-            W_eff = W_eff + delta
+        W_eff = self.base.patch_embed.weight
+        baseDelta = self.base.patch_adapter.DeltaWeight()
+        if baseDelta is not None:
+            W_eff = W_eff + baseDelta
+        deltaPatch2D = deltasPerLayer[0].get("patch", None)
+        if deltaPatch2D is not None:
+            E, Ckhw = deltaPatch2D.shape
+            C = self.base.patch_embed.in_channels
+            kh, kw = self.base.patch_embed.kernel_size
+            W_eff = W_eff + deltaPatch2D.view(E, C, kh, kw)
 
         patches = F.conv2d(
             feat, W_eff, bias=None,
@@ -969,89 +615,60 @@ class PerceptionOnlineWrapper(nn.Module):
             dilation=self.base.patch_embed.dilation,
             groups=self.base.patch_embed.groups)
 
-        Bsz, Edim, Ph, Pw = patches.shape
+        B, E, Ph, Pw = patches.shape
         tokens = rearrange(patches, 'b c h w -> b (h w) c')
-        cls_tokens = repeat(self.base.cls_token, '1 1 d -> b 1 d', b=Bsz)
-        x_tok = torch.cat([cls_tokens, tokens], dim=1)
-        x_tok = x_tok + self.base.pos_embed
-        x_tok = self.base.pos_drop(x_tok)
+        cls = repeat(self.base.cls_token, '1 1 d -> b 1 d', b=B)
+        xTok = torch.cat([cls, tokens], dim=1)
+        xTok = xTok + self.base.pos_embed
+        xTok = self.base.pos_drop(xTok)
 
         for i, layer in enumerate(self.base.transformer_layers):
-            x_layer = layer(x_tok)
-            token_in = x_layer
-            base_out = self.base.token_adapters[i](token_in)
-            if len(P["token_A"][i]) > 0:
-                add = 0.0
-                for A, Bp, s in zip(P["token_A"][i], P["token_B"][i], P["token_s"][i]):
-                    add = add + s * ((token_in @ A.t()) @ Bp.t())
-                x_tok = base_out + add
+            xLayer = layer(xTok)
+            xBase = self.base.token_adapters[i](xLayer)
+            deltaTok2D = deltasPerLayer[i].get("token", None)
+            if deltaTok2D is not None:
+                xTok = xBase + (xLayer @ deltaTok2D.t())
             else:
-                x_tok = base_out
+                xTok = xBase
 
-        x_tok = self.base.encoder_norm(x_tok)
+        xTok = self.base.encoder_norm(xTok)
 
-        cls_rep = x_tok[:, 0, :]
-        mlp_out = self.base.mlp(cls_rep)
-        gate = self.base.adaptive_gate(mlp_out)
-        out = gate * mlp_out + (1 - gate) * cls_rep
+        clsRep = xTok[:, 0, :]
+        mlpOut = self.base.mlp(clsRep)
+        gate = self.base.adaptive_gate(mlpOut)
+        out = gate * mlpOut + (1 - gate) * clsRep
         out = self.base.output_norm(out)
 
-        patch_tokens = x_tok[:, 1:, :]
-        patch_scores = self.base.patch_aggregator(patch_tokens).squeeze(-1)
-        patch_weights = F.softmax(patch_scores, dim=1)
-        global_patch = (patch_tokens * patch_weights.unsqueeze(-1)).sum(dim=1)
+        patchTokens = xTok[:, 1:, :]
+        patchScores = self.base.patch_aggregator(patchTokens).squeeze(-1)
+        patchWeights = torch.softmax(patchScores, dim=1)
+        globalPatch = (patchTokens * patchWeights.unsqueeze(-1)).sum(dim=1)
 
-        return torch.cat([out, global_patch], dim=1)
+        return torch.cat([out, globalPatch], dim=1)
 
     @torch.no_grad()
-    def WritebackToBase(self, P: Dict[str, Any], sample: Optional[torch.Tensor]) -> Dict[str, float]:
-        if P is None or not P.get("active", False):
-            raise RuntimeError("No candidate adapters to commit.")
-        if sample is None:
-            B = 2; H = getattr(self.base, "img_size", 224)
-            sample = torch.randn(B, 3, H, H, device=self.device, dtype=self.dtype)
+    def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
+        if site == "feat":
+            if layerIdx != 0:
+                return False
+            init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
+            self.base.cnn_feat_adapter.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
 
-        with self.HebbDisabled():
-            y_before = self.ForwardWithCandidates(sample, P)
+        elif site == "patch":
+            if layerIdx != 0:
+                return False
+            init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
+            self.base.patch_adapter.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
 
-            for A, Bp, s in zip(P["feat_A"], P["feat_B"], P["feat_s"]):
-                init = {"A": A.detach().clone(), "B": Bp.detach().clone(), "scale": float(s.item())}
-                self.base.cnn_feat_adapter.Grow(addRank=A.size(0), init=init, freezeOld=False)
-            for A, Bp, s in zip(P["patch_A"], P["patch_B"], P["patch_s"]):
-                init = {"A": A.detach().clone(), "B": Bp.detach().clone(), "scale": float(s.item())}
-                self.base.patch_adapter.Grow(addRank=A.size(0), init=init, freezeOld=False)
-            for i in range(self._L):
-                for A, Bp, s in zip(P["token_A"][i], P["token_B"][i], P["token_s"][i]):
-                    init = {"A": A.detach().clone(), "B": Bp.detach().clone(), "scale": float(s.item())}
-                    self.base.token_adapters[i].Grow(addRank=A.size(0), init=init, freezeOld=False)
+        elif site == "token":
+            init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
+            self.base.token_adapters[layerIdx].Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
 
-            y_after = self.base(sample)
-
-        max_abs = (y_after - y_before).abs().max().item()
-        max_rel = ((y_after - y_before).abs() / (y_before.abs() + 1e-9)).max().item()
-        ok = (max_abs <= self.verify_atol) or (max_rel <= self.verify_rtol)
-        if not ok:
-            raise RuntimeError(f"[Commit verify failed] max_abs={max_abs:.3e}, max_rel={max_rel:.3e}")
-        return {"max_abs_diff": max_abs, "max_rel_diff": max_rel, "verified_equal": float(ok)}
-
-    def CollectHebbModules(self):
-        mods = []
-        for m in self.base.modules():
-            if hasattr(m, "enable_hebbian_updates"):
-                mods.append(m)
-        return mods
-
-    @contextmanager
-    def HebbDisabled(self):
-        mods = self.CollectHebbModules()
-        old = [bool(m.enable_hebbian_updates) for m in mods]
-        try:
-            for m in mods:
-                m.enable_hebbian_updates = False
-            yield
-        finally:
-            for m, v in zip(mods, old):
-                m.enable_hebbian_updates = v
+        else:
+            raise ValueError(f"Unknown site: {site}")
 
 
 
@@ -1060,6 +677,46 @@ class TestPerceptionMTool:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         torch.manual_seed(42)
 
+    def AdapterRankAndParams(self, adapter) -> Tuple[int, int]:
+        rank_sum = 0
+        param_cnt = 0
+        if not hasattr(adapter, "A_list"):
+            return 0, 0
+        for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
+            rank_sum += int(A.shape[0])
+            param_cnt += int(A.numel() + B.numel() + 1)
+        return rank_sum, param_cnt
+
+    def _token_ranks_and_params(self, token_adapters: Iterable) -> Tuple[List[int], int]:
+        per_layer_ranks = []
+        total_params = 0
+        for ta in token_adapters:
+            r, p = self.AdapterRankAndParams(ta)
+            per_layer_ranks.append(r)
+            total_params += p
+        return per_layer_ranks, total_params
+
+    def DeltaFromConv1x1Adapter(self, adapter) -> torch.Tensor:
+        if not hasattr(adapter, "A_list") or len(adapter.A_list) == 0:
+            C = adapter.C if hasattr(adapter, "C") else 0
+            return torch.zeros(C, C, device=self.device)
+        C = adapter.C
+        delta = torch.zeros(C, C, device=adapter.A_list[0].device, dtype=adapter.A_list[0].dtype)
+        for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
+            A2 = A.view(A.size(0), C) 
+            B2 = B.view(C, A.size(0)) 
+            delta = delta + float(s.detach()) * (B2 @ A2) 
+        return delta
+
+    def DeltaFromTokenAdapter(self, adapter) -> torch.Tensor:
+        if not hasattr(adapter, "A_list") or len(adapter.A_list) == 0:
+            D = adapter.D if hasattr(adapter, "D") else 0
+            return torch.zeros(D, D, device=self.device)
+        D = adapter.D
+        delta = torch.zeros(D, D, device=adapter.A_list[0].device, dtype=adapter.A_list[0].dtype)
+        for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
+            delta = delta + float(s.detach()) * (B @ A) 
+        return delta
 
     def TestHebbianConv2d(self):
         try:
@@ -1108,7 +765,6 @@ class TestPerceptionMTool:
         except Exception as e:
             print(f"PerceiveExtractor test error: {e}")
             return False
-
 
     def TrainStepSmoke(self):
         try:
@@ -1251,23 +907,11 @@ class TestPerceptionMTool:
             print(f"TestNormalTrainingConvergence error: {e}")
             return False
 
-
-    def SumRanksFeat(self, adapter) -> int:
-        return sum(int(A.shape[0]) for A in adapter.A_list)
-
-    def SumRanksPatch(self, adapter) -> int:
-        return sum(int(A.shape[0]) for A in adapter.A_list)
-
-    def SumRanksToken(self, ta) -> int:
-        return sum(int(A.shape[0]) for A in ta.A_list)
-
-
     def WrapperForwardEqualWhenNoInitRank(self):
         try:
-            base = PerceiveExtractor(imgSize=64, patchSize=1, embedDim=64, numHeads=8,
-                                     numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            base = PerceiveExtractor(imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
             base.eval()
-            wrapper = PerceptionOnlineWrapper(base=base, initFeatRank=0, initPatchRank=0, initTokenRank=0).to(self.device)
+            wrapper = PerceptionOnlineWrapper(base=base, initRankEach=0).to(self.device)
             wrapper.eval()
 
             x = torch.randn(3, 3, 64, 64, device=self.device)
@@ -1288,27 +932,27 @@ class TestPerceptionMTool:
 
     def WrapperAPIBasics(self):
         try:
-            base = PerceiveExtractor(imgSize=64, patchSize=1, embedDim=64, numHeads=8,
-                                     numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            base = PerceiveExtractor(imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
             base.eval()
-            wrapper = PerceptionOnlineWrapper(base=base, initFeatRank=0, initPatchRank=0, initTokenRank=0).to(self.device)
+            wrapper = PerceptionOnlineWrapper(base=base, initRankEach=0).to(self.device)
             wrapper.train()
 
             r = wrapper.Update("ranks")["ranks"]
-            assert r["feat"] == 0 and r["patch"] == 0 and all(v == 0 for v in r["token"])
+            assert r["sum"]["feat"] == 0 and r["sum"]["patch"] == 0 and all(row["token"] == 0 for row in r["perLayer"])
 
-            wrapper.Update("grow", growFactor=2.0, addFeat=2, addPatch=2, addTokenEach=1)
+            wrapper.Update("grow", growFactor=2.0, addEach=1)
             r2 = wrapper.Update("ranks")["ranks"]
-            assert r2["feat"] >= 2 and r2["patch"] >= 2 and all(v >= 1 for v in r2["token"])
+            assert r2["sum"]["feat"] >= 1 and r2["sum"]["patch"] >= 1 and all(row["token"] >= 1 for row in r2["perLayer"])
 
             wrapper.Update("accumulategrads")
 
-            st = wrapper.Update("set", evThreshold=0.85, maxRank=64, gradEma=0.8)
-            assert st["ok"] and abs(st["settings"]["evThreshold"] - 0.85) < 1e-12
+            st = wrapper.Update("set", evThreshold=0.85, gradEma=0.8,
+                                **{"maxRank:feat":64, "maxRank:patch":64, "maxRank:token":64})
+            assert st["ok"]
 
             wrapper.Update("rollback")
             r3 = wrapper.Update("ranks")["ranks"]
-            assert r3["feat"] == 0 and r3["patch"] == 0 and all(v == 0 for v in r3["token"])
+            assert r3["sum"]["feat"] == 0 and r3["sum"]["patch"] == 0 and all(row["token"] == 0 for row in r3["perLayer"])
 
             print("WrapperAPIBasics passed.")
             return True
@@ -1322,21 +966,20 @@ class TestPerceptionMTool:
     def WrapperManualGrowTrainAndCommit(self):
         try:
             img_size = 64
-            base = PerceiveExtractor(imgSize=img_size, patchSize=1, embedDim=64,numHeads=8, numLayers=2, baseChannels=16,useHebbian=False).to(self.device)
+            base = PerceiveExtractor(
+                imgSize=img_size, patchSize=1, embedDim=64,
+                numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
             base.eval()
 
-            wrapper = PerceptionOnlineWrapper(
-                base=base, initFeatRank=2, initPatchRank=2, initTokenRank=1,
-                verifyAtol=1e-5, verifyRtol=1e-4).to(self.device)
+            wrapper = PerceptionOnlineWrapper(base=base, initRankEach=4).to(self.device)
             wrapper.train()
 
             head = nn.Linear(128, 16).to(self.device).train()
-
             opt = torch.optim.Adam(list(wrapper.CandParameters()) + list(head.parameters()), lr=3e-3)
 
-            _ = wrapper.Update("grow", growFactor=2.0)
+            _ = wrapper.Update("grow", growFactor=2.0, addEach=0)
 
-            for _ in range(10):
+            for _ in range(8):
                 x = torch.randn(8, 3, img_size, img_size, device=self.device)
                 y = torch.randn(8, 16, device=self.device)
                 pred = head(wrapper(x))
@@ -1346,19 +989,66 @@ class TestPerceptionMTool:
                 wrapper.Update("accumulategrads")
                 opt.step()
 
-            wrapper.eval()
+            expected = []
+            for li in range(wrapper.layerCount):
+                per = {}
+                for site in ("feat", "patch", "token"):
+                    per[site] = wrapper.ComposeOne(site, li).detach().clone()
+                expected.append(per)
 
-            sample = torch.randn(4, 3, img_size, img_size, device=self.device)
-            res = wrapper.Update("commit", sample=sample)
-            assert res["ok"] and res["commit_stats"]["verified_equal"], "Commit verify failed."
+            res = wrapper.Update("commit")
+            assert res["ok"] and res["commit_stats"]["committed_triples"] > 0, "Nothing committed."
+
+            committed_triples = int(res["commit_stats"]["committed_triples"])
+            committed_rank = int(res["commit_stats"]["committed_rank"])
+            print(f"[Commit] committed_triples={committed_triples}, committed_rank={committed_rank}")
+
+            feat_rank, feat_params = self.AdapterRankAndParams(base.cnn_feat_adapter)
+            patch_rank, patch_params = self.AdapterRankAndParams(base.patch_adapter)
+            token_ranks, token_params = self._token_ranks_and_params(base.token_adapters)
+
+            total_rank_injected = feat_rank + patch_rank + sum(token_ranks)
+            total_params_injected = feat_params + patch_params + token_params
+
+            print(
+                "[Injected] feat: rank={}, params={}; patch: rank={}, params={}; "
+                "token per-layer ranks={}, token_total_params={}; "
+                "TOTAL rank={}, TOTAL params={}".format(
+                    feat_rank, feat_params,
+                    patch_rank, patch_params,
+                    token_ranks, token_params,
+                    total_rank_injected, total_params_injected))
+
+            r = wrapper.Update("ranks")["ranks"]
+            assert all(row["feat"] == 0 and row["patch"] == 0 and row["token"] == 0 for row in r["perLayer"])
+
+            atol, rtol = 1e-6, 1e-4
+
+            exp_feat = expected[0]["feat"]
+            if not torch.allclose(exp_feat, torch.zeros_like(exp_feat)):
+                got_feat = self.DeltaFromConv1x1Adapter(base.cnn_feat_adapter)
+                assert torch.allclose(got_feat, exp_feat, atol=atol, rtol=rtol), f"feat delta mismatch: max_abs={(got_feat-exp_feat).abs().max().item():.3e}"
+
+            exp_patch = expected[0]["patch"]
+            if not torch.allclose(exp_patch, torch.zeros_like(exp_patch)):
+                dw = base.patch_adapter.DeltaWeight()
+                assert dw is not None, "patch adapter not injected"
+                got_patch = dw.view(exp_patch.shape[0], -1)
+                assert torch.allclose(got_patch, exp_patch, atol=atol, rtol=rtol), f"patch delta mismatch: max_abs={(got_patch-exp_patch).abs().max().item():.3e}"
+
+            for li, ta in enumerate(base.token_adapters):
+                exp_tok = expected[li]["token"]
+                if torch.allclose(exp_tok, torch.zeros_like(exp_tok)):
+                    continue
+                got_tok = self.DeltaFromTokenAdapter(ta)
+                assert torch.allclose(got_tok, exp_tok, atol=atol, rtol=rtol), f"token[{li}] delta mismatch: max_abs={(got_tok-exp_tok).abs().max().item():.3e}"
 
             base.eval(); wrapper.eval()
-            x = torch.randn(2, 3, img_size, img_size, device=self.device)
+            x_chk = torch.randn(2, 3, img_size, img_size, device=self.device)
             with torch.no_grad():
-                y0 = base(x)
-                y1 = wrapper(x)
-            max_abs = (y0 - y1).abs().max().item()
-            assert max_abs < 1e-6, f"Wrapper vs base mismatch after commit: {max_abs:.3e}"
+                y0 = base(x_chk)
+                y1 = wrapper(x_chk)
+            assert torch.allclose(y0, y1, atol=1e-6, rtol=1e-4), "base vs wrapper mismatch after commit."
 
             print("WrapperManualGrowTrainAndCommit passed.")
             return True
@@ -1372,25 +1062,18 @@ class TestPerceptionMTool:
     def WrapperAutoGrowDecreaseRank(self):
         try:
             img_size = 64
-            base = PerceiveExtractor(imgSize=img_size, patchSize=1, embedDim=64,numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            base = PerceiveExtractor(imgSize=img_size, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
             base.eval()
 
-            wrapper = PerceptionOnlineWrapper(
-                base=base, initFeatRank=4, initPatchRank=0, initTokenRank=0,
-                evThreshold=0.90, maxRankFeat=8, verifyAtol=1e-5, verifyRtol=1e-4).to(self.device)
+            wrapper = PerceptionOnlineWrapper(base=base, initRankEach=4).to(self.device)
             wrapper.train()
 
-            ranks_before = wrapper.Update("ranks")["ranks"]["feat"]
+            ranks_before = wrapper.Update("ranks")["ranks"]["sum"]["feat"]
             assert ranks_before >= 4, f"expected feat rank >=4, got {ranks_before}"
 
-            L = len(wrapper._cand["feat_A"])
-            wrapper._grad_ema_buf = {
-                "feat":  {"A": [None]*L, "B": [None]*L},
-                "patch": {"A": [], "B": []},
-                "token": [{"A": [], "B": []} for _ in range(wrapper._L)],}
-
+            wrapper.Update("accumulategrads")
             wrapper.Update("autogrow")
-            ranks_after = wrapper.Update("ranks")["ranks"]["feat"]
+            ranks_after = wrapper.Update("ranks")["ranks"]["sum"]["feat"]
             assert ranks_after == 0, f"rank not decreased to 0: before={ranks_before}, after={ranks_after}"
 
             print("WrapperAutoGrowDecreaseRank passed.")
@@ -1405,9 +1088,8 @@ class TestPerceptionMTool:
     def WrapperPipelineCompatible(self):
         try:
             img_size = 64
-            base = PerceiveExtractor(imgSize=img_size, patchSize=1, embedDim=64, numHeads=8,
-                                     numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
-            wrapper = PerceptionOnlineWrapper(base=base, initFeatRank=0, initPatchRank=0, initTokenRank=0).to(self.device)
+            base = PerceiveExtractor(imgSize=img_size, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            wrapper = PerceptionOnlineWrapper(base=base, initRankEach=4).to(self.device)
             wrapper.train(); base.eval()
 
             head = nn.Linear(128, 16).to(self.device)
@@ -1434,6 +1116,105 @@ class TestPerceptionMTool:
             print(f"WrapperPipelineCompatible error: {e}")
             return False
 
+    def WrapperAdaptiveGrowAndCommit(self):
+        try:
+            img_size = 64
+            base = PerceiveExtractor(imgSize=img_size, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            base.eval()
+
+            wrapper = PerceptionOnlineWrapper(base=base, initRankEach=0, autoRank=True).to(self.device)
+            wrapper.train()
+
+            wrapper.Update("set", evThreshold=0.97, gradEma=0.5, **{"maxRank:feat": 16, "maxRank:patch": 32, "maxRank:token": 24})
+
+            wrapper.Update("autogrow")
+            r0 = wrapper.Update("ranks")["ranks"]
+            print(f"[Seed] ranks after initial autogrow -> feat={r0['sum']['feat']}, "f"patch={r0['sum']['patch']}, token per-layer={[row['token'] for row in r0['perLayer']]}")
+
+            head = nn.Linear(128, 16).to(self.device).train()
+            opt = torch.optim.Adam(list(wrapper.CandParameters()) + list(head.parameters()), lr=2e-3)
+
+            B = 12
+            data_x = torch.randn(B, 3, img_size, img_size, device=self.device)
+            data_y = torch.randn(B, 16, device=self.device)
+
+            steps = 30
+            grow_every = 5
+
+            for t in range(1, steps + 1):
+                pred = head(wrapper(data_x))
+                loss = F.mse_loss(pred, data_y)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                wrapper.Update("accumulategrads")
+
+                if (t % grow_every) == 0:
+                    wrapper.Update("autogrow")
+                    rk = wrapper.Update("ranks")["ranks"]
+                    feat_r = rk["sum"]["feat"]
+                    patch_r = rk["sum"]["patch"]
+                    token_layers = [row["token"] for row in rk["perLayer"]]
+                    print(f"[Adaptive@{t}] feat={feat_r}, patch={patch_r}, token per-layer={token_layers}")
+
+                opt.step()
+
+            rk_final = wrapper.Update("ranks")["ranks"]
+            feat_r = rk_final["sum"]["feat"]
+            patch_r = rk_final["sum"]["patch"]
+            token_layers = [row["token"] for row in rk_final["perLayer"]]
+            token_sum = sum(token_layers)
+            total_rank = feat_r + patch_r + token_sum
+
+            res = wrapper.Update("commit")
+            assert res["ok"], "Commit failed."
+            stats = res.get("commit_stats", {})
+            committed_rank = int(stats.get("committed_rank", 0))
+            committed_triples = int(stats.get("committed_triples", 0))
+            print(f"[Commit] committed_triples={committed_triples}, committed_rank={committed_rank}")
+
+            base.eval(); wrapper.eval()
+            x_chk = torch.randn(2, 3, img_size, img_size, device=self.device)
+            with torch.no_grad():
+                y0 = base(x_chk)
+                y1 = wrapper(x_chk)
+            max_abs = (y0 - y1).abs().max().item()
+            assert max_abs < 1e-6, f"Wrapper vs base mismatch after commit: {max_abs:.3e}"
+
+            if total_rank == 0:
+                assert committed_rank == 0 and committed_triples == 0, f"Expected no injection, but got committed_rank={committed_rank}, triples={committed_triples}"
+                print("[Adaptive] No growth needed. Passed without injection.")
+            else:
+                def count_lora_params(adapter):
+                    total_r, total_p = 0, 0
+                    for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
+                        total_r += int(A.shape[0])
+                        total_p += int(A.numel() + B.numel() + 1)
+                    return total_r, total_p
+
+                feat_rank, feat_params = count_lora_params(base.cnn_feat_adapter)
+                patch_rank, patch_params = count_lora_params(base.patch_adapter)
+                token_layer_ranks, token_params_total = [], 0
+                for ta in base.token_adapters:
+                    r, p = count_lora_params(ta)
+                    token_layer_ranks.append(r)
+                    token_params_total += p
+
+                total_injected_rank = feat_rank + patch_rank + sum(token_layer_ranks)
+                total_injected_params = feat_params + patch_params + token_params_total
+                print(f"[Injected-Adaptive] feat: rank={feat_rank}, params={feat_params}; "
+                      f"patch: rank={patch_rank}, params={patch_params}; "
+                      f"token per-layer ranks={token_layer_ranks}, token_total_params={token_params_total}; "
+                      f"TOTAL rank={total_injected_rank}, TOTAL params={total_injected_params}")
+
+            print("WrapperAdaptiveGrowAndCommit passed.")
+            return True
+        except AssertionError as e:
+            print("WrapperAdaptiveGrowAndCommit failed:\n", e)
+            return False
+        except Exception as e:
+            print("WrapperAdaptiveGrowAndCommit error:\n", e)
+            return False
+
 
     def RunAll(self):
         results = {
@@ -1444,12 +1225,12 @@ class TestPerceptionMTool:
             "NoNanAfterManySteps": self.NoNanAfterManySteps(),
             "ParamsActuallyChange": self.ParamsActuallyChange(),
             "NormalTrainingConvergence": self.TestNormalTrainingConvergence(),
-
             "WrapperForwardEqualWhenNoInitRank": self.WrapperForwardEqualWhenNoInitRank(),
             "WrapperAPIBasics": self.WrapperAPIBasics(),
             "WrapperManualGrowTrainAndCommit": self.WrapperManualGrowTrainAndCommit(),
             "WrapperAutoGrowDecreaseRank": self.WrapperAutoGrowDecreaseRank(),
-            "WrapperPipelineCompatible": self.WrapperPipelineCompatible(),}
+            "WrapperPipelineCompatible": self.WrapperPipelineCompatible(),
+            "WrapperAdaptiveGrowAndCommit": self.WrapperAdaptiveGrowAndCommit()}
 
         passed = sum(1 for v in results.values() if v)
         print(f"\nPerception module tests (with wrapper): {passed}/{len(results)} passed.")

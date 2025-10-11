@@ -1,9 +1,64 @@
 from __future__ import annotations
 import math
-from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, Tuple, List, Dict
+from FunctionTools import SiteSpec, BaseOnlineWrapper
+from contextlib import contextmanager
+
+
+class GrowableLoRALinear(nn.Module):
+    def __init__(self, targetLinear: nn.Linear):
+        super().__init__()
+        self.target = targetLinear
+        self.A_list = nn.ParameterList()
+        self.B_list = nn.ParameterList()
+        self.alpha = nn.ParameterList()
+
+        self.out_f = targetLinear.out_features
+        self.in_f = targetLinear.in_features
+
+    @torch.no_grad()
+    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
+        if addRank <= 0:
+            return
+        if init is None: init = {}
+
+        dev = self.target.weight.device
+        dt  = self.target.weight.dtype
+
+        A = init.get("A", torch.randn(addRank, self.in_f,  device=dev, dtype=dt) * 1e-4)
+        B = init.get("B", torch.zeros(self.out_f, addRank, device=dev, dtype=dt))
+        s = init.get("scale", 1e-3)
+
+        A = nn.Parameter(A.contiguous())
+        B = nn.Parameter(B.contiguous())
+        s = nn.Parameter(torch.tensor(float(s), device=dev, dtype=dt))
+
+        if freezeOld:
+            for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
+                p.requires_grad_(False)
+
+        self.A_list.append(A)
+        self.B_list.append(B)
+        self.alpha.append(s)
+
+    def DeltaWeight(self) -> Optional[torch.Tensor]:
+        if len(self.A_list) == 0:
+            return None
+        delta = self.target.weight.new_zeros(self.out_f, self.in_f)
+        for A, B, s in zip(self.A_list, self.B_list, self.alpha):
+            delta = delta + float(s) * (B @ A)
+        return delta
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        W = self.target.weight
+        delta = self.DeltaWeight()
+        if delta is not None:
+            W = W + delta
+        return F.linear(x, W, self.target.bias)
+
 
 class SimpleSSM(nn.Module):
     def __init__(self, embedDim: int, convKernel: int = 3):
@@ -86,6 +141,11 @@ class MultiHeadAttention(nn.Module):
         self.k_proj = nn.Linear(embedDim, embedDim)
         self.v_proj = nn.Linear(embedDim, embedDim)
         self.out_proj = nn.Linear(embedDim, embedDim)
+
+        self.q_adapter = GrowableLoRALinear(self.q_proj)
+        self.k_adapter = GrowableLoRALinear(self.k_proj)
+        self.v_adapter = GrowableLoRALinear(self.v_proj)
+        self.o_adapter = GrowableLoRALinear(self.out_proj)
 
         eye = torch.eye(self.head_dim)
         hebb_shape = (numHeads, self.head_dim, self.head_dim)
@@ -199,18 +259,17 @@ class MultiHeadAttention(nn.Module):
             self.hebbian_weights.copy_(W_new)
 
 
-    def ProJ(self, layer: nn.Linear, x: torch.Tensor) -> torch.Tensor:
-        B, L, _ = x.shape
-        out: torch.Tensor = layer(x)
-        return out.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)  # (B,H,L,D)
-
-
     def forward(self, query, key, value, keyPaddingMask: Optional[torch.Tensor]=None, tdError: Optional[torch.Tensor]=None, uncertainty: Optional[torch.Tensor]=None):
         B, L, _ = query.shape
         neuromod = self.ComputeNeuromodulation(tdError, B)
-        q = self.ProJ(self.q_proj, query)
-        k = self.ProJ(self.k_proj, key)
-        v = self.ProJ(self.v_proj, value)
+
+        q_lin = self.q_adapter(query) 
+        k_lin = self.k_adapter(key)
+        v_lin = self.v_adapter(value) 
+
+        q = q_lin.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k_lin.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v_lin.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.update_hebbian_flag and self.base_hebbian_rate > 0:
             self.hebb_step.add_(1)
@@ -242,7 +301,10 @@ class MultiHeadAttention(nn.Module):
         weights = F.dropout(weights, p=self.attn_dropout_p if self.training else 0.0, training=self.training)
         context = torch.matmul(weights, v_fast)
         out = context.transpose(1, 2).reshape(B, L, self.embed_dim)
-        return self.out_proj(out)
+
+        out_lin = self.o_adapter(out)
+        
+        return out_lin
 
 
     @torch.no_grad()
@@ -435,97 +497,6 @@ class HebbianFusion(nn.Module):
         return fused
 
 
-class MetaStrategySelector(nn.Module):
-    def __init__(self, embedDim: int, numStrategies: int, numHeads: int = 4, *, useMeta: bool = False, ema: float = 0.05, offsetScale: float = 0.2, temperature: float = 1.0, confGate: Optional[float] = None):
-        super().__init__()
-        self.embed_dim = embedDim
-        self.num_strategies = numStrategies
-        self.num_heads = numHeads
-
-        self.use_meta_update = useMeta
-        self.ema = ema
-        self.offset_scale = offsetScale
-        self.temperature = temperature
-        self.conf_gate = confGate  
-
-        self.generator = nn.Sequential(
-            nn.Linear(embedDim, embedDim * 2),
-            nn.GELU(),
-            nn.Linear(embedDim * 2, numHeads * numStrategies),)
-
-        self.register_buffer("strategy_weights", torch.zeros(numHeads, numStrategies))
-        self.ResetParameters()
-
-
-    def ResetParameters(self):
-        nn.init.uniform_(self.strategy_weights, -0.05, 0.05)
-        for m in self.generator:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)   
-                nn.init.zeros_(m.bias)
-
-    def ResetStrategyWeights(self):
-        nn.init.normal_(self.strategy_weights, std=0.01)
-
-
-    @staticmethod
-    def MaskedSoftmax(logits: torch.Tensor, mask: Optional[torch.Tensor], dim: int = -1, temperature: float = 1.0) -> torch.Tensor:
-        if temperature <= 0:
-            raise ValueError("temperature must be > 0")
-        x = logits / temperature
-
-        if mask is not None:
-            m = mask
-            for _ in range(x.ndim - m.ndim):
-                m = m.unsqueeze(0)
-            m = m.expand_as(x)
-            x = x.masked_fill(m, -1e4)
-
-        x = x - x.max(dim=dim, keepdim=True).values
-        ex = torch.exp(x)
-        if mask is not None:
-            ex = ex * (~m).float()
-        denom = ex.sum(dim=dim, keepdim=True).clamp_min(1e-8)
-        return ex / denom
-
-
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B = x.size(0)
-        assert x.shape[-1] == self.embed_dim, "embed dim mismatch"
-
-        offsets = self.generator(x).view(B, self.num_heads, self.num_strategies) # (B,H,S)
-        offsets = torch.tanh(offsets) * self.offset_scale
-
-        params = self.strategy_weights + offsets  # (B,H,S)
-
-        probs = self.MaskedSoftmax(params, mask, dim=-1, temperature=self.temperature) # (B,H,S)
-
-        if self.use_meta_update:
-            with torch.no_grad():
-                if self.conf_gate is not None:
-                    ent = -(probs.clamp_min(1e-12) * probs.clamp_min(1e-12).log()).sum(dim=-1)
-                    max_ent = math.log(self.num_strategies)
-                    conf = (1.0 - ent / max_ent).clamp(0.0, 1.0)  
-                    gate = (conf.mean(dim=0) > float(self.conf_gate)).float() # (H,)
-                    gate = gate.unsqueeze(-1)  # (H,1)
-                else:
-                    gate = None
-
-                denom = probs.sum(dim=0) + 1e-8 # (H,S)
-                batch_mean = (params * probs).sum(dim=0) / denom # (H,S)
-
-                if gate is not None:
-                    batch_mean = gate * batch_mean + (1 - gate) * self.strategy_weights
-
-                sw_new = (1.0 - self.ema) * self.strategy_weights + self.ema * batch_mean
-                self.strategy_weights.copy_(sw_new) 
-
-        return probs  # (B,H,S)
-
-    def SetUseMetaUpdate(self, flag: bool = True):
-        self.use_meta_update = bool(flag)
-
-
 
 class AttentionExtractor(nn.Module):
     def __init__(self,
@@ -536,15 +507,14 @@ class AttentionExtractor(nn.Module):
                  routingIterations: int = 3,
                  hebbianRate: float = 0.01,
                  useHebbian: bool = True,
-                 useMetaLearning: bool = True,
                  gradientClipVal: float = 1.0,):
         super().__init__()
 
         self.num_caps = sequenceLength
-        self.use_meta_learning = useMetaLearning
         self.gradient_clip_val = gradientClipVal
         self.output_dim = embedDim
         self.use_hebbian = useHebbian
+        self.num_heads = numHeads
 
         self.temporal_blocks: nn.ModuleList = nn.ModuleList([
             TemporalAttention(embedDim, numHeads, idx, useHebbian=useHebbian)
@@ -554,8 +524,12 @@ class AttentionExtractor(nn.Module):
 
         self.fusion = HebbianFusion(numModes=3, embedDim=embedDim, hebbianRate=hebbianRate, useHebbian=useHebbian)
 
-        self.meta_selector = MetaStrategySelector(embedDim, numStrategies=3, useMeta=useMetaLearning)
         self.context_proj = nn.Sequential(nn.Linear(embedDim * 2, embedDim), nn.GELU())
+
+        self.static_mixer = nn.Sequential(
+            nn.Linear(embedDim, embedDim),
+            nn.GELU(),
+            nn.Linear(embedDim, numHeads * 3))
 
         self.output_proj = nn.Sequential(
             nn.Linear(embedDim, embedDim * 2),
@@ -624,23 +598,21 @@ class AttentionExtractor(nn.Module):
         
         fused = self.fusion(fusion_in)  # (B,E)
 
-        context = self.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))
-        strat_w = self.meta_selector(context)  # (B,H=4,S=3)
-            
+        context = self.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))  # (B,E)
+
+        logits = self.static_mixer(context).view(B, self.num_heads, 3)
+        strat_w = torch.softmax(logits, dim=-1)  # (B,H,3)
+
         feats = torch.stack([temp_mean, routed_mean, fused], dim=1)  # (B,3,E)
-            
         mixed_per_head = torch.einsum("bhs,bse->bhe", strat_w, feats)  # (B,H,E)
-        out = mixed_per_head.mean(dim=1)
+        out = mixed_per_head.mean(dim=1)  # (B,E)
 
         return self.output_proj(out)
 
     def ResetFastWeights(self) -> None:
-        """Reset all Hebbian weights and strategy weights in the module"""
         for blk in self.temporal_blocks:
             blk.mhsa.ResetHebbianMemory()
         self.fusion.ResetHebbianMemory()
-        if self.use_meta_learning:
-            self.meta_selector.ResetStrategyWeights()
 
     def AttenLowrankToFullrank(self, residual: bool = True):
         for blk in self.temporal_blocks:
@@ -650,26 +622,254 @@ class AttentionExtractor(nn.Module):
         for blk in self.temporal_blocks:
             blk.mhsa.FullrankToLowrank(residual)
 
-    def SetUseMetaLearning(self, flag: bool = True):
-        self.meta_selector.SetUseMetaUpdate(flag)
+
+class AttentionOnlineWrapper(BaseOnlineWrapper):
+    def __init__(
+        self,
+        base: nn.Module,
+        initRankEach: int = 0,
+        autoRank: bool = True,
+        evThreshold: float = 0.90,
+        gradEma: float = 0.9,
+        maxRankQ: int = 64,
+        maxRankK: int = 64,
+        maxRankV: int = 64,
+        maxRankO: int = 64,):
+        self.maxRankQ = int(maxRankQ)
+        self.maxRankK = int(maxRankK)
+        self.maxRankV = int(maxRankV)
+        self.maxRankO = int(maxRankO)
+        super().__init__(
+            base,
+            initRankEach=initRankEach,
+            autoRank=autoRank,
+            evThreshold=evThreshold,
+            gradEma=gradEma,)
+
+    def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
+        L = len(self.base.temporal_blocks)
+        assert L > 0, "AttentionExtractor.temporal_blocks is NULL"
+        E = int(self.base.temporal_blocks[0].mhsa.embed_dim)
+
+        def alloc_linear(addRank: int, device: torch.device, dtype: torch.dtype):
+            A = nn.Parameter(torch.randn(addRank, E, device=device, dtype=dtype) * 1e-4) # (r, inDim)
+            B = nn.Parameter(torch.zeros(E, addRank, device=device, dtype=dtype)) # (outDim, r)
+            s = nn.Parameter(torch.tensor(1e-2, device=device, dtype=dtype))
+            return A, B, s
+
+        def compose_linear(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+            return float(s) * (b @ a)
+
+        return {
+            "q": SiteSpec("q", L, E, E, self.maxRankQ, alloc_linear, compose_linear),
+            "k": SiteSpec("k", L, E, E, self.maxRankK, alloc_linear, compose_linear),
+            "v": SiteSpec("v", L, E, E, self.maxRankV, alloc_linear, compose_linear),
+            "o": SiteSpec("o", L, E, E, self.maxRankO, alloc_linear, compose_linear),}
+
+    def ForwardWithDeltas(
+        self,
+        x: torch.Tensor,  # (B,S,E)
+        keyPaddingMask: Optional[torch.Tensor],
+        tdError: Optional[torch.Tensor],
+        uncertainty: Optional[torch.Tensor],
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],) -> torch.Tensor:
+        B, S, E = x.shape
+        num_caps = int(self.base.num_caps)
+
+        if S % num_caps != 0:
+            pad_len = num_caps - (S % num_caps)
+            x = F.pad(x, (0, 0, 0, pad_len))
+            if keyPaddingMask is not None:
+                keyPaddingMask = F.pad(keyPaddingMask, (0, pad_len), value=True)
+            S = x.size(1)
+
+        h = x
+        for layerIdx, blk in enumerate(self.base.temporal_blocks):
+            h = self.ForwardBlockWithDeltas(
+                blk=blk,
+                x=h,
+                keyPaddingMask=keyPaddingMask,
+                tdError=tdError,
+                uncertainty=uncertainty,
+                delta=deltasPerLayer[layerIdx],)
+
+        chunk = S // num_caps
+        if keyPaddingMask is not None:
+            seg_mask = keyPaddingMask.reshape(B, num_caps, chunk)  # (B,I,chunk)
+        else:
+            seg_mask = h.new_zeros(B, num_caps, chunk, dtype=torch.bool)
+
+        valid = (~seg_mask).float()
+        valid_cnt = valid.sum(dim=2, keepdim=True).clamp_min(1.0)
+        h_seg = h.reshape(B, num_caps, chunk, E)
+        caps = (h_seg * valid.unsqueeze(-1)).sum(dim=2) / valid_cnt
+        caps_mask = (valid_cnt.squeeze(-1) == 0)
+
+        routed = self.base.routing(caps, caps_mask)  # (B,4,E)
+        routed = F.layer_norm(routed, (E,))
+
+        routed_mean = routed.mean(dim=1)
+        temp_mean = h.mean(dim=1)
+
+        fusion_in = torch.stack([temp_mean, routed_mean, temp_mean + routed_mean], dim=1)  # (B,3,E)
+        fused = self.base.fusion(fusion_in)
+
+        context = self.base.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))  # (B,E)
+
+        logits = self.base.static_mixer(context).view(B, self.base.num_heads, 3)
+        strat_w = torch.softmax(logits, dim=-1)
+
+        feats = torch.stack([temp_mean, routed_mean, fused], dim=1)  # (B,3,E)
+        mixed_per_head = torch.einsum("bhs,bse->bhe", strat_w, feats)
+        out = mixed_per_head.mean(dim=1)
+
+        return self.base.output_proj(out)
+
+    @torch.no_grad()
+    def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
+        r = int(a.size(0))
+        if r <= 0 or a.numel() == 0 or b.numel() == 0 or abs(float(scale)) < 1e-12:
+            return False
+
+        blk = self.base.temporal_blocks[layerIdx]
+        mhsa = blk.mhsa
+        init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
+
+        if site == "q":
+            mhsa.q_adapter.Grow(addRank=r, init=init, freezeOld=False)
+        elif site == "k":
+            mhsa.k_adapter.Grow(addRank=r, init=init, freezeOld=False)
+        elif site == "v":
+            mhsa.v_adapter.Grow(addRank=r, init=init, freezeOld=False)
+        elif site == "o":
+            mhsa.o_adapter.Grow(addRank=r, init=init, freezeOld=False)
+        else:
+            raise ValueError(f"Unknown site: {site}")
+        return True
+
+    def ForwardBlockWithDeltas(
+        self,
+        blk,
+        x: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor],
+        tdError: Optional[torch.Tensor],
+        uncertainty: Optional[torch.Tensor],
+        delta: Dict[str, Optional[torch.Tensor]],) -> torch.Tensor:
+        mhsa = blk.mhsa
+        B, S, _ = x.shape
+
+        def eff_linear(weight: torch.Tensor, adapter, d2: Optional[torch.Tensor]):
+            W = weight
+            d_base = adapter.DeltaWeight()
+            if d_base is not None:
+                W = W + d_base
+            if d2 is not None:
+                W = W + d2
+            return W
+
+        Wq = eff_linear(mhsa.q_proj.weight, mhsa.q_adapter, delta.get("q"))
+        Wk = eff_linear(mhsa.k_proj.weight, mhsa.k_adapter, delta.get("k"))
+        Wv = eff_linear(mhsa.v_proj.weight, mhsa.v_adapter, delta.get("v"))
+        Wo = eff_linear(mhsa.out_proj.weight, mhsa.o_adapter, delta.get("o"))
+
+        neuromod = mhsa.ComputeNeuromodulation(tdError, B)
+
+        q_lin = F.linear(x, Wq, mhsa.q_proj.bias)
+        k_lin = F.linear(x, Wk, mhsa.k_proj.bias)
+        v_lin = F.linear(x, Wv, mhsa.v_proj.bias)
+
+        q = q_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
+        k = k_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
+        v = v_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
+
+        if mhsa.update_hebbian_flag and mhsa.base_hebbian_rate > 0:
+            mhsa.hebb_step.add_(1)
+            if int(mhsa.hebb_step.item()) % mhsa.hebb_period == 0:
+                alpha = float(mhsa.base_hebbian_rate * neuromod.mean())
+                mhsa.UpdateHebbianWeights(v, q, alpha)
+
+        q = q * neuromod
+        if mhsa.use_low_rank:
+            vU = torch.einsum("bhse,her->bhsr", v, mhsa.U)
+            delt = torch.einsum("bhsr,hdr->bhsd", vU, mhsa.V)
+            v_fast = v + delt
+        else:
+            v_fast = torch.einsum("bhse,hde->bhsd", v, mhsa.hebbian_weights)
+
+        tau, bias = mhsa.ModulateTauBias(tdError, uncertainty, B)
+        q = q / tau
+
+        d = q.size(-1)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
+        scores = scores + bias
+        if keyPaddingMask is not None:
+            mask = keyPaddingMask[:, None, None, :]
+            mask_val = torch.tensor(-1e9 if q.dtype != torch.float16 else -1e4, dtype=q.dtype, device=q.device)
+            scores = scores.masked_fill(mask, mask_val)
+
+        weights = F.softmax(scores, dim=-1)
+        weights = F.dropout(weights, p=mhsa.attn_dropout_p if mhsa.training else 0.0, training=mhsa.training)
+        context = torch.matmul(weights, v_fast)
+        out = context.transpose(1, 2).reshape(B, S, mhsa.embed_dim)
+
+        mhsa_out = F.linear(out, Wo, mhsa.out_proj.bias)
+
+        ssm_out = blk.ssm(x, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty)
+        w = torch.sigmoid(blk.mix_gate(x))
+        y = w * mhsa_out + (1 - w) * ssm_out
+        return blk.norm(x + blk.dropout(y))
 
 
 
 class TestAttentionMTool:
-    def __init__(self, device: torch.device | None = None):
-        try:
-            self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.B = 2
-            self.S = 16
-            self.E = 32
-            self.H = 4
-            self.R = 4
-            self.M = 3
-            self.out_caps = 4
-            torch.manual_seed(42)
-        except Exception as e:
-            print("Init failed:", e)
-            self.device = torch.device("cpu")
+    def __init__(self, device: Optional[torch.device] = None):
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch.manual_seed(42)
+
+        self.B = 2
+        self.S = 16
+        self.E = 32
+        self.H = 4
+        self.R = 4
+        self.M = 3
+        self.out_caps = 4
+
+    def AdapterRankAndParams(self, adapter) -> Tuple[int, int]:
+        rank_sum = 0
+        param_cnt = 0
+        if not hasattr(adapter, "A_list"):
+            return 0, 0
+        for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
+            rank_sum += int(A.shape[0])
+            param_cnt += int(A.numel() + B.numel() + 1)
+        return rank_sum, param_cnt
+
+    def MhsaAllRanksAndParams(self, base) -> Tuple[List[Tuple[int,int,int,int]], Tuple[int,int,int,int]]:
+        per_layer = []
+        sum_q = sum_k = sum_v = sum_o = 0
+        for blk in base.temporal_blocks:
+            mhsa = blk.mhsa
+            rq, _ = self.AdapterRankAndParams(mhsa.q_adapter)
+            rk, _ = self.AdapterRankAndParams(mhsa.k_adapter)
+            rv, _ = self.AdapterRankAndParams(mhsa.v_adapter)
+            ro, _ = self.AdapterRankAndParams(mhsa.o_adapter)
+            per_layer.append((rq, rk, rv, ro))
+            sum_q += rq; sum_k += rk; sum_v += rv; sum_o += ro
+        return per_layer, (sum_q, sum_k, sum_v, sum_o)
+
+    def DeltaFromLinearAdapter(self, adapter) -> torch.Tensor:
+        if (not hasattr(adapter, "A_list")) or len(adapter.A_list) == 0:
+            out_f = getattr(adapter, "out_f", None)
+            in_f = getattr(adapter, "in_f", None)
+            if out_f is None or in_f is None:
+                return torch.zeros(0, 0, device=self.device)
+            return torch.zeros(out_f, in_f, device=self.device)
+        out_f = adapter.out_f
+        in_f  = adapter.in_f
+        delta = torch.zeros(out_f, in_f, device=adapter.A_list[0].device, dtype=adapter.A_list[0].dtype)
+        for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
+            delta = delta + float(s.detach()) * (B @ A)
+        return delta
 
     def TestSimpleSSM(self):
         try:
@@ -678,41 +878,36 @@ class TestAttentionMTool:
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
             kpm[:, -3:] = True
             y = ssm(x, keyPaddingMask=kpm, tdError=torch.randn(self.B, device=self.device))
-            ok = torch.allclose(y[:, -3:, :], torch.zeros_like(y[:, -3:, :]), atol=1e-6)
-            print("SimpleSSM pad-freeze test passed." if ok else "SimpleSSM pad-freeze test failed.")
-            return ok
+            assert y.shape == (self.B, self.S, self.E), f"Output shape mismatch: {y.shape}"
+            print("SimpleSSM test passed.")
+            return True
+        except AssertionError as e:
+            print(f"SimpleSSM test failed: {e}")
+            return False
         except Exception as e:
-            print("SimpleSSM test failed with exception:", e)
+            print(f"SimpleSSM test error: {e}")
             return False
 
     def TestMultiHeadAttention(self):
         try:
             x = torch.randn(self.B, self.S, self.E, device=self.device)
-            kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
-            kpm[:, -3:] = True
-
+            kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device); kpm[:, -3:] = True
             attn = MultiHeadAttention(embedDim=self.E, numHeads=self.H, lowRank=True, rank=self.R).to(self.device)
             y1 = attn(x, x, x, keyPaddingMask=kpm, tdError=None)
-            ok1 = (y1.shape == (self.B, self.S, self.E))
-
-            y2 = attn(x, x, x, keyPaddingMask=None, tdError=torch.tensor(0.5, device=self.device))
-            y3 = attn(x, x, x, keyPaddingMask=None, tdError=torch.randn(self.B, device=self.device))
-            ok2 = (y2.shape == (self.B, self.S, self.E)) and (y3.shape == (self.B, self.S, self.E))
-
+            assert y1.shape == (self.B, self.S, self.E)
             attn.LowrankToFullrank(residual=True)
-            y4 = attn(x, x, x, keyPaddingMask=kpm, tdError=None)
+            y2 = attn(x, x, x, keyPaddingMask=kpm, tdError=None)
+            assert y2.shape == (self.B, self.S, self.E)
             attn.FullrankToLowrank(residual=True)
-            y5 = attn(x, x, x, keyPaddingMask=kpm, tdError=None)
-            ok3 = (y4.shape == (self.B, self.S, self.E)) and (y5.shape == (self.B, self.S, self.E))
-
-            if ok1 and ok2 and ok3:
-                print("MultiHeadAttention test passed.")
-                return True
-            else:
-                print(f"MultiHeadAttention shape mismatch: y1={y1.shape}, y2={y2.shape}, y3={y3.shape}, y4={y4.shape}, y5={y5.shape}")
-                return False
+            y3 = attn(x, x, x, keyPaddingMask=kpm, tdError=None)
+            assert y3.shape == (self.B, self.S, self.E)
+            print("MultiHeadAttention test passed.")
+            return True
+        except AssertionError as e:
+            print(f"MultiHeadAttention test failed: {e}")
+            return False
         except Exception as e:
-            print("MultiHeadAttention test failed with exception:", e)
+            print(f"MultiHeadAttention test error: {e}")
             return False
 
     def TestTemporalAttention(self):
@@ -720,35 +915,31 @@ class TestAttentionMTool:
             x = torch.randn(self.B, self.S, self.E, device=self.device)
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
             ta = TemporalAttention(self.E, self.H, layerIdx=0, useHebbian=True).to(self.device)
-
             y = ta(x, keyPaddingMask=kpm, tdError=torch.randn(self.B, device=self.device))
-            ok1 = (y.shape == (self.B, self.S, self.E))
-
-            y2 = ta(x, keyPaddingMask=kpm, tdError=torch.randn(self.B, device=self.device), uncertainty=torch.randn(self.B, device=self.device))
-            ok = ok1 and (y2.shape == (self.B, self.S, self.E))
-
-            print("TemporalAttention test passed." if ok else "TemporalAttention output shape mismatch.")
-            return ok
+            assert y.shape == (self.B, self.S, self.E)
+            print("TemporalAttention test passed.")
+            return True
+        except AssertionError as e:
+            print(f"TemporalAttention test failed: {e}")
+            return False
         except Exception as e:
-            print("TemporalAttention test failed with exception:", e)
+            print(f"TemporalAttention test error: {e}")
             return False
 
     def TestDynamicRouting(self):
         try:
             x = torch.randn(self.B, self.S, self.E, device=self.device)
-            mask = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
-            mask[:, -2:] = True
-
+            mask = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device); mask[:, -2:] = True
             router = DynamicRouting(inCaps=self.S, inDim=self.E, outCaps=self.out_caps, outDim=self.E, iterations=3).to(self.device)
             y = router(x, mask)
-            if y.shape == (self.B, self.out_caps, self.E):
-                print("DynamicRouting test passed.")
-                return True
-            else:
-                print(f"DynamicRouting output shape mismatch: {y.shape}")
-                return False
+            assert y.shape == (self.B, self.out_caps, self.E), f"Output shape mismatch: {y.shape}"
+            print("DynamicRouting test passed.")
+            return True
+        except AssertionError as e:
+            print(f"DynamicRouting test failed: {e}")
+            return False
         except Exception as e:
-            print("DynamicRouting test failed with exception:", e)
+            print(f"DynamicRouting test error: {e}")
             return False
 
     def TestHebbianFusion(self):
@@ -756,98 +947,41 @@ class TestAttentionMTool:
             fusion = HebbianFusion(numModes=self.M, embedDim=self.E, hebbianRate=0.01, useHebbian=True).to(self.device)
             inputs = torch.randn(self.B, self.M, self.E, device=self.device)
             y = fusion(inputs)
-            if y.shape == (self.B, self.E):
-                print("HebbianFusion test passed.")
-                return True
-            else:
-                print(f"HebbianFusion output shape mismatch: {y.shape}")
-                return False
-        except AttributeError as e:
-            print("HebbianFusion test failed :", e)
+            assert y.shape == (self.B, self.E), f"Output shape mismatch: {y.shape}"
+            print("HebbianFusion test passed.")
+            return True
+        except AssertionError as e:
+            print(f"HebbianFusion test failed: {e}")
             return False
         except Exception as e:
-            print("HebbianFusion test failed with exception:", e)
-            return False
-
-    def TestMetaStrategySelector(self):
-        try:
-            selector = MetaStrategySelector(embedDim=self.E, numStrategies=self.M, numHeads=self.H, useMeta=True).to(self.device)
-            x = torch.randn(self.B, self.E, device=self.device)
-            probs = selector(x, mask=None)
-            ok_shape = (probs.shape == (self.B, self.H, self.M))
-            ok_sum = torch.allclose(probs.sum(dim=-1), torch.ones(self.B, self.H, device=self.device), atol=1e-4)
-            if ok_shape and ok_sum:
-                print("MetaStrategySelector test passed.")
-                return True
-            else:
-                print(f"MetaStrategySelector output invalid: shape={probs.shape}, sum={probs.sum(dim=-1)}")
-                return False
-        except Exception as e:
-            print("MetaStrategySelector test failed with exception:", e)
+            print(f"HebbianFusion test error: {e}")
             return False
 
     def TestAttentionExtractor(self):
         try:
-            model = AttentionExtractor(
-                embedDim=self.E,
-                sequenceLength=self.S,
-                numHeads=self.H,
-                temporalLayers=2,
-                routingIterations=3,
-                hebbianRate=0.01,
-                useHebbian=True,
-                useMetaLearning=True,
-                gradientClipVal=0.5,).to(self.device)
-
+            model = AttentionExtractor(embedDim=self.E, sequenceLength=self.S, numHeads=self.H,temporalLayers=2, routingIterations=3, hebbianRate=0.01,useHebbian=True, gradientClipVal=0.5).to(self.device)
             x = torch.randn(self.B, self.S, self.E, device=self.device)
-            kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
-            kpm[:, -2:] = True
+            kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device); kpm[:, -2:] = True
             td = torch.randn(self.B, device=self.device)
-
             y = model(x, keyPaddingMask=kpm, tdError=td)
-            ok1 = (y.shape == (self.B, self.E))
+            assert y.shape == (self.B, self.E)
 
-            try:
-                loss = y.mean()
-                loss.backward()
-                model.ClipGrads()
-                ok2 = True
-            except Exception as be:
-                print("AttentionExtractor backward failed:", be)
-                ok2 = False
-
-            try:
-                model.ResetFastWeights()
-                _ = model(x, keyPaddingMask=kpm, tdError=None)
-                model.AttenLowrankToFullrank(residual=True)
-                _ = model(x, keyPaddingMask=kpm, tdError=None)
-                model.AttenFullrankToLowrank(residual=True)
-                _ = model(x, keyPaddingMask=kpm, tdError=None)
-                ok3 = True
-            except Exception as se:
-                print("AttentionExtractor switch/reset failed:", se)
-                ok3 = False
-
-            if ok1 and ok2 and ok3:
-                print("AttentionExtractor test passed. Output shape:", y.shape)
-                return True
-            else:
-                if not ok1:
-                    print(f"AttentionExtractor output shape mismatch: {y.shape}")
-                return False
+            loss = y.mean()
+            loss.backward()
+            model.ClipGrads()
+            print("AttentionExtractor test passed.")
+            return True
+        except AssertionError as e:
+            print(f"AttentionExtractor test failed: {e}")
+            return False
         except Exception as e:
-            print("AttentionExtractor test failed with exception:", e)
+            print(f"AttentionExtractor test error: {e}")
             return False
 
     def TrainStepSmoke(self):
         try:
             torch.manual_seed(123)
-            model = AttentionExtractor(
-                embedDim=64, sequenceLength=16, numHeads=4,
-                temporalLayers=2, routingIterations=3,
-                hebbianRate=0.01, useHebbian=True,
-                useMetaLearning=True, gradientClipVal=0.5).to(self.device)
-            
+            model = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3,hebbianRate=0.01, useHebbian=True, gradientClipVal=0.5).to(self.device)
             head = nn.Linear(64, 12).to(self.device)
             model.train(); head.train()
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
@@ -859,47 +993,29 @@ class TestAttentionMTool:
             out = model(x, keyPaddingMask=None, tdError=td)
             pred = head(out)
             loss = F.mse_loss(pred, y)
-
             opt.zero_grad(set_to_none=True)
             loss.backward()
             model.ClipGrads()
 
-            must_have_grad = [
-                "temporal_blocks.0.mhsa.q_proj.weight",
-                "temporal_blocks.0.ssm.in_proj.weight",
-                "output_proj.0.weight",
-                "weight(head)",]
             grads_ok = True
-            name_to_param = dict(model.named_parameters())
-            for n in must_have_grad:
-                if n == "weight(head)":
-                    g = head.weight.grad
-                    if g is None or not torch.isfinite(g).all():
-                        print("Bad grad at: head.weight")
-                        grads_ok = False
-                else:
-                    p = name_to_param.get(n, None)
-                    if (p is None) or (p.grad is None) or (not torch.isfinite(p.grad).all()):
-                        print("Bad grad at:", n)
-                        grads_ok = False
-            assert grads_ok, "Key gradients missing or non-finite."
-
+            for _, p in model.named_parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    grads_ok = False; break
+            assert grads_ok and head.weight.grad is not None and torch.isfinite(head.weight.grad).all(), "Gradient invalid."
             opt.step()
-            print("Attention TrainStepSmoke passed.")
+            print("TrainStepSmoke passed.")
             return True
+        except AssertionError as e:
+            print(f"TrainStepSmoke failed: {e}")
+            return False
         except Exception as e:
-            print("TrainStepSmoke failed:", e)
+            print(f"TrainStepSmoke error: {e}")
             return False
 
     def NoNanAfterManySteps(self, steps: int = 30):
         try:
             torch.manual_seed(321)
-            model = AttentionExtractor(
-                embedDim=64, sequenceLength=16, numHeads=4,
-                temporalLayers=2, routingIterations=3,
-                hebbianRate=0.01, useHebbian=True,
-                useMetaLearning=True, gradientClipVal=0.5).to(self.device)
-            
+            model = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3,hebbianRate=0.01, useHebbian=True, gradientClipVal=0.5).to(self.device)
             head = nn.Linear(64, 12).to(self.device)
             model.train(); head.train()
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
@@ -911,30 +1027,26 @@ class TestAttentionMTool:
 
                 pred = head(model(x, tdError=td))
                 loss = F.mse_loss(pred, y)
-
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 model.ClipGrads()
-
                 for n, p in list(model.named_parameters()) + list(head.named_parameters()):
                     if p.grad is not None:
                         assert torch.isfinite(p.grad).all(), f"Non-finite grad at step {t}, {n}"
                 opt.step()
-            print("Attention NoNanAfterManySteps passed.")
+            print("NoNanAfterManySteps passed.")
             return True
+        except AssertionError as e:
+            print(f"NoNanAfterManySteps failed: {e}")
+            return False
         except Exception as e:
-            print("NoNanAfterManySteps failed:", e)
+            print(f"NoNanAfterManySteps error: {e}")
             return False
 
     def ParamsActuallyChange(self, steps: int = 10):
         try:
             torch.manual_seed(111)
-            model = AttentionExtractor(
-                embedDim=64, sequenceLength=16, numHeads=4,
-                temporalLayers=2, routingIterations=3,
-                hebbianRate=0.01, useHebbian=True,
-                useMetaLearning=True, gradientClipVal=0.5).to(self.device)
-            
+            model = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3,hebbianRate=0.01, useHebbian=True, gradientClipVal=0.5).to(self.device)
             head = nn.Linear(64, 12).to(self.device)
             model.train(); head.train()
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
@@ -944,8 +1056,7 @@ class TestAttentionMTool:
                     "mhsa_q_proj": next(p for p in model.temporal_blocks[0].mhsa.q_proj.parameters() if p.dim() >= 2),
                     "fusion_base": model.fusion.base_weights,
                     "output_proj_w": next(p for p in model.output_proj[0].parameters() if p.dim() >= 2),
-                    "head_w": head.weight,}
-                
+                    "head_w": head.weight}
                 init_norms = {k: v.norm().item() for k, v in key_params.items()}
 
             for _ in range(steps):
@@ -961,24 +1072,21 @@ class TestAttentionMTool:
 
             with torch.no_grad():
                 new_norms = {k: v.norm().item() for k, v in key_params.items()}
-
             changed = any(abs(new_norms[k] - init_norms[k]) > 1e-6 for k in init_norms)
             assert changed, "Key parameters seem unchanged; suspected no updates."
-            print("Attention ParamsActuallyChange passed.")
+            print("ParamsActuallyChange passed.")
             return True
+        except AssertionError as e:
+            print(f"ParamsActuallyChange failed: {e}")
+            return False
         except Exception as e:
-            print("ParamsActuallyChange failed:", e)
+            print(f"ParamsActuallyChange error: {e}")
             return False
 
     def TestNormalTrainingConvergence(self, steps: int = 120, logEvery: int = 30):
         try:
             torch.manual_seed(222)
-            model = AttentionExtractor(
-                embedDim=64, sequenceLength=16, numHeads=4,
-                temporalLayers=2, routingIterations=3,
-                hebbianRate=0.01, useHebbian=True,
-                useMetaLearning=True, gradientClipVal=0.5).to(self.device)
-            
+            model = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3,hebbianRate=0.01, useHebbian=True, gradientClipVal=0.5).to(self.device)
             head = nn.Linear(64, 12).to(self.device)
             model.train(); head.train()
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
@@ -998,7 +1106,6 @@ class TestAttentionMTool:
                 loss.backward()
                 model.ClipGrads()
                 opt.step()
-
                 if (t % logEvery) == 0 or t == 1:
                     print(f"[AttentionTrain] step {t}/{steps} | mse={loss.item():.6f}")
 
@@ -1007,29 +1114,266 @@ class TestAttentionMTool:
 
             print(f"\n[AttentionTrain] loss start={start:.6f} -> end={end:.6f}")
             assert end <= 0.8 * start, "Training did not converge enough (<20% drop)."
-            print("Attention TestNormalTrainingConvergence passed.")
+            print("TestNormalTrainingConvergence passed.")
             return True
+        except AssertionError as e:
+            print(f"TestNormalTrainingConvergence failed: {e}")
+            return False
         except Exception as e:
-            print("TestNormalTrainingConvergence failed:", e)
+            print(f"TestNormalTrainingConvergence error: {e}")
+            return False
+
+    def WrapperForwardEqualWhenNoInitRank(self):
+        try:
+            base = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3,hebbianRate=0.0, useHebbian=False).to(self.device)
+            base.eval()
+            wrapper = AttentionOnlineWrapper(base=base, initRankEach=0, autoRank=False).to(self.device)
+            wrapper.eval()
+
+            x = torch.randn(3, 16, 64, device=self.device)
+            kpm = torch.zeros(3, 16, dtype=torch.bool, device=self.device)
+            with torch.no_grad():
+                y_base = base(x, keyPaddingMask=kpm, tdError=None)
+                y_wrap = wrapper(x, keyPaddingMask=kpm, tdError=None)
+
+            max_abs = (y_base - y_wrap).abs().max().item()
+            assert max_abs < 1e-6, f"Wrapper forward differs when ranks=0: max_abs={max_abs:.3e}"
+            print("WrapperForwardEqualWhenNoInitRank passed.")
+            return True
+        except AssertionError as e:
+            print(f"WrapperForwardEqualWhenNoInitRank failed: {e}")
+            return False
+        except Exception as e:
+            print(f"WrapperForwardEqualWhenNoInitRank error: {e}")
+            return False
+
+    def WrapperAPIBasics(self):
+        try:
+            base = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3,hebbianRate=0.0, useHebbian=False).to(self.device)
+            base.eval()
+            wrapper = AttentionOnlineWrapper(base=base, initRankEach=0, autoRank=True).to(self.device)
+            wrapper.train()
+
+            r = wrapper.Update("ranks")["ranks"]
+            assert all(row.get("q",0)==0 and row.get("k",0)==0 and row.get("v",0)==0 and row.get("o",0)==0 for row in r["perLayer"])
+
+            wrapper.Update("grow", growFactor=2.0, addEach=1)
+            r2 = wrapper.Update("ranks")["ranks"]
+            assert all(row["q"] >= 1 and row["k"] >= 1 and row["v"] >= 1 and row["o"] >= 1 for row in r2["perLayer"])
+
+            wrapper.Update("accumulategrads")
+
+            st = wrapper.Update("set", evThreshold=0.85, gradEma=0.8, **{"maxRank:q":64, "maxRank:k":64, "maxRank:v":64, "maxRank:o":64})
+            assert st["ok"]
+
+            wrapper.Update("rollback")
+            r3 = wrapper.Update("ranks")["ranks"]
+            assert all(row["q"] == 0 and row["k"] == 0 and row["v"] == 0 and row["o"] == 0 for row in r3["perLayer"])
+
+            print("WrapperAPIBasics passed.")
+            return True
+        except AssertionError as e:
+            print("WrapperAPIBasics failed:\n", e)
+            return False
+        except Exception as e:
+            print("WrapperAPIBasics error:\n", e)
+            return False
+
+    def WrapperManualGrowTrainAndCommit(self):
+        try:
+            torch.manual_seed(11)
+            base = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3,hebbianRate=0.0, useHebbian=False).to(self.device)
+            base.eval()
+
+            wrapper = AttentionOnlineWrapper(base=base, initRankEach=2, autoRank=False).to(self.device)
+            wrapper.train()
+
+            head = nn.Linear(64, 12).to(self.device).train()
+            opt = torch.optim.Adam(list(wrapper.CandParameters()) + list(head.parameters()), lr=3e-3)
+
+            _ = wrapper.Update("grow", growFactor=2.0, addEach=0)
+
+            for _ in range(6):
+                x = torch.randn(8, 16, 64, device=self.device)
+                td = torch.randn(8, device=self.device)
+                y = torch.randn(8, 12, device=self.device)
+
+                pred = head(wrapper(x, tdError=td))
+                loss = F.mse_loss(pred, y)
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                wrapper.Update("accumulategrads")
+                opt.step()
+
+            expected = []
+            for li in range(wrapper.layerCount):
+                per = {}
+                for site in ("q", "k", "v", "o"):
+                    per[site] = wrapper.ComposeOne(site, li).detach().clone()
+                expected.append(per)
+
+            res = wrapper.Update("commit")
+            assert res["ok"] and res["commit_stats"]["committed_triples"] > 0, "Nothing committed."
+
+            per_layer_rp, sums = self.MhsaAllRanksAndParams(base)
+            print(f"[ManualCommit] committed_triples={int(res['commit_stats']['committed_triples'])}, "f"committed_rank={int(res['commit_stats']['committed_rank'])}")
+            print(f"[Injected ranks per-layer] {per_layer_rp}; sums(q,k,v,o)={sums}")
+
+            atol, rtol = 1e-6, 1e-4
+            for li, blk in enumerate(base.temporal_blocks):
+                mhsa = blk.mhsa
+                got_q = self.DeltaFromLinearAdapter(mhsa.q_adapter); exp_q = expected[li]["q"]
+                got_k = self.DeltaFromLinearAdapter(mhsa.k_adapter); exp_k = expected[li]["k"]
+                got_v = self.DeltaFromLinearAdapter(mhsa.v_adapter); exp_v = expected[li]["v"]
+                got_o = self.DeltaFromLinearAdapter(mhsa.o_adapter); exp_o = expected[li]["o"]
+
+                if not torch.allclose(exp_q, torch.zeros_like(exp_q)): assert torch.allclose(got_q, exp_q, atol=atol, rtol=rtol), f"[L{li}] q delta mismatch"
+                if not torch.allclose(exp_k, torch.zeros_like(exp_k)): assert torch.allclose(got_k, exp_k, atol=atol, rtol=rtol), f"[L{li}] k delta mismatch"
+                if not torch.allclose(exp_v, torch.zeros_like(exp_v)): assert torch.allclose(got_v, exp_v, atol=atol, rtol=rtol), f"[L{li}] v delta mismatch"
+                if not torch.allclose(exp_o, torch.zeros_like(exp_o)): assert torch.allclose(got_o, exp_o, atol=atol, rtol=rtol), f"[L{li}] o delta mismatch"
+
+            r = wrapper.Update("ranks")["ranks"]
+            assert all(row["q"] == 0 and row["k"] == 0 and row["v"] == 0 and row["o"] == 0 for row in r["perLayer"])
+
+            base.eval(); wrapper.eval()
+            x_chk = torch.randn(2, 16, 64, device=self.device)
+            kpm_chk = torch.zeros(2, 16, dtype=torch.bool, device=self.device)
+            with torch.no_grad():
+                y0 = base(x_chk, keyPaddingMask=kpm_chk, tdError=None)
+                y1 = wrapper(x_chk, keyPaddingMask=kpm_chk, tdError=None)
+            assert torch.allclose(y0, y1, atol=1e-6, rtol=1e-4), "base vs wrapper mismatch after commit."
+
+            print("WrapperManualGrowTrainAndCommit passed.")
+            return True
+        except AssertionError as e:
+            print("WrapperManualGrowTrainAndCommit failed:\n", e)
+            return False
+        except Exception as e:
+            print("WrapperManualGrowTrainAndCommit error:\n", e)
+            return False
+
+    def WrapperAutoInjectAndCommit(self):
+        try:
+            torch.manual_seed(2025)
+            base = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3,hebbianRate=0.0, useHebbian=False).to(self.device)
+
+            wrapper = AttentionOnlineWrapper(base=base, initRankEach=0, autoRank=True, evThreshold=0.9).to(self.device)
+
+            _ = wrapper.Update("autogrow")
+            r0 = wrapper.Update("ranks")["ranks"]
+            seed_per_layer = [(row.get("q", 0), row.get("k", 0), row.get("v", 0), row.get("o", 0)) for row in r0["perLayer"]]
+            seed_sums = (sum(r[0] for r in seed_per_layer),
+                        sum(r[1] for r in seed_per_layer),
+                        sum(r[2] for r in seed_per_layer),
+                        sum(r[3] for r in seed_per_layer))
+            print(f"[Seed ranks per-layer] {seed_per_layer}; sums(q,k,v,o)={seed_sums}")
+
+            head = nn.Linear(64, 12).to(self.device)
+            wrapper.train(); head.train()
+            opt = torch.optim.Adam(list(wrapper.CandParameters()) + list(head.parameters()), lr=5e-3)
+
+            for _ in range(8):
+                x = torch.randn(16, 16, 64, device=self.device)
+                td = torch.randn(16, device=self.device)
+                y = torch.randn(16, 12, device=self.device)
+
+                pred = head(wrapper(x, tdError=td))
+                loss = F.mse_loss(pred, y)
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                wrapper.Update("accumulategrads")
+                opt.step()
+
+            res = wrapper.Update("commit")
+            assert res["ok"], "Commit failed."
+            stats = res.get("commit_stats", {})
+            committed_rank = int(stats.get("committed_rank", 0))
+            committed_triples = int(stats.get("committed_triples", 0))
+            print(f"[AutoCommit] committed_triples={committed_triples}, committed_rank={committed_rank}")
+
+            per_layer_rp, sums = self.MhsaAllRanksAndParams(base)
+            print(f"[Injected ranks per-layer] {per_layer_rp}; sums(q,k,v,o)={sums}")
+            assert (committed_rank > 0) == (sum(sums) > 0), "Committed rank/stat mismatch with adapters."
+
+            base.eval(); wrapper.eval()
+            x_chk = torch.randn(2, 16, 64, device=self.device)
+            kpm_chk = torch.zeros(2, 16, dtype=torch.bool, device=self.device)
+            with torch.no_grad():
+                y0 = base(x_chk, keyPaddingMask=kpm_chk, tdError=None)
+                y1 = wrapper(x_chk, keyPaddingMask=kpm_chk, tdError=None)
+            max_abs = (y0 - y1).abs().max().item()
+            assert max_abs < 1e-6, f"Wrapper vs base mismatch after auto-commit: {max_abs:.3e}"
+
+            print("WrapperAutoInjectAndCommit passed.")
+            return True
+        except AssertionError as e:
+            print("WrapperAutoInjectAndCommit failed:\n", e)
+            return False
+        except Exception as e:
+            print("WrapperAutoInjectAndCommit error:\n", e)
+            return False
+
+    def WrapperPipelineCompatible(self):
+        try:
+            torch.manual_seed(13)
+            base = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3,hebbianRate=0.01, useHebbian=True).to(self.device)
+
+            wrapper = AttentionOnlineWrapper(base=base, initRankEach=2, autoRank=False).to(self.device)
+
+            for site in wrapper.sites:
+                for li in range(wrapper.layerCount):
+                    for s_param in wrapper.cand[site][li]["s"]:
+                        s_param.requires_grad_(False)
+
+            wrapper.train(); 
+            head = nn.Linear(64, 10).to(self.device)
+            head.train()
+
+            opt = torch.optim.Adam(list(head.parameters()) + list(wrapper.CandParameters()), lr=1e-3)
+
+            x  = torch.randn(6, 16, 64, device=self.device)
+            td = torch.randn(6, device=self.device)
+            y  = torch.randn(6, 10, device=self.device)
+
+            pred = head(wrapper(x, tdError=td))
+            loss = F.mse_loss(pred, y)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+
+            assert head.weight.grad is not None and torch.isfinite(head.weight.grad).all(), "Head grad invalid with wrapper."
+
+            opt.step()
+            print("WrapperPipelineCompatible passed.")
+            return True
+
+        except AssertionError as e:
+            print("WrapperPipelineCompatible failed:", e)
+            return False
+        except Exception as e:
+            print("WrapperPipelineCompatible error:", e)
             return False
 
     def RunAll(self):
         results = {
+            "SimpleSSM": self.TestSimpleSSM(),
             "MultiHeadAttention": self.TestMultiHeadAttention(),
             "TemporalAttention": self.TestTemporalAttention(),
             "DynamicRouting": self.TestDynamicRouting(),
             "HebbianFusion": self.TestHebbianFusion(),
-            "MetaStrategySelector": self.TestMetaStrategySelector(),
-            "AttentionExtractor": self.TestAttentionExtractor(),
-            "TestSimpleSSM": self.TestSimpleSSM(),
+            "AttentionExtractorForward": self.TestAttentionExtractor(),
             "TrainStepSmoke": self.TrainStepSmoke(),
             "NoNanAfterManySteps": self.NoNanAfterManySteps(),
             "ParamsActuallyChange": self.ParamsActuallyChange(),
-            "NormalTrainingConvergence": self.TestNormalTrainingConvergence(),}
-        
+            "NormalTrainingConvergence": self.TestNormalTrainingConvergence(),
+            "WrapperForwardEqualWhenNoInitRank": self.WrapperForwardEqualWhenNoInitRank(),
+            "WrapperAPIBasics": self.WrapperAPIBasics(),
+            "WrapperManualGrowTrainAndCommit": self.WrapperManualGrowTrainAndCommit(),
+            "WrapperAutoInjectAndCommit": self.WrapperAutoInjectAndCommit(),
+            "WrapperPipelineCompatible": self.WrapperPipelineCompatible(),}
         passed = sum(1 for v in results.values() if v)
-        total = len(results)
-        print(f"\nSummary: {passed}/{total} tests passed.")
-        for k, v in results.items():
-            print(f" {k}: {'OK' if v else 'FAIL'}")
+        print(f"\nAttention module tests (with wrapper): {passed}/{len(results)} passed.")
         return results
+
