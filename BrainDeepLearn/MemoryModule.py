@@ -347,134 +347,6 @@ class LongTermMemory(nn.Module):
         return fused, sem_vecs, sem_w, epi_vecs, epi_w
 
 
-class MetaPlasticityController(nn.Module):
-    def __init__(self, metaInDim: int = 7, hiddenDim: int = 96, *, trainable: bool = True):
-        super().__init__()
-        self.meta_in_dim = metaInDim
-        self.hidden_dim = hiddenDim
-        self.trainable = bool(trainable)
-        
-        self.rnn = nn.GRUCell(metaInDim, hiddenDim)
-        
-        self.fc_out = nn.Linear(hiddenDim, 5)
-        
-        self.usage_rnn = nn.GRUCell(1, 8)
-        self.usage_proj = nn.Linear(8, hiddenDim) 
-        self.usage_gate = nn.Linear(hiddenDim * 2, hiddenDim) 
-        
-        self.h_state = None
-        self.usage_hidden = None
-        self.register_buffer("usage_history", torch.zeros(5))
-        self.usage_ptr = 0
-        
-        self.ResetParameters()
-        self.SetTrainable(trainable)
-
-    def SetTrainable(self, flag: bool = True):
-        self.trainable = bool(flag)
-        for p in self.parameters():
-            p.requires_grad_(self.trainable)
-
-    def Reset(self):
-        self.h_state = None
-        self.usage_hidden = None
-        self.usage_history.zero_()
-        self.usage_ptr = 0
-
-    def ResetParameters(self):
-        nn.init.xavier_uniform_(self.rnn.weight_ih)
-        nn.init.xavier_uniform_(self.rnn.weight_hh)
-        if self.rnn.bias_ih is not None:
-            nn.init.zeros_(self.rnn.bias_ih)
-        if self.rnn.bias_hh is not None:
-            nn.init.zeros_(self.rnn.bias_hh)
-        
-        nn.init.xavier_uniform_(self.fc_out.weight)
-        nn.init.zeros_(self.fc_out.bias)
-        
-        nn.init.xavier_uniform_(self.usage_rnn.weight_ih)
-        nn.init.xavier_uniform_(self.usage_rnn.weight_hh)
-        if self.usage_rnn.bias_ih is not None:
-            nn.init.zeros_(self.usage_rnn.bias_ih)
-        if self.usage_rnn.bias_hh is not None:
-            nn.init.zeros_(self.usage_rnn.bias_hh)
-            
-        nn.init.xavier_uniform_(self.usage_proj.weight)
-        nn.init.zeros_(self.usage_proj.bias)
-        
-        nn.init.xavier_uniform_(self.usage_gate.weight)
-        nn.init.zeros_(self.usage_gate.bias)
-        
-        self.h_state = None
-        self.usage_hidden = None
-
-    def UpdateMemoryUtilization(self, usage: float):
-        device = self.usage_history.device
-        
-        self.usage_history[self.usage_ptr] = usage
-        self.usage_ptr = (self.usage_ptr + 1) % len(self.usage_history)
-        
-        if self.usage_hidden is None:
-            self.usage_hidden = torch.zeros(1, 8, device=device)
-        
-        weights = torch.linspace(0.5, 1.0, len(self.usage_history), device=device)
-        weighted_usage = (self.usage_history * weights).sum() / weights.sum()
-        
-        usage_input = weighted_usage.view(1, 1)
-
-        h_prev = self.usage_hidden.detach()
-
-        if self.trainable:
-            self.usage_hidden = self.usage_rnn(usage_input, h_prev)
-        else:
-            with torch.no_grad():
-                self.usage_hidden = self.usage_rnn(usage_input, h_prev)
-
-    def forward(self, metaFeat: torch.Tensor):
-        metaFeat = metaFeat.contiguous()
-        B, device = metaFeat.size(0), metaFeat.device
-
-        if (self.h_state is None) or (self.h_state.size(0) != B) or (self.h_state.device != device):
-            self.h_state = torch.zeros(B, self.hidden_dim, device=device)
-        
-        if (self.usage_hidden is None) or (self.usage_hidden.device != device):
-            self.usage_hidden = torch.zeros(1, 8, device=device)
-        
-        usage_hidden_expanded = self.usage_hidden.expand(B, -1)
-        
-        with torch.set_grad_enabled(self.trainable):
-            h_now = self.rnn(metaFeat, self.h_state)
-            
-            usage_proj = self.usage_proj(usage_hidden_expanded)
-            
-            gate_input = torch.cat([h_now, usage_proj], dim=1)
-            gate = torch.sigmoid(self.usage_gate(gate_input))
-            
-            h_fused = gate * usage_proj + (1 - gate) * h_now
-            
-            o = self.fc_out(h_fused)
-
-        self.h_state = h_now.detach()
-        self.usage_hidden = self.usage_hidden.detach()
-
-        if not self.trainable:
-            o = o.detach()
-        
-        a_hat, b_hat, bias_hat, fus_hat, imp_hat = o.split(1, dim=1)
-
-        a = 0.5 + 0.5 * torch.sigmoid(a_hat)
-        b = 0.5 + 0.5 * torch.sigmoid(b_hat) 
-        bias = torch.tanh(bias_hat)
-        fusion_gate = torch.sigmoid(fus_hat)
-        importance = torch.sigmoid(imp_hat) 
-
-        return (a.squeeze(-1),
-                b.squeeze(-1),
-                bias.squeeze(-1),
-                fusion_gate.squeeze(-1),
-                importance.squeeze(-1))
-
-
 class MemoryExtractor(nn.Module):
     def __init__(
         self,
@@ -488,7 +360,6 @@ class MemoryExtractor(nn.Module):
         topk: int = 8,
         tdScale: float = 5.0,
         softBeta: float = 0.2,
-        useMeta: bool = True,
         useHebbian: bool = True,
         useAmp: bool = True,
         svdInterval: int = 10,
@@ -512,7 +383,6 @@ class MemoryExtractor(nn.Module):
         self.decay = decayFactor
         self.td_scale = tdScale
         self.soft_beta = softBeta
-        self.use_meta = useMeta
         self.enable_hebb_update = useHebbian
         self.use_amp = useAmp
         self.svd_interval = max(1, svdInterval)
@@ -525,6 +395,8 @@ class MemoryExtractor(nn.Module):
         self.ltm_align_lambda = 0.0 
         self.ltm_online_imp_thresh = 0.75
         self.ltm_online_td_thresh  = 0.60
+
+        self.gws_align_weight = 0.05
 
         self.enable_rehearsal = True
         self._ltm_cache = None
@@ -562,6 +434,17 @@ class MemoryExtractor(nn.Module):
         self.fro_norm_history: List[float] = []
         self.svd_threshold = 5.0
 
+        self.ctrl_norm = nn.LayerNorm(ssmStateDim)
+
+        ctrl_in_dim = ssmStateDim + memoryDim + 3 + 1 + 2
+        self.ctrl_head = nn.Sequential(
+            nn.Linear(ctrl_in_dim, 96), nn.SiLU(),
+            nn.Linear(96, 64), nn.SiLU(),
+            nn.Linear(64, 4))
+        
+        nn.init.zeros_(self.ctrl_head[-1].weight)
+        nn.init.zeros_(self.ctrl_head[-1].bias)
+
         self.state2mem = nn.Linear(ssmStateDim, memoryDim)
         self.state2val = nn.Linear(ssmStateDim, memoryDim)
         
@@ -581,8 +464,6 @@ class MemoryExtractor(nn.Module):
         self.ltm_gate = nn.Sequential(
             nn.Linear(memoryDim * 4, 128), nn.ReLU(),
             nn.Linear(128, 1), nn.Sigmoid())
-
-        self.meta_ctrl = MetaPlasticityController(hiddenDim=96, trainable=False) if useMeta else None
 
         self.fusion = nn.Sequential(
             nn.Linear(outputDim + memoryDim, 1024), nn.GELU(),
@@ -643,6 +524,28 @@ class MemoryExtractor(nn.Module):
     def backward(self, mainLoss: torch.Tensor, **kwargs):
         total = self.AttachLoss(mainLoss)
         total.backward(**kwargs)
+
+
+    @torch.no_grad()
+    def KvStats(self, key: torch.Tensor) -> torch.Tensor:
+        B = key.size(0)
+        if self.memory_filled == 0:
+            return torch.zeros(B, 3, device=key.device)
+
+        K = self.memory_keys[:self.memory_filled].float().to(key.device)
+        sim = key @ K.t()
+        attn = F.softmax(sim, dim=-1)
+
+        k = min(8, sim.size(1))
+        topk_vals, _ = StableTopk(sim, k) 
+        m = topk_vals.mean(dim=1, keepdim=True) 
+        s = topk_vals.std(dim=1, keepdim=True, unbiased=False)
+
+        age = (self.time_step - self.memory_steps[:self.memory_filled]).float().to(key.device) 
+        age_w = (attn * age.unsqueeze(0)).sum(dim=1, keepdim=True) 
+
+        age_w = torch.tanh(age_w / 100.0)
+        return torch.cat([m, s, age_w], dim=-1)
 
     def NsEnsurePrev(self, B: int, device: torch.device):
         if (self._ns_prev_P_pre is None) or (self._ns_prev_P_pre.size(0) != B) or (self._ns_prev_P_pre.device != device):
@@ -725,13 +628,13 @@ class MemoryExtractor(nn.Module):
         rule_loss_post = per_sample_post.mean()
         return P_post, per_sample_post, rule_loss_post, damp, adj_mem 
 
+
+
     def forward(self,
                 x: torch.Tensor,
                 *,
                 tdError: Optional[torch.Tensor] = None,
-                entropy: Optional[torch.Tensor] = None,
                 reward: Optional[torch.Tensor] = None,
-                uncertainty: Optional[torch.Tensor] = None,
                 reset: bool = False,
                 softReset: bool = False,) -> Tuple[torch.Tensor, torch.Tensor]:
 
@@ -776,9 +679,23 @@ class MemoryExtractor(nn.Module):
             self.UpdateMemoryUtilization()
             self.AutoCompress()
 
-            a, b, gate_bias, fusion_gate, meta_imp = self.GetMetaSignals(tdError, entropy, reward, uncertainty, B, device)
-            
-            importance = 0.7 * importance + 0.3 * meta_imp.view(-1, 1)
+            td_feat = tdError.view(-1, 1) if tdError is not None else torch.zeros(B, 1, device=device)
+            kv_feat = self.KvStats(key) 
+            phi = torch.cat([self.ctrl_norm(h_mix), key, kv_feat, importance, gate_local, td_feat], dim=-1)
+
+            ctrl = self.ctrl_head(phi) 
+            a_raw, b_raw, f_raw, bias_raw = ctrl.split(1, dim=-1)
+
+            a = (0.7 + 0.6 * torch.sigmoid(a_raw)).squeeze(-1)
+
+            b = (0.97 + 0.03 * torch.sigmoid(b_raw)).squeeze(-1)
+
+            fusion_gate = torch.sigmoid(f_raw).squeeze(-1)
+
+            gate_bias = 0.5 * torch.tanh(bias_raw).squeeze(-1)
+
+            reg = (a - 1.0).abs().mean() + (b - 1.0).abs().mean() + (fusion_gate - 0.5).abs().mean() + gate_bias.abs().mean()
+            self.AddInternalLoss(1e-4 * reg)
 
             if self.ns_enable:
                 P_pre, per_pre, rule_pre, importance = self.NsPreWrite(val, importance) 
@@ -786,17 +703,23 @@ class MemoryExtractor(nn.Module):
                 rule_pre = torch.zeros([], device=h_new.device)
 
             self.LtmOnlineStore(key, val, importance, tdError=tdError, reward=reward)
+       
+            fw_local = self.BuildFastWeights(key, gate_local, neuromod, a, b) if self.enable_hebb_update else None
 
-            
+            mem_recall = self.Retrieve(key, fusion_gate, importance=importance, localGate=gate_local, fwOverride=fw_local)
+
             self.HebbianUpdate(key, gate_local, neuromod, a, b)
             self.KvWrite(key, val, importance)
 
             ltm_recall, sem_vecs, sem_w, epi_vecs, epi_w = self.ltm.Retrieve(key, topkSem=self.ltm_topk_sem, topkEpi=self.ltm_topk_epi)
-            
-            mem_recall = self.Retrieve(key, fusion_gate, importance=importance, localGate=gate_local)
 
             msg = torch.cat([h_new, y_ssm, mem_recall], dim=-1)
             ws_val = F.normalize(self.gws_summary(msg), dim=-1)
+
+            mem_recall_base = mem_recall.detach() 
+            if self.gws_align_weight > 0:
+                loss_gws_align = self.gws_align_weight * (1 - F.cosine_similarity(ws_val, mem_recall_base, dim=-1)).mean()
+                self.AddInternalLoss(loss_gws_align)
 
             for i in range(B):
                 self.gws.Write(key[i], ws_val[i], priority=float(importance[i].item()), ttl=6, tagId=1, ownerId=self.owner_id)
@@ -849,42 +772,6 @@ class MemoryExtractor(nn.Module):
             return torch.ones(1, 1, 1, device=self.h_state.device)
         return torch.tanh(tdError / self.td_scale).view(-1, 1, 1)
 
-    def GetMetaSignals(self, tdError, entropy, reward, uncertainty, B, device):
-        if self.meta_ctrl is None or self.use_meta is False:
-            one = torch.ones(B, device=device)
-            zero = torch.zeros(B, device=device)
-            half = torch.full((B,), 0.5, device=device)
-            one_point_five = torch.full((B,), 1.0, device=device)
-            return (one, one, zero, half, one_point_five)
-
-        def V(x, fill=0.0):
-            if x is None:
-                return torch.full((B,), float(fill), device=device, dtype=torch.float32)
-            return x.to(device=device, dtype=torch.float32).view(B).detach()
-
-        td = V(tdError, 0.0)
-        ent = V(entropy, 0.0)
-        rew = V(reward, 0.0)
-        unc = V(uncertainty, 0.0)
-
-        mem_usage_t = torch.full((B,), float(self.memory_usage), device=device, dtype=torch.float32)
-        fill_ratio = float(self.memory_filled) / float(self.memory_size) if self.memory_size > 0 else 0.0
-        mem_fill_ratio_t = torch.full((B,), fill_ratio, device=device, dtype=torch.float32)
-
-        meta_feat = torch.stack([td, td.abs(), ent, rew, mem_usage_t, unc, mem_fill_ratio_t], dim=-1).contiguous()
-
-        with torch.set_grad_enabled(getattr(self.meta_ctrl, "trainable", True)):
-            a, b, bias, fusion_gate, importance = self.meta_ctrl(meta_feat)
-
-        if not getattr(self.meta_ctrl, "trainable", True):
-            a = a.detach()
-            b = b.detach()
-            bias = bias.detach()
-            fusion_gate = fusion_gate.detach()
-            importance = importance.detach()
-
-        return (a, b, bias, fusion_gate, importance)
-
     
     def ApplyOutputGate(self, memRecall: torch.Tensor, tdError: torch.Tensor, gateBias: torch.Tensor) -> torch.Tensor:
         gate_out = (1.0 + torch.tanh(tdError.detach() / self.td_scale + gateBias)) / 2.0
@@ -894,6 +781,7 @@ class MemoryExtractor(nn.Module):
     def SoftReset(self):
         self.h_state.copy_(self.h_state * self.soft_beta)
         self.fast_weights.copy_(self.fast_weights * self.soft_beta)
+        self._steps_since_svd = 0
         if self.memory_filled > 0:
             new_imp = self.memory_importance.clone()
             new_imp[:self.memory_filled] = new_imp[:self.memory_filled] * self.soft_beta
@@ -934,6 +822,28 @@ class MemoryExtractor(nn.Module):
             S = torch.clamp(S, self.svd_min, self.svd_max)
             fw_proj = U @ torch.diag(S) @ Vh
             self.fast_weights.copy_(fw_proj.to(self.fast_weights.dtype))
+
+
+    def BuildFastWeights(self,key: torch.Tensor,gateLocal: torch.Tensor,neuromod: torch.Tensor,a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        if not self.enable_hebb_update:
+            return None
+        
+        DtypeFW = self.fast_weights.dtype
+        key_f = key.to(DtypeFW) 
+        outer = torch.einsum('bi,bj->bij', key_f, key_f)   
+
+        a_f = a.view(-1, 1, 1).to(DtypeFW)
+        g_f = gateLocal.view(-1, 1, 1).to(DtypeFW) 
+        n_f = neuromod.to(DtypeFW) 
+
+        update = (n_f * self.hebb_alpha * a_f * g_f * outer).sum(0)
+
+        b_bar = b.mean()  
+
+        fw_prev = self.fast_weights.detach().clone().to(DtypeFW)
+        fw_local = fw_prev * (self.decay * b_bar) + update  
+        return fw_local
+
 
     @torch.no_grad()
     def KvWrite(self, key: torch.Tensor, val: torch.Tensor, importance: torch.Tensor) -> None:
@@ -980,20 +890,33 @@ class MemoryExtractor(nn.Module):
                 reward=float(0.0 if reward is None else reward[i].item()),
                 score=float(imp[i].item()),)
 
-    def Retrieve(self,query: torch.Tensor,fusionGate: torch.Tensor,importance: Optional[torch.Tensor] = None,localGate: Optional[torch.Tensor] = None,) -> torch.Tensor:
-        fast_part = query @ self.fast_weights
+    def Retrieve(self,
+             query: torch.Tensor,
+             fusionGate: torch.Tensor,
+             *,
+             importance: Optional[torch.Tensor] = None,
+             localGate: Optional[torch.Tensor] = None,
+             fwOverride: Optional[torch.Tensor] = None) -> torch.Tensor:
+        fw_base = self.fast_weights if self.enable_hebb_update else torch.zeros_like(self.fast_weights)
+        fw = fwOverride if fwOverride is not None else fw_base
+
+        fast_part = (query.to(fw.dtype)) @ fw
+        fast_part = fast_part.to(query.dtype)
+
         if self.memory_filled == 0:
             kv_part = torch.zeros_like(fast_part)
         else:
             keys = self.memory_keys[:self.memory_filled].float()
             values = self.memory_values[:self.memory_filled].float()
-            imp_kv = self.memory_importance[:self.memory_filled]   # [M]
-            corr = self.memory_corr[:self.memory_filled] 
-            steps = self.memory_steps[:self.memory_filled]
+            imp_kv = self.memory_importance[:self.memory_filled].detach().clone()
+            corr = self.memory_corr[:self.memory_filled].detach().clone()
+            steps = self.memory_steps[:self.memory_filled].detach().clone()
+
             sim = query @ keys.t()
             sim = sim * imp_kv.unsqueeze(0) * corr.unsqueeze(0)
             age = (self.time_step - steps).clamp(min=0).float()
             sim = sim * torch.exp(-0.05 * age).unsqueeze(0)
+
             k = max(1, min(self.topk, self.memory_filled))
             top_sim, top_idx = StableTopk(sim, k)
             th = top_sim.mean(dim=-1, keepdim=True) - 0.5 * top_sim.std(dim=-1, keepdim=True, unbiased=False)
@@ -1011,8 +934,9 @@ class MemoryExtractor(nn.Module):
             attn_weights = F.softmax(top_sim_eff.float(), dim=-1)
             vals = values[top_idx]
             kv_part = torch.einsum('bk,bkd->bd', attn_weights, vals)
+
         fusion_input = torch.cat([query, fast_part, kv_part], dim=-1)
-        gate = self.fusion_gate_net(fusion_input)         # ∈ (0,1)
+        gate = self.fusion_gate_net(fusion_input) 
 
         if importance is not None:
             gate = gate + 0.25 * (importance.clamp(0, 1) - 0.5)
@@ -1020,8 +944,8 @@ class MemoryExtractor(nn.Module):
             gate = gate + 0.25 * (localGate.clamp(0, 1) - 0.5)
 
         gate = 0.5 * gate + 0.5 * fusionGate.view(-1, 1)
-
         gate = gate.clamp(1e-3, 1 - 1e-3)
+
         return gate * fast_part + (1 - gate) * kv_part
 
     def UpdateMemoryUtilization(self):
@@ -1030,13 +954,6 @@ class MemoryExtractor(nn.Module):
         accessed = ((self.memory_steps >= min_step) & (self.memory_steps > 0) & (torch.arange(self.memory_size, device=self.memory_steps.device) < self.memory_filled))
         accessed_count = accessed.sum().item()
         self.memory_usage = (min(1.0, accessed_count / self.memory_filled) if self.memory_filled > 0 else 0.0)
-
-        if self.meta_ctrl:
-            if getattr(self.meta_ctrl, "trainable", False):
-                self.meta_ctrl.UpdateMemoryUtilization(self.memory_usage)
-            else:
-                with torch.no_grad():
-                    self.meta_ctrl.UpdateMemoryUtilization(self.memory_usage)
 
     @torch.no_grad()
     def AutoCompress(self):
@@ -1142,7 +1059,6 @@ class MemoryExtractor(nn.Module):
         self.last_compress_step = 0
         self._steps_since_svd = 0
         self.h_state.zero_()
-        if self.meta_ctrl: self.meta_ctrl.Reset()
         self.gws.Reset()
         self.ltm.Reset()
 
@@ -1151,6 +1067,12 @@ class MemoryExtractor(nn.Module):
         self._ns_penalty_vec = None
         self.ns_last = {}
         self.ResetInternalLoss()
+
+    def ResetHebbianMemory(self):
+        self.fast_weights.zero_()
+        self._steps_since_svd = 0
+        self.fro_norm_history.clear()
+        self.svd_threshold = 5.0
 
     @torch.no_grad()
     def GetState(self) -> dict:
@@ -1169,9 +1091,6 @@ class MemoryExtractor(nn.Module):
             "mem_ptr": torch.tensor(self.mem_ptr),
             "time_step": torch.tensor(self.time_step),
             "memory_filled": torch.tensor(self.memory_filled),
-
-            "meta_ctrl": (self.meta_ctrl.h_state.clone()
-                          if (self.meta_ctrl and self.meta_ctrl.h_state is not None) else None),
 
             "_steps_since_svd": torch.tensor(self._steps_since_svd),
             "last_compress_step": torch.tensor(self.last_compress_step),
@@ -1226,12 +1145,6 @@ class MemoryExtractor(nn.Module):
         self.time_step = int(state["time_step"].item())
         self.memory_filled = int(state["memory_filled"].item())
 
-        if self.meta_ctrl and state["meta_ctrl"] is not None:
-            hs = state["meta_ctrl"].to(self.h_state.device)
-            if (self.meta_ctrl.h_state is None) or (self.meta_ctrl.h_state.shape != hs.shape):
-                self.meta_ctrl.h_state = torch.zeros_like(hs)
-            self.meta_ctrl.h_state.copy_(hs)
-
         if "_steps_since_svd" in state:
             self._steps_since_svd = int(state["_steps_since_svd"].item())
         if "last_compress_step" in state:
@@ -1277,16 +1190,6 @@ class MemoryExtractor(nn.Module):
         if "ns_prev_P_post" in state:
             self._ns_prev_P_post = (state["ns_prev_P_post"].to(self.h_state.device)
                                     if state["ns_prev_P_post"] is not None else None)
-
-    def Step(self, x: torch.Tensor, state: Optional[dict] = None, tdError=None, entropy=None, reward=None, uncertainty=None):
-        if state is not None:
-            orig = self.GetState()
-            self.SetState(state)
-        out, _ = self.forward(x, tdError=tdError, entropy=entropy, reward=reward, uncertainty=uncertainty, reset=False, softReset=False)
-        new_state = self.GetState() if state is not None else None
-        if state is not None:
-            self.SetState(orig)
-        return out, new_state
 
     @torch.no_grad()
     def Reason(self, goal: Optional[torch.Tensor] = None, steps: int = 3) -> torch.Tensor:
@@ -1373,7 +1276,7 @@ class TestMemoryMTool:
 
     def TestMemoryExtractorForward(self):
         try:
-            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96,useMeta=True, useAmp=True, gwsSlots=8, gwsTtl=6, consolidateEvery=50, rehearseEvery=60)
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6, consolidateEvery=50, rehearseEvery=60)
             mem = MemoryExtractor(**cfg).to(self.device)
             B = 4
             x = torch.randn(B, cfg["inputDim"], device=self.device)
@@ -1392,7 +1295,7 @@ class TestMemoryMTool:
 
     def TestStateSaveRestore(self):
         try:
-            cfg = dict(inputDim=48, ssmStateDim=48, memoryDim=64, memorySize=24, outputDim=64,useMeta=True, useAmp=True, gwsSlots=8, gwsTtl=6)
+            cfg = dict(inputDim=48, ssmStateDim=48, memoryDim=64, memorySize=24, outputDim=64, useAmp=True, gwsSlots=8, gwsTtl=6)
             mem = MemoryExtractor(**cfg).to(self.device)
             state0 = mem.GetState()
             torch.manual_seed(123)
@@ -1414,7 +1317,7 @@ class TestMemoryMTool:
 
     def TestReason(self):
         try:
-            cfg = dict(inputDim=32, ssmStateDim=32, memoryDim=48, memorySize=32, outputDim=48, useMeta=True, useAmp=True, gwsSlots=10, gwsTtl=6)
+            cfg = dict(inputDim=32, ssmStateDim=32, memoryDim=48, memorySize=32, outputDim=48, useAmp=True, gwsSlots=10, gwsTtl=6)
             mem = MemoryExtractor(**cfg).to(self.device)
             for _ in range(5):
                 x = torch.randn(2, cfg["inputDim"], device=self.device)
@@ -1439,7 +1342,7 @@ class TestMemoryMTool:
 
     def TestResetAndSoftReset(self):
         try:
-            cfg = dict(inputDim=32, ssmStateDim=32, memoryDim=48, memorySize=32, outputDim=48, useMeta=True, useAmp=True, gwsSlots=8, gwsTtl=6)
+            cfg = dict(inputDim=32, ssmStateDim=32, memoryDim=48, memorySize=32, outputDim=48, useAmp=True, gwsSlots=8, gwsTtl=6)
             mem = MemoryExtractor(**cfg).to(self.device)
             x = torch.randn(4, cfg["inputDim"], device=self.device)
             mem(x)
@@ -1472,10 +1375,7 @@ class TestMemoryMTool:
     def TestMemoryTrain(self, steps: int = 120, batch_size: int = 16):
         try:
             torch.manual_seed(2025)
-            cfg = dict(
-                inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64, outputDim=64,
-                useMeta=True, useAmp=True, gwsSlots=8, gwsTtl=6,
-                consolidateEvery=10_000, rehearseEvery=10_000,)
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64, outputDim=64, useAmp=True, gwsSlots=8, gwsTtl=6,consolidateEvery=10_000, rehearseEvery=10_000,)
             
             device = self.device
             mem = MemoryExtractor(**cfg).to(device)
@@ -1494,7 +1394,8 @@ class TestMemoryMTool:
                 "ltm_gate", "state2mem", "state2val", "fusion",
                 "A_full", "B_mat", "C_mat", "D_mat",
                 "gws_summary", "gws_gate", "ns_head_pre", "ns_head_post",
-                "grad_bridge", "norm",]
+                "grad_bridge", "norm",
+                "ctrl_head", "ctrl_norm"]
             
             snap_before = {}
             for n, p in mem.named_parameters():
@@ -1505,10 +1406,6 @@ class TestMemoryMTool:
 
             opt = torch.optim.Adam(mem.parameters(), lr=1e-3)
             losses = []
-
-            meta_trainable = (mem.meta_ctrl is not None) and getattr(mem.meta_ctrl, "trainable", False)
-            with torch.no_grad():
-                meta_p0 = {n: p.detach().clone() for n, p in (mem.meta_ctrl.named_parameters() if mem.meta_ctrl else [])}
 
             with torch.no_grad():
                 p0 = []
@@ -1572,18 +1469,6 @@ class TestMemoryMTool:
             for pref in soft_expect:
                 assert grads_seen[pref], f"{pref} No gradient hits seen (check if it participates in the loss path)"
 
-            if mem.meta_ctrl is not None:
-                meta_after = {n: p.detach().clone() for n, p in mem.meta_ctrl.named_parameters()}
-                total_delta = 0.0
-                for n in meta_p0:
-                    d = float((meta_after[n] - meta_p0[n]).abs().sum().item())
-                    total_delta += d
-                    if meta_trainable:
-                        assert d > 0.0, f"meta_ctrl parameter {n} did not change when trainable=True"
-                    else:
-                        assert d == 0.0, f"meta_ctrl parameter {n} changes when trainable=False"
-                print(f"[meta_ctrl] {'trainable=True → params updated' if meta_trainable else 'trainable=False → params frozen'}, total Δ={total_delta:.3e}")
-
             with torch.no_grad():
                 p1 = []
                 for n, p in mem.named_parameters():
@@ -1611,20 +1496,6 @@ class TestMemoryMTool:
             print(f"TestNormalTrainingConvergence/Trainability error: {e}")
             return False
 
-    def RunAll(self):
-        results = {
-            "GlobalWorkspace": self.TestGlobalWorkspace(),
-            "LongTermMemory": self.TestLongTermMemory(),
-            "MemoryExtractorForward": self.TestMemoryExtractorForward(),
-            "StateSaveRestore": self.TestStateSaveRestore(),
-            "Reason": self.TestReason(),
-            "ResetAndSoftReset": self.TestResetAndSoftReset(),
-            "TestMemoryTrain": self.TestMemoryTrain()}
-        
-        passed = sum(1 for v in results.values() if v)
-        print(f"\nMemory module tests: {passed}/{len(results)} passed.")
-        return results
-    
 
     @torch.no_grad()
     def NumericalStabilityProbe(
@@ -1680,7 +1551,7 @@ class TestMemoryMTool:
 
     def TestNumericalStability(self):
         try:
-            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=48, outputDim=96,useMeta=True, useAmp=True, gwsSlots=8, gwsTtl=6, consolidateEvery=1000, rehearseEvery=1000)
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=48, outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6, consolidateEvery=1000, rehearseEvery=1000)
             mem = MemoryExtractor(**cfg).to(self.device)
 
             cos_hist = self.NumericalStabilityProbe(
@@ -1717,68 +1588,83 @@ class TestMemoryMTool:
 
 
     def TrainStepSmoke(self):
-        cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96, useMeta=True, useAmp=True, gwsSlots=8, gwsTtl=6, consolidateEvery=10_000, rehearseEvery=10_000)
-        mem = MemoryExtractor(**cfg).to(self.device)
-        mem.train()
-        opt = torch.optim.Adam(mem.parameters(), lr=1e-3)
+        try:
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96,useAmp=True, gwsSlots=8, gwsTtl=6, consolidateEvery=10_000, rehearseEvery=10_000)
+            mem = MemoryExtractor(**cfg).to(self.device)
+            mem.train()
+            opt = torch.optim.Adam(mem.parameters(), lr=1e-3)
 
-        B = 8
-        x = torch.randn(B, cfg["inputDim"], device=self.device)
-        target = torch.randn(B, cfg["outputDim"], device=self.device)
+            B = 8
+            x = torch.randn(B, cfg["inputDim"], device=self.device)
+            target = torch.randn(B, cfg["outputDim"], device=self.device)
 
-        out, _ = mem(x)
-        base = F.mse_loss(out, target)
+            out, _ = mem(x)
+            base = F.mse_loss(out, target)
 
-        total = self.AttachAllInternalLosses(mem, base)
-        opt.zero_grad()
-        total.backward()
-
-        nesy_grad_ok = any(
-            (("ns_head_pre" in n or "ns_head_post" in n) and p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0)
-            for n, p in mem.named_parameters())
-        assert nesy_grad_ok, "NeSy heads did not receive gradients."
-
-        for n, p in mem.named_parameters():
-            if p.grad is not None:
-                assert torch.isfinite(p.grad).all(), f"Non-finite grad at {n}"
-
-        opt.step()
-        print("TrainStepSmoke passed.")
-        return True
-    
-    def TrainNeSyOnlySanity(self, steps: int = 30):
-        cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96, useMeta=True, useAmp=True, gwsSlots=8, gwsTtl=6)
-        mem = MemoryExtractor(**cfg).to(self.device)
-        mem.ns_enable = True
-        mem.ns_lambda = 0.5 
-        mem.train()
-        opt = torch.optim.Adam([p for p in mem.parameters() if p.requires_grad], lr=1e-3)
-
-        in_dim = cfg["inputDim"]
-        last = None
-        for t in range(steps):
-            x = torch.randn(8, in_dim, device=self.device)
-            out, _ = mem(x) 
-            base = torch.zeros([], device=self.device)  
             total = self.AttachAllInternalLosses(mem, base)
-
             opt.zero_grad()
             total.backward()
+
+            nesy_grad_ok = any(
+                (("ns_head_pre" in n or "ns_head_post" in n) and p.grad is not None
+                 and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0)
+                for n, p in mem.named_parameters())
+            assert nesy_grad_ok, "NeSy heads did not receive gradients."
+
+            for n, p in mem.named_parameters():
+                if p.grad is not None:
+                    assert torch.isfinite(p.grad).all(), f"Non-finite grad at {n}"
+
             opt.step()
+            print("TestMemoryMTool.TrainStepSmoke passed.")
+            return True
+        except AssertionError as e:
+            print(f"TestMemoryMTool.TrainStepSmoke failed: {e}")
+            return False
+        except Exception as e:
+            print(f"TestMemoryMTool.TrainStepSmoke error: {e}")
+            return False
+    
+    def TrainNeSyOnlySanity(self, steps: int = 30):
+        try:
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6)
+            mem = MemoryExtractor(**cfg).to(self.device)
+            mem.ns_enable = True
+            mem.ns_lambda = 0.5
+            mem.train()
+            opt = torch.optim.Adam([p for p in mem.parameters() if p.requires_grad], lr=1e-3)
 
-            cur = float(total.detach().item())
-            if last is not None:
-                pass
-            last = cur
+            in_dim = cfg["inputDim"]
+            last = None
+            for t in range(steps):
+                x = torch.randn(8, in_dim, device=self.device)
+                out, _ = mem(x)
+                base = torch.zeros([], device=self.device)
+                total = self.AttachAllInternalLosses(mem, base)
 
-        changed = False
-        for n, p in mem.named_parameters():
-            if ("ns_head_pre" in n or "ns_head_post" in n) and p.grad is not None:
-                changed = True
-                break
-        assert changed, "NeSy heads were not updated under internal loss only."
-        print("TrainNeSyOnlySanity passed.")
-        return True
+                opt.zero_grad()
+                total.backward()
+                opt.step()
+
+                cur = float(total.detach().item())
+                if last is not None:
+                    pass
+                last = cur
+
+            changed = False
+            for n, p in mem.named_parameters():
+                if ("ns_head_pre" in n or "ns_head_post" in n) and p.grad is not None:
+                    changed = True
+                    break
+            assert changed, "NeSy heads were not updated under internal loss only."
+            print("TestMemoryMTool.TrainNeSyOnlySanity passed.")
+            return True
+        except AssertionError as e:
+            print(f"TestMemoryMTool.TrainNeSyOnlySanity failed: {e}")
+            return False
+        except Exception as e:
+            print(f"TestMemoryMTool.TrainNeSyOnlySanity error: {e}")
+            return False
     
 
 
@@ -1790,72 +1676,105 @@ class TestMemoryMTool:
             mem(x)
 
     def TestNeSyRetrievalEffect(self):
-        cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64, outputDim=96, useMeta=True, useAmp=True, gwsSlots=8, gwsTtl=6)
-        mem = MemoryExtractor(**cfg).to(self.device)
-        mem.eval()
-        mem.ns_enable = False
-        self.PrimeMemoryWithConflict(mem, rounds=6)
+        try:
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64, outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6)
+            mem = MemoryExtractor(**cfg).to(self.device)
+            mem.eval()
+            mem.ns_enable = False
+            self.PrimeMemoryWithConflict(mem, rounds=6)
 
-        x = torch.randn(8, cfg["inputDim"], device=self.device)
-        _, rec_off = mem(x) 
+            x = torch.randn(8, cfg["inputDim"], device=self.device)
+            _, rec_off = mem(x)
 
-        mem.ns_enable = True
-        mem.ns_retrieve_boost = 0.5
-        mem.ns_alpha_out = 0.4
+            mem.ns_enable = True
+            mem.ns_retrieve_boost = 0.5
+            mem.ns_alpha_out = 0.4
 
-        _, rec_on = mem(x)  
+            _, rec_on = mem(x)
 
-        delta = (rec_on - rec_off).norm(dim=1).mean().item()
-        cos = F.cosine_similarity(rec_on, rec_off, dim=1).mean().item()
-        assert (delta > 1e-3) or (cos < 0.99), f"NeSy had negligible effect on retrieval (delta={delta:.3e}, cos={cos:.4f})"
-        print("TestNeSyRetrievalEffect passed.")
-        return True
+            delta = (rec_on - rec_off).norm(dim=1).mean().item()
+            cos = F.cosine_similarity(rec_on, rec_off, dim=1).mean().item()
+            assert (delta > 1e-3) or (cos < 0.99), f"NeSy had negligible effect on retrieval (delta={delta:.3e}, cos={cos:.4f})"
+            print("TestMemoryMTool.TestNeSyRetrievalEffect passed.")
+            return True
+        except AssertionError as e:
+            print(f"TestMemoryMTool.TestNeSyRetrievalEffect failed: {e}")
+            return False
+        except Exception as e:
+            print(f"TestMemoryMTool.TestNeSyRetrievalEffect error: {e}")
+            return False
     
     def CheckAttachCollector(self):
-        mem = MemoryExtractor(inputDim=32, ssmStateDim=32, memoryDim=48, memorySize=16, outputDim=48, useMeta=True, useAmp=True).to(self.device)
-        mem.train()
-        x = torch.randn(4, 32, device=self.device)
-        out, _ = mem(x)
-        base = F.mse_loss(out, torch.zeros_like(out))
+        try:
+            mem = MemoryExtractor(inputDim=32, ssmStateDim=32, memoryDim=48, memorySize=16, outputDim=48, useAmp=True).to(self.device)
+            mem.train()
+            x = torch.randn(4, 32, device=self.device)
+            out, _ = mem(x)
+            base = F.mse_loss(out, torch.zeros_like(out))
 
-        manual = mem.GetInternalLoss()
-        total = self.AttachAllInternalLosses(mem, base)
-        auto_extra = total - base
+            manual = mem.GetInternalLoss().to(dtype=base.dtype, device=base.device)
+            total = self.AttachAllInternalLosses(mem, base)
+            auto_extra = total - base
 
-        diff = float((manual - auto_extra).abs().item())
-        assert diff < 1e-7, f"Collector mismatch: {diff}"
-        print("CheckAttachCollector passed.")
-        return True
+            diff = float((manual - auto_extra).abs().item())
+            tol = float(torch.finfo(base.dtype).eps) * 8 
+            assert diff <= tol, f"Collector mismatch: diff={diff:g} > tol={tol:g}"
+
+            print("TestMemoryMTool.CheckAttachCollector passed.")
+            return True
+        except AssertionError as e:
+            print(f"TestMemoryMTool.CheckAttachCollector failed: {e}")
+            return False
+        except Exception as e:
+            print(f"TestMemoryMTool.CheckAttachCollector error: {e}")
+            return False
     
 
     def NoNanAfterManySteps(self, steps: int = 50):
-        cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64, outputDim=96, useMeta=True, useAmp=True, gwsSlots=8, gwsTtl=6)
-        mem = MemoryExtractor(**cfg).to(self.device)
-        mem.train()
-        opt = torch.optim.Adam(mem.parameters(), lr=1e-3)
+        try:
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64, outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6)
+            mem = MemoryExtractor(**cfg).to(self.device)
+            mem.train()
+            opt = torch.optim.Adam(mem.parameters(), lr=1e-3)
 
-        for t in range(steps):
-            x = torch.randn(8, cfg["inputDim"], device=self.device)
-            y = torch.randn(8, cfg["outputDim"], device=self.device)
-            out, _ = mem(x)
-            base = F.mse_loss(out, y)
-            total = self.AttachAllInternalLosses(mem, base)
+            for t in range(steps):
+                x = torch.randn(8, cfg["inputDim"], device=self.device)
+                y = torch.randn(8, cfg["outputDim"], device=self.device)
+                out, _ = mem(x)
+                base = F.mse_loss(out, y)
+                total = self.AttachAllInternalLosses(mem, base)
 
-            opt.zero_grad()
-            total.backward()
-            for n, p in mem.named_parameters():
-                if p.grad is not None:
-                    assert torch.isfinite(p.grad).all(), f"Non-finite grad at step {t}, {n}"
-            opt.step()
-        print("NoNanAfterManySteps passed.")
-        return True
-    
-    def TestTraining(self):
-        ok = True
-        ok &= self.TrainStepSmoke()
-        ok &= self.TrainNeSyOnlySanity()
-        ok &= self.TestNeSyRetrievalEffect()
-        ok &= self.CheckAttachCollector()
-        ok &= self.NoNanAfterManySteps()
-        print(f"\nTraining-like tests: {'OK' if ok else 'FAIL'}")
-        return ok
+                opt.zero_grad()
+                total.backward()
+                for n, p in mem.named_parameters():
+                    if p.grad is not None:
+                        assert torch.isfinite(p.grad).all(), f"Non-finite grad at step {t}, {n}"
+                opt.step()
+
+            print("TestMemoryMTool.NoNanAfterManySteps passed.")
+            return True
+        except AssertionError as e:
+            print(f"TestMemoryMTool.NoNanAfterManySteps failed: {e}")
+            return False
+        except Exception as e:
+            print(f"TestMemoryMTool.NoNanAfterManySteps error: {e}")
+            return False
+        
+    def RunAll(self):
+        results = {
+            "GlobalWorkspace": self.TestGlobalWorkspace(),
+            "LongTermMemory": self.TestLongTermMemory(),
+            "MemoryExtractorForward": self.TestMemoryExtractorForward(),
+            "StateSaveRestore": self.TestStateSaveRestore(),
+            "Reason": self.TestReason(),
+            "ResetAndSoftReset": self.TestResetAndSoftReset(),
+            "TestMemoryTrain": self.TestMemoryTrain(),
+            "TrainStepSmoke": self.TrainStepSmoke(),
+            "TrainNeSyOnlySanity": self.TrainNeSyOnlySanity(),
+            "TestNeSyRetrievalEffect": self.TestNeSyRetrievalEffect(),
+            "CheckAttachCollector": self.CheckAttachCollector(),
+            "NoNanAfterManySteps": self.NoNanAfterManySteps(),}
+        
+        passed = sum(1 for v in results.values() if v)
+        print(f"\nMemory module tests: {passed}/{len(results)} passed.")
+        return results
