@@ -81,7 +81,7 @@ class SimpleSSM(nn.Module):
             t = t.detach().to(dev).float().view(B)
             return torch.tanh((t - t.mean()) / (t.std(unbiased=False).clamp_min(1e-6)))
         
-        td_z  = z_(tdError)
+        td_z = z_(tdError)
         unc_z = z_(uncertainty)
 
         gate_bias = (0.5 * td_z + 0.5 * (-unc_z)).view(B,1,1)
@@ -92,6 +92,15 @@ class SimpleSSM(nn.Module):
         u_and_g = self.in_proj(x)
         u, g = torch.chunk(u_and_g, 2, dim=-1)
         u = F.silu(u)
+
+        keep3 = None
+        if keyPaddingMask is not None:
+            keep3 = (~keyPaddingMask).to(u.dtype).unsqueeze(-1) 
+            u = u * keep3  
+
+        u_conv = self.dw_conv(u.transpose(1,2)).transpose(1,2)
+        u = u + 0.5 * u_conv
+
         g = torch.sigmoid(g + gate_bias)
 
         u_conv = self.dw_conv(u.transpose(1,2)).transpose(1,2)
@@ -132,9 +141,9 @@ class MultiHeadAttention(nn.Module):
 
         self.register_buffer("hebb_step", torch.tensor(0, dtype=torch.long), persistent=False)
 
-        self.temp_w_td  = nn.Parameter(torch.tensor(0.8))
+        self.temp_w_td = nn.Parameter(torch.tensor(0.8))
         self.temp_w_unc = nn.Parameter(torch.tensor(0.5))
-        self.bias_w_td  = nn.Parameter(torch.tensor(0.4))
+        self.bias_w_td = nn.Parameter(torch.tensor(0.4))
         self.bias_w_unc = nn.Parameter(torch.tensor(0.6))
 
         self.q_proj = nn.Linear(embedDim, embedDim)
@@ -168,10 +177,10 @@ class MultiHeadAttention(nn.Module):
                 raise ValueError(f"Expected size {B}, got {t.numel()}")
             return torch.tanh((t - t.mean()) / (t.std(unbiased=False).clamp_min(1e-6)))
         
-        td_z  = z_(tdError)
+        td_z = z_(tdError)
         unc_z = z_(uncertainty)
 
-        tau  = 1.0 + 0.5*torch.tanh(self.temp_w_td*td_z + self.temp_w_unc*unc_z)
+        tau = 1.0 + 0.5*torch.tanh(self.temp_w_td*td_z + self.temp_w_unc*unc_z)
         bias = 0.5*torch.tanh(self.bias_w_td*td_z + self.bias_w_unc*unc_z)
         return tau.view(B,1,1,1), bias.view(B,1,1,1)
 
@@ -182,6 +191,11 @@ class MultiHeadAttention(nn.Module):
             if mod.bias is not None:
                 nn.init.zeros_(mod.bias)
         self.ResetHebbianMemory()
+
+        with torch.no_grad():
+            if self.use_low_rank:
+                self.U.normal_(0.0, 1e-3)
+                self.V.normal_(0.0, 1e-3)
 
     def ResetHebbianMemory(self):
         device = self.hebbian_weights.device
@@ -250,8 +264,8 @@ class MultiHeadAttention(nn.Module):
         if self.use_low_rank:
             U_grad = torch.einsum('hde,her->hdr', hebb, self.V)
             V_grad = torch.einsum('hde,hdr->her', hebb, self.U)
-            U_new = torch.clamp(self.U + alpha * (U_grad - self.U), -1.5, 1.5)
-            V_new = torch.clamp(self.V + alpha * (V_grad - self.V), -1.5, 1.5)
+            U_new = torch.clamp(self.U + alpha * U_grad, -1.5, 1.5)
+            V_new = torch.clamp(self.V + alpha * V_grad, -1.5, 1.5)
             self.U.copy_(U_new)
             self.V.copy_(V_new)
         else:
@@ -271,11 +285,16 @@ class MultiHeadAttention(nn.Module):
         k = k_lin.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = v_lin.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if self.update_hebbian_flag and self.base_hebbian_rate > 0:
+        if self.training and self.update_hebbian_flag and self.base_hebbian_rate > 0:
             self.hebb_step.add_(1)
             if int(self.hebb_step.item()) % self.hebb_period == 0:
                 alpha = float(self.base_hebbian_rate * neuromod.mean())
-                self.UpdateHebbianWeights(v, q, alpha)
+                if keyPaddingMask is not None:
+                    keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, L, 1)  # (B,1,L,1)
+                    v_upd, q_upd = v * keep4, q * keep4
+                else:
+                    v_upd, q_upd = v, q
+                self.UpdateHebbianWeights(v_upd, q_upd, alpha)
 
         q = q * neuromod
 
@@ -339,7 +358,7 @@ class TemporalAttention(nn.Module):
 
         td_scale = 5.0 / (layerIdx + 1)
         self.mhsa = MultiHeadAttention(embedDim, numHeads, tdScale=td_scale, useHebbian=useHebbian)
-        self.ssm  = SimpleSSM(embedDim)
+        self.ssm = SimpleSSM(embedDim)
 
         self.mix_gate = nn.Sequential(
             nn.Linear(embedDim, embedDim),
@@ -359,7 +378,11 @@ class TemporalAttention(nn.Module):
 
         y = w * mhsa_out + (1 - w) * ssm_out # (B,S,E)
 
-        return self.norm(x + self.dropout(y))
+        out = self.norm(x + self.dropout(y))
+        if keyPaddingMask is not None:
+            keep = (~keyPaddingMask).unsqueeze(-1).to(out.dtype)  # (B,S,1)
+            out = out * keep
+        return out
 
 
 class DynamicRouting(nn.Module):
@@ -561,6 +584,10 @@ class AttentionExtractor(nn.Module):
                 keyPaddingMask = F.pad(keyPaddingMask, (0,pad_len), value=True)
             S = x.size(1)
 
+        if keyPaddingMask is not None:
+            keep = (~keyPaddingMask).unsqueeze(-1).to(x.dtype)
+            x = x * keep
+
         h = x
         
         # Use detached version of tdError for checkpointing
@@ -589,7 +616,13 @@ class AttentionExtractor(nn.Module):
 
         # Fusion of different representations
         routed_mean = routed.mean(dim=1) # (B,E)
-        temp_mean = h.mean(dim=1) # (B,E)
+        
+        if keyPaddingMask is not None:
+            keep = (~keyPaddingMask).to(h.dtype).unsqueeze(-1)  # (B,S,1)
+            denom = keep.sum(dim=1, keepdim=True).clamp_min(1.0) # (B,1,1)
+            temp_mean = (h * keep).sum(dim=1) / denom.squeeze(-1)  
+        else:
+            temp_mean = h.mean(dim=1)
         
         fusion_in = torch.stack([
             temp_mean, 
@@ -782,11 +815,16 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         k = k_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
         v = v_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
 
-        if mhsa.update_hebbian_flag and mhsa.base_hebbian_rate > 0:
+        if mhsa.training and mhsa.update_hebbian_flag and mhsa.base_hebbian_rate > 0:
             mhsa.hebb_step.add_(1)
             if int(mhsa.hebb_step.item()) % mhsa.hebb_period == 0:
                 alpha = float(mhsa.base_hebbian_rate * neuromod.mean())
-                mhsa.UpdateHebbianWeights(v, q, alpha)
+                if keyPaddingMask is not None:
+                    keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, S, 1)  # (B,1,S,1)
+                    v_upd, q_upd = v * keep4, q * keep4
+                else:
+                    v_upd, q_upd = v, q
+                mhsa.UpdateHebbianWeights(v_upd, q_upd, alpha)
 
         q = q * neuromod
         if mhsa.use_low_rank:
@@ -1356,6 +1394,186 @@ class TestAttentionMTool:
             print("WrapperPipelineCompatible error:", e)
             return False
 
+
+    def GradCoverageReportAttention(self, min_ratio: float = 0.65):
+        try:
+            torch.manual_seed(7)
+            model = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3,hebbianRate=0.01, useHebbian=True, gradientClipVal=0.5).to(self.device)
+            head = nn.Linear(64, 12).to(self.device)
+            model.train(); head.train()
+            opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
+
+            x  = torch.randn(8, 16, 64, device=self.device)
+            td = torch.randn(8, device=self.device)
+            y  = torch.randn(8, 12, device=self.device)
+
+            pred = head(model(x, tdError=td))
+            loss = F.mse_loss(pred, y)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            model.ClipGrads()
+
+            named = dict(list(model.named_parameters()) + [('head.'+k, v) for k,v in head.named_parameters()])
+            total_trainable = sum(1 for p in named.values() if p.requires_grad)
+            total_with_grad = sum(1 for p in named.values() if (p.requires_grad and (p.grad is not None)))
+            ratio = total_with_grad / max(1, total_trainable)
+
+            must_have = [
+                "temporal_blocks.0.mhsa.q_proj.weight",
+                "temporal_blocks.0.mhsa.k_proj.weight",
+                "temporal_blocks.0.mhsa.v_proj.weight",
+                "temporal_blocks.0.mhsa.out_proj.weight",
+                "temporal_blocks.0.ssm.in_proj.weight",
+                "routing.transformation",
+                "fusion.base_weights",
+                "context_proj.0.weight",
+                "static_mixer.0.weight",
+                "output_proj.0.weight",
+                "head.weight",]
+            missing = [n for n in must_have if (n in named) and (named[n].grad is None)]
+            assert len(missing) == 0, f"The key layer does not get the gradient: {missing}"
+            assert ratio >= min_ratio, f"Gradient coverage is too low: {ratio:.2%} < {min_ratio:.2%}"
+
+            print(f"GradCoverageReportAttention passed. grad_ratio={ratio:.2%}")
+            return True
+        except AssertionError as e:
+            print(f"GradCoverageReportAttention failed: {e}")
+            return False
+        except Exception as e:
+            print(f"GradCoverageReportAttention error: {e}")
+            return False
+
+    def MaskInvariance(self):
+        try:
+            torch.manual_seed(8)
+            model = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3, hebbianRate=0.01, useHebbian=False).to(self.device)
+            model.eval()
+            B, S, E = 3, 16, 64
+            x1 = torch.randn(B, S, E, device=self.device)
+            x2 = x1.clone()
+
+            kpm = torch.zeros(B, S, dtype=torch.bool, device=self.device)
+            kpm[:, -4:] = True
+            x2[:, -4:, :] += torch.randn(B, 4, E, device=self.device) * 10.0
+
+            with torch.no_grad():
+                y1 = model(x1, keyPaddingMask=kpm)
+                y2 = model(x2, keyPaddingMask=kpm)
+
+            max_abs = (y1 - y2).abs().max().item()
+            assert max_abs < 5e-5, f"Mask invariance fails, max_abs={max_abs:.3e}"
+            print("MaskInvariance passed.")
+            return True
+        except AssertionError as e:
+            print(f"MaskInvariance failed: {e}")
+            return False
+        except Exception as e:
+            print(f"MaskInvariance error: {e}")
+            return False
+
+    def LowrankFullrankConsistency(self):
+        try:
+            torch.manual_seed(9)
+            attn = MultiHeadAttention(embedDim=64, numHeads=4, lowRank=True, rank=4, useHebbian=True).to(self.device)
+            attn.eval()
+            B,S,E = 2, 12, 64
+            x = torch.randn(B, S, E, device=self.device)
+            with torch.no_grad():
+                y_low = attn(x, x, x, keyPaddingMask=None, tdError=None)
+                attn.LowrankToFullrank(residual=True)
+                y_full = attn(x, x, x, keyPaddingMask=None, tdError=None)
+            max_abs = (y_low - y_full).abs().max().item()
+            assert max_abs < 1e-5, f"Low rank->full rank values are inconsistent, max_abs={max_abs:.3e}"
+
+            with torch.no_grad():
+                attn.FullrankToLowrank(residual=True)
+                y_low2 = attn(x, x, x, keyPaddingMask=None, tdError=None)
+            max_abs2 = (y_full - y_low2).abs().max().item()
+            assert max_abs2 < 1e-5, f"Full rank-> low rank values are inconsistent, max_abs={max_abs2:.3e}"
+
+            print("LowrankFullrankConsistency passed.")
+            return True
+        except AssertionError as e:
+            print(f"LowrankFullrankConsistency failed: {e}")
+            return False
+        except Exception as e:
+            print(f"LowrankFullrankConsistency error: {e}")
+            return False
+
+    def HebbianMemoryLifecycleAttention(self):
+        try:
+            attn = MultiHeadAttention(embedDim=64, numHeads=4, lowRank=True, rank=4,useHebbian=True, hebbianRate=0.05, hebbPeriod=1).to(self.device)
+            attn.train()
+            B,S,E = 2, 10, 64
+            x = torch.randn(B, S, E, device=self.device)
+
+            U0 = attn.U.norm().item(); V0 = attn.V.norm().item()
+            for _ in range(3):
+                _ = attn(x, x, x, tdError=torch.randn(B, device=self.device))
+            U1 = attn.U.norm().item(); V1 = attn.V.norm().item()
+            assert U1 > U0 + 1e-8 and V1 > V0 + 1e-8, "MHSA Hebbian(U/V) not growing"
+
+            attn.ResetHebbianMemory()
+            assert attn.U.abs().max().item() < 1e-12 and attn.V.abs().max().item() < 1e-12, "MHSA Hebbian(U/V) not cleared"
+
+            fusion = HebbianFusion(numModes=3, embedDim=64, hebbianRate=0.1, useHebbian=True).to(self.device)
+            fusion.train()
+            inputs = torch.randn(4, 3, 64, device=self.device)
+            n0 = fusion.hebbian_memory.norm().item()
+            _ = fusion(inputs)
+            n1 = fusion.hebbian_memory.norm().item()
+            assert n1 > n0 + 1e-8, "Fusion Hebbian memory not growing"
+            fusion.ResetHebbianMemory()
+            assert fusion.hebbian_memory.abs().max().item() < 1e-12, "Fusion Hebbian memory not cleared"
+
+            print("HebbianMemoryLifecycleAttention passed.")
+            return True
+        except AssertionError as e:
+            print(f"HebbianMemoryLifecycleAttention failed: {e}")
+            return False
+        except Exception as e:
+            print(f"HebbianMemoryLifecycleAttention error: {e}")
+            return False
+
+    def WrapperKeepsBaseEval(self):
+        try:
+            base = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3, hebbianRate=0.0, useHebbian=False).to(self.device)
+            wrapper = AttentionOnlineWrapper(base=base, initRankEach=0, autoRank=True).to(self.device)
+            wrapper.train()
+            assert wrapper.training and (not base.training), "base should remain eval() when wrapper.train()"
+            print("WrapperKeepsBaseEval passed.")
+            return True
+        except AssertionError as e:
+            print(f"WrapperKeepsBaseEval failed: {e}")
+            return False
+        except Exception as e:
+            print(f"WrapperKeepsBaseEval error: {e}")
+            return False
+
+    def SmallBatchSafety(self):
+        try:
+            model = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=2, routingIterations=3, hebbianRate=0.01, useHebbian=True).to(self.device)
+            head = nn.Linear(64, 12).to(self.device)
+            model.eval(); head.train()
+            x = torch.randn(1, 16, 64, device=self.device)
+            td = torch.randn(1, device=self.device)
+            y = torch.randn(1, 12, device=self.device)
+
+            pred = head(model(x, tdError=td))
+            loss = F.mse_loss(pred, y)
+            head.zero_grad(set_to_none=True)
+            loss.backward()
+            assert head.weight.grad is not None and torch.isfinite(head.weight.grad).all(), "Head gradient is abnormal when batch=1"
+            print("SmallBatchSafety passed.")
+            return True
+        except AssertionError as e:
+            print(f"SmallBatchSafety failed: {e}")
+            return False
+        except Exception as e:
+            print(f"SmallBatchSafety error: {e}")
+            return False
+
     def RunAll(self):
         results = {
             "SimpleSSM": self.TestSimpleSSM(),
@@ -1372,7 +1590,13 @@ class TestAttentionMTool:
             "WrapperAPIBasics": self.WrapperAPIBasics(),
             "WrapperManualGrowTrainAndCommit": self.WrapperManualGrowTrainAndCommit(),
             "WrapperAutoInjectAndCommit": self.WrapperAutoInjectAndCommit(),
-            "WrapperPipelineCompatible": self.WrapperPipelineCompatible(),}
+            "WrapperPipelineCompatible": self.WrapperPipelineCompatible(),
+            "GradCoverageReportAttention": self.GradCoverageReportAttention(),
+            "MaskInvariance": self.MaskInvariance(),
+            "LowrankFullrankConsistency": self.LowrankFullrankConsistency(),
+            "HebbianMemoryLifecycleAttention": self.HebbianMemoryLifecycleAttention(),
+            "WrapperKeepsBaseEval": self.WrapperKeepsBaseEval(),
+            "SmallBatchSafety": self.SmallBatchSafety(),}
         passed = sum(1 for v in results.values() if v)
         print(f"\nAttention module tests (with wrapper): {passed}/{len(results)} passed.")
         return results

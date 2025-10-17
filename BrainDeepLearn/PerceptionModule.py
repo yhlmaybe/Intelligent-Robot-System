@@ -1215,6 +1215,152 @@ class TestPerceptionMTool:
             print("WrapperAdaptiveGrowAndCommit error:\n", e)
             return False
 
+    def GradCoverageReport(self, min_ratio: float = 0.60):
+        try:
+            model = PerceiveExtractor(imgSize=64, patchSize=1, embedDim=64, numHeads=8,
+                                      numLayers=2, baseChannels=16, useHebbian=True).to(self.device)
+            head = nn.Linear(128, 16).to(self.device)
+            model.train(); head.train()
+            opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
+
+            x = torch.randn(8, 3, 64, 64, device=self.device)
+            y = torch.randn(8, 16, device=self.device)
+            pred = head(model(x))
+            loss = F.mse_loss(pred, y)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+
+            named = dict(list(model.named_parameters()) + [('head.'+k, v) for k,v in head.named_parameters()])
+            total_trainable = sum(1 for p in named.values() if p.requires_grad)
+            total_with_grad = sum(1 for p in named.values() if p.requires_grad and (p.grad is not None))
+            ratio = total_with_grad / max(1, total_trainable)
+
+            must_have = [
+                "cnn_extractor.conv1.conv.weight",
+                "patch_embed.weight",
+                "transformer_layers.0.self_atten.out_proj.weight",
+                "transformer_layers.0.linear1.weight",
+                "mlp.2.weight",  
+                "mlp.6.weight",  
+                "head.weight", ]
+            missing = [n for n in must_have if (n in named) and (named[n].grad is None)]
+            assert len(missing) == 0, f"The key layer does not get the gradient: {missing}"
+            assert ratio >= min_ratio, f"Gradient coverage is too low: {ratio:.2%} < {min_ratio:.2%}"
+
+            print(f"GradCoverageReport passed. grad_ratio={ratio:.2%}")
+            return True
+        except AssertionError as e:
+            print(f"GradCoverageReport failed: {e}")
+            return False
+        except Exception as e:
+            print(f"GradCoverageReport error: {e}")
+            return False
+
+    def LossDecreasesWithHebbToggle(self, steps: int = 80):
+        try:
+            for flag in (False, True):
+                model = PerceiveExtractor(imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=flag).to(self.device)
+                head = nn.Linear(128, 16).to(self.device)
+                model.train(); head.train()
+                opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
+
+                B = 16
+                data_x = torch.randn(B, 3, 64, 64, device=self.device)
+                data_y = torch.randn(B, 16, device=self.device)
+
+                with torch.no_grad():
+                    start = F.mse_loss(head(model(data_x)), data_y).item()
+
+                hist = []
+                for _ in range(steps):
+                    pred = head(model(data_x))
+                    loss = F.mse_loss(pred, data_y)
+                    opt.zero_grad(set_to_none=True)
+                    loss.backward()
+                    opt.step()
+                    hist.append(loss.item())
+
+                end = hist[-1]
+                tail_mean = sum(hist[-10:]) / min(10, len(hist))
+                assert tail_mean <= 0.5 * start, f"Hebbian={flag} insufficient convergence: start={start:.4f}, tail_mean={tail_mean:.4f}"
+                print(f"LossDecreasesWithHebbToggle({flag}) passed. start={start:.4f} -> end={end:.4f}")
+            return True
+        except AssertionError as e:
+            print(f"LossDecreasesWithHebbToggle failed: {e}")
+            return False
+        except Exception as e:
+            print(f"LossDecreasesWithHebbToggle error: {e}")
+            return False
+
+    def HebbianMemoryLifecycle(self):
+        try:
+            conv = HebbianConv2d(3, 8, 3, stride=1, padding=1, useHebbian=True).to(self.device)
+            x = torch.randn(4, 3, 32, 32, device=self.device)
+            n0 = conv.hebb_memory.norm().item()
+            for _ in range(3):
+                _ = conv(x)
+            n1 = conv.hebb_memory.norm().item()
+            assert n1 > n0 + 1e-12, f"Conv Hebbian memory no growth: before={n0:.3e}, after={n1:.3e}"
+            conv.ResetHebbianMemory()
+            n2 = conv.hebb_memory.norm().item()
+            assert n2 < 1e-12, f"Conv Hebbian memory unclear zero: now={n2:.3e}"
+
+            lin = HebbianLinear(32, 16, useHebbian=True).to(self.device)
+            z = torch.randn(6, 32, device=self.device)
+            n0 = lin.hebb_memory.norm().item()
+            for _ in range(3):
+                _ = lin(z)
+            n1 = lin.hebb_memory.norm().item()
+            assert n1 > n0 + 1e-12, f"Linear Hebbian memory no growth: before={n0:.3e}, after={n1:.3e}"
+            lin.ResetHebbianMemory()
+            n2 = lin.hebb_memory.norm().item()
+            assert n2 < 1e-12, f"Linear Hebbian memory unclear zero: now={n2:.3e}"
+
+            print("HebbianMemoryLifecycle passed.")
+            return True
+        except AssertionError as e:
+            print(f"HebbianMemoryLifecycle failed: {e}")
+            return False
+        except Exception as e:
+            print(f"HebbianMemoryLifecycle error: {e}")
+            return False
+
+    def WrapperKeepsBaseEval(self):
+        try:
+            base = PerceiveExtractor(imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            wrapper = PerceptionOnlineWrapper(base=base, initRankEach=0).to(self.device)
+            wrapper.train()
+            assert wrapper.training and (not base.training), "When wrapper.train() is used, base should be eval()"
+            print("WrapperKeepsBaseEval passed.")
+            return True
+        except AssertionError as e:
+            print(f"WrapperKeepsBaseEval failed: {e}")
+            return False
+        except Exception as e:
+            print(f"WrapperKeepsBaseEval error: {e}")
+            return False
+
+    def SmallBatchSafety(self):
+        try:
+            model = PerceiveExtractor(imgSize=64, patchSize=1, embedDim=64, numHeads=8,numLayers=2, baseChannels=16, useHebbian=True).to(self.device)
+            head = nn.Linear(128, 16).to(self.device)
+            model.eval(); head.train()  
+            x = torch.randn(1, 3, 64, 64, device=self.device)
+            y = torch.randn(1, 16, device=self.device)
+            pred = head(model(x))
+            loss = F.mse_loss(pred, y)
+            head.zero_grad(set_to_none=True)
+            loss.backward()
+            assert head.weight.grad is not None and torch.isfinite(head.weight.grad).all(), "Head gradient abnormality when batch=1"
+            print("SmallBatchSafety passed.")
+            return True
+        except AssertionError as e:
+            print(f"SmallBatchSafety failed: {e}")
+            return False
+        except Exception as e:
+            print(f"SmallBatchSafety error: {e}")
+            return False
 
     def RunAll(self):
         results = {
@@ -1230,8 +1376,12 @@ class TestPerceptionMTool:
             "WrapperManualGrowTrainAndCommit": self.WrapperManualGrowTrainAndCommit(),
             "WrapperAutoGrowDecreaseRank": self.WrapperAutoGrowDecreaseRank(),
             "WrapperPipelineCompatible": self.WrapperPipelineCompatible(),
-            "WrapperAdaptiveGrowAndCommit": self.WrapperAdaptiveGrowAndCommit()}
-
+            "WrapperAdaptiveGrowAndCommit": self.WrapperAdaptiveGrowAndCommit(),
+            "GradCoverageReport": self.GradCoverageReport(),
+            "LossDecreasesWithHebbToggle": self.LossDecreasesWithHebbToggle(),
+            "HebbianMemoryLifecycle": self.HebbianMemoryLifecycle(),
+            "WrapperKeepsBaseEval": self.WrapperKeepsBaseEval(),
+            "SmallBatchSafety": self.SmallBatchSafety(),}
         passed = sum(1 for v in results.values() if v)
         print(f"\nPerception module tests (with wrapper): {passed}/{len(results)} passed.")
         return results
