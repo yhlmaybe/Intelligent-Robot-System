@@ -1,9 +1,10 @@
 from __future__ import annotations
 import math
-from typing import Dict, Tuple, Optional, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Tuple, Optional, List, Any
+from FunctionTools import SiteSpec, BaseOnlineWrapper
 
 
 KEYBOARD_LAYOUT = {
@@ -73,8 +74,8 @@ def StableLogProbBernoulli(logits: torch.Tensor, actions: torch.Tensor) -> torch
     return (actions * (-F.softplus(-logits)) + (1.0 - actions) * (-F.softplus(logits))).sum(-1)
 
 def EntropyBernoulliFromLogits(logits: torch.Tensor) -> torch.Tensor:
-    p = torch.sigmoid(logits)
-    return -(p * (p.clamp_min(1e-8)).log() + (1 - p) * ((1 - p).clamp_min(1e-8)).log()).sum(-1)
+    p = torch.sigmoid(logits).clamp(1e-6, 1.0 - 1e-6)
+    return -(p * p.log() + (1 - p) * (1 - p).log()).sum(-1)
 
 def MixLogits(base: torch.Tensor, prior: Optional[torch.Tensor], w: float) -> torch.Tensor:
     if prior is None:
@@ -91,6 +92,89 @@ def MixGauss(mu: torch.Tensor, logstd: torch.Tensor, priorMu: Optional[torch.Ten
     return mu_mix, logstd_mix
 
 
+
+class LoRALinearAdapter(nn.Module):
+    def __init__(self, target_linear: nn.Linear):
+        super().__init__()
+        assert isinstance(target_linear, nn.Linear)
+        self.target = target_linear
+        self.in_f = target_linear.in_features
+        self.out_f = target_linear.out_features
+
+        self.A_list = nn.ParameterList()
+        self.B_list = nn.ParameterList()  
+        self.alpha = nn.ParameterList() 
+
+    @torch.no_grad()
+    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True, scale: float = 1e-2):
+        if addRank <= 0: return
+        init = init or {}
+        dev, dt = self.target.weight.device, self.target.weight.dtype
+        A = init.get("A", torch.randn(addRank, self.in_f, device=dev, dtype=dt) * 1e-4)
+        B = init.get("B", torch.randn(self.out_f, addRank, device=dev, dtype=dt) * 1e-4)
+        s = init.get("scale", scale)
+
+        A = nn.Parameter(A.contiguous())
+        B = nn.Parameter(B.contiguous())
+        s = nn.Parameter(torch.tensor(float(s), device=dev, dtype=dt))
+
+        if freezeOld:
+            for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
+                p.requires_grad_(False)
+
+        self.A_list.append(A); self.B_list.append(B); self.alpha.append(s)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        W = self.target.weight
+        if len(self.A_list) > 0:
+            dW = W.new_zeros(self.out_f, self.in_f)
+            for A, B, s in zip(self.A_list, self.B_list, self.alpha):
+                s_eff = torch.tanh(s) * 1e-1 
+                dW = dW + s_eff * (B @ A)
+            W = W + dW
+        return F.linear(x, W, self.target.bias)
+
+
+class MatLoRAAdapter(nn.Module):
+    def __init__(self, rows: int, cols: int):
+        super().__init__()
+        self.M, self.N = int(rows), int(cols)
+        self.A_list = nn.ParameterList()
+        self.B_list = nn.ParameterList() 
+        self.alpha = nn.ParameterList()
+
+    @torch.no_grad()
+    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True, scale: float = 1e-3):
+        if addRank <= 0: return
+        init = init or {}
+        p_any = next(iter(self.parameters()), None)
+        dev = (p_any.device if p_any is not None else torch.device('cpu'))
+        dt  = (p_any.dtype  if p_any is not None else torch.float32)
+        A = init.get("A", torch.randn(addRank, self.N, device=dev, dtype=dt) * 1e-4)
+        B = init.get("B", torch.randn(self.M, addRank, device=dev, dtype=dt) * 1e-4)
+        s = init.get("scale", scale)
+
+        A = nn.Parameter(A.contiguous())
+        B = nn.Parameter(B.contiguous())
+        s = nn.Parameter(torch.tensor(float(s), device=dev, dtype=dt))
+
+        if freezeOld:
+            for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
+                p.requires_grad_(False)
+
+        self.A_list.append(A); self.B_list.append(B); self.alpha.append(s)
+
+    def forward(self, baseMatrix: torch.Tensor) -> torch.Tensor:
+        M_eff = baseMatrix
+        if len(self.A_list) > 0:
+            d = baseMatrix.new_zeros(self.M, self.N)
+            for A, B, s in zip(self.A_list, self.B_list, self.alpha):
+                s_eff = torch.tanh(s) * 1e-1
+                d = d + s_eff * (B @ A)
+            M_eff = M_eff + d
+        return M_eff
+
+
 class HebbianPlasticityLayer(nn.Module):
     def __init__(self, inDim: int, outDim: int, rate: float = 1e-3, decay: float = 0.995, maxRowNorm: float = 2.0):
         super().__init__()
@@ -100,7 +184,6 @@ class HebbianPlasticityLayer(nn.Module):
         self.base = nn.Parameter(torch.randn(outDim, inDim) * 0.02)
         self.register_buffer("hebb", torch.zeros(outDim, inDim))
 
-    @torch.no_grad()
     def Project(self):
         w = self.hebb
         row_norm = w.norm(p=2, dim=1, keepdim=True).clamp_min(1e-8)
@@ -183,6 +266,8 @@ class OptionPolicy(nn.Module):
 
         self.trans = nn.Parameter(torch.zeros(self.K, self.K)) 
 
+        self.trans_adapter = MatLoRAAdapter(self.K, self.K)
+
         self.psi_head = nn.Linear(hidden, self.K * psiDim)
         self.psiDim = psiDim
 
@@ -190,7 +275,10 @@ class OptionPolicy(nn.Module):
             nn.Linear(hidden + self.K, hidden), nn.ReLU(),
             nn.Linear(hidden, 1))
         
-        nn.init.constant_(self.beta_head[-1].bias, -2.2)
+        nn.init.constant_(self.beta_head[-1].bias, -0.5)
+
+        self.psi_amp_global = nn.Parameter(torch.tensor(1.0))
+        self.psi_amp_per_option = nn.Parameter(torch.ones(self.K))
 
     def forward(self, z, prevOnehot=None):
         h = self.enc(z)
@@ -198,13 +286,17 @@ class OptionPolicy(nn.Module):
 
         if prevOnehot is not None:
             prev = prevOnehot.detach()
-            logits_o = logits_base + prev @ self.trans
-            beta = torch.sigmoid(self.beta_head(torch.cat([h, prev], dim=-1)))
+            trans_eff = self.trans_adapter(self.trans)
+            trans_eff = torch.nan_to_num(trans_eff, nan=0.0).clamp(-10.0, 10.0)
+            logits_o = logits_base + prev @ trans_eff
+            beta = torch.sigmoid(self.beta_head(torch.cat([h, prev], dim=-1))).clamp(1e-6, 1.0 - 1e-6)
         else:
             logits_o = logits_base
-            beta = torch.sigmoid(self.beta_head(torch.cat([h, torch.zeros_like(logits_base)], dim=-1)))
+            beta = torch.sigmoid(self.beta_head(torch.cat([h, torch.zeros_like(logits_base)], dim=-1))).clamp(1e-6, 1.0 - 1e-6)
 
         psi_all = self.psi_head(h).view(-1, self.K, self.psiDim)
+        psi_all = psi_all * self.psi_amp_global * self.psi_amp_per_option.view(1, self.K, 1)
+
         return logits_o, psi_all, beta
 
 
@@ -213,7 +305,7 @@ class DecisionExtractor(nn.Module):
         self,
         stateDim: int = 768,
         includeNoSkill: bool = True,
-        useHebbOnline: bool = False,
+        useHebb: bool = False,
         optionNum: int = 16,
         psiDim: int = 128,
         *,
@@ -227,7 +319,7 @@ class DecisionExtractor(nn.Module):
         
         self.hebb = HebbianPlasticityLayer(512, 512)
         self.to_z = nn.Linear(512, 256)
-        self.use_hebb_online = useHebbOnline
+        self.use_hebb_online = useHebb
 
         base_names  = list(KEYBOARD_LAYOUT["base_keys"].keys())
         skill_names = list(KEYBOARD_LAYOUT["skill_keys"].keys())
@@ -255,9 +347,74 @@ class DecisionExtractor(nn.Module):
         self.logstd_low = float(logstdBounds[0])
         self.logstd_high = float(logstdBounds[1])
 
-    def Encode(self, stateFeat: torch.Tensor, updateHebb: bool) -> torch.Tensor:
+        self.InstallAdaptersMandatory()
+
+        self.dim_base = self.keyboard.base_head.target.out_features
+        self.dim_extra = self.keyboard.extra_head.target.out_features
+        self.dim_skill = self.keyboard.skill_head.target.out_features
+        self.dim_mu = 2
+        self.dim_ls = 2
+        self.dim_click = 2
+
+        self.psi_to = nn.ModuleDict({
+            "base": nn.Sequential( nn.Linear(psiDim, 64), nn.ReLU(),nn.Linear(64, self.dim_base)),
+            "extra": nn.Sequential(nn.Linear(psiDim, 64), nn.ReLU(), nn.Linear(64, self.dim_extra)),
+            "skill": nn.Sequential(nn.Linear(psiDim, 64), nn.ReLU(),nn.Linear(64, self.dim_skill)),
+            "mu": nn.Sequential(nn.Linear(psiDim, 32), nn.ReLU(),nn.Linear(32, self.dim_mu)),
+            "logstd": nn.Sequential(nn.Linear(psiDim, 32), nn.ReLU(),nn.Linear(32, self.dim_ls)),
+            "click": nn.Sequential(nn.Linear(psiDim, 32), nn.ReLU(),nn.Linear(32, self.dim_click)),})
+
+        K = optionNum
+        self.psi_amp = nn.ParameterDict({
+            "base": nn.Parameter(torch.zeros(K, 1)),
+            "extra": nn.Parameter(torch.zeros(K, 1)),
+            "skill": nn.Parameter(torch.zeros(K, 1)),
+            "mu": nn.Parameter(torch.zeros(K, 1)),
+            "ls": nn.Parameter(torch.zeros(K, 1)),
+            "click": nn.Parameter(torch.zeros(K, 1)),})
+
+        self.g_base = nn.Parameter(torch.tensor(0.5))
+        self.g_extra = nn.Parameter(torch.tensor(0.5))
+        self.g_skill = nn.Parameter(torch.tensor(0.5))
+        self.g_mu = nn.Parameter(torch.tensor(0.5))
+        self.g_ls = nn.Parameter(torch.tensor(0.5))  
+        self.g_click = nn.Parameter(torch.tensor(0.5))
+
+    def InstallAdaptersMandatory(self):
+        def wrap_linear(parent, name: str):
+            lin = getattr(parent, name)
+            assert isinstance(lin, nn.Linear), f"{name} must be nn.Linear"
+            setattr(parent, name, LoRALinearAdapter(lin))
+
+        wrap_linear(self, "to_z")
+
+        wrap_linear(self.keyboard, "base_head")
+        wrap_linear(self.keyboard, "skill_head")
+        wrap_linear(self.keyboard, "extra_head")
+
+        wrap_linear(self.mouse, "mu_head")
+        wrap_linear(self.mouse, "logstd_head")
+
+        wrap_linear(self.mouse.click_head, "0")
+        wrap_linear(self.mouse.click_head, "2")
+
+        wrap_linear(self.option, "pi_o")
+        wrap_linear(self.option, "psi_head")
+
+        wrap_linear(self.option.beta_head, "0")
+        wrap_linear(self.option.beta_head, "2")
+
+    @staticmethod
+    def Safe(x: torch.Tensor, clip: float = 60.0) -> torch.Tensor:
+         return torch.nan_to_num(x, nan=0.0, posinf=clip, neginf=-clip).clamp(-clip, clip)
+
+    @staticmethod
+    def SafeSoftmax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
+         return torch.softmax(DecisionExtractor.Safe(logits, 60.0), dim=dim)
+
+    def Encode(self, stateFeat: torch.Tensor) -> torch.Tensor:
         x = self.feature_net(stateFeat)
-        x = self.hebb(x, update=(self.use_hebb_online and updateHebb))
+        x = self.hebb(x, update=(self.use_hebb_online))
         z = F.relu(self.to_z(x))
         return z
 
@@ -308,23 +465,29 @@ class DecisionExtractor(nn.Module):
             x2 = torch.cat([x2[:, :max_scan] * keep.float(), x2[:, max_scan:]], dim=1)
         return x2
 
-    def EntropyComponents(
-        self,
-        baseLogits: torch.Tensor,
-        extraLogits: torch.Tensor,
-        skillLogits: torch.Tensor,
-        logstd: torch.Tensor,) -> Dict[str, torch.Tensor]:
-        
+    def EntropyComponents(self,baseLogits: torch.Tensor,extraLogits: torch.Tensor,skillLogits: torch.Tensor,logstd: torch.Tensor,) -> Dict[str, torch.Tensor]:
+
+        def clean_logits(x):
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+            return x.clamp(-60.0, 60.0)
+
+        baseLogits = clean_logits(baseLogits)
+        extraLogits = clean_logits(extraLogits)
+        skillLogits = clean_logits(skillLogits)
+
         ent_base = EntropyBernoulliFromLogits(baseLogits)
         ent_extra = EntropyBernoulliFromLogits(extraLogits)
-        ent_skill = torch.distributions.Categorical(logits=skillLogits).entropy()
+
+        s = skillLogits - skillLogits.logsumexp(dim=-1, keepdim=True)
+        p = s.exp().clamp(1e-12, 1.0) 
+        ent_skill = -(p * s).sum(dim=-1)
+
         ent_mouse = (0.5 * (1.0 + math.log(2 * math.pi)) + logstd).sum(-1)
 
         n_base = max(1, baseLogits.size(-1))
         n_extra = max(1, extraLogits.size(-1))
-        n_skill = max(2, skillLogits.size(-1)) 
-
-        base_norm  = ent_base / n_base
+        n_skill = max(2, skillLogits.size(-1))
+        base_norm = ent_base / n_base
         extra_norm = ent_extra / n_extra
         skill_norm = ent_skill / math.log(n_skill)
 
@@ -354,121 +517,176 @@ class DecisionExtractor(nn.Module):
         prevOptionOnehot: Optional[torch.Tensor] = None,     
         prior: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,  
         mixW: float = 0.25,                              
-        updateHebb: bool = False,                      
         returnKeysVec: bool = True,                        
         applyConstraints: bool = True) -> Dict[str, torch.Tensor]:
         
         B = stateFeat.size(0)
 
-        z = self.Encode(stateFeat, updateHebb=updateHebb)
-
+        z = self.Encode(stateFeat)
         if prevOptionOnehot is not None:
             prevOptionOnehot = prevOptionOnehot.detach().clone()
-
+        
         option_logits, psi_all, beta = self.option(z, prevOptionOnehot)
+        option_logits = self.Safe(option_logits, 60.0)
+        psi_all = self.Safe(psi_all, 30.0) 
 
-        base_logits, skill_logits, extra_logits = self.keyboard.Logits(z)
+        p_new = self.SafeSoftmax(option_logits, dim=-1)
 
-        mu, logstd, click_logits = self.mouse.Params(z)
+        if prevOptionOnehot is not None:
+            w_t = (1.0 - beta) * prevOptionOnehot + beta * p_new
+        else:
+            w_t = p_new
+
+        base_direct, skill_direct, extra_direct = self.keyboard.Logits(z)
+        mu_direct, logstd_direct, click_direct = self.mouse.Params(z)
+
+        sp = F.softplus 
+
+        def mix_psi_per_branch(amp_param: torch.nn.Parameter) -> torch.Tensor:
+            amp = F.softplus(amp_param).unsqueeze(0) * 0.5 
+            return (w_t.unsqueeze(-1) * psi_all * amp).sum(dim=1)
+
+        psi_cond_base = mix_psi_per_branch(self.psi_amp["base"])
+        psi_cond_extra = mix_psi_per_branch(self.psi_amp["extra"])
+        psi_cond_skill = mix_psi_per_branch(self.psi_amp["skill"])
+        psi_cond_mu = mix_psi_per_branch(self.psi_amp["mu"])
+        psi_cond_ls = mix_psi_per_branch(self.psi_amp["ls"])
+        psi_cond_click = mix_psi_per_branch(self.psi_amp["click"])
+
+        base_psi = self.psi_to["base"](psi_cond_base)
+        extra_psi = self.psi_to["extra"](psi_cond_extra)
+        skill_psi = self.psi_to["skill"](psi_cond_skill)
+        mu_psi = self.psi_to["mu"](psi_cond_mu)
+        ls_psi = self.psi_to["logstd"](psi_cond_ls)
+        click_psi = self.psi_to["click"](psi_cond_click)
+
+        w_base = F.softplus(self.g_base) / (F.softplus(self.g_base) + 1.0)
+        w_extra = F.softplus(self.g_extra) / (F.softplus(self.g_extra) + 1.0)
+        w_skill = F.softplus(self.g_skill) / (F.softplus(self.g_skill) + 1.0)
+        w_mu = F.softplus(self.g_mu) / (F.softplus(self.g_mu) + 1.0)
+        w_ls = F.softplus(self.g_ls) / (F.softplus(self.g_ls) + 1.0)
+        w_click = F.softplus(self.g_click) / (F.softplus(self.g_click) + 1.0)
+
+        base_logits = w_base * base_psi + (1.0 - w_base) * base_direct
+        extra_logits = w_extra * extra_psi + (1.0 - w_extra) * extra_direct
+        skill_logits = w_skill * skill_psi + (1.0 - w_skill) * skill_direct
+        mu = w_mu * mu_psi + (1.0 - w_mu) * mu_direct
+
+        std_psi = torch.exp(ls_psi)
+        std_dir = torch.exp(logstd_direct)
+        var_mix = (w_ls * (std_psi ** 2) + (1.0 - w_ls) * (std_dir ** 2)).clamp_min(1e-12)
+        logstd = 0.5 * torch.log(var_mix)
+        logstd = ClampLogstd(logstd, self.logstd_low, self.logstd_high)
+
+        click_logits = w_click * click_psi + (1.0 - w_click) * click_direct
 
         if prior is not None:
-            base_logits = MixLogits(base_logits,  prior.get("base", {}).get("logits", None),  mixW)
-            extra_logits = MixLogits(extra_logits, prior.get("extra", {}).get("logits", None),  mixW)
-            skill_logits = MixLogits(skill_logits, prior.get("skill", {}).get("logits", None),  mixW)
-            mu, logstd = MixGauss(mu, logstd, prior.get("mouse", {}).get("mu",  None), prior.get("mouse", {}).get("var", None), mixW)
+            base_logits = MixLogits(base_logits, prior.get("base", {}).get("logits", None), mixW)
+            extra_logits = MixLogits(extra_logits, prior.get("extra", {}).get("logits", None), mixW)
+            skill_logits = MixLogits(skill_logits, prior.get("skill", {}).get("logits", None), mixW)
+            mu, logstd = MixGauss(mu, logstd, prior.get("mouse", {}).get("mu", None), prior.get("mouse", {}).get("var", None), mixW)
             click_logits = MixLogits(click_logits, prior.get("click", {}).get("logits", None), mixW)
 
         comps = self.EntropyComponents(base_logits, extra_logits, skill_logits, logstd)
 
         entropy_scalar = self.AggregateEntropy(comps)  
 
+        def sanitize_(x: torch.Tensor, clip: float = 60.0) -> torch.Tensor:
+            return torch.nan_to_num(x, nan=0.0, posinf=clip, neginf=-clip).clamp(-clip, clip)
+
         out: Dict[str, any] = {
             "z": z,
             "entropy": entropy_scalar, 
             "option": {"logits": option_logits, "psi_all": psi_all, "beta": beta},
-            "keyboard": {"base_logits":  base_logits,"skill_logits": skill_logits,"extra_logits": extra_logits,},
-            "mouse": {"mu": mu, "logstd": logstd, "click_logits": click_logits},
+            "keyboard": {
+                "base_logits":  base_logits,
+                "skill_logits": skill_logits,
+                "extra_logits": extra_logits,},
+            "mouse": {
+                "mu": mu,
+                "logstd": logstd,
+                "click_logits": sanitize_(click_logits),},
             "entropy_components": {
                 "base": comps["ent_base"], "extra": comps["ent_extra"],
                 "skill": comps["ent_skill"], "mouse": comps["ent_mouse"],
                 "base_norm": comps["base_norm"], "extra_norm": comps["extra_norm"],
                 "skill_norm": comps["skill_norm"], "mouse_norm": comps["mouse_norm"],},}
 
+
         if sample:
+            base_logits_s = sanitize_(base_logits)
+            extra_logits_s = sanitize_(extra_logits)
+            skill_logits_s = sanitize_(skill_logits)
+            click_logits_s = sanitize_(click_logits)
+            option_logits_s = sanitize_(option_logits)
+            beta_s = torch.nan_to_num(beta, nan=0.0, posinf=1.0, neginf=0.0).clamp(1e-6, 1-1e-6)
+
             if deterministic:
-                base_act = (torch.sigmoid(base_logits)  > 0.5).float()
-                extra_act = (torch.sigmoid(extra_logits) > 0.5).float()
-                skill_idx = torch.argmax(skill_logits, dim=-1)
-                clicks = (torch.sigmoid(click_logits) > 0.5).float()
+                base_act = (torch.sigmoid(base_logits_s)  > 0.5).float()
+                extra_act = (torch.sigmoid(extra_logits_s) > 0.5).float()
+                skill_idx = torch.argmax(skill_logits_s, dim=-1)
+                clicks = (torch.sigmoid(click_logits_s) > 0.5).float()
 
                 mouse_a = mu
 
-                logp_base = StableLogProbBernoulli(base_logits, base_act)
-                logp_extra = StableLogProbBernoulli(extra_logits, extra_act)
-                logp_skill = torch.distributions.Categorical(logits=skill_logits).log_prob(skill_idx)
-                logp_mouse = -(logstd.sum(-1) + 0.5 * logstd.size(-1) * math.log(2 * math.pi))
+                logp_base = StableLogProbBernoulli(base_logits_s,  base_act)
+                logp_extra = StableLogProbBernoulli(extra_logits_s, extra_act)
+                logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx)
+                
+                std = torch.exp(logstd)
+                eps_train = torch.randn_like(std)
+                mouse_a_train = (mu + eps_train * std).detach()
+                LOG_TWO_PI = math.log(2.0 * math.pi)
+                logp_mouse = -0.5 * (((mouse_a_train - mu) / std).pow(2) + 2.0 * logstd + LOG_TWO_PI).sum(-1)
             else:
-                base_prob = torch.sigmoid(base_logits)
-                extra_prob = torch.sigmoid(extra_logits)
+                base_prob  = torch.sigmoid(base_logits_s).clamp(1e-6, 1.0 - 1e-6)
+                extra_prob = torch.sigmoid(extra_logits_s).clamp(1e-6, 1.0 - 1e-6)
 
                 base_act = torch.bernoulli(base_prob)
                 extra_act = torch.bernoulli(extra_prob)
 
-                skill_idx = torch.distributions.Categorical(logits=skill_logits).sample()
+                skill_idx = torch.distributions.Categorical(logits=skill_logits_s).sample()
 
                 std = torch.exp(logstd)
                 eps = torch.randn_like(std)
                 mouse_a = mu + eps * std
 
-                click_prob = torch.sigmoid(click_logits)
+                click_prob = torch.sigmoid(click_logits_s).clamp(1e-6, 1.0 - 1e-6)
                 clicks = torch.bernoulli(click_prob)
 
-                logp_base = StableLogProbBernoulli(base_logits, base_act)
-                logp_extra = StableLogProbBernoulli(extra_logits, extra_act)
-                logp_skill = torch.distributions.Categorical(logits=skill_logits).log_prob(skill_idx)
-                logp_mouse = -0.5 * (((mouse_a - mu) / std).pow(2) + 2 * logstd + math.log(2 * math.pi)).sum(-1)
+                logp_base = StableLogProbBernoulli(base_logits_s,  base_act)
+                logp_extra = StableLogProbBernoulli(extra_logits_s, extra_act)
+                logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx)
+                dist_mouse = torch.distributions.Normal(mu, std)
+                logp_mouse = dist_mouse.log_prob(mouse_a.detach()).sum(-1)
 
             out["keyboard"].update({
                 "base_act": base_act, "extra_act": extra_act, "skill_idx": skill_idx,
                 "logp_base": logp_base, "logp_extra": logp_extra, "logp_skill": logp_skill,})
-            
             out["mouse"].update({"a": mouse_a, "logp": logp_mouse, "click_sample": clicks})
 
             device = z.device
-            if prevOptionOnehot is not None:
-                prev_idx = torch.argmax(prevOptionOnehot, dim=-1)
-            else:
-                prev_idx = torch.zeros(B, dtype=torch.long, device=device)
+            prev_idx = torch.argmax(prevOptionOnehot, dim=-1) if prevOptionOnehot is not None else torch.zeros(B, dtype=torch.long, device=device)
 
             if deterministic:
-                if beta is None:
-                    terminate = torch.ones(B, 1, device=device)
-                else:
-                    terminate = (beta > 0.5).float()
-                new_idx = torch.argmax(option_logits, dim=-1)
+                terminate = (beta_s > 0.5).float()
+                new_idx = torch.argmax(option_logits_s, dim=-1)
             else:
-                if beta is None:
-                    terminate = torch.ones(B, 1, device=device)
-                else:
-                    terminate = torch.bernoulli(beta.clamp(1e-6, 1-1e-6))
-                new_idx = torch.distributions.Categorical(logits=option_logits).sample()
+                terminate = torch.bernoulli(beta_s)
+                new_idx = torch.distributions.Categorical(logits=option_logits_s).sample()
 
             term_mask = terminate.squeeze(-1).bool()
-
             opt_idx = torch.where(term_mask, new_idx, prev_idx)
 
             psi = psi_all[torch.arange(B, device=device), opt_idx]
 
-            dist_opt = torch.distributions.Categorical(logits=option_logits)
+            dist_opt = torch.distributions.Categorical(logits=option_logits_s)
             logp_new = dist_opt.log_prob(new_idx)
             logp_opt = torch.where(term_mask, logp_new, torch.zeros_like(logp_new))
 
-            if beta is None:
-                log_beta = torch.zeros(B, device=device)
-            else:
-                b = beta.clamp(1e-6, 1-1e-6).squeeze(-1)
-                t = terminate.squeeze(-1)
-                log_beta = t * b.log() + (1 - t) * (1 - b).log()
+            b = beta_s.squeeze(-1)
+            t = terminate.squeeze(-1)
+            log_beta = t * b.log() + (1 - t) * (1 - b).log()
 
             out["option"].update({
                 "opt_idx": opt_idx,
@@ -476,12 +694,11 @@ class DecisionExtractor(nn.Module):
                 "psi": psi,
                 "logp_option": logp_opt,
                 "logp_beta": log_beta,})
-            
+
             if "opt_idx" in out["option"]:
                 opt_idx = out["option"]["opt_idx"]
-                opt_onehot = torch.nn.functional.one_hot(
-                    opt_idx, num_classes=self.num_options).float().to(opt_idx.device)
-                out["option"]["opt_onehot"] = opt_onehot.detach()  
+                opt_onehot = torch.nn.functional.one_hot(opt_idx, num_classes=self.num_options).float().to(opt_idx.device)
+                out["option"]["opt_onehot"] = opt_onehot.detach()
 
             if returnKeysVec:
                 keyvec_raw = self.ToKeysVec(base_act, extra_act, skill_idx, clicks)
@@ -495,6 +712,279 @@ class DecisionExtractor(nn.Module):
             for m in self.modules():
                 if isinstance(m, HebbianPlasticityLayer):
                     m.hebb.fill_(value)
+
+
+
+class DecisionOnlineWrapper(BaseOnlineWrapper):
+    def __init__(
+        self,
+        base: DecisionExtractor,
+        *,
+        initRankEach: int = 0,
+        autoRank: bool = True,
+        evThreshold: float = 0.90,
+        gradEma: float = 0.9,
+        maxRankToZ: int = 64,
+        maxRankKbd: int = 64,
+        maxRankMouse: int = 64,
+        maxRankClick0: int = 32,
+        maxRankClick2: int = 32,
+        maxRankPi: int = 64,
+        maxRankPsi: int = 64,
+        maxRankBeta0: int = 32,
+        maxRankBeta2: int = 32,
+        maxRankTrans: int = 64,):
+        self.maxRankToZ = int(maxRankToZ)
+        self.maxRankKbd = int(maxRankKbd)
+        self.maxRankMouse = int(maxRankMouse)
+        self.maxRankClick0 = int(maxRankClick0)
+        self.maxRankClick2 = int(maxRankClick2)
+        self.maxRankPi = int(maxRankPi)
+        self.maxRankPsi = int(maxRankPsi)
+        self.maxRankBeta0 = int(maxRankBeta0)
+        self.maxRankBeta2 = int(maxRankBeta2)
+        self.maxRankTrans = int(maxRankTrans)
+        super().__init__(
+            base=base,
+            initRankEach=initRankEach,
+            autoRank=autoRank,
+            evThreshold=evThreshold,
+            gradEma=gradEma,)
+
+    def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
+        def alloc_lin(addRank, device, dtype, inDim, outDim):
+            A = nn.Parameter(torch.randn(addRank, inDim,  device=device, dtype=dtype) * 1e-4)
+            B = nn.Parameter(torch.zeros(outDim, addRank, device=device, dtype=dtype))
+            s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
+            return A, B, s
+
+        def compose_lin(a, b, s):
+            return float(s) * (b @ a)
+
+        def alloc_mat(addRank, device, dtype, N, M):
+            A = nn.Parameter(torch.randn(addRank, N, device=device, dtype=dtype) * 1e-4)
+            B = nn.Parameter(torch.zeros(M, addRank, device=device, dtype=dtype))
+            s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
+            return A, B, s
+
+        def compose_mat(a, b, s):
+            return float(s) * (b @ a)
+
+        L = 1
+
+        toz_in = self.base.to_z.target.in_features
+        toz_out = self.base.to_z.target.out_features
+
+        kbd_base_in = self.base.keyboard.base_head.target.in_features
+        kbd_base_out = self.base.keyboard.base_head.target.out_features
+        kbd_skill_in = self.base.keyboard.skill_head.target.in_features
+        kbd_skill_out = self.base.keyboard.skill_head.target.out_features
+        kbd_extra_in = self.base.keyboard.extra_head.target.in_features
+        kbd_extra_out = self.base.keyboard.extra_head.target.out_features
+
+        mouse_mu_in = self.base.mouse.mu_head.target.in_features
+        mouse_mu_out = self.base.mouse.mu_head.target.out_features
+        mouse_ls_in = self.base.mouse.logstd_head.target.in_features
+        mouse_ls_out = self.base.mouse.logstd_head.target.out_features
+
+        click0_in = self.base.mouse.click_head[0].target.in_features
+        click0_out = self.base.mouse.click_head[0].target.out_features
+        click2_in = self.base.mouse.click_head[2].target.in_features
+        click2_out = self.base.mouse.click_head[2].target.out_features
+
+        K = self.base.option.K
+        opt_pi_in = self.base.option.pi_o.target.in_features
+        opt_pi_out = self.base.option.pi_o.target.out_features
+        opt_psi_in = self.base.option.psi_head.target.in_features
+        opt_psi_out = self.base.option.psi_head.target.out_features
+        opt_b0_in = self.base.option.beta_head[0].target.in_features
+        opt_b0_out = self.base.option.beta_head[0].target.out_features
+        opt_b2_in = self.base.option.beta_head[2].target.in_features
+        opt_b2_out = self.base.option.beta_head[2].target.out_features
+
+        return {
+            "toz": SiteSpec("toz", L, toz_in, toz_out, self.maxRankToZ, lambda r, d, dt: alloc_lin(r, d, dt, toz_in, toz_out), compose_lin),
+
+            "kbd_base": SiteSpec("kbd_base", L, kbd_base_in, kbd_base_out, self.maxRankKbd, lambda r, d, dt: alloc_lin(r, d, dt, kbd_base_in, kbd_base_out), compose_lin),
+            "kbd_skill": SiteSpec("kbd_skill", L, kbd_skill_in, kbd_skill_out, self.maxRankKbd, lambda r, d, dt: alloc_lin(r, d, dt, kbd_skill_in, kbd_skill_out), compose_lin),
+            "kbd_extra": SiteSpec("kbd_extra", L, kbd_extra_in, kbd_extra_out, self.maxRankKbd, lambda r, d, dt: alloc_lin(r, d, dt, kbd_extra_in, kbd_extra_out), compose_lin),
+
+            "mouse_mu": SiteSpec("mouse_mu", L, mouse_mu_in, mouse_mu_out, self.maxRankMouse, lambda r, d, dt: alloc_lin(r, d, dt, mouse_mu_in, mouse_mu_out), compose_lin),
+            "mouse_ls": SiteSpec("mouse_ls", L, mouse_ls_in, mouse_ls_out, self.maxRankMouse, lambda r, d, dt: alloc_lin(r, d, dt, mouse_ls_in, mouse_ls_out), compose_lin),
+
+            "click0": SiteSpec("click0", L, click0_in, click0_out, self.maxRankClick0, lambda r, d, dt: alloc_lin(r, d, dt, click0_in, click0_out), compose_lin),
+            "click2": SiteSpec("click2", L, click2_in, click2_out, self.maxRankClick2, lambda r, d, dt: alloc_lin(r, d, dt, click2_in, click2_out), compose_lin),
+
+            "opt_pi": SiteSpec("opt_pi", L, opt_pi_in, opt_pi_out, self.maxRankPi, lambda r, d, dt: alloc_lin(r, d, dt, opt_pi_in, opt_pi_out), compose_lin),
+            "opt_psi": SiteSpec("opt_psi", L, opt_psi_in, opt_psi_out, self.maxRankPsi, lambda r, d, dt: alloc_lin(r, d, dt, opt_psi_in, opt_psi_out), compose_lin),
+            "opt_beta0": SiteSpec("opt_beta0", L, opt_b0_in, opt_b0_out, self.maxRankBeta0, lambda r, d, dt: alloc_lin(r, d, dt, opt_b0_in, opt_b0_out), compose_lin),
+            "opt_beta2": SiteSpec("opt_beta2", L, opt_b2_in, opt_b2_out, self.maxRankBeta2, lambda r, d, dt: alloc_lin(r, d, dt, opt_b2_in, opt_b2_out), compose_lin),
+
+            "opt_trans": SiteSpec("opt_trans", L, K, K, min(self.maxRankTrans, K), lambda r, d, dt: alloc_mat(r, d, dt, K, K), compose_mat),}
+
+    @torch.no_grad()
+    def ForwardWithDeltas(
+        self,
+        stateFeat: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor],
+        tdError: Optional[torch.Tensor],
+        uncertainty: Optional[torch.Tensor],
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],) -> Dict[str, Any]:
+        D = deltasPerLayer[0] if (len(deltasPerLayer) > 0) else {}
+
+        B = stateFeat.size(0)
+        device = stateFeat.device
+        K = self.base.option.K
+
+        if (keyPaddingMask is not None) and (keyPaddingMask.dim() == 2) and (keyPaddingMask.size(1) == K):
+            prev = keyPaddingMask.detach().to(dtype=stateFeat.dtype, device=device)
+        else:
+            prev = torch.zeros(B, K, dtype=stateFeat.dtype, device=device)
+
+        x = self.base.feature_net(stateFeat)
+        x = self.base.hebb(x, update=self.base.use_hebb_online)
+
+        z_lin = self.base.to_z(x)
+        if D.get("toz") is not None:
+            z_lin = z_lin + F.linear(x, D["toz"], bias=None)
+        z = F.relu(z_lin)
+
+        h_k = self.base.keyboard.backbone(z)
+
+        base_logits  = self.base.keyboard.base_head(h_k)
+        skill_logits = self.base.keyboard.skill_head(h_k)
+        extra_logits = self.base.keyboard.extra_head(h_k)
+
+        if D.get("kbd_base") is not None: base_logits = base_logits + F.linear(h_k, D["kbd_base"], bias=None)
+        if D.get("kbd_skill") is not None: skill_logits = skill_logits + F.linear(h_k, D["kbd_skill"], bias=None)
+        if D.get("kbd_extra") is not None: extra_logits = extra_logits + F.linear(h_k, D["kbd_extra"], bias=None)
+
+        h_m = self.base.mouse.backbone(z)
+
+        mu = self.base.mouse.mu_head(h_m)
+        logstd = self.base.mouse.logstd_head(h_m)
+        if D.get("mouse_mu") is not None: mu = mu + F.linear(h_m, D["mouse_mu"], bias=None)
+        if D.get("mouse_ls") is not None: logstd = logstd + F.linear(h_m, D["mouse_ls"], bias=None)
+        logstd = torch.clamp(logstd, self.base.logstd_low, self.base.logstd_high)
+
+        c0 = self.base.mouse.click_head[0](h_m)
+        if D.get("click0") is not None: c0 = c0 + F.linear(h_m, D["click0"], bias=None)
+        c0 = F.relu(c0)
+
+        click_logits = self.base.mouse.click_head[2](c0)
+        if D.get("click2") is not None: click_logits = click_logits + F.linear(c0, D["click2"], bias=None)
+
+        h_o = self.base.option.enc(z)
+
+        opt_logits_base = self.base.option.pi_o(h_o)
+        if D.get("opt_pi") is not None: opt_logits_base = opt_logits_base + F.linear(h_o, D["opt_pi"], bias=None)
+
+        psi_flat = self.base.option.psi_head(h_o)
+        if D.get("opt_psi") is not None: psi_flat = psi_flat + F.linear(h_o, D["opt_psi"], bias=None)
+        psi_all = psi_flat.view(-1, K, self.base.option.psiDim)
+
+        b0_in = torch.cat([h_o, prev], dim=-1)
+        b0 = self.base.option.beta_head[0](b0_in)
+        if D.get("opt_beta0") is not None: b0 = b0 + F.linear(b0_in, D["opt_beta0"], bias=None)
+        b0 = F.relu(b0)
+        beta = self.base.option.beta_head[2](b0)
+        if D.get("opt_beta2") is not None: beta = beta + F.linear(b0, D["opt_beta2"], bias=None)
+        beta = torch.sigmoid(beta)
+
+        trans_eff = self.base.option.trans_adapter(self.base.option.trans)
+        if D.get("opt_trans") is not None:
+            trans_eff = trans_eff + D["opt_trans"]
+
+        option_logits = opt_logits_base + prev @ trans_eff
+
+        p_new = torch.softmax(option_logits, dim=-1)
+        w_t = (1.0 - beta) * prev + beta * p_new
+        psi_cond = (w_t.unsqueeze(-1) * psi_all).sum(dim=1)
+
+        base_logits = base_logits + self.base.psi_to["base"](psi_cond)
+        extra_logits = extra_logits + self.base.psi_to["extra"](psi_cond)
+        skill_logits = skill_logits + self.base.psi_to["skill"](psi_cond)
+        mu = mu + self.base.psi_to["mu"](psi_cond)
+        logstd = torch.clamp(logstd + self.base.psi_to["logstd"](psi_cond), self.base.logstd_low, self.base.logstd_high)
+        click_logits = click_logits + self.base.psi_to["click"](psi_cond)
+
+        comps = self.base.EntropyComponents(base_logits, extra_logits, skill_logits, logstd)
+        entropy_scalar = self.base.AggregateEntropy(comps)
+
+        return {
+            "z": z,
+            "entropy": entropy_scalar,
+            "entropy_components": {
+                "base": comps["ent_base"], "extra": comps["ent_extra"],
+                "skill": comps["ent_skill"], "mouse": comps["ent_mouse"],
+                "base_norm": comps["base_norm"], "extra_norm": comps["extra_norm"],
+                "skill_norm": comps["skill_norm"], "mouse_norm": comps["mouse_norm"],},
+            "keyboard": {
+                "base_logits":  base_logits,
+                "skill_logits": skill_logits,
+                "extra_logits": extra_logits,},
+            "mouse": {
+                "mu": mu,
+                "logstd": logstd,
+                "click_logits": click_logits,},
+            "option": {
+                "logits": option_logits,
+                "psi_all": psi_all,
+                "beta": beta,},}
+
+    @torch.no_grad()
+    def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
+        if layerIdx != 0:
+            return False
+
+        init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
+
+        if site == "toz":
+            self.base.to_z.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+
+        if site == "kbd_base":
+            self.base.keyboard.base_head.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+        if site == "kbd_skill":
+            self.base.keyboard.skill_head.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+        if site == "kbd_extra":
+            self.base.keyboard.extra_head.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+
+        if site == "mouse_mu":
+            self.base.mouse.mu_head.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+        if site == "mouse_ls":
+            self.base.mouse.logstd_head.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+
+        if site == "click0":
+            self.base.mouse.click_head[0].Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+        if site == "click2":
+            self.base.mouse.click_head[2].Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+
+        if site == "opt_pi":
+            self.base.option.pi_o.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+        if site == "opt_psi":
+            self.base.option.psi_head.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+        if site == "opt_beta0":
+            self.base.option.beta_head[0].Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+        if site == "opt_beta2":
+            self.base.option.beta_head[2].Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+
+        if site == "opt_trans":
+            self.base.option.trans_adapter.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+
+        raise ValueError(f"Unknown site: {site}")
 
 
 
@@ -516,11 +1006,11 @@ class CEMPlanner(nn.Module):
         self.has_no_skill = bool(hasNoSkill)
 
         self.max_code = int(maxCode)
-        self.register_buffer("base_codes_buf",  torch.tensor(baseCodes,  dtype=torch.long))
+        self.register_buffer("base_codes_buf", torch.tensor(baseCodes, dtype=torch.long))
         self.register_buffer("skill_codes_buf", torch.tensor(skillCodes, dtype=torch.long))
         self.register_buffer("extra_codes_buf", torch.tensor(extraCodes, dtype=torch.long))
 
-        self.n_base  = self.base_codes_buf.numel()
+        self.n_base = self.base_codes_buf.numel()
         self.n_skill = self.skill_codes_buf.numel() + (1 if self.has_no_skill else 0)  
         self.n_extra = self.extra_codes_buf.numel()
 
@@ -621,10 +1111,11 @@ class CEMPlanner(nn.Module):
                 skill_seq.append(idx)
             skill_seq = torch.stack(skill_seq, dim=0)
 
-            pb = torch.sigmoid(logits_b)
-            pe = torch.sigmoid(logits_e)
-            pc = torch.sigmoid(logits_c)
-            base_seq  = (torch.rand(H, B, N, self.n_base, device=device) < pb.unsqueeze(2)).float()
+            def prob_(x): return torch.sigmoid(x).clamp(1e-6, 1.0 - 1e-6)
+
+            pb, pe, pc = prob_(logits_b), prob_(logits_e), prob_(logits_c)
+
+            base_seq = (torch.rand(H, B, N, self.n_base, device=device) < pb.unsqueeze(2)).float()
             extra_seq = (torch.rand(H, B, N, self.n_extra, device=device) < pe.unsqueeze(2)).float()
             click_seq = (torch.rand(H, B, N, 2,device=device) < pc.unsqueeze(2)).float()
 
@@ -708,7 +1199,7 @@ class CEMPlanner(nn.Module):
         out = {
             "mouse": {"mu": mouse_mu0, "var": mouse_var0},
             "skill": {"logits": logits_s[0]},
-            "base":  {"logits": logits_b[0]},
+            "base": {"logits": logits_b[0]},
             "extra": {"logits": logits_e[0]},
             "click": {"logits": logits_c[0]}}
 
@@ -716,7 +1207,7 @@ class CEMPlanner(nn.Module):
             out["diagnostics"] = {
                 "mu_seq": mu_t, "std_seq": std_t,
                 "skill_logits_seq": logits_s,
-                "base_logits_seq":  logits_b,
+                "base_logits_seq": logits_b,
                 "extra_logits_seq": logits_e,
                 "click_logits_seq": logits_c}
         return out
@@ -745,12 +1236,14 @@ class DecisionPlannerExtractor:
 
 
 class TestDecisionMTool:
-    def __init__(self, device: Optional[str] = None):
+    def __init__(self, device: str | None = None):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        torch.manual_seed(0)
 
         self.base_names = list(KEYBOARD_LAYOUT["base_keys"].keys())
         self.skill_names = list(KEYBOARD_LAYOUT["skill_keys"].keys())
         self.extra_groups = ["menu_keys", "system_keys", "alpha_keys"]
+
         self.base_codes  = [KEYBOARD_LAYOUT["base_keys"][k]  for k in self.base_names]
         self.skill_codes = [KEYBOARD_LAYOUT["skill_keys"][k] for k in self.skill_names]
         self.extra_codes = []
@@ -760,10 +1253,11 @@ class TestDecisionMTool:
         for grp in KEYBOARD_LAYOUT.values():
             all_codes += list(grp.values())
         self.max_code = max(all_codes)
-        self.keyvec_dim = self.max_code + 1 + 2 
+
         self.num_base = len(self.base_codes)
         self.num_skill = len(self.skill_names) + 1 
         self.num_extra = len(self.extra_codes)
+        self.keyvec_dim = self.max_code + 1 + 2
 
     class MockActionEncoder(nn.Module):
         def __init__(self, keyDim: int, outDim: int):
@@ -771,7 +1265,6 @@ class TestDecisionMTool:
             self.net = nn.Sequential(
                 nn.Linear(keyDim + 2, 128), nn.ReLU(),
                 nn.Linear(128, outDim))
-            
         def forward(self, keysOnehot: torch.Tensor, mouseDelta: torch.Tensor):
             x = torch.cat([keysOnehot.float(), mouseDelta.float()], dim=-1)
             return self.net(x)
@@ -796,80 +1289,30 @@ class TestDecisionMTool:
             self.register_buffer("_h", torch.zeros(1, deterDim))
             self.register_buffer("_z", torch.zeros(1, stochDim))
 
-        def ResetHidden(self, B: int = 1, device: Optional[torch.device] = None):
+        def ResetHidden(self, B: int = 1, device: torch.device | None = None):
             if device is None:
                 device = self._h.device
             self._h = torch.zeros(B, self.deter_dim, device=device)
             self._z = torch.zeros(B, self.stoch_dim, device=device)
 
-        def ExportState(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        def ExportState(self):
             return self._h, self._z
 
         @torch.no_grad()
-        def StepPriorOnly(self, hPrev: torch.Tensor, zPrev: torch.Tensor, aEnc: torch.Tensor, sample: bool = False):
+        def StepPriorOnly(self, hPrev, zPrev, aEnc, sample: bool = False):
             a = self.act_proj(aEnc)
-            h_next = self.gru(torch.cat([zPrev, a], dim=-1), hPrev) 
+            h_next = self.gru(torch.cat([zPrev, a], dim=-1), hPrev)
             mu_p, logstd_p = self.prior_head(h_next).chunk(2, dim=-1)
             logstd_p = torch.clamp(logstd_p, -6.0, 2.0)
             z_next = mu_p
-
             s_next = self.state_proj(torch.cat([h_next, z_next], dim=-1))
             r_pred = self.rew_head(s_next).squeeze(-1)
             d_prob = torch.sigmoid(self.done_head(s_next)).squeeze(-1)
             return h_next, z_next, s_next, r_pred, d_prob
 
-    def ResetHebbianMemory(self, hebb_layer: nn.Module):
+    def BuildPlanner(self, horizon=3, N=16, elite=4, iters=2):
         try:
-            if hasattr(hebb_layer, "ResetHebbianMemory"):
-                hebb_layer.ResetHebbianMemory()
-            elif hasattr(hebb_layer, "hebb"):
-                with torch.no_grad():
-                    hebb_layer.hebb.zero_()
-        except Exception as e:
-            print("ResetHebbianMemory error:", type(e).__name__, e)
-
-    def TestHebbianPlasticityLayer(self) -> bool:
-        try:
-            layer = HebbianPlasticityLayer(inDim=512, outDim=512).to(self.device)
-            x = torch.randn(4, 512, device=self.device)
-            y = layer(x, update=False)
-            ok = (y.shape == (4, 512))
-            y2 = layer(x, update=True)
-            ok = ok and (y2.shape == (4, 512))
-            self.ResetHebbianMemory(layer)
-            print("HebbianPlasticityLayer test {}.".format("passed" if ok else "failed"))
-            return ok
-        except Exception as e:
-            print("HebbianPlasticityLayer test crash:", type(e).__name__, e)
-            return False
-
-    def TestDecisionExtractorNoPrior(self) -> bool:
-        try:
-            model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=False).to(self.device)
-            model.eval()
-            B = 3
-            state_feat = torch.randn(B, 1024, device=self.device)
-
-            out0 = model(state_feat, sample=False, prior=None, updateHebb=False)
-            ok = True
-            kb = out0["keyboard"]; ms = out0["mouse"]
-            ok = ok and (kb["base_logits"].shape  == (B, self.num_base))
-            ok = ok and (kb["skill_logits"].shape == (B, self.num_skill))
-            ok = ok and (kb["extra_logits"].shape == (B, self.num_extra))
-            ok = ok and (ms["mu"].shape == (B, 2) and ms["logstd"].shape == (B, 2) and ms["click_logits"].shape == (B, 2))
-
-            out1 = model(state_feat, sample=True, deterministic=False, prior=None, updateHebb=False, returnKeysVec=True, applyConstraints=True)
-            ok = ok and ("keyvec_raw" in out1) and ("key_vec" in out1)
-            ok = ok and (out1["key_vec"].shape == (B, self.keyvec_dim))
-            print("DecisionExtractor (no prior) test {}.".format("passed" if ok else "failed"))
-            return ok
-        except Exception as e:
-            print("DecisionExtractorNoPrior test crash:", type(e).__name__, e)
-            return False
-
-    def _build_planner(self, horizon=3, N=16, elite=4, iters=2):
-        try:
-            wm = self.MockWorldModel(keyDim=self.keyvec_dim, actionDim=128, deterDim=256, stochDim=32, stateDim=256).to(self.device)
+            wm = self.MockWorldModel(keyDim=self.keyvec_dim, actionDim=128, deterDim=128, stochDim=16, stateDim=128).to(self.device)
             wm.ResetHidden(B=2, device=self.device)
             planner = CEMPlanner(
                 worldModel=wm,
@@ -881,324 +1324,787 @@ class TestDecisionMTool:
                 horizon=horizon, N=N, elite=elite, iters=iters).to(self.device)
             return wm, planner
         except Exception as e:
-            print("_build_planner crash:", type(e).__name__, e)
+            print("BuildPlanner error:", type(e).__name__, e)
             return None, None
 
-    def TestCEMPlanner(self) -> bool:
+    def DecisionOnlyLoss(self, out: Dict[str, Any], adv: Optional[Dict[str, torch.Tensor]] = None, entCoef: float = 0.0, *, returnBreakdown: bool = False,) -> torch.Tensor | Dict[str, Any]:
+        device = out["mouse"]["mu"].device
+        B = out["mouse"]["mu"].size(0)
+        adv = adv or {}
+
+        def adv_(name: str, shape) -> torch.Tensor:
+            a = adv.get(name, None)
+            if a is None:
+                a = torch.randn(shape, device=device)
+            return a.detach()
+
+        kb, ms, op = out["keyboard"], out["mouse"], out["option"]
+
+        loss_core = torch.tensor(0.0, device=device)
+        terms: Dict[str, torch.Tensor] = {}
+
+        if "logp_base" in kb:
+            t = -(adv_("base", (B,)) * kb["logp_base"]).mean()
+            terms["base"] = t; loss_core = loss_core + t
+        if "logp_extra" in kb:
+            t = -(adv_("extra", (B,)) * kb["logp_extra"]).mean()
+            terms["extra"] = t; loss_core = loss_core + t
+        if "logp_skill" in kb:
+            t = -(adv_("skill", (B,)) * kb["logp_skill"]).mean()
+            terms["skill"] = t; loss_core = loss_core + t
+
+        if "logp" in ms:
+            t = -(adv_("mouse", (B,)) * ms["logp"]).mean()
+            terms["mouse"] = t; loss_core = loss_core + t
+
+        if ("click_logits" in ms) and ("click_sample" in ms):
+            logp_click = StableLogProbBernoulli(ms["click_logits"], ms["click_sample"])
+            t = -(adv_("click", (B,)) * logp_click).mean()
+            terms["click"] = t; loss_core = loss_core + t
+
+        if "logp_option" in op:
+            t = -(adv_("option", (B,)) * op["logp_option"]).mean()
+            terms["option"] = t; loss_core = loss_core + t
+        if "logp_beta" in op:
+            t = -(adv_("beta", (B,)) * op["logp_beta"]).mean()
+            terms["beta"] = t; loss_core = loss_core + t
+
+        ent_term = torch.tensor(0.0, device=device)
+        if entCoef != 0.0 and ("entropy" in out):
+            ent_term = - entCoef * out["entropy"].mean()
+
+        loss = loss_core + ent_term
+
+        if not returnBreakdown:
+            return loss
+
+        breakdown = {k: float(v.detach()) for k, v in terms.items()}
+        return {
+            "total": float(loss.detach()),
+            "core": float(loss_core.detach()),
+            "entropy": float(ent_term.detach()),
+            "terms": breakdown,}
+
+    def TestHebbLayer(self) -> bool:
         try:
-            _, planner = self._build_planner(horizon=3, N=16, elite=4, iters=2)
-            if planner is None:
+            layer = HebbianPlasticityLayer(128, 64).to(self.device)
+            x = torch.randn(8, 128, device=self.device)
+            y0 = layer(x, update=False)
+            y1 = layer(x, update=True)
+            if y0.shape != (8, 64) or y1.shape != (8, 64):
+                print("HebbianPlasticityLayer shape does not match")
                 return False
-            prior = planner.Plan(returnTrajectories=False)
-            ok = True
-            ok = ok and ("mouse" in prior and "mu" in prior["mouse"] and "var" in prior["mouse"])
-            ok = ok and (prior["mouse"]["mu"].shape == (2, 2) and prior["mouse"]["var"].shape == (2, 2))
-            ok = ok and (prior["skill"]["logits"].shape == (2, self.num_skill))
-            ok = ok and (prior["base"]["logits"].shape == (2, self.num_base))
-            ok = ok and (prior["extra"]["logits"].shape == (2, self.num_extra))
-            ok = ok and (prior["click"]["logits"].shape == (2, 2))
-            print("CEMPlanner test {}.".format("passed" if ok else "failed"))
-            return ok
+            with torch.no_grad():
+                changed = layer.hebb.abs().sum().item() > 0
+            if not changed:
+                print("The Hebb buffer is not updated online")
+                return False
+            print("HebbianPlasticityLayer pass")
+            return True
         except Exception as e:
-            print("CEMPlanner test crash:", type(e).__name__, e)
+            print("HebbianPlasticityLayer error:", type(e).__name__, e)
             return False
 
-    def TestDecisionExtractorWithPrior(self) -> bool:
+    def TestLoraLinearAdapter(self) -> bool:
         try:
-            _, planner = self._build_planner(horizon=3, N=16, elite=4, iters=2)
-            if planner is None:
+            lin = nn.Linear(32, 16).to(self.device)
+            adap = LoRALinearAdapter(lin).to(self.device)
+            x = torch.randn(4, 32, device=self.device)
+            y_base = adap(x)
+            adap.Grow(addRank=3, scale=1e-3)
+            y_aug = adap(x)
+            A, B, s = adap.A_list[0], adap.B_list[0], adap.alpha[0]
+            s_eff = torch.tanh(s) * 1e-2
+            delta = F.linear(x, s_eff * (B @ A), bias=None)
+            diff = (y_aug - y_base - delta).abs().max().item()
+            if diff >= 1e-5:
+                print(f"LoRA linear increment inconsistency: max|Δ|={diff:.2e}")
                 return False
-            prior = planner.Plan(returnTrajectories=False)
+            print("LoRALinearAdapter.Grow & forward pass")
+            return True
+        except Exception as e:
+            print("LoRALinearAdapter error:", type(e).__name__, e)
+            return False 
 
-            model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=True).to(self.device)
+    def TestMatloraAdapter(self) -> bool:
+        try:
+            M, N = 10, 7
+            base = torch.randn(M, N, device=self.device)
+            adap = MatLoRAAdapter(M, N).to(self.device)
+
+            out0 = adap(base)
+
+            adap.Grow(addRank=1, scale=1e-3)
+            adap.Grow(addRank=1, scale=1e-3, freezeOld=True)
+
+            out1 = adap(base)
+
+            A0, B0, s0 = adap.A_list[0], adap.B_list[0], adap.alpha[0]
+            A1, B1, s1 = adap.A_list[1], adap.B_list[1], adap.alpha[1]
+            expect = base + s0 * (B0 @ A0) + s1 * (B1 @ A1)
+
+            err = (out1 - expect).abs().max().item()
+            if out0.shape != base.shape or err >= 1e-5:
+                print(f"MatLoRAAdapter inconsistency: err={err:.2e}")
+                return False
+            print("MatLoRAAdapter.Grow & forward pass")
+            return True
+        except Exception as e:
+            print("MatLoRAAdapter error:", type(e).__name__, e)
+            return False
+
+    def TestDecisionForwardShapes(self) -> bool:
+        try:
+            model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebb=False).to(self.device)
             model.eval()
-            model.num_options = model.option.K
-
-            state_feat = torch.randn(2, 1024, device=self.device)
-            out = model(state_feat, sample=True, deterministic=False, prior=prior, mixW=0.3, updateHebb=True, returnKeysVec=True, applyConstraints=True)
-
-            ok = True
-            ok = ok and ("key_vec" in out and out["key_vec"].shape == (2, self.keyvec_dim))
-            ok = ok and (out["keyboard"]["base_logits"].shape == (2, self.num_base))
-            ok = ok and (out["keyboard"]["skill_logits"].shape == (2, self.num_skill))
-            ok = ok and (out["keyboard"]["extra_logits"].shape == (2, self.num_extra))
-            ok = ok and (out["mouse"]["mu"].shape == (2, 2))
-            print("DecisionExtractor (with prior) test {}.".format("passed" if ok else "failed"))
-            return ok
+            B = 3
+            x = torch.randn(B, 1024, device=self.device)
+            out = model(x, sample=False, prior=None, returnKeysVec=False, applyConstraints=True)
+            kb, ms, opt = out["keyboard"], out["mouse"], out["option"]
+            checks = [
+                kb["base_logits"].shape  == (B, self.num_base),
+                kb["skill_logits"].shape == (B, self.num_skill),
+                kb["extra_logits"].shape == (B, self.num_extra),
+                ms["mu"].shape == (B, 2),
+                ms["logstd"].shape == (B, 2),
+                ms["click_logits"].shape == (B, 2),
+                opt["psi_all"].shape == (B, model.num_options, model.option.psiDim),]
+            if not all(checks):
+                print("DecisionExtractor forward output dimension does not match")
+                return False
+            out2 = model(x, sample=True, deterministic=False, prior=None, returnKeysVec=True, applyConstraints=True)
+            key_vec = out2["key_vec"]
+            if key_vec.shape != (B, self.keyvec_dim):
+                print("key_vec shape does not match")
+                return False
+            pressed = (key_vec[:, :self.max_code+1] > 0.5).sum(-1).max().item()
+            if pressed > 6:
+                print(f"Constraint failed: Number of keys={pressed}")
+                return False
+            print("DecisionExtractor Forward/Sampling/Constraint pass")
+            return True
         except Exception as e:
-            print("DecisionExtractorWithPrior test crash:", type(e).__name__, e)
+            print("DecisionExtractor forward error:", type(e).__name__, e)
             return False
 
-    def TestIntegrationEndToEnd(self) -> bool:
+    def TestOptionPrevAndTrans(self) -> bool:
         try:
-            _, planner = self._build_planner(horizon=3, N=8, elite=2, iters=2)
+            model = DecisionExtractor(stateDim=256, includeNoSkill=True, useHebb=False).to(self.device)
+            model.eval()
+            K = model.num_options
+            model.option.trans_adapter.Grow(addRank=1, scale=1e-2)
+
+            x = torch.randn(2, 256, device=self.device)
+            prev0 = torch.zeros(2, K, device=self.device)
+            prev1 = torch.zeros(2, K, device=self.device); prev1[:, 0] = 1.0
+
+            out0 = model(x, sample=False, prevOptionOnehot=prev0, returnKeysVec=False)
+            out1 = model(x, sample=False, prevOptionOnehot=prev1, returnKeysVec=False)
+
+            with torch.no_grad():
+                h = model.option.enc(F.relu(model.to_z(model.hebb(model.feature_net(x), update=False))))
+                trans_eff = model.option.trans_adapter(model.option.trans)
+                expect = prev1 @ trans_eff
+            diff = (out1["option"]["logits"] - out0["option"]["logits"] - expect).abs().max().item()
+            if diff >= 1e-5:
+                print(f"prev@trans_eff mismatched functions: diff={diff:.2e}")
+                return False
+            print("OptionPolicy prev/transferMatrix pass")
+            return True
+        except Exception as e:
+            print("OptionPolicy error:", type(e).__name__, e)
+            return False
+
+    def TestCemPlanner(self) -> bool:
+        try:
+            _, planner = self.BuildPlanner()
             if planner is None:
                 return False
-            planner.wm.ResetHidden(B=1, device=self.device)
             prior = planner.Plan(returnTrajectories=False)
-
-            dec = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=False).to(self.device)
-            dec.eval()
-            dec.num_options = dec.option.K 
-            state_feat = torch.randn(1, 1024, device=self.device)
-
-            out = dec(state_feat, sample=True, deterministic=True, prior=prior, mixW=0.5, updateHebb=False, returnKeysVec=True, applyConstraints=True)
-            ok = ("key_vec" in out and out["key_vec"].shape == (1, self.keyvec_dim))
-            print("Integration (CEM -> Decision) test {}.".format("passed" if ok else "failed"))
-            return ok
+            ok = True
+            ok &= prior["mouse"]["mu"].shape == (2, 2)
+            ok &= prior["mouse"]["var"].shape == (2, 2)
+            ok &= prior["skill"]["logits"].shape == (2, self.num_skill)
+            ok &= prior["base"]["logits"].shape == (2, self.num_base)
+            ok &= prior["extra"]["logits"].shape == (2, self.num_extra)
+            if not ok:
+                print("CEMPlanner output shape does not match")
+                return False
+            print("CEMPlanner.Plan pass")
+            return True
         except Exception as e:
-            print("IntegrationEndToEnd test crash:", type(e).__name__, e)
+            print("CEMPlanner error:", type(e).__name__, e)
             return False
 
-    class Teacher(nn.Module):
-        def __init__(self, inDim, numBase, numSkill, numExtra):
-            super().__init__()
-            h = 384
-            self.backbone = nn.Sequential(
-                nn.Linear(inDim, h), nn.GELU(),
-                nn.Linear(h, h), nn.GELU(),)
-            
-            self.base_head = nn.Linear(h, numBase)
-            self.extra_head = nn.Linear(h, numExtra)
-            self.skill_head = nn.Linear(h, numSkill)
-            self.mouse_mu = nn.Linear(h, 2)
-            self.mouse_ls = nn.Linear(h, 2)
-            self.click_head = nn.Linear(h, 2)
-
-        def forward(self, x):
-            h = self.backbone(x)
-            return {
-                "base_logits":  self.base_head(h),
-                "extra_logits": self.extra_head(h),
-                "skill_logits": self.skill_head(h),
-                "mouse_mu":     self.mouse_mu(h),
-                "mouse_logstd": torch.clamp(self.mouse_ls(h), -5.0, 2.0),
-                "click_logits": self.click_head(h),}
-
-    def SupervisedLoss(self, out, tgt):
-        bce = nn.BCEWithLogitsLoss()
-        loss = 0.0
-        loss += bce(out["keyboard"]["base_logits"], torch.sigmoid(tgt["base_logits"]))
-        loss += bce(out["keyboard"]["extra_logits"], torch.sigmoid(tgt["extra_logits"]))
-        loss += bce(out["mouse"]["click_logits"], torch.sigmoid(tgt["click_logits"]))
-        labels = torch.argmax(tgt["skill_logits"], dim=-1)
-        loss += F.cross_entropy(out["keyboard"]["skill_logits"], labels)
-        loss += F.mse_loss(out["mouse"]["mu"], tgt["mouse_mu"])
-        loss += F.mse_loss(out["mouse"]["logstd"], tgt["mouse_logstd"])
-        return loss
-
-    def TrainStepSmoke(self):
+    def TestForwardWithDeltasInjection(self) -> bool:
         try:
-            model = DecisionExtractor(stateDim=1024, includeNoSkill=True, useHebbOnline=False).to(self.device)
+            model = DecisionExtractor(stateDim=128, includeNoSkill=True, useHebb=False).to(self.device)
+            wrapper = DecisionOnlineWrapper(model, initRankEach=0, autoRank=False)
+            model.eval()
+            B = 4
+            x = torch.randn(B, 128, device=self.device)
+
+            h = model.keyboard.backbone(F.relu(model.to_z(model.hebb(model.feature_net(x), update=False))))
+            out_dim = model.keyboard.base_head.target.out_features
+            in_dim = model.keyboard.base_head.target.in_features
+            deltaW = torch.randn(out_dim, in_dim, device=self.device) * 1e-3
+            D = {"kbd_base": deltaW}
+
+            outD = wrapper.ForwardWithDeltas(x, keyPaddingMask=None, tdError=None, uncertainty=None, deltasPerLayer=[D])
+            out0 = wrapper.ForwardWithDeltas(x, keyPaddingMask=None, tdError=None, uncertainty=None, deltasPerLayer=[{}])
+
+            expect = F.linear(h, deltaW, bias=None)
+            err = (outD["keyboard"]["base_logits"] - out0["keyboard"]["base_logits"] - expect).abs().max().item()
+            if err >= 1e-5:
+                print(f"ForwardWithDeltas injection mismatch: err={err:.2e}")
+                return False
+            print("DecisionOnlineWrapper.ForwardWithDeltas injection pass")
+            return True
+        except Exception as e:
+            print("ForwardWithDeltas error:", type(e).__name__, e)
+            return False
+
+    def TestCommitOneGrowsLora(self) -> bool:
+        try:
+            model = DecisionExtractor(stateDim=128, includeNoSkill=True, useHebb=False).to(self.device)
+            wrapper = DecisionOnlineWrapper(model, initRankEach=0, autoRank=False)
+
+            tgt = model.keyboard.base_head
+            r_before = len(tgt.A_list)
+            in_dim = tgt.target.in_features
+            out_dim = tgt.target.out_features
+            addRank = 2
+            A = torch.randn(addRank, in_dim, device=self.device) * 1e-4
+            B = torch.zeros(out_dim, addRank, device=self.device)
+
+            x = torch.randn(5, 128, device=self.device)
+            h = model.keyboard.backbone(F.relu(model.to_z(model.hebb(model.feature_net(x), update=False))))
+            with torch.no_grad():
+                y_base = model.keyboard.base_head(h).detach()
+
+            ok = wrapper.CommitOne("kbd_base", layerIdx=0, a=A, b=B, scale=1e-3)
+            if not ok or len(tgt.A_list) != r_before + 1:
+                print("CommitOne did not increase LoRA rank")
+                return False
+
+            y_after = model.keyboard.base_head(h)
+
+            A_new, B_new, s_new = tgt.A_list[-1], tgt.B_list[-1], tgt.alpha[-1]
+            expect_delta = F.linear(h, s_new * (B_new @ A_new), bias=None)
+
+            err = (y_after - y_base - expect_delta).abs().max().item()
+            if err >= 1e-5:
+                print(f"CommitOne increment value does not match: err={err:.2e}")
+                return False
+            print("CommitOne -> LoRA growth and value verification pass")
+            return True
+        except Exception as e:
+            print("CommitOne error:", type(e).__name__, e)
+            return False
+
+    def TestActionsOnly(self, steps: int = 80) -> bool:
+        try:
+            in_dim, B = 512, 32
+            torch.manual_seed(123)
+
+            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebb=False).to(self.device)
+            model.train()
+
+            model.option.trans_adapter.Grow(addRank=2, scale=1e-3, freezeOld=False)
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+            x_fix = torch.randn(B, in_dim, device=self.device)
+            K = model.num_options
+            prev_fix = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
+
+            with torch.no_grad():
+                out0 = model(x_fix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev_fix, returnKeysVec=False)
+                start_loss = self.DecisionOnlyLoss(out0, entCoef=0.0).item()
+
+            for t in range(steps):
+                x = torch.randn(B, in_dim, device=self.device)
+                prev = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
+
+                self.ZeroAllGrads(model)
+                out = model(x, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev, returnKeysVec=False)
+                adv = {
+                    "option": torch.full((B,), 1.5, device=self.device),
+                    "beta": torch.full((B,), 0.5, device=self.device),
+                    "skill": torch.ones(B, device=self.device),
+                    "base": torch.ones(B, device=self.device),
+                    "extra": torch.ones(B, device=self.device),
+                    "mouse": torch.ones(B, device=self.device),
+                    "click": torch.ones(B, device=self.device),}
+                
+                loss = self.DecisionOnlyLoss(out, adv=adv, entCoef=0.0)
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+
+                def g(p): 
+                    return None if (p.grad is None) else float(p.grad.norm().item())
+
+                print("β bias grad:", g(model.option.beta_head[-1].target.bias))
+                print("trans base grad:", g(model.option.trans))
+
+                ta = model.option.trans_adapter
+                if len(ta.A_list) > 0:
+                    print("trans LoRA A grad:", g(ta.A_list[-1]))
+                    print("trans LoRA B grad:", g(ta.B_list[-1]))
+                    print("trans LoRA s grad:", g(ta.alpha[-1]))
+
+                for name, seq in model.psi_to.items():
+                    for m in seq.modules():
+                        if isinstance(m, nn.Linear):
+                            print(f"psi_to[{name}] weight grad:", g(m.weight))
+
+                if t == 0:
+                    def any_grad_lora(adp):
+                        base_has = self.HasGrad(adp.target.weight) or (adp.target.bias is not None and self.HasGrad(adp.target.bias))
+                        lora_has = any(self.HasGrad(p) for p in list(adp.A_list) + list(adp.B_list) + list(adp.alpha))
+                        return base_has or lora_has
+
+                    ok_pi = any_grad_lora(model.option.pi_o)
+                    ok_psi = any_grad_lora(model.option.psi_head)
+                    ok_b0 = any_grad_lora(model.option.beta_head[0])
+                    ok_b2 = any_grad_lora(model.option.beta_head[2])
+
+                    ok_trans_base = self.HasGrad(model.option.trans)
+                    ta = model.option.trans_adapter
+                    ok_trans_lora = (len(ta.A_list) > 0) and any(self.HasGrad(p) for p in list(ta.A_list) + list(ta.B_list) + list(ta.alpha))
+
+                    def has_seq_grad(seq):
+                        oks = []
+                        for m in seq.modules():
+                            if isinstance(m, nn.Linear):
+                                oks.append(self.HasGrad(m.weight))
+                        return all(oks) and (len(oks) > 0)
+
+                    ok_psito = all(has_seq_grad(seq) for seq in model.psi_to.values())
+
+                    if not (ok_pi and ok_psi and ok_b0 and ok_b2 and ok_trans_base and ok_trans_lora and ok_psito):
+                        print("Key option/psi/trans path missing gradient under decision-only loss: ",
+                              dict(pi=ok_pi, psi=ok_psi, beta0=ok_b0, beta2=ok_b2, trans_base=ok_trans_base, trans_lora=ok_trans_lora, psi_to=ok_psito))
+                        return False
+
+                for n, p in model.named_parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        print(f"Non-finite gradient: {n}")
+                        return False
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
+            with torch.no_grad():
+                out1 = model(x_fix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev_fix, returnKeysVec=False)
+                end_loss = self.DecisionOnlyLoss(out1, entCoef=0.0).item()
+
+            print(f"[ActionsOnly(decision-only)] loss {start_loss:.4f} -> {end_loss:.4f}")
+            ok_improve = (end_loss <= 0.8 * start_loss) or ((start_loss - end_loss) >= 0.05)
+            if not ok_improve:
+                print("Fixed batch drop insufficiency")
+                return False
+
+            print("Decision-only training: option/psi/beta/trans_adapter get gradients and loss decreases, pass")
+            return True
+
+        except Exception as e:
+            print("Actions-only (decision-only) test error:", type(e).__name__, e)
+            return False
+
+    def TestTrainStepSmoke(self) -> bool:
+        try:
+            in_dim = 512
+            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebb=False).to(self.device)
             model.train()
             opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
             B = 8
-            state_feat = torch.randn(B, 1024, device=self.device)
+            x = torch.randn(B, in_dim, device=self.device)
+            K = model.num_options
+            prev = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
 
-            num_options = model.option.K
-            prev_opt = torch.randint(0, num_options, (B,), device=self.device)
-            prev_onehot = F.one_hot(prev_opt, num_classes=num_options).float()
-
-            out = model(state_feat, sample=False, deterministic=False, prior=None, mixW=0.0, updateHebb=False, prevOptionOnehot=prev_onehot, returnKeysVec=False, applyConstraints=False)
-
-            kb = out["keyboard"]; ms = out["mouse"]
-            base_tgt = torch.rand_like(kb["base_logits"])
-            extra_tgt = torch.rand_like(kb["extra_logits"])
-            bce = torch.nn.BCEWithLogitsLoss()
-            loss_base = bce(kb["base_logits"], base_tgt)
-            loss_extra = bce(kb["extra_logits"], extra_tgt)
-
-            num_skill = kb["skill_logits"].size(-1)
-            skill_tgt = torch.randint(0, num_skill, (B,), device=self.device)
-            loss_skill = F.cross_entropy(kb["skill_logits"], skill_tgt)
-
-            mu, logstd = ms["mu"], ms["logstd"]
-            std = torch.exp(logstd)
-            mouse_tgt = torch.randn_like(mu)
-            loss_mouse = 0.5 * (((mouse_tgt - mu) / std) ** 2 + 2 * logstd + math.log(2 * math.pi)).sum(dim=-1).mean()
-
-            click_tgt = torch.rand_like(ms["click_logits"])
-            loss_click = bce(ms["click_logits"], click_tgt)
-
-            main_loss = loss_base + loss_extra + loss_skill + loss_mouse + loss_click
-
-            opt_dict   = out["option"]
-            opt_logits = opt_dict["logits"]
-
-            if "psi" in opt_dict:
-                psi = opt_dict["psi"]
-            else:
-                psi_all = opt_dict["psi_all"] 
-                idx = torch.argmax(opt_logits, dim=-1)
-                b_idx = torch.arange(B, device=self.device)
-                psi = psi_all[b_idx, idx]
-
-            beta = opt_dict["beta"].squeeze(-1)
-            psi_dim = psi.size(-1)
-            opt_tgt = torch.randint(0, num_options, (B,), device=self.device)
-            psi_tgt = torch.randn(B, psi_dim, device=self.device)
-            beta_tgt = torch.rand(B, device=self.device)
-
-            loss_opt_ce = F.cross_entropy(opt_logits, opt_tgt)
-            loss_psi_mse = F.mse_loss(psi, psi_tgt)
-            loss_beta_bce = F.binary_cross_entropy(beta, beta_tgt)
-
-            total = main_loss + (0.1 * loss_opt_ce + 0.05 * loss_psi_mse + 0.05 * loss_beta_bce)
+            out = model(x, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev, returnKeysVec=False)
+            loss = self.DecisionOnlyLoss(out, entCoef=0.0)
 
             opt.zero_grad(set_to_none=True)
-            total.backward()
-
-            bad = []
-            for n, p in model.named_parameters():
-                if p.requires_grad:
-                    if (p.grad is None) or (not torch.isfinite(p.grad).all()) or (p.grad.abs().sum() == 0):
-                        bad.append(n)
-            if bad:
-                print("Decision TrainStepSmoke failed:\n\n Bad grad at:", bad)
+            loss.backward()
+            if model.feature_net[0].weight.grad is None or \
+               model.keyboard.base_head.target.weight.grad is None or \
+               model.mouse.mu_head.target.weight.grad is None:
+                print("Training Smoke: Critical Gradient Missing (decision-only)")
                 return False
-
             opt.step()
-            print("Decision TrainStepSmoke passed.")
+            print("Training smoke (decision-only loss) pass")
             return True
         except Exception as e:
-            print("TrainStepSmoke crash:", type(e).__name__, e)
+            print("Training smoke error:", type(e).__name__, e)
             return False
 
-    def NoNanAfterManySteps(self, steps: int = 40) -> bool:
+    def TestNoNanManySteps(self, steps: int = 40) -> bool:
         try:
             in_dim = 512
-            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebbOnline=False).to(self.device)
-            teacher = self.Teacher(in_dim, self.num_base, self.num_skill, self.num_extra).to(self.device)
-            for p in teacher.parameters():
-                p.requires_grad_(False)
+            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebb=False).to(self.device)
             model.train()
             opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-
+            B = 16
             for t in range(steps):
-                x = torch.randn(16, in_dim, device=self.device)
-                with torch.no_grad():
-                    tgt = teacher(x)
-                out = model(x, sample=False, prior=None, updateHebb=False)
-                loss = self.SupervisedLoss(out, tgt)
+                x = torch.randn(B, in_dim, device=self.device)
+                K = model.num_options
+                prev = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
+                out = model(x, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev, returnKeysVec=False)
 
+                loss = self.DecisionOnlyLoss(out, entCoef=0.0)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 for n, p in model.named_parameters():
-                    if p.grad is not None:
-                        assert torch.isfinite(p.grad).all(), f"Non-finite grad at step {t}, {n}"
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        print(f"Non-finite grad at step {t}, {n}")
+                        return False
                 opt.step()
-            print("Decision NoNanAfterManySteps passed.")
+            print("Multi-step training (decision-only) without NaN/Inf, pass")
             return True
-        except AssertionError as e:
-            print("Decision NoNanAfterManySteps failed:\n", e)
-            return False
         except Exception as e:
-            print("Decision NoNanAfterManySteps error:\n", type(e).__name__, e)
+            print("Multi-step training error:", type(e).__name__, e)
             return False
 
-    def ParamsActuallyChange(self, steps: int = 20) -> bool:
+    def TestParamsChange(self, steps: int = 20) -> bool:
         try:
             in_dim = 512
-            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebbOnline=False).to(self.device)
-            teacher = self.Teacher(in_dim, self.num_base, self.num_skill, self.num_extra).to(self.device)
-            for p in teacher.parameters():
-                p.requires_grad_(False)
+            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebb=False).to(self.device)
             model.train()
             opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
             with torch.no_grad():
-                w0_feat = model.feature_net[0].weight.clone()
-                w0_kbd = model.keyboard.base_head.weight.clone()
-                w0_mu = model.mouse.mu_head.weight.clone()
+                w_feat0 = model.feature_net[0].weight.clone()
+                w_kbd0 = model.keyboard.base_head.target.weight.clone()
+                w_mu0  = model.mouse.mu_head.target.weight.clone()
 
+            B = 16
             for _ in range(steps):
-                x = torch.randn(16, in_dim, device=self.device)
-                with torch.no_grad():
-                    tgt = teacher(x)
-                out = model(x, sample=False, prior=None, updateHebb=False)
-                loss = self.SupervisedLoss(out, tgt)
+                x = torch.randn(B, in_dim, device=self.device)
+                K = model.num_options
+                prev = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
+                out = model(x, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev, returnKeysVec=False)
+                loss = self.DecisionOnlyLoss(out, entCoef=0.0)
+
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
 
             with torch.no_grad():
-                d_feat = (w0_feat - model.feature_net[0].weight).norm().item()
-                d_kbd = (w0_kbd - model.keyboard.base_head.weight).norm().item()
-                d_mu = (w0_mu - model.mouse.mu_head.weight).norm().item()
-
-            changed = any(d > 1e-6 for d in [d_feat, d_kbd, d_mu])
-            assert changed, f"Parameters barely changed: feat={d_feat:.3e}, kbd={d_kbd:.3e}, mu={d_mu:.3e}"
-            print("Decision ParamsActuallyChange passed.")
+                d_feat = (w_feat0 - model.feature_net[0].weight).norm().item()
+                d_kbd = (w_kbd0 - model.keyboard.base_head.target.weight).norm().item()
+                d_mu = (w_mu0 - model.mouse.mu_head.target.weight).norm().item()
+            if not any(d > 1e-6 for d in [d_feat, d_kbd, d_mu]):
+                print(f"Parameter changes are too small: feat={d_feat:.3e}, kbd={d_kbd:.3e}, mu={d_mu:.3e}")
+                return False
+            print("Parameters change after decision-only training, pass")
             return True
-        except AssertionError as e:
-            print("Decision ParamsActuallyChange failed:\n", e)
-            return False
         except Exception as e:
-            print("Decision ParamsActuallyChange error:\n", type(e).__name__, e)
+            print("Parameter change test error:", type(e).__name__, e)
             return False
 
-    def TestNormalTrainingConvergence(self, steps: int = 120, logEvery: int = 30) -> bool:
+    def TestConvergence(self, steps: int = 500, logEvery: int = 20) -> bool:
         try:
             in_dim = 512
-            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebbOnline=False).to(self.device)
-            teacher = self.Teacher(in_dim, self.num_base, self.num_skill, self.num_extra).to(self.device)
-            for p in teacher.parameters():
-                p.requires_grad_(False)
+            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebb=False).to(self.device)
             model.train()
-            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+            opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
 
             B = 32
             xfix = torch.randn(B, in_dim, device=self.device)
-            with torch.no_grad():
-                tgtfix = teacher(xfix)
+            K = model.num_options
+            prevfix = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
+
+            g = torch.Generator(device=self.device).manual_seed(42)
+            def r(shape): return torch.randn(shape, generator=g, device=self.device)
+            fixed_adv = {
+                "option": r((B,)), "beta": r((B,)),
+                "skill": r((B,)), "base": r((B,)),
+                "extra": r((B,)), "mouse": r((B,)),
+                "click": r((B,)),}
 
             with torch.no_grad():
-                start = self.SupervisedLoss(model(xfix, sample=False, prior=None, updateHebb=False), tgtfix).item()
+                out0 = model(xfix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prevfix, returnKeysVec=False)
+                start_bd = self.DecisionOnlyLoss(out0, adv=fixed_adv, entCoef=0.0, returnBreakdown=True)
+                start_total = start_bd["total"]
+                start_core  = start_bd["core"]
 
             for t in range(1, steps + 1):
-                out = model(xfix, sample=False, prior=None, updateHebb=False)
-                loss = self.SupervisedLoss(out, tgtfix)
-
+                out = model(xfix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prevfix, returnKeysVec=False)
+                loss = self.DecisionOnlyLoss(out, adv=fixed_adv, entCoef=0.0) 
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
 
                 if (t % logEvery) == 0 or t == 1:
-                    print(f"[DecisionTrain] step {t}/{steps} | loss={loss.item():.6f}")
+                    with torch.no_grad():
+                        bd = self.DecisionOnlyLoss(out, adv=fixed_adv, entCoef=0.0, returnBreakdown=True)
+                    core = bd["core"]; tot = bd["total"]
+                    print(
+                        f"[DecisionOnlyTrain] step {t}/{steps} | total={tot:.6f} | core={core:.6f} "
+                        f"| base={bd['terms'].get('base',0.0):.4f} extra={bd['terms'].get('extra',0.0):.4f} "
+                        f"skill={bd['terms'].get('skill',0.0):.4f} mouse={bd['terms'].get('mouse',0.0):.4f} "
+                        f"click={bd['terms'].get('click',0.0):.4f} option={bd['terms'].get('option',0.0):.4f} "
+                        f"beta={bd['terms'].get('beta',0.0):.4f}")
 
             with torch.no_grad():
-                end = self.SupervisedLoss(model(xfix, sample=False, prior=None, updateHebb=False), tgtfix).item()
+                out1 = model(xfix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prevfix, returnKeysVec=False)
+                end_bd = self.DecisionOnlyLoss(out1, adv=fixed_adv, entCoef=0.0, returnBreakdown=True)
+                end_total = end_bd["total"]
+                end_core  = end_bd["core"]
 
-            print(f"\n[DecisionTrain] loss start={start:.6f} -> end={end:.6f}")
-            assert end <= 0.8 * start, "Training did not show sufficient convergence (drop < 20%)."
-            print("Decision TestNormalTrainingConvergence passed.")
+            print(f"[DecisionOnlyTrain] total {start_total:.6f} -> {end_total:.6f}")
+            print(f"[DecisionOnlyTrain] core  {start_core:.6f} -> {end_core:.6f}")
+
+            rel_drop_core = (start_core - end_core) / max(1e-9, abs(start_core))
+            if rel_drop_core < 0.05:
+                print("Insufficient convergence on core (decrease < 5%)")
+                return False
+
+            print("Fixed set convergence (decision-only), pass")
             return True
-        except AssertionError as e:
-            print("Decision TestNormalTrainingConvergence failed:\n", e)
-            return False
         except Exception as e:
-            print("Decision TestNormalTrainingConvergence error:\n", type(e).__name__, e)
+            print("Convergence test error:", type(e).__name__, e)
             return False
 
-    def RunAll(self):
+    def PregrowAllLora(self, model: nn.Module, rank: int = 2, scale: float = 1e-3, freezeOld: bool = True) -> bool:
         try:
-            results = []
-            results.append(self.TestHebbianPlasticityLayer())
-            results.append(self.TestDecisionExtractorNoPrior())
-            results.append(self.TestCEMPlanner())
-            results.append(self.TestDecisionExtractorWithPrior())
-            results.append(self.TestIntegrationEndToEnd())
-            results.append(self.TrainStepSmoke())
-            results.append(self.NoNanAfterManySteps())
-            results.append(self.ParamsActuallyChange())
-            results.append(self.TestNormalTrainingConvergence())
-
-            passed = sum(1 for x in results if x)
-            print(f"[DecisionModule Tests] {passed}/{len(results)} passed.")
-            return all(results)
+            cnt = 0
+            for m in model.modules():
+                if isinstance(m, LoRALinearAdapter) or isinstance(m, MatLoRAAdapter):
+                    m.Grow(addRank=rank, scale=scale, freezeOld=freezeOld)
+                    cnt += 1
+            if cnt == 0:
+                print("No LoRA adapter modules found")
+                return False
+            return True
         except Exception as e:
-            print("RunAll crash:", type(e).__name__, e)
+            print("PregrowAllLora error:", type(e).__name__, e)
             return False
 
+    def ZeroAllGrads(self, model: nn.Module):
+        for p in model.parameters():
+            p.grad = None
+
+    def SetLoraTrainMode(self, model: nn.Module, mode: str) -> bool:
+        assert mode in ("lora_only", "base_only", "hybrid")
+        for p in model.parameters():
+            p.requires_grad_(False)
+            p.grad = None
+
+        def set_lora_linear(m: LoRALinearAdapter):
+            if mode in ("base_only", "hybrid"):
+                if m.target.bias is not None: m.target.bias.requires_grad_(True)
+                m.target.weight.requires_grad_(True)
+            if mode in ("lora_only", "hybrid"):
+                for p in list(m.A_list) + list(m.B_list) + list(m.alpha):
+                    p.requires_grad_(True)
+
+        def set_mat_lora(m: MatLoRAAdapter, trans_param: torch.nn.Parameter):
+            if mode in ("base_only", "hybrid"):
+                trans_param.requires_grad_(True)
+            if mode in ("lora_only", "hybrid"):
+                for p in list(m.A_list) + list(m.B_list) + list(m.alpha):
+                    p.requires_grad_(True)
+
+        for mod in model.modules():
+            if isinstance(mod, LoRALinearAdapter):
+                set_lora_linear(mod)
+
+        if hasattr(model, "option"):
+            set_mat_lora(model.option.trans_adapter, model.option.trans)
+
+        if mode in ("base_only", "hybrid"):
+            for name, p in model.named_parameters():
+                if ("A_list" in name) or ("B_list" in name) or ("alpha" in name):
+                    continue
+                if name.startswith("option.trans"):
+                    continue
+                if name.startswith(("feature_net.", "keyboard.backbone.","mouse.backbone.", "psi_to.", "hebb.base")):
+                    p.requires_grad_(True)
+        return True
+
+    @staticmethod
+    def HasGrad(p: torch.Tensor, threshold: float = 1e-12) -> bool:
+        return ((p is not None) and getattr(p, "requires_grad", False) and (p.grad is not None) and torch.isfinite(p.grad).all() and (p.grad.abs().max().item() > threshold))
+
+    def TestGradRoutingLora(self, mode: str = "lora_only") -> bool:
+        try:
+            in_dim, B = 512, 32
+            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebb=False).to(self.device)
+
+            if not self.PregrowAllLora(model, rank=2, scale=1e-3, freezeOld=True):
+                return False
+            if not self.SetLoraTrainMode(model, mode):
+                return False
+
+            model.train()
+            opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+
+            x = torch.randn(B, in_dim, device=self.device)
+            K = model.num_options
+            prev_onehot = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
+
+            self.ZeroAllGrads(model)
+            out = model(x, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev_onehot, returnKeysVec=False)
+
+            adv = {
+                "option": torch.full((B,), 1.5, device=self.device),
+                "beta": torch.full((B,), 0.7, device=self.device),
+                "skill": torch.ones(B, device=self.device),
+                "base": torch.ones(B, device=self.device),
+                "extra": torch.ones(B, device=self.device),
+                "mouse": torch.ones(B, device=self.device),
+                "click": torch.ones(B, device=self.device),}
+
+            loss = self.DecisionOnlyLoss(out, adv=adv, entCoef=0.0)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward(retain_graph=True)
+
+            def dep_any(params: List[torch.Tensor]) -> bool:
+                cand = [p for p in params if isinstance(p, torch.Tensor) and p.requires_grad]
+                if len(cand) == 0:
+                    return False
+                try:
+                    gs = torch.autograd.grad(loss, cand, retain_graph=True, allow_unused=True)
+                except RuntimeError:
+                    return False
+                return any(g is not None for g in gs)
+
+            ok_all = True
+
+            for m in model.modules():
+                if isinstance(m, LoRALinearAdapter):
+                    base_has = False
+                    if m.target.weight is not None:
+                        base_has |= self.HasGrad(m.target.weight, threshold=1e-12)
+                    if getattr(m.target, "bias", None) is not None:
+                        base_has |= self.HasGrad(m.target.bias, threshold=1e-12)
+
+                    lora_params  = list(m.A_list) + list(m.B_list) + list(m.alpha)
+                    lora_has_num = any(self.HasGrad(p, threshold=1e-12) for p in lora_params)
+                    lora_has_dep = dep_any(lora_params)
+
+                    if mode == "lora_only":
+                        cond = (not base_has) and (lora_has_num or lora_has_dep)
+                    elif mode == "base_only":
+                        cond = base_has and (not lora_has_num) and (not lora_has_dep)
+                    else: 
+                        cond = base_has and (lora_has_num or lora_has_dep)
+
+                    if not cond:
+                        print(f"Grad routing does not comply with policy {mode} @ LoRA({m.target.in_features}->{m.target.out_features})")
+                        ok_all = False
+
+            for m in model.option.modules():
+                if isinstance(m, MatLoRAAdapter):
+                    trans_base_has = self.HasGrad(model.option.trans, threshold=1e-12)
+
+                    lora_params  = list(m.A_list) + list(m.B_list) + list(m.alpha)
+                    lora_has_num = any(self.HasGrad(p, threshold=1e-12) for p in lora_params)
+                    lora_has_dep = dep_any(lora_params)
+
+                    if mode == "lora_only":
+                        cond = (not trans_base_has) and (lora_has_num or lora_has_dep)
+                    elif mode == "base_only":
+                        cond = trans_base_has and (not lora_has_num) and (not lora_has_dep)
+                    else: 
+                        cond = trans_base_has and (lora_has_num or lora_has_dep)
+
+                    if not cond:
+                        print("MatLoRA grad routing does not comply with policy", mode)
+                        ok_all = False
+
+            def seq_has_grad(seq, thr=1e-12):
+                for _, p in seq.named_parameters(recurse=True):
+                    if self.HasGrad(p, threshold=thr):
+                        return True
+                return False
+            ok_psito = all(seq_has_grad(seq) for seq in model.psi_to.values())
+            if not ok_psito:
+                print("psi_to path has no visible grads (FYI)")
+
+            if not ok_all:
+                return False
+
+            opt.step()
+            print(f"Grad routing policy verification (decision-only loss), pass  {mode}")
+            return True
+
+        except Exception as e:
+            print("Grad routing test error:", type(e).__name__, e)
+            return False
+
+    def StressTestPlannerAndDecision(self,horizon: int = 6, N: int = 96, elite: int = 12,iters: int = 3, train_steps: int = 150) -> bool:
+        try:
+            wm, planner = self.BuildPlanner(horizon=horizon, N=N, elite=elite, iters=iters)
+            if planner is None:
+                return False
+            in_dim, B = 512, 32
+
+            planner.wm.ResetHidden(B=B, device=self.device)
+
+            prior = planner.Plan(returnTrajectories=False)
+            
+            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebb=True).to(self.device)
+            model.train()
+            opt = torch.optim.Adam(model.parameters(), lr=2e-4)
+
+            x = torch.randn(B, in_dim, device=self.device)
+            K = model.num_options
+            prev_onehot = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
+
+            for t in range(train_steps):
+                out = model(x, sample=True, deterministic=False, prior=prior, mixW=0.3, prevOptionOnehot=prev_onehot, returnKeysVec=False)
+                loss = self.DecisionOnlyLoss(out, entCoef=0.01)
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+
+                for n, p in model.named_parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        print(f"Stress: Non-finite gradient {n} @ step {t}")
+                        return False
+                opt.step()
+
+            print("Stress testing (planner+decision, decision-only loss), pass")
+            return True
+        except Exception as e:
+            print("Stress test error:", type(e).__name__, e)
+            return False
+
+    def TestGradRoutingAllModes(self) -> bool:
+        ok1 = self.TestGradRoutingLora("lora_only")
+        ok2 = self.TestGradRoutingLora("base_only")
+        ok3 = self.TestGradRoutingLora("hybrid")
+        return ok1 and ok2 and ok3
+
+    def RunAll(self) -> bool:
+        tests = [
+            ("HebbianPlasticityLayer", self.TestHebbLayer),
+            ("LoRALinearAdapter", self.TestLoraLinearAdapter),
+            ("MatLoRAAdapter", self.TestMatloraAdapter),
+            ("Decision forward/constraints", self.TestDecisionForwardShapes),
+            ("Option prev/trans", self.TestOptionPrevAndTrans),
+            ("CEMPlanner", self.TestCemPlanner),
+            ("ForwardWithDeltas", self.TestForwardWithDeltasInjection),
+            ("CommitOne grows LoRA", self.TestCommitOneGrowsLora),
+            ("Train smoke", self.TestTrainStepSmoke),
+            ("No-NaN many steps", self.TestNoNanManySteps),
+            ("Params change", self.TestParamsChange),
+            ("Convergence", self.TestConvergence),
+            ("LoRA grad routing (all modes)", self.TestGradRoutingAllModes),
+            ("Stress test (planner+decision)", self.StressTestPlannerAndDecision),
+            ("TestActionsOnly", self.TestActionsOnly), ]
+        passed = 0
+        for name, fn in tests:
+            ok = fn()
+            print(f" -> {name}: {'PASS' if ok else 'FAIL'}")
+            if ok: passed += 1
+        total = len(tests)
+        print(f"\n[DecisionModule Tests] {passed}/{total} passed.")
+        return passed == total

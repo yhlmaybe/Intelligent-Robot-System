@@ -576,9 +576,9 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             return float(s) * (b @ a)
 
         return {
-            "feat": SiteSpec("feat",  L, C * 1, C * 1, self.maxRankFeat,  alloc_feat,  compose_feat),
-            "patch":SiteSpec("patch", L, C * ksz, E,   self.maxRankPatch, alloc_patch, compose_patch),
-            "token":SiteSpec("token", L, D,       D,   self.maxRankToken, alloc_token, compose_token),}
+            "feat": SiteSpec("feat",  L, C * 1, C * 1, self.maxRankFeat, alloc_feat, compose_feat),
+            "patch":SiteSpec("patch", L, C * ksz, E, self.maxRankPatch, alloc_patch, compose_patch),
+            "token":SiteSpec("token", L, D, D, self.maxRankToken, alloc_token, compose_token),}
 
     def ForwardWithDeltas(
         self,
@@ -687,7 +687,7 @@ class TestPerceptionMTool:
             param_cnt += int(A.numel() + B.numel() + 1)
         return rank_sum, param_cnt
 
-    def _token_ranks_and_params(self, token_adapters: Iterable) -> Tuple[List[int], int]:
+    def TokenRanksAndParams(self, token_adapters: Iterable) -> Tuple[List[int], int]:
         per_layer_ranks = []
         total_params = 0
         for ta in token_adapters:
@@ -1005,7 +1005,7 @@ class TestPerceptionMTool:
 
             feat_rank, feat_params = self.AdapterRankAndParams(base.cnn_feat_adapter)
             patch_rank, patch_params = self.AdapterRankAndParams(base.patch_adapter)
-            token_ranks, token_params = self._token_ranks_and_params(base.token_adapters)
+            token_ranks, token_params = self.TokenRanksAndParams(base.token_adapters)
 
             total_rank_injected = feat_rank + patch_rank + sum(token_ranks)
             total_params_injected = feat_params + patch_params + token_params
