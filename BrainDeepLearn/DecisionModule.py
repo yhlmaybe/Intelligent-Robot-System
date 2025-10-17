@@ -851,7 +851,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
 
         h_k = self.base.keyboard.backbone(z)
 
-        base_logits  = self.base.keyboard.base_head(h_k)
+        base_logits = self.base.keyboard.base_head(h_k)
         skill_logits = self.base.keyboard.skill_head(h_k)
         extra_logits = self.base.keyboard.extra_head(h_k)
 
@@ -877,36 +877,88 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         h_o = self.base.option.enc(z)
 
         opt_logits_base = self.base.option.pi_o(h_o)
-        if D.get("opt_pi") is not None: opt_logits_base = opt_logits_base + F.linear(h_o, D["opt_pi"], bias=None)
+        if D.get("opt_pi") is not None:
+            opt_logits_base = opt_logits_base + F.linear(h_o, D["opt_pi"], bias=None)
 
         psi_flat = self.base.option.psi_head(h_o)
-        if D.get("opt_psi") is not None: psi_flat = psi_flat + F.linear(h_o, D["opt_psi"], bias=None)
-        psi_all = psi_flat.view(-1, K, self.base.option.psiDim)
+        if D.get("opt_psi") is not None:
+            psi_flat = psi_flat + F.linear(h_o, D["opt_psi"], bias=None)
 
-        b0_in = torch.cat([h_o, prev], dim=-1)
+        K = self.base.option.K
+
+        psi_all = psi_flat.view(-1, K, self.base.option.psiDim)
+        psi_all = psi_all * self.base.option.psi_amp_global * self.base.option.psi_amp_per_option.view(1, K, 1)
+        psi_all = self.base.Safe(psi_all, 30.0)
+
+        has_prev = (keyPaddingMask is not None) and (keyPaddingMask.dim() == 2) and (keyPaddingMask.size(1) == K)
+        prev = (keyPaddingMask.detach().to(dtype=stateFeat.dtype, device=device) if has_prev
+                else torch.zeros(B, K, dtype=stateFeat.dtype, device=device))
+
+        b0_in = torch.cat([h_o, (prev if has_prev else torch.zeros_like(prev))], dim=-1)
         b0 = self.base.option.beta_head[0](b0_in)
-        if D.get("opt_beta0") is not None: b0 = b0 + F.linear(b0_in, D["opt_beta0"], bias=None)
+        if D.get("opt_beta0") is not None:
+            b0 = b0 + F.linear(b0_in, D["opt_beta0"], bias=None)
         b0 = F.relu(b0)
         beta = self.base.option.beta_head[2](b0)
-        if D.get("opt_beta2") is not None: beta = beta + F.linear(b0, D["opt_beta2"], bias=None)
-        beta = torch.sigmoid(beta)
+        if D.get("opt_beta2") is not None:
+            beta = beta + F.linear(b0, D["opt_beta2"], bias=None)
+        beta = torch.sigmoid(beta).clamp(1e-6, 1.0 - 1.0e-6)
 
         trans_eff = self.base.option.trans_adapter(self.base.option.trans)
         if D.get("opt_trans") is not None:
             trans_eff = trans_eff + D["opt_trans"]
 
-        option_logits = opt_logits_base + prev @ trans_eff
+        trans_eff = torch.nan_to_num(trans_eff, nan=0.0).clamp(-10.0, 10.0)
 
-        p_new = torch.softmax(option_logits, dim=-1)
-        w_t = (1.0 - beta) * prev + beta * p_new
-        psi_cond = (w_t.unsqueeze(-1) * psi_all).sum(dim=1)
+        option_logits = self.base.Safe(opt_logits_base + (prev @ trans_eff if has_prev else 0.0), 60.0)
+        p_new = self.base.SafeSoftmax(option_logits, dim=-1)
 
-        base_logits = base_logits + self.base.psi_to["base"](psi_cond)
-        extra_logits = extra_logits + self.base.psi_to["extra"](psi_cond)
-        skill_logits = skill_logits + self.base.psi_to["skill"](psi_cond)
-        mu = mu + self.base.psi_to["mu"](psi_cond)
-        logstd = torch.clamp(logstd + self.base.psi_to["logstd"](psi_cond), self.base.logstd_low, self.base.logstd_high)
-        click_logits = click_logits + self.base.psi_to["click"](psi_cond)
+        w_t = (1.0 - beta) * prev + beta * p_new if has_prev else p_new
+
+        sp = F.softplus
+        def mix_psi(amp_param: torch.nn.Parameter) -> torch.Tensor:
+            amp = sp(amp_param).unsqueeze(0) * 0.5 
+            return (w_t.unsqueeze(-1) * psi_all * amp).sum(dim=1) 
+
+        psi_cond_base = mix_psi(self.base.psi_amp["base"])
+        psi_cond_extra = mix_psi(self.base.psi_amp["extra"])
+        psi_cond_skill = mix_psi(self.base.psi_amp["skill"])
+        psi_cond_mu = mix_psi(self.base.psi_amp["mu"])
+        psi_cond_ls = mix_psi(self.base.psi_amp["ls"])
+        psi_cond_click = mix_psi(self.base.psi_amp["click"])
+
+        base_psi = self.base.psi_to["base"](psi_cond_base)
+        extra_psi = self.base.psi_to["extra"](psi_cond_extra)
+        skill_psi = self.base.psi_to["skill"](psi_cond_skill)
+        mu_psi = self.base.psi_to["mu"](psi_cond_mu)
+        ls_psi = self.base.psi_to["logstd"](psi_cond_ls)
+        click_psi = self.base.psi_to["click"](psi_cond_click)
+
+        def gate(gparam: torch.nn.Parameter) -> torch.Tensor:
+            s = sp(gparam)
+            return s / (s + 1.0)
+
+        w_base = gate(self.base.g_base)
+        w_extra = gate(self.base.g_extra)
+        w_skill = gate(self.base.g_skill)
+        w_mu = gate(self.base.g_mu)
+        w_ls = gate(self.base.g_ls)
+        w_click = gate(self.base.g_click)
+
+        base_logits = w_base * base_psi + (1.0 - w_base) * base_logits
+        extra_logits = w_extra * extra_psi + (1.0 - w_extra) * extra_logits
+        skill_logits = w_skill * skill_psi + (1.0 - w_skill) * skill_logits
+
+        mu = w_mu * mu_psi + (1.0 - w_mu) * mu
+
+        std_psi = torch.exp(ls_psi)
+        std_dir = torch.exp(logstd)
+        var_mix = (w_ls * (std_psi ** 2) + (1.0 - w_ls) * (std_dir ** 2)).clamp_min(1e-12)
+        logstd = 0.5 * torch.log(var_mix)
+        logstd = torch.clamp(logstd, self.base.logstd_low, self.base.logstd_high)
+
+        click_logits = w_click * click_psi + (1.0 - w_click) * click_logits
+        click_logits = self.base.Safe(click_logits, 60.0)
 
         comps = self.base.EntropyComponents(base_logits, extra_logits, skill_logits, logstd)
         entropy_scalar = self.base.AggregateEntropy(comps)
@@ -1553,7 +1605,10 @@ class TestDecisionMTool:
             outD = wrapper.ForwardWithDeltas(x, keyPaddingMask=None, tdError=None, uncertainty=None, deltasPerLayer=[D])
             out0 = wrapper.ForwardWithDeltas(x, keyPaddingMask=None, tdError=None, uncertainty=None, deltasPerLayer=[{}])
 
-            expect = F.linear(h, deltaW, bias=None)
+            sp = F.softplus
+            w_base = sp(model.g_base) / (sp(model.g_base) + 1.0) 
+            expect = (1.0 - w_base) * F.linear(h, deltaW, bias=None)
+            
             err = (outD["keyboard"]["base_logits"] - out0["keyboard"]["base_logits"] - expect).abs().max().item()
             if err >= 1e-5:
                 print(f"ForwardWithDeltas injection mismatch: err={err:.2e}")

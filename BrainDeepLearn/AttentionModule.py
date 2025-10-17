@@ -716,19 +716,18 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
                 keyPaddingMask = F.pad(keyPaddingMask, (0, pad_len), value=True)
             S = x.size(1)
 
-        h = x
+        if keyPaddingMask is not None:
+            keep0 = (~keyPaddingMask).unsqueeze(-1).to(x.dtype)
+            h = x * keep0
+        else:
+            h = x
+
         for layerIdx, blk in enumerate(self.base.temporal_blocks):
-            h = self.ForwardBlockWithDeltas(
-                blk=blk,
-                x=h,
-                keyPaddingMask=keyPaddingMask,
-                tdError=tdError,
-                uncertainty=uncertainty,
-                delta=deltasPerLayer[layerIdx],)
+            h = self.ForwardBlockWithDeltas(blk=blk, x=h, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty, delta=deltasPerLayer[layerIdx],)
 
         chunk = S // num_caps
         if keyPaddingMask is not None:
-            seg_mask = keyPaddingMask.reshape(B, num_caps, chunk)  # (B,I,chunk)
+            seg_mask = keyPaddingMask.reshape(B, num_caps, chunk)
         else:
             seg_mask = h.new_zeros(B, num_caps, chunk, dtype=torch.bool)
 
@@ -742,7 +741,12 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         routed = F.layer_norm(routed, (E,))
 
         routed_mean = routed.mean(dim=1)
-        temp_mean = h.mean(dim=1)
+        if keyPaddingMask is not None:
+            keep = (~keyPaddingMask).to(h.dtype).unsqueeze(-1) 
+            denom = keep.sum(dim=1, keepdim=True).clamp_min(1.0) 
+            temp_mean = (h * keep).sum(dim=1) / denom.squeeze(-1) 
+        else:
+            temp_mean = h.mean(dim=1)
 
         fusion_in = torch.stack([temp_mean, routed_mean, temp_mean + routed_mean], dim=1)  # (B,3,E)
         fused = self.base.fusion(fusion_in)
@@ -855,7 +859,12 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         ssm_out = blk.ssm(x, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty)
         w = torch.sigmoid(blk.mix_gate(x))
         y = w * mhsa_out + (1 - w) * ssm_out
-        return blk.norm(x + blk.dropout(y))
+
+        out = blk.norm(x + blk.dropout(y))
+        if keyPaddingMask is not None:
+            keep = (~keyPaddingMask).unsqueeze(-1).to(out.dtype) 
+            out = out * keep
+        return out
 
 
 
