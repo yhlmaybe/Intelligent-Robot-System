@@ -480,40 +480,6 @@ class GeoTropicalOut(NamedTuple):
 
 
 
-class MetaPlasticityController(nn.Module):
-    def __init__(self, hDim: int, mid: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hDim + 4, mid), nn.ReLU(),
-            nn.Linear(mid, mid), nn.ReLU(),
-            nn.Linear(mid, 1 + 1 + 1 + 2))
-        
-        with torch.no_grad():
-            for m in self.net:
-                if isinstance(m, nn.Linear):
-                    nn.init.orthogonal_(m.weight); nn.init.zeros_(m.bias)
-
-    def forward(self, h: torch.Tensor, compsNorm: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        z = torch.stack([
-            compsNorm.get("novelty_n", torch.zeros_like(h[:,0])),
-            compsNorm.get("progress_n", torch.zeros_like(h[:,0])),
-            compsNorm.get("entropy_n", torch.zeros_like(h[:,0])),
-            compsNorm.get("uncertainty_n", torch.zeros_like(h[:,0])),], dim=-1)
-        
-        inp = torch.cat([h, z], dim=-1)
-        out = self.net(inp).squeeze(-1)
-
-        eta_raw, lam_raw, beta_raw, film_g_raw, film_b_raw = torch.split(out, [1,1,1,1,1], dim=-1)
-        eta = torch.sigmoid(eta_raw) * 0.01 
-        lam = torch.sigmoid(lam_raw) * 0.2 
-        beta = torch.tanh(beta_raw) 
-        film_g = 0.1 * torch.tanh(film_g_raw) 
-        film_b = 0.1 * torch.tanh(film_b_raw)
-        return {"eta": eta.squeeze(-1), "lam": lam.squeeze(-1),
-                "beta_mix": beta.squeeze(-1),
-                "film_gamma": film_g.squeeze(-1), "film_beta": film_b.squeeze(-1)}
-
-
 class ValueEstimationExtractor(nn.Module):
     def __init__(self,
                  memoryDim: int = 768,
@@ -531,14 +497,12 @@ class ValueEstimationExtractor(nn.Module):
                  wEntropyTeacher: float = 1e-3,
                  persLevels: int = 5, persTemp: float = 0.5, persWeight: float = 1e-3,
                  wGITScale: float = 1e-3, wGITShift: float = 1e-3, wGITSign: float = 1e-3,
-                 useHebb: bool = False, hebbCap: float = 1.0, hebbOja: bool = True, detachHebbGrad: bool = True,
-                 useMeta: bool = False):
+                 useHebb: bool = False, hebbCap: float = 1.0, hebbOja: bool = True, detachHebbGrad: bool = True,):
         super().__init__()
         self.in_dim = memoryDim + attnDim + stateDim
         H = hidden
 
         self.use_hebb = useHebb
-        self.use_meta = useMeta
 
         self.wEntropyTeacher = wEntropyTeacher
 
@@ -549,8 +513,6 @@ class ValueEstimationExtractor(nn.Module):
 
         if self.use_hebb:
             self.hebb_value = HebbianLinearFW(H, 1, bias=True,initEta=1e-3, initLambda=0.1,cap=hebbCap, useOja=hebbOja, detachHebb=detachHebbGrad)
-        if self.use_meta:
-            self.meta_ctrl = MetaPlasticityController(H)
 
         self.value_head  = nn.Linear(H, 1)
         self.uncert_head = nn.Linear(H, 1)
@@ -600,24 +562,13 @@ class ValueEstimationExtractor(nn.Module):
         r_int, eT, comps = irg_out.rInt.detach(), irg_out.eT, irg_out.components
 
         hebb_eta = hebb_lam = beta_mix = None
-        if self.use_meta:
-            ctrl = self.meta_ctrl(h, {
-                "novelty_n": comps.get("novelty_n"),
-                "progress_n": comps.get("progress_n"),
-                "entropy_n": comps.get("entropy_n"),
-                "uncertainty_n": comps.get("uncertainty_n"),})
-            
-            h = (1.0 + ctrl["film_gamma"]).unsqueeze(-1) * h + ctrl["film_beta"].unsqueeze(-1)
-            hebb_eta = ctrl["eta"]; hebb_lam = ctrl["lam"]; beta_mix = ctrl["beta_mix"]
-        else:
-            if self.use_hebb:
-                hebb_eta = eT[..., 1].clamp_min(0).tanh() * 0.01 
-                hebb_lam = torch.full((B,), 0.1, device=device)
-                beta_mix = torch.zeros(B, device=device)
 
         uncert_pred = F.softplus(self.uncert_head(h).squeeze(-1))
 
         if self.use_hebb:
+            hebb_eta = eT[..., 1].clamp_min(0).tanh() * 0.01 
+            hebb_lam = torch.full((B,), 0.1, device=device)
+            beta_mix = torch.zeros(B, device=device)
             v_hebb, hebb_extras = self.hebb_value(h, eta=hebb_eta, lam=hebb_lam, betaMix=beta_mix)
             v_param = self.value_head(h).squeeze(-1)
             mix = torch.sigmoid(beta_mix) if beta_mix is not None else 0.5
@@ -720,9 +671,7 @@ class ValueEstimationExtractor(nn.Module):
             "aff_out": transp_extras.get("aff_out", torch.zeros_like(value)).detach(),
             "a": transp_extras.get("a", torch.zeros_like(value)).detach(),
             "b": transp_extras.get("b", torch.zeros_like(value)).detach(),
-            "hebb_H_norm": hebb_extras.get("H_norm", torch.tensor(0.0, device=device)).detach(),
-            "meta_eta": (hebb_eta.mean().detach() if (hebb_eta is not None) else torch.tensor(0.0, device=device)),
-            "meta_lambda": (hebb_lam.mean().detach() if (hebb_lam is not None) else torch.tensor(0.0, device=device)),}
+            "hebb_H_norm": hebb_extras.get("H_norm", torch.tensor(0.0, device=device)).detach()}
 
         return GeoTropicalOut(
             value=value,
@@ -744,15 +693,14 @@ class TestValueEstimationMTool:
         self.attn_dim = 512
         self.state_dim= 256
 
-    def MakeEstimatorHebbMeta(self, **overrides):
+    def MakeEstimatorHebb(self, **overrides):
         est = ValueEstimationExtractor(
             memoryDim=self.mem_dim,
             attnDim=self.attn_dim,
             stateDim=self.state_dim,
             useLayerNorm=True,
             useHebb=True,
-            useMeta=True, 
-            irgKwargs={"teacherDropoutProb": 0.0}, 
+            irgKwargs={"teacherDropoutProb": 0.0},
             **overrides).to(self.device)
         est.train()
         return est
@@ -1097,7 +1045,7 @@ class TestValueEstimationMTool:
             torch.manual_seed(7)
             B = 6
             mem, attn, state = self.RandBatch(B)
-            est = self.MakeEstimatorHebbMeta()
+            est = self.MakeEstimatorHebb()
             H0 = est.hebb_value.H.detach().clone()
 
             entropy_prev = torch.rand(B, device=self.device)
@@ -1118,146 +1066,6 @@ class TestValueEstimationMTool:
             print(f"Hebbian memory update error: {e}")
             return False
 
-    def TestMetaCtrlGetsGrad(self) -> bool:
-        try:
-            torch.manual_seed(11)
-            B = 8
-            mem, attn, state = self.RandBatch(B)
-            est = self.MakeEstimatorHebbMeta()
-            opt = torch.optim.Adam(est.parameters(), lr=1e-3)
-
-            entropy_prev = torch.rand(B, device=self.device)
-            uncert_teacher = F.softplus(torch.randn(B, device=self.device))
-            reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
-
-            out = est(memory=mem, attn=attn, state=state,
-                      rewardExt=reward_ext, policyEntropyPrev=entropy_prev,
-                      uncertaintyTeacher=uncert_teacher, tdErrorPrev=None,
-                      done=torch.zeros(B, device=self.device),
-                      edgeIndex=self.MakeChainEdges(B, closed=True), edgeWeight=None)
-
-            loss = out.loss
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-
-            has_meta_grad = True
-            bad = []
-            for n, p in est.named_parameters():
-                if 'meta_ctrl' in n and p.requires_grad:
-                    if (p.grad is None) or (not torch.isfinite(p.grad).all()):
-                        has_meta_grad = False
-                        bad.append(n)
-            if not has_meta_grad:
-                print("Meta controller missing/NaN grad:\n", bad)
-                return False
-
-            head_ok = (est.value_head.weight.grad is not None) and torch.isfinite(est.value_head.weight.grad).all()
-            print(f"MetaCtrl grad {'passed' if (has_meta_grad and head_ok) else 'failed'}.")
-            return has_meta_grad and head_ok
-        except Exception as e:
-            print(f"MetaCtrl grad error: {e}")
-            return False
-
-    def ParamsChange_WithHebbMeta(self, steps: int = 20) -> bool:
-        try:
-            torch.manual_seed(17)
-            est = self.MakeEstimatorHebbMeta()
-            est.train()
-            opt = torch.optim.Adam(est.parameters(), lr=1e-3)
-
-            with torch.no_grad():
-                p0 = []
-                for n, p in est.named_parameters():
-                    if p.requires_grad and p.data.numel() > 0:
-                        p0.append(p.data.flatten()[:64].clone())
-                p0 = torch.cat(p0) if p0 else torch.zeros(1, device=self.device)
-
-            for t in range(steps):
-                B = 10
-                mem, attn, state = self.RandBatch(B)
-                edgeIndex = self.MakeChainEdges(B, closed=(t % 2 == 0))
-                done = torch.zeros(B, device=self.device)
-                entropy_prev = torch.rand(B, device=self.device)
-                uncert_teacher = F.softplus(torch.randn(B, device=self.device))
-                reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
-
-                out = est(memory=mem, attn=attn, state=state,
-                          rewardExt=reward_ext, policyEntropyPrev=entropy_prev,
-                          uncertaintyTeacher=uncert_teacher, tdErrorPrev=None,
-                          done=done, edgeIndex=edgeIndex, edgeWeight=None)
-
-                opt.zero_grad(set_to_none=True)
-                out.loss.backward()
-                torch.nn.utils.clip_grad_norm_(est.parameters(), 1.0)
-                opt.step()
-
-            with torch.no_grad():
-                p1 = []
-                for n, p in est.named_parameters():
-                    if p.requires_grad and p.data.numel() > 0:
-                        p1.append(p.data.flatten()[:64].clone())
-                p1 = torch.cat(p1) if p1 else torch.zeros(1, device=self.device)
-                delta = (p0 - p1).abs().mean().item()
-
-            ok = delta > 1e-6
-            print(f"ParamsChange_WithHebbMeta {'passed' if ok else 'failed'} (delta={delta:.3e}).")
-            return ok
-        except Exception as e:
-            print(f"ParamsChange_WithHebbMeta error: {e}")
-            return False
-
-    def TestLossDecreases_WithHebbMeta(self, steps: int = 100, batch_size: int = 16) -> bool:
-        try:
-            torch.manual_seed(2025)
-            est = self.MakeEstimatorHebbMeta(wExt=1.0, wInt=0.1)
-            est.train()
-            opt = torch.optim.Adam(est.parameters(), lr=1e-3)
-
-            losses = []
-            for t in range(steps):
-                mem = torch.randn(batch_size, self.mem_dim,  device=self.device)
-                attn = torch.randn(batch_size, self.attn_dim, device=self.device)
-                state = torch.randn(batch_size, self.state_dim,device=self.device)
-
-                edgeIndex = self.MakeChainEdges(batch_size, closed=(t % 4 == 0))
-                done = torch.zeros(batch_size, device=self.device)
-
-                reward_ext = torch.randn(batch_size, device=self.device).clamp(-1, 1)
-                entropy_prev = torch.rand(batch_size, device=self.device)
-                uncert_teacher = F.softplus(torch.randn(batch_size, device=self.device))
-
-                out = est(memory=mem, attn=attn, state=state,
-                          rewardExt=reward_ext, policyEntropyPrev=entropy_prev,
-                          uncertaintyTeacher=uncert_teacher, tdErrorPrev=None,
-                          done=done, edgeIndex=edgeIndex, edgeWeight=None)
-
-                total = out.loss
-                opt.zero_grad(set_to_none=True)
-                total.backward()
-                torch.nn.utils.clip_grad_norm_(est.parameters(), 1.0)
-                opt.step()
-
-                losses.append(float(total.detach().item()))
-                if (t + 1) % max(1, steps // 4) == 0:
-                    print(f"[HebbMetaTrain] step {t+1}/{steps} | loss={losses[-1]:.6f}")
-
-            assert len(losses) >= 2, "No valid loss trajectory is generated"
-            start = losses[0]
-            end = min(losses[-1], sum(losses[-10:]) / max(1, len(losses[-10:])))
-            print(f"\n[HebbMetaTrain] loss start={start:.6f} -> end={end:.6f}\n")
-
-            rel_ok = end <= start * 0.85
-            abs_ok = (start - end) >= 0.05
-            ok = rel_ok or abs_ok
-            print(f"LossDecreases_WithHebbMeta {'passed' if ok else 'failed'}.")
-            return ok
-        except AssertionError as e:
-            print(f"LossDecreases_WithHebbMeta failed: {e}")
-            return False
-        except Exception as e:
-            print(f"LossDecreases_WithHebbMeta error: {e}")
-            return False
-
 
     def RunAll(self):
         results = []
@@ -1269,9 +1077,7 @@ class TestValueEstimationMTool:
         results.append(self.ParamsActuallyChange())
         results.append(self.TestLossDecreases())
         results.append(self.TestHebbMemoryUpdates())
-        results.append(self.TestMetaCtrlGetsGrad())
-        results.append(self.ParamsChange_WithHebbMeta())
-        results.append(self.TestLossDecreases_WithHebbMeta())
+
         passed = sum(1 for x in results if x)
         print(f"\n[ValueEstimationExtractor Tests] {passed}/{len(results)} passed.")
         return all(results)
