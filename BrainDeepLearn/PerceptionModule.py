@@ -346,8 +346,7 @@ class CNNFeatureExtractor(nn.Module):
         self.layer3 = self.make_layer(baseChannels*2, baseChannels*4, blocks=2, stride=2, useHebbian=useHebbian)
         self.layer4 = self.make_layer(baseChannels*4, baseChannels*8, blocks=2, stride=2, useHebbian=useHebbian)
 
-        self.conv2 = HebbianConv2d(baseChannels*8, baseChannels*16, 3, stride=1, padding=1,
-                                   bias=False, useHebbian=useHebbian)
+        self.conv2 = HebbianConv2d(baseChannels*8, baseChannels*16, 3, stride=1, padding=1, bias=False, useHebbian=useHebbian)
         self.bn2 = nn.BatchNorm2d(baseChannels*16)
 
     def make_layer(self, inC, outC, blocks, stride, useHebbian):
@@ -576,9 +575,9 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             return float(s) * (b @ a)
 
         return {
-            "feat": SiteSpec("feat",  L, C * 1, C * 1, self.maxRankFeat, alloc_feat, compose_feat),
-            "patch":SiteSpec("patch", L, C * ksz, E, self.maxRankPatch, alloc_patch, compose_patch),
-            "token":SiteSpec("token", L, D, D, self.maxRankToken, alloc_token, compose_token),}
+            "feat": SiteSpec("feat", L, C * 1, C * 1, self.maxRankFeat, alloc_feat, compose_feat),
+            "patch": SiteSpec("patch", L, C * ksz, E, self.maxRankPatch, alloc_patch, compose_patch),
+            "token": SiteSpec("token", L, D, D, self.maxRankToken, alloc_token, compose_token),}
 
     def ForwardWithDeltas(
         self,
@@ -966,9 +965,7 @@ class TestPerceptionMTool:
     def WrapperManualGrowTrainAndCommit(self):
         try:
             img_size = 64
-            base = PerceiveExtractor(
-                imgSize=img_size, patchSize=1, embedDim=64,
-                numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            base = PerceiveExtractor(imgSize=img_size, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
             base.eval()
 
             wrapper = PerceptionOnlineWrapper(base=base, initRankEach=4).to(self.device)
@@ -1217,8 +1214,7 @@ class TestPerceptionMTool:
 
     def GradCoverageReport(self, min_ratio: float = 0.60):
         try:
-            model = PerceiveExtractor(imgSize=64, patchSize=1, embedDim=64, numHeads=8,
-                                      numLayers=2, baseChannels=16, useHebbian=True).to(self.device)
+            model = PerceiveExtractor(imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=True).to(self.device)
             head = nn.Linear(128, 16).to(self.device)
             model.train(); head.train()
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
