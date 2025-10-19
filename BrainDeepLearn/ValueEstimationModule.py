@@ -6,6 +6,59 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class GrowableLoRALinear(nn.Module):
+
+    def __init__(self, targetLinear: nn.Linear):
+        super().__init__()
+        assert isinstance(targetLinear, nn.Linear)
+        self.target = targetLinear
+        self.A_list = nn.ParameterList()
+        self.B_list = nn.ParameterList()
+        self.alpha = nn.ParameterList()
+
+        self.out_f = int(targetLinear.out_features)
+        self.in_f = int(targetLinear.in_features)
+
+    @torch.no_grad()
+    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
+        if (addRank is None) or (addRank <= 0):
+            return
+        if init is None: init = {}
+
+        dev = self.target.weight.device
+        dt = self.target.weight.dtype
+
+        A = init.get("A", torch.randn(addRank, self.in_f,  device=dev, dtype=dt) * 1e-4)
+        B = init.get("B", torch.zeros(self.out_f, addRank, device=dev, dtype=dt))
+        s = init.get("scale", 1e-3)
+
+        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
+        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
+        s = nn.Parameter(torch.as_tensor(s, device=dev, dtype=dt))
+
+        if freezeOld:
+            for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
+                p.requires_grad_(False)
+
+        self.A_list.append(A)
+        self.B_list.append(B)
+        self.alpha.append(s)
+
+    def DeltaWeight(self) -> Optional[torch.Tensor]:
+        if len(self.A_list) == 0:
+            return None
+        delta = self.target.weight.new_zeros(self.out_f, self.in_f)
+        for A, B, s in zip(self.A_list, self.B_list, self.alpha):
+            delta = delta + s * (B @ A)
+        return delta
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.target.weight
+        delta = self.DeltaWeight()
+        if delta is not None:
+            w = w + delta
+        return F.linear(x, w, self.target.bias)
+
 class HebbianLinearFW(nn.Module):
     def __init__(self, inFeatures: int, outFeatures: int, bias: bool = True, *,initEta: float = 1e-3, initLambda: float = 0.1, cap: float = 1.0,useOja: bool = True, detachHebb: bool = True):
         super().__init__()
@@ -326,17 +379,15 @@ class GITGaugeRegularizer(nn.Module):
         self.w_shift = wShift
         self.w_sign = wSign
 
-    def forward(self,
-                value_head: nn.Linear,
-                transp_extras: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, valueHead: nn.Linear, transpExtras: Dict[str, torch.Tensor]) -> torch.Tensor:
         
-        reg = value_head.weight.new_zeros(())
-        W = value_head.weight
+        reg = valueHead.weight.new_zeros(())
+        W = valueHead.weight
         fro = torch.linalg.matrix_norm(W, ord='fro')
         reg = reg + self.w_scale * (fro - 1.0).pow(2)
 
-        if "b" in transp_extras:
-            b = transp_extras["b"]
+        if "b" in transpExtras:
+            b = transpExtras["b"]
             reg = reg + self.w_shift * (b.mean()).pow(2)
 
         with torch.no_grad():
