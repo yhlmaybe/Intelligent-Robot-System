@@ -371,10 +371,8 @@ class RSSMWorldModel(nn.Module):
 
         if self._use_memory and self._mem_path:
             self.LoadMemory(self._mem_path, map_location=None, strict=False)
-        if self._use_memory:
-            self.mem_val_to_e = nn.Sequential(nn.Linear(deterDim, stochDim), nn.LayerNorm(stochDim))
-        else:
-            self.mem_val_to_e = None
+
+        self.mem_val_to_e = nn.Sequential(nn.Linear(deterDim, stochDim), nn.LayerNorm(stochDim))
 
     def SaveMemory(self, path: Optional[str] = None):
         if not self._use_memory:
