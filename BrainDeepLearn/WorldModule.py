@@ -293,11 +293,10 @@ class RSSMWorldModel(nn.Module):
         nn.init.zeros_(self.rew_head[-1].target.bias)
         nn.init.zeros_(self.done_head[-1].target.bias)
 
-        if useDecoder:
-            self.obs_dec = nn.Sequential(
-                GrowableLoRALinear(nn.Linear(stateDim, stateDim, bias=True)),
-                nn.GELU(),
-                GrowableLoRALinear(nn.Linear(stateDim, visionDim, bias=True)),)
+        self.obs_dec = nn.Sequential(
+            GrowableLoRALinear(nn.Linear(stateDim, stateDim, bias=True)),
+            nn.GELU(),
+            GrowableLoRALinear(nn.Linear(stateDim, visionDim, bias=True)),)
 
         self._use_memory = bool(useMemory)
         self._mem_capacity = int(memoryCapacity)
@@ -305,14 +304,10 @@ class RSSMWorldModel(nn.Module):
         self._mem_autosave_every = int(memoryAutosaveEvery)
         self._mem_add_count = 0
 
-        if self._use_memory:
-            self.register_buffer("_mem_keys", torch.zeros(self._mem_capacity, stochDim))
-            self.register_buffer("_mem_vals", torch.zeros(self._mem_capacity, deterDim))
-            self._mem_size: int = 0
-            self._mem_ptr: int = 0
-        else:
-            self._mem_keys = self._mem_vals = None
-            self._mem_size = self._mem_ptr = 0
+        self.register_buffer("_mem_keys", torch.zeros(self._mem_capacity, stochDim))
+        self.register_buffer("_mem_vals", torch.zeros(self._mem_capacity, deterDim))
+        self._mem_size: int = 0
+        self._mem_ptr: int = 0
 
         self._ns_enabled = bool(nsEnabled)
         self._ns_bias_prior = bool(nsBiasPrior)
@@ -347,24 +342,18 @@ class RSSMWorldModel(nn.Module):
             (21, 17),
             (22, 13),]
 
-        if self._ns_enabled:
-            hid = max(128, stochDim)
-            self.ns_head_post = nn.Sequential(nn.Linear(deterDim + stochDim, hid), nn.GELU(), nn.Linear(hid, self._ns_K))
-            self.ns_head_prior = nn.Sequential(nn.Linear(deterDim, hid), nn.GELU(), nn.Linear(hid, self._ns_K))
-            self.ns_to_delta_e = nn.Linear(self._ns_K, stochDim)
-            self.ns_to_delta_mu = nn.Linear(self._ns_K, stochDim)
-            self.ns_gate_e = nn.Linear(deterDim + stochDim, stochDim)
-            self.ns_gate_mu = nn.Linear(deterDim + stochDim, stochDim)
 
-            self.ns_lambda_excl = float(nsLambdaExclusive)
-            self.ns_lambda_alo = float(nsLambdaAtLeastOne)
-            self.ns_lambda_impl = float(nsLambdaImplication)
-        else:
-            self.ns_head_post = self.ns_head_prior = None
-            self.ns_to_delta_e = self.ns_to_delta_mu = None
-            self.ns_gate_e = self.ns_gate_mu = None
-            self.ns_exclusives = self.ns_atleast_one = self.ns_implications = []
-            self.ns_lambda_excl = self.ns_lambda_alo = self.ns_lambda_impl = 0.0
+        hid = max(128, stochDim)
+        self.ns_head_post = nn.Sequential(nn.Linear(deterDim + stochDim, hid), nn.GELU(), nn.Linear(hid, self._ns_K))
+        self.ns_head_prior = nn.Sequential(nn.Linear(deterDim, hid), nn.GELU(), nn.Linear(hid, self._ns_K))
+        self.ns_to_delta_e = nn.Linear(self._ns_K, stochDim)
+        self.ns_to_delta_mu = nn.Linear(self._ns_K, stochDim)
+        self.ns_gate_e = nn.Linear(deterDim + stochDim, stochDim)
+        self.ns_gate_mu = nn.Linear(deterDim + stochDim, stochDim)
+
+        self.ns_lambda_excl = float(nsLambdaExclusive)
+        self.ns_lambda_alo = float(nsLambdaAtLeastOne)
+        self.ns_lambda_impl = float(nsLambdaImplication)
 
         self._meta_dim = int(metaDim)
         self.meta_to_e = nn.Linear(self._meta_dim, stochDim, bias=False)
@@ -993,18 +982,26 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         maxRankRew1: int = 32,
         maxRankRew2: int = 8,
         maxRankDone1:int = 32,
-        maxRankDone2:int = 8,):
+        maxRankDone2:int = 8,
+        maxRankDec1: int = 64,
+        maxRankDec2: int = 64,
+        maxRankGruIH: int = 64,
+        maxRankGruHH: int = 64,):
         self._maxRank = dict(
             obs1 = int(maxRankObs1),
             obs2 = int(maxRankObs2),
-            act  = int(maxRankAct),
-            prior= int(maxRankPrior),
+            act = int(maxRankAct),
+            prior = int(maxRankPrior),
             post = int(maxRankPost),
-            state= int(maxRankState),
+            state = int(maxRankState),
             rew1 = int(maxRankRew1),
             rew2 = int(maxRankRew2),
-            done1= int(maxRankDone1),
-            done2= int(maxRankDone2),)
+            done1 = int(maxRankDone1),
+            done2 = int(maxRankDone2),
+            dec1 = int(maxRankDec1),
+            dec2 = int(maxRankDec2),
+            gru_ih = int(maxRankGruIH),
+            gru_hh = int(maxRankGruHH),)
         super().__init__(base, initRankEach=initRankEach, autoRank=autoRank, evThreshold=evThreshold, gradEma=gradEma)
 
     def BuildSiteSpecs(self) -> Dict[str, "SiteSpec"]:
@@ -1043,6 +1040,12 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         add("rew2", 256, 1, self._maxRank["rew2"]) # rew_head[2]
         add("done1", S, 256, self._maxRank["done1"]) # done_head[0]
         add("done2", 256, 1, self._maxRank["done2"]) # done_head[2]
+        add("gru_ih", 2*Z, 3*D, self._maxRank["gru_ih"])
+        add("gru_hh", D, 3*D, self._maxRank["gru_hh"])
+
+        if wm.use_decoder:
+            add("dec1", S, S, self._maxRank["dec1"])  # obs_dec[0]
+            add("dec2", S, V, self._maxRank["dec2"]) 
         return specs
 
     def ForwardWithDeltas(
@@ -1093,7 +1096,24 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         a_t = wm.act_proj[1](a_t)
         a_t = wm.act_proj[2](a_t)
 
-        h_next = wm.gru(torch.cat([zPrev, a_t], dim=-1), hPrev)
+        x_in = torch.cat([zPrev, a_t], dim=-1)
+        W_ih = wm.gru.target.weight_ih
+        W_hh = wm.gru.target.weight_hh
+        if (d := wm.gru.DeltaIH()) is not None: W_ih = W_ih + d
+        if (d := wm.gru.DeltaHH()) is not None: W_hh = W_hh + d
+        if "gru_ih" in deltas and deltas["gru_ih"] is not None: W_ih = W_ih + deltas["gru_ih"]
+        if "gru_hh" in deltas and deltas["gru_hh"] is not None: W_hh = W_hh + deltas["gru_hh"]
+        b_ih = wm.gru.target.bias_ih
+        b_hh = wm.gru.target.bias_hh
+
+        gi = F.linear(x_in, W_ih, b_ih)
+        gh = F.linear(hPrev, W_hh, b_hh)
+        i_r, i_i, i_n = gi.chunk(3, dim=1)
+        h_r, h_i, h_n = gh.chunk(3, dim=1)
+        resetgate = torch.sigmoid(i_r + h_r)
+        inputgate = torch.sigmoid(i_i + h_i)
+        newgate = torch.tanh(i_n + resetgate * h_n)
+        h_next = newgate + inputgate * (hPrev - newgate)
 
         W_prior, b_prior = eff_linear(wm.prior_net[0], deltas.get("prior", None))
         prior_out = F.linear(h_next, W_prior, b_prior)
@@ -1199,7 +1219,12 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
             out["ns_probs"]  = ns_probs
 
         if (mode == "posterior") and wm.use_decoder:
-            out["recon"] = wm.obs_dec(s_next)
+            W_dec1, b_dec1 = eff_linear(wm.obs_dec[0], deltas.get("dec1", None))
+            dec_mid = F.linear(s_next, W_dec1, b_dec1)
+            dec_mid = wm.obs_dec[1](dec_mid)
+            W_dec2, b_dec2 = eff_linear(wm.obs_dec[2], deltas.get("dec2", None))
+            recon = F.linear(dec_mid, W_dec2, b_dec2)
+            out["recon"] = recon
             out["recon_target"] = v
 
         if mode == "posterior":
@@ -1236,6 +1261,16 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
             wm.done_head[0].Grow(addRank=a.size(0), init=init, freezeOld=False);  return True
         if site == "done2":
             wm.done_head[2].Grow(addRank=a.size(0), init=init, freezeOld=False);  return True
+        if site == "dec1":
+            wm.obs_dec[0].Grow(addRank=a.size(0), init=init, freezeOld=False);  return True
+        if site == "dec2":
+            wm.obs_dec[2].Grow(addRank=a.size(0), init=init, freezeOld=False);  return True
+        if site == "gru_ih":
+            init_gru = {"A_ih": a.detach().clone(), "B_ih": b.detach().clone(), "scale_ih": float(scale)}
+            wm.gru.Grow(addRank=a.size(0), init=init_gru, freezeOld=False, mode="ih");  return True
+        if site == "gru_hh":
+            init_gru = {"A_hh": a.detach().clone(), "B_hh": b.detach().clone(), "scale_hh": float(scale)}
+            wm.gru.Grow(addRank=a.size(0), init=init_gru, freezeOld=False, mode="hh");  return True
         return False
 
 
