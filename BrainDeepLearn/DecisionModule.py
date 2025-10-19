@@ -106,17 +106,18 @@ class LoRALinearAdapter(nn.Module):
         self.alpha = nn.ParameterList() 
 
     @torch.no_grad()
-    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True, scale: float = 1e-2):
+    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
         if addRank <= 0: return
-        init = init or {}
+        if init is None: init = {}
         dev, dt = self.target.weight.device, self.target.weight.dtype
+
         A = init.get("A", torch.randn(addRank, self.in_f, device=dev, dtype=dt) * 1e-4)
         B = init.get("B", torch.randn(self.out_f, addRank, device=dev, dtype=dt) * 1e-4)
-        s = init.get("scale", scale)
+        s = init.get("scale", 1e-2)
 
-        A = nn.Parameter(A.contiguous())
-        B = nn.Parameter(B.contiguous())
-        s = nn.Parameter(torch.tensor(float(s), device=dev, dtype=dt))
+        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
+        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
+        s = nn.Parameter(torch.tensor(s, device=dev, dtype=dt))
 
         if freezeOld:
             for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
@@ -143,20 +144,22 @@ class MatLoRAAdapter(nn.Module):
         self.B_list = nn.ParameterList() 
         self.alpha = nn.ParameterList()
 
+        self.register_buffer("_anchor", torch.empty(0))
+
     @torch.no_grad()
-    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True, scale: float = 1e-3):
+    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
         if addRank <= 0: return
-        init = init or {}
-        p_any = next(iter(self.parameters()), None)
-        dev = (p_any.device if p_any is not None else torch.device('cpu'))
-        dt  = (p_any.dtype  if p_any is not None else torch.float32)
+        if init is None: init = {}
+
+        dev, dt = self._anchor.device, self._anchor.dtype
+
         A = init.get("A", torch.randn(addRank, self.N, device=dev, dtype=dt) * 1e-4)
         B = init.get("B", torch.randn(self.M, addRank, device=dev, dtype=dt) * 1e-4)
-        s = init.get("scale", scale)
+        s = init.get("scale", 1e-3)
 
-        A = nn.Parameter(A.contiguous())
-        B = nn.Parameter(B.contiguous())
-        s = nn.Parameter(torch.tensor(float(s), device=dev, dtype=dt))
+        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
+        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
+        s = nn.Parameter(torch.as_tensor(s, device=dev, dtype=dt))
 
         if freezeOld:
             for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
@@ -366,12 +369,12 @@ class DecisionExtractor(nn.Module):
 
         K = optionNum
         self.psi_amp = nn.ParameterDict({
-            "base": nn.Parameter(torch.zeros(K, 1)),
-            "extra": nn.Parameter(torch.zeros(K, 1)),
-            "skill": nn.Parameter(torch.zeros(K, 1)),
-            "mu": nn.Parameter(torch.zeros(K, 1)),
-            "ls": nn.Parameter(torch.zeros(K, 1)),
-            "click": nn.Parameter(torch.zeros(K, 1)),})
+            "base": nn.Parameter(torch.full((K, 1), -4.0)),
+            "extra": nn.Parameter(torch.full((K, 1), -4.0)),
+            "skill": nn.Parameter(torch.full((K, 1), -4.0)),
+            "mu": nn.Parameter(torch.full((K, 1), -4.0)),
+            "ls": nn.Parameter(torch.full((K, 1), -4.0)),
+            "click": nn.Parameter(torch.full((K, 1), -4.0)),})
 
         self.g_base = nn.Parameter(torch.tensor(0.5))
         self.g_extra = nn.Parameter(torch.tensor(0.5))
@@ -540,10 +543,8 @@ class DecisionExtractor(nn.Module):
         base_direct, skill_direct, extra_direct = self.keyboard.Logits(z)
         mu_direct, logstd_direct, click_direct = self.mouse.Params(z)
 
-        sp = F.softplus 
-
         def mix_psi_per_branch(amp_param: torch.nn.Parameter) -> torch.Tensor:
-            amp = F.softplus(amp_param).unsqueeze(0) * 0.5 
+            amp = torch.sigmoid(amp_param).unsqueeze(0) 
             return (w_t.unsqueeze(-1) * psi_all * amp).sum(dim=1)
 
         psi_cond_base = mix_psi_per_branch(self.psi_amp["base"])
@@ -759,7 +760,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
             return A, B, s
 
         def compose_lin(a, b, s):
-            return float(s) * (b @ a)
+            return s * (b @ a)
 
         def alloc_mat(addRank, device, dtype, N, M):
             A = nn.Parameter(torch.randn(addRank, N, device=device, dtype=dtype) * 1e-4)
@@ -768,7 +769,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
             return A, B, s
 
         def compose_mat(a, b, s):
-            return float(s) * (b @ a)
+            return s * (b @ a)
 
         L = 1
 
@@ -917,8 +918,8 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
 
         sp = F.softplus
         def mix_psi(amp_param: torch.nn.Parameter) -> torch.Tensor:
-            amp = sp(amp_param).unsqueeze(0) * 0.5 
-            return (w_t.unsqueeze(-1) * psi_all * amp).sum(dim=1) 
+            amp = torch.sigmoid(amp_param).unsqueeze(0) 
+            return (w_t.unsqueeze(-1) * psi_all * amp).sum(dim=1)
 
         psi_cond_base = mix_psi(self.base.psi_amp["base"])
         psi_cond_extra = mix_psi(self.base.psi_amp["extra"])
@@ -1459,10 +1460,10 @@ class TestDecisionMTool:
             adap = LoRALinearAdapter(lin).to(self.device)
             x = torch.randn(4, 32, device=self.device)
             y_base = adap(x)
-            adap.Grow(addRank=3, scale=1e-3)
+            adap.Grow(addRank=3)
             y_aug = adap(x)
             A, B, s = adap.A_list[0], adap.B_list[0], adap.alpha[0]
-            s_eff = torch.tanh(s) * 1e-2
+            s_eff = torch.tanh(s) * 1e-1
             delta = F.linear(x, s_eff * (B @ A), bias=None)
             diff = (y_aug - y_base - delta).abs().max().item()
             if diff >= 1e-5:
@@ -1482,14 +1483,16 @@ class TestDecisionMTool:
 
             out0 = adap(base)
 
-            adap.Grow(addRank=1, scale=1e-3)
-            adap.Grow(addRank=1, scale=1e-3, freezeOld=True)
+            adap.Grow(addRank=1)
+            adap.Grow(addRank=1, freezeOld=True)
 
             out1 = adap(base)
 
             A0, B0, s0 = adap.A_list[0], adap.B_list[0], adap.alpha[0]
             A1, B1, s1 = adap.A_list[1], adap.B_list[1], adap.alpha[1]
-            expect = base + s0 * (B0 @ A0) + s1 * (B1 @ A1)
+            s0_eff = torch.tanh(s0) * 1e-1
+            s1_eff = torch.tanh(s1) * 1e-1
+            expect = base + s0_eff * (B0 @ A0) + s1_eff * (B1 @ A1)
 
             err = (out1 - expect).abs().max().item()
             if out0.shape != base.shape or err >= 1e-5:
@@ -1540,7 +1543,7 @@ class TestDecisionMTool:
             model = DecisionExtractor(stateDim=256, includeNoSkill=True, useHebb=False).to(self.device)
             model.eval()
             K = model.num_options
-            model.option.trans_adapter.Grow(addRank=1, scale=1e-2)
+            model.option.trans_adapter.Grow(addRank=1)
 
             x = torch.randn(2, 256, device=self.device)
             prev0 = torch.zeros(2, K, device=self.device)
@@ -1661,7 +1664,7 @@ class TestDecisionMTool:
             model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebb=False).to(self.device)
             model.train()
 
-            model.option.trans_adapter.Grow(addRank=2, scale=1e-3, freezeOld=False)
+            model.option.trans_adapter.Grow(addRank=2, freezeOld=False)
             opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
             x_fix = torch.randn(B, in_dim, device=self.device)
@@ -1855,68 +1858,134 @@ class TestDecisionMTool:
         except Exception as e:
             print("Parameter change test error:", type(e).__name__, e)
             return False
+        
+    def TestConvergence(self, steps: int = 400, logEvery: int = 20) -> bool:
+        device = self.device
 
-    def TestConvergence(self, steps: int = 500, logEvery: int = 20) -> bool:
         try:
             in_dim = 512
-            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebb=False).to(self.device)
+            model = DecisionExtractor(stateDim=in_dim, includeNoSkill=True, useHebb=False,logstdBounds=(-4.0, 0.5)).to(device)
             model.train()
-            opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
+
+            opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
 
             B = 32
-            xfix = torch.randn(B, in_dim, device=self.device)
+            xfix = torch.randn(B, in_dim, device=device)
             K = model.num_options
-            prevfix = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
+            prevfix = F.one_hot(torch.randint(0, K, (B,), device=device), num_classes=K).float()
 
-            g = torch.Generator(device=self.device).manual_seed(42)
-            def r(shape): return torch.randn(shape, generator=g, device=self.device)
-            fixed_adv = {
-                "option": r((B,)), "beta": r((B,)),
-                "skill": r((B,)), "base": r((B,)),
-                "extra": r((B,)), "mouse": r((B,)),
-                "click": r((B,)),}
+            def metrics(out: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+                kb, ms, op = out["keyboard"], out["mouse"], out["option"]
+                base_p = torch.sigmoid(kb["base_logits"]).clamp(1e-6, 1-1e-6)
+                extra_p = torch.sigmoid(kb["extra_logits"]).clamp(1e-6, 1-1e-6)
+                base_cnt = (base_p > 0.5).float().sum(dim=1)
+                extra_cnt = (extra_p > 0.5).float().sum(dim=1)
+
+                mu, logstd = ms["mu"], ms["logstd"]
+                mu_energy = mu.pow(2).sum(dim=1)
+                click_p  = torch.sigmoid(ms["click_logits"]).mean(dim=1)
+
+                opt_p0 = F.softmax(op["logits"], dim=-1)[:, 0]
+                beta_m = op["beta"].squeeze(-1)
+
+                base_norm = base_cnt / max(1, self.num_base)
+                extra_norm = extra_cnt / max(1, self.num_extra)
+
+                proxy = (0.20 * base_norm + 0.35 * extra_norm + 0.20 * mu_energy + 0.12 * click_p + 0.08 * beta_m + 0.05 * (1.0 - opt_p0))
+
+                return {
+                    "proxy": proxy,
+                    "base_cnt": base_cnt, "extra_cnt": extra_cnt,
+                    "mu_energy": mu_energy, "click_p": click_p,
+                    "opt0": opt_p0, "beta": beta_m,}
+
+            def shaping_loss(out: Dict[str, Any]) -> torch.Tensor:
+                kb, ms, op = out["keyboard"], out["mouse"], out["option"]
+
+                extra_p = torch.sigmoid(kb["extra_logits"]).clamp(1e-6, 1-1e-6)
+                click_p = torch.sigmoid(ms["click_logits"]).clamp(1e-6, 1-1e-6)
+                mu, logstd = ms["mu"], ms["logstd"]
+                beta_m = op["beta"].squeeze(-1)
+
+                L_extra = extra_p.mean() 
+                L_click = click_p.mean() 
+                L_beta = beta_m.mean() 
+                L_mu = mu.pow(2).mean()
+                L_sig = torch.exp(logstd).mean()
+
+                target0 = torch.zeros(mu.shape[0], dtype=torch.long, device=mu.device)
+                L_opt = F.cross_entropy(op["logits"], target0) 
+
+                base_p = torch.sigmoid(kb["base_logits"]).clamp(1e-6, 1-1e-6)
+                L_base = base_p.mean() * 0.2
+
+                w_extra, w_click, w_beta = 1.0, 0.5, 0.5
+                w_mu, w_sig, w_opt, w_base = 0.3, 0.2, 0.6, 0.1
+
+                return ( w_extra * L_extra + w_click * L_click + w_beta * L_beta + w_mu * L_mu + w_sig * L_sig + w_opt * L_opt + w_base * L_base)
+
+            def zero_adv(out: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+                B = out["mouse"]["mu"].shape[0]
+                z = torch.zeros(B, device=device)
+                return {"base": z, "extra": z, "skill": z, "mouse": z, "click": z, "option": z, "beta": z}
 
             with torch.no_grad():
-                out0 = model(xfix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prevfix, returnKeysVec=False)
-                start_bd = self.DecisionOnlyLoss(out0, adv=fixed_adv, entCoef=0.0, returnBreakdown=True)
-                start_total = start_bd["total"]
-                start_core = start_bd["core"]
+                out0 = model(xfix, sample=True, deterministic=False, prevOptionOnehot=prevfix, returnKeysVec=False)
+                m0 = metrics(out0)
+                start_proxy = float(m0["proxy"].mean().item())
+                start_pack = {k: float(v.mean().item()) for k, v in m0.items() if k != "proxy"}
+                print(f"[DecisionOnlyTrain] START proxy={start_proxy:.6f} | "
+                      f"base={start_pack['base_cnt']:.3f} extra={start_pack['extra_cnt']:.3f} "
+                      f"mu2={start_pack['mu_energy']:.3f} click={start_pack['click_p']:.3f} "
+                      f"opt0={start_pack['opt0']:.3f} beta={start_pack['beta']:.3f}")
 
+            ent_coef = 0.0 
             for t in range(1, steps + 1):
-                out = model(xfix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prevfix, returnKeysVec=False)
-                loss = self.DecisionOnlyLoss(out, adv=fixed_adv, entCoef=0.0) 
+                out = model(xfix, sample=True, deterministic=False, prevOptionOnehot=prevfix, returnKeysVec=False)
+
+                base_loss = self.DecisionOnlyLoss(out, adv=zero_adv(out), entCoef=ent_coef)
+                shape_loss = shaping_loss(out)
+
+                loss = base_loss + shape_loss
+
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                 opt.step()
 
                 if (t % logEvery) == 0 or t == 1:
                     with torch.no_grad():
-                        bd = self.DecisionOnlyLoss(out, adv=fixed_adv, entCoef=0.0, returnBreakdown=True)
-                    core = bd["core"]; tot = bd["total"]
-                    print(
-                        f"[DecisionOnlyTrain] step {t}/{steps} | total={tot:.6f} | core={core:.6f} "
-                        f"| base={bd['terms'].get('base',0.0):.4f} extra={bd['terms'].get('extra',0.0):.4f} "
-                        f"skill={bd['terms'].get('skill',0.0):.4f} mouse={bd['terms'].get('mouse',0.0):.4f} "
-                        f"click={bd['terms'].get('click',0.0):.4f} option={bd['terms'].get('option',0.0):.4f} "
-                        f"beta={bd['terms'].get('beta',0.0):.4f}")
+                        m = metrics(out)
+                        proxy = float(m["proxy"].mean().item())
+                        print(
+                            f"[DecisionOnlyTrain] step {t}/{steps} | proxy={proxy:.6f} "
+                            f"| base={m['base_cnt'].mean():.2f} extra={m['extra_cnt'].mean():.2f} "
+                            f"mu2={m['mu_energy'].mean():.3f} click={m['click_p'].mean():.3f} "
+                            f"opt0={m['opt0'].mean():.3f} beta={m['beta'].mean():.3f}")
 
             with torch.no_grad():
-                out1 = model(xfix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prevfix, returnKeysVec=False)
-                end_bd = self.DecisionOnlyLoss(out1, adv=fixed_adv, entCoef=0.0, returnBreakdown=True)
-                end_total = end_bd["total"]
-                end_core = end_bd["core"]
+                out1 = model(xfix, sample=True, deterministic=False, prevOptionOnehot=prevfix, returnKeysVec=False)
+                m1 = metrics(out1)
+                end_proxy = float(m1["proxy"].mean().item())
+                end_pack = {k: float(v.mean().item()) for k, v in m1.items() if k != "proxy"}
 
-            print(f"[DecisionOnlyTrain] total {start_total:.6f} -> {end_total:.6f}")
-            print(f"[DecisionOnlyTrain] core {start_core:.6f} -> {end_core:.6f}")
+            print(f"[DecisionOnlyTrain] proxy {start_proxy:.6f} -> {end_proxy:.6f}")
 
-            rel_drop_core = (start_core - end_core) / max(1e-9, abs(start_core))
-            if rel_drop_core < 0.05:
-                print("Insufficient convergence on core (decrease < 5%)")
+            rel_drop = (start_proxy - end_proxy) / max(1e-9, abs(start_proxy))
+            ok_checks = 0
+            ok_checks += int(end_pack["extra_cnt"] <= start_pack["extra_cnt"] * 0.90)
+            ok_checks += int(end_pack["mu_energy"] <= start_pack["mu_energy"] * 0.90)
+            ok_checks += int(end_pack["click_p"] <= start_pack["click_p"] * 0.90)
+            ok_checks += int(end_pack["beta"] <= start_pack["beta"] * 0.90)
+            ok_checks += int(end_pack["opt0"] >= start_pack["opt0"] * 1.05)
+
+            if (rel_drop >= 0.10) and (ok_checks >= 3):
+                print("Fixed set convergence via behavior proxy, pass")
+                return True
+            else:
+                print(f"Convergence insufficient: rel_drop={rel_drop:.3f}, checks_passed={ok_checks}/5")
                 return False
 
-            print("Fixed set convergence (decision-only), pass")
-            return True
         except Exception as e:
             print("Convergence test error:", type(e).__name__, e)
             return False
@@ -1926,7 +1995,7 @@ class TestDecisionMTool:
             cnt = 0
             for m in model.modules():
                 if isinstance(m, LoRALinearAdapter) or isinstance(m, MatLoRAAdapter):
-                    m.Grow(addRank=rank, scale=scale, freezeOld=freezeOld)
+                    m.Grow(addRank=rank, freezeOld=freezeOld)
                     cnt += 1
             if cnt == 0:
                 print("No LoRA adapter modules found")

@@ -31,13 +31,17 @@ class GrowableLoRAConv2d(nn.Module):
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
         ksz = self.kh * self.kw
         if init is None: init = {}
-        A = init.get("A", torch.randn(addRank, self.cin * ksz) * 1e-4)
-        B = init.get("B", torch.zeros(self.cout, addRank))
+
+        dev = self.target.weight.device
+        dt = self.target.weight.dtype
+
+        A = init.get("A", torch.randn(addRank, self.cin * ksz, device=dev, dtype=dt) * 1e-4)
+        B = init.get("B", torch.zeros(self.cout, addRank, device=dev, dtype=dt))
         s = init.get("scale", 1e-3)
 
-        A = nn.Parameter(A.contiguous())
-        B = nn.Parameter(B.contiguous())
-        s = nn.Parameter(torch.tensor(float(s)))
+        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
+        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
+        s = nn.Parameter(torch.as_tensor(s, device=A.device, dtype=A.dtype))
 
         if freezeOld:
             for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
@@ -77,6 +81,8 @@ class GrowableConv1x1Adapter(nn.Module):
         self.B_list = nn.ParameterList() 
         self.alpha = nn.ParameterList()
 
+        self.register_buffer("_anchor", torch.empty(0))
+
     @torch.no_grad()
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
         if init is None: init = {}
@@ -84,9 +90,10 @@ class GrowableConv1x1Adapter(nn.Module):
         B = init.get("B", torch.zeros(self.C, addRank, 1, 1))
         s = init.get("scale", 1e-3)
 
-        A = nn.Parameter(A.contiguous())
-        B = nn.Parameter(B.contiguous())
-        s = nn.Parameter(torch.tensor(float(s)))
+        dev, dt = self._anchor.device, self._anchor.dtype
+        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
+        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
+        s = nn.Parameter(torch.as_tensor(s, device=dev, dtype=dt))
 
         if freezeOld:
             for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
@@ -115,16 +122,20 @@ class GrowableTokenAdapter(nn.Module):
         self.B_list = nn.ParameterList()
         self.alpha = nn.ParameterList()
 
+        self.register_buffer("_anchor", torch.empty(0))
+
     @torch.no_grad()
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
         if init is None: init = {}
+        
         A = init.get("A", torch.randn(addRank, self.D) * 1e-4)
         B = init.get("B", torch.zeros(self.D, addRank))
         s = init.get("scale", 1e-3)
 
-        A = nn.Parameter(A.contiguous())
-        B = nn.Parameter(B.contiguous())
-        s = nn.Parameter(torch.tensor(float(s)))
+        dev, dt = self._anchor.device, self._anchor.dtype
+        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
+        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
+        s = nn.Parameter(torch.as_tensor(s, device=dev, dtype=dt))
 
         if freezeOld:
             for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
@@ -554,7 +565,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         def compose_feat(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
             A2 = a.view(a.size(0), C)
             B2 = b.view(C, a.size(0))
-            return float(s) * (B2 @ A2)
+            return s * (B2 @ A2)
 
         def alloc_patch(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, C * ksz, device=device, dtype=dtype) * 1e-4)
@@ -563,7 +574,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             return A, B, s
 
         def compose_patch(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return float(s) * (b @ a)
+            return s * (b @ a)
 
         def alloc_token(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, D, device=device, dtype=dtype) * 1e-4)
@@ -572,7 +583,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             return A, B, s
 
         def compose_token(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return float(s) * (b @ a)
+            return s * (b @ a)
 
         return {
             "feat": SiteSpec("feat", L, C * 1, C * 1, self.maxRankFeat, alloc_feat, compose_feat),

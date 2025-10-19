@@ -26,15 +26,15 @@ class GrowableLoRALinear(nn.Module):
         if init is None: init = {}
 
         dev = self.target.weight.device
-        dt  = self.target.weight.dtype
+        dt = self.target.weight.dtype
 
-        A = init.get("A", torch.randn(addRank, self.in_f,  device=dev, dtype=dt) * 1e-4)
+        A = init.get("A", torch.randn(addRank, self.in_f, device=dev, dtype=dt) * 1e-4)
         B = init.get("B", torch.zeros(self.out_f, addRank, device=dev, dtype=dt))
         s = init.get("scale", 1e-3)
 
-        A = nn.Parameter(A.contiguous())
-        B = nn.Parameter(B.contiguous())
-        s = nn.Parameter(torch.tensor(float(s), device=dev, dtype=dt))
+        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
+        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
+        s = nn.Parameter(torch.as_tensor(s, device=A.device, dtype=A.dtype))
 
         if freezeOld:
             for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
@@ -49,7 +49,7 @@ class GrowableLoRALinear(nn.Module):
             return None
         delta = self.target.weight.new_zeros(self.out_f, self.in_f)
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-            delta = delta + float(s) * (B @ A)
+            delta = delta + s * (B @ A)
         return delta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -691,7 +691,7 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
             return A, B, s
 
         def compose_linear(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return float(s) * (b @ a)
+            return s * (b @ a)
 
         return {
             "q": SiteSpec("q", L, E, E, self.maxRankQ, alloc_linear, compose_linear),

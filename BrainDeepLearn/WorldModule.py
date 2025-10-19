@@ -69,9 +69,9 @@ class GrowableLoRALinear(nn.Module):
         B = init.get("B", torch.zeros(self.out_f, addRank, device=dev, dtype=dt))
         s = init.get("scale", 1e-3)
 
-        A = nn.Parameter(A.contiguous())
-        B = nn.Parameter(B.contiguous())
-        s = nn.Parameter(torch.tensor(s, device=dev, dtype=dt))
+        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
+        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
+        s = nn.Parameter(torch.as_tensor(s, device=dev, dtype=dt))
 
         if freezeOld:
             for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
@@ -153,7 +153,7 @@ class GrowableLoRAGRUCell(nn.Module):
         if addRank <= 0:
             return
         dev = self.target.weight_ih.device
-        dt  = self.target.weight_ih.dtype
+        dt = self.target.weight_ih.dtype
         I, H = self.input_size, self.hidden_size
         out_rows = 3 * H
 
@@ -175,17 +175,17 @@ class GrowableLoRAGRUCell(nn.Module):
             A = (init.get("A_ih", None) if init else None) or (torch.randn(r_ih, I, device=dev, dtype=dt) * 1e-4)
             B = (init.get("B_ih", None) if init else None) or (torch.zeros(out_rows, r_ih, device=dev, dtype=dt))
             s = (init.get("scale_ih", None) if init else None) or 1e-3
-            self.A_ih.append(nn.Parameter(A.contiguous()))
-            self.B_ih.append(nn.Parameter(B.contiguous()))
-            self.s_ih.append(nn.Parameter(torch.tensor(s, device=dev, dtype=dt)))
+            self.A_ih.append(nn.Parameter(A.contiguous().to(device=dev, dtype=dt)))
+            self.B_ih.append(nn.Parameter(B.contiguous().to(device=dev, dtype=dt)))
+            self.s_ih.append(nn.Parameter(torch.as_tensor(s, device=dev, dtype=dt)))
 
         if r_hh > 0:
             A = (init.get("A_hh", None) if init else None) or (torch.randn(r_hh, H, device=dev, dtype=dt) * 1e-4)
             B = (init.get("B_hh", None) if init else None) or (torch.zeros(out_rows, r_hh, device=dev, dtype=dt))
             s = (init.get("scale_hh", None) if init else None) or 1e-3
-            self.A_hh.append(nn.Parameter(A.contiguous()))
-            self.B_hh.append(nn.Parameter(B.contiguous()))
-            self.s_hh.append(nn.Parameter(torch.tensor(s, device=dev, dtype=dt)))
+            self.A_hh.append(nn.Parameter(A.contiguous().to(device=dev, dtype=dt)))
+            self.B_hh.append(nn.Parameter(B.contiguous().to(device=dev, dtype=dt)))
+            self.s_hh.append(nn.Parameter(torch.as_tensor(s, device=dev, dtype=dt)))
 
     def DeltaIH(self) -> Optional[torch.Tensor]:
         if len(self.A_ih) == 0:
