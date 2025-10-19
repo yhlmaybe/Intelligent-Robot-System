@@ -321,7 +321,7 @@ class DecisionExtractor(nn.Module):
         self.to_z = nn.Linear(512, 256)
         self.use_hebb_online = useHebb
 
-        base_names  = list(KEYBOARD_LAYOUT["base_keys"].keys())
+        base_names = list(KEYBOARD_LAYOUT["base_keys"].keys())
         skill_names = list(KEYBOARD_LAYOUT["skill_keys"].keys())
         self.base_codes = [KEYBOARD_LAYOUT["base_keys"][k] for k in base_names]
         self.skill_codes = [KEYBOARD_LAYOUT["skill_keys"][k] for k in skill_names]
@@ -891,8 +891,8 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         psi_all = self.base.Safe(psi_all, 30.0)
 
         has_prev = (keyPaddingMask is not None) and (keyPaddingMask.dim() == 2) and (keyPaddingMask.size(1) == K)
-        prev = (keyPaddingMask.detach().to(dtype=stateFeat.dtype, device=device) if has_prev
-                else torch.zeros(B, K, dtype=stateFeat.dtype, device=device))
+
+        prev = (keyPaddingMask.detach().to(dtype=stateFeat.dtype, device=device) if has_prev else torch.zeros(B, K, dtype=stateFeat.dtype, device=device))
 
         b0_in = torch.cat([h_o, (prev if has_prev else torch.zeros_like(prev))], dim=-1)
         b0 = self.base.option.beta_head[0](b0_in)
@@ -1229,7 +1229,6 @@ class CEMPlanner(nn.Module):
                 logits_new_s = (counts + self.laplace).log()
                 logits_s[t] = self.momentum * logits_s[t] + (1 - self.momentum) * logits_new_s
 
-
                 elite_base_t = base_seq[t][b_idx, topk, :]
                 p_hat_b = (w_exp * elite_base_t).sum(dim=1).clamp(self.eps_bern, 1 - self.eps_bern)
                 logits_new_b = self.LogitsFromProb(p_hat_b, self.eps_bern)
@@ -1244,7 +1243,6 @@ class CEMPlanner(nn.Module):
                 p_hat_c = (w_exp * elite_click_t).sum(dim=1).clamp(self.eps_bern, 1 - self.eps_bern)
                 logits_new_c = self.LogitsFromProb(p_hat_c, self.eps_bern)
                 logits_c[t] = self.momentum * logits_c[t] + (1 - self.momentum) * logits_new_c
-
 
         mouse_mu0 = mu_t[0]
         mouse_var0 = (std_t[0] * std_t[0])
@@ -1282,8 +1280,6 @@ class DecisionPlannerExtractor:
         max_code = max(all_codes)
 
         return CEMPlanner(worldModel=worldModel,baseCodes=base_codes,skillCodes=skill_codes,extraCodes=extra_codes,maxCode=max_code,hasNoSkill=includeNoSkill,**cemKwargs)
-
-
 
 
 
@@ -1833,7 +1829,7 @@ class TestDecisionMTool:
             with torch.no_grad():
                 w_feat0 = model.feature_net[0].weight.clone()
                 w_kbd0 = model.keyboard.base_head.target.weight.clone()
-                w_mu0  = model.mouse.mu_head.target.weight.clone()
+                w_mu0 = model.mouse.mu_head.target.weight.clone()
 
             B = 16
             for _ in range(steps):
@@ -1884,7 +1880,7 @@ class TestDecisionMTool:
                 out0 = model(xfix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prevfix, returnKeysVec=False)
                 start_bd = self.DecisionOnlyLoss(out0, adv=fixed_adv, entCoef=0.0, returnBreakdown=True)
                 start_total = start_bd["total"]
-                start_core  = start_bd["core"]
+                start_core = start_bd["core"]
 
             for t in range(1, steps + 1):
                 out = model(xfix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prevfix, returnKeysVec=False)
@@ -1909,10 +1905,10 @@ class TestDecisionMTool:
                 out1 = model(xfix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prevfix, returnKeysVec=False)
                 end_bd = self.DecisionOnlyLoss(out1, adv=fixed_adv, entCoef=0.0, returnBreakdown=True)
                 end_total = end_bd["total"]
-                end_core  = end_bd["core"]
+                end_core = end_bd["core"]
 
             print(f"[DecisionOnlyTrain] total {start_total:.6f} -> {end_total:.6f}")
-            print(f"[DecisionOnlyTrain] core  {start_core:.6f} -> {end_core:.6f}")
+            print(f"[DecisionOnlyTrain] core {start_core:.6f} -> {end_core:.6f}")
 
             rel_drop_core = (start_core - end_core) / max(1e-9, abs(start_core))
             if rel_drop_core < 0.05:
@@ -2059,7 +2055,7 @@ class TestDecisionMTool:
                 if isinstance(m, MatLoRAAdapter):
                     trans_base_has = self.HasGrad(model.option.trans, threshold=1e-12)
 
-                    lora_params  = list(m.A_list) + list(m.B_list) + list(m.alpha)
+                    lora_params = list(m.A_list) + list(m.B_list) + list(m.alpha)
                     lora_has_num = any(self.HasGrad(p, threshold=1e-12) for p in lora_params)
                     lora_has_dep = dep_any(lora_params)
 
@@ -2138,28 +2134,24 @@ class TestDecisionMTool:
         ok3 = self.TestGradRoutingLora("hybrid")
         return ok1 and ok2 and ok3
 
-    def RunAll(self) -> bool:
-        tests = [
-            ("HebbianPlasticityLayer", self.TestHebbLayer),
-            ("LoRALinearAdapter", self.TestLoraLinearAdapter),
-            ("MatLoRAAdapter", self.TestMatloraAdapter),
-            ("Decision forward/constraints", self.TestDecisionForwardShapes),
-            ("Option prev/trans", self.TestOptionPrevAndTrans),
-            ("CEMPlanner", self.TestCemPlanner),
-            ("ForwardWithDeltas", self.TestForwardWithDeltasInjection),
-            ("CommitOne grows LoRA", self.TestCommitOneGrowsLora),
-            ("Train smoke", self.TestTrainStepSmoke),
-            ("No-NaN many steps", self.TestNoNanManySteps),
-            ("Params change", self.TestParamsChange),
-            ("Convergence", self.TestConvergence),
-            ("LoRA grad routing (all modes)", self.TestGradRoutingAllModes),
-            ("Stress test (planner+decision)", self.StressTestPlannerAndDecision),
-            ("TestActionsOnly", self.TestActionsOnly), ]
-        passed = 0
-        for name, fn in tests:
-            ok = fn()
-            print(f" -> {name}: {'PASS' if ok else 'FAIL'}")
-            if ok: passed += 1
-        total = len(tests)
-        print(f"\n[DecisionModule Tests] {passed}/{total} passed.")
-        return passed == total
+    def RunAll(self):
+        results = {
+            "HebbianPlasticityLayer": self.TestHebbLayer(),
+            "LoRALinearAdapter": self.TestLoraLinearAdapter(),
+            "MatLoRAAdapter": self.TestMatloraAdapter(),
+            "DecisionForwardShapes": self.TestDecisionForwardShapes(),
+            "OptionPrevAndTrans": self.TestOptionPrevAndTrans(),
+            "CEMPlanner": self.TestCemPlanner(),
+            "ForwardWithDeltas": self.TestForwardWithDeltasInjection(),
+            "CommitOneGrowsLora": self.TestCommitOneGrowsLora(),
+            "TrainStepSmoke": self.TestTrainStepSmoke(),
+            "NoNanManySteps": self.TestNoNanManySteps(),
+            "ParamsChange": self.TestParamsChange(),
+            "Convergence": self.TestConvergence(),
+            "GradRoutingAllModes": self.TestGradRoutingAllModes(),
+            "StressTestPlannerAndDecision": self.StressTestPlannerAndDecision(),
+            "ActionsOnly": self.TestActionsOnly(),}
+    
+        passed = sum(1 for v in results.values() if v)
+        print(f"\n[DecisionModule Tests] {passed}/{len(results)} passed.")
+        return results
