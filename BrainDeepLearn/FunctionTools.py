@@ -55,7 +55,8 @@ class BaseOnlineWrapper(nn.Module):
         keyPaddingMask: Optional[torch.Tensor],
         tdError: Optional[torch.Tensor],
         uncertainty: Optional[torch.Tensor],
-        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],) -> torch.Tensor:
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
+        **kwargs, ) -> torch.Tensor:
         raise NotImplementedError
 
     @torch.no_grad()
