@@ -1335,17 +1335,23 @@ class TestWorldMTool:
         try:
             B = 4
             vision, keys, mouse = self.Batch(B, keyIdx=(17,57))
+            self.wm.ResetHidden(batchSize=B, device=self.device)
             a_enc = self.wm.action_encoder(keys, mouse)
-            h0, z0 = self.wm.ExportState()
+            h0 = torch.zeros(B, self.wm.deter_dim, device=self.device)
+            z0 = torch.zeros(B, self.wm.stoch_dim, device=self.device)
+
+            h_before, z_before = self.wm.ExportState()
             out = self.wm.StepPosterior(h0, z0, vision, a_enc, sample=False)
+            h_after, z_after = self.wm.ExportState()
+
             ok_shapes = (
                 out["h_next"].shape == (B, self.wm.deter_dim)
                 and out["z_next"].shape == (B, self.wm.stoch_dim)
                 and out["s_next"].shape == (B, self.wm.state_dim)
                 and out["r_pred"].shape == (B,)
                 and out["d_prob"].shape == (B,))
-            h1, z1 = self.wm.ExportState()
-            changed = (not torch.allclose(h0, h1)) or (not torch.allclose(z0, z1))
+            
+            changed = (not torch.allclose(h_before, h_after)) or (not torch.allclose(z_before, z_after))
             in_range = (out["d_prob"].min() >= 0.0) and (out["d_prob"].max() <= 1.0)
             ok = ok_shapes and changed and in_range
             print("RSSM StepPosterior test " + ("passed." if ok else "failed."))
@@ -1358,13 +1364,25 @@ class TestWorldMTool:
         try:
             B = 4
             _, keys, mouse = self.Batch(B, keyIdx=(30,))
+
+            self.wm.ResetHidden(batchSize=B, device=self.device)
+
             a_enc = self.wm.action_encoder(keys, mouse)
-            h0, z0 = self.wm.ExportState()
-            h_before, z_before = h0.clone(), z0.clone()
+            h0 = torch.zeros(B, self.wm.deter_dim, device=self.device)
+            z0 = torch.zeros(B, self.wm.stoch_dim, device=self.device)
+
+            h_prev, z_prev = self.wm.ExportState()
             h1, z1, s1, r, d = self.wm.StepPriorOnly(h0, z0, a_enc, sample=False)
-            ok_shapes = ( h1.shape == (B, self.wm.deter_dim) and z1.shape == (B, self.wm.stoch_dim) and s1.shape == (B, self.wm.state_dim) and r.shape == (B,) and d.shape == (B,))
-            hin, zin = self.wm.ExportState()
-            not_written = torch.allclose(hin, h_before) and torch.allclose(zin, z_before)
+
+            ok_shapes = (
+                h1.shape == (B, self.wm.deter_dim)
+                and z1.shape == (B, self.wm.stoch_dim)
+                and s1.shape == (B, self.wm.state_dim)
+                and r.shape == (B,)
+                and d.shape == (B,))
+            h_after, z_after = self.wm.ExportState()
+
+            not_written = torch.allclose(h_prev, h_after) and torch.allclose(z_prev, z_after)
             ok = ok_shapes and not_written
             print("RSSM StepPriorOnly test " + ("passed." if ok else "failed."))
             return ok
@@ -1376,13 +1394,26 @@ class TestWorldMTool:
         try:
             B = 2
             vision, keys, mouse = self.Batch(B, keyIdx=(17,))
-            out = self.wm.ForwardTrainSeq(visionSeq=vision, keysVec=keys, mouseSeq=mouse, rewardSeq=None, doneSeq=None, alphaKl=0.8, freeNats=1.0, reconCoef=1.0, rewardCoef=1.0, doneCoef=1.0, )
+
+            self.wm.train()
+            for p in self.wm.parameters():
+                p.requires_grad_(True)
+
+            self.wm.ResetHidden(batchSize=B, device=self.device)
+
+            out = self.wm.ForwardTrainSeq(
+                visionSeq=vision, keysVec=keys, mouseSeq=mouse,
+                rewardSeq=None, doneSeq=None,
+                alphaKl=0.8, freeNats=1.0,
+                reconCoef=1.0, rewardCoef=1.0, doneCoef=1.0,)
+            
             loss = out["loss"]
             if not torch.isfinite(loss):
                 print("ForwardTrainSeq loss is not finite.")
                 return False
+
             self.wm.zero_grad(set_to_none=True)
-            loss.backward()
+            loss.backward() 
             print("RSSM ForwardTrainSeq test passed. loss =", float(loss.item()), " | distill=", float(out["loss_ns_distill"].item()))
             return True
         except Exception as e:
