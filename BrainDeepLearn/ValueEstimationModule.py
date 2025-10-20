@@ -1,9 +1,10 @@
 from __future__ import annotations
-from typing import Optional, Dict, NamedTuple, Tuple
+from typing import Optional, Dict, NamedTuple, Tuple, List
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from FunctionTools import SiteSpec, BaseOnlineWrapper
 
 
 class GrowableLoRALinear(nn.Module):
@@ -127,6 +128,8 @@ class RunningEMA(nn.Module):
 
     @torch.no_grad()
     def Update(self, x: torch.Tensor):
+        if not self.training:
+            return
         if x.dim() == 1:
             x = x.unsqueeze(-1)
         mask = torch.isfinite(x).all(dim=-1)
@@ -221,6 +224,8 @@ class IntrinsicRewardGenerator(nn.Module):
 
     @torch.no_grad()
     def UpdateStateEma(self, s: torch.Tensor):
+        if not self.training:
+            return
         mean_s = s.mean(0)
         self.state_ema.copy_(self.state_ema * self.state_momentum + (1 - self.state_momentum) * mean_s)
 
@@ -362,7 +367,7 @@ class TropicalAffineTransport(nn.Module):
         g = self.g_net(h)
         trop_in = torch.cat([h, v_in], dim=-1)
         trop_out = self.trop(trop_in).squeeze(-1)
-        aff_out  = (a.squeeze(-1) * v) + b.squeeze(-1)
+        aff_out = (a.squeeze(-1) * v) + b.squeeze(-1)
         v_next_hat = g.squeeze(-1) * trop_out + (1.0 - g.squeeze(-1)) * aff_out
         extras = {
             "gate_trop": g.squeeze(-1),
@@ -548,7 +553,7 @@ class ValueEstimationExtractor(nn.Module):
                  wEntropyTeacher: float = 1e-3,
                  persLevels: int = 5, persTemp: float = 0.5, persWeight: float = 1e-3,
                  wGITScale: float = 1e-3, wGITShift: float = 1e-3, wGITSign: float = 1e-3,
-                 useHebb: bool = False, hebbCap: float = 1.0, hebbOja: bool = True, detachHebbGrad: bool = True,):
+                 useHebb: bool = True, hebbCap: float = 1.0, hebbOja: bool = True, detachHebbGrad: bool = True,):
         super().__init__()
         self.in_dim = memoryDim + attnDim + stateDim
         H = hidden
@@ -562,11 +567,15 @@ class ValueEstimationExtractor(nn.Module):
         self.norm1 = nn.LayerNorm(H) if useLayerNorm else None
         self.norm2 = nn.LayerNorm(H) if useLayerNorm else None
 
-        if self.use_hebb:
-            self.hebb_value = HebbianLinearFW(H, 1, bias=True,initEta=1e-3, initLambda=0.1,cap=hebbCap, useOja=hebbOja, detachHebb=detachHebbGrad)
+        self.hebb_value = HebbianLinearFW(H, 1, bias=True,initEta=1e-3, initLambda=0.1,cap=hebbCap, useOja=hebbOja, detachHebb=detachHebbGrad)
 
-        self.value_head  = nn.Linear(H, 1)
+        self.value_head = nn.Linear(H, 1)
         self.uncert_head = nn.Linear(H, 1)
+
+        self.fc1_adapter = GrowableLoRALinear(self.fc1)
+        self.fc2_adapter = GrowableLoRALinear(self.fc2)
+        self.value_adapter = GrowableLoRALinear(self.value_head)
+        self.uncert_adapter = GrowableLoRALinear(self.uncert_head)
 
         self.transport = TropicalAffineTransport(H, useSoftTrop, tropTemp, epsA)
         self.rgen = IntrinsicRewardGenerator(memoryDim, attnDim, stateDim, **(irgKwargs or {}))
@@ -582,8 +591,10 @@ class ValueEstimationExtractor(nn.Module):
                 nn.init.orthogonal_(m.weight); nn.init.zeros_(m.bias)
 
     def Trunk(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.relu(self.fc1(x)); h = self.norm1(h) if self.norm1 is not None else h
-        h = F.relu(self.fc2(h)); h = self.norm2(h) if self.norm2 is not None else h
+        h = F.relu(self.fc1_adapter(x))
+        h = self.norm1(h) if self.norm1 is not None else h
+        h = F.relu(self.fc2_adapter(h))
+        h = self.norm2(h) if self.norm2 is not None else h
         return h
 
     def forward(self,
@@ -597,14 +608,14 @@ class ValueEstimationExtractor(nn.Module):
                 tdErrorPrev: Optional[torch.Tensor] = None,
                 done: Optional[torch.Tensor] = None, 
                 edgeIndex: Optional[torch.Tensor] = None,
-                edgeWeight: Optional[torch.Tensor] = None
-                ) -> GeoTropicalOut:
+                edgeWeight: Optional[torch.Tensor] = None) -> GeoTropicalOut:
 
         B, device = state.size(0), state.device
         x = torch.cat([memory, attn, state], dim=-1)
         h = self.Trunk(x)
 
-        uncert_pred_fallback = F.softplus(self.uncert_head(h).squeeze(-1)).detach()
+        uncert_raw = self.uncert_adapter(h).squeeze(-1)
+        uncert_pred_fallback = F.softplus(uncert_raw).detach()
 
         irg_out = self.rgen(memoryPrev=memory, attnPrev=attn, stateCurr=state,
                             policyEntropyPrev=policyEntropyPrev,
@@ -614,18 +625,18 @@ class ValueEstimationExtractor(nn.Module):
 
         hebb_eta = hebb_lam = beta_mix = None
 
-        uncert_pred = F.softplus(self.uncert_head(h).squeeze(-1))
+        uncert_pred = F.softplus(uncert_raw)
 
         if self.use_hebb:
             hebb_eta = eT[..., 1].clamp_min(0).tanh() * 0.01 
             hebb_lam = torch.full((B,), 0.1, device=device)
             beta_mix = torch.zeros(B, device=device)
             v_hebb, hebb_extras = self.hebb_value(h, eta=hebb_eta, lam=hebb_lam, betaMix=beta_mix)
-            v_param = self.value_head(h).squeeze(-1)
+            v_param = self.value_adapter(h).squeeze(-1)
             mix = torch.sigmoid(beta_mix) if beta_mix is not None else 0.5
             value = (1.0 - mix) * v_param + mix * v_hebb.squeeze(-1)
         else:
-            value = self.value_head(h).squeeze(-1)
+            value = self.value_adapter(h).squeeze(-1)
             hebb_extras = {"H_norm": torch.tensor(0.0, device=device)}
 
         if rewardExt is None:
@@ -671,10 +682,7 @@ class ValueEstimationExtractor(nn.Module):
                 curv_e = BtVMinusF(value, gamma_edge, r_edge, eidx_masked)
                 loss_curv = ((w * curv_e.pow(2)).sum() / (w.sum().clamp_min(1.0))) * self.wCurv
 
-                loss_pers = self.pers(valueNodes=value,
-                                      rEdge=r_edge,
-                                      gammaEdge=gamma_edge,
-                                      edgeIndex=eidx_masked)
+                loss_pers = self.pers(valueNodes=value, rEdge=r_edge,gammaEdge=gamma_edge, edgeIndex=eidx_masked)
 
         loss_unc = value.new_zeros(()) 
         if (uncertaintyTeacher is not None) and (self.wUncertTeacher > 0):
@@ -734,6 +742,251 @@ class ValueEstimationExtractor(nn.Module):
             uncertainty=uncert_pred,
             extras=extras)
 
+    @torch.no_grad()
+    def ResetHebb(self):
+        self.hebb_value.ResetHebbianMemory()
+
+class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
+    def __init__(
+        self,
+        base: nn.Module, 
+        initRankEach: int = 0,
+        autoRank: bool = True,
+        evThreshold: float = 0.90,
+        gradEma: float = 0.9,
+        maxRankFc1: int = 128,
+        maxRankFc2: int = 128,
+        maxRankVHead: int = 64,
+        maxRankUHead: int = 64,):
+        self.maxRankFc1 = int(maxRankFc1)
+        self.maxRankFc2 = int(maxRankFc2)
+        self.maxRankVHead = int(maxRankVHead)
+        self.maxRankUHead = int(maxRankUHead)
+        super().__init__(base, initRankEach=initRankEach, autoRank=autoRank, evThreshold=evThreshold, gradEma=gradEma)
+
+    @staticmethod
+    def LinearWithDelta(layer: nn.Linear,x: torch.Tensor,delta_mat: Optional[torch.Tensor] = None, base_adapter: Optional[nn.Module] = None) -> torch.Tensor:
+        W_eff = layer.weight
+        if (base_adapter is not None) and hasattr(base_adapter, "DeltaWeight"):
+            base_delta = base_adapter.DeltaWeight()
+            if base_delta is not None:
+                W_eff = W_eff + base_delta
+        if delta_mat is not None:
+            W_eff = W_eff + delta_mat
+        return F.linear(x, W_eff, layer.bias)
+
+    @staticmethod
+    def EnsureInputs(x):
+        if isinstance(x, (tuple, list)) and len(x) == 3:
+            return x[0], x[1], x[2]
+        if isinstance(x, dict) and all(k in x for k in ("memory", "attn", "state")):
+            return x["memory"], x["attn"], x["state"]
+        raise TypeError("ValueEstimationOnlineWrapper expects x as (memory, attn, state) tuple/list" "or dict with keys {'memory','attn','state'}.")
+
+    def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
+        H = int(self.base.value_head.in_features) 
+        Din = int(self.base.fc1.in_features)
+        L = 2 
+
+        def alloc(addRank: int, inDim: int, outDim: int, device: torch.device, dtype: torch.dtype):
+            A = nn.Parameter(torch.randn(addRank, inDim, device=device, dtype=dtype) * 1e-4)
+            B = nn.Parameter(torch.zeros(outDim, addRank, device=device, dtype=dtype))
+            s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
+            return A, B, s
+
+        def compose(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+            return s * (b @ a)
+
+        return {
+            "fc1": SiteSpec("fc1", L, Din, H, self.maxRankFc1, lambda r,dv,dt: alloc(r, Din, H, dv, dt), compose),
+            "fc2": SiteSpec("fc2", L, H, H, self.maxRankFc2, lambda r,dv,dt: alloc(r, H, H, dv, dt), compose),
+            "vhead": SiteSpec("vhead", L, H, 1, self.maxRankVHead, lambda r,dv,dt: alloc(r, H, 1, dv, dt), compose),
+            "uhead": SiteSpec("uhead", L, H, 1, self.maxRankUHead, lambda r,dv,dt: alloc(r, H, 1, dv, dt), compose),}
+
+    def ForwardWithDeltas(
+        self,
+        x,
+        keyPaddingMask: Optional[torch.Tensor],
+        tdError: Optional[torch.Tensor],
+        uncertainty: Optional[torch.Tensor],  
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
+         **kwargs):
+        
+        allowed = {"rewardExt", "policyEntropyPrev", "done", "edgeIndex", "edgeWeight"}
+        unknown = set(kwargs) - allowed
+        if unknown:
+            raise TypeError(f"Unknown kwargs in ForwardWithDeltas: {unknown}")
+
+        rewardExt = kwargs.get("rewardExt", None)
+        policyEntropyPrev = kwargs.get("policyEntropyPrev", None)
+        done = kwargs.get("done", None)
+        edgeIndex = kwargs.get("edgeIndex", None)
+        edgeWeight = kwargs.get("edgeWeight", None)
+
+        memory, attn, state = self.EnsureInputs(x)
+        base = self.base
+        B, device = state.size(0), state.device
+
+        d_fc1 = deltasPerLayer[0].get("fc1", None)
+        h = self.LinearWithDelta( base.fc1, torch.cat([memory, attn, state], dim=-1), d_fc1, getattr(base, "fc1_adapter", None))
+        h = F.relu(h)
+        if base.norm1 is not None:
+            h = base.norm1(h)
+
+        d_fc2 = deltasPerLayer[1].get("fc2", None)
+        h = self.LinearWithDelta( base.fc2, h, d_fc2, getattr(base, "fc2_adapter", None))
+        h = F.relu(h)
+        if base.norm2 is not None:
+            h = base.norm2(h)
+
+        d_uh = deltasPerLayer[1].get("uhead", None)
+        uncert_raw = self.LinearWithDelta( base.uncert_head, h, d_uh, getattr(base, "uncert_adapter", None)).squeeze(-1)
+        uncert_pred = F.softplus(uncert_raw)
+        uncert_pred_fallback = uncert_pred.detach()
+
+        irg_out = base.rgen(
+            memoryPrev=memory, attnPrev=attn, stateCurr=state,
+            policyEntropyPrev=policyEntropyPrev,
+            uncertainty=(uncertainty if uncertainty is not None else uncert_pred_fallback),
+            tdErrorPrev=tdError)
+        
+        r_int, eT, comps = irg_out.rInt.detach(), irg_out.eT, irg_out.components
+
+        if base.use_hebb:
+            hebb_eta = eT[..., 1].clamp_min(0).tanh() * 0.01
+            hebb_lam = torch.full((B,), 0.1, device=device)
+            beta_mix = torch.zeros(B, device=device)
+            v_hebb, hebb_extras = base.hebb_value(h, eta=hebb_eta, lam=hebb_lam, betaMix=beta_mix)
+
+            d_vh = deltasPerLayer[1].get("vhead", None)
+            v_param = self.LinearWithDelta(base.value_head, h,d_vh, getattr(base, "value_adapter", None)).squeeze(-1)
+            mix = torch.sigmoid(beta_mix) if beta_mix is not None else 0.5
+            value = (1.0 - mix) * v_param + mix * v_hebb.squeeze(-1)
+        else:
+            d_vh = deltasPerLayer[1].get("vhead", None)
+            value = self.LinearWithDelta(base.value_head, h,d_vh, getattr(base, "value_adapter", None)).squeeze(-1)
+            hebb_extras = {"H_norm": torch.tensor(0.0, device=device)}
+
+        if rewardExt is None:
+            r_used = base.wInt * r_int
+        else:
+            r_used = base.wExt * rewardExt.to(device) + base.wInt * r_int
+
+        gamma = eT[..., 2]
+        if base.stopGrad_r_gamma:
+            r_used = r_used.detach()
+            gamma  = gamma.detach()
+        if done is not None:
+            gamma = gamma * (1.0 - done.float())
+
+        v_next_hat, transp_extras = base.transport(h, value)
+        delta = r_used + gamma * v_next_hat - value
+        loss_td = (delta ** 2).mean() * base.wTD
+
+        loss_glue = value.new_zeros(())
+        loss_curv = value.new_zeros(())
+        loss_pers = value.new_zeros(())
+
+        if (edgeIndex is not None) and (edgeIndex.numel() > 0):
+            assert edgeIndex.dtype in (torch.int64, torch.long) and edgeIndex.dim() == 2 and edgeIndex.size(0) == 2, "edgeIndex must be LongTensor of shape [2, E]"
+            u_all, v_all = edgeIndex[0].to(device), edgeIndex[1].to(device)
+
+            if done is not None:
+                mask_edge = (done[u_all] < 0.5)
+                u_all, v_all = u_all[mask_edge], v_all[mask_edge]
+
+            if u_all.numel() > 0:
+                w = edgeWeight.to(device) if edgeWeight is not None else torch.ones_like(u_all, dtype=value.dtype, device=device)
+
+                glue_resid = (v_next_hat[u_all] - value[v_all])
+                loss_glue = ((w * glue_resid.pow(2)).sum() / (w.sum().clamp_min(1.0))) * base.wGlue
+
+                r_edge = r_used[u_all]
+                gamma_edge = gamma[u_all]
+                eidx_masked = torch.stack([u_all, v_all], dim=0)
+                curv_e = BtVMinusF(value, gamma_edge, r_edge, eidx_masked)
+                loss_curv = ((w * curv_e.pow(2)).sum() / (w.sum().clamp_min(1.0))) * base.wCurv
+
+                loss_pers = base.pers(valueNodes=value, rEdge=r_edge, gammaEdge=gamma_edge, edgeIndex=eidx_masked)
+
+        if (uncertainty is not None) and (base.wUncertTeacher > 0):
+            m = torch.isfinite(uncertainty)
+            loss_unc = base.wUncertTeacher * F.mse_loss(uncert_pred[m], uncertainty[m]) if m.any() else 1e-4 * uncert_pred.mean()
+        elif base.wUncertTeacher > 0:
+            loss_unc = 1e-4 * uncert_pred.mean()
+        else:
+            loss_unc = value.new_zeros(())
+
+        loss_ent = torch.tensor(0.0, device=device)
+        if (policyEntropyPrev is not None) and (base.wEntropyTeacher > 0):
+            e_pred = irg_out.components.get("entropy_pred", None)
+            if e_pred is not None:
+                m = torch.isfinite(policyEntropyPrev)
+                if m.any():
+                    loss_ent = F.mse_loss(e_pred[m], policyEntropyPrev[m]) * base.wEntropyTeacher
+
+        loss_git = base.git(base.value_head, transp_extras)
+
+        loss_gate_trop = torch.tensor(0.0, device=device)
+        if "gate_trop" in transp_extras:
+            gt = transp_extras["gate_trop"]
+            loss_gate_trop = 1e-3 * ((gt - 0.5) ** 2).mean()
+
+        loss_irg = 0.0
+        if "reg_gate" in comps: loss_irg = loss_irg + comps["reg_gate"].mean()
+        if "reg_eT" in comps: loss_irg = loss_irg + comps["reg_eT"].mean()
+
+        total_loss = loss_td + loss_glue + loss_curv + loss_pers + loss_unc + loss_git + loss_gate_trop + loss_irg + loss_ent
+
+        extras: Dict[str, torch.Tensor] = {
+            "loss_td": loss_td.detach(),
+            "loss_glue": loss_glue.detach(),
+            "loss_curv": loss_curv.detach(),
+            "loss_pers": loss_pers.detach(),
+            "loss_unc": loss_unc.detach(),
+            "loss_git": loss_git.detach(),
+            "loss_gate_trop": loss_gate_trop.detach(),
+            "v_next_hat": v_next_hat.detach(),
+            "gate_trop": transp_extras.get("gate_trop", torch.zeros_like(value)).detach(),
+            "trop_out": transp_extras.get("trop_out", torch.zeros_like(value)).detach(),
+            "aff_out": transp_extras.get("aff_out", torch.zeros_like(value)).detach(),
+            "a": transp_extras.get("a", torch.zeros_like(value)).detach(),
+            "b": transp_extras.get("b", torch.zeros_like(value)).detach(),
+            "hebb_H_norm": hebb_extras.get("H_norm", torch.tensor(0.0, device=device)).detach(),}
+
+        return GeoTropicalOut(
+            value=value,
+            tdError=delta,
+            loss=total_loss,
+            eT=eT,
+            rInt=r_int,
+            rComps={k: v.detach() for k, v in comps.items()},
+            uncertainty=uncert_pred,
+            extras=extras,)
+
+    @torch.no_grad()
+    def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
+        mapping = {
+            "fc1": ("fc1_adapter", "fc1", [0]),
+            "fc2": ("fc2_adapter", "fc2", [1]),
+            "vhead": ("value_adapter", "value_head", [1]),
+            "uhead": ("uncert_adapter","uncert_head", [1]),}
+        
+        if site not in mapping:
+            return False
+        attr_name, tgt_name, allow_layers = mapping[site]
+        if layerIdx not in allow_layers:
+            return False
+
+        target: nn.Linear = getattr(self.base, tgt_name)
+        if not hasattr(self.base, attr_name) or not isinstance(getattr(self.base, attr_name), nn.Module):
+            adapter = GrowableLoRALinear(target)
+            setattr(self.base, attr_name, adapter.to(target.weight.device, dtype=target.weight.dtype))
+
+        adapter: GrowableLoRALinear = getattr(self.base, attr_name)
+        init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
+        adapter.Grow(addRank=a.size(0), init=init, freezeOld=False)
+        return True
 
 
 
@@ -742,7 +995,7 @@ class TestValueEstimationMTool:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.mem_dim = 768
         self.attn_dim = 512
-        self.state_dim= 256
+        self.state_dim = 256
 
     def MakeEstimatorHebb(self, **overrides):
         est = ValueEstimationExtractor(
@@ -771,8 +1024,11 @@ class TestValueEstimationMTool:
         if closed:
             src = torch.cat([src, torch.tensor([B-1], device=self.device)])
             dst = torch.cat([dst, torch.tensor([0], device=self.device)])
-        edgeIndex = torch.stack([src, dst], dim=0) 
+        edgeIndex = torch.stack([src, dst], dim=0)
         return edgeIndex
+
+    def ParamIds(self, module: nn.Module):
+        return {id(p) for p in module.parameters() if p.requires_grad}
 
     def TestIntrinsicRewardGenerator(self) -> bool:
         try:
@@ -809,10 +1065,7 @@ class TestValueEstimationMTool:
             edgeIndex = self.MakeChainEdges(B, closed=False)
             done = torch.zeros(B, device=self.device)
 
-            est = ValueEstimationExtractor(memoryDim=self.mem_dim,
-                                            attnDim=self.attn_dim,
-                                            stateDim=self.state_dim,
-                                            useLayerNorm=True).to(self.device)
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim,stateDim=self.state_dim, useLayerNorm=True).to(self.device)
             est.train()
 
             entropy_prev = torch.rand(B, device=self.device)
@@ -848,11 +1101,7 @@ class TestValueEstimationMTool:
             edgeIndex = self.MakeChainEdges(B, closed=True)
             done = torch.randint(0, 2, (B,), device=self.device).float()
 
-            est = ValueEstimationExtractor(memoryDim=self.mem_dim,
-                                            attnDim=self.attn_dim,
-                                            stateDim=self.state_dim,
-                                            useLayerNorm=False,
-                                            wExt=1.0, wInt=1.0).to(self.device)
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim, useLayerNorm=False, wExt=1.0, wInt=1.0).to(self.device)
             est.eval()
 
             reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
@@ -889,11 +1138,7 @@ class TestValueEstimationMTool:
             edgeIndex = self.MakeChainEdges(B, closed=True)
             done = torch.zeros(B, device=self.device)
 
-            est = ValueEstimationExtractor(
-                memoryDim=self.mem_dim,
-                attnDim=self.attn_dim,
-                stateDim=self.state_dim,
-                useLayerNorm=True).to(self.device)
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim,attnDim=self.attn_dim,stateDim=self.state_dim,useLayerNorm=True).to(self.device)
             est.train()
             opt = torch.optim.Adam(est.parameters(), lr=1e-3)
 
@@ -901,15 +1146,10 @@ class TestValueEstimationMTool:
             uncert_teacher = F.softplus(torch.randn(B, device=self.device))
             reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
 
-            out = est(
-                memory=mem, attn=attn, state=state,
-                rewardExt=reward_ext,
-                policyEntropyPrev=entropy_prev,
-                uncertaintyTeacher=uncert_teacher,
-                tdErrorPrev=None,
-                done=done,
-                edgeIndex=edgeIndex,
-                edgeWeight=None)
+            out = est(memory=mem, attn=attn, state=state,
+                rewardExt=reward_ext, policyEntropyPrev=entropy_prev,
+                uncertaintyTeacher=uncert_teacher,tdErrorPrev=None,
+                done=done,edgeIndex=edgeIndex, edgeWeight=None)
 
             loss = out.loss
             assert loss.dim() == 0 and torch.isfinite(loss), "loss not scalar/finite"
@@ -945,10 +1185,7 @@ class TestValueEstimationMTool:
 
     def NoNanAfterManySteps(self, steps: int = 50) -> bool:
         try:
-            est = ValueEstimationExtractor(memoryDim=self.mem_dim,
-                                            attnDim=self.attn_dim,
-                                            stateDim=self.state_dim,
-                                            useLayerNorm=True).to(self.device)
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim,attnDim=self.attn_dim,stateDim=self.state_dim,useLayerNorm=True).to(self.device)
             est.train()
             opt = torch.optim.Adam(est.parameters(), lr=1e-3)
 
@@ -956,7 +1193,7 @@ class TestValueEstimationMTool:
                 B = 8
                 mem, attn, state = self.RandBatch(B)
                 edgeIndex = self.MakeChainEdges(B, closed=(t%3==0))
-                done = torch.randint(0, 2, (B,), device=self.device).float() * 0 
+                done = torch.randint(0, 2, (B,), device=self.device).float() * 0
 
                 entropy_prev = torch.rand(B, device=self.device)
                 uncert_teacher = F.softplus(torch.randn(B, device=self.device))
@@ -986,10 +1223,7 @@ class TestValueEstimationMTool:
 
     def ParamsActuallyChange(self, steps: int = 30) -> bool:
         try:
-            est = ValueEstimationExtractor(memoryDim=self.mem_dim,
-                                            attnDim=self.attn_dim,
-                                            stateDim=self.state_dim,
-                                            useLayerNorm=True).to(self.device)
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim,attnDim=self.attn_dim,stateDim=self.state_dim,useLayerNorm=True).to(self.device)
             est.train()
             opt = torch.optim.Adam(est.parameters(), lr=1e-3)
 
@@ -1039,11 +1273,7 @@ class TestValueEstimationMTool:
     def TestLossDecreases(self, steps: int = 120, batch_size: int = 16) -> bool:
         try:
             torch.manual_seed(2025)
-            est = ValueEstimationExtractor(memoryDim=self.mem_dim,
-                                            attnDim=self.attn_dim,
-                                            stateDim=self.state_dim,
-                                            useLayerNorm=True,
-                                            wExt=1.0, wInt=0.1).to(self.device)
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim,attnDim=self.attn_dim,stateDim=self.state_dim,useLayerNorm=True,wExt=1.0, wInt=0.1).to(self.device)
             est.train()
             opt = torch.optim.Adam(est.parameters(), lr=1e-3)
 
@@ -1076,7 +1306,7 @@ class TestValueEstimationMTool:
                     print(f"[GeoTropTrain] step {t+1}/{steps} | loss={losses[-1]:.6f}")
 
             assert len(losses) >= 2, "No valid loss trajectory is generated"
-            start, end = losses[0], min(losses[-1], sum(losses[-10:])/max(1,len(losses[-10:])))
+            start, end = losses[0], min(losses[-1], sum(losses[-10:])/max(1,len(losses[-10:])) )
             print(f"\n[GeoTropTrain] loss start={start:.6f} -> end={end:.6f}\n")
 
             rel_ok = end <= start * 0.80
@@ -1117,18 +1347,288 @@ class TestValueEstimationMTool:
             print(f"Hebbian memory update error: {e}")
             return False
 
+    def TestWrapperAlignmentNoDelta(self) -> bool:
+        try:
+            torch.manual_seed(123)
+            B = 6
+            mem, attn, state = self.RandBatch(B)
+            edgeIndex = self.MakeChainEdges(B, closed=True)
+            done = torch.zeros(B, device=self.device)
+
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim, useLayerNorm=True).to(self.device)
+
+            est.eval()
+            est.rgen.teacher_dropout_prob = 0.0
+
+            wrapper = ValueEstimationOnlineWrapper(est, initRankEach=0, autoRank=False)
+
+            reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
+            entropy_prev = torch.rand(B, device=self.device)
+            uncert_teacher = F.softplus(torch.randn(B, device=self.device))
+            td_prev = torch.randn(B, device=self.device) * 0.1
+
+            rgen_state = {k: v.clone() for k, v in est.rgen.state_dict().items()}
+
+            out_ref = est(
+                memory=mem, attn=attn, state=state,
+                rewardExt=reward_ext, policyEntropyPrev=entropy_prev,
+                uncertaintyTeacher=uncert_teacher, tdErrorPrev=td_prev,
+                done=done, edgeIndex=edgeIndex, edgeWeight=None)
+
+            est.rgen.load_state_dict(rgen_state, strict=True)
+
+            deltas = [ {"fc1": None}, {"fc2": None, "vhead": None, "uhead": None} ]
+            out_wr = wrapper.ForwardWithDeltas(
+                x=(mem, attn, state),
+                keyPaddingMask=None,
+                tdError=td_prev,
+                uncertainty=uncert_teacher,
+                deltasPerLayer=deltas,
+                rewardExt=reward_ext,
+                policyEntropyPrev=entropy_prev,
+                done=done,
+                edgeIndex=edgeIndex,
+                edgeWeight=None)
+
+            atol, rtol = 1e-6, 1e-5
+            ok = (
+                torch.allclose(out_wr.value, out_ref.value, atol=atol, rtol=rtol) and
+                torch.allclose(out_wr.tdError, out_ref.tdError, atol=atol, rtol=rtol) and
+                torch.allclose(out_wr.loss, out_ref.loss, atol=atol, rtol=rtol) and
+                torch.allclose(out_wr.eT, out_ref.eT, atol=atol, rtol=rtol) and
+                torch.allclose(out_wr.uncertainty, out_ref.uncertainty, atol=atol, rtol=rtol) and
+                torch.allclose(out_wr.extras["v_next_hat"], out_ref.extras["v_next_hat"], atol=atol, rtol=rtol))
+            print(f"WrapperAlignment_NoDelta {'pass' if ok else 'fail'}")
+            return ok
+        except Exception as e:
+            print(f"WrapperAlignment_NoDelta error: {e}")
+            return False
+
+    def TestSimThenCommitVHead(self) -> bool:
+        try:
+            torch.manual_seed(7)
+            B = 5
+            mem, attn, state = self.RandBatch(B)
+            edgeIndex = self.MakeChainEdges(B, closed=False)
+            done = torch.zeros(B, device=self.device)
+
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim, useLayerNorm=True, useHebb=False,).to(self.device)
+            est.eval() 
+            est.rgen.teacher_dropout_prob = 0.0  
+            wrapper = ValueEstimationOnlineWrapper(est, initRankEach=0, autoRank=False)
+
+            reward_ext = None
+            entropy_prev = torch.rand(B, device=self.device)
+            uncert_teacher = F.softplus(torch.randn(B, device=self.device))
+            td_prev = torch.randn(B, device=self.device) * 0.05
+
+            H = int(est.value_head.in_features)
+            delta_v = (torch.randn(1, H, device=self.device) * 1e-3) 
+
+            deltas_sim = [ {"fc1": None}, {"fc2": None, "vhead": delta_v, "uhead": None} ]
+            out_sim = wrapper.ForwardWithDeltas(
+                x=(mem, attn, state),
+                keyPaddingMask=None,
+                tdError=td_prev,
+                uncertainty=uncert_teacher,
+                deltasPerLayer=deltas_sim,
+                rewardExt=reward_ext,
+                policyEntropyPrev=entropy_prev,
+                done=done,
+                edgeIndex=edgeIndex,
+                edgeWeight=None)
+
+            A = delta_v.clone()
+            norm = A.norm() + 1e-12
+            A = A / norm
+            Bm = torch.tensor([[norm.item()]], device=self.device) 
+            scale = 1.0
+
+            before_ids = self.ParamIds(est)
+            ok_commit = wrapper.CommitOne("vhead", layerIdx=1, a=A, b=Bm, scale=float(scale))
+            assert ok_commit, "CommitOne failed for vhead"
+            after_ids = self.ParamIds(est)
+            new_param_count = len(after_ids - before_ids)
+            assert new_param_count > 0, "No new trainable parameters after CommitOne"
+
+            deltas_none = [ {"fc1": None}, {"fc2": None, "vhead": None, "uhead": None} ]
+            out_after = wrapper.ForwardWithDeltas(
+                x=(mem, attn, state),
+                keyPaddingMask=None,
+                tdError=td_prev,
+                uncertainty=uncert_teacher,
+                deltasPerLayer=deltas_none,
+                rewardExt=reward_ext,
+                policyEntropyPrev=entropy_prev,
+                done=done,
+                edgeIndex=edgeIndex,
+                edgeWeight=None)
+
+            atol, rtol = 5e-6, 1e-4
+            ok = (
+                torch.allclose(out_after.value, out_sim.value, atol=atol, rtol=rtol) and
+                torch.allclose(out_after.tdError, out_sim.tdError, atol=atol, rtol=rtol) and
+                torch.allclose(out_after.loss, out_sim.loss, atol=atol, rtol=rtol) and
+                torch.allclose(out_after.uncertainty,out_sim.uncertainty,atol=atol, rtol=rtol) and
+                torch.allclose(out_after.extras["v_next_hat"], out_sim.extras["v_next_hat"], atol=atol, rtol=rtol))
+            
+            print(f"SimThenCommit_VHead {'pass' if ok else 'fail'} (new_params={new_param_count})")
+            return ok
+        except Exception as e:
+            print(f"SimThenCommit_VHead error: {e}")
+            return False
+
+    def TestWrapperTempDeltasTrainable(self) -> bool:
+        try:
+            torch.manual_seed(11)
+            B = 6
+            mem, attn, state = self.RandBatch(B)
+            edgeIndex = self.MakeChainEdges(B, closed=True)
+            done = torch.zeros(B, device=self.device)
+
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim,stateDim=self.state_dim,useLayerNorm=True).to(self.device)
+            est.train()
+            wrapper = ValueEstimationOnlineWrapper(est, initRankEach=0, autoRank=False)
+
+            with torch.no_grad():
+                W_fc1_0 = est.fc1.weight.clone()
+                W_fc2_0 = est.fc2.weight.clone()
+                W_vh_0 = est.value_head.weight.clone()
+                W_uh_0 = est.uncert_head.weight.clone()
+
+            d_fc1 = nn.Parameter(torch.zeros_like(est.fc1.weight))
+            d_fc2 = nn.Parameter(torch.zeros_like(est.fc2.weight))
+            d_vh = nn.Parameter(torch.zeros_like(est.value_head.weight))
+            d_uh = nn.Parameter(torch.zeros_like(est.uncert_head.weight))
+
+            opt = torch.optim.Adam([d_fc1, d_fc2, d_vh, d_uh], lr=1e-1)
+
+            entropy_prev = torch.rand(B, device=self.device)
+            reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
+            uncert_teacher = F.softplus(torch.randn(B, device=self.device))
+            td_prev = None
+
+            for _ in range(5):
+                deltas = [ {"fc1": d_fc1}, {"fc2": d_fc2, "vhead": d_vh, "uhead": d_uh} ]
+                out = wrapper.ForwardWithDeltas(
+                    x=(mem, attn, state),
+                    keyPaddingMask=None,
+                    tdError=td_prev,
+                    uncertainty=uncert_teacher,
+                    deltasPerLayer=deltas,
+                    rewardExt=reward_ext,
+                    policyEntropyPrev=entropy_prev,
+                    done=done,
+                    edgeIndex=edgeIndex,
+                    edgeWeight=None)
+                loss = out.loss
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+
+            with torch.no_grad():
+                ok_base_unchanged = (
+                    torch.allclose(est.fc1.weight, W_fc1_0, atol=0, rtol=0) and
+                    torch.allclose(est.fc2.weight, W_fc2_0, atol=0, rtol=0) and
+                    torch.allclose(est.value_head.weight, W_vh_0, atol=0, rtol=0) and
+                    torch.allclose(est.uncert_head.weight, W_uh_0, atol=0, rtol=0))
+            delta_change = (d_fc1.detach().abs().mean() + d_fc2.detach().abs().mean() + d_vh.detach().abs().mean() + d_uh.detach().abs().mean()).item()
+            ok_delta_changed = delta_change > 0
+
+            ok = ok_base_unchanged and ok_delta_changed
+            print(f"WrapperTempDeltasTrainable {'pass' if ok else 'fail'} "
+                  f"(Δ_abs_mean_sum={delta_change:.3e})")
+            return ok
+        except Exception as e:
+            print(f"WrapperTempDeltasTrainable error: {e}")
+            return False
+
+    def TestGradFlowCoverage(self) -> bool:
+        try:
+            torch.manual_seed(17)
+            B = 8
+            mem, attn, state = self.RandBatch(B)
+            edgeIndex = self.MakeChainEdges(B, closed=True)
+            done = torch.zeros(B, device=self.device)
+
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim,attnDim=self.attn_dim,stateDim=self.state_dim,useLayerNorm=True).to(self.device)
+            est.train()
+
+            reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
+            entropy_prev = torch.rand(B, device=self.device)
+            uncert_teacher = F.softplus(torch.randn(B, device=self.device))
+
+            out = est(memory=mem, attn=attn, state=state,rewardExt=reward_ext, policyEntropyPrev=entropy_prev,uncertaintyTeacher=uncert_teacher, tdErrorPrev=None,done=done, edgeIndex=edgeIndex, edgeWeight=None)
+
+            loss = out.loss
+            loss.backward()
+
+            keys = [
+                "fc1.weight", "fc2.weight",
+                "value_head.weight", "uncert_head.weight",
+                "transport.trop.W", "transport.a_net.0.weight",
+                "transport.b_net.0.weight", "transport.g_net.0.weight",]
+            ok = True
+            bad = []
+            for name, p in est.named_parameters():
+                if any(name.endswith(k) for k in keys):
+                    if (p.grad is None) or (not torch.isfinite(p.grad).all()):
+                        ok = False; bad.append(name)
+            if not ok:
+                print("GradFlowCoverage failed:", bad)
+            else:
+                print("GradFlowCoverage pass")
+            return ok
+        except Exception as e:
+            print(f"GradFlowCoverage error: {e}")
+            return False
+
+    def TestWrapperKwargsValidation(self) -> bool:
+        try:
+            B = 3
+            mem, attn, state = self.RandBatch(B)
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim,attnDim=self.attn_dim,stateDim=self.state_dim,useLayerNorm=True).to(self.device)
+            wrapper = ValueEstimationOnlineWrapper(est, initRankEach=0, autoRank=False)
+
+            try:
+                _ = wrapper.ForwardWithDeltas(
+                    x=(mem, attn, state),
+                    keyPaddingMask=None,
+                    tdError=None,
+                    uncertainty=None,
+                    deltasPerLayer=[{"fc1": None}, {"fc2": None, "vhead": None, "uhead": None}],
+                    mysterious_key=torch.tensor(1.0, device=self.device), )
+            except TypeError:
+                print("WrapperKwargsValidation pass")
+                return True
+            except Exception as e:
+                print(f"WrapperKwargsValidation wrong exception: {e}")
+                return False
+            print("WrapperKwargsValidation fail (no exception)")
+            return False
+        except Exception as e:
+            print(f"WrapperKwargsValidation error: {e}")
+            return False
+
 
     def RunAll(self):
-        results = []
-        results.append(self.TestIntrinsicRewardGenerator())
-        results.append(self.TestForwardNoReward())
-        results.append(self.TestForwardWithReward())
-        results.append(self.TestBackwardOneStep())
-        results.append(self.NoNanAfterManySteps())
-        results.append(self.ParamsActuallyChange())
-        results.append(self.TestLossDecreases())
-        results.append(self.TestHebbMemoryUpdates())
+        results = {
+            "WrapperAlignmentNoDelta": self.TestWrapperAlignmentNoDelta(),
+            "SimThenCommitVHead": self.TestSimThenCommitVHead(),
+            "WrapperTempDeltasTrainable": self.TestWrapperTempDeltasTrainable(),
+            "GradFlowCoverage": self.TestGradFlowCoverage(),
+            "WrapperKwargsValidation": self.TestWrapperKwargsValidation(),
+            "IntrinsicRewardGenerator": self.TestIntrinsicRewardGenerator(),
+            "ForwardNoReward": self.TestForwardNoReward(),
+            "ForwardWithReward": self.TestForwardWithReward(),
+            "BackwardOneStep": self.TestBackwardOneStep(),
+            "NoNanAfterManySteps": self.NoNanAfterManySteps(),
+            "ParamsActuallyChange": self.ParamsActuallyChange(),
+            "LossDecreases": self.TestLossDecreases(),
+            "HebbMemoryUpdates": self.TestHebbMemoryUpdates(),}
 
-        passed = sum(1 for x in results if x)
+        passed = sum(1 for v in results.values() if v)
+
         print(f"\n[ValueEstimationExtractor Tests] {passed}/{len(results)} passed.")
-        return all(results)
+        return results
+
