@@ -16,12 +16,12 @@ import os
 
 from torch.utils.data import Dataset, DataLoader
 
-from PerceptionModule import PerceiveExtractor, TestPerceptionMTool
-from AttentionModule import AttentionExtractor, TestAttentionMTool
+from PerceptionModule import PerceiveExtractor, PerceptionOnlineWrapper, TestPerceptionMTool
+from AttentionModule import AttentionExtractor, AttentionOnlineWrapper, TestAttentionMTool
 from MemoryModule import MemoryExtractor, TestMemoryMTool
-from DecisionModule import DecisionExtractor, KEYBOARD_LAYOUT, TestDecisionMTool, DecisionPlannerExtractor
-from WorldModule import RSSMWorldModel, TestWorldMTool
-from ValueEstimationModule import ValueEstimationExtractor, TestValueEstimationMTool
+from DecisionModule import DecisionExtractor, DecisionOnlineWrapper, KEYBOARD_LAYOUT, TestDecisionMTool, DecisionPlannerExtractor
+from WorldModule import RSSMWorldModel, WorldModelOnlineWrapper, TestWorldMTool
+from ValueEstimationModule import ValueEstimationExtractor,ValueEstimationOnlineWrapper, TestValueEstimationMTool
 
 try:
     import imageio.v3 as iio
@@ -30,12 +30,6 @@ except Exception:
 
 
 def ToDevice(x, device):
-    if isinstance(x, torch.Tensor):
-        return x.to(device)
-    return x
-
-
-def to_device(x, device):
     if isinstance(x, torch.Tensor):
         return x.to(device)
     return x
