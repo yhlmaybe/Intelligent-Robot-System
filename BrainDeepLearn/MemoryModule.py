@@ -347,13 +347,47 @@ class LongTermMemory(nn.Module):
         return fused, sem_vecs, sem_w, epi_vecs, epi_w
 
 
+class FusionMoE(nn.Module):
+    def __init__(self, inDim: int, outDim: int, numExperts: int = 4, hidden: int = 1024):
+        super().__init__()
+        self.gate = nn.Linear(inDim, numExperts)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(inDim, hidden), nn.GELU(),
+                nn.Linear(hidden, hidden), nn.GELU(),
+                nn.Linear(hidden, outDim)
+            ) for _ in range(numExperts)])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = F.softmax(self.gate(x), dim=-1) 
+        ys = [self.experts[i](x) for i in range(len(self.experts))] 
+        y = torch.stack(ys, dim=-1)  
+        return (y * a.unsqueeze(1)).sum(dim=-1)  
+    
+class NeSyHead(nn.Module):
+    def __init__(self, inDim: int, K: int, hidden: int = 1024, experts: int = 4):
+        super().__init__()
+        self.gate = nn.Linear(inDim, experts)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(inDim, hidden), nn.GELU(),
+                nn.Linear(hidden, hidden), nn.GELU(),
+                nn.Linear(hidden, K)
+            ) for _ in range(experts)])
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = F.softmax(self.gate(x), dim=-1)
+        ys = [e(x) for e in self.experts] 
+        y = torch.stack(ys, dim=-1) 
+        return (y * a.unsqueeze(1)).sum(dim=-1) 
+
 class MemoryExtractor(nn.Module):
     def __init__(
         self,
         inputDim: int = 1024,
-        ssmStateDim: int = 512,
+        ssmStateDim: int = 1024,
         memoryDim: int = 768,
-        memorySize: int = 200,
+        memorySize: int = 400,
         outputDim: int = 768,
         hebbAlpha: float = 0.15,
         decayFactor: float = 0.95,
@@ -367,7 +401,7 @@ class MemoryExtractor(nn.Module):
         svdMax: float = 1.5,
         gws: Optional[GlobalWorkspace] = None,
         ltm: Optional[LongTermMemory] = None,
-        gwsSlots: int = 12,
+        gwsSlots: int = 24,
         gwsTtl: int = 8,
         consolidateEvery: int = 200,
         rehearseEvery: int = 300,
@@ -436,38 +470,48 @@ class MemoryExtractor(nn.Module):
 
         self.ctrl_norm = nn.LayerNorm(ssmStateDim)
 
-        ctrl_in_dim = ssmStateDim + memoryDim + 3 + 1 + 2
+        ctrl_hidden = 512
         self.ctrl_head = nn.Sequential(
-            nn.Linear(ctrl_in_dim, 96), nn.SiLU(),
-            nn.Linear(96, 64), nn.SiLU(),
-            nn.Linear(64, 4))
+            nn.Linear(self.ctrl_norm.normalized_shape[0] + self.memory_dim + 3 + 1 + 2, ctrl_hidden), nn.SiLU(),
+            nn.Linear(ctrl_hidden, ctrl_hidden), nn.SiLU(),
+            nn.Linear(ctrl_hidden, ctrl_hidden), nn.SiLU(),
+            nn.Linear(ctrl_hidden, 4))
         
         nn.init.zeros_(self.ctrl_head[-1].weight)
         nn.init.zeros_(self.ctrl_head[-1].bias)
 
-        self.state2mem = nn.Linear(ssmStateDim, memoryDim)
-        self.state2val = nn.Linear(ssmStateDim, memoryDim)
+        self.kv_mlp = nn.Sequential(
+            nn.LayerNorm(ssmStateDim),
+            nn.Linear(ssmStateDim, 512), nn.SiLU(),
+            nn.Linear(512, 512), nn.SiLU())
+
+        self.kv_heads = 4
+        assert memoryDim % self.kv_heads == 0, "memoryDim must be divisible by kv_heads"
+        self.kv_head_dim = memoryDim // self.kv_heads
+
+        self.kv_head_proj = nn.Parameter(torch.randn(self.kv_heads, 512, self.kv_head_dim) * 0.02)
+
+        self.k_bias = nn.Parameter(torch.zeros(self.kv_heads, self.kv_head_dim))
+        self.v_bias = nn.Parameter(torch.zeros(self.kv_heads, self.kv_head_dim))
         
         self.importance_net = nn.Sequential(
-            nn.Linear(ssmStateDim, 128), nn.ReLU(),
-            nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, 1), nn.Sigmoid(),)
+            nn.Linear(ssmStateDim, 512), nn.ReLU(),
+            nn.Linear(512, 256), nn.ReLU(),
+            nn.Linear(256, 1), nn.Sigmoid(),)
 
         self.local_gate = nn.Sequential(
-            nn.Linear(ssmStateDim, 128), nn.ReLU(),
-            nn.Linear(128, 1), nn.Sigmoid(),)
+            nn.Linear(ssmStateDim, 512), nn.ReLU(),
+            nn.Linear(512, 1), nn.Sigmoid(),)
 
         self.fusion_gate_net = nn.Sequential(
-            nn.Linear(memoryDim * 3, 128), nn.ReLU(),
-            nn.Linear(128, 1), nn.Sigmoid(),)
+            nn.Linear(memoryDim * 3, 512), nn.ReLU(),
+            nn.Linear(512, 1), nn.Sigmoid(),)
         
         self.ltm_gate = nn.Sequential(
-            nn.Linear(memoryDim * 4, 128), nn.ReLU(),
-            nn.Linear(128, 1), nn.Sigmoid())
+            nn.Linear(memoryDim * 4, 512), nn.ReLU(),
+            nn.Linear(512, 1), nn.Sigmoid())
 
-        self.fusion = nn.Sequential(
-            nn.Linear(outputDim + memoryDim, 1024), nn.GELU(),
-            nn.Linear(1024, outputDim),)
+        self.fusion = FusionMoE(inDim = outputDim + memoryDim,outDim = outputDim,numExperts = 4, hidden = 2048)
 
         self.norm = nn.LayerNorm(outputDim)
         self.grad_bridge = nn.Parameter(torch.tensor(0.3))
@@ -492,11 +536,22 @@ class MemoryExtractor(nn.Module):
 
         self.ns_implications = [(12, 1),(11, 0),(10, 0),(1, 13),(2, 14),(3, 15),(6, 16),(6, 14),(9, 15),(7, 13),(20, 17),(21, 17),(22, 13),]
 
-        self.ns_head_pre = nn.Linear(self.memory_dim, self.ns_K)
-        self.ns_head_post = nn.Linear(self.memory_dim, self.ns_K)
+        self.ns_head_pre = NeSyHead(self.memory_dim, self.ns_K, hidden=1024, experts=4)
+        self.ns_head_post = NeSyHead(self.memory_dim, self.ns_K, hidden=1024, experts=4)
 
-        nn.init.xavier_uniform_(self.ns_head_pre.weight); nn.init.zeros_(self.ns_head_pre.bias)
-        nn.init.xavier_uniform_(self.ns_head_post.weight); nn.init.zeros_(self.ns_head_post.bias)
+        self.ns_proto = nn.Parameter(torch.randn(self.ns_K, self.memory_dim) * 0.02) 
+        self.ns_temp = nn.Parameter(torch.ones(self.ns_K)) 
+        self.ns_bias = nn.Parameter(torch.zeros(self.ns_K))   
+
+        def init_mlp(m: nn.Module):
+            for mod in m.modules():
+                if isinstance(mod, nn.Linear):
+                    nn.init.xavier_uniform_(mod.weight)
+                    if mod.bias is not None:
+                        nn.init.zeros_(mod.bias)
+
+        init_mlp(self.ns_head_pre)
+        init_mlp(self.ns_head_post)
 
         self._ns_prev_P_pre: Optional[torch.Tensor] = None
         self._ns_prev_P_post: Optional[torch.Tensor] = None
@@ -525,6 +580,20 @@ class MemoryExtractor(nn.Module):
         total = self.AttachLoss(mainLoss)
         total.backward(**kwargs)
 
+
+    def EncodeKV(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.kv_mlp(h) 
+        heads = torch.einsum('bd,kdf->bkf', x, self.kv_head_proj)
+
+        k_heads = heads + self.k_bias.unsqueeze(0)  
+        v_heads = heads + self.v_bias.unsqueeze(0) 
+
+        key = k_heads.reshape(h.size(0), -1) 
+        val = v_heads.reshape(h.size(0), -1)
+
+        key = F.normalize(key, dim=-1)
+        val = F.normalize(val, dim=-1)
+        return key, val
 
     @torch.no_grad()
     def KvStats(self, key: torch.Tensor) -> torch.Tensor:
@@ -586,7 +655,12 @@ class MemoryExtractor(nn.Module):
         B, device = val.size(0), val.device
         self.NsEnsurePrev(B, device)
 
-        P_pre = torch.sigmoid(self.ns_head_pre(val))
+        temp = self.ns_temp.clamp_min(1e-2).view(1, -1).to(val.dtype) 
+        bias = self.ns_bias.view(1, -1).to(val.dtype) 
+        proto = F.normalize(self.ns_proto, dim=-1).to(val.dtype)
+
+        logit_pre  = self.ns_head_pre(val) + (F.normalize(val,  dim=-1) @ proto.t()) + bias
+        P_pre  = torch.sigmoid(logit_pre  / temp)
 
         per_sample_pre = self.NsRules(P_pre, self._ns_prev_P_pre)
 
@@ -615,7 +689,13 @@ class MemoryExtractor(nn.Module):
         B, device = memRecall.size(0), memRecall.device
         self.NsEnsurePrev(B, device)
 
-        P_post = torch.sigmoid(self.ns_head_post(memRecall))
+        temp = self.ns_temp.clamp_min(1e-2).view(1, -1).to(memRecall.dtype)
+        bias = self.ns_bias.view(1, -1).to(memRecall.dtype)
+        proto = F.normalize(self.ns_proto, dim=-1).to(memRecall.dtype)
+
+        logit_post = self.ns_head_post(memRecall) + (F.normalize(memRecall, dim=-1) @ proto.t()) + bias
+        P_post = torch.sigmoid(logit_post / temp)
+
         per_sample_post = self.NsRules(P_post, self._ns_prev_P_post)
         self._ns_prev_P_post = P_post.detach()
 
@@ -649,8 +729,11 @@ class MemoryExtractor(nn.Module):
                 self.ResetAll()
             elif softReset:
                 self.SoftReset()
-            if self.h_state.size(0) != B or self.h_state.device != device:
-                self.h_state = torch.zeros(B, self.ssm_state_dim, device=device)
+
+            if self.h_state.device != device:
+                self.h_state = self.h_state.to(device)
+            if self.h_state.size(0) != B:
+                self.h_state.resize_(B, self.ssm_state_dim).zero_()
 
             self.time_step += 1
 
@@ -667,8 +750,7 @@ class MemoryExtractor(nn.Module):
 
             y_ssm = self.C_mat(h_mix) + self.D_mat(x)
 
-            key = F.normalize(self.state2mem(h_mix), dim=-1)
-            val = F.normalize(self.state2val(h_mix), dim=-1)
+            key, val = self.EncodeKV(h_mix)
 
             self.h_state = h_mix.detach()
 
@@ -1195,7 +1277,7 @@ class MemoryExtractor(nn.Module):
     def Reason(self, goal: Optional[torch.Tensor] = None, steps: int = 3) -> torch.Tensor:
         device = self.h_state.device
         h = self.h_state.mean(dim=0, keepdim=True)
-        q = F.normalize(self.state2mem(h), dim=-1)
+        q, _ = self.EncodeKV(h)
         if goal is not None:
             goal = F.normalize(goal.to(device).view(1, -1), dim=-1)
             q = F.normalize(q + goal, dim=-1)
@@ -1390,12 +1472,13 @@ class TestMemoryMTool:
                 p.requires_grad_(False)
 
             must_train_prefixes = [
+                "kv_mlp", "kv_head_proj", "k_bias", "v_bias",
                 "importance_net", "local_gate", "fusion_gate_net",
-                "ltm_gate", "state2mem", "state2val", "fusion",
+                "ltm_gate", "fusion",
                 "A_full", "B_mat", "C_mat", "D_mat",
                 "gws_summary", "gws_gate", "ns_head_pre", "ns_head_post",
                 "grad_bridge", "norm",
-                "ctrl_head", "ctrl_norm"]
+                "ctrl_head", "ctrl_norm",]
             
             snap_before = {}
             for n, p in mem.named_parameters():
@@ -1456,7 +1539,7 @@ class TestMemoryMTool:
                 if any(n.startswith(pref) for pref in must_train_prefixes):
                     snap_after[n] = p.detach().clone()
 
-            for must in ["importance_net", "local_gate"]:
+            for must in ["importance_net", "local_gate", "kv_mlp", "kv_head_proj"]:
                 assert grads_seen[must], f"{must} Never received gradients (maybe detached or not participating in the computation graph)"
                 delta_sum = 0.0
                 for n in snap_before:
@@ -1465,7 +1548,8 @@ class TestMemoryMTool:
                 assert delta_sum > 0.0, f"{must} No parameter update occurs (total Δ = 0)"
                 print(f"[trainable] {must}: grad_seen={grads_seen[must]}, Δ_sum={delta_sum:.3e}")
 
-            soft_expect = ["fusion_gate_net", "state2mem", "state2val", "fusion", "A_full", "B_mat", "C_mat", "D_mat"]
+            soft_expect = ["fusion_gate_net", "fusion", "A_full", "B_mat", "C_mat", "D_mat","kv_mlp", "kv_head_proj", "k_bias", "v_bias",]
+
             for pref in soft_expect:
                 assert grads_seen[pref], f"{pref} No gradient hits seen (check if it participates in the loss path)"
 
