@@ -4,6 +4,14 @@ from typing import Dict, List, Optional, Callable, Tuple
 import torch
 import torch.nn as nn
 
+
+def GetParameterSScale(like: Optional[torch.Tensor] = None):
+    val = 1e-1
+    if like is None:
+        return val
+    return torch.as_tensor(val, device=like.device, dtype=like.dtype)
+
+
 @dataclass
 class SiteSpec:
     name: str
@@ -56,7 +64,7 @@ class BaseOnlineWrapper(nn.Module):
         tdError: Optional[torch.Tensor],
         uncertainty: Optional[torch.Tensor],
         deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
-        **kwargs, ) -> torch.Tensor:
+        **kwargs, ):
         raise NotImplementedError
 
     @torch.no_grad()
@@ -154,9 +162,8 @@ class BaseOnlineWrapper(nn.Module):
             for name in self.sites:
                 r = 0
                 for aParam, sParam in zip(self.cand[name][layerIdx]["A"], self.cand[name][layerIdx]["s"]):
-                    sVal = float(sParam.detach().item()) if torch.is_tensor(sParam) else float(sParam)
-                    if abs(sVal) > eps:
-                        r += int(aParam.size(0))
+                    sVal = float(torch.tanh(sParam.detach()).item()) * 1e-1
+                    if abs(sVal) > eps: r += int(aParam.size(0))
                 row[name] = r
             out["perLayer"].append(row)
         out["sum"] = {name: sum(row[name] for row in out["perLayer"]) for name in self.sites}
@@ -239,16 +246,16 @@ class BaseOnlineWrapper(nn.Module):
             for gA, gB, aParam, bParam, sParam in zip(gradAList, gradBList, aList, bList, sList):
                 if gA is None and gB is None:
                     continue
-                sVal = float(sParam.detach().item()) if torch.is_tensor(sParam) else float(sParam)
-                sVal = sVal if abs(sVal) > 1e-12 else 1.0
+                sEff = float(torch.tanh(sParam.detach()).item()) * 1e-1
+                sEff = sEff if abs(sEff) > 1e-12 else 1.0
                 parts = []
                 if gA is not None:
                     bt = bParam.t()
-                    g_a = (torch.linalg.pinv(bt) @ gA) / sVal
+                    g_a = (torch.linalg.pinv(bt) @ gA) / sEff
                     parts.append(g_a)
                 if gB is not None:
                     at = aParam.t()
-                    g_b = (gB @ torch.linalg.pinv(at)) / sVal
+                    g_b = (gB @ torch.linalg.pinv(at)) / sEff
                     parts.append(g_b)
                 if not parts:
                     continue
@@ -289,7 +296,9 @@ class BaseOnlineWrapper(nn.Module):
                             if isinstance(sParam, nn.Parameter):
                                 sParam.data.zero_()
                     else:
-                        sqrtS = torch.sqrt(S[:r]).unsqueeze(0)
+                        s_set = torch.tensor(1.0, device=self.deviceRef, dtype=self.dtypeRef)
+                        c = torch.tanh(s_set) * 1e-1
+                        sqrtS = torch.sqrt(S[:r] / c).unsqueeze(0) 
                         bNew = (U[:, :r] * sqrtS).contiguous()
                         aNew = (sqrtS.t() @ Vh[:r, :]).contiguous()
                         self.cand[name][layerIdx]["A"].clear()
@@ -297,7 +306,7 @@ class BaseOnlineWrapper(nn.Module):
                         self.cand[name][layerIdx]["s"].clear()
                         self.cand[name][layerIdx]["A"].append(nn.Parameter(aNew))
                         self.cand[name][layerIdx]["B"].append(nn.Parameter(bNew))
-                        self.cand[name][layerIdx]["s"].append(nn.Parameter(torch.tensor(1.0, device=self.deviceRef, dtype=self.dtypeRef)))
+                        self.cand[name][layerIdx]["s"].append(nn.Parameter(s_set))
 
     def ComposeOne(self, site: str, layerIdx: int) -> torch.Tensor:
         spec = self.sites[site]
