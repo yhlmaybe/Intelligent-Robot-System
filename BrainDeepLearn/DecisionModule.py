@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional, List, Any
-from FunctionTools import SiteSpec, BaseOnlineWrapper
+from FunctionTools import GetParameterSScale, SiteSpec, BaseOnlineWrapper
 
 
 KEYBOARD_LAYOUT = {
@@ -130,7 +130,7 @@ class LoRALinearAdapter(nn.Module):
         if len(self.A_list) > 0:
             dW = W.new_zeros(self.out_f, self.in_f)
             for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-                s_eff = torch.tanh(s) * 1e-1 
+                s_eff = torch.tanh(s) * GetParameterSScale(s) 
                 dW = dW + s_eff * (B @ A)
             W = W + dW
         return F.linear(x, W, self.target.bias)
@@ -172,7 +172,7 @@ class MatLoRAAdapter(nn.Module):
         if len(self.A_list) > 0:
             d = baseMatrix.new_zeros(self.M, self.N)
             for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-                s_eff = torch.tanh(s) * 1e-1
+                s_eff = torch.tanh(s) * GetParameterSScale(s)
                 d = d + s_eff * (B @ A)
             M_eff = M_eff + d
         return M_eff
@@ -208,8 +208,10 @@ class HebbianPlasticityLayer(nn.Module):
 
 
 class MouseActor(nn.Module):
-    def __init__(self, inDim: int = 256, hidden: int = 256, actDim: int = 2):
+    def __init__(self, inDim: int = 512, hidden: int = 256, actDim: int = 2, logstdBounds=(-5.0, 2.0)):
         super().__init__()
+        self._ls_low, self._ls_high = logstdBounds
+
         self.backbone = nn.Sequential(
             nn.Linear(inDim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU())
@@ -221,13 +223,13 @@ class MouseActor(nn.Module):
     def Params(self, feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = self.backbone(feat)
         mu = self.mu_head(h)
-        logstd = ClampLogstd(self.logstd_head(h))
+        logstd = ClampLogstd(self.logstd_head(h), self._ls_low, self._ls_high)
         click_logits = self.click_head(h)
         return mu, logstd, click_logits
 
 
 class KeyboardActor(nn.Module):
-    def __init__(self, inDim: int = 256,baseKeyNames: Optional[List[str]] = None,skillNames: Optional[List[str]] = None,includeNoSkill: bool = True,hidden: int = 256):
+    def __init__(self, inDim: int = 512,baseKeyNames: Optional[List[str]] = None,skillNames: Optional[List[str]] = None,includeNoSkill: bool = True,hidden: int = 256):
         super().__init__()
         baseKeyNames = baseKeyNames or list(KEYBOARD_LAYOUT["base_keys"].keys())
         skillNames = skillNames or list(KEYBOARD_LAYOUT["skill_keys"].keys())
@@ -260,7 +262,7 @@ class KeyboardActor(nn.Module):
 
 
 class OptionPolicy(nn.Module):
-    def __init__(self, zDim=256, numOptions=16, psiDim=128, hidden=256):
+    def __init__(self, zDim=512, numOptions=16, psiDim=128, hidden=256):
         super().__init__()
         self.K = numOptions
         self.enc = nn.Sequential(nn.Linear(zDim, hidden), nn.ReLU())
@@ -303,25 +305,41 @@ class OptionPolicy(nn.Module):
         return logits_o, psi_all, beta
 
 
+class SwiGLUBlock(nn.Module):
+    def __init__(self, dim=768, hidden=1024, p=0.1, layerscale=1e-2):
+        super().__init__()
+        self.ln = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, hidden * 2)  
+        self.fc2 = nn.Linear(hidden, dim)
+        self.drop = nn.Dropout(p)
+        self.gamma = nn.Parameter(torch.ones(dim) * layerscale)  
+
+    def forward(self, x):
+        h = self.ln(x)
+        a, b = self.fc1(h).chunk(2, dim=-1)
+        h = F.silu(a) * b 
+        h = self.fc2(h)
+        return x + self.drop(h * self.gamma)
+
 class DecisionExtractor(nn.Module):
     def __init__(
         self,
         stateDim: int = 768,
         includeNoSkill: bool = True,
         useHebb: bool = False,
-        optionNum: int = 16,
-        psiDim: int = 128,
+        optionNum: int = 80,
+        psiDim: int = 384,
         *,
         entropyWeights: Tuple[float, float, float, float] = (0.3, 0.2, 0.4, 0.1),
         logstdBounds: Tuple[float, float] = (-5.0, 2.0),):
         super().__init__()
 
         self.feature_net = nn.Sequential(
-            nn.Linear(stateDim, 512), nn.ReLU(),
-            nn.Linear(512, 512), nn.ReLU())
+            SwiGLUBlock(dim=stateDim, hidden=1024, p=0.1),
+            SwiGLUBlock(dim=stateDim, hidden=1024, p=0.1))
         
-        self.hebb = HebbianPlasticityLayer(512, 512)
-        self.to_z = nn.Linear(512, 256)
+        self.hebb = HebbianPlasticityLayer(stateDim, stateDim)
+        self.to_z = nn.Linear(stateDim, 512)
         self.use_hebb_online = useHebb
 
         base_names = list(KEYBOARD_LAYOUT["base_keys"].keys())
@@ -342,9 +360,9 @@ class DecisionExtractor(nn.Module):
 
         self.num_options = optionNum
 
-        self.keyboard = KeyboardActor(256, base_names, skill_names, includeNoSkill=includeNoSkill)
-        self.mouse = MouseActor(256)
-        self.option = OptionPolicy(zDim=256, numOptions=optionNum, psiDim=psiDim)
+        self.keyboard = KeyboardActor(512, base_names, skill_names, includeNoSkill=includeNoSkill)
+        self.mouse = MouseActor(512, logstdBounds=logstdBounds)
+        self.option = OptionPolicy(zDim=512, numOptions=optionNum, psiDim=psiDim)
 
         self.register_buffer("entropy_w", torch.tensor(entropyWeights, dtype=torch.float32))
         self.logstd_low = float(logstdBounds[0])
@@ -373,7 +391,7 @@ class DecisionExtractor(nn.Module):
             "extra": nn.Parameter(torch.full((K, 1), -4.0)),
             "skill": nn.Parameter(torch.full((K, 1), -4.0)),
             "mu": nn.Parameter(torch.full((K, 1), -4.0)),
-            "ls": nn.Parameter(torch.full((K, 1), -4.0)),
+            "logstd": nn.Parameter(torch.full((K, 1), -4.0)),
             "click": nn.Parameter(torch.full((K, 1), -4.0)),})
 
         self.g_base = nn.Parameter(torch.tensor(0.5))
@@ -406,6 +424,11 @@ class DecisionExtractor(nn.Module):
 
         wrap_linear(self.option.beta_head, "0")
         wrap_linear(self.option.beta_head, "2")
+
+        for blk in self.feature_net:
+            if isinstance(blk, SwiGLUBlock):
+                wrap_linear(blk, "fc1")
+                wrap_linear(blk, "fc2")
 
     @staticmethod
     def Safe(x: torch.Tensor, clip: float = 60.0) -> torch.Tensor:
@@ -462,10 +485,11 @@ class DecisionExtractor(nn.Module):
         x2[:, D:D+1] = torch.where(ad_conf, x2.new_zeros(x2[:, D:D+1].shape), x2[:, D:D+1])
 
         if max_scan > 0:
-            pressed = (x2[:, :max_scan] > 0.5)
-            rank = torch.cumsum(pressed.to(torch.int16), dim=1)
-            keep = (rank <= 6) | (~pressed)
-            x2 = torch.cat([x2[:, :max_scan] * keep.float(), x2[:, max_scan:]], dim=1)
+            pressed = x2[:, :max_scan]
+            k = min(6, pressed.size(1))
+            topk = pressed.topk(k, dim=1).indices
+            mask = torch.zeros_like(pressed).scatter(1, topk, 1.0)
+            x2 = torch.cat([pressed * mask, x2[:, max_scan:]], dim=1)
         return x2
 
     def EntropyComponents(self,baseLogits: torch.Tensor,extraLogits: torch.Tensor,skillLogits: torch.Tensor,logstd: torch.Tensor,) -> Dict[str, torch.Tensor]:
@@ -551,14 +575,14 @@ class DecisionExtractor(nn.Module):
         psi_cond_extra = mix_psi_per_branch(self.psi_amp["extra"])
         psi_cond_skill = mix_psi_per_branch(self.psi_amp["skill"])
         psi_cond_mu = mix_psi_per_branch(self.psi_amp["mu"])
-        psi_cond_ls = mix_psi_per_branch(self.psi_amp["ls"])
+        psi_cond_logstd  = mix_psi_per_branch(self.psi_amp["logstd"])
         psi_cond_click = mix_psi_per_branch(self.psi_amp["click"])
 
         base_psi = self.psi_to["base"](psi_cond_base)
         extra_psi = self.psi_to["extra"](psi_cond_extra)
         skill_psi = self.psi_to["skill"](psi_cond_skill)
         mu_psi = self.psi_to["mu"](psi_cond_mu)
-        ls_psi = self.psi_to["logstd"](psi_cond_ls)
+        ls_psi = self.psi_to["logstd"](psi_cond_logstd)
         click_psi = self.psi_to["click"](psi_cond_click)
 
         w_base = F.softplus(self.g_base) / (F.softplus(self.g_base) + 1.0)
@@ -638,7 +662,7 @@ class DecisionExtractor(nn.Module):
                 eps_train = torch.randn_like(std)
                 mouse_a_train = (mu + eps_train * std).detach()
                 LOG_TWO_PI = math.log(2.0 * math.pi)
-                logp_mouse = -0.5 * (((mouse_a_train - mu) / std).pow(2) + 2.0 * logstd + LOG_TWO_PI).sum(-1)
+                logp_mouse = -0.5 * (2.0 * logstd + LOG_TWO_PI).sum(-1)
             else:
                 base_prob  = torch.sigmoid(base_logits_s).clamp(1e-6, 1.0 - 1e-6)
                 extra_prob = torch.sigmoid(extra_logits_s).clamp(1e-6, 1.0 - 1e-6)
@@ -725,6 +749,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         autoRank: bool = True,
         evThreshold: float = 0.90,
         gradEma: float = 0.9,
+        maxRankFeat: int = 64,
         maxRankToZ: int = 64,
         maxRankKbd: int = 64,
         maxRankMouse: int = 64,
@@ -735,6 +760,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         maxRankBeta0: int = 32,
         maxRankBeta2: int = 32,
         maxRankTrans: int = 64,):
+        self.maxRankFeat = int(maxRankFeat)
         self.maxRankToZ = int(maxRankToZ)
         self.maxRankKbd = int(maxRankKbd)
         self.maxRankMouse = int(maxRankMouse)
@@ -755,21 +781,21 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
     def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
         def alloc_lin(addRank, device, dtype, inDim, outDim):
             A = nn.Parameter(torch.randn(addRank, inDim,  device=device, dtype=dtype) * 1e-4)
-            B = nn.Parameter(torch.zeros(outDim, addRank, device=device, dtype=dtype))
+            B = nn.Parameter(torch.zeros(outDim, addRank, device=device, dtype=dtype) * 1e-4)
             s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
             return A, B, s
 
         def compose_lin(a, b, s):
-            return s * (b @ a)
+            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
 
         def alloc_mat(addRank, device, dtype, N, M):
             A = nn.Parameter(torch.randn(addRank, N, device=device, dtype=dtype) * 1e-4)
-            B = nn.Parameter(torch.zeros(M, addRank, device=device, dtype=dtype))
+            B = nn.Parameter(torch.zeros(M, addRank, device=device, dtype=dtype) * 1e-4)
             s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
             return A, B, s
 
         def compose_mat(a, b, s):
-            return s * (b @ a)
+            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
 
         L = 1
 
@@ -803,7 +829,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         opt_b2_in = self.base.option.beta_head[2].target.in_features
         opt_b2_out = self.base.option.beta_head[2].target.out_features
 
-        return {
+        specs = {
             "toz": SiteSpec("toz", L, toz_in, toz_out, self.maxRankToZ, lambda r, d, dt: alloc_lin(r, d, dt, toz_in, toz_out), compose_lin),
 
             "kbd_base": SiteSpec("kbd_base", L, kbd_base_in, kbd_base_out, self.maxRankKbd, lambda r, d, dt: alloc_lin(r, d, dt, kbd_base_in, kbd_base_out), compose_lin),
@@ -823,29 +849,71 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
 
             "opt_trans": SiteSpec("opt_trans", L, K, K, min(self.maxRankTrans, K), lambda r, d, dt: alloc_mat(r, d, dt, K, K), compose_mat),}
 
+        for i, blk in enumerate(self.base.feature_net):
+            if isinstance(blk, SwiGLUBlock):
+                fc1_in, fc1_out = blk.fc1.target.in_features, blk.fc1.target.out_features
+                fc2_in, fc2_out = blk.fc2.target.in_features, blk.fc2.target.out_features
+                specs[f"feat{i}_fc1"] = SiteSpec(
+                    f"feat{i}_fc1", L, fc1_in, fc1_out, self.maxRankFeat,
+                    lambda r, d, dt, _in=fc1_in, _out=fc1_out: alloc_lin(r, d, dt, _in, _out),
+                    compose_lin,)
+                specs[f"feat{i}_fc2"] = SiteSpec(
+                    f"feat{i}_fc2", L, fc2_in, fc2_out, self.maxRankFeat,
+                    lambda r, d, dt, _in=fc2_in, _out=fc2_out: alloc_lin(r, d, dt, _in, _out),
+                    compose_lin,)
+
+        return specs
+
     @torch.no_grad()
     def ForwardWithDeltas(
         self,
-        stateFeat: torch.Tensor,
+        x: torch.Tensor,
         keyPaddingMask: Optional[torch.Tensor],
         tdError: Optional[torch.Tensor],
         uncertainty: Optional[torch.Tensor],
-        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],) -> Dict[str, Any]:
-        D = deltasPerLayer[0] if (len(deltasPerLayer) > 0) else {}
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
+        **kwargs,) -> Dict[str, Any]:
 
-        B = stateFeat.size(0)
-        device = stateFeat.device
+        D = deltasPerLayer[0] if (deltasPerLayer and len(deltasPerLayer) > 0) else {}
+
+        prior: Optional[Dict[str, Dict[str, torch.Tensor]]] = kwargs.pop("prior", None)
+        mixW: float = float(kwargs.pop("mixW", 0.25))
+        prevOptionOnehot: Optional[torch.Tensor] = kwargs.pop("prevOptionOnehot", None)
+        if (prevOptionOnehot is None) and (keyPaddingMask is not None):
+            prevOptionOnehot = keyPaddingMask
+
+        B = x.size(0)
+        device = x.device
         K = self.base.option.K
 
-        if (keyPaddingMask is not None) and (keyPaddingMask.dim() == 2) and (keyPaddingMask.size(1) == K):
-            prev = keyPaddingMask.detach().to(dtype=stateFeat.dtype, device=device)
-        else:
-            prev = torch.zeros(B, K, dtype=stateFeat.dtype, device=device)
+        has_prev = (prevOptionOnehot is not None) and (prevOptionOnehot.dim() == 2) and (prevOptionOnehot.size(1) == K)
+        prev = (prevOptionOnehot.detach().to(dtype=x.dtype, device=device) if has_prev else torch.zeros(B, K, dtype=x.dtype, device=device))
 
-        x = self.base.feature_net(stateFeat)
+        for i, blk in enumerate(self.base.feature_net):
+            if isinstance(blk, SwiGLUBlock):
+                h_norm = blk.ln(x)
+
+                fc1_out = blk.fc1(h_norm) 
+                d_fc1 = D.get(f"feat{i}_fc1", None)
+                if d_fc1 is not None:
+                    fc1_out = fc1_out + F.linear(h_norm, d_fc1, bias=None)
+
+                a, b = fc1_out.chunk(2, dim=-1)
+                mid = F.silu(a) * b
+
+                fc2_out = blk.fc2(mid)  
+                d_fc2 = D.get(f"feat{i}_fc2", None)
+                if d_fc2 is not None:
+                    fc2_out = fc2_out + F.linear(mid, d_fc2, bias=None)
+
+                x = x + blk.drop(fc2_out * blk.gamma)
+            else:
+                x = blk(x)
+
         x = self.base.hebb(x, update=self.base.use_hebb_online)
 
         z_lin = self.base.to_z(x)
+
         if D.get("toz") is not None:
             z_lin = z_lin + F.linear(x, D["toz"], bias=None)
         z = F.relu(z_lin)
@@ -891,11 +959,8 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         psi_all = psi_all * self.base.option.psi_amp_global * self.base.option.psi_amp_per_option.view(1, K, 1)
         psi_all = self.base.Safe(psi_all, 30.0)
 
-        has_prev = (keyPaddingMask is not None) and (keyPaddingMask.dim() == 2) and (keyPaddingMask.size(1) == K)
-
-        prev = (keyPaddingMask.detach().to(dtype=stateFeat.dtype, device=device) if has_prev else torch.zeros(B, K, dtype=stateFeat.dtype, device=device))
-
         b0_in = torch.cat([h_o, (prev if has_prev else torch.zeros_like(prev))], dim=-1)
+
         b0 = self.base.option.beta_head[0](b0_in)
         if D.get("opt_beta0") is not None:
             b0 = b0 + F.linear(b0_in, D["opt_beta0"], bias=None)
@@ -912,6 +977,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         trans_eff = torch.nan_to_num(trans_eff, nan=0.0).clamp(-10.0, 10.0)
 
         option_logits = self.base.Safe(opt_logits_base + (prev @ trans_eff if has_prev else 0.0), 60.0)
+
         p_new = self.base.SafeSoftmax(option_logits, dim=-1)
 
         w_t = (1.0 - beta) * prev + beta * p_new if has_prev else p_new
@@ -925,7 +991,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         psi_cond_extra = mix_psi(self.base.psi_amp["extra"])
         psi_cond_skill = mix_psi(self.base.psi_amp["skill"])
         psi_cond_mu = mix_psi(self.base.psi_amp["mu"])
-        psi_cond_ls = mix_psi(self.base.psi_amp["ls"])
+        psi_cond_ls = mix_psi(self.base.psi_amp["logstd"])
         psi_cond_click = mix_psi(self.base.psi_amp["click"])
 
         base_psi = self.base.psi_to["base"](psi_cond_base)
@@ -959,7 +1025,17 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         logstd = torch.clamp(logstd, self.base.logstd_low, self.base.logstd_high)
 
         click_logits = w_click * click_psi + (1.0 - w_click) * click_logits
+        
         click_logits = self.base.Safe(click_logits, 60.0)
+
+        if prior is not None:
+            base_logits = MixLogits(base_logits,  prior.get("base",  {}).get("logits", None), mixW)
+            extra_logits = MixLogits(extra_logits, prior.get("extra", {}).get("logits", None), mixW)
+            skill_logits = MixLogits(skill_logits, prior.get("skill", {}).get("logits", None), mixW)
+            mu, logstd = MixGauss(mu, logstd, prior.get("mouse", {}).get("mu",  None), prior.get("mouse", {}).get("var", None), mixW)
+            
+            click_logits = MixLogits(click_logits, prior.get("click", {}).get("logits", None), mixW)
+ 
 
         comps = self.base.EntropyComponents(base_logits, extra_logits, skill_logits, logstd)
         entropy_scalar = self.base.AggregateEntropy(comps)
@@ -1035,6 +1111,13 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
 
         if site == "opt_trans":
             self.base.option.trans_adapter.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            return True
+        
+        if site.startswith("feat") and ("_fc" in site):
+            head, tail = site.split("_", 1)   
+            idx = int(head.replace("feat", ""))
+            blk = self.base.feature_net[idx]
+            getattr(blk, tail).Grow(addRank=a.size(0), init=init, freezeOld=False)
             return True
 
         raise ValueError(f"Unknown site: {site}")
@@ -1463,7 +1546,7 @@ class TestDecisionMTool:
             adap.Grow(addRank=3)
             y_aug = adap(x)
             A, B, s = adap.A_list[0], adap.B_list[0], adap.alpha[0]
-            s_eff = torch.tanh(s) * 1e-1
+            s_eff = torch.tanh(s) * GetParameterSScale(s)
             delta = F.linear(x, s_eff * (B @ A), bias=None)
             diff = (y_aug - y_base - delta).abs().max().item()
             if diff >= 1e-5:
@@ -1490,8 +1573,8 @@ class TestDecisionMTool:
 
             A0, B0, s0 = adap.A_list[0], adap.B_list[0], adap.alpha[0]
             A1, B1, s1 = adap.A_list[1], adap.B_list[1], adap.alpha[1]
-            s0_eff = torch.tanh(s0) * 1e-1
-            s1_eff = torch.tanh(s1) * 1e-1
+            s0_eff = torch.tanh(s0) * GetParameterSScale(s0)
+            s1_eff = torch.tanh(s1) * GetParameterSScale(s1)
             expect = base + s0_eff * (B0 @ A0) + s1_eff * (B1 @ A1)
 
             err = (out1 - expect).abs().max().item()
@@ -1629,7 +1712,7 @@ class TestDecisionMTool:
             out_dim = tgt.target.out_features
             addRank = 2
             A = torch.randn(addRank, in_dim, device=self.device) * 1e-4
-            B = torch.zeros(out_dim, addRank, device=self.device)
+            B = torch.zeros(out_dim, addRank, device=self.device) * 1e-4
 
             x = torch.randn(5, 128, device=self.device)
             h = model.keyboard.backbone(F.relu(model.to_z(model.hebb(model.feature_net(x), update=False))))
@@ -1644,7 +1727,9 @@ class TestDecisionMTool:
             y_after = model.keyboard.base_head(h)
 
             A_new, B_new, s_new = tgt.A_list[-1], tgt.B_list[-1], tgt.alpha[-1]
-            expect_delta = F.linear(h, s_new * (B_new @ A_new), bias=None)
+
+            s_eff = torch.tanh(s_new) * GetParameterSScale(s_new)
+            expect_delta = F.linear(h, s_eff * (B_new @ A_new), bias=None)
 
             err = (y_after - y_base - expect_delta).abs().max().item()
             if err >= 1e-5:
@@ -1783,11 +1868,11 @@ class TestDecisionMTool:
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            if model.feature_net[0].weight.grad is None or \
-               model.keyboard.base_head.target.weight.grad is None or \
-               model.mouse.mu_head.target.weight.grad is None:
+
+            if (model.feature_net[0].fc1.target.weight.grad is None) or (model.keyboard.base_head.target.weight.grad is None) or (model.mouse.mu_head.target.weight.grad is None):
                 print("Training Smoke: Critical Gradient Missing (decision-only)")
                 return False
+            
             opt.step()
             print("Training smoke (decision-only loss) pass")
             return True
@@ -1830,7 +1915,7 @@ class TestDecisionMTool:
             opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
             with torch.no_grad():
-                w_feat0 = model.feature_net[0].weight.clone()
+                w_feat0 = model.feature_net[0].fc1.target.weight.clone()
                 w_kbd0 = model.keyboard.base_head.target.weight.clone()
                 w_mu0 = model.mouse.mu_head.target.weight.clone()
 
@@ -1847,7 +1932,7 @@ class TestDecisionMTool:
                 opt.step()
 
             with torch.no_grad():
-                d_feat = (w_feat0 - model.feature_net[0].weight).norm().item()
+                d_feat = (w_feat0 - model.feature_net[0].fc1.target.weight).norm().item()
                 d_kbd = (w_kbd0 - model.keyboard.base_head.target.weight).norm().item()
                 d_mu = (w_mu0 - model.mouse.mu_head.target.weight).norm().item()
             if not any(d > 1e-6 for d in [d_feat, d_kbd, d_mu]):
