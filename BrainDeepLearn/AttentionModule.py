@@ -4,8 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict
-from FunctionTools import SiteSpec, BaseOnlineWrapper
-from contextlib import contextmanager
+from FunctionTools import GetParameterSScale, SiteSpec, BaseOnlineWrapper
 
 
 class GrowableLoRALinear(nn.Module):
@@ -29,7 +28,7 @@ class GrowableLoRALinear(nn.Module):
         dt = self.target.weight.dtype
 
         A = init.get("A", torch.randn(addRank, self.in_f, device=dev, dtype=dt) * 1e-4)
-        B = init.get("B", torch.zeros(self.out_f, addRank, device=dev, dtype=dt))
+        B = init.get("B", torch.zeros(self.out_f, addRank, device=dev, dtype=dt) * 1e-4)
         s = init.get("scale", 1e-3)
 
         A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
@@ -49,7 +48,8 @@ class GrowableLoRALinear(nn.Module):
             return None
         delta = self.target.weight.new_zeros(self.out_f, self.in_f)
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-            delta = delta + s * (B @ A)
+            s_eff = torch.tanh(s) * GetParameterSScale(s) 
+            delta = delta + s_eff * (B @ A)
         return delta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -587,13 +587,11 @@ class AttentionExtractor(nn.Module):
         if keyPaddingMask is not None:
             keep = (~keyPaddingMask).unsqueeze(-1).to(x.dtype)
             x = x * keep
-
-        h = x
         
         # Use detached version of tdError for checkpointing
         #td_error_detached = tdError.detach() if tdError is not None else None
         for blk in self.temporal_blocks:
-            h = blk(h, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty= uncertainty)
+            x = blk(x, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty= uncertainty)
 
         # Create capsule mask
         chunk = S // self.num_caps
@@ -601,13 +599,13 @@ class AttentionExtractor(nn.Module):
         if keyPaddingMask is not None:
             seg_mask = keyPaddingMask.reshape(B, self.num_caps, chunk) # (B,I,chunk)
         else:
-            seg_mask = h.new_zeros(B, self.num_caps, chunk, dtype=torch.bool)
+            seg_mask = x.new_zeros(B, self.num_caps, chunk, dtype=torch.bool)
 
         valid = (~seg_mask).float()                                  
         valid_cnt = valid.sum(dim=2, keepdim=True) # (B,I,1)
         valid_cnt_safe = valid_cnt.clamp_min(1.0)
 
-        h_seg = h.reshape(B, self.num_caps, chunk, E) # (B,I,chunk,E)
+        h_seg = x.reshape(B, self.num_caps, chunk, E) # (B,I,chunk,E)
         caps = (h_seg * valid.unsqueeze(-1)).sum(dim=2) / valid_cnt_safe # (B,I,E) masked mean
         caps_mask = (valid_cnt.squeeze(-1) == 0)                      
 
@@ -618,11 +616,11 @@ class AttentionExtractor(nn.Module):
         routed_mean = routed.mean(dim=1) # (B,E)
         
         if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).to(h.dtype).unsqueeze(-1)  # (B,S,1)
+            keep = (~keyPaddingMask).to(x.dtype).unsqueeze(-1)  # (B,S,1)
             denom = keep.sum(dim=1, keepdim=True).clamp_min(1.0) # (B,1,1)
-            temp_mean = (h * keep).sum(dim=1) / denom.squeeze(-1)  
+            temp_mean = (x * keep).sum(dim=1) / denom.squeeze(-1)  
         else:
-            temp_mean = h.mean(dim=1)
+            temp_mean = x.mean(dim=1)
         
         fusion_in = torch.stack([
             temp_mean, 
@@ -686,12 +684,13 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
 
         def alloc_linear(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, E, device=device, dtype=dtype) * 1e-4) # (r, inDim)
-            B = nn.Parameter(torch.zeros(E, addRank, device=device, dtype=dtype)) # (outDim, r)
+            B = nn.Parameter(torch.zeros(E, addRank, device=device, dtype=dtype) * 1e-4) # (outDim, r)
             s = nn.Parameter(torch.tensor(1e-2, device=device, dtype=dtype))
             return A, B, s
 
         def compose_linear(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return s * (b @ a)
+            s_eff = torch.tanh(s) * GetParameterSScale(s) 
+            return s_eff * (b @ a)
 
         return {
             "q": SiteSpec("q", L, E, E, self.maxRankQ, alloc_linear, compose_linear),
@@ -705,7 +704,8 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         keyPaddingMask: Optional[torch.Tensor],
         tdError: Optional[torch.Tensor],
         uncertainty: Optional[torch.Tensor],
-        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],) -> torch.Tensor:
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
+        **kwargs,) -> torch.Tensor:
         B, S, E = x.shape
         num_caps = int(self.base.num_caps)
 
@@ -912,10 +912,11 @@ class TestAttentionMTool:
                 return torch.zeros(0, 0, device=self.device)
             return torch.zeros(out_f, in_f, device=self.device)
         out_f = adapter.out_f
-        in_f  = adapter.in_f
+        in_f = adapter.in_f
         delta = torch.zeros(out_f, in_f, device=adapter.A_list[0].device, dtype=adapter.A_list[0].dtype)
         for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
-            delta = delta + float(s.detach()) * (B @ A)
+            s_eff = torch.tanh(s.detach()) * GetParameterSScale(s.detach())
+            delta = delta + s_eff * (B @ A)
         return delta
 
     def TestSimpleSSM(self):
