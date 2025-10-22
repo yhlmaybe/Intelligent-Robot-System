@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from typing import Dict, List, Optional, Iterable, Tuple, Any
-from FunctionTools import SiteSpec, BaseOnlineWrapper
+from FunctionTools import GetParameterSScale, SiteSpec, BaseOnlineWrapper
 
 
 
@@ -36,7 +36,7 @@ class GrowableLoRAConv2d(nn.Module):
         dt = self.target.weight.dtype
 
         A = init.get("A", torch.randn(addRank, self.cin * ksz, device=dev, dtype=dt) * 1e-4)
-        B = init.get("B", torch.zeros(self.cout, addRank, device=dev, dtype=dt))
+        B = init.get("B", torch.zeros(self.cout, addRank, device=dev, dtype=dt) * 1e-4)
         s = init.get("scale", 1e-3)
 
         A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
@@ -57,7 +57,7 @@ class GrowableLoRAConv2d(nn.Module):
         ksz = self.kh * self.kw
         delta = self.target.weight.new_zeros(self.cout, self.cin * ksz)
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-            delta = delta + s * (B @ A)
+            delta = delta + torch.tanh(s) * GetParameterSScale(s) * (B @ A)
         return delta.view(self.cout, self.cin, self.kh, self.kw)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -65,12 +65,7 @@ class GrowableLoRAConv2d(nn.Module):
         delta = self.DeltaWeight()
         if delta is not None:
             w = w + delta
-        return F.conv2d(
-            x, w, self.target.bias,
-            stride=self.target.stride,
-            padding=self.target.padding,
-            dilation=self.target.dilation,
-            groups=self.target.groups)
+        return F.conv2d(x, w, self.target.bias, stride=self.target.stride, padding=self.target.padding, dilation=self.target.dilation, groups=self.target.groups)
 
 
 class GrowableConv1x1Adapter(nn.Module):
@@ -87,7 +82,7 @@ class GrowableConv1x1Adapter(nn.Module):
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
         if init is None: init = {}
         A = init.get("A", torch.randn(addRank, self.C, 1, 1) * 1e-4)
-        B = init.get("B", torch.zeros(self.C, addRank, 1, 1))
+        B = init.get("B", torch.zeros(self.C, addRank, 1, 1) * 1e-4)
         s = init.get("scale", 1e-3)
 
         dev, dt = self._anchor.device, self._anchor.dtype
@@ -110,7 +105,7 @@ class GrowableConv1x1Adapter(nn.Module):
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
             z = F.conv2d(x, A, bias=None, stride=1, padding=0)
             z = F.conv2d(z, B, bias=None, stride=1, padding=0)
-            y = y + s * z
+            y = y + torch.tanh(s) * GetParameterSScale(s) * z
         return y
 
 
@@ -129,7 +124,7 @@ class GrowableTokenAdapter(nn.Module):
         if init is None: init = {}
         
         A = init.get("A", torch.randn(addRank, self.D) * 1e-4)
-        B = init.get("B", torch.zeros(self.D, addRank))
+        B = init.get("B", torch.zeros(self.D, addRank) * 1e-4)
         s = init.get("scale", 1e-3)
 
         dev, dt = self._anchor.device, self._anchor.dtype
@@ -152,7 +147,7 @@ class GrowableTokenAdapter(nn.Module):
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
             z = torch.matmul(x, A.t())
             z = torch.matmul(z, B.t())
-            y = y + s * z
+            y = y + torch.tanh(s) * GetParameterSScale(s) * z
         return y
 
 
@@ -558,32 +553,32 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
 
         def alloc_feat(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, C, 1, 1, device=device, dtype=dtype) * 1e-4)
-            B = nn.Parameter(torch.zeros(C, addRank, 1, 1, device=device, dtype=dtype))
+            B = nn.Parameter(torch.zeros(C, addRank, 1, 1, device=device, dtype=dtype) * 1e-4)
             s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
             return A, B, s
 
         def compose_feat(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
             A2 = a.view(a.size(0), C)
             B2 = b.view(C, a.size(0))
-            return s * (B2 @ A2)
+            return torch.tanh(s) * GetParameterSScale(s) * (B2 @ A2)
 
         def alloc_patch(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, C * ksz, device=device, dtype=dtype) * 1e-4)
-            B = nn.Parameter(torch.zeros(E, addRank, device=device, dtype=dtype))
+            B = nn.Parameter(torch.zeros(E, addRank, device=device, dtype=dtype) * 1e-4)
             s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
             return A, B, s
 
         def compose_patch(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return s * (b @ a)
+            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
 
         def alloc_token(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, D, device=device, dtype=dtype) * 1e-4)
-            B = nn.Parameter(torch.zeros(D, addRank, device=device, dtype=dtype))
+            B = nn.Parameter(torch.zeros(D, addRank, device=device, dtype=dtype) * 1e-4)
             s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
             return A, B, s
 
         def compose_token(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return s * (b @ a)
+            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
 
         return {
             "feat": SiteSpec("feat", L, C * 1, C * 1, self.maxRankFeat, alloc_feat, compose_feat),
@@ -596,7 +591,8 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         keyPaddingMask: Optional[torch.Tensor],
         tdError: Optional[torch.Tensor],
         uncertainty: Optional[torch.Tensor],
-        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],) -> torch.Tensor:
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
+        **kwargs,) -> torch.Tensor:
 
         featIn = self.base.cnn_extractor(x)
         feat = self.base.cnn_feat_adapter(featIn)
@@ -715,7 +711,8 @@ class TestPerceptionMTool:
         for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
             A2 = A.view(A.size(0), C) 
             B2 = B.view(C, A.size(0)) 
-            delta = delta + float(s.detach()) * (B2 @ A2) 
+            scale = torch.tanh(s.detach()) * GetParameterSScale(s.detach())
+            delta = delta + scale * (B2 @ A2) 
         return delta
 
     def DeltaFromTokenAdapter(self, adapter) -> torch.Tensor:
@@ -725,7 +722,8 @@ class TestPerceptionMTool:
         D = adapter.D
         delta = torch.zeros(D, D, device=adapter.A_list[0].device, dtype=adapter.A_list[0].dtype)
         for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
-            delta = delta + float(s.detach()) * (B @ A) 
+            scale = torch.tanh(s.detach()) * GetParameterSScale(s.detach())
+            delta = delta + scale * (B @ A)
         return delta
 
     def TestHebbianConv2d(self):
