@@ -31,19 +31,35 @@ def BalancedKL(muQ: torch.Tensor,logstdQ: torch.Tensor,muP: torch.Tensor,logstdP
 
 
 class ActionEncoder(nn.Module):
-    def __init__(self, numDiscrete: int = 106, contDim: int = 2, outDim: int = 128):
+    def __init__(self, numDiscrete=106, contDim=2, outDim=256, hidden=512):
         super().__init__()
-        self.disc_proj = nn.Linear(numDiscrete, outDim, bias=False)
-        self.cont_net = nn.Sequential(nn.Linear(contDim, 64), nn.ReLU(), nn.Linear(64, outDim))
-        self.fuse = nn.Sequential(nn.Linear(outDim * 2, outDim), nn.Tanh())
-        nn.init.normal_(self.disc_proj.weight, mean=0.0, std=0.02)
 
-    def forward(self, keysOnehot: torch.Tensor, mouseDelta: Optional[torch.Tensor] = None) -> torch.Tensor:
-        disc_vec = self.disc_proj(keysOnehot.float())
+        self.disc_net = nn.Sequential(
+            nn.LayerNorm(numDiscrete),
+            nn.Linear(numDiscrete, hidden), nn.GELU(),
+            nn.Linear(hidden, outDim),)
+
+        self.cont_net = nn.Sequential(
+            nn.LayerNorm(contDim),
+            nn.Linear(contDim, 128), nn.SiLU(),
+            nn.Linear(128, outDim),)
+        
+        self.to_gamma = nn.Linear(outDim, outDim)
+
+        self.to_beta  = nn.Linear(outDim, outDim)
+        
+        self.fuse = nn.Sequential(
+            nn.LayerNorm(outDim * 2),
+            nn.Linear(outDim * 2, outDim * 2), nn.GELU(),
+            nn.Linear(outDim * 2, outDim),)
+
+    def forward(self, keysOnehot, mouseDelta=None):
+        d = self.disc_net(keysOnehot.float())
         if mouseDelta is None:
-            return disc_vec
-        cont_vec = self.cont_net(mouseDelta.float())
-        return self.fuse(torch.cat([disc_vec, cont_vec], dim=-1))
+            return d
+        c = self.cont_net(mouseDelta.float())
+        d = (1.0 + torch.tanh(self.to_gamma(c))) * d + self.to_beta(c)
+        return self.fuse(torch.cat([d, c], dim=-1))
 
 
 class GrowableLoRALinear(nn.Module):
@@ -97,144 +113,419 @@ class GrowableLoRALinear(nn.Module):
         return F.linear(x, W, self.target.bias)
 
 
-class GrowableLoRAGRUCell(nn.Module):
-    def __init__(self, targetGRU: nn.GRUCell, gradMomentum: float = 0.9, winnerRatio: float = 1.2):
+class S4DCell(nn.Module):
+    def __init__(self, inDim: int, deterDim: int, ssmDim: int = 512, dt: float = 1.0, dropout: float = 0.0, ffnMult: int = 4):
         super().__init__()
-        assert isinstance(targetGRU, nn.GRUCell)
-        self.target = targetGRU
-        self.input_size  = int(targetGRU.input_size)
-        self.hidden_size = int(targetGRU.hidden_size)
+        self.U = int(inDim)
+        self.D = int(deterDim)
+        self.N = int(ssmDim)
+        self.dt = float(dt)
 
-        self.A_ih = nn.ParameterList(); self.B_ih = nn.ParameterList(); self.s_ih = nn.ParameterList()
+        self.theta = nn.Parameter(torch.randn(self.N) * 0.1)
 
-        self.A_hh = nn.ParameterList(); self.B_hh = nn.ParameterList(); self.s_hh = nn.ParameterList()
+        self.B = GrowableLoRALinear(nn.Linear(self.U, self.N, bias=True))
+        self.C = GrowableLoRALinear(nn.Linear(self.N, self.D, bias=True))
+        self.D0 = GrowableLoRALinear(nn.Linear(self.U, self.D, bias=True))
+        self.gate = GrowableLoRALinear(nn.Linear(self.U, self.N, bias=True))
+        self.out_gate = GrowableLoRALinear(nn.Linear(self.N, self.D, bias=True))
 
-        self.register_buffer("ema_g2_ih", torch.tensor(0.0))
-        self.register_buffer("ema_g2_hh", torch.tensor(0.0))
-        self.grad_momentum = float(gradMomentum)
-        self.winner_ratio = float(winnerRatio) 
+        self.ln_y = nn.LayerNorm(self.D)
+        self.ln_ffn = nn.LayerNorm(self.D)
+        self.ffn = nn.Sequential(
+            nn.Linear(self.D, ffnMult * self.D, bias=True),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(ffnMult * self.D, self.D, bias=True),)
 
-        def hook_ih(grad):
-            with torch.no_grad():
-                g2 = grad.detach().pow(2).mean()
-                self.ema_g2_ih.mul_(self.grad_momentum).add_(g2, alpha=1 - self.grad_momentum)
-            return grad
-        def hook_hh(grad):
-            with torch.no_grad():
-                g2 = grad.detach().pow(2).mean()
-                self.ema_g2_hh.mul_(self.grad_momentum).add_(g2, alpha=1 - self.grad_momentum)
-            return grad
+        self.register_buffer("x", torch.zeros(1, self.N), persistent=False)
 
-        self.target.weight_ih.register_hook(hook_ih)
-        self.target.weight_hh.register_hook(hook_hh)
+    @staticmethod
+    def CayleyStep(aDiag: torch.Tensor, x: torch.Tensor, Bu: torch.Tensor, dt: float):
+        A = -F.softplus(aDiag)
+        k = 0.5 * dt * A
+        num = (1 + k) * x + dt * Bu
+        denom = (1 - k).clamp_min(1e-6)
+        return num / denom
 
-    @torch.no_grad()
-    def DecideSplit(self, addRank: int) -> tuple[int, int]:
-        g_ih = float(self.ema_g2_ih)
-        g_hh = float(self.ema_g2_hh)
+    def ResetState(self, batch: int, device: torch.device):
+        self.x = torch.zeros(batch, self.N, device=device)
 
-        if g_ih <= 0 and g_hh <= 0:
-            r_ih = addRank // 2
-            r_hh = addRank - r_ih
-            return r_ih, r_hh
-        if g_ih > self.winner_ratio * g_hh:
-            return addRank, 0
-        if g_hh > self.winner_ratio * g_ih:
-            return 0, addRank
+    def Step(self, zPrev: torch.Tensor, aT: torch.Tensor, *, updateState: bool = True) -> torch.Tensor:
+        u = torch.cat([zPrev, aT], dim=-1)
+        g = torch.sigmoid(self.gate(u))
+        Bu = self.B(u) * g
+
+        B = u.size(0)
+        if (self.x.dim() != 2
+            or self.x.size(0) != B
+            or self.x.size(1) != self.N
+            or self.x.device != u.device
+            or self.x.dtype != u.dtype):
+            self.x = torch.zeros(B, self.N, device=u.device, dtype=u.dtype)
+        x_use = self.x 
+
+        x_next = self.CayleyStep(self.theta, x_use, Bu, self.dt)
+        y_lin = self.C(x_next) + self.D0(u)
+        y_glu = y_lin * torch.sigmoid(self.out_gate(x_next))
+        y = self.ln_y(y_glu)
+        y = y + self.ffn(self.ln_ffn(y))
+
+        if updateState:
+            self.x = x_next.detach()
+        return y
+    
+class HNNPhysHead(nn.Module):
+    def __init__(self, deterDim: int, projDim: int = 256):
+        super().__init__()
+        self.D = deterDim
+        self.P = projDim
+        self.to_qp = GrowableLoRALinear(nn.Linear(self.D, self.P, bias=True))
+
+        self.H = nn.Sequential(
+            GrowableLoRALinear(nn.Linear(self.P, self.P)),
+            nn.GELU(),
+            GrowableLoRALinear(nn.Linear(self.P, 1)))
         
-        p_ih = g_ih / (g_ih + g_hh + 1e-12)
-        r_ih = int(round(addRank * p_ih))
-        r_ih = max(0, min(addRank, r_ih))
-        r_hh = addRank - r_ih
-        return r_ih, r_hh
+        self.from_qp = GrowableLoRALinear(nn.Linear(self.P, self.D, bias=True))
+        self.dt = 1.0
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        qp = self.to_qp(x)
+        q, p = qp.chunk(2, dim=-1)
+
+        with torch.enable_grad():
+            qp_in = torch.cat([q, p], dim=-1).detach().requires_grad_(True)
+            H_val = self.H(qp_in)
+            grad = torch.autograd.grad(H_val.sum(), qp_in, create_graph=self.training, retain_graph=True)[0]
+            dH_dq, dH_dp = grad.chunk(2, dim=-1)
+
+            p_half = p - 0.5 * self.dt * dH_dq
+
+            qp_mid = torch.cat([q, p_half], dim=-1).detach().requires_grad_(True)
+            H_mid = self.H(qp_mid)
+            grad_mid = torch.autograd.grad(H_mid.sum(), qp_mid, create_graph=self.training, retain_graph=True)[0]
+            dH_dq_mid, dH_dp_mid = grad_mid.chunk(2, dim=-1)
+
+            q_new = q + self.dt * dH_dp_mid
+
+            qp_new = torch.cat([q_new, p_half], dim=-1).detach().requires_grad_(True)
+            H_new = self.H(qp_new)
+            grad2 = torch.autograd.grad(H_new.sum(), qp_new, create_graph=self.training, retain_graph=True)[0]
+            dH_dq2, dH_dp2 = grad2.chunk(2, dim=-1)
+
+            p_new = p_half - 0.5 * self.dt * dH_dq2
+
+        h_phys = self.from_qp(torch.cat([q_new, p_new], dim=-1))
+        e_cons = (H_val.detach() - self.H(torch.cat([q_new, p_new], dim=-1))).pow(2).mean()
+        return h_phys, e_cons
+
+
+class ODEPhysHead(nn.Module):
+    def __init__(self, deterDim: int, actDim: int, hidden: int = 256):
+        super().__init__()
+        self.f = nn.Sequential(
+            GrowableLoRALinear(nn.Linear(deterDim + actDim, hidden)),
+            nn.SiLU(),
+            GrowableLoRALinear(nn.Linear(hidden, deterDim)))
+        
+        self.dt = 1.0
+
+    def forward(self, h: torch.Tensor, aT: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        a_t = aT
+        inp = torch.cat([h, a_t], dim=-1)
+        k1 = self.f(inp)
+        mid = h + 0.5*self.dt*k1
+        k2 = self.f(torch.cat([mid, a_t], dim=-1))
+        h_ode = h + self.dt * k2
+        smooth = (k2 - k1).pow(2).mean()
+        return h_ode, smooth
+
+class NeSyHead(nn.Module):
+    def __init__(self, inDim: int, K: int, hidden: int = 1024, experts: int = 4):
+        super().__init__()
+        self.gate = nn.Linear(inDim, experts)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(inDim, hidden), nn.GELU(),
+                nn.Linear(hidden, hidden), nn.GELU(),
+                nn.Linear(hidden, K)
+            ) for _ in range(experts)])
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = F.softmax(self.gate(x), dim=-1) 
+        ys = [e(x) for e in self.experts]
+        y = torch.stack(ys, dim=-1)  
+        return (y * a.unsqueeze(1)).sum(dim=-1)
+
+
+
+class GeometricLinear(nn.Module):
+    def __init__(self, inFeatures, outFeatures, wrapLinear=None, gain=0.1):
+        super().__init__()
+        lin = nn.Linear(inFeatures, outFeatures, bias=True)
+        nn.init.orthogonal_(lin.weight, gain=gain)
+        nn.init.zeros_(lin.bias)
+        self.linear = wrapLinear(lin) if wrapLinear is not None else lin
+
+    def forward(self, x): return self.linear(x)
+
+class FilmResidual(nn.Module):
+    def __init__(self, hidden, alpha=0.1, wrapLinear=None):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.ln = nn.LayerNorm(hidden)
+        self.ff = nn.Sequential(
+            GeometricLinear(hidden, hidden, wrapLinear),
+            nn.GELU(),
+            nn.LayerNorm(hidden),
+            GeometricLinear(hidden, hidden, wrapLinear),)
+        
+    def forward(self, h, gx, bx):
+        y = (1.0 + gx) * h + bx
+        y = self.ln(y)
+        y = self.ff(y)
+        return h + self.alpha * y
+
+class ConnNet(nn.Module):
+    def __init__(self,
+                 stateDim: int,
+                 actDim: int,
+                 *,
+                 hidden: int = 512,
+                 numBlocks: int = 3,
+                 rank: int = 8,
+                 useFull: bool = True,
+                 useLowrank: bool = True,
+                 transport: str = "auto",
+                 dt: float = 1.0,
+                 lambdaFro: float = 1e-4,
+                 lambdaL1: float = 1e-5,
+                 lambdaSmooth: float = 3e-5,
+                 normClip: float = 0.8,
+                 wrapLinear=None):
+        super().__init__()
+        self.S = int(stateDim)
+        self.A = int(actDim)
+        self.H = int(hidden)
+        self.r = int(rank)
+        self.use_full = bool(useFull)
+        self.use_lowrank = bool(useLowrank)
+        self.transport = str(transport).lower()
+        self.dt = float(dt)
+        self.lambda_fro = float(lambdaFro)
+        self.lambda_l1 = float(lambdaL1)
+        self.lambda_smooth = float(lambdaSmooth)
+        self.norm_clip = float(normClip)
+
+        self.enc_s = nn.Sequential(
+            nn.LayerNorm(self.S),
+            GeometricLinear(self.S, self.H, wrapLinear),
+            nn.GELU(),)
+        
+        self.enc_a = nn.Sequential(
+            nn.LayerNorm(self.A),
+            GeometricLinear(self.A, self.H, wrapLinear),
+            nn.GELU(),)
+
+        self.film_gamma_a = GeometricLinear(self.H, self.H, wrapLinear)
+        self.film_beta_a = GeometricLinear(self.H, self.H, wrapLinear)
+
+        self.blocks = nn.ModuleList([FilmResidual(self.H, alpha=0.1, wrapLinear=wrapLinear) for _ in range(numBlocks)])
+
+        if self.use_lowrank:
+            self.head_uv = GeometricLinear(self.H, 2 * self.S * self.r, wrapLinear)
+        if self.use_full:
+            self.head_full = GeometricLinear(self.H, self.S * self.S, wrapLinear)
+        nBranches = int(self.use_lowrank) + int(self.use_full)
+        self.mix = GeometricLinear(self.H, max(1, nBranches), wrapLinear)
+
+    def BuildLowrank(self, h):
+        uv = self.head_uv(h)
+        U, V = uv.split(self.S * self.r, dim=-1)
+        U = U.view(-1, self.S, self.r)
+        V = V.view(-1, self.S, self.r)
+        return U @ V.transpose(1, 2) - V @ U.transpose(1, 2)
+
+    def BuildFull(self, h):
+        M = self.head_full(h).view(-1, self.S, self.S)
+        return 0.5 * (M - M.transpose(1, 2))
+
+    def TransportApply(self, A: torch.Tensor, sBase: torch.Tensor) -> torch.Tensor:
+        B, S = A.size(0), A.size(1)
+        dt = self.dt
+
+        euler = sBase + dt * torch.einsum("bij,bj->bi", A, sBase)
+
+        I = torch.eye(S, device=A.device, dtype=A.dtype).unsqueeze(0).expand(B, S, S)
+        lhs = I - 0.5 * dt * A 
+        rhs_vec = torch.einsum("bij,bj->bi", I + 0.5 * dt * A, sBase) 
+        cayley = torch.linalg.solve(lhs, rhs_vec.unsqueeze(-1)).squeeze(-1)  
+
+        mode = self.transport
+        if mode == "euler":
+            return euler
+        if mode == "cayley":
+            return cayley
+
+        fro = A.pow(2).mean(dim=(1, 2)).sqrt() 
+        mask = (fro > 0.75).to(A.dtype).view(B, 1)  
+        return mask * cayley + (1.0 - mask) * euler
+
+    def ComputeGeomReg(self, A, prevA=None):
+        reg = self.lambda_fro * A.pow(2).mean()
+        if self.use_full and self.lambda_l1 > 0:
+            reg = reg + self.lambda_l1 * A.abs().mean()
+        if (prevA is not None) and (self.lambda_smooth > 0):
+            reg = reg + self.lambda_smooth * (A - prevA).pow(2).mean()
+        return reg
+
+    def forward(self, sBase: torch.Tensor, actPrev: torch.Tensor) -> torch.Tensor:
+        B = sBase.size(0)
+        hs = self.enc_s(sBase) 
+        ha = self.enc_a(actPrev) 
+
+        g = torch.tanh(self.film_gamma_a(ha))
+        b = self.film_beta_a(ha) 
+
+        h = hs
+        for blk in self.blocks:
+            h = blk(h, g, b) 
+
+        A_list = []
+        if self.use_lowrank:
+            A_list.append(self.BuildLowrank(h))
+        if self.use_full:
+            A_list.append(self.BuildFull(h))
+
+        if not A_list:
+            A = torch.zeros(B, self.S, self.S, device=sBase.device, dtype=sBase.dtype)
+        elif len(A_list) == 1:
+            A = A_list[0]
+        else:
+            w = F.softmax(self.mix(h), dim=-1) 
+            A = w[:, :1].view(B, 1, 1) * A_list[0] + w[:, 1:2].view(B, 1, 1) * A_list[1]
+
+        if self.norm_clip and self.norm_clip > 0:
+            fro = A.pow(2).mean(dim=(1, 2)).sqrt().clamp_min(1e-8)
+            scale = torch.minimum(torch.ones_like(fro), self.norm_clip / fro).view(B, 1, 1)
+            A = A * scale
+        return A
+
+
+
+class SoftNeSyStructure(nn.Module):
+    def __init__(self, k: int, gExcl: int = 8, gAlo: int = 8, tauInit: float = 1.0):
+        super().__init__()
+        self.K = int(k)
+        self.Ge = int(gExcl)
+        self.Ga = int(gAlo)
+        self.tau = nn.Parameter(torch.tensor(float(tauInit)))
+        self.M_excl = nn.Parameter(torch.randn(self.Ge, self.K) * 0.01)
+        self.M_alo  = nn.Parameter(torch.randn(self.Ga, self.K) * 0.01)
+        E = torch.zeros(self.K, self.K)
+        E.fill_(0.0)
+        self.E = nn.Parameter(E)
+        self.register_buffer("_eye", torch.eye(self.K))
+
+    def MixExclusive(self, P: torch.Tensor, temp: float) -> torch.Tensor:
+        B, K = P.shape
+        eps = 1e-6
+        Wg = F.softmax(self.M_excl, dim=-1) 
+        logP = torch.log(P.clamp(eps, 1 - eps)) / max(1e-6, temp)
+        g = logP.unsqueeze(1) + torch.log(Wg.unsqueeze(0).clamp(eps))
+        g_sm = F.softmax(g, dim=-1)
+        Wk = F.softmax(self.M_excl.t(), dim=-1)
+        P_new = torch.einsum("bgk,kg->bk", g_sm, Wk)
+        return P_new.clamp(eps, 1 - eps)
+
+    def EnforceAlo(self, P: torch.Tensor, tau: float) -> torch.Tensor:
+        B, K = P.shape
+        eps = 1e-6
+        Wa = F.softmax(self.M_alo, dim=-1)
+        group_vals = (P.unsqueeze(1) * Wa.unsqueeze(0)).max(dim=-1).values
+        scale = torch.where(group_vals < tau, tau / (group_vals + eps), torch.ones_like(group_vals))
+        P_scaled = P.clone()
+        Wk = F.softmax(self.M_alo.t(), dim=-1)
+        s = torch.einsum("bg,kg->bk", scale, Wk)
+        P_scaled = (P_scaled * s).clamp(eps, 1 - eps)
+        return P_scaled
+
+    def ApplyImplications(self, P: torch.Tensor, alpha: float) -> torch.Tensor:
+        B, K = P.shape
+        eps = 1e-6
+        W = torch.sigmoid(self.E) * (1.0 - self._eye)
+        contrib = P.unsqueeze(2) * W.unsqueeze(0)
+        implied = contrib.max(dim=1).values
+        Q = torch.maximum(P, alpha * implied).clamp(eps, 1 - eps)
+        return Q
+
+    def ProjectTrain(self, logits: torch.Tensor, temp: float = 1.0) -> torch.Tensor:
+        P0 = torch.sigmoid(logits / max(1e-6, temp))
+        P1 = self.MixExclusive(P0, temp)
+        return P1
 
     @torch.no_grad()
-    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True, mode: str = "auto"):
-        if addRank <= 0:
-            return
-        dev = self.target.weight_ih.device
-        dt = self.target.weight_ih.dtype
-        I, H = self.input_size, self.hidden_size
-        out_rows = 3 * H
+    def ProjectRuntime(self, P: torch.Tensor, aloTau: float = 0.60, implAlpha: float = 1.0, temp: float = 1.0):
+        Q = self.MixExclusive(P, temp)
+        Q = self.EnforceAlo(Q, aloTau)
+        Q = self.ApplyImplications(Q, implAlpha)
 
-        if freezeOld:
-            for p in list(self.A_ih)+list(self.B_ih)+list(self.s_ih)+list(self.A_hh)+list(self.B_hh)+list(self.s_hh):
-                p.requires_grad_(False)
+        Ge = F.softmax(self.M_excl, dim=-1)
+        gprob = F.softmax((torch.log(Q.clamp(1e-6, 1-1e-6))).unsqueeze(1) + torch.log(Ge.unsqueeze(0).clamp(1e-6)), dim=-1)
+        excl_pen = 0.5 * ((gprob.sum(-1) ** 2) - (gprob ** 2).sum(-1)).mean(dim=-1)
 
-        if mode == "ih":
-            r_ih, r_hh = addRank, 0
-        elif mode == "hh":
-            r_ih, r_hh = 0, addRank
-        elif mode == "both_even":
-            r_ih = addRank // 2
-            r_hh = addRank - r_ih
-        else:
-            r_ih, r_hh = self.DecideSplit(addRank)
+        Ga = F.softmax(self.M_alo, dim=-1)
+        alo_val = (Q.unsqueeze(1) * Ga.unsqueeze(0)).max(-1).values
+        alo_pen = F.relu(aloTau - alo_val).mean(dim=-1)
 
-        if r_ih > 0:
-            A = (init.get("A_ih", None) if init else None) or (torch.randn(r_ih, I, device=dev, dtype=dt) * 1e-4)
-            B = (init.get("B_ih", None) if init else None) or (torch.zeros(out_rows, r_ih, device=dev, dtype=dt))
-            s = (init.get("scale_ih", None) if init else None) or 1e-3
-            self.A_ih.append(nn.Parameter(A.contiguous().to(device=dev, dtype=dt)))
-            self.B_ih.append(nn.Parameter(B.contiguous().to(device=dev, dtype=dt)))
-            self.s_ih.append(nn.Parameter(torch.as_tensor(s, device=dev, dtype=dt)))
+        W = torch.sigmoid(self.E) * (1.0 - self._eye)
+        impl_pen = (W.unsqueeze(0) * F.relu(Q.unsqueeze(2) - Q.unsqueeze(1))).mean(dim=(1,2))
 
-        if r_hh > 0:
-            A = (init.get("A_hh", None) if init else None) or (torch.randn(r_hh, H, device=dev, dtype=dt) * 1e-4)
-            B = (init.get("B_hh", None) if init else None) or (torch.zeros(out_rows, r_hh, device=dev, dtype=dt))
-            s = (init.get("scale_hh", None) if init else None) or 1e-3
-            self.A_hh.append(nn.Parameter(A.contiguous().to(device=dev, dtype=dt)))
-            self.B_hh.append(nn.Parameter(B.contiguous().to(device=dev, dtype=dt)))
-            self.s_hh.append(nn.Parameter(torch.as_tensor(s, device=dev, dtype=dt)))
+        pen = excl_pen + alo_pen + impl_pen
+        pen = (pen / (pen.detach().quantile(0.9) + 1e-6)).clamp(0.0, 1.0)
+        return Q, pen
 
-    def DeltaIH(self) -> Optional[torch.Tensor]:
-        if len(self.A_ih) == 0:
-            return None
-        dW = self.target.weight_ih.new_zeros(3*self.hidden_size, self.input_size)
-        for A, B, s in zip(self.A_ih, self.B_ih, self.s_ih):
-            dW = dW + s * (B @ A)
-        return dW
+    def LogicLosses(self, P: torch.Tensor, lambdaExcl: float, lambdaAlo: float, lambdaImpl: float, aloTau: float = 0.60):
+        Ge = F.softmax(self.M_excl, dim=-1)
+        g = (torch.log(P.clamp(1e-6, 1-1e-6))).unsqueeze(1) + torch.log(Ge.unsqueeze(0).clamp(1e-6))
+        g_sm = F.softmax(g, dim=-1)
+        excl = 0.5 * ((g_sm.sum(-1)**2) - (g_sm**2).sum(-1))
+        excl = excl.mean()
 
-    def DeltaHH(self) -> Optional[torch.Tensor]:
-        if len(self.A_hh) == 0:
-            return None
-        dW = self.target.weight_hh.new_zeros(3*self.hidden_size, self.hidden_size)
-        for A, B, s in zip(self.A_hh, self.B_hh, self.s_hh):
-            dW = dW + s * (B @ A)
-        return dW
+        Ga = F.softmax(self.M_alo, dim=-1)
+        top1 = (P.unsqueeze(1) * Ga.unsqueeze(0)).max(-1).values
+        alo = (F.relu(aloTau - top1) ** 2).mean()
 
-    def forward(self, x: torch.Tensor, hPrev: torch.Tensor) -> torch.Tensor:
-        W_ih = self.target.weight_ih
-        W_hh = self.target.weight_hh
-        b_ih = self.target.bias_ih
-        b_hh = self.target.bias_hh
+        W = torch.sigmoid(self.E) * (1.0 - self._eye)
+        impl = (W.unsqueeze(0) * F.relu(P.unsqueeze(2) - P.unsqueeze(1))).mean()
 
-        d_ih = self.DeltaIH()
-        d_hh = self.DeltaHH()
-        if d_ih is not None: W_ih = W_ih + d_ih
-        if d_hh is not None: W_hh = W_hh + d_hh
+        loss = lambdaExcl * excl + lambdaAlo * alo + lambdaImpl * impl
 
-        gi = F.linear(x, W_ih, b_ih) 
-        gh = F.linear(hPrev, W_hh, b_hh)  
-        i_r, i_i, i_n = gi.chunk(3, dim=1)
-        h_r, h_i, h_n = gh.chunk(3, dim=1)
+        reg = 1e-4 * W.mean() + 1e-3 * (
+            (F.softmax(self.M_excl, dim=-1)*torch.log(F.softmax(self.M_excl, dim=-1)+1e-6)).sum()/self.Ge +
+            (F.softmax(self.M_alo , dim=-1)*torch.log(F.softmax(self.M_alo , dim=-1)+1e-6)).sum()/self.Ga)
+        
+        reg = reg + 1e-6 * (torch.trace(torch.matrix_exp(W * W)) - self.K)
 
-        resetgate = torch.sigmoid(i_r + h_r)
-        inputgate = torch.sigmoid(i_i + h_i)
-        newgate = torch.tanh(i_n + resetgate * h_n)
-        h_next = newgate + inputgate * (hPrev - newgate)
-        return h_next
-
+        loss = loss + reg
+        stats = {"excl": excl.detach(), "alo": alo.detach(), "impl": impl.detach()}
+        return loss, stats
 
 
 class RSSMWorldModel(nn.Module):
     def __init__(
         self,
-        visionDim: int = 512,
-        actionDim: int = 128,
-        deterDim: int = 256,
-        stochDim: int = 32,
-        stateDim: int = 256,
+        visionDim: int = 1024,
+        actionDim: int = 256,
+        deterDim: int = 512,
+        stochDim: int = 64,
+        stateDim: int = 512,
         useDecoder: bool = True,
         useMemory: bool = False,
         memoryCapacity: int = 4096,
@@ -255,6 +546,8 @@ class RSSMWorldModel(nn.Module):
         self.state_dim = stateDim
         self.use_decoder = useDecoder
 
+        self._A_prev = None
+
         self.obs_enc = nn.Sequential(
             nn.LayerNorm(visionDim),
             GrowableLoRALinear(nn.Linear(visionDim, stateDim, bias=True)),
@@ -268,8 +561,8 @@ class RSSMWorldModel(nn.Module):
             GrowableLoRALinear(nn.Linear(actionDim, stochDim, bias=True)),
             nn.LayerNorm(stochDim),
             nn.Tanh(),)
-
-        self.gru = GrowableLoRAGRUCell(nn.GRUCell(input_size=stochDim + stochDim, hidden_size=deterDim))
+        
+        self.s4 = S4DCell(inDim=stochDim + stochDim, deterDim=deterDim, ssmDim=512, dt=1.0)
 
         self.prior_net = nn.Sequential(GrowableLoRALinear(nn.Linear(deterDim, 2 * stochDim, bias=True)))
         
@@ -311,41 +604,13 @@ class RSSMWorldModel(nn.Module):
 
         self._ns_enabled = bool(nsEnabled)
         self._ns_bias_prior = bool(nsBiasPrior)
-        self._ns_K: int = 24
+ 
+        self._ns_K: int = 60
+        self.ns_struct = SoftNeSyStructure(k=self._ns_K, gExcl=8, gAlo=8, tauInit=1.0)
 
-        self.ns_exclusives = [
-            [0, 1, 2, 3],
-            [4, 5, 6],
-            [7, 8, 9],
-            [10, 11, 12],
-            [13, 14, 15, 16, 17],]
-        
-        self.ns_atleast_one = [
-            [0, 1, 2, 3],
-            [4, 5, 6],
-            [7, 8, 9],
-            [10, 11, 12],
-            [13, 14, 15, 16, 17],]
-        
-        self.ns_implications = [
-            (12, 1),
-            (11, 0),
-            (10, 0),
-            (1, 13),
-            (2, 14),
-            (3, 15),
-            (6, 16),
-            (6, 14),
-            (9, 15),
-            (7, 13),
-            (20, 17),
-            (21, 17),
-            (22, 13),]
+        self.ns_head_prior = NeSyHead(deterDim, self._ns_K, hidden=1024, experts=4)
+        self.ns_head_post = NeSyHead(deterDim + stochDim, self._ns_K, hidden=1024, experts=4)
 
-
-        hid = max(128, stochDim)
-        self.ns_head_post = nn.Sequential(nn.Linear(deterDim + stochDim, hid), nn.GELU(), nn.Linear(hid, self._ns_K))
-        self.ns_head_prior = nn.Sequential(nn.Linear(deterDim, hid), nn.GELU(), nn.Linear(hid, self._ns_K))
         self.ns_to_delta_e = nn.Linear(self._ns_K, stochDim)
         self.ns_to_delta_mu = nn.Linear(self._ns_K, stochDim)
         self.ns_gate_e = nn.Linear(deterDim + stochDim, stochDim)
@@ -373,6 +638,13 @@ class RSSMWorldModel(nn.Module):
             self.LoadMemory(self._mem_path, map_location=None, strict=False)
 
         self.mem_val_to_e = nn.Sequential(nn.Linear(deterDim, stochDim), nn.LayerNorm(stochDim))
+
+
+        self.conn = ConnNet(stateDim=stateDim,actDim=stochDim,wrapLinear=GrowableLoRALinear)
+
+        self.phys_hnn = HNNPhysHead(deterDim=self.deter_dim, projDim=128)
+        self.phys_ode = ODEPhysHead(deterDim=self.deter_dim, actDim=self.stoch_dim)
+        self.mix_gate = nn.Sequential(GrowableLoRALinear(nn.Linear(self.deter_dim + 2*self.stoch_dim, 4)))
 
     def SaveMemory(self, path: Optional[str] = None):
         if not self._use_memory:
@@ -466,6 +738,8 @@ class RSSMWorldModel(nn.Module):
         device = torch.device(device)
         self._h = torch.zeros(batchSize, self.deter_dim, device=device)
         self._z = torch.zeros(batchSize, self.stoch_dim, device=device)
+        self.s4.ResetState(batchSize, device)
+        self._A_prev = None
 
     def ExportState(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return self._h, self._z
@@ -475,67 +749,11 @@ class RSSMWorldModel(nn.Module):
         self._z = z.detach().clone()
 
     def NsProjectProbs(self, logits: torch.Tensor, temp: float = 1.0) -> torch.Tensor:
-        sig = logits / max(1e-6, temp)
-        probs = sig.sigmoid()
-        for grp in self.ns_exclusives:
-            if len(grp) <= 1:
-                continue
-            g = sig[:, grp]
-            g_sm = F.softmax(g, dim=-1)
-            probs = probs.clone()
-            probs[:, grp] = g_sm
-        return probs
+        return self.ns_struct.ProjectTrain(logits, temp=temp)
 
     @torch.no_grad()
-    def NsProjectRuntime(
-        self,
-        P: torch.Tensor,
-        *,
-        aloTau: float = 0.60,
-        implAlpha: float = 1.0,
-        temp: float = 1.0,) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        eps = 1e-6
-        Q = P.detach().clamp(eps, 1 - eps).clone()
-
-        for grp in self.ns_exclusives:
-            if len(grp) <= 1:
-                continue
-            g = torch.log(Q[:, grp]) / max(1e-6, temp)
-            g_sm = F.softmax(g, dim=-1)
-            Q[:, grp] = g_sm.clamp(eps, 1 - eps)
-
-        for grp in self.ns_atleast_one:
-            if len(grp) == 0:
-                continue
-            m = Q[:, grp].max(dim=-1, keepdim=True).values
-            scale = torch.where(m < aloTau, aloTau / (m + eps), torch.ones_like(m))
-            Q[:, grp] = (Q[:, grp] * scale).clamp(eps, 1 - eps)
-
-        for a, b in self.ns_implications:
-            Q[:, b] = torch.maximum(Q[:, b], implAlpha * Q[:, a]).clamp(eps, 1 - eps)
-
-        excl_v = Q.new_zeros(Q.size(0))
-        for grp in self.ns_exclusives:
-            if len(grp) <= 1:
-                continue
-            Psum = Q[:, grp].sum(dim=-1)
-            P2 = (Q[:, grp] * Q[:, grp]).sum(dim=-1)
-            excl_v = excl_v + 0.5 * (Psum * Psum - P2)
-
-        alo_v = Q.new_zeros(Q.size(0))
-        for grp in self.ns_atleast_one:
-            if len(grp) == 0:
-                continue
-            alo_v = alo_v + F.relu(aloTau - Q[:, grp].max(dim=-1).values)
-
-        impl_v = Q.new_zeros(Q.size(0))
-        for a, b in self.ns_implications:
-            impl_v = impl_v + F.relu(Q[:, a] - Q[:, b])
-
-        pen = excl_v + alo_v + impl_v
-        pen = (pen / (pen.detach().quantile(0.9) + 1e-6)).clamp(0.0, 1.0)
-        return Q, pen
+    def NsProjectRuntime(self, P: torch.Tensor, *, aloTau: float = 0.60, implAlpha: float = 1.0, temp: float = 1.0):
+        return self.ns_struct.ProjectRuntime(P, aloTau=aloTau, implAlpha=implAlpha, temp=temp)
 
     def NsConfidence(self, P: torch.Tensor) -> torch.Tensor:
         eps = 1e-6
@@ -545,42 +763,26 @@ class RSSMWorldModel(nn.Module):
         conf = (1.0 - H / Hmax).clamp(0.0, 1.0)
         return conf
 
-    def NsLogicLosses(self, probs: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        excl = probs.new_zeros([])
-        for grp in self.ns_exclusives:
-            if len(grp) <= 1:
-                continue
-            P = probs[:, grp]
-            s1 = P.sum(dim=-1)
-            s2 = (P * P).sum(dim=-1)
-            excl = excl + 0.5 * (s1 * s1 - s2).mean()
-
-        alo = probs.new_zeros([])
-        tau = 0.60
-        for grp in self.ns_atleast_one:
-            if len(grp) == 0:
-                continue
-            top1 = probs[:, grp].max(dim=-1).values
-            alo = alo + (F.relu(tau - top1) ** 2).mean()
-
-        impl = probs.new_zeros([])
-        for a, b in self.ns_implications:
-            impl = impl + F.relu(probs[:, a] - probs[:, b]).mean()
-
-        loss = self.ns_lambda_excl * excl + self.ns_lambda_alo * alo + self.ns_lambda_impl * impl
-        stats = {"excl": excl.detach(), "alo": alo.detach(), "impl": impl.detach()}
+    def NsLogicLosses(self, probs: torch.Tensor):
+        loss, stats = self.ns_struct.LogicLosses(
+            probs,
+            lambdaExcl=self.ns_lambda_excl,
+            lambdaAlo=self.ns_lambda_alo,
+            lambdaImpl=self.ns_lambda_impl,
+            aloTau=0.60,)
+        
         return loss, stats
 
     @torch.no_grad()
     def StepPriorOnly(
         self,
-        hPrev: torch.Tensor,
-        zPrev: torch.Tensor,
+        hPrev: torch.Tensor, # deterministic state
+        zPrev: torch.Tensor, # stochastic state
         actionEnc: torch.Tensor,
         sample: bool = False,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
         a_t = self.act_proj(actionEnc)
-        h_next = self.gru(torch.cat([zPrev, a_t], dim=-1), hPrev)
+        h_next = self.s4.Step(zPrev, a_t, updateState=False)
 
         mu_p, logstd_p = self.prior_net(h_next).chunk(2, dim=-1)
         logstd_p = ClampLogStd(logstd_p)
@@ -604,7 +806,18 @@ class RSSMWorldModel(nn.Module):
         else:
             z_next = mu_p
 
-        s_next = self.state_proj(torch.cat([h_next, z_next], dim=-1))
+        s_base = self.state_proj(torch.cat([h_next, z_next], dim=-1))
+        s_prev_base = self.state_proj(torch.cat([hPrev, zPrev], dim=-1))
+        A_t = self.conn(s_prev_base, a_t)
+        s_transport = self.conn.TransportApply(A_t, s_prev_base)
+        h_phys, _ = self.phys_hnn(h_next)
+        h_ode, _ = self.phys_ode(h_next, a_t)
+        s_phys = self.state_proj(torch.cat([h_phys, z_next], dim=-1))
+        s_ode = self.state_proj(torch.cat([h_ode, z_next], dim=-1))
+        logits = self.mix_gate(torch.cat([h_next, z_next, a_t], dim=-1))
+        w = F.softmax(logits, dim=-1)
+        s_next = (w[:,0:1]*s_base + w[:,1:2]*s_transport + w[:,2:3]*s_phys + w[:,3:4]*s_ode)
+
         r_pred = self.rew_head(s_next).squeeze(-1)
         d_prob = torch.sigmoid(self.done_head(s_next)).squeeze(-1)
         return h_next, z_next, s_next, r_pred, d_prob
@@ -618,8 +831,9 @@ class RSSMWorldModel(nn.Module):
         sample: bool = False,) -> Dict[str, torch.Tensor]:
 
         raw_e = self.obs_enc(visionIn)
+
         a_t = self.act_proj(actionEnc)
-        h_next = self.gru(torch.cat([zPrev, a_t], dim=-1), hPrev)
+        h_next = self.s4.Step(zPrev, a_t, updateState=True)
 
         mu_p, logstd_p = self.prior_net(h_next).chunk(2, dim=-1)
         logstd_p = ClampLogStd(logstd_p)
@@ -664,7 +878,18 @@ class RSSMWorldModel(nn.Module):
         logstd_q = ClampLogStd(logstd_q)
         z_next = mu_q + torch.exp(logstd_q) * torch.randn_like(mu_q) if sample else mu_q
 
-        s_next = self.state_proj(torch.cat([h_next, z_next], dim=-1))
+        s_base = self.state_proj(torch.cat([h_next, z_next], dim=-1))
+        s_prev_base = self.state_proj(torch.cat([hPrev, zPrev], dim=-1))
+        A_t = self.conn(s_prev_base, a_t)
+        s_transport = self.conn.TransportApply(A_t, s_prev_base)
+        h_phys, _ = self.phys_hnn(h_next)
+        h_ode, _ = self.phys_ode(h_next, a_t)
+        s_phys = self.state_proj(torch.cat([h_phys, z_next], dim=-1))
+        s_ode = self.state_proj(torch.cat([h_ode, z_next], dim=-1))
+        logits = self.mix_gate(torch.cat([h_next, z_next, a_t], dim=-1))
+        w = F.softmax(logits, dim=-1)
+        s_next = (w[:,0:1]*s_base + w[:,1:2]*s_transport + w[:,2:3]*s_phys + w[:,3:4]*s_ode)
+
         r_pred = self.rew_head(s_next).squeeze(-1)
         d_prob = torch.sigmoid(self.done_head(s_next)).squeeze(-1)
 
@@ -696,20 +921,20 @@ class RSSMWorldModel(nn.Module):
 
     def ForwardTrainSeq(
         self,
-        visionSeq: torch.Tensor,  # [B, visionDim]
-        keysVec: torch.Tensor,  # [B,106]
-        mouseSeq: torch.Tensor,  # [B,2]
+        visionSeq: torch.Tensor,
+        keysVec: torch.Tensor,
+        mouseSeq: torch.Tensor,  
         h0: Optional[torch.Tensor] = None,
         z0: Optional[torch.Tensor] = None,
-        rewardSeq: Optional[torch.Tensor] = None,  # [B]
-        doneSeq: Optional[torch.Tensor] = None,  # [B]
+        rewardSeq: Optional[torch.Tensor] = None, 
+        doneSeq: Optional[torch.Tensor] = None, 
         alphaKl: float = 0.8,
         freeNats: float = 1.0,
         reconCoef: float = 1.0,
         rewardCoef: float = 1.0,
         doneCoef: float = 1.0,
         nsCoef: float = 1.0,
-        nsDistillCoef: float = 1e-2, 
+        nsDistillCoef: float = 1e-2,
         nsPriorLogicCoef: float = 1e-3,) -> Dict[str, torch.Tensor]:
 
         B = visionSeq.size(0)
@@ -721,8 +946,7 @@ class RSSMWorldModel(nn.Module):
 
         a_enc = self.action_encoder(keysVec, mouseSeq)
         a_enc = self.act_proj(a_enc)
-
-        h_next = self.gru(torch.cat([z0, a_enc], dim=-1), h0)
+        h_next = self.s4.Step(z0, a_enc, updateState=False)
 
         mu_p, logstd_p = self.prior_net(h_next).chunk(2, dim=-1)
         logstd_p = ClampLogStd(logstd_p)
@@ -748,15 +972,15 @@ class RSSMWorldModel(nn.Module):
 
         ns_prior_logic = visionSeq.new_tensor(0.0)
         if self._ns_enabled:
-            logits_pr = self.ns_head_prior(h_next)  # [B, K]
+            logits_pr = self.ns_head_prior(h_next) 
             P_pr_raw = torch.sigmoid(logits_pr)
-            P_pr_train = self.NsProjectProbs(logits_pr) 
+            P_pr_train = self.NsProjectProbs(logits_pr)
 
             de_mu = self.ns_to_delta_mu(P_pr_train)
             base_gate_mu = torch.sigmoid(self.ns_gate_mu(torch.cat([h_next, mu_p], dim=-1)))
             with torch.no_grad():
                 _, pen_pr = self.NsProjectRuntime(P_pr_raw, aloTau=0.60, implAlpha=1.0, temp=1.0)
-            conf_pr = self.NsConfidence(P_pr_raw)  # grad flows
+            conf_pr = self.NsConfidence(P_pr_raw)
             gate_scale_mu = (1.0 - 0.25 * pen_pr.view(-1, 1)) * (0.6 + 0.4 * conf_pr)
             gate_mu = (base_gate_mu * gate_scale_mu).clamp(0.0, 1.0)
             mu_p = mu_p + gate_mu * de_mu
@@ -779,7 +1003,7 @@ class RSSMWorldModel(nn.Module):
         ns_distill = visionSeq.new_tensor(0.0)
         if self._ns_enabled and (logits_pr is not None) and (ns_logits is not None) and (nsDistillCoef > 0):
             with torch.no_grad():
-                P_teacher = torch.sigmoid(ns_logits) 
+                P_teacher = torch.sigmoid(ns_logits)
             ns_distill = F.binary_cross_entropy_with_logits(logits_pr, P_teacher, reduction="mean")
             if nsPriorLogicCoef > 0 and (P_pr_train is not None):
                 ns_prior_logic, _ = self.NsLogicLosses(P_pr_train)
@@ -787,7 +1011,25 @@ class RSSMWorldModel(nn.Module):
         mu_q, logstd_q = self.post_net(torch.cat([h_next, e_t], dim=-1)).chunk(2, dim=-1)
         logstd_q = ClampLogStd(logstd_q)
         z1 = mu_q + torch.exp(logstd_q) * torch.randn_like(mu_q)
-        s1 = self.state_proj(torch.cat([h_next, z1], dim=-1))
+
+        s_base = self.state_proj(torch.cat([h_next, z1], dim=-1))
+        s_prev_base = self.state_proj(torch.cat([h0, z0], dim=-1))
+
+        A_t = self.conn(s_prev_base, a_enc)
+        s_transport = self.conn.TransportApply(A_t, s_prev_base)
+
+        prevA = (self._A_prev if (self._A_prev is not None  and self._A_prev.shape == A_t.shape) else None)
+        reg_A = self.conn.ComputeGeomReg(A_t, prevA)
+        self._A_prev = A_t.detach()
+        
+        h_phys, e_cons = self.phys_hnn(h_next)
+        h_ode, e_smooth = self.phys_ode(h_next, a_enc)
+        s_phys = self.state_proj(torch.cat([h_phys, z1], dim=-1))
+        s_ode = self.state_proj(torch.cat([h_ode,  z1], dim=-1))
+        logits = self.mix_gate(torch.cat([h_next, z1, a_enc], dim=-1))
+        w = F.softmax(logits, dim=-1)
+        s1 = (w[:,0:1]*s_base + w[:,1:2]*s_transport + w[:,2:3]*s_phys + w[:,3:4]*s_ode)
+
         r1 = self.rew_head(s1).squeeze(-1)
         d_logit = self.done_head(s1).squeeze(-1)
         d_prob = torch.sigmoid(d_logit)
@@ -801,12 +1043,12 @@ class RSSMWorldModel(nn.Module):
             F.mse_loss(r1, torch.zeros_like(r1), reduction="mean")
             if rewardSeq is None
             else F.mse_loss(r1, rewardSeq, reduction="mean"))
-        
+
         loss_done = F.binary_cross_entropy_with_logits(
             d_logit,
             torch.zeros_like(d_logit) if doneSeq is None else doneSeq.float(),
             reduction="mean",)
-        
+
         loss_kl = BalancedKL(mu_q, logstd_q, mu_p, logstd_p, alpha=alphaKl, freeNats=freeNats).mean()
 
         loss = (
@@ -816,7 +1058,10 @@ class RSSMWorldModel(nn.Module):
             + loss_kl
             + nsCoef * ns_loss
             + nsDistillCoef * ns_distill
-            + nsPriorLogicCoef * ns_prior_logic)
+            + nsPriorLogicCoef * ns_prior_logic
+            + 1e-5 * e_smooth
+            + 1e-4 * e_cons
+            + reg_A)
 
         if self._use_memory:
             with torch.no_grad():
@@ -876,92 +1121,6 @@ class RSSMWorldModel(nn.Module):
         return float(loss.detach().item())
 
 
-class WMAdapterForPlanner(nn.Module):
-    def __init__(
-        self,
-        wm: RSSMWorldModel,
-        maxCode: int,
-        baseCodes: List[int],
-        skillCodes: List[int],
-        extraCodes: List[int],
-        noSkillId: Optional[int],
-        deterministicZ: bool = True,):
-        super().__init__()
-        self.wm = wm
-        self.max_code = maxCode
-        self.register_buffer("base_codes_buf", torch.tensor(baseCodes, dtype=torch.long))
-        self.register_buffer("skill_codes_buf", torch.tensor(skillCodes, dtype=torch.long))
-        self.register_buffer("extra_codes_buf", torch.tensor(extraCodes, dtype=torch.long))
-        self.no_skill_id = noSkillId
-        self.deterministic_z = deterministicZ
-
-    @staticmethod
-    def MakeKeys(
-        baseAct: torch.Tensor,
-        skillIdx: torch.Tensor,
-        extraAct: torch.Tensor,
-        baseCodes: torch.Tensor,
-        skillCodes: torch.Tensor,
-        extraCodes: torch.Tensor,
-        noSkillId: Optional[int],
-        numDiscrete: int,) -> torch.Tensor:
-        B, device = baseAct.size(0), baseAct.device
-        base_M = F.one_hot(baseCodes.to(device), num_classes=numDiscrete).float()
-        extra_M = F.one_hot(extraCodes.to(device), num_classes=numDiscrete).float()
-        base_part = baseAct @ base_M
-        extra_part = extraAct @ extra_M
-        if noSkillId is None:
-            chosen = skillIdx
-            valid = torch.ones_like(chosen, dtype=torch.bool)
-        else:
-            valid = skillIdx != noSkillId
-            chosen = skillIdx.clamp_max(skillCodes.numel() - 1)
-        sel_codes = skillCodes.to(device)[chosen.clamp_min(0)]
-        skill_onehot = F.one_hot(sel_codes, num_classes=numDiscrete).float() * valid.view(-1, 1).float()
-        key_vec = base_part + extra_part + skill_onehot
-        return key_vec
-
-    @torch.no_grad()
-    def Step(
-        self,
-        aMouse: torch.Tensor,  # [B,2]
-        aSkill: torch.Tensor,  # [B]
-        aBase: Optional[torch.Tensor] = None,  # [B, n_base]
-        aExtra: Optional[torch.Tensor] = None,  # [B, n_extra]
-        h0: Optional[torch.Tensor] = None,  # [B, deterDim]
-        z0: Optional[torch.Tensor] = None,  # [B, stochDim]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B = aMouse.size(0)
-        device = aMouse.device
-        if aBase is None:
-            aBase = torch.zeros(B, self.base_codes_buf.numel(), device=device)
-        if aExtra is None:
-            aExtra = torch.zeros(B, self.extra_codes_buf.numel(), device=device)
-
-        numDiscrete = int(self.wm.action_encoder.disc_proj.in_features)
-        keysSeq = self.MakeKeys(
-            aBase,
-            aSkill,
-            aExtra,
-            self.base_codes_buf.to(device),
-            self.skill_codes_buf.to(device),
-            self.extra_codes_buf.to(device),
-            self.no_skill_id,
-            numDiscrete,)
-        
-        a_enc = self.wm.action_encoder(keysSeq, aMouse)
-
-        if h0 is None or z0 is None:
-            h_prev, z_prev = self.wm.ExportState()
-            if h_prev is None or h_prev.size(0) != B or h_prev.device != device:
-                h_prev = torch.zeros(B, self.wm.deter_dim, device=device)
-                z_prev = torch.zeros(B, self.wm.stoch_dim, device=device)
-        else:
-            h_prev, z_prev = h0, z0
-
-        h1, z1, s1, r, d = self.wm.StepPriorOnly(h_prev, z_prev, a_enc, sample=not self.deterministic_z)
-        return s1, r, d
-
 
 class WorldModelOnlineWrapper(BaseOnlineWrapper):
     def __init__(
@@ -974,32 +1133,52 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         maxRankObs1: int = 64,
         maxRankObs2: int = 64,
         maxRankAct: int = 64,
-        maxRankPrior:int = 64,
+        maxRankPrior: int = 64,
         maxRankPost: int = 64,
-        maxRankState:int = 64,
+        maxRankState: int = 64,
         maxRankRew1: int = 32,
         maxRankRew2: int = 8,
-        maxRankDone1:int = 32,
-        maxRankDone2:int = 8,
+        maxRankDone1: int = 32,
+        maxRankDone2: int = 8,
         maxRankDec1: int = 64,
         maxRankDec2: int = 64,
         maxRankGruIH: int = 64,
         maxRankGruHH: int = 64,):
+
         self._maxRank = dict(
-            obs1 = int(maxRankObs1),
-            obs2 = int(maxRankObs2),
-            act = int(maxRankAct),
-            prior = int(maxRankPrior),
-            post = int(maxRankPost),
-            state = int(maxRankState),
-            rew1 = int(maxRankRew1),
-            rew2 = int(maxRankRew2),
-            done1 = int(maxRankDone1),
-            done2 = int(maxRankDone2),
-            dec1 = int(maxRankDec1),
-            dec2 = int(maxRankDec2),
-            gru_ih = int(maxRankGruIH),
-            gru_hh = int(maxRankGruHH),)
+            obs1=int(maxRankObs1),
+            obs2=int(maxRankObs2),
+            act=int(maxRankAct),
+            prior=int(maxRankPrior),
+            post=int(maxRankPost),
+            state=int(maxRankState),
+            rew1=int(maxRankRew1),
+            rew2=int(maxRankRew2),
+            done1=int(maxRankDone1),
+            done2=int(maxRankDone2),
+            dec1=int(maxRankDec1),
+            dec2=int(maxRankDec2),
+            s4_B=int(maxRankGruIH),
+            s4_C=int(maxRankGruHH),
+            s4_D0=int(maxRankAct),
+            s4_gate=int(maxRankAct),
+            s4_out_gate=int(maxRankAct),
+            hnn_to=32,
+            hnn_H1=32,
+            hnn_H2=8,
+            hnn_from=32,
+            ode_f1=32,
+            ode_f2=32,
+            mix=8,
+            conn_enc_s=64,
+            conn_enc_a=64,
+            conn_gamma=64,
+            conn_beta=64,
+            conn_blk_ff1=64,
+            conn_blk_ff2=64,
+            conn_head_uv=64,
+            conn_head_full=64,
+            conn_mix=8,)
         super().__init__(base, initRankEach=initRankEach, autoRank=autoRank, evThreshold=evThreshold, gradEma=gradEma)
 
     def BuildSiteSpecs(self) -> Dict[str, "SiteSpec"]:
@@ -1014,7 +1193,7 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
             return A, B, s
 
         def compose_linear(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return s * (b @ a)  # [out,in]
+            return s * (b @ a)
 
         specs: Dict[str, SiteSpec] = {}
         add = lambda name, inD, outD, maxRank: specs.setdefault(
@@ -1026,24 +1205,78 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
                 outDim=outD,
                 maxRank=int(maxRank),
                 allocFn=lambda r, dev, dt, _in=inD, _out=outD: alloc_linear(r, dev, dt, _in, _out),
-                composeFn=compose_linear,))
+                composeFn=compose_linear,),)
 
-        add("obs1", V, S, self._maxRank["obs1"]) # obs_enc[1]: vision -> state
-        add("obs2", S, Z, self._maxRank["obs2"]) # obs_enc[4]: state  -> stoch
-        add("act", wm.action_dim, Z, self._maxRank["act"]) # act_proj[0]: action -> stoch
-        add("prior", D, 2*Z, self._maxRank["prior"]) # prior_net[0]: deter -> (mu,std)
-        add("post", D+Z, 2*Z, self._maxRank["post"]) # post_net[0] : [deter, e] -> (mu,std)
-        add("state", D+Z, S, self._maxRank["state"]) # state_proj[1]: [deter, z] -> state
-        add("rew1", S, 256, self._maxRank["rew1"]) # rew_head[0]
-        add("rew2", 256, 1, self._maxRank["rew2"]) # rew_head[2]
-        add("done1", S, 256, self._maxRank["done1"]) # done_head[0]
-        add("done2", 256, 1, self._maxRank["done2"]) # done_head[2]
-        add("gru_ih", 2*Z, 3*D, self._maxRank["gru_ih"])
-        add("gru_hh", D, 3*D, self._maxRank["gru_hh"])
+        add("obs1", V, S, self._maxRank["obs1"])
+        add("obs2", S, Z, self._maxRank["obs2"])
+        add("act", wm.action_dim, Z, self._maxRank["act"])
+        add("prior", D, 2 * Z, self._maxRank["prior"])
+        add("post", D + Z, 2 * Z, self._maxRank["post"])
+        add("state", D + Z, S, self._maxRank["state"])
+        add("rew1", S, 256, self._maxRank["rew1"])
+        add("rew2", 256, 1, self._maxRank["rew2"])
+        add("done1", S, 256, self._maxRank["done1"])
+        add("done2", 256, 1, self._maxRank["done2"])
+
+        add("s4_B", wm.s4.B.target.in_features, wm.s4.B.target.out_features, self._maxRank["s4_B"])
+        add("s4_C", wm.s4.C.target.in_features, wm.s4.C.target.out_features, self._maxRank["s4_C"])
+        add("s4_D0", wm.s4.D0.target.in_features, wm.s4.D0.target.out_features, self._maxRank["s4_D0"])
+        add("s4_gate", wm.s4.gate.target.in_features, wm.s4.gate.target.out_features, self._maxRank["s4_gate"])
+        add("s4_out_gate",wm.s4.out_gate.target.in_features,wm.s4.out_gate.target.out_features,self._maxRank["s4_out_gate"])
+
+        add("hnn_to", wm.phys_hnn.to_qp.target.in_features, wm.phys_hnn.to_qp.target.out_features, self._maxRank["hnn_to"])
+        add("hnn_H1", wm.phys_hnn.H[0].target.in_features, wm.phys_hnn.H[0].target.out_features, self._maxRank["hnn_H1"])
+        add("hnn_H2", wm.phys_hnn.H[2].target.in_features, wm.phys_hnn.H[2].target.out_features, self._maxRank["hnn_H2"])
+        add("hnn_from", wm.phys_hnn.from_qp.target.in_features, wm.phys_hnn.from_qp.target.out_features, self._maxRank["hnn_from"])
+
+        add("ode_f1", wm.phys_ode.f[0].target.in_features, wm.phys_ode.f[0].target.out_features, self._maxRank["ode_f1"])
+        add("ode_f2", wm.phys_ode.f[2].target.in_features, wm.phys_ode.f[2].target.out_features, self._maxRank["ode_f2"])
+
+        add("mix", wm.mix_gate[0].target.in_features, wm.mix_gate[0].target.out_features, self._maxRank["mix"])
+
+        add("conn_enc_s",
+            wm.conn.enc_s[1].linear.target.in_features,
+            wm.conn.enc_s[1].linear.target.out_features,
+            self._maxRank["conn_enc_s"])
+        add("conn_enc_a",
+            wm.conn.enc_a[1].linear.target.in_features,
+            wm.conn.enc_a[1].linear.target.out_features,
+            self._maxRank["conn_enc_a"])
+        add("conn_gamma",
+            wm.conn.film_gamma_a.linear.target.in_features,
+            wm.conn.film_gamma_a.linear.target.out_features,
+            self._maxRank["conn_gamma"])
+        add("conn_beta",
+            wm.conn.film_beta_a.linear.target.in_features,
+            wm.conn.film_beta_a.linear.target.out_features,
+            self._maxRank["conn_beta"])
+        for i, blk in enumerate(wm.conn.blocks):
+            add(f"conn_blk{i}_ff1",
+                blk.ff[0].linear.target.in_features,
+                blk.ff[0].linear.target.out_features,
+                self._maxRank["conn_blk_ff1"])
+            add(f"conn_blk{i}_ff2",
+                blk.ff[3].linear.target.in_features,
+                blk.ff[3].linear.target.out_features,
+                self._maxRank["conn_blk_ff2"])
+        if wm.conn.use_lowrank:
+            add("conn_head_uv",
+                wm.conn.head_uv.linear.target.in_features,
+                wm.conn.head_uv.linear.target.out_features,
+                self._maxRank["conn_head_uv"])
+        if wm.conn.use_full:
+            add("conn_head_full",
+                wm.conn.head_full.linear.target.in_features,
+                wm.conn.head_full.linear.target.out_features,
+                self._maxRank["conn_head_full"])
+        add("conn_mix",
+            wm.conn.mix.linear.target.in_features,
+            wm.conn.mix.linear.target.out_features,
+            self._maxRank["conn_mix"])
 
         if wm.use_decoder:
-            add("dec1", S, S, self._maxRank["dec1"])  # obs_dec[0]
-            add("dec2", S, V, self._maxRank["dec2"]) 
+            add("dec1", S, S, self._maxRank["dec1"])
+            add("dec2", S, V, self._maxRank["dec2"])
         return specs
 
     def ForwardWithDeltas(
@@ -1054,29 +1287,45 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         uncertainty: Optional[torch.Tensor],
         deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],) -> Dict[str, torch.Tensor]:
         wm = self.base
-
         B = x["vision"].size(0)
         device = x["vision"].device
 
-        mode = str(x.get("mode", "posterior")).lower() 
+        mode = str(x.get("mode", "posterior")).lower()
         sample = bool(x.get("sample", False))
 
         hPrev = x.get("hPrev", None)
         zPrev = x.get("zPrev", None)
         if (hPrev is None) or (zPrev is None):
             h0, z0 = wm.ExportState()
-            if hPrev is None: hPrev = h0
-            if zPrev is None: zPrev = z0
-            if hPrev.size(0) != B: hPrev = torch.zeros(B, wm.deter_dim, device=device)
-            if zPrev.size(0) != B: zPrev = torch.zeros(B, wm.stoch_dim, device=device)
+            if hPrev is None:
+                hPrev = h0
+            if zPrev is None:
+                zPrev = z0
+            if hPrev.size(0) != B:
+                hPrev = torch.zeros(B, wm.deter_dim, device=device)
+            if zPrev.size(0) != B:
+                zPrev = torch.zeros(B, wm.stoch_dim, device=device)
 
         deltas = deltasPerLayer[0] if len(deltasPerLayer) > 0 else {}
+
+        a_enc = x.get("a_enc", None)
+        if a_enc is None:
+            a_enc = wm.action_encoder(x["keys"], x["mouse"])
+
+        if (len(deltas) == 0) or all((v is None) for v in deltas.values()):
+            if mode == "posterior":
+                return wm.StepPosterior(hPrev, zPrev, x["vision"], a_enc, sample=sample)
+            else:
+                h_next, z_next, s_next, r_pred, d_prob = wm.StepPriorOnly(hPrev, zPrev, a_enc, sample=sample)
+                return {"h_next": h_next, "z_next": z_next, "s_next": s_next,"r_pred": r_pred, "d_prob": d_prob,"mu_p": None, "logstd_p": None, "mu_q": None, "logstd_q": None,}
 
         def eff_linear(lo: "GrowableLoRALinear", deltaExtra: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
             W = lo.target.weight
             base_delta = lo.DeltaWeight()
-            if base_delta is not None: W = W + base_delta
-            if deltaExtra is not None: W = W + deltaExtra
+            if base_delta is not None:
+                W = W + base_delta
+            if deltaExtra is not None:
+                W = W + deltaExtra
             return W, lo.target.bias
 
         v = x["vision"]
@@ -1094,24 +1343,36 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         a_t = wm.act_proj[1](a_t)
         a_t = wm.act_proj[2](a_t)
 
-        x_in = torch.cat([zPrev, a_t], dim=-1)
-        W_ih = wm.gru.target.weight_ih
-        W_hh = wm.gru.target.weight_hh
-        if (d := wm.gru.DeltaIH()) is not None: W_ih = W_ih + d
-        if (d := wm.gru.DeltaHH()) is not None: W_hh = W_hh + d
-        if "gru_ih" in deltas and deltas["gru_ih"] is not None: W_ih = W_ih + deltas["gru_ih"]
-        if "gru_hh" in deltas and deltas["gru_hh"] is not None: W_hh = W_hh + deltas["gru_hh"]
-        b_ih = wm.gru.target.bias_ih
-        b_hh = wm.gru.target.bias_hh
+        has_s4_delta = any(deltas.get(k, None) is not None for k in ["s4_B", "s4_C", "s4_D0", "s4_gate", "s4_out_gate"])
 
-        gi = F.linear(x_in, W_ih, b_ih)
-        gh = F.linear(hPrev, W_hh, b_hh)
-        i_r, i_i, i_n = gi.chunk(3, dim=1)
-        h_r, h_i, h_n = gh.chunk(3, dim=1)
-        resetgate = torch.sigmoid(i_r + h_r)
-        inputgate = torch.sigmoid(i_i + h_i)
-        newgate = torch.tanh(i_n + resetgate * h_n)
-        h_next = newgate + inputgate * (hPrev - newgate)
+        if not has_s4_delta:
+            h_next = wm.s4.Step(zPrev, a_t, updateState=(mode == "posterior"))
+            x_next = None 
+        else:
+            W_gate, b_gate = eff_linear(wm.s4.gate, deltas.get("s4_gate", None))
+            W_B, b_B = eff_linear(wm.s4.B, deltas.get("s4_B", None))
+            W_C, b_C = eff_linear(wm.s4.C, deltas.get("s4_C", None))
+            W_D0, b_D0 = eff_linear(wm.s4.D0, deltas.get("s4_D0", None))
+            u = torch.cat([zPrev, a_t], dim=-1)
+            g = torch.sigmoid(F.linear(u, W_gate, b_gate))
+            Bu = F.linear(u, W_B, b_B) * g
+
+            x_buf = wm.s4.x
+            Bcur = u.size(0)
+            if (x_buf.dim() != 2 or x_buf.size(0) != Bcur or x_buf.size(1) != wm.s4.N
+                or x_buf.device != u.device or x_buf.dtype != u.dtype):
+                x_prev = torch.zeros(Bcur, wm.s4.N, device=u.device, dtype=u.dtype)
+            else:
+                x_prev = x_buf
+
+            x_next = wm.s4.CayleyStep(wm.s4.theta, x_prev, Bu, wm.s4.dt)
+
+            W_outg, b_outg = eff_linear(wm.s4.out_gate, deltas.get("s4_out_gate", None))
+            y_lin = F.linear(x_next, W_C, b_C) + F.linear(u, W_D0, b_D0)
+            y_glu = y_lin * torch.sigmoid(F.linear(x_next, W_outg, b_outg))
+            y = wm.s4.ln_y(y_glu)
+            y = y + wm.s4.ffn(wm.s4.ln_ffn(y))
+            h_next = y
 
         W_prior, b_prior = eff_linear(wm.prior_net[0], deltas.get("prior", None))
         prior_out = F.linear(h_next, W_prior, b_prior)
@@ -1141,19 +1402,16 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
                 mu_p = mu_p + gate_mu * dmu_meta
 
             if wm._ns_enabled:
-                ns_logits = wm.ns_head_post(torch.cat([h_next, e_in], dim=-1)) 
+                ns_logits = wm.ns_head_post(torch.cat([h_next, e_in], dim=-1))
                 P_raw = torch.sigmoid(ns_logits)
-                P_train = wm.NsProjectProbs(ns_logits) 
+                P_train = wm.NsProjectProbs(ns_logits)
                 Q, pen = wm.NsProjectRuntime(P_raw, aloTau=0.60, implAlpha=1.0, temp=1.0)
                 conf = wm.NsConfidence(P_raw)
-
                 base_gate = torch.sigmoid(wm.ns_gate_e(torch.cat([h_next, e_in], dim=-1)))
                 gate_scale = (1.0 - 0.25 * pen.view(-1, 1)) * (0.6 + 0.4 * conf)
                 gate = (base_gate * gate_scale).clamp(0.0, 1.0)
-
                 de = wm.ns_to_delta_e(Q)
                 e_t = e_in + gate * de
-
                 ns_probs = P_train
             else:
                 e_t = e_in
@@ -1163,21 +1421,17 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
             mu_q, logstd_q = post_out.chunk(2, dim=-1)
             logstd_q = ClampLogStd(logstd_q)
             z_next = mu_q + torch.exp(logstd_q) * torch.randn_like(mu_q) if sample else mu_q
-
         else:
             if wm._ns_enabled and wm._ns_bias_prior:
                 ns_logits_pr = wm.ns_head_prior(h_next)
                 P_raw = torch.sigmoid(ns_logits_pr)
                 Q, pen = wm.NsProjectRuntime(P_raw, aloTau=0.60, implAlpha=1.0, temp=1.0)
                 conf = wm.NsConfidence(P_raw)
-
                 base_gate = torch.sigmoid(wm.ns_gate_mu(torch.cat([h_next, mu_p], dim=-1)))
                 gate_scale = (1.0 - 0.40 * pen.view(-1, 1)) * (0.6 + 0.4 * conf)
                 gate = (base_gate * gate_scale).clamp(0.0, 1.0)
-
                 dmu = wm.ns_to_delta_mu(Q)
                 mu_p = mu_p + gate * dmu
-
             z_next = mu_p + torch.exp(logstd_p) * torch.randn_like(mu_p) if sample else mu_p
             mu_q = None
             logstd_q = None
@@ -1186,7 +1440,124 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         s_pre = wm.state_proj[0](hz)
         W_state, b_state = eff_linear(wm.state_proj[1], deltas.get("state", None))
         s_mid = F.linear(s_pre, W_state, b_state)
-        s_next = wm.state_proj[2](s_mid)
+        s_base = wm.state_proj[2](s_mid)
+
+        hz_prev = torch.cat([hPrev, zPrev], dim=-1)
+        s_prev_pre = wm.state_proj[0](hz_prev)
+        W_state, b_state = eff_linear(wm.state_proj[1], deltas.get("state", None))
+        s_prev_mid = F.linear(s_prev_pre, W_state, b_state)
+        s_prev_base = wm.state_proj[2](s_prev_mid)
+
+        hs = wm.conn.enc_s[0](s_prev_base)
+        W_ces, b_ces = eff_linear(wm.conn.enc_s[1].linear, deltas.get("conn_enc_s", None))
+        hs = F.linear(hs, W_ces, b_ces)
+        hs = wm.conn.enc_s[2](hs)
+
+        ha = wm.conn.enc_a[0](a_t)
+        W_cea, b_cea = eff_linear(wm.conn.enc_a[1].linear, deltas.get("conn_enc_a", None))
+        ha = F.linear(ha, W_cea, b_cea)
+        ha = wm.conn.enc_a[2](ha)
+
+        W_gam, b_gam = eff_linear(wm.conn.film_gamma_a.linear, deltas.get("conn_gamma", None))
+        W_bet, b_bet = eff_linear(wm.conn.film_beta_a.linear, deltas.get("conn_beta", None))
+        g = torch.tanh(F.linear(ha, W_gam, b_gam))
+        b = F.linear(ha, W_bet, b_bet)
+
+        h_conn = hs
+        for i, blk in enumerate(wm.conn.blocks):
+            y = (1.0 + g) * h_conn + b
+            y = blk.ln(y)
+            W_ff1, b_ff1 = eff_linear(blk.ff[0].linear, deltas.get(f"conn_blk{i}_ff1", None))
+            t = F.linear(y, W_ff1, b_ff1)
+            t = blk.ff[1](t)
+            t = blk.ff[2](t)
+            W_ff2, b_ff2 = eff_linear(blk.ff[3].linear, deltas.get(f"conn_blk{i}_ff2", None))
+            t = F.linear(t, W_ff2, b_ff2)
+            h_conn = h_conn + blk.alpha * t
+
+        A_list = []
+        if wm.conn.use_lowrank:
+            W_uv, b_uv = eff_linear(wm.conn.head_uv.linear, deltas.get("conn_head_uv", None))
+            uv = F.linear(h_conn, W_uv, b_uv)
+            U, V = uv.split(wm.conn.S * wm.conn.r, dim=-1)
+            U = U.view(-1, wm.conn.S, wm.conn.r)
+            V = V.view(-1, wm.conn.S, wm.conn.r)
+            A_lr = torch.bmm(U, V.transpose(1, 2)) - torch.bmm(V, U.transpose(1, 2))
+            A_list.append(A_lr)
+        if wm.conn.use_full:
+            W_f, b_f = eff_linear(wm.conn.head_full.linear, deltas.get("conn_head_full", None))
+            M = F.linear(h_conn, W_f, b_f).view(-1, wm.conn.S, wm.conn.S)
+            A_full = 0.5 * (M - M.transpose(1, 2))
+            A_list.append(A_full)
+
+        if not A_list:
+            A_t = torch.zeros(B, wm.conn.S, wm.conn.S, device=device, dtype=s_prev_base.dtype)
+        elif len(A_list) == 1:
+            A_t = A_list[0]
+        else:
+            W_mx, b_mx = eff_linear(wm.conn.mix.linear, deltas.get("conn_mix", None))
+            w_mx = F.softmax(F.linear(h_conn, W_mx, b_mx), dim=-1)
+            A_t = w_mx[:, :1].view(B, 1, 1) * A_list[0] + w_mx[:, 1:2].view(B, 1, 1) * A_list[1]
+
+        if wm.conn.norm_clip and wm.conn.norm_clip > 0:
+            fro = A_t.pow(2).mean(dim=(1, 2)).sqrt().clamp_min(1e-8)
+            scale = torch.minimum(torch.ones_like(fro), wm.conn.norm_clip / fro).view(B, 1, 1)
+            A_t = A_t * scale
+
+        s_transport = wm.conn.TransportApply(A_t, s_prev_base)
+
+        W_hnn_to, b_hnn_to = eff_linear(wm.phys_hnn.to_qp, deltas.get("hnn_to", None))
+        W_hnn_H1, b_hnn_H1 = eff_linear(wm.phys_hnn.H[0], deltas.get("hnn_H1", None))
+        W_hnn_H2, b_hnn_H2 = eff_linear(wm.phys_hnn.H[2], deltas.get("hnn_H2", None))
+        W_hnn_from, b_hnn_from = eff_linear(wm.phys_hnn.from_qp, deltas.get("hnn_from", None))
+
+        qp = F.linear(h_next, W_hnn_to, b_hnn_to)
+        q, p = qp.chunk(2, dim=-1)
+
+        need_graph = bool(wm.training and torch.is_grad_enabled())
+
+        with torch.enable_grad():
+            qp_in = torch.cat([q, p], dim=-1).detach().requires_grad_(True)
+            H_val = F.linear(F.gelu(F.linear(qp_in, W_hnn_H1, b_hnn_H1)), W_hnn_H2, b_hnn_H2)
+            grad = torch.autograd.grad(H_val.sum(), qp_in, create_graph=need_graph, retain_graph=False)[0]
+            dH_dq, dH_dp = grad.chunk(2, dim=-1)
+            p_half = p - 0.5 * wm.phys_hnn.dt * dH_dq
+
+            qp_mid = torch.cat([q, p_half], dim=-1).detach().requires_grad_(True)
+            H_mid = F.linear(F.gelu(F.linear(qp_mid, W_hnn_H1, b_hnn_H1)), W_hnn_H2, b_hnn_H2)
+            grad_mid = torch.autograd.grad(H_mid.sum(), qp_mid, create_graph=need_graph, retain_graph=False)[0]
+            dH_dq_mid, dH_dp_mid = grad_mid.chunk(2, dim=-1)
+            q_new = q + wm.phys_hnn.dt * dH_dp_mid
+
+            qp_new = torch.cat([q_new, p_half], dim=-1).detach().requires_grad_(True)
+            H_new = F.linear(F.gelu(F.linear(qp_new, W_hnn_H1, b_hnn_H1)), W_hnn_H2, b_hnn_H2)
+            grad2 = torch.autograd.grad(H_new.sum(), qp_new, create_graph=need_graph, retain_graph=False)[0]
+            dH_dq2, dH_dp2 = grad2.chunk(2, dim=-1)
+            p_new = p_half - 0.5 * wm.phys_hnn.dt * dH_dq2
+
+        h_phys = F.linear(torch.cat([q_new, p_new], dim=-1), W_hnn_from, b_hnn_from)
+
+        W_ode_f1, b_ode_f1 = eff_linear(wm.phys_ode.f[0], deltas.get("ode_f1", None))
+        W_ode_f2, b_ode_f2 = eff_linear(wm.phys_ode.f[2], deltas.get("ode_f2", None))
+
+        def f_eval(inp):
+            t = F.linear(inp, W_ode_f1, b_ode_f1)
+            t = F.silu(t)
+            t = F.linear(t, W_ode_f2, b_ode_f2)
+            return t
+
+        k1 = f_eval(torch.cat([h_next, a_t], dim=-1))
+        mid = h_next + 0.5 * wm.phys_ode.dt * k1
+        k2 = f_eval(torch.cat([mid, a_t], dim=-1))
+        h_ode = h_next + wm.phys_ode.dt * k2
+
+        s_phys = wm.state_proj(torch.cat([h_phys, z_next], dim=-1))
+        s_ode = wm.state_proj(torch.cat([h_ode, z_next], dim=-1))
+
+        W_mix, b_mix = eff_linear(wm.mix_gate[0], deltas.get("mix", None))
+        logits = F.linear(torch.cat([h_next, z_next, a_t], dim=-1), W_mix, b_mix)
+        w = F.softmax(logits, dim=-1)
+        s_next = (w[:, 0:1] * s_base + w[:, 1:2] * s_transport + w[:, 2:3] * s_phys + w[:, 3:4] * s_ode)
 
         W_rw1, b_rw1 = eff_linear(wm.rew_head[0], deltas.get("rew1", None))
         r_mid = F.linear(s_next, W_rw1, b_rw1)
@@ -1209,12 +1580,12 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
             "d_prob": d_prob,
             "mu_p": mu_p,
             "logstd_p": logstd_p,
-            "mu_q": mu_q,
-            "logstd_q": logstd_q,}
+            "mu_q": mu_q if mode == "posterior" else None,
+            "logstd_q": logstd_q if mode == "posterior" else None,}
 
         if (mode == "posterior") and wm._ns_enabled:
             out["ns_logits"] = ns_logits
-            out["ns_probs"]  = ns_probs
+            out["ns_probs"] = ns_probs
 
         if (mode == "posterior") and wm.use_decoder:
             W_dec1, b_dec1 = eff_linear(wm.obs_dec[0], deltas.get("dec1", None))
@@ -1223,9 +1594,11 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
             W_dec2, b_dec2 = eff_linear(wm.obs_dec[2], deltas.get("dec2", None))
             recon = F.linear(dec_mid, W_dec2, b_dec2)
             out["recon"] = recon
-            out["recon_target"] = v
+            out["recon_target"] = v       
 
         if mode == "posterior":
+            if has_s4_delta and (x_next is not None):
+                wm.s4.x = x_next.detach()
             wm._h = h_next.detach()
             wm._z = z_next.detach()
             if wm._use_memory:
@@ -1233,7 +1606,7 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
                     wm.MemAdd(raw_e.detach(), h_next.detach())
 
         return out
-    
+
     @torch.no_grad()
     def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
         wm = self.base
@@ -1244,32 +1617,81 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         if site == "obs2":
             wm.obs_enc[4].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
         if site == "act":
-            wm.act_proj[0].Grow(addRank=a.size(0), init=init, freezeOld=False);   return True
+            wm.act_proj[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
         if site == "prior":
-            wm.prior_net[0].Grow(addRank=a.size(0), init=init, freezeOld=False);  return True
+            wm.prior_net[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
         if site == "post":
-            wm.post_net[0].Grow(addRank=a.size(0), init=init, freezeOld=False);   return True
+            wm.post_net[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
         if site == "state":
             wm.state_proj[1].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
         if site == "rew1":
-            wm.rew_head[0].Grow(addRank=a.size(0), init=init, freezeOld=False);   return True
+            wm.rew_head[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
         if site == "rew2":
-            wm.rew_head[2].Grow(addRank=a.size(0), init=init, freezeOld=False);   return True
+            wm.rew_head[2].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
         if site == "done1":
-            wm.done_head[0].Grow(addRank=a.size(0), init=init, freezeOld=False);  return True
+            wm.done_head[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
         if site == "done2":
-            wm.done_head[2].Grow(addRank=a.size(0), init=init, freezeOld=False);  return True
+            wm.done_head[2].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
         if site == "dec1":
-            wm.obs_dec[0].Grow(addRank=a.size(0), init=init, freezeOld=False);  return True
+            wm.obs_dec[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
         if site == "dec2":
-            wm.obs_dec[2].Grow(addRank=a.size(0), init=init, freezeOld=False);  return True
-        if site == "gru_ih":
-            init_gru = {"A_ih": a.detach().clone(), "B_ih": b.detach().clone(), "scale_ih": float(scale)}
-            wm.gru.Grow(addRank=a.size(0), init=init_gru, freezeOld=False, mode="ih");  return True
-        if site == "gru_hh":
-            init_gru = {"A_hh": a.detach().clone(), "B_hh": b.detach().clone(), "scale_hh": float(scale)}
-            wm.gru.Grow(addRank=a.size(0), init=init_gru, freezeOld=False, mode="hh");  return True
+            wm.obs_dec[2].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+
+        if site == "s4_B":
+            wm.s4.B.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "s4_C":
+            wm.s4.C.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "s4_D0":
+            wm.s4.D0.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "s4_gate":
+            wm.s4.gate.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "s4_out_gate":
+            wm.s4.out_gate.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+
+        if site == "hnn_to":
+            wm.phys_hnn.to_qp.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "hnn_H1":
+            wm.phys_hnn.H[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "hnn_H2":
+            wm.phys_hnn.H[2].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "hnn_from":
+            wm.phys_hnn.from_qp.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+
+        if site == "ode_f1":
+            wm.phys_ode.f[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "ode_f2":
+            wm.phys_ode.f[2].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+
+        if site == "mix":
+            wm.mix_gate[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+
+        if site == "conn_enc_s":
+            wm.conn.enc_s[1].linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "conn_enc_a":
+            wm.conn.enc_a[1].linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "conn_gamma":
+            wm.conn.film_gamma_a.linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "conn_beta":
+            wm.conn.film_beta_a.linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+
+        if site.startswith("conn_blk"):
+            tag = site[len("conn_blk"):] 
+            idx_str, which = tag.split("_ff")
+            i = int(idx_str)
+            if which == "1":
+                wm.conn.blocks[i].ff[0].linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            if which == "2":
+                wm.conn.blocks[i].ff[3].linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+
+        if site == "conn_head_uv" and wm.conn.use_lowrank:
+            wm.conn.head_uv.linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "conn_head_full" and wm.conn.use_full:
+            wm.conn.head_full.linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+        if site == "conn_mix":
+            wm.conn.mix.linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+
         return False
+
 
 
 class TestWorldMTool:
@@ -1288,11 +1710,13 @@ class TestWorldMTool:
             all_codes += list(grp.values())
         self.max_code = max(all_codes)
 
-        self.wm = RSSMWorldModel(visionDim=512, actionDim=128, deterDim=256, stochDim=32, stateDim=256, useDecoder=True, useMemory=False, nsEnabled=True, ).to(self.device)
+        self.wm = RSSMWorldModel(
+            visionDim=1024, actionDim=256, deterDim=256, stochDim=32, stateDim=256,
+            useDecoder=True, useMemory=False, nsEnabled=True).to(self.device)
         self.wm.ResetHidden(batchSize=4, device=self.device)
 
     def Batch(self, B, keyIdx=(17,)):
-        vision = torch.randn(B, 512, device=self.device)
+        vision = torch.randn(B, 1024, device=self.device)
         keys = torch.zeros(B, 106, device=self.device)
         for k in keyIdx:
             keys[:, k] = 1.0
@@ -1307,13 +1731,14 @@ class TestWorldMTool:
 
     def SeedNonzeroCandidates(self, wrapper, scale=1e-3):
         with torch.no_grad():
-            for name, layer_list in wrapper.cand.items():
-                for slot in layer_list: 
+            for _, layer_list in wrapper.cand.items():
+                for slot in layer_list:
                     for Bp in slot["B"]:
                         if Bp.numel() > 0:
                             Bp.data.normal_(0.0, scale)
                     for sp in slot["s"]:
                         sp.data.fill_(1.0)
+
 
     def TestActionEncoder(self):
         try:
@@ -1336,6 +1761,7 @@ class TestWorldMTool:
             B = 4
             vision, keys, mouse = self.Batch(B, keyIdx=(17,57))
             self.wm.ResetHidden(batchSize=B, device=self.device)
+
             a_enc = self.wm.action_encoder(keys, mouse)
             h0 = torch.zeros(B, self.wm.deter_dim, device=self.device)
             z0 = torch.zeros(B, self.wm.stoch_dim, device=self.device)
@@ -1352,8 +1778,15 @@ class TestWorldMTool:
                 and out["d_prob"].shape == (B,))
             
             changed = (not torch.allclose(h_before, h_after)) or (not torch.allclose(z_before, z_after))
-            in_range = (out["d_prob"].min() >= 0.0) and (out["d_prob"].max() <= 1.0)
-            ok = ok_shapes and changed and in_range
+            in_range = (out["d_prob"].min().item() >= 0.0) and (out["d_prob"].max().item() <= 1.0)
+
+            with torch.no_grad():
+                a_t = self.wm.act_proj(a_enc)
+                logits = self.wm.mix_gate(torch.cat([out["h_next"], out["z_next"], a_t], dim=-1))
+                w = torch.softmax(logits, dim=-1)
+                mix_ok = torch.allclose(w.sum(dim=-1), torch.ones(B, device=w.device), atol=1e-6)
+
+            ok = ok_shapes and changed and in_range and mix_ok
             print("RSSM StepPosterior test " + ("passed." if ok else "failed."))
             return ok
         except Exception as e:
@@ -1364,7 +1797,6 @@ class TestWorldMTool:
         try:
             B = 4
             _, keys, mouse = self.Batch(B, keyIdx=(30,))
-
             self.wm.ResetHidden(batchSize=B, device=self.device)
 
             a_enc = self.wm.action_encoder(keys, mouse)
@@ -1380,8 +1812,8 @@ class TestWorldMTool:
                 and s1.shape == (B, self.wm.state_dim)
                 and r.shape == (B,)
                 and d.shape == (B,))
+            
             h_after, z_after = self.wm.ExportState()
-
             not_written = torch.allclose(h_prev, h_after) and torch.allclose(z_prev, z_after)
             ok = ok_shapes and not_written
             print("RSSM StepPriorOnly test " + ("passed." if ok else "failed."))
@@ -1394,49 +1826,44 @@ class TestWorldMTool:
         try:
             B = 2
             vision, keys, mouse = self.Batch(B, keyIdx=(17,))
-
             self.wm.train()
             for p in self.wm.parameters():
                 p.requires_grad_(True)
-
             self.wm.ResetHidden(batchSize=B, device=self.device)
 
             out = self.wm.ForwardTrainSeq(
                 visionSeq=vision, keysVec=keys, mouseSeq=mouse,
                 rewardSeq=None, doneSeq=None,
                 alphaKl=0.8, freeNats=1.0,
-                reconCoef=1.0, rewardCoef=1.0, doneCoef=1.0,)
-            
+                reconCoef=1.0, rewardCoef=1.0, doneCoef=1.0)
+
             loss = out["loss"]
-            if not torch.isfinite(loss):
+            if not torch.isfinite(loss).item():
                 print("ForwardTrainSeq loss is not finite.")
                 return False
 
             self.wm.zero_grad(set_to_none=True)
-            loss.backward() 
+            loss.backward()
             print("RSSM ForwardTrainSeq test passed. loss =", float(loss.item()), " | distill=", float(out["loss_ns_distill"].item()))
             return True
         except Exception as e:
             print(f"ForwardTrainSeq test FAILED: {type(e).__name__}: {e}")
             return False
 
-    def TestWMAdapterForPlanner(self):
+    def TestConnRegReset(self):
         try:
-            adapter = WMAdapterForPlanner(
-                wm=self.wm, maxCode=self.max_code,
-                baseCodes=self.base_codes, skillCodes=self.skill_codes, extraCodes=self.extra_codes,
-                noSkillId=None, deterministicZ=True,).to(self.device)
-            B = 3
-            a_mouse = torch.randn(B, 2, device=self.device)
-            a_base = (torch.rand(B, len(self.base_codes), device=self.device) > 0.5).float()
-            a_extra = (torch.rand(B, len(self.extra_codes), device=self.device) > 0.5).float()
-            a_skill = torch.randint(low=0, high=len(self.skill_codes), size=(B,), device=self.device)
-            s1, r, d = adapter.Step(aMouse=a_mouse, aSkill=a_skill, aBase=a_base, aExtra=a_extra)
-            ok_shapes = s1.shape == (B, self.wm.state_dim) and r.shape == (B,) and d.shape == (B,)
-            print("WMAdapterForPlanner.Step test " + ("passed." if ok_shapes else "failed."))
-            return ok_shapes
+            B = 2
+            vision, keys, mouse = self.Batch(B, keyIdx=(18,))
+            self.wm.ResetHidden(batchSize=B, device=self.device)
+            _ = self.wm.ForwardTrainSeq(vision, keys, mouse)
+            has_prev = (self.wm._A_prev is not None) and (self.wm._A_prev.shape == (B, self.wm.state_dim, self.wm.state_dim))
+            self.wm.ResetHidden(batchSize=B, device=self.device)
+            cleared = (self.wm._A_prev is None)
+            ok = has_prev and cleared
+            print("Conn regularization cache reset " + ("passed." if ok else "failed."))
+            return ok
         except Exception as e:
-            print(f"WMAdapterForPlanner.Step test FAILED: {type(e).__name__}: {e}")
+            print(f"Conn regularization cache reset FAILED: {type(e).__name__}: {e}")
             return False
 
     def TestWrapperAPIBasics(self):
@@ -1445,10 +1872,11 @@ class TestWorldMTool:
             wrapper.train()
             B = 4
             vision, keys, mouse = self.Batch(B, keyIdx=(17,57))
-            x = self.MKX(vision, keys, mouse, mode="posterior", sample=False)
-            out = wrapper(x)
-            ok = ( ("h_next" in out) and ("z_next" in out) and ("s_next" in out) and ("r_pred" in out) and ("d_prob" in out) and out["s_next"].shape == (B, self.wm.state_dim))
-            
+            self.wm.ResetHidden(batchSize=B, device=self.device)
+            out = wrapper(self.MKX(vision, keys, mouse, mode="posterior", sample=False))
+            ok = ( ("h_next" in out) and ("z_next" in out) and ("s_next" in out)
+                   and ("r_pred" in out) and ("d_prob" in out)
+                   and out["s_next"].shape == (B, self.wm.state_dim))
             print("Wrapper API basics " + ("passed." if ok else "failed."))
             return ok
         except Exception as e:
@@ -1461,12 +1889,12 @@ class TestWorldMTool:
             wrapper.eval()
             B = 3
             vision, keys, mouse = self.Batch(B, keyIdx=(31,))
-            x = self.MKX(vision, keys, mouse, mode="posterior", sample=False)
+            self.wm.ResetHidden(batchSize=B, device=self.device)
 
-            out0 = wrapper.ForwardWithDeltas(x, None, None, None, [{}])
+            out0 = wrapper.ForwardWithDeltas(self.MKX(vision, keys, mouse, mode="posterior", sample=False), None, None, None, [{}])
             Z = self.wm.stoch_dim
             A = torch.randn(Z, self.wm.action_dim, device=self.device) * 1e-3
-            out1 = wrapper.ForwardWithDeltas(x, None, None, None, [{"act": A}])
+            out1 = wrapper.ForwardWithDeltas(self.MKX(vision, keys, mouse, mode="posterior", sample=False), None, None, None, [{"act": A}])
 
             diff = (out0["s_next"] - out1["s_next"]).abs().mean().item()
             ok = diff > 1e-7
@@ -1486,23 +1914,21 @@ class TestWorldMTool:
             r = 2
             A = torch.randn(r, self.wm.action_dim, device=self.device) * 1e-2
             Bm = torch.randn(self.wm.stoch_dim, r, device=self.device) * 1e-2
-            s = 1.0
-            ok_commit = wrapper.CommitOne("act", 0, A, Bm, s)
-
+            ok_commit = wrapper.CommitOne("act", 0, A, Bm, 1.0)
             n1 = len(lo.A_list)
             grew = ok_commit and (n1 == n0 + 1)
 
             Bsz = 4
             vision, keys, mouse = self.Batch(Bsz, keyIdx=(33,))
-            x = self.MKX(vision, keys, mouse, mode="posterior", sample=False)
+            self.wm.ResetHidden(batchSize=Bsz, device=self.device)
 
             with torch.no_grad():
                 last_alpha = lo.alpha[-1].clone()
                 lo.alpha[-1].zero_()
-                out_before = wrapper(x)
+                out_before = wrapper(self.MKX(vision, keys, mouse, mode="posterior", sample=False))
                 lo.alpha[-1].copy_(last_alpha)
 
-            out_after = wrapper(x)
+            out_after = wrapper(self.MKX(vision, keys, mouse, mode="posterior", sample=False))
             change = (out_after["s_next"] - out_before["s_next"]).abs().mean().item()
 
             ok = grew and (change > 1e-7)
@@ -1520,12 +1946,12 @@ class TestWorldMTool:
 
             B = 6
             vision, keys, mouse = self.Batch(B, keyIdx=(45,))
-            x = self.MKX(vision, keys, mouse, mode="posterior", sample=False)
+            self.wm.ResetHidden(batchSize=B, device=self.device)
 
-            out = wrapper(x)
+            out = wrapper(self.MKX(vision, keys, mouse, mode="posterior", sample=False))
             loss = ( F.mse_loss(out["r_pred"], torch.zeros_like(out["r_pred"])) +
-                0.5 * F.binary_cross_entropy(out["d_prob"], torch.zeros_like(out["d_prob"])) +
-                0.1 * F.mse_loss(out["s_next"], torch.zeros_like(out["s_next"])))
+                     0.5 * F.binary_cross_entropy(out["d_prob"], torch.zeros_like(out["d_prob"])) +
+                     0.1 * F.mse_loss(out["s_next"], torch.zeros_like(out["s_next"])) )
 
             params = list(wrapper.CandParameters())
             if len(params) == 0:
@@ -1538,7 +1964,7 @@ class TestWorldMTool:
 
             def has_grad(plist):
                 for p in plist:
-                    if (p.grad is not None) and torch.isfinite(p.grad).all() and (p.grad.abs().sum() > 0):
+                    if (p.grad is not None) and torch.isfinite(p.grad).all().item() and (p.grad.abs().sum().item() > 0):
                         return True
                 return False
 
@@ -1555,27 +1981,24 @@ class TestWorldMTool:
             wrapper = WorldModelOnlineWrapper(self.wm, initRankEach=2, autoRank=False).to(self.device)
             wrapper.train()
             self.SeedNonzeroCandidates(wrapper, scale=1e-3)
-
             opt = torch.optim.Adam(list(wrapper.CandParameters()), lr=2e-3)
 
             B = 8
             vision, keys, mouse = self.Batch(B, keyIdx=(31,49))
-            x = self.MKX(vision, keys, mouse, mode="posterior", sample=False)
+            self.wm.ResetHidden(batchSize=B, device=self.device)
 
             watch = None
             for p in wrapper.CandParameters():
-                watch = p
-                break
+                watch = p; break
             before = watch.detach().clone() if watch is not None else None
 
             steps = 40
             losses = []
             for t in range(1, steps + 1):
-                out = wrapper(x)
-                loss = (
-                    F.mse_loss(out["r_pred"], torch.zeros_like(out["r_pred"])) +
-                    0.5 * F.binary_cross_entropy(out["d_prob"], torch.zeros_like(out["d_prob"])) +
-                    0.1 * F.mse_loss(out["s_next"], torch.zeros_like(out["s_next"])))
+                out = wrapper(self.MKX(vision, keys, mouse, mode="posterior", sample=False))
+                loss = ( F.mse_loss(out["r_pred"], torch.zeros_like(out["r_pred"])) +
+                         0.5 * F.binary_cross_entropy(out["d_prob"], torch.zeros_like(out["d_prob"])) +
+                         0.1 * F.mse_loss(out["s_next"], torch.zeros_like(out["s_next"])) )
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(list(wrapper.CandParameters()), 3.0)
@@ -1600,7 +2023,7 @@ class TestWorldMTool:
 
     def TestBaseGradFlow(self):
         try:
-            base = RSSMWorldModel(visionDim=512, actionDim=128, deterDim=256, stochDim=32, stateDim=256, useDecoder=True, useMemory=False, nsEnabled=True).to(self.device)
+            base = RSSMWorldModel(visionDim=1024, actionDim=256, deterDim=256, stochDim=32, stateDim=256, useDecoder=True, useMemory=False, nsEnabled=True).to(self.device)
             base.train()
             B = 6
             vision, keys, mouse = self.Batch(B, keyIdx=(32,))
@@ -1609,11 +2032,16 @@ class TestWorldMTool:
             base.zero_grad(set_to_none=True)
             loss.backward()
 
-            sample_params = [ base.obs_enc[1].target.weight, base.gru.target.weight_ih, base.rew_head[0].target.weight, base.done_head[2].target.weight, ]
+            sample_params = [
+                base.obs_enc[1].target.weight,
+                base.s4.B.target.weight,
+                base.rew_head[0].target.weight,
+                base.done_head[2].target.weight,]
+            
             grads_ok = True
             for p in sample_params:
                 g = p.grad
-                if (g is None) or (not torch.isfinite(g).all()) or (g.abs().sum() == 0):
+                if (g is None) or (not torch.isfinite(g).all().item()) or (g.abs().sum().item() == 0.0):
                     grads_ok = False
                     break
             print(f"Base grad flow: {'passed' if grads_ok else 'failed'} | loss={float(loss.item()):.6f}")
@@ -1624,14 +2052,13 @@ class TestWorldMTool:
 
     def TestBaseTrainingLossDecreases(self):
         try:
-            base = RSSMWorldModel(visionDim=512, actionDim=128, deterDim=256, stochDim=32, stateDim=256, useDecoder=True, useMemory=False, nsEnabled=True).to(self.device)
+            base = RSSMWorldModel(visionDim=1024, actionDim=256, deterDim=256, stochDim=32, stateDim=256, useDecoder=True, useMemory=False, nsEnabled=True).to(self.device)
             base.train()
             opt = torch.optim.Adam(base.parameters(), lr=1e-3)
 
             B = 8
             vision, keys, mouse = self.Batch(B, keyIdx=(32,))
-
-            watch_params = [base.obs_enc[1].target.weight, base.gru.target.weight_ih]
+            watch_params = [base.obs_enc[1].target.weight, base.s4.B.target.weight]
             before_vals = [p.detach().clone() for p in watch_params]
 
             losses = []
@@ -1670,48 +2097,40 @@ class TestWorldMTool:
 
             B = 5
             vision, keys, mouse = self.Batch(B, keyIdx=(31,))
+            self.wm.ResetHidden(batchSize=B, device=self.device)
 
             x1 = self.MKX(vision, keys, mouse, mode="posterior", sample=False)
             out1 = wrapper(x1)
-            mu_q_star = out1["mu_q"].detach()
-            logstd_q_star = out1["logstd_q"].detach()
+            mu_q_star = out1["mu_q"].detach(); logstd_q_star = out1["logstd_q"].detach()
 
             x2 = self.MKX(vision, keys, mouse, mode="posterior", sample=False)
             out2 = wrapper(x2)
 
-            base_loss = (
-                F.mse_loss(out2["r_pred"], torch.zeros_like(out2["r_pred"])) +
-                0.5 * F.binary_cross_entropy(out2["d_prob"], torch.zeros_like(out2["d_prob"])) +
-                0.1 * F.mse_loss(out2["s_next"], torch.zeros_like(out2["s_next"])))   
-
-            kl_prior = KLDiagNormal( mu_q_star, logstd_q_star, out2["mu_p"], out2["logstd_p"]).mean()
-
-            loss = base_loss + 0.1 * kl_prior 
+            base_loss = ( F.mse_loss(out2["r_pred"], torch.zeros_like(out2["r_pred"])) +
+                          0.5 * F.binary_cross_entropy(out2["d_prob"], torch.zeros_like(out2["d_prob"])) +
+                          0.1 * F.mse_loss(out2["s_next"], torch.zeros_like(out2["s_next"])) )
+            kl_prior = KLDiagNormal(mu_q_star, logstd_q_star, out2["mu_p"], out2["logstd_p"]).mean()
+            loss = base_loss + 0.1 * kl_prior
 
             for p in wrapper.CandParameters():
                 if p.grad is not None:
                     p.grad.zero_()
             loss.backward()
 
-            missing = []
             def site_ok(name: str) -> bool:
                 slot = wrapper.cand[name][0]
                 def hasg(lst):
-                    return any( (p.grad is not None) and torch.isfinite(p.grad).all() and (p.grad.abs().sum() > 0) for p in lst)
+                    return any((p.grad is not None) and torch.isfinite(p.grad).all().item() and (p.grad.abs().sum().item() > 0) for p in lst)
                 return hasg(slot["A"]) and hasg(slot["B"]) and hasg(slot["s"])
 
-            for name in ["obs1","obs2","act","prior","post","state","rew1","rew2","done1","done2"]:
-                if not site_ok(name):
-                    missing.append(name)
-
+            missing = [name for name in ["obs1","obs2","act","prior","post","state","rew1","rew2","done1","done2"] if not site_ok(name)]
             ok_all = (len(missing) == 0)
             print(f"Grad coverage (candidates) {'passed' if ok_all else 'failed'}; missing/no-grad: {missing}")
             return ok_all
-
         except Exception as e:
             print(f"Grad coverage (candidates) FAILED: {type(e).__name__}: {e}")
             return False
-        
+
     def TestParityPosterior(self):
         try:
             torch.manual_seed(0)
@@ -1720,28 +2139,59 @@ class TestWorldMTool:
             wrapper.eval(); wm.eval()
 
             B = 3
-            vision, keys, mouse = self.Batch(B, keyIdx=(31,57))
+            vision, keys, mouse = self.Batch(B, keyIdx=(31, 57))
+            wm.ResetHidden(batchSize=B, device=self.device)
 
             h0 = torch.zeros(B, wm.deter_dim, device=self.device)
             z0 = torch.zeros(B, wm.stoch_dim, device=self.device)
 
             a_enc = wm.action_encoder(keys, mouse)
+
             out_base = wm.StepPosterior(h0, z0, vision, a_enc, sample=False)
 
+            wm.ResetHidden(batchSize=B, device=self.device)
+
             x = self.MKX(vision, keys, mouse, mode="posterior", sample=False, hPrev=h0, zPrev=z0)
+            x["a_enc"] = a_enc  
             out_wrap = wrapper.ForwardWithDeltas(x, None, None, None, [{}])
 
-            def close(a,b): return torch.allclose(a, b, atol=1e-6, rtol=1e-5)
+            def _close(a, b, atol=1e-6, rtol=1e-5):
+                return torch.allclose(a, b, atol=atol, rtol=rtol)
 
-            ok = (close(out_base["h_next"], out_wrap["h_next"])
-                and close(out_base["z_next"], out_wrap["z_next"])
-                and close(out_base["s_next"], out_wrap["s_next"])
-                and close(out_base["r_pred"], out_wrap["r_pred"])
-                and close(out_base["d_prob"], out_wrap["d_prob"]) )
-            print("Parity posterior " + ("passed." if ok else "failed."))
-            return ok
+            def _mdiff(a, b):
+                return float((a - b).abs().max().item())
+
+            keys_to_check = ["h_next", "z_next", "s_next", "r_pred", "d_prob", "mu_p", "logstd_p", "mu_q", "logstd_q",]
+
+            ok = True
+            diffs = {}
+            for k in keys_to_check:
+                if (k in out_base) and (k in out_wrap) and (out_base[k] is not None) and (out_wrap[k] is not None):
+                    same = _close(out_base[k], out_wrap[k])
+                    ok = ok and same
+                    if not same:
+                        diffs[k] = _mdiff(out_base[k], out_wrap[k])
+
+            if ok:
+                print("TestWorldMTool.Parity posterior passed.")
+                return True
+
+            print("TestWorldMTool.Parity posterior failed.")
+            for k in keys_to_check:
+                if k in diffs:
+                    print(f"  Δ[{k}]_max = {diffs[k]:.6e}")
+
+            a_enc_wrap = wm.action_encoder(keys, mouse)  
+            print(f" Δ[a_enc]_max (vs. wrapper默认重算) = {_mdiff(a_enc, a_enc_wrap):.6e}")
+
+            print(f" ‖Δ[s_next]‖_∞ = {_mdiff(out_base['s_next'], out_wrap['s_next']):.6e}")
+            print(f" ‖Δ[r_pred]‖_∞ = {_mdiff(out_base['r_pred'], out_wrap['r_pred']):.6e}")
+            print(f" ‖Δ[d_prob]‖_∞ = {_mdiff(out_base['d_prob'], out_wrap['d_prob']):.6e}")
+
+            return False
+
         except Exception as e:
-            print(f"Parity posterior FAILED: {type(e).__name__}: {e}")
+            print(f"TestWorldMTool.Parity posterior FAILED: {type(e).__name__}: {e}")
             return False
 
     def TestParityPrior(self):
@@ -1752,24 +2202,24 @@ class TestWorldMTool:
             wrapper.eval(); wm.eval()
 
             B = 3
+            vision = torch.randn(B, 1024, device=self.device)
             _, keys, mouse = self.Batch(B, keyIdx=(33,))
-            
+            wm.ResetHidden(batchSize=B, device=self.device)
+
             h0 = torch.zeros(B, wm.deter_dim, device=self.device)
             z0 = torch.zeros(B, wm.stoch_dim, device=self.device)
 
             a_enc = wm.action_encoder(keys, mouse)
             h1, z1, s1, r1, d1 = wm.StepPriorOnly(h0, z0, a_enc, sample=False)
 
-            x = self.MKX(torch.randn(B, 512, device=self.device), keys, mouse, mode="prior", sample=False, hPrev=h0, zPrev=z0)
-            out_wrap = wrapper.ForwardWithDeltas(x, None, None, None, [{}])
+            out_wrap = wrapper.ForwardWithDeltas(self.MKX(vision, keys, mouse, mode="prior", sample=False, hPrev=h0, zPrev=z0), None, None, None, [{}])
 
             def close(a,b): return torch.allclose(a, b, atol=1e-6, rtol=1e-5)
-
             ok = (close(h1, out_wrap["h_next"])
-                and close(z1, out_wrap["z_next"])
-                and close(s1, out_wrap["s_next"])
-                and close(r1, out_wrap["r_pred"])
-                and close(d1, out_wrap["d_prob"]) )
+                  and close(z1, out_wrap["z_next"])
+                  and close(s1, out_wrap["s_next"])
+                  and close(r1, out_wrap["r_pred"])
+                  and close(d1, out_wrap["d_prob"]))
             print("Parity prior " + ("passed." if ok else "failed."))
             return ok
         except Exception as e:
@@ -1782,20 +2232,19 @@ class TestWorldMTool:
             "RSSMStepPosterior": self.TestRSSMStepPosterior(),
             "RSSMStepPriorOnly": self.TestRSSMStepPriorOnly(),
             "ForwardTrainSeq": self.TestForwardTrainSeq(),
-            "WMAdapterForPlanner": self.TestWMAdapterForPlanner(),
+            "ConnRegReset": self.TestConnRegReset(),
             "WrapperAPIBasics": self.TestWrapperAPIBasics(),
             "ForwardWithDeltasInjection": self.TestForwardWithDeltasInjection(),
             "WrapperManualGrowTrainAndCommit": self.TestCommitOneGrowAndValueChange(),
             "GradFlowCandidates": self.TestGradFlowCandidates(),
             "WrapperTrainLossDecreases": self.TestWrapperTrainLossDecreases(),
-            "BaseGradFlow": self.TestBaseGradFlow(),  
-            "BaseTrainLossDecreases": self.TestBaseTrainingLossDecreases(), 
+            "BaseGradFlow": self.TestBaseGradFlow(),
+            "BaseTrainLossDecreases": self.TestBaseTrainingLossDecreases(),
             "GradCoverageCandidateSites": self.TestGradCoverageCandidateSites(),
             "ParityPosterior": self.TestParityPosterior(),
-            "ParityPrior": self.TestParityPrior()}
-
+            "ParityPrior": self.TestParityPrior(),}
+        
         passed = sum(1 for ok in results.values() if ok)
         total = len(results)
         print(f"\nWorldModel test summary: {passed}/{total} passed.")
         return all(results.values())
-
