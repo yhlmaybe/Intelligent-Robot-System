@@ -77,6 +77,10 @@ class GrowableLoRAConv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w = self.target.weight
+
+        if hasattr(self.target, "Preprocess"):
+            x = self.target.Preprocess(x)
+
         delta = self.DeltaWeight()
         if delta is not None:
             w = w + delta
@@ -164,6 +168,109 @@ class GrowableTokenAdapter(nn.Module):
             z = torch.matmul(z, B.t())
             y = y + torch.tanh(s) * GetParameterSScale(s) * z
         return y
+
+class SheafGaugeConv2d(nn.Conv2d):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        bias: bool = True,
+        padding_mode: str = "zeros",
+        device=None,
+        dtype=None,
+        *,
+        sheaf_alpha: float = 0.1, 
+        sheaf_iters: int = 1,  
+        gauge_groups: int = 1, 
+        gauge_scale: float = 0.1,  
+        gauge_bias_scale: float = 0.1,
+        eps: float = 1e-5, ):
+        factory = {"device": device, "dtype": dtype}
+        super().__init__(in_channels, out_channels, kernel_size, stride, padding,dilation, groups, bias, padding_mode, **factory)
+
+        self.sheaf_alpha = nn.Parameter(torch.tensor(float(sheaf_alpha), **factory))
+        self.sheaf_iters = int(sheaf_iters)
+        self.eps = float(eps)
+        self.sheaf_gain_h = nn.Parameter(torch.ones(in_channels, **factory))
+        self.sheaf_gain_v = nn.Parameter(torch.ones(in_channels, **factory))
+
+        assert in_channels % gauge_groups == 0, "gauge_groups must be divisible by in_channels"
+        self.gauge_gamma = nn.Conv2d(in_channels, in_channels, kernel_size=1, groups=gauge_groups, bias=True, **factory)
+        self.gauge_beta = nn.Conv2d(in_channels, in_channels, kernel_size=1, groups=gauge_groups, bias=True, **factory)
+
+        nn.init.zeros_(self.gauge_gamma.weight)
+        nn.init.zeros_(self.gauge_gamma.bias)
+        nn.init.zeros_(self.gauge_beta.weight)
+        nn.init.zeros_(self.gauge_beta.bias)
+
+        self.gauge_scale = float(gauge_scale)
+        self.gauge_bias_scale = float(gauge_bias_scale)
+
+    @staticmethod
+    def Shift(x: torch.Tensor, dim: int, step: int) -> torch.Tensor:
+        if step == 0:
+            return x
+        y = torch.roll(x, shifts=step, dims=dim)
+        if step > 0:
+            sl = [slice(None)] * y.ndim
+            sl[dim] = slice(0, step)
+            y[tuple(sl)] = x[tuple(sl)]
+        else:
+            sl = [slice(None)] * y.ndim
+            sl[dim] = slice(step, None)
+            y[tuple(sl)] = x[tuple(sl)]
+        return y
+
+    def SheafStep(self, x: torch.Tensor) -> torch.Tensor:
+        if self.sheaf_iters <= 0:
+            return x
+        g_h = self.sheaf_gain_h.view(1, -1, 1, 1)
+        g_v = self.sheaf_gain_v.view(1, -1, 1, 1)
+
+        x_cur = x
+        for _ in range(self.sheaf_iters):
+            left = self.Shift(x_cur, dim=-1, step=-1)
+            right = self.Shift(x_cur, dim=-1, step=+1)
+            up = self.Shift(x_cur, dim=-2, step=-1)
+            down = self.Shift(x_cur, dim=-2, step=+1)
+
+            h_mean = 0.5 * (left + right)
+            v_mean = 0.5 * (up + down)
+
+            msg = g_h * (h_mean - x_cur) + g_v * (v_mean - x_cur)
+            x_cur = x_cur + self.sheaf_alpha * msg
+        return x_cur
+
+    def GaugeStep(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(dim=(-2, -1), keepdim=True)
+        var = x.var(dim=(-2, -1), keepdim=True, unbiased=False)
+        x_norm = (x - mean) / (var + self.eps).sqrt()
+
+        gamma = torch.tanh(self.gauge_gamma(x_norm)) * self.gauge_scale
+        beta  = torch.tanh(self.gauge_beta(x_norm))  * self.gauge_bias_scale
+        return (1.0 + gamma) * x + beta
+
+    def Preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.SheafStep(x)
+        x = self.GaugeStep(x)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.Preprocess(x)
+        return super().forward(x)
+
+    def extra_repr(self) -> str:
+        base = super().extra_repr()
+        extras = (f"sheaf_alpha={float(self.sheaf_alpha):.4f}, "
+                  f"sheaf_iters={self.sheaf_iters}, "
+                  f"gauge_groups={self.gauge_gamma.groups}")
+        return base + ", " + extras
+
 
 
 class HebbianConv2d(nn.Module):
@@ -426,12 +533,17 @@ class PerceiveExtractor(nn.Module):
 
         cnn_feat_dim = baseChannels * 16
 
-        self.patch_embed = nn.Conv2d(
+        self.patch_embed = SheafGaugeConv2d(
             in_channels=cnn_feat_dim,
             out_channels=embedDim,
             kernel_size=patchSize,
             stride=patchSize,
-            bias=False)
+            bias=False,
+            sheaf_alpha=0.1,
+            sheaf_iters=1,
+            gauge_groups=1, 
+            gauge_scale=0.1,
+            gauge_bias_scale=0.1)
         
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embedDim))
         nn.init.trunc_normal_(self.cls_token, std=0.02)
@@ -531,9 +643,6 @@ class PerceiveExtractor(nn.Module):
                 nn.init.zeros_(self.patch_embed.bias)
 
         for m in self.modules():
-            if m is self.patch_embed:
-                continue
-
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
@@ -642,6 +751,9 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
 
         featIn = self.base.cnn_extractor(x)
         feat = self.base.cnn_feat_adapter(featIn)
+
+        if hasattr(self.base.patch_embed, "Preprocess"):
+            feat = self.base.patch_embed.Preprocess(feat)
 
         deltaFeat2D = deltasPerLayer[0].get("feat", None)
         if deltaFeat2D is not None:
