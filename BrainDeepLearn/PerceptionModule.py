@@ -7,6 +7,8 @@ from FunctionTools import GetParameterSScale, SiteSpec, BaseOnlineWrapper
 
 
 
+
+
 def ProjectFroNorm(tensor: torch.Tensor, maxNorm: Optional[float]):
     if not maxNorm:
         return
@@ -14,6 +16,19 @@ def ProjectFroNorm(tensor: torch.Tensor, maxNorm: Optional[float]):
         n = torch.linalg.vector_norm(tensor, ord=2)
         if torch.isfinite(n) and (n > maxNorm):
             tensor.mul_(float(maxNorm) / (n + 1e-12))
+
+
+def Norm2d(C: int, groups: int = 32, desiredCpg: int = 16, mincpg: int = 8) -> nn.Module:
+    max_g = min(groups, C)
+
+    candidates = [g for g in range(1, max_g + 1) if (C % g == 0) and (C // g >= mincpg)]
+
+    if not candidates:
+        candidates = [g for g in range(1, max_g + 1) if (C % g == 0)] 
+
+    g = min(candidates, key=lambda d: abs((C // d) - desiredCpg))
+
+    return nn.GroupNorm(num_groups=g, num_channels=C, affine=True)
 
 
 class GrowableLoRAConv2d(nn.Module):
@@ -322,12 +337,12 @@ class ResidualBlock(nn.Module):
         if stride != 1 or inChannels != outChannels:
             self.downsample = nn.Sequential(
                 nn.Conv2d(inChannels, outChannels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(outChannels))
+                Norm2d(outChannels))
             
         self.conv1 = HebbianConv2d(inChannels, outChannels, 3, stride=stride, padding=1,bias=False, useHebbian=useHebbian)
-        self.bn1 = nn.BatchNorm2d(outChannels)
+        self.bn1 = Norm2d(outChannels)
         self.conv2 = HebbianConv2d(outChannels, outChannels, 3, stride=1, padding=1,bias=False, useHebbian=useHebbian)
-        self.bn2 = nn.BatchNorm2d(outChannels)
+        self.bn2 = Norm2d(outChannels)
         self.relu = nn.ReLU(inplace=False) 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -343,7 +358,7 @@ class CNNFeatureExtractor(nn.Module):
         super().__init__()
         self.conv1 = HebbianConv2d(inChannels, baseChannels, 7, stride=2, padding=3,bias=False, useHebbian=useHebbian)
         
-        self.bn1 = nn.BatchNorm2d(baseChannels)
+        self.bn1 = Norm2d(baseChannels)
         self.relu = nn.ReLU(inplace=False) 
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
@@ -353,7 +368,7 @@ class CNNFeatureExtractor(nn.Module):
         self.layer4 = self.make_layer(baseChannels*4, baseChannels*8, blocks=2, stride=2, useHebbian=useHebbian)
 
         self.conv2 = HebbianConv2d(baseChannels*8, baseChannels*16, 3, stride=1, padding=1, bias=False, useHebbian=useHebbian)
-        self.bn2 = nn.BatchNorm2d(baseChannels*16)
+        self.bn2 = Norm2d(baseChannels*16)
 
     def make_layer(self, inC, outC, blocks, stride, useHebbian):
         layers = [ResidualBlock(inC, outC, stride=stride, useHebbian=useHebbian)]
@@ -510,15 +525,46 @@ class PerceiveExtractor(nn.Module):
 
 
     def InitWeights(self):
-        nn.init.kaiming_normal_(self.patch_embed.weight, mode='fan_out', nonlinearity='relu')
+        if isinstance(self.patch_embed, nn.Conv2d):
+            nn.init.kaiming_normal_(self.patch_embed.weight, mode='fan_out', nonlinearity='relu')
+            if self.patch_embed.bias is not None:
+                nn.init.zeros_(self.patch_embed.bias)
+
         for m in self.modules():
-            if isinstance(m, nn.Linear):
+            if m is self.patch_embed:
+                continue
+
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+            elif isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+                    nn.init.zeros_(m.bias)
+
+            elif isinstance(m, (nn.GroupNorm, nn.InstanceNorm2d, nn.LayerNorm, nn.BatchNorm2d)):
+                if getattr(m, "affine", True):
+                    if hasattr(m, "weight") and m.weight is not None:
+                        nn.init.ones_(m.weight)
+                    if hasattr(m, "bias") and m.bias is not None:
+                        nn.init.zeros_(m.bias)
+
+            elif isinstance(m, nn.MultiheadAttention):
+                if hasattr(m, "in_proj_weight") and m.in_proj_weight is not None:
+                    nn.init.xavier_uniform_(m.in_proj_weight)
+                if hasattr(m, "in_proj_bias") and m.in_proj_bias is not None:
+                    nn.init.zeros_(m.in_proj_bias)
+                if hasattr(m, "out_proj") and isinstance(m.out_proj, nn.Linear):
+                    nn.init.xavier_uniform_(m.out_proj.weight)
+                    if m.out_proj.bias is not None:
+                        nn.init.zeros_(m.out_proj.bias)
+            
+            elif isinstance(m, HebbianLinear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def ResetHebbianMemory(self):
         for module in self.modules():
