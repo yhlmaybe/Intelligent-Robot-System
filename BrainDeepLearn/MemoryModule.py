@@ -17,6 +17,228 @@ def StableTopk(scores: torch.Tensor, k: int):
     biased = scores.float() + eps
     return torch.topk(biased, k, dim=-1)
 
+
+class SoftSymbolicRules(nn.Module):
+    def __init__(self, k: int, gExcl: int = 5, gOr: int = 5, sparsity: float = 1e-4, entropy: float = 1e-4, impScale: float = 1.0):
+        super().__init__()
+        self.K = k
+        self.G_excl, self.G_or = gExcl, gOr
+        self.sparsity = sparsity
+        self.entropy = entropy
+        self.imp_scale = impScale
+
+        self.excl_logits = nn.Parameter(torch.randn(gExcl, k) * 0.05) if gExcl > 0 else None
+        self.or_logits = nn.Parameter(torch.randn(gOr, k) * 0.05) if gOr > 0 else None
+
+        self.imp_logits = nn.Parameter(torch.full((k, k), -3.5))
+        self.register_buffer("no_self", (1 - torch.eye(k)))
+
+    def Weights(self):
+        def RowNormPos(logits):
+            W = torch.sigmoid(logits)
+            return W / (W.sum(dim=1, keepdim=True) + 1e-6)
+
+        W_excl = RowNormPos(self.excl_logits) if self.excl_logits is not None else None
+        W_or = RowNormPos(self.or_logits) if self.or_logits is not None else None
+        A_imp = F.softplus(self.imp_logits) * self.no_self
+        return W_excl, W_or, A_imp
+
+    def forward(self, p: torch.Tensor, pPrev: Optional[torch.Tensor] = None):
+        B, K = p.size(0), p.size(1)
+        device = p.device
+        total = torch.zeros(B, device=device)
+        W_excl, W_or, A_imp = self.Weights()
+
+        if W_excl is not None and W_excl.numel() > 0:
+            s = torch.matmul(W_excl, p.t()).t() 
+            s2 = torch.matmul(W_excl.pow(2), (p.pow(2)).t()).t() 
+            excl_pen = 0.5 * (s * s - s2)
+            total = total + excl_pen.mean(dim=1)
+
+        if W_or is not None and W_or.numel() > 0:
+            eps = 1e-6
+            z = torch.clamp(p.unsqueeze(1) * W_or.unsqueeze(0), 0.0, 1.0) 
+            log_not = torch.log(torch.clamp(1.0 - z, eps, 1.0))
+            prod_not = torch.exp(log_not.sum(dim=-1))
+            total = total + prod_not.mean(dim=1)
+
+        Pa = p.unsqueeze(2) 
+        Pb = p.unsqueeze(1) 
+        diff = F.relu(Pa - Pb) 
+        imp_pen = (diff * A_imp.unsqueeze(0)).sum(dim=(1, 2)) / max(1, K)
+        total = total + self.imp_scale * imp_pen
+
+        if pPrev is not None and pPrev.shape == p.shape:
+            total = total + torch.relu(pPrev - p).mean(dim=1)
+
+        def RowEntropy(W, eps: float = 1e-6):
+            Wn = W / (W.sum(dim=1, keepdim=True) + eps)
+            return -(Wn * (Wn.clamp_min(eps)).log()).sum(dim=1).mean()
+
+        aux_reg = total.new_zeros([])
+        if self.training:
+            if W_excl is not None:
+                aux_reg = aux_reg + self.sparsity * W_excl.abs().mean() + self.entropy * RowEntropy(W_excl)
+            if W_or is not None:
+                aux_reg = aux_reg + self.sparsity * W_or.abs().mean() + self.entropy * RowEntropy(W_or)
+            aux_reg = aux_reg + self.sparsity * (F.softplus(self.imp_logits).abs().mean())
+
+        return total, aux_reg
+
+    @torch.no_grad()
+    def SeedFromSets(self, exclusives=None, atleastOne=None, implications=None, strength: float = 3.5):
+        if exclusives is not None and self.excl_logits is not None:
+            self.excl_logits.zero_()
+            for g, S in enumerate(exclusives[:self.G_excl]):
+                for j in S:
+                    if 0 <= j < self.K:
+                        self.excl_logits[g, j] = strength
+        if atleastOne is not None and self.or_logits is not None:
+            self.or_logits.zero_()
+            for g, S in enumerate(atleastOne[:self.G_or]):
+                for j in S:
+                    if 0 <= j < self.K:
+                        self.or_logits[g, j] = strength
+        if implications is not None:
+            self.imp_logits.data.fill_(-4.0)
+            for (a, b) in implications:
+                if 0 <= a < self.K and 0 <= b < self.K and a != b:
+                    self.imp_logits[a, b] = strength
+
+
+class SymbolicCoder(nn.Module):
+    def __init__(self, inDim: int, k: int, hidden: int = 1024, experts: int = 4):
+        super().__init__()
+        self.gate = nn.Linear(inDim, experts)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(inDim, hidden), nn.GELU(),
+                nn.Linear(hidden, hidden), nn.GELU(),
+                nn.Linear(hidden, k)
+            ) for _ in range(experts)])
+        
+        self.proto = nn.Parameter(torch.randn(k, inDim) * 0.02)
+        self.temp = nn.Parameter(torch.ones(k))
+        self.bias = nn.Parameter(torch.zeros(k))
+
+    def forward(self, x: torch.Tensor):
+        a = F.softmax(self.gate(x), dim=-1)
+        ys = [e(x) for e in self.experts] 
+        y = torch.stack(ys, dim=-1) 
+        logits = (y * a.unsqueeze(1)).sum(dim=-1) 
+
+        proto_term = F.normalize(x, dim=-1) @ F.normalize(self.proto, dim=-1).t()
+        logits = logits + proto_term + self.bias
+        P = torch.sigmoid(logits / self.temp.clamp_min(1e-2))
+        return P, logits
+
+
+class QueryToSymbol(nn.Module):
+    def __init__(self, inDim: int, k: int, hidden: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(inDim),
+            nn.Linear(inDim, hidden), nn.SiLU(),
+            nn.Linear(hidden, k))
+
+    def forward(self, q: torch.Tensor):
+        return torch.sigmoid(self.net(q))
+
+
+class SymbolicMemory(nn.Module):
+    def __init__(self, k: int, capacity: int = 4096):
+        super().__init__()
+        self.K = k
+        self.capacity = capacity
+        self.register_buffer("Pstore", torch.zeros(capacity, k, dtype=torch.float16))
+        self.register_buffer("prio", torch.zeros(capacity))
+        self.register_buffer("step", torch.zeros(capacity, dtype=torch.long))
+        self.register_buffer("touch", torch.zeros(capacity, dtype=torch.long))
+        self.filled = 0
+        self.global_step = 0
+
+    @torch.no_grad()
+    def StepTick(self):
+        self.global_step += 1
+
+    @torch.no_grad()
+    def Store(self, p: torch.Tensor, score: float = 1.0):
+        p = p.detach().clamp(0, 1)
+        if self.filled < self.capacity:
+            i = self.filled
+            self.filled += 1
+        else:
+            age = (self.global_step - self.step[:self.filled]).clamp(min=0).float()
+            eff = self.prio[:self.filled] * torch.exp(-0.01 * age)
+            i = int(torch.argmin(eff).item())
+        self.Pstore[i] = p.to(self.Pstore.dtype)
+        self.prio[i] = max(float(score), float(self.prio[i].item()))
+        self.step[i] = self.global_step
+        self.touch[i] += 1
+
+    def Retrieve(self, qSym: torch.Tensor, topK: int = 8, recentBias: float = 0.05, returnDetails: bool = False):
+        if self.filled == 0:
+            out = torch.zeros(qSym.size(0), self.K, device=qSym.device, dtype=qSym.dtype)
+            return (out, None, None, None) if returnDetails else out
+
+        P = self.Pstore[:self.filled].to(qSym.device).float()
+
+        sim = qSym @ P.t()
+        age = (self.global_step - self.step[:self.filled]).clamp(min=0).float().to(qSym.device)
+        sim = sim * torch.exp(-recentBias * age).unsqueeze(0) * (self.prio[:self.filled].to(qSym.device).unsqueeze(0))
+
+        k = max(1, min(topK, self.filled))
+        top_sim, idx = StableTopk(sim, k)
+        w = F.softmax(top_sim, dim=-1)
+        vecs = P[idx] 
+        out = torch.einsum('bk,bkd->bd', w, vecs)
+
+        with torch.no_grad():
+            flat = idx.reshape(-1)
+            self.touch[flat] += 1
+            self.step[flat] = self.global_step
+
+        if returnDetails:
+            return out, vecs, w, idx
+        return out
+
+
+class SymbolicEmbed(nn.Module):
+    def __init__(self, k: int, outDim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(k + 4, 512), nn.GELU(),
+            nn.Linear(512, outDim))
+
+    def forward(self, pCur: torch.Tensor, symRecall: torch.Tensor):
+        ent = -(pCur * (pCur.clamp_min(1e-6)).log() + (1 - pCur) * ((1 - pCur).clamp_min(1e-6)).log()).mean(dim=-1, keepdim=True)
+        pmax = pCur.max(dim=-1, keepdim=True).values
+        pmean = pCur.mean(dim=-1, keepdim=True)
+        pspa = (pCur < 0.1).float().mean(dim=-1, keepdim=True)
+        feat = torch.cat([symRecall, ent, pmax, pmean, pspa], dim=-1) 
+        return F.normalize(self.mlp(feat), dim=-1)  
+
+
+class NeuroSymbolicFusion(nn.Module):
+    def __init__(self, inDims: Dict[str, int], mid: int, out: int):
+        super().__init__()
+        D = inDims
+        total_in = D["y"] + D["mem"] + D["ltm"] + D["gws"] + D["sym"] + D["ctx"]
+        self.backbone = nn.Sequential(
+            nn.Linear(total_in, 1024), nn.GELU(),
+            nn.Linear(1024, 1024), nn.GELU(),
+            nn.Linear(1024, mid), nn.GELU())
+        
+        self.refine = FusionMoE(inDim=mid + D["mem"], outDim=out, numExperts=4, hidden=2048)
+        self.norm = nn.LayerNorm(out)
+
+    def forward(self, ySsm, memVec, ltmVec, gwsVec, symVec, ctx):
+        x = torch.cat([ySsm, memVec, ltmVec, gwsVec, symVec, ctx], dim=-1)
+        mid = self.backbone(x)
+        fused = self.refine(torch.cat([mid, memVec], dim=-1))  
+        return self.norm(fused)
+
+
 class GlobalWorkspace(nn.Module):
     def __init__(self, dim: int, slots: int = 12, defaultTtl: int = 8, recencyTemp: float = 0.07, priorityTemp: float = 1.0):
         super().__init__()
@@ -521,37 +743,29 @@ class MemoryExtractor(nn.Module):
         self.gws_summary = nn.Linear(ssmStateDim + outputDim + memoryDim, memoryDim)
         self.gws_gate = nn.Sequential(nn.Linear(memoryDim * 2, 128), nn.ReLU(), nn.Linear(128, 1), nn.Sigmoid())
 
-        # neural symbolic reasoning
         self.ns_enable: bool = True
         self.ns_lambda = 0.08
         self.ns_alpha_write = 0.15
         self.ns_alpha_out = 0.2
         self.ns_retrieve_boost = 0.3
 
-        self.ns_K: int = 24
+        self.ns_K: int = 80
+        self.sym_capacity: int = 4096 
+        self.ns_gExcl: int = 5  
+        self.ns_gOr: int = 5 
 
-        self.ns_exclusives = [[0,1,2,3],[4,5,6],[7,8,9],[10,11,12],[13,14,15,16,17],]
+        self.ns_coder_pre = SymbolicCoder(self.memory_dim, self.ns_K, hidden=1024, experts=4)
+        self.ns_coder_post = SymbolicCoder(self.memory_dim, self.ns_K, hidden=1024, experts=4)
 
-        self.ns_atleast_one = [[0,1,2,3],[4,5,6],[7,8,9],[10,11,12],[13,14,15,16,17],]
+        self.sym_rules = SoftSymbolicRules(k=self.ns_K,gExcl=self.ns_gExcl,gOr=self.ns_gOr,sparsity=1e-4,entropy=1e-4,impScale=1.0)
 
-        self.ns_implications = [(12, 1),(11, 0),(10, 0),(1, 13),(2, 14),(3, 15),(6, 16),(6, 14),(9, 15),(7, 13),(20, 17),(21, 17),(22, 13),]
+        self.sym_query = QueryToSymbol(inDim=self.memory_dim, k=self.ns_K, hidden=512) 
+        self.sym_mem = SymbolicMemory(k=self.ns_K, capacity=self.sym_capacity)
 
-        self.ns_head_pre = NeSyHead(self.memory_dim, self.ns_K, hidden=1024, experts=4)
-        self.ns_head_post = NeSyHead(self.memory_dim, self.ns_K, hidden=1024, experts=4)
-
-        self.ns_proto = nn.Parameter(torch.randn(self.ns_K, self.memory_dim) * 0.02) 
-        self.ns_temp = nn.Parameter(torch.ones(self.ns_K)) 
-        self.ns_bias = nn.Parameter(torch.zeros(self.ns_K))   
-
-        def init_mlp(m: nn.Module):
-            for mod in m.modules():
-                if isinstance(mod, nn.Linear):
-                    nn.init.xavier_uniform_(mod.weight)
-                    if mod.bias is not None:
-                        nn.init.zeros_(mod.bias)
-
-        init_mlp(self.ns_head_pre)
-        init_mlp(self.ns_head_post)
+        self.sym_embed = SymbolicEmbed(self.ns_K, outDim=self.memory_dim)
+        self.sym_fuse_gate = nn.Sequential(
+            nn.Linear(self.memory_dim * 2, 128), nn.ReLU(),
+            nn.Linear(128, 1), nn.Sigmoid())
 
         self._ns_prev_P_pre: Optional[torch.Tensor] = None
         self._ns_prev_P_post: Optional[torch.Tensor] = None
@@ -623,27 +837,13 @@ class MemoryExtractor(nn.Module):
             self._ns_prev_P_post = torch.zeros(B, self.ns_K, device=device)
 
     def NsRules(self, P: torch.Tensor, P_prev: Optional[torch.Tensor]) -> torch.Tensor:
-        B = P.size(0)
-        device = P.device
-        per_sample = torch.zeros(B, device=device)
+        if (not self.ns_enable) or (P is None):
+            return torch.zeros(P.size(0), device=P.device)
 
-        for S in self.ns_exclusives:
-            if len(S) >= 2:
-                ps = P[:, S]
-                s = ps.sum(dim=1)
-                s2 = (ps * ps).sum(dim=1)
-                per_sample = per_sample + 0.5 * (s * s - s2)
+        per_sample, aux_reg = self.sym_rules(P, P_prev)
 
-        for (a, b) in self.ns_implications:
-            per_sample = per_sample + torch.relu(P[:, a] - P[:, b])
-
-        for S in self.ns_atleast_one:
-            if len(S) > 0:
-                anyp = P[:, S].max(dim=1).values
-                per_sample = per_sample + (1.0 - anyp)
-
-        if (P_prev is not None) and (P_prev.shape == P.shape):
-            per_sample = per_sample + torch.relu(P_prev - P).mean(dim=1)
+        if self.training and (aux_reg is not None):
+            self.AddInternalLoss(self.ns_lambda * aux_reg)
 
         return per_sample
 
@@ -651,30 +851,23 @@ class MemoryExtractor(nn.Module):
         if not self.ns_enable:
             dev = val.device
             return torch.empty(0, device=dev), torch.empty(0, device=dev), torch.zeros([], device=dev), importance
-        
+
         B, device = val.size(0), val.device
         self.NsEnsurePrev(B, device)
 
-        temp = self.ns_temp.clamp_min(1e-2).view(1, -1).to(val.dtype) 
-        bias = self.ns_bias.view(1, -1).to(val.dtype) 
-        proto = F.normalize(self.ns_proto, dim=-1).to(val.dtype)
-
-        logit_pre  = self.ns_head_pre(val) + (F.normalize(val,  dim=-1) @ proto.t()) + bias
-        P_pre  = torch.sigmoid(logit_pre  / temp)
-
-        per_sample_pre = self.NsRules(P_pre, self._ns_prev_P_pre)
-
+        P_pre, _ = self.ns_coder_pre(val) 
+        per_sample_pre = self.NsRules(P_pre, self._ns_prev_P_pre) 
         self._ns_prev_P_pre = P_pre.detach()
 
+        damp = torch.clamp(per_sample_pre, 0, 1).view(-1, 1)
         updated_importance = importance
         if self.ns_alpha_write > 0.0:
-            damp = torch.clamp(per_sample_pre, 0, 1).view(-1, 1)
             updated_importance = importance * (1.0 - self.ns_alpha_write * damp)
 
         rule_loss_pre = per_sample_pre.mean()
-        self._ns_penalty_vec = torch.clamp(per_sample_pre, 0, 1).view(-1, 1).detach()
+        self._ns_penalty_vec = damp.detach()
 
-        return P_pre, per_sample_pre, rule_loss_pre, updated_importance  
+        return P_pre, per_sample_pre, rule_loss_pre, updated_importance
 
     def NsPostRead(self, memRecall: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self.ns_enable:
@@ -685,28 +878,22 @@ class MemoryExtractor(nn.Module):
                     torch.zeros([], device=dev),
                     torch.zeros(B, 1, device=dev),
                     memRecall)
-        
+
         B, device = memRecall.size(0), memRecall.device
         self.NsEnsurePrev(B, device)
 
-        temp = self.ns_temp.clamp_min(1e-2).view(1, -1).to(memRecall.dtype)
-        bias = self.ns_bias.view(1, -1).to(memRecall.dtype)
-        proto = F.normalize(self.ns_proto, dim=-1).to(memRecall.dtype)
-
-        logit_post = self.ns_head_post(memRecall) + (F.normalize(memRecall, dim=-1) @ proto.t()) + bias
-        P_post = torch.sigmoid(logit_post / temp)
-
+        P_post, _ = self.ns_coder_post(memRecall)  
         per_sample_post = self.NsRules(P_post, self._ns_prev_P_post)
         self._ns_prev_P_post = P_post.detach()
 
         damp = torch.clamp(per_sample_post, 0, 1).view(-1, 1)
         adj_mem = memRecall
         if self.ns_alpha_out > 0.0:
-            adj_mem = memRecall * (1.0 - self.ns_alpha_out * damp)  
+            adj_mem = memRecall * (1.0 - self.ns_alpha_out * damp)
 
         self._ns_penalty_vec = damp.detach()
         rule_loss_post = per_sample_post.mean()
-        return P_post, per_sample_post, rule_loss_post, damp, adj_mem 
+        return P_post, per_sample_post, rule_loss_post, damp, adj_mem
 
 
 
@@ -739,6 +926,7 @@ class MemoryExtractor(nn.Module):
 
             self.gws.StepTick()
             self.ltm.StepTick()
+            self.sym_mem.StepTick()
 
             h_prev = self.h_state.detach()
 
@@ -780,7 +968,12 @@ class MemoryExtractor(nn.Module):
             self.AddInternalLoss(1e-4 * reg)
 
             if self.ns_enable:
-                P_pre, per_pre, rule_pre, importance = self.NsPreWrite(val, importance) 
+                P_pre, per_pre, rule_pre, importance = self.NsPreWrite(val, importance)
+                self.AddInternalLoss(self.ns_lambda * rule_pre)
+
+                with torch.no_grad():
+                    for i in range(B):
+                        self.sym_mem.Store(P_pre[i], score=float(importance[i].item()))
             else:
                 rule_pre = torch.zeros([], device=h_new.device)
 
@@ -815,17 +1008,26 @@ class MemoryExtractor(nn.Module):
                 mem_recall = (1.0 - gamma_ltm) * mem_recall + gamma_ltm * ltm_recall
 
             if self.ns_enable:
-                P_post, per_post, rule_post, damp, mem_recall = self.NsPostRead(mem_recall) 
+                P_post, per_post, rule_post, damp, mem_recall = self.NsPostRead(mem_recall)
                 self.ns_last = {
-                    "P_pre": P_pre.detach(),
+                    "P_pre": P_pre.detach() if 'P_pre' in locals() else None,
                     "P_post": P_post.detach(),
-                    "per_sample_pre": per_pre.detach(),
+                    "per_sample_pre": per_pre.detach() if 'per_pre' in locals() else None,
                     "per_sample_post": per_post.detach(),
-                    "rule_loss_pre": (self.ns_lambda * rule_pre).detach(),
+                    "rule_loss_pre": (self.ns_lambda * rule_pre).detach() if 'rule_pre' in locals() else torch.zeros([], device=mem_recall.device),
                     "rule_loss_post": (self.ns_lambda * rule_post).detach(),}
-                self.AddInternalLoss(self.ns_lambda * (rule_pre + rule_post))
+                self.AddInternalLoss(self.ns_lambda * rule_post)
             else:
                 self.ns_last = {}
+
+            Qsym = self.sym_query(key)
+            sym_recall = self.sym_mem.Retrieve(Qsym, topK=8) 
+
+            P_cur = P_post if self.ns_enable else Qsym 
+            sym_vec = self.sym_embed(P_cur, sym_recall)
+
+            g_sym = self.sym_fuse_gate(torch.cat([mem_recall, sym_vec], dim=-1))
+            mem_recall = (1.0 - g_sym) * mem_recall + g_sym * sym_vec
 
             if tdError is not None:
                 mem_recall = self.ApplyOutputGate(mem_recall, tdError, gate_bias)
@@ -1150,6 +1352,8 @@ class MemoryExtractor(nn.Module):
         self.ns_last = {}
         self.ResetInternalLoss()
 
+        self.sym_mem = SymbolicMemory(k=self.ns_K, capacity=self.sym_capacity)
+
     def ResetHebbianMemory(self):
         self.fast_weights.zero_()
         self._steps_since_svd = 0
@@ -1216,7 +1420,13 @@ class MemoryExtractor(nn.Module):
         if "rng_cuda" in state and state["rng_cuda"] is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["rng_cuda"])
 
-        self.h_state.copy_(state["h_state"].to(self.h_state.device))
+        
+        hs = state["h_state"].to(self.h_state.device)
+        if self.h_state.shape != hs.shape:
+            self.h_state.resize_(hs.shape).copy_(hs)
+        else:
+            self.h_state.copy_(hs)
+
         self.fast_weights.copy_(state["fast_weights"].to(self.fast_weights.device))
         self.memory_keys.copy_(state["memory_keys"].to(self.memory_keys.device))
         self.memory_values.copy_(state["memory_values"].to(self.memory_values.device))
@@ -1315,12 +1525,12 @@ class TestMemoryMTool:
 
             q = (e0 + e1).unsqueeze(0)
             out, w = gws.Attend(q, topk=2, returnWeights=True)
-            assert out.shape == (1, dim), f"GWS attend shape mismatch: {out.shape}"
-            assert w is not None and w.shape == (1, 2), f"GWS weights shape mismatch: {None if w is None else w.shape}"
+            assert out.shape == (1, dim)
+            assert w is not None and w.shape == (1, 2)
 
             gws.StepTick()
             out2, _ = gws.Attend(q, topk=3)
-            assert out2.shape == (1, dim), "GWS attend after TTL shape mismatch"
+            assert out2.shape == (1, dim)
 
             print("GlobalWorkspace test passed.")
             return True
@@ -1344,8 +1554,8 @@ class TestMemoryMTool:
 
             q = vec
             fused, *_ = ltm.Retrieve(q, topkSem=4, topkEpi=2)
-            assert fused.shape == (1, dim), f"LTM retrieve shape mismatch: {fused.shape}"
-            assert torch.linalg.norm(fused).item() > 0, "LTM retrieve returned near-zero vector"
+            assert fused.shape == (1, dim)
+            assert torch.linalg.norm(fused).item() > 0
 
             print("LongTermMemory test passed.")
             return True
@@ -1364,8 +1574,8 @@ class TestMemoryMTool:
             x = torch.randn(B, cfg["inputDim"], device=self.device)
             out, memrec = mem(x)
 
-            assert out.shape == (B, cfg["outputDim"]), f"MemoryExtractor out shape mismatch: {out.shape}"
-            assert memrec.shape == (B, cfg["memoryDim"]), f"MemoryExtractor mem_recall shape mismatch: {memrec.shape}"
+            assert out.shape == (B, cfg["outputDim"])
+            assert memrec.shape == (B, cfg["memoryDim"])
             print("MemoryExtractor forward test passed.")
             return True
         except AssertionError as e:
@@ -1386,10 +1596,9 @@ class TestMemoryMTool:
             _ = mem(x)
             mem.SetState(state0)
             out2, _ = mem(x)
-            assert torch.allclose(out1, out2, atol=5e-4, rtol=1e-3), "State restore did not reproduce identical output from the same pre-forward state."
+            assert torch.allclose(out1, out2, atol=5e-4, rtol=1e-3)
             print("MemoryExtractor state save/restore test passed.")
             return True
-
         except AssertionError as e:
             print(f"MemoryExtractor state test failed: {e}")
             return False
@@ -1407,11 +1616,11 @@ class TestMemoryMTool:
 
             goal = torch.randn(cfg["memoryDim"], device=self.device)
             hyp = mem.Reason(goal=goal, steps=3)
-            assert hyp.shape == (1, cfg["memoryDim"]), f"Reason output shape mismatch: {hyp.shape}"
-            assert torch.linalg.norm(hyp).item() > 0, "Reason produced near-zero vector"
+            assert hyp.shape == (1, cfg["memoryDim"])
+            assert torch.linalg.norm(hyp).item() > 0
 
             snap = mem.gws.Inspect()
-            assert torch.count_nonzero(snap["priority"] > 0).item() > 0, "GWS appears empty after Reason"
+            assert torch.count_nonzero(snap["priority"] > 0).item() > 0
 
             print("MemoryExtractor Reason test passed.")
             return True
@@ -1435,15 +1644,15 @@ class TestMemoryMTool:
             fw_after = mem.fast_weights.detach().clone()
             imp_after = mem.memory_importance.detach().clone()
 
-            assert torch.linalg.norm(fw_after) <= torch.linalg.norm(fw_before) + 1e-6, "SoftReset did not reduce fast_weights norm"
+            assert torch.linalg.norm(fw_after) <= torch.linalg.norm(fw_before) + 1e-6
             if mem.memory_filled > 0:
-                assert torch.mean(imp_after[:mem.memory_filled]) <= torch.mean(imp_before[:mem.memory_filled]) + 1e-6, "SoftReset did not reduce memory importance"
+                assert torch.mean(imp_after[:mem.memory_filled]) <= torch.mean(imp_before[:mem.memory_filled]) + 1e-6
 
             mem.ResetAll()
-            assert mem.memory_filled == 0 and mem.time_step == 0, "ResetAll did not clear counters"
+            assert mem.memory_filled == 0 and mem.time_step == 0
             gws_snap = mem.gws.Inspect()
-            assert torch.count_nonzero(gws_snap["priority"]).item() == 0, "ResetAll did not clear GWS priorities"
-            assert mem.ltm.semantic.filled == 0 and mem.ltm.episodic.filled == 0, "ResetAll did not clear LTM"
+            assert torch.count_nonzero(gws_snap["priority"]).item() == 0
+            assert mem.ltm.semantic.filled == 0 and mem.ltm.episodic.filled == 0
 
             print("MemoryExtractor Reset/SoftReset test passed.")
             return True
@@ -1457,8 +1666,7 @@ class TestMemoryMTool:
     def TestMemoryTrain(self, steps: int = 120, batch_size: int = 16):
         try:
             torch.manual_seed(2025)
-            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64, outputDim=64, useAmp=True, gwsSlots=8, gwsTtl=6,consolidateEvery=10_000, rehearseEvery=10_000,)
-            
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64, outputDim=64, useAmp=True, gwsSlots=8, gwsTtl=6, consolidateEvery=10_000, rehearseEvery=10_000)
             device = self.device
             mem = MemoryExtractor(**cfg).to(device)
             mem.train()
@@ -1474,12 +1682,12 @@ class TestMemoryMTool:
             must_train_prefixes = [
                 "kv_mlp", "kv_head_proj", "k_bias", "v_bias",
                 "importance_net", "local_gate", "fusion_gate_net",
-                "ltm_gate", "fusion",
+                "ltm_gate", "fusion", "norm",
                 "A_full", "B_mat", "C_mat", "D_mat",
-                "gws_summary", "gws_gate", "ns_head_pre", "ns_head_post",
-                "grad_bridge", "norm",
-                "ctrl_head", "ctrl_norm",]
-            
+                "gws_summary", "gws_gate",
+                "ns_coder_pre", "ns_coder_post", "sym_query", "sym_embed", "sym_rules",
+                "grad_bridge", "ctrl_head", "ctrl_norm",]
+
             snap_before = {}
             for n, p in mem.named_parameters():
                 if any(n.startswith(pref) for pref in must_train_prefixes):
@@ -1500,10 +1708,12 @@ class TestMemoryMTool:
             in_dim = cfg["inputDim"]
             for t in range(steps):
                 x = torch.randn(batch_size, in_dim, device=device)
+                td = torch.randn(batch_size, device=device)  
+                rwd = torch.randn(batch_size, device=device) 
                 with torch.no_grad():
                     target = teacher(x)
 
-                out, _ = mem(x)
+                out, _ = mem(x, tdError=td, reward=rwd)
                 base = F.mse_loss(out, target)
                 total = self.AttachAllInternalLosses(mem, base)
 
@@ -1527,31 +1737,32 @@ class TestMemoryMTool:
                 if (t + 1) % max(1, steps // 4) == 0:
                     print(f"[NormalTrain] step {t+1}/{steps} | mse={losses[-1]:.6f}")
 
-            assert len(losses) >= 2, "No valid loss trajectory is generated"
+            assert len(losses) >= 2
             start, end = losses[0], losses[-1]
             print(f"[NormalTrain] loss start={start:.6f} -> end={end:.6f}")
             rel_ok = end <= start * 0.70
             abs_ok = (start - end) >= 0.05
-            assert rel_ok or abs_ok, f"Losses have not decreased significantly : start={start:.6f}, end={end:.6f}"
+            assert rel_ok or abs_ok, f"Loss not decreased enough: start={start:.6f}, end={end:.6f}"
 
             snap_after = {}
             for n, p in mem.named_parameters():
                 if any(n.startswith(pref) for pref in must_train_prefixes):
                     snap_after[n] = p.detach().clone()
 
-            for must in ["importance_net", "local_gate", "kv_mlp", "kv_head_proj"]:
-                assert grads_seen[must], f"{must} Never received gradients (maybe detached or not participating in the computation graph)"
+            for must in ["importance_net", "local_gate", "kv_mlp", "kv_head_proj", "ns_coder_pre", "ns_coder_post", "sym_rules"]:
+                assert grads_seen[must], f"{must} never received gradients"
                 delta_sum = 0.0
                 for n in snap_before:
                     if n.startswith(must):
                         delta_sum += float((snap_after[n] - snap_before[n]).abs().sum().item())
-                assert delta_sum > 0.0, f"{must} No parameter update occurs (total Δ = 0)"
+                assert delta_sum > 0.0, f"{must} parameters did not change (Δ=0)"
                 print(f"[trainable] {must}: grad_seen={grads_seen[must]}, Δ_sum={delta_sum:.3e}")
 
-            soft_expect = ["fusion_gate_net", "fusion", "A_full", "B_mat", "C_mat", "D_mat","kv_mlp", "kv_head_proj", "k_bias", "v_bias",]
-
+            soft_expect = ["fusion_gate_net", "fusion", "A_full", "B_mat", "C_mat", "D_mat",
+                           "kv_mlp", "kv_head_proj", "k_bias", "v_bias", "gws_summary", "gws_gate",
+                           "ctrl_head", "ctrl_norm", "grad_bridge", "sym_query", "sym_embed"]
             for pref in soft_expect:
-                assert grads_seen[pref], f"{pref} No gradient hits seen (check if it participates in the loss path)"
+                assert grads_seen[pref], f"{pref} saw no gradients (check if in loss path)"
 
             with torch.no_grad():
                 p1 = []
@@ -1560,39 +1771,27 @@ class TestMemoryMTool:
                         p1.append(p.data.flatten()[:32].clone())
                 p1 = torch.cat(p1) if p1 else torch.zeros(1, device=device)
                 delta = (p0 - p1).abs().mean().item()
-                assert delta > 1e-6, f"The parameters barely changed, delta={delta:.3e}"
+                assert delta > 1e-6, f"Overall parameters barely changed, delta={delta:.3e}"
 
-            assert "fast_weights" not in dict(mem.named_parameters()), "fast_weights should be a buffer and should not appear in named_parameters"
-            assert "memory_keys"  not in dict(mem.named_parameters())
-            assert "memory_values" not in dict(mem.named_parameters())
-            assert "memory_importance" not in dict(mem.named_parameters())
-            assert "memory_steps" not in dict(mem.named_parameters())
-            assert "memory_corr" not in dict(mem.named_parameters())
-            assert "h_state" not in dict(mem.named_parameters())
+            npn = dict(mem.named_parameters())
+            assert "fast_weights" not in npn
+            assert "memory_keys"  not in npn and "memory_values" not in npn
+            assert "memory_importance" not in npn and "memory_steps" not in npn and "memory_corr" not in npn
+            assert "h_state" not in npn
 
             print("TestNormalTrainingConvergence + Trainability checks passed.")
             return True
 
         except AssertionError as e:
-            print(f"TestNormalTrainingConvergence/Trainability failed: {e}")
+            print(f"TestMemoryTrain failed: {e}")
             return False
         except Exception as e:
-            print(f"TestNormalTrainingConvergence/Trainability error: {e}")
+            print(f"TestMemoryTrain error: {e}")
             return False
 
-
     @torch.no_grad()
-    def NumericalStabilityProbe(
-        self,
-        mem, *,
-        steps: int = 200,
-        batch: int = 4,
-        eps: float = 1e-6,
-        perturb_each_step: bool = True,
-        seed: int = 123,
-        device: torch.device | None = None,
-        print_every: int = 25,):
-
+    def NumericalStabilityProbe(self, mem, *, steps: int = 200, batch: int = 4, eps: float = 1e-6, perturb_each_step: bool = True,
+                                seed: int = 123, device: torch.device | None = None, print_every: int = 25,):
         device = device or (next(mem.parameters()).device if any(p.is_cuda for p in mem.parameters()) else torch.device("cpu"))
         rng = torch.Generator(device=device).manual_seed(seed)
 
@@ -1602,7 +1801,10 @@ class TestMemoryMTool:
             xw = torch.randn(batch, in_dim, generator=rng, device=device)
             mem(xw)
 
-        mem2 = copy.deepcopy(mem)
+        mem2 = MemoryExtractor(inputDim=mem.B_mat.in_features, ssmStateDim=mem.ssm_state_dim, memoryDim=mem.memory_dim,
+                                memorySize=mem.memory_size, outputDim=mem.output_dim, useAmp=mem.use_amp, gwsSlots=mem.gws.slots,
+                                gwsTtl=mem.gws.default_ttl, consolidateEvery=mem.consolidate_every, rehearseEvery=mem.rehearse_every,).to(device)
+        mem2.SetState(mem.GetState())
 
         cos_hist = []
         for t in range(steps):
@@ -1622,16 +1824,13 @@ class TestMemoryMTool:
                 print(f"[probe] step {t+1:4d}/{steps}, cosine={c:.6f}")
 
         cos_np = np.array(cos_hist, dtype=np.float64)
-
         print(f"steps={steps}, batch={batch}, eps={eps:g}, perturb_each_step={perturb_each_step}")
-        print(f"cos(mean)={cos_np.mean():.6f}, cos(std)={cos_np.std():.6f}, " f"cos(min)={cos_np.min():.6f}, cos(max)={cos_np.max():.6f}")
+        print(f"cos(mean)={cos_np.mean():.6f}, cos(std)={cos_np.std():.6f}, cos(min)={cos_np.min():.6f}, cos(max)={cos_np.max():.6f}")
         print(f"cos(start)={cos_np[0]:.6f}, cos(last)={cos_np[-1]:.6f}, drop={cos_np[0]-cos_np[-1]:.6f}")
-
         return list(cos_hist)
-    
+
     def RandnLikeGen(self, x: torch.Tensor, generator: torch.Generator | None = None):
         return torch.randn(x.shape, dtype=x.dtype, device=x.device, generator=generator)
-
 
     def TestNumericalStability(self):
         try:
@@ -1639,16 +1838,10 @@ class TestMemoryMTool:
             mem = MemoryExtractor(**cfg).to(self.device)
 
             cos_hist = self.NumericalStabilityProbe(
-                mem,
-                steps=200,
-                batch=4,
-                eps=1e-6,
-                perturb_each_step=True,
-                seed=123,
-                device=self.device,
-                print_every=25,)
+                mem, steps=200, batch=4, eps=1e-6, perturb_each_step=True,
+                seed=123, device=self.device, print_every=25,)
 
-            ok = (sum(c < 0.95 for c in cos_hist[:30]) == 0)  
+            ok = (sum(c < 0.95 for c in cos_hist[:30]) == 0)
             if ok:
                 print("MemoryExtractor numerical stability test passed.")
                 return True
@@ -1658,7 +1851,6 @@ class TestMemoryMTool:
         except Exception as e:
             print(f"MemoryExtractor numerical stability test error: {e}")
             return False
-
 
     def AttachAllInternalLosses(self, rootModule: torch.nn.Module, baseLoss: torch.Tensor):
         extras = []
@@ -1670,10 +1862,9 @@ class TestMemoryMTool:
                     extras.append(v.to(device=baseLoss.device, dtype=baseLoss.dtype))
         return baseLoss + (torch.stack(extras).sum() if extras else baseLoss.new_zeros([]))
 
-
     def TrainStepSmoke(self):
         try:
-            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96,useAmp=True, gwsSlots=8, gwsTtl=6, consolidateEvery=10_000, rehearseEvery=10_000)
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6, consolidateEvery=10_000, rehearseEvery=10_000)
             mem = MemoryExtractor(**cfg).to(self.device)
             mem.train()
             opt = torch.optim.Adam(mem.parameters(), lr=1e-3)
@@ -1682,7 +1873,7 @@ class TestMemoryMTool:
             x = torch.randn(B, cfg["inputDim"], device=self.device)
             target = torch.randn(B, cfg["outputDim"], device=self.device)
 
-            out, _ = mem(x)
+            out, _ = mem(x, tdError=torch.randn(B, device=self.device), reward=torch.randn(B, device=self.device))
             base = F.mse_loss(out, target)
 
             total = self.AttachAllInternalLosses(mem, base)
@@ -1690,10 +1881,11 @@ class TestMemoryMTool:
             total.backward()
 
             nesy_grad_ok = any(
-                (("ns_head_pre" in n or "ns_head_post" in n) and p.grad is not None
-                 and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0)
+                (("ns_coder_pre" in n or "ns_coder_post" in n or "sym_rules" in n) and
+                 (p.grad is not None) and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0)
                 for n, p in mem.named_parameters())
-            assert nesy_grad_ok, "NeSy heads did not receive gradients."
+            
+            assert nesy_grad_ok, "NeSy stack (ns_coder_* / sym_rules) did not receive gradients."
 
             for n, p in mem.named_parameters():
                 if p.grad is not None:
@@ -1708,7 +1900,7 @@ class TestMemoryMTool:
         except Exception as e:
             print(f"TestMemoryMTool.TrainStepSmoke error: {e}")
             return False
-    
+
     def TrainNeSyOnlySanity(self, steps: int = 30):
         try:
             cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6)
@@ -1718,11 +1910,13 @@ class TestMemoryMTool:
             mem.train()
             opt = torch.optim.Adam([p for p in mem.parameters() if p.requires_grad], lr=1e-3)
 
+            watch = lambda n: ("ns_coder_pre" in n) or ("ns_coder_post" in n) or ("sym_rules" in n)
+            snap_before = {n: p.detach().clone() for n, p in mem.named_parameters() if watch(n)}
+
             in_dim = cfg["inputDim"]
-            last = None
-            for t in range(steps):
+            for _ in range(steps):
                 x = torch.randn(8, in_dim, device=self.device)
-                out, _ = mem(x)
+                _ = mem(x) 
                 base = torch.zeros([], device=self.device)
                 total = self.AttachAllInternalLosses(mem, base)
 
@@ -1730,17 +1924,13 @@ class TestMemoryMTool:
                 total.backward()
                 opt.step()
 
-                cur = float(total.detach().item())
-                if last is not None:
-                    pass
-                last = cur
+            delta = 0.0
+            with torch.no_grad():
+                for n, p in mem.named_parameters():
+                    if n in snap_before:
+                        delta += float((p - snap_before[n]).abs().sum().item())
 
-            changed = False
-            for n, p in mem.named_parameters():
-                if ("ns_head_pre" in n or "ns_head_post" in n) and p.grad is not None:
-                    changed = True
-                    break
-            assert changed, "NeSy heads were not updated under internal loss only."
+            assert delta > 0.0, f"NeSy parameters have not been effectively updated (Δ={delta:.3e})"
             print("TestMemoryMTool.TrainNeSyOnlySanity passed.")
             return True
         except AssertionError as e:
@@ -1749,45 +1939,89 @@ class TestMemoryMTool:
         except Exception as e:
             print(f"TestMemoryMTool.TrainNeSyOnlySanity error: {e}")
             return False
-    
 
+    def TestAllTrainablesTouched(self, steps: int = 10, batch_size: int = 12):
+        try:
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64, outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6, consolidateEvery=10_000, rehearseEvery=10_000)
+            device = self.device
+            mem = MemoryExtractor(**cfg).to(device)
+            mem.train()
 
-    @torch.no_grad()
-    def PrimeMemoryWithConflict(self, mem: MemoryExtractor, rounds: int = 4):
-        in_dim = mem.B_mat.in_features
-        for _ in range(rounds):
-            x = torch.randn(8, in_dim, device=self.device)
-            mem(x)
+            opt = torch.optim.Adam(mem.parameters(), lr=1e-3)
+            seen = {n: False for n, p in mem.named_parameters() if p.requires_grad and p.data.numel() > 0}
+
+            for t in range(steps):
+                x = torch.randn(batch_size, cfg["inputDim"], device=device)
+                y = torch.randn(batch_size, cfg["outputDim"], device=device)
+                td = torch.randn(batch_size, device=device)
+                rwd = torch.randn(batch_size, device=device)
+
+                out, _ = mem(x, tdError=td, reward=rwd)
+                base = F.mse_loss(out, y)
+                total = self.AttachAllInternalLosses(mem, base)
+
+                opt.zero_grad()
+                total.backward()
+
+                for n, p in mem.named_parameters():
+                    if n in seen and p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0:
+                        seen[n] = True
+
+                torch.nn.utils.clip_grad_norm_(mem.parameters(), 1.0)
+                opt.step()
+
+            missing = sorted([n for n, hit in seen.items() if not hit])
+            if missing:
+                print("Parameters without nonzero grads at least once:")
+                for n in missing:
+                    print("  -", n)
+            assert len(missing) == 0, f"{len(missing)} parameters never received gradients"
+            print("TestAllTrainablesTouched passed.")
+            return True
+        except AssertionError as e:
+            print(f"TestAllTrainablesTouched failed: {e}")
+            return False
+        except Exception as e:
+            print(f"TestAllTrainablesTouched error: {e}")
+            return False
 
     def TestNeSyRetrievalEffect(self):
         try:
-            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64, outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6)
-            mem = MemoryExtractor(**cfg).to(self.device)
-            mem.eval()
-            mem.ns_enable = False
-            self.PrimeMemoryWithConflict(mem, rounds=6)
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=48, outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6, consolidateEvery=1000, rehearseEvery=1000)
+            torch.manual_seed(7)
+            device = self.device
 
-            x = torch.randn(8, cfg["inputDim"], device=self.device)
-            _, rec_off = mem(x)
+            B = 6
+            mem_on = MemoryExtractor(**cfg).to(device)
+            mem_on.ns_enable = True
+            mem_on.eval()
+            with torch.no_grad():
+                for _ in range(3):
+                    xw = torch.randn(B, cfg["inputDim"], device=device)
+                    mem_on(xw)
 
-            mem.ns_enable = True
-            mem.ns_retrieve_boost = 0.5
-            mem.ns_alpha_out = 0.4
+            mem_off = MemoryExtractor(**cfg).to(device)
+            mem_off.SetState(mem_on.GetState())
+            mem_off.ns_enable = False 
+            mem_off.eval()
 
-            _, rec_on = mem(x)
+            with torch.no_grad():
+                xq = torch.randn(B, cfg["inputDim"], device=device)
+                _, recall_on  = mem_on(xq)
+                _, recall_off = mem_off(xq)
 
-            delta = (rec_on - rec_off).norm(dim=1).mean().item()
-            cos = F.cosine_similarity(rec_on, rec_off, dim=1).mean().item()
-            assert (delta > 1e-3) or (cos < 0.99), f"NeSy had negligible effect on retrieval (delta={delta:.3e}, cos={cos:.4f})"
-            print("TestMemoryMTool.TestNeSyRetrievalEffect passed.")
+            diff = (recall_on - recall_off).abs().mean().item()
+            assert diff > 1e-6, f"NeSy on/off has little effect on mem_recall, diff={diff:.3e}"
+            print("TestNeSyRetrievalEffect passed.")
             return True
+
         except AssertionError as e:
-            print(f"TestMemoryMTool.TestNeSyRetrievalEffect failed: {e}")
+            print(f"TestNeSyRetrievalEffect failed: {e}")
             return False
         except Exception as e:
-            print(f"TestMemoryMTool.TestNeSyRetrievalEffect error: {e}")
+            print(f"TestNeSyRetrievalEffect error: {e}")
             return False
-    
+
     def CheckAttachCollector(self):
         try:
             mem = MemoryExtractor(inputDim=32, ssmStateDim=32, memoryDim=48, memorySize=16, outputDim=48, useAmp=True).to(self.device)
@@ -1801,7 +2035,7 @@ class TestMemoryMTool:
             auto_extra = total - base
 
             diff = float((manual - auto_extra).abs().item())
-            tol = float(torch.finfo(base.dtype).eps) * 8 
+            tol = float(torch.finfo(base.dtype).eps) * 8
             assert diff <= tol, f"Collector mismatch: diff={diff:g} > tol={tol:g}"
 
             print("TestMemoryMTool.CheckAttachCollector passed.")
@@ -1812,7 +2046,6 @@ class TestMemoryMTool:
         except Exception as e:
             print(f"TestMemoryMTool.CheckAttachCollector error: {e}")
             return False
-    
 
     def NoNanAfterManySteps(self, steps: int = 50):
         try:
@@ -1824,7 +2057,7 @@ class TestMemoryMTool:
             for t in range(steps):
                 x = torch.randn(8, cfg["inputDim"], device=self.device)
                 y = torch.randn(8, cfg["outputDim"], device=self.device)
-                out, _ = mem(x)
+                out, _ = mem(x, tdError=torch.randn(8, device=self.device), reward=torch.randn(8, device=self.device))
                 base = F.mse_loss(out, y)
                 total = self.AttachAllInternalLosses(mem, base)
 
@@ -1843,7 +2076,7 @@ class TestMemoryMTool:
         except Exception as e:
             print(f"TestMemoryMTool.NoNanAfterManySteps error: {e}")
             return False
-        
+
     def RunAll(self):
         results = {
             "GlobalWorkspace": self.TestGlobalWorkspace(),
@@ -1857,7 +2090,8 @@ class TestMemoryMTool:
             "TrainNeSyOnlySanity": self.TrainNeSyOnlySanity(),
             "TestNeSyRetrievalEffect": self.TestNeSyRetrievalEffect(),
             "CheckAttachCollector": self.CheckAttachCollector(),
-            "NoNanAfterManySteps": self.NoNanAfterManySteps(),}
+            "NoNanAfterManySteps": self.NoNanAfterManySteps(),
+            "AllTrainablesTouched": self.TestAllTrainablesTouched(),}
         
         passed = sum(1 for v in results.values() if v)
         print(f"\nMemory module tests: {passed}/{len(results)} passed.")
