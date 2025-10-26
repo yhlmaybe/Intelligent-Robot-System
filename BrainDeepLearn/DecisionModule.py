@@ -658,9 +658,6 @@ class DecisionExtractor(nn.Module):
                 logp_extra = StableLogProbBernoulli(extra_logits_s, extra_act)
                 logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx)
                 
-                std = torch.exp(logstd)
-                eps_train = torch.randn_like(std)
-                mouse_a_train = (mu + eps_train * std).detach()
                 LOG_TWO_PI = math.log(2.0 * math.pi)
                 logp_mouse = -0.5 * (2.0 * logstd + LOG_TWO_PI).sum(-1)
             else:
