@@ -752,14 +752,14 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         featIn = self.base.cnn_extractor(x)
         feat = self.base.cnn_feat_adapter(featIn)
 
-        if hasattr(self.base.patch_embed, "Preprocess"):
-            feat = self.base.patch_embed.Preprocess(feat)
-
         deltaFeat2D = deltasPerLayer[0].get("feat", None)
         if deltaFeat2D is not None:
             C = deltaFeat2D.size(0)
             w1x1 = deltaFeat2D.view(C, C, 1, 1)
             feat = feat + F.conv2d(featIn, w1x1, bias=None, stride=1, padding=0)
+
+        if hasattr(self.base.patch_embed, "Preprocess"):
+            feat = self.base.patch_embed.Preprocess(feat)
 
         W_eff = self.base.patch_embed.weight
         baseDelta = self.base.patch_adapter.DeltaWeight()
