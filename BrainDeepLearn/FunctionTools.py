@@ -54,6 +54,8 @@ class BaseOnlineWrapper(nn.Module):
 
         self.InitCandidates(initRankEach)
 
+        self.freezeOldPar = True
+
     def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
         raise NotImplementedError
 
@@ -139,6 +141,9 @@ class BaseOnlineWrapper(nn.Module):
 
         else:
             raise ValueError(f"Unknown action {action}")
+    
+    def SetFreezeOldPar(self, isfreezeOld: bool):
+        self.freezeOldPar = isfreezeOld
 
     def EmptyLayerSlot(self):
         return {"A": nn.ParameterList(), "B": nn.ParameterList(), "s": nn.ParameterList()}

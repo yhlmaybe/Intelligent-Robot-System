@@ -147,8 +147,8 @@ class S4DCell(nn.Module):
         denom = (1 - k).clamp_min(1e-6)
         return num / denom
 
-    def ResetState(self, batch: int, device: torch.device):
-        self.x = torch.zeros(batch, self.N, device=device)
+    def ResetState(self, batch: int):
+        self.x = torch.zeros(batch, self.N)
 
     def Step(self, zPrev: torch.Tensor, aT: torch.Tensor, *, updateState: bool = True) -> torch.Tensor:
         u = torch.cat([zPrev, aT], dim=-1)
@@ -522,6 +522,7 @@ class RSSMWorldModel(nn.Module):
     def __init__(
         self,
         visionDim: int = 1024,
+        batchSize: int = 1,
         actionDim: int = 256,
         deterDim: int = 512,
         stochDim: int = 64,
@@ -632,7 +633,7 @@ class RSSMWorldModel(nn.Module):
         nn.init.constant_(self.meta_gate_e.bias, -1.0)
         nn.init.constant_(self.meta_gate_mu.bias, -1.0)
 
-        self.ResetHidden()
+        self.ResetHidden(batchSize=batchSize)
 
         if self._use_memory and self._mem_path:
             self.LoadMemory(self._mem_path, map_location=None, strict=False)
@@ -734,11 +735,10 @@ class RSSMWorldModel(nn.Module):
         vals = self._mem_vals[idx] # [B, deterDim]
         return vals[0] if single else vals
 
-    def ResetHidden(self, batchSize: int = 1, device: torch.device | str = "cpu"):
-        device = torch.device(device)
-        self._h = torch.zeros(batchSize, self.deter_dim, device=device)
-        self._z = torch.zeros(batchSize, self.stoch_dim, device=device)
-        self.s4.ResetState(batchSize, device)
+    def ResetHidden(self, batchSize: int = 1):
+        self._h = torch.zeros(batchSize, self.deter_dim)
+        self._z = torch.zeros(batchSize, self.stoch_dim)
+        self.s4.ResetState(batchSize)
         self._A_prev = None
 
     def ExportState(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -820,7 +820,7 @@ class RSSMWorldModel(nn.Module):
 
         r_pred = self.rew_head(s_next).squeeze(-1)
         d_prob = torch.sigmoid(self.done_head(s_next)).squeeze(-1)
-        return h_next, z_next, s_next, r_pred, d_prob
+        return h_next, z_next, s_next, r_pred, d_prob # s_next is world state
 
     def StepPosterior(
         self,
@@ -828,7 +828,8 @@ class RSSMWorldModel(nn.Module):
         zPrev: torch.Tensor,
         visionIn: torch.Tensor,
         actionEnc: torch.Tensor,
-        sample: bool = False,) -> Dict[str, torch.Tensor]:
+        sample: bool = False, # False: Deterministic Forward, True: Reparameterized sampling with noise(More exploratory)
+        ) -> Dict[str, torch.Tensor]:
 
         raw_e = self.obs_enc(visionIn)
 
@@ -897,8 +898,8 @@ class RSSMWorldModel(nn.Module):
             "h_next": h_next,
             "z_next": z_next,
             "s_next": s_next,
-            "r_pred": r_pred,
-            "d_prob": d_prob,
+            "r_pred": r_pred, # Prediction Rewards
+            "d_prob": d_prob, # Predicted termination probability
             "mu_p": mu_p,
             "logstd_p": logstd_p,
             "mu_q": mu_q,
@@ -1613,82 +1614,82 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
 
         if site == "obs1":
-            wm.obs_enc[1].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.obs_enc[1].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "obs2":
-            wm.obs_enc[4].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.obs_enc[4].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "act":
-            wm.act_proj[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.act_proj[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "prior":
-            wm.prior_net[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.prior_net[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "post":
-            wm.post_net[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.post_net[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "state":
-            wm.state_proj[1].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.state_proj[1].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "rew1":
-            wm.rew_head[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.rew_head[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "rew2":
-            wm.rew_head[2].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.rew_head[2].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "done1":
-            wm.done_head[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.done_head[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "done2":
-            wm.done_head[2].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.done_head[2].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "dec1":
-            wm.obs_dec[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.obs_dec[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "dec2":
-            wm.obs_dec[2].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.obs_dec[2].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
 
         if site == "s4_B":
-            wm.s4.B.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.s4.B.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "s4_C":
-            wm.s4.C.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.s4.C.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "s4_D0":
-            wm.s4.D0.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.s4.D0.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "s4_gate":
-            wm.s4.gate.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.s4.gate.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "s4_out_gate":
-            wm.s4.out_gate.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.s4.out_gate.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
 
         if site == "hnn_to":
-            wm.phys_hnn.to_qp.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.phys_hnn.to_qp.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "hnn_H1":
-            wm.phys_hnn.H[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.phys_hnn.H[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "hnn_H2":
-            wm.phys_hnn.H[2].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.phys_hnn.H[2].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "hnn_from":
-            wm.phys_hnn.from_qp.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.phys_hnn.from_qp.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
 
         if site == "ode_f1":
-            wm.phys_ode.f[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.phys_ode.f[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "ode_f2":
-            wm.phys_ode.f[2].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.phys_ode.f[2].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
 
         if site == "mix":
-            wm.mix_gate[0].Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.mix_gate[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
 
         if site == "conn_enc_s":
-            wm.conn.enc_s[1].linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.conn.enc_s[1].linear.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "conn_enc_a":
-            wm.conn.enc_a[1].linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.conn.enc_a[1].linear.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "conn_gamma":
-            wm.conn.film_gamma_a.linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.conn.film_gamma_a.linear.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "conn_beta":
-            wm.conn.film_beta_a.linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.conn.film_beta_a.linear.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
 
         if site.startswith("conn_blk"):
             tag = site[len("conn_blk"):] 
             idx_str, which = tag.split("_ff")
             i = int(idx_str)
             if which == "1":
-                wm.conn.blocks[i].ff[0].linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+                wm.conn.blocks[i].ff[0].linear.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
             if which == "2":
-                wm.conn.blocks[i].ff[3].linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+                wm.conn.blocks[i].ff[3].linear.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
 
         if site == "conn_head_uv" and wm.conn.use_lowrank:
-            wm.conn.head_uv.linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.conn.head_uv.linear.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "conn_head_full" and wm.conn.use_full:
-            wm.conn.head_full.linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.conn.head_full.linear.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         if site == "conn_mix":
-            wm.conn.mix.linear.Grow(addRank=a.size(0), init=init, freezeOld=False); return True
+            wm.conn.mix.linear.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
 
         return False
 
@@ -1713,7 +1714,7 @@ class TestWorldMTool:
         self.wm = RSSMWorldModel(
             visionDim=1024, actionDim=256, deterDim=256, stochDim=32, stateDim=256,
             useDecoder=True, useMemory=False, nsEnabled=True).to(self.device)
-        self.wm.ResetHidden(batchSize=4, device=self.device)
+        self.wm.ResetHidden(batchSize=4)
 
     def Batch(self, B, keyIdx=(17,)):
         vision = torch.randn(B, 1024, device=self.device)
@@ -1760,7 +1761,7 @@ class TestWorldMTool:
         try:
             B = 4
             vision, keys, mouse = self.Batch(B, keyIdx=(17,57))
-            self.wm.ResetHidden(batchSize=B, device=self.device)
+            self.wm.ResetHidden(batchSize=B)
 
             a_enc = self.wm.action_encoder(keys, mouse)
             h0 = torch.zeros(B, self.wm.deter_dim, device=self.device)
@@ -1797,7 +1798,7 @@ class TestWorldMTool:
         try:
             B = 4
             _, keys, mouse = self.Batch(B, keyIdx=(30,))
-            self.wm.ResetHidden(batchSize=B, device=self.device)
+            self.wm.ResetHidden(batchSize=B)
 
             a_enc = self.wm.action_encoder(keys, mouse)
             h0 = torch.zeros(B, self.wm.deter_dim, device=self.device)
@@ -1829,7 +1830,7 @@ class TestWorldMTool:
             self.wm.train()
             for p in self.wm.parameters():
                 p.requires_grad_(True)
-            self.wm.ResetHidden(batchSize=B, device=self.device)
+            self.wm.ResetHidden(batchSize=B)
 
             out = self.wm.ForwardTrainSeq(
                 visionSeq=vision, keysVec=keys, mouseSeq=mouse,
@@ -1854,10 +1855,10 @@ class TestWorldMTool:
         try:
             B = 2
             vision, keys, mouse = self.Batch(B, keyIdx=(18,))
-            self.wm.ResetHidden(batchSize=B, device=self.device)
+            self.wm.ResetHidden(batchSize=B)
             _ = self.wm.ForwardTrainSeq(vision, keys, mouse)
             has_prev = (self.wm._A_prev is not None) and (self.wm._A_prev.shape == (B, self.wm.state_dim, self.wm.state_dim))
-            self.wm.ResetHidden(batchSize=B, device=self.device)
+            self.wm.ResetHidden(batchSize=B)
             cleared = (self.wm._A_prev is None)
             ok = has_prev and cleared
             print("Conn regularization cache reset " + ("passed." if ok else "failed."))
@@ -1872,7 +1873,7 @@ class TestWorldMTool:
             wrapper.train()
             B = 4
             vision, keys, mouse = self.Batch(B, keyIdx=(17,57))
-            self.wm.ResetHidden(batchSize=B, device=self.device)
+            self.wm.ResetHidden(batchSize=B)
             out = wrapper(self.MKX(vision, keys, mouse, mode="posterior", sample=False))
             ok = ( ("h_next" in out) and ("z_next" in out) and ("s_next" in out)
                    and ("r_pred" in out) and ("d_prob" in out)
@@ -1889,7 +1890,7 @@ class TestWorldMTool:
             wrapper.eval()
             B = 3
             vision, keys, mouse = self.Batch(B, keyIdx=(31,))
-            self.wm.ResetHidden(batchSize=B, device=self.device)
+            self.wm.ResetHidden(batchSize=B)
 
             out0 = wrapper.ForwardWithDeltas(self.MKX(vision, keys, mouse, mode="posterior", sample=False), None, None, None, [{}])
             Z = self.wm.stoch_dim
@@ -1920,7 +1921,7 @@ class TestWorldMTool:
 
             Bsz = 4
             vision, keys, mouse = self.Batch(Bsz, keyIdx=(33,))
-            self.wm.ResetHidden(batchSize=Bsz, device=self.device)
+            self.wm.ResetHidden(batchSize=Bsz)
 
             with torch.no_grad():
                 last_alpha = lo.alpha[-1].clone()
@@ -1946,7 +1947,7 @@ class TestWorldMTool:
 
             B = 6
             vision, keys, mouse = self.Batch(B, keyIdx=(45,))
-            self.wm.ResetHidden(batchSize=B, device=self.device)
+            self.wm.ResetHidden(batchSize=B)
 
             out = wrapper(self.MKX(vision, keys, mouse, mode="posterior", sample=False))
             loss = ( F.mse_loss(out["r_pred"], torch.zeros_like(out["r_pred"])) +
@@ -1985,7 +1986,7 @@ class TestWorldMTool:
 
             B = 8
             vision, keys, mouse = self.Batch(B, keyIdx=(31,49))
-            self.wm.ResetHidden(batchSize=B, device=self.device)
+            self.wm.ResetHidden(batchSize=B)
 
             watch = None
             for p in wrapper.CandParameters():
@@ -2097,7 +2098,7 @@ class TestWorldMTool:
 
             B = 5
             vision, keys, mouse = self.Batch(B, keyIdx=(31,))
-            self.wm.ResetHidden(batchSize=B, device=self.device)
+            self.wm.ResetHidden(batchSize=B)
 
             x1 = self.MKX(vision, keys, mouse, mode="posterior", sample=False)
             out1 = wrapper(x1)
@@ -2140,7 +2141,7 @@ class TestWorldMTool:
 
             B = 3
             vision, keys, mouse = self.Batch(B, keyIdx=(31, 57))
-            wm.ResetHidden(batchSize=B, device=self.device)
+            wm.ResetHidden(batchSize=B)
 
             h0 = torch.zeros(B, wm.deter_dim, device=self.device)
             z0 = torch.zeros(B, wm.stoch_dim, device=self.device)
@@ -2149,7 +2150,7 @@ class TestWorldMTool:
 
             out_base = wm.StepPosterior(h0, z0, vision, a_enc, sample=False)
 
-            wm.ResetHidden(batchSize=B, device=self.device)
+            wm.ResetHidden(batchSize=B)
 
             x = self.MKX(vision, keys, mouse, mode="posterior", sample=False, hPrev=h0, zPrev=z0)
             x["a_enc"] = a_enc  
@@ -2204,7 +2205,7 @@ class TestWorldMTool:
             B = 3
             vision = torch.randn(B, 1024, device=self.device)
             _, keys, mouse = self.Batch(B, keyIdx=(33,))
-            wm.ResetHidden(batchSize=B, device=self.device)
+            wm.ResetHidden(batchSize=B)
 
             h0 = torch.zeros(B, wm.deter_dim, device=self.device)
             z0 = torch.zeros(B, wm.stoch_dim, device=self.device)

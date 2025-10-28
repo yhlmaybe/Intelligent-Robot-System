@@ -1066,55 +1066,55 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
 
         if site == "toz":
-            self.base.to_z.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.to_z.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
 
         if site == "kbd_base":
-            self.base.keyboard.base_head.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.keyboard.base_head.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
         if site == "kbd_skill":
-            self.base.keyboard.skill_head.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.keyboard.skill_head.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
         if site == "kbd_extra":
-            self.base.keyboard.extra_head.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.keyboard.extra_head.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
 
         if site == "mouse_mu":
-            self.base.mouse.mu_head.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.mouse.mu_head.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
         if site == "mouse_ls":
-            self.base.mouse.logstd_head.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.mouse.logstd_head.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
 
         if site == "click0":
-            self.base.mouse.click_head[0].Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.mouse.click_head[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
         if site == "click2":
-            self.base.mouse.click_head[2].Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.mouse.click_head[2].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
 
         if site == "opt_pi":
-            self.base.option.pi_o.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.option.pi_o.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
         if site == "opt_psi":
-            self.base.option.psi_head.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.option.psi_head.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
         if site == "opt_beta0":
-            self.base.option.beta_head[0].Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.option.beta_head[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
         if site == "opt_beta2":
-            self.base.option.beta_head[2].Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.option.beta_head[2].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
 
         if site == "opt_trans":
-            self.base.option.trans_adapter.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.option.trans_adapter.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
         
         if site.startswith("feat") and ("_fc" in site):
             head, tail = site.split("_", 1)   
             idx = int(head.replace("feat", ""))
             blk = self.base.feature_net[idx]
-            getattr(blk, tail).Grow(addRank=a.size(0), init=init, freezeOld=False)
+            getattr(blk, tail).Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
 
         raise ValueError(f"Unknown site: {site}")

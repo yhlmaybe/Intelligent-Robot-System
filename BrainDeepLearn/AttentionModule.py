@@ -773,13 +773,13 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
 
         if site == "q":
-            mhsa.q_adapter.Grow(addRank=r, init=init, freezeOld=False)
+            mhsa.q_adapter.Grow(addRank=r, init=init, freezeOld=self.freezeOldPar)
         elif site == "k":
-            mhsa.k_adapter.Grow(addRank=r, init=init, freezeOld=False)
+            mhsa.k_adapter.Grow(addRank=r, init=init, freezeOld=self.freezeOldPar)
         elif site == "v":
-            mhsa.v_adapter.Grow(addRank=r, init=init, freezeOld=False)
+            mhsa.v_adapter.Grow(addRank=r, init=init, freezeOld=self.freezeOldPar)
         elif site == "o":
-            mhsa.o_adapter.Grow(addRank=r, init=init, freezeOld=False)
+            mhsa.o_adapter.Grow(addRank=r, init=init, freezeOld=self.freezeOldPar)
         else:
             raise ValueError(f"Unknown site: {site}")
         return True

@@ -36,60 +36,42 @@ def ToDevice(x, device):
 
 
 class BrainCore(nn.Module):
-    SEQ_LEN = 16
     def __init__(
         self,
         device: Optional[torch.device] = None,
         *,
+        seqLen: int = 16,
         plasticHebbian: bool = True,
-        plasticMeta: bool = True,
+        plasticOnlineLearning: bool = True,
         usePlanner: bool = True,):
         super().__init__()
+        self.SEQ_LEN = seqLen
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         self.perc = PerceiveExtractor(useHebbian=plasticHebbian)
-        if hasattr(self.perc, "plastic_on"):
-            self.perc.plastic_on = plasticMeta
-
-        self.attn = AttentionExtractor(hebbianRate=(0.01 if plasticHebbian else 0.0))
-        self.mem = MemoryExtractor(hebbAlpha=(0.15 if plasticHebbian else 0.0), useMeta=plasticMeta)
-
-        # 决策器输入维度对齐 Memory 输出：768
+        self.attn = AttentionExtractor(sequenceLength=seqLen, hebbianRate=(0.01 if plasticHebbian else 0.0))
+        self.mem = MemoryExtractor(hebbAlpha=(0.15 if plasticHebbian else 0.0))
         self.actor = DecisionExtractor(stateDim=768, includeNoSkill=True, useHebbOnline=plasticHebbian)
-
-        # 世界模型：视觉维度使用感知输出的 1024，内部状态 256
-        self.world = RSSMWorldModel(
-            visionDim=1024, actionDim=128, deterDim=256, stochDim=32, stateDim=256, useDecoder=True
-        )
-        self.world.ResetHidden(batchSize=1, device=self.device)
-
-        # 价值估计：接收 prev memory(768) + prev attn(1024) + 当前世界状态(256)
+        self.world = RSSMWorldModel(visionDim=1024)
         self.critic = ValueEstimationExtractor(memoryDim=768, attnDim=1024, stateDim=256)
 
-        # 规划器（CEM），用于生成 prior 混合到 actor
-        self.use_planner = usePlanner
         self.planner = DecisionPlannerExtractor().BuildPlanner(
             worldModel=self.world,
             KEYBOARD_LAYOUT=KEYBOARD_LAYOUT,
             includeNoSkill=True,
             horizon=5, N=64, elite=8, iters=3,
             gamma=0.99, temperature=1.0, momentum=0.15,
-            laplace=1.0, minVar=1e-4, epsBern=1e-4
-        )
+            laplace=1.0, minVar=1e-4, epsBern=1e-4)
 
-        # === 键盘向量长度：max_code+1(离散按键) + 2(左右键点击) ===
         all_codes = []
         for grp in KEYBOARD_LAYOUT.values():
             all_codes += list(grp.values())
         self.max_code = max(all_codes)
         self.keyvec_dim = (self.max_code + 1) + 2  # 106
 
-        # 运行缓存
         self._buf_B = 0
         self.ResetBuffers(B=1, device=self.device)
         self.to(self.device)
 
-    # ----------------- 缓存管理 -----------------
     @torch.no_grad()
     def ResetBuffers(self, B: int = 1, device: Optional[torch.device] = None):
         device = device or self.device
@@ -97,25 +79,19 @@ class BrainCore(nn.Module):
         def z(*s, dtype=torch.float32):
             return torch.zeros(B, *s, device=device, dtype=dtype)
 
-        # 上一时刻的 B 与 C
         self.prev_mem = z(768)
         self.prev_attn = z(1024)
-        # 世界隐藏状态的语义投影
         self.prev_state = z(256)
 
-        # 上一时刻的动作（供世界模型使用）
-        self.prev_key_vec = z(self.keyvec_dim)  # [B,106]
+        self.prev_key_vec = z(self.keyvec_dim) 
         self.prev_mouse = z(2)
 
-        # 教师信号（传给价值估计/注意力/记忆）
-        self.prev_reward = z()         # [B]
-        self.prev_done = z()           # [B]
-        self.prev_entropy = z()        # [B,1]   来自 actor 的策略熵聚合指标
-        self.prev_unc = z()            # [B,1]   来自 critic 的不确定性
-        self.prev_td = z()             # [B,1]   来自 critic 的 TD 误差
+        self.prev_done = z() 
+        self.prev_entropy = z() 
+        self.prev_unc = z() 
+        self.prev_td = z() 
 
-        # 感知帧序列（供注意力）
-        self.perc_buf = z(self.SEQ_LEN, 1024)  # [B,T,1024]
+        self.perc_buf = z(self.SEQ_LEN, 1024) 
         self.tlen = torch.zeros(B, dtype=torch.long, device=device)
 
         self.have_prev = False
@@ -129,50 +105,50 @@ class BrainCore(nn.Module):
 
     @torch.no_grad()
     def PushPerc(self, feat_p: torch.Tensor):
-        # shift-left
         self.perc_buf[:, :-1] = self.perc_buf[:, 1:].clone()
         self.perc_buf[:, -1] = feat_p
         self.tlen = torch.clamp(self.tlen + 1, max=self.SEQ_LEN)
 
-    # ----------------- 核心一步 -----------------
     def Step(
         self,
-        frame: torch.Tensor,                      # [B,3,H,W]
-        rewardExt: Optional[torch.Tensor] = None, # [B] 或 None
-        doneFlag: Optional[torch.Tensor] = None,  # [B] 或 None
+        frames: torch.Tensor, # [B, T=SEQ_LEN, C, H, W]
+        rewardExt: Optional[torch.Tensor] = None,
+        doneFlag: Optional[torch.Tensor] = None,
         *,
-        sampleActions: bool = True,               # True=随机; False=确定性
-        deterministicActor: bool = False,
-    ) -> Dict[str, Any]:
-        B, dev = frame.size(0), frame.device
+        sampleActions: bool = True, 
+        deterministicActor: bool = False,) -> Dict[str, Any]:
+        B, dev = frames.size(0), frames.device
         self.EnsureB(B, dev)
 
-        # 1) 感知 A
-        feat_p = self.perc(frame)                 # [B,1024]
-        self.PushPerc(feat_p)
-        L = int(max(1, min(self.SEQ_LEN, int(self.tlen.min().item()))))
-        seq = self.perc_buf[:, -L:]               # [B,L,1024]
+        B, T = frames.shape[:2]
 
-        # 2) 世界模型（使用上一步动作）
+        if T != self.SEQ_LEN:
+            raise ValueError(f"Expected sequence length {self.SEQ_LEN}, but got {T}. "f"frames.shape={tuple(frames.shape)}")
+
+        percs = [self.perc(frames[:, t]) for t in range(T) ]
+        seq = torch.stack(percs, dim=1)      
+
         a_enc_prev = self.world.action_encoder(self.prev_key_vec, self.prev_mouse)
         hPrev, zPrev = self.world.ExportState()
-        w_out = self.world.StepPosterior(hPrev, zPrev, visionIn=feat_p, actionEnc=a_enc_prev, sample=False)
-        s_t = w_out["s_next"]     # [B,256]
-        r_t = w_out["r_pred"]     # [B]
-        d_t = w_out["d_prob"]     # [B]
+        w_out = self.world.StepPosterior(hPrev, zPrev, visionIn=seq, actionEnc=a_enc_prev, sample=False)
 
-        # 3) 价值估计（E + 上一帧 B/C）
+        s_t = w_out["s_next"]
+        r_t = w_out["r_pred"]
+        d_t = w_out["d_prob"]
+        
+        rew_ext = None
+        if rewardExt is not None:
+            rew_ext = rewardExt.view(B)
+
         if self.have_prev:
-            rew_prev = (rewardExt if rewardExt is not None else self.prev_reward).view(B)
             done_prev = (doneFlag if doneFlag is not None else self.prev_done).view(B)
-            pe_prev = self.prev_entropy.view(B)          # [B]
-            unc_teacher = self.prev_unc.view(B)          # [B]
-            td_prev = self.prev_td.view(B)               # [B]
+            pe_prev = self.prev_entropy.view(B) 
+            unc_teacher = self.prev_unc.view(B) 
+            td_prev = self.prev_td.view(B)
             mem_prev = self.prev_mem
             attn_prev = self.prev_attn
         else:
             zeros = torch.zeros(B, device=dev)
-            rew_prev = zeros
             done_prev = zeros
             pe_prev = zeros
             unc_teacher = zeros
@@ -184,21 +160,19 @@ class BrainCore(nn.Module):
             memory=mem_prev,
             attn=attn_prev,
             state=s_t,
-            rewardExt=rew_prev,
+            rewardExt=rew_ext,
             policyEntropyPrev=pe_prev,
             uncertaintyTeacher=unc_teacher,
             tdErrorPrev=td_prev,
             done=done_prev,
             edgeIndex=None,
-            edgeWeight=None,
-        )
-        # 提取指导信号
-        td_sig = critic_out.tdError.view(B, 1)                      # [B,1]
+            edgeWeight=None,)
+        
+        td_sig = critic_out.tdError.view(B, 1)  
         ent_sig = critic_out.rComps.get("entropy", torch.zeros(B, device=dev)).view(B, 1)
         unc_sig = critic_out.uncertainty.view(B, 1)
 
-        # 4) 注意力 B（受 TD 影响）
-        feat_b = self.attn(seq, tdError=td_sig)                     # [B,1024]
+        feat_b = self.attn(seq, tdError=td_sig) 
 
         # 5) 记忆 C（受 TD/熵/奖励/不确定性影响）
         # 这里作为奖励信号，使用内在奖励 rInt（与外部奖励无关，更稳定）
@@ -251,7 +225,7 @@ class BrainCore(nn.Module):
             "decision": act_out,
             "world": {"state": s_t, "reward": r_t, "done": d_t},
             "critic": critic_out,
-            "features": {"perc": feat_p, "attn": feat_b, "mem": feat_c, "mem_recall": mem_recall},
+            "features": {"perc": percs, "attn": feat_b, "mem": feat_c, "mem_recall": mem_recall},
         }
 
     # ----------------- 运行态保存/恢复 -----------------

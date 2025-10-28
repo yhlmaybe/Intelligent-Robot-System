@@ -816,19 +816,19 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             if layerIdx != 0:
                 return False
             init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
-            self.base.cnn_feat_adapter.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.cnn_feat_adapter.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
 
         elif site == "patch":
             if layerIdx != 0:
                 return False
             init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
-            self.base.patch_adapter.Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.patch_adapter.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
 
         elif site == "token":
             init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
-            self.base.token_adapters[layerIdx].Grow(addRank=a.size(0), init=init, freezeOld=False)
+            self.base.token_adapters[layerIdx].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
 
         else:
