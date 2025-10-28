@@ -51,7 +51,7 @@ class GrowableLoRAConv2d(nn.Module):
         dt = self.target.weight.dtype
 
         A = init.get("A", torch.randn(addRank, self.cin * ksz, device=dev, dtype=dt) * 1e-4)
-        B = init.get("B", torch.zeros(self.cout, addRank, device=dev, dtype=dt) * 1e-4)
+        B = init.get("B", torch.randn(self.cout, addRank, device=dev, dtype=dt) * 1e-4)
         s = init.get("scale", 1e-3)
 
         A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
@@ -101,7 +101,7 @@ class GrowableConv1x1Adapter(nn.Module):
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
         if init is None: init = {}
         A = init.get("A", torch.randn(addRank, self.C, 1, 1) * 1e-4)
-        B = init.get("B", torch.zeros(self.C, addRank, 1, 1) * 1e-4)
+        B = init.get("B", torch.randn(self.C, addRank, 1, 1) * 1e-4)
         s = init.get("scale", 1e-3)
 
         dev, dt = self._anchor.device, self._anchor.dtype
@@ -143,7 +143,7 @@ class GrowableTokenAdapter(nn.Module):
         if init is None: init = {}
         
         A = init.get("A", torch.randn(addRank, self.D) * 1e-4)
-        B = init.get("B", torch.zeros(self.D, addRank) * 1e-4)
+        B = init.get("B", torch.randn(self.D, addRank) * 1e-4)
         s = init.get("scale", 1e-3)
 
         dev, dt = self._anchor.device, self._anchor.dtype

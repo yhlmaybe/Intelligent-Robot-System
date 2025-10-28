@@ -82,7 +82,7 @@ class GrowableLoRALinear(nn.Module):
             init = {}
         dev, dt = self.target.weight.device, self.target.weight.dtype
         A = init.get("A", torch.randn(addRank, self.in_f, device=dev, dtype=dt) * 1e-4)
-        B = init.get("B", torch.zeros(self.out_f, addRank, device=dev, dtype=dt))
+        B = init.get("B", torch.randn(self.out_f, addRank, device=dev, dtype=dt) * 1e-4)
         s = init.get("scale", 1e-3)
 
         A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
