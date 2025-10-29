@@ -927,8 +927,8 @@ class RSSMWorldModel(nn.Module):
         mouseSeq: torch.Tensor,  
         h0: Optional[torch.Tensor] = None,
         z0: Optional[torch.Tensor] = None,
-        rewardSeq: Optional[torch.Tensor] = None, 
-        doneSeq: Optional[torch.Tensor] = None, 
+        rewardSeq: Optional[torch.Tensor] = None, # [B]
+        doneSeq: Optional[torch.Tensor] = None, # [B]
         alphaKl: float = 0.8,
         freeNats: float = 1.0,
         reconCoef: float = 1.0,
@@ -1077,9 +1077,9 @@ class RSSMWorldModel(nn.Module):
             "loss_ns": ns_loss,
             "loss_ns_distill": ns_distill,
             "loss_ns_prior_logic": ns_prior_logic,
-            "s_last": s1,
-            "h_last": h_next,
-            "z_last": z1,
+            "s_next": s1,
+            "h_next": h_next,
+            "z_next": z1,
             "r_pred": r1,
             "d_prob": d_prob,}
 

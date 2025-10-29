@@ -539,8 +539,8 @@ class DecisionExtractor(nn.Module):
         self,
         stateFeat: torch.Tensor,                            
         *,
-        sample: bool = True,                               
-        deterministic: bool = False,                           
+        sample: bool = True, # Whether to perform sampling output specific actions
+        deterministic: bool = False, # True indicates that the sample will be taken from the mean or a greedy sample; False indicates that the sample will be taken randomly (to increase the exploratory nature of the process)
         prevOptionOnehot: Optional[torch.Tensor] = None,     
         prior: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,  
         mixW: float = 0.25,                              
