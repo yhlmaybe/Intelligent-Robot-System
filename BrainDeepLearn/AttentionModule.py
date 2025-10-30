@@ -470,7 +470,7 @@ class HebbianFusion(nn.Module):
 
         self.gate_head = nn.Sequential(
             nn.Linear(4 * embedDim, 2 * embedDim),
-            nn.GELU(),
+            nn.SiLU(),
             nn.Linear(2 * embedDim, 1))
         
         for m in self.gate_head:

@@ -480,8 +480,7 @@ class ValueEstimationExtractor(nn.Module):
                  microMaxAnchors: int = 256, microTopK: int = 4, microDistTau: float = 0.5, microLenPower: float = 0.5,
                  wUncertTeacher: float = 1e-2, wEntropyTeacher: float = 1e-3,
                  wGITScale: float = 1e-3, wGITShift: float = 1e-3, wGITSign: float = 1e-3,
-                 useHebb: bool = True, hebbCap: float = 1.0, hebbOja: bool = True, detachHebbGrad: bool = True,
-                 commitHistoricalAnchorInEval: bool = True,):
+                 useHebb: bool = True, hebbCap: float = 1.0, hebbOja: bool = True, detachHebbGrad: bool = True,):
         super().__init__()
 
         if irgKwargs is None:
@@ -489,8 +488,6 @@ class ValueEstimationExtractor(nn.Module):
 
         self.in_dim = memoryDim + attnDim + stateDim
         H = hidden
-
-        self.commit_in_eval = commitHistoricalAnchorInEval
 
         self.use_hebb = useHebb
         self.wEntropyTeacher = wEntropyTeacher
@@ -536,9 +533,9 @@ class ValueEstimationExtractor(nn.Module):
         nn.init.constant_(self.mix_gate.bias, -2.0)  
 
     def Trunk(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.relu(self.fc1_adapter(x))
+        h = F.gelu(self.fc1_adapter(x))
         h = self.norm1(h) if self.norm1 is not None else h
-        h = F.relu(self.fc2_adapter(h))
+        h = F.gelu(self.fc2_adapter(h))
         h = self.norm2(h) if self.norm2 is not None else h
         return h
 
@@ -758,16 +755,13 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         B, device = state.size(0), state.device
 
         d_fc1 = deltasPerLayer[0].get("fc1", None)
-
         h = self.LinearWithDelta(base.fc1, torch.cat([memory, attn, state], dim=-1), d_fc1, getattr(base, "fc1_adapter", None))
-
-        h = F.relu(h)
-
+        h = F.gelu(h)
         h = base.norm1(h) if base.norm1 is not None else h
 
         d_fc2 = deltasPerLayer[1].get("fc2", None)
         h = self.LinearWithDelta(base.fc2, h, d_fc2, getattr(base, "fc2_adapter", None))
-        h = F.relu(h)
+        h = F.gelu(h)
         h = base.norm2(h) if base.norm2 is not None else h
 
         d_uh = deltasPerLayer[1].get("uhead", None)
@@ -1492,7 +1486,7 @@ class TestValueEstimationMTool:
             mem, attn, state = self.RandBatch(B)
             done = torch.ones(B, device=self.device)
 
-            est = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useLayerNorm=True, commitHistoricalAnchorInEval=True).to(self.device)
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useLayerNorm=True).to(self.device)
             est.eval()
             est.rgen.teacher_dropout_prob = 0.0
 

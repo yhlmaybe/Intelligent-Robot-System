@@ -378,12 +378,12 @@ class DecisionExtractor(nn.Module):
         self.dim_click = 2
 
         self.psi_to = nn.ModuleDict({
-            "base": nn.Sequential( nn.Linear(psiDim, 64), nn.ReLU(),nn.Linear(64, self.dim_base)),
-            "extra": nn.Sequential(nn.Linear(psiDim, 64), nn.ReLU(), nn.Linear(64, self.dim_extra)),
-            "skill": nn.Sequential(nn.Linear(psiDim, 64), nn.ReLU(),nn.Linear(64, self.dim_skill)),
-            "mu": nn.Sequential(nn.Linear(psiDim, 32), nn.ReLU(),nn.Linear(32, self.dim_mu)),
-            "logstd": nn.Sequential(nn.Linear(psiDim, 32), nn.ReLU(),nn.Linear(32, self.dim_ls)),
-            "click": nn.Sequential(nn.Linear(psiDim, 32), nn.ReLU(),nn.Linear(32, self.dim_click)),})
+            "base": nn.Sequential( nn.Linear(psiDim, 64), nn.SiLU(),nn.Linear(64, self.dim_base)),
+            "extra": nn.Sequential(nn.Linear(psiDim, 64), nn.SiLU(), nn.Linear(64, self.dim_extra)),
+            "skill": nn.Sequential(nn.Linear(psiDim, 64), nn.SiLU(),nn.Linear(64, self.dim_skill)),
+            "mu": nn.Sequential(nn.Linear(psiDim, 32), nn.SiLU(),nn.Linear(32, self.dim_mu)),
+            "logstd": nn.Sequential(nn.Linear(psiDim, 32), nn.SiLU(),nn.Linear(32, self.dim_ls)),
+            "click": nn.Sequential(nn.Linear(psiDim, 32), nn.SiLU(),nn.Linear(32, self.dim_click)),})
 
         K = optionNum
         self.psi_amp = nn.ParameterDict({
@@ -441,7 +441,7 @@ class DecisionExtractor(nn.Module):
     def Encode(self, stateFeat: torch.Tensor) -> torch.Tensor:
         x = self.feature_net(stateFeat)
         x = self.hebb(x, update=(self.use_hebb_online))
-        z = F.relu(self.to_z(x))
+        z = F.silu(self.to_z(x))
         return z
 
     def ToKeysVec(self, baseAct: torch.Tensor, extraAct: torch.Tensor, skillIdx: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
@@ -913,7 +913,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
 
         if D.get("toz") is not None:
             z_lin = z_lin + F.linear(x, D["toz"], bias=None)
-        z = F.relu(z_lin)
+        z = F.silu(z_lin)
 
         h_k = self.base.keyboard.backbone(z)
 
@@ -1633,7 +1633,7 @@ class TestDecisionMTool:
             out1 = model(x, sample=False, prevOptionOnehot=prev1, returnKeysVec=False)
 
             with torch.no_grad():
-                h = model.option.enc(F.relu(model.to_z(model.hebb(model.feature_net(x), update=False))))
+                h = model.option.enc(F.silu(model.to_z(model.hebb(model.feature_net(x), update=False))))
                 trans_eff = model.option.trans_adapter(model.option.trans)
                 expect = prev1 @ trans_eff
             diff = (out1["option"]["logits"] - out0["option"]["logits"] - expect).abs().max().item()
@@ -1675,7 +1675,7 @@ class TestDecisionMTool:
             B = 4
             x = torch.randn(B, 128, device=self.device)
 
-            h = model.keyboard.backbone(F.relu(model.to_z(model.hebb(model.feature_net(x), update=False))))
+            h = model.keyboard.backbone(F.silu(model.to_z(model.hebb(model.feature_net(x), update=False))))
             out_dim = model.keyboard.base_head.target.out_features
             in_dim = model.keyboard.base_head.target.in_features
             deltaW = torch.randn(out_dim, in_dim, device=self.device) * 1e-3

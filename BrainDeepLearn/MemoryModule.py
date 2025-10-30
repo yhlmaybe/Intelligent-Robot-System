@@ -64,8 +64,12 @@ class SoftSymbolicRules(nn.Module):
 
         Pa = p.unsqueeze(2) 
         Pb = p.unsqueeze(1) 
-        diff = F.relu(Pa - Pb) 
-        imp_pen = (diff * A_imp.unsqueeze(0)).sum(dim=(1, 2)) / max(1, K)
+
+        margin = Pa - Pb 
+        soft = F.softplus(margin, beta=4.0) - F.softplus(torch.zeros(1, device=p.device), beta=4.0)
+        soft = soft.clamp_min(0.0)
+
+        imp_pen = (soft * A_imp.unsqueeze(0)).sum(dim=(1, 2)) / max(1, K)
         total = total + self.imp_scale * imp_pen
 
         if pPrev is not None and pPrev.shape == p.shape:
@@ -517,7 +521,7 @@ class LTMFuser(nn.Module):
     def __init__(self, dim: int, hidden: int = 128):
         super().__init__()
         self.fc = nn.Sequential(
-            nn.Linear(2*dim + 5, hidden), nn.ReLU(),
+            nn.Linear(2*dim + 5, hidden), nn.SiLU(),
             nn.Linear(hidden, 1), nn.Sigmoid())
 
     def forward(self, semOut: torch.Tensor, epiOut: torch.Tensor,semW: Optional[torch.Tensor], epiW: Optional[torch.Tensor]) -> torch.Tensor:
@@ -717,20 +721,20 @@ class MemoryExtractor(nn.Module):
         self.v_bias = nn.Parameter(torch.zeros(self.kv_heads, self.kv_head_dim))
         
         self.importance_net = nn.Sequential(
-            nn.Linear(ssmStateDim, 512), nn.ReLU(),
-            nn.Linear(512, 256), nn.ReLU(),
+            nn.Linear(ssmStateDim, 512), nn.SiLU(),
+            nn.Linear(512, 256), nn.SiLU(),
             nn.Linear(256, 1), nn.Sigmoid(),)
 
         self.local_gate = nn.Sequential(
-            nn.Linear(ssmStateDim, 512), nn.ReLU(),
+            nn.Linear(ssmStateDim, 512), nn.SiLU(),
             nn.Linear(512, 1), nn.Sigmoid(),)
 
         self.fusion_gate_net = nn.Sequential(
-            nn.Linear(memoryDim * 3, 512), nn.ReLU(),
+            nn.Linear(memoryDim * 3, 512), nn.SiLU(),
             nn.Linear(512, 1), nn.Sigmoid(),)
         
         self.ltm_gate = nn.Sequential(
-            nn.Linear(memoryDim * 4, 512), nn.ReLU(),
+            nn.Linear(memoryDim * 4, 512), nn.SiLU(),
             nn.Linear(512, 1), nn.Sigmoid())
 
         self.fusion = FusionMoE(inDim = outputDim + memoryDim,outDim = outputDim,numExperts = 4, hidden = 2048)
@@ -741,7 +745,12 @@ class MemoryExtractor(nn.Module):
         self.gws = gws if gws is not None else GlobalWorkspace(dim=memoryDim, slots=gwsSlots, defaultTtl=gwsTtl)
         self.ltm = ltm if ltm is not None else LongTermMemory(dim=memoryDim)
         self.gws_summary = nn.Linear(ssmStateDim + outputDim + memoryDim, memoryDim)
-        self.gws_gate = nn.Sequential(nn.Linear(memoryDim * 2, 128), nn.ReLU(), nn.Linear(128, 1), nn.Sigmoid())
+
+        self.gws_gate = nn.Sequential(
+            nn.Linear(memoryDim * 2, 128), 
+            nn.SiLU(), 
+            nn.Linear(128, 1), 
+            nn.Sigmoid())
 
         self.ns_enable: bool = True
         self.ns_lambda = 0.08
@@ -763,9 +772,12 @@ class MemoryExtractor(nn.Module):
         self.sym_mem = SymbolicMemory(k=self.ns_K, capacity=self.sym_capacity)
 
         self.sym_embed = SymbolicEmbed(self.ns_K, outDim=self.memory_dim)
+
         self.sym_fuse_gate = nn.Sequential(
-            nn.Linear(self.memory_dim * 2, 128), nn.ReLU(),
-            nn.Linear(128, 1), nn.Sigmoid())
+            nn.Linear(self.memory_dim * 2, 128), 
+            nn.SiLU(),
+            nn.Linear(128, 1), 
+            nn.Sigmoid())
 
         self._ns_prev_P_pre: Optional[torch.Tensor] = None
         self._ns_prev_P_post: Optional[torch.Tensor] = None
@@ -1345,6 +1357,7 @@ class MemoryExtractor(nn.Module):
         self.h_state.zero_()
         self.gws.Reset()
         self.ltm.Reset()
+        self._ltm_cache = None
 
         self._ns_prev_P_pre = None
         self._ns_prev_P_post = None

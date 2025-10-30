@@ -576,12 +576,12 @@ class RSSMWorldModel(nn.Module):
 
         self.rew_head = nn.Sequential(
             GrowableLoRALinear(nn.Linear(stateDim, 256, bias=True)),
-            nn.ReLU(),
+            nn.SiLU(),
             GrowableLoRALinear(nn.Linear(256, 1, bias=True)),)
         
         self.done_head = nn.Sequential(
             GrowableLoRALinear(nn.Linear(stateDim, 256, bias=True)),
-            nn.ReLU(),
+            nn.SiLU(),
             GrowableLoRALinear(nn.Linear(256, 1, bias=True)),)
         
         nn.init.zeros_(self.rew_head[-1].target.bias)

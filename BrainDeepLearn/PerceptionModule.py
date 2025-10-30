@@ -450,7 +450,7 @@ class ResidualBlock(nn.Module):
         self.bn1 = Norm2d(outChannels)
         self.conv2 = HebbianConv2d(outChannels, outChannels, 3, stride=1, padding=1,bias=False, useHebbian=useHebbian)
         self.bn2 = Norm2d(outChannels)
-        self.relu = nn.ReLU(inplace=False) 
+        self.relu = nn.SiLU() 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = x if self.downsample is None else self.downsample(x)
@@ -466,7 +466,7 @@ class CNNFeatureExtractor(nn.Module):
         self.conv1 = HebbianConv2d(inChannels, baseChannels, 7, stride=2, padding=3,bias=False, useHebbian=useHebbian)
         
         self.bn1 = Norm2d(baseChannels)
-        self.relu = nn.ReLU(inplace=False) 
+        self.relu = nn.SiLU() 
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         self.layer1 = self.make_layer(baseChannels, baseChannels, blocks=2, stride=1, useHebbian=useHebbian)
@@ -582,7 +582,7 @@ class PerceiveExtractor(nn.Module):
 
         self.adaptive_gate = nn.Sequential(
             nn.Linear(embedDim, embedDim // 4, bias=True),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(embedDim // 4, 1, bias=True),
             nn.Sigmoid())
 
@@ -590,7 +590,7 @@ class PerceiveExtractor(nn.Module):
 
         self.patch_aggregator = nn.Sequential(
             nn.Linear(embedDim, embedDim // 4, bias= True),
-            nn.ReLU(inplace=False),
+            nn.SiLU(),
             nn.Linear(embedDim // 4, 1, bias=True))
 
         self.InitWeights()

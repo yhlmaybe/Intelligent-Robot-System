@@ -48,11 +48,13 @@ class BrainCore(nn.Module):
         self.SEQ_LEN = seqLen
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.perc = PerceiveExtractor(useHebbian=plasticHebbian)
-        self.attn = AttentionExtractor(sequenceLength=seqLen, hebbianRate=(0.01 if plasticHebbian else 0.0))
-        self.mem = MemoryExtractor(hebbAlpha=(0.15 if plasticHebbian else 0.0))
+        self.attn = AttentionExtractor(sequenceLength=seqLen, hebbianRate=(0.01 if plasticHebbian else 0.0), useHebbian=plasticHebbian)
+        self.mem = MemoryExtractor(hebbAlpha=(0.15 if plasticHebbian else 0.0), useHebbian=plasticHebbian)
         self.actor = DecisionExtractor(stateDim=768, includeNoSkill=True, useHebbOnline=plasticHebbian)
         self.world = RSSMWorldModel(visionDim=1024)
-        self.critic = ValueEstimationExtractor(memoryDim=768, attnDim=1024, stateDim=256)
+        self.critic = ValueEstimationExtractor(memoryDim=768, attnDim=1024, stateDim=256, useHebb=plasticHebbian)
+
+        self.use_planner = usePlanner
 
         self.planner = DecisionPlannerExtractor().BuildPlanner(
             worldModel=self.world,
@@ -86,15 +88,11 @@ class BrainCore(nn.Module):
         self.prev_key_vec = z(self.keyvec_dim) 
         self.prev_mouse = z(2)
 
-        self.prev_done = z() 
-        self.prev_entropy = z() 
-        self.prev_unc = z() 
-        self.prev_td = z() 
+        self.prev_done = z(1) 
+        self.prev_entropy = z(1) 
+        self.prev_unc = z(1) 
+        self.prev_td = z(1) 
 
-        self.perc_buf = z(self.SEQ_LEN, 1024) 
-        self.tlen = torch.zeros(B, dtype=torch.long, device=device)
-
-        self.have_prev = False
         self._buf_B = B
 
     @torch.no_grad()
@@ -103,132 +101,98 @@ class BrainCore(nn.Module):
             self.ResetBuffers(B, device)
             self.world.ResetHidden(batchSize=B, device=device)
 
-    @torch.no_grad()
-    def PushPerc(self, feat_p: torch.Tensor):
-        self.perc_buf[:, :-1] = self.perc_buf[:, 1:].clone()
-        self.perc_buf[:, -1] = feat_p
-        self.tlen = torch.clamp(self.tlen + 1, max=self.SEQ_LEN)
-
     def Step(
         self,
-        frames: torch.Tensor, # [B, T=SEQ_LEN, C, H, W]
-        rewardExt: Optional[torch.Tensor] = None,
-        doneFlag: Optional[torch.Tensor] = None,
+        frames: torch.Tensor,  # [B, T=SEQ_LEN, C, H, W]
+        rewardExt: Optional[torch.Tensor] = None, # [B]
+        doneFlag: Optional[torch.Tensor] = None, # [B]
         *,
-        sampleActions: bool = True, 
+        isTrain: bool = False,
+        sampleActions: bool = True,
         deterministicActor: bool = False,) -> Dict[str, Any]:
-        B, dev = frames.size(0), frames.device
-        self.EnsureB(B, dev)
 
-        B, T = frames.shape[:2]
+        B, T, C, H, W = frames.shape
+        dev = frames.device
+        self.EnsureB(B, dev)
 
         if T != self.SEQ_LEN:
             raise ValueError(f"Expected sequence length {self.SEQ_LEN}, but got {T}. "f"frames.shape={tuple(frames.shape)}")
 
-        percs = [self.perc(frames[:, t]) for t in range(T) ]
-        seq = torch.stack(percs, dim=1)      
+        # [B,T,C,H,W] -> [B*T,C,H,W]
+        x = frames.view(B * T, C, H, W).contiguous()
+
+        perc_feats = self.perc(x) # [B*T,D]
+
+        percs_seq = perc_feats.view(B, T, -1).contiguous() # [B, T, D]
+
+        with torch.no_grad():
+            world_vis_in = self.attn(percs_seq)
 
         a_enc_prev = self.world.action_encoder(self.prev_key_vec, self.prev_mouse)
         hPrev, zPrev = self.world.ExportState()
-        w_out = self.world.StepPosterior(hPrev, zPrev, visionIn=seq, actionEnc=a_enc_prev, sample=False)
 
-        s_t = w_out["s_next"]
-        r_t = w_out["r_pred"]
-        d_t = w_out["d_prob"]
-        
-        rew_ext = None
-        if rewardExt is not None:
-            rew_ext = rewardExt.view(B)
-
-        if self.have_prev:
-            done_prev = (doneFlag if doneFlag is not None else self.prev_done).view(B)
-            pe_prev = self.prev_entropy.view(B) 
-            unc_teacher = self.prev_unc.view(B) 
-            td_prev = self.prev_td.view(B)
-            mem_prev = self.prev_mem
-            attn_prev = self.prev_attn
+        if isTrain:
+            w_out = self.world.ForwardTrainSeq(visionSeq=world_vis_in,keysVec= self.prev_key_vec, mouseSeq=self.prev_mouse, h0=hPrev, z0=zPrev,rewardSeq=rewardExt,doneSeq=doneFlag)
         else:
-            zeros = torch.zeros(B, device=dev)
-            done_prev = zeros
-            pe_prev = zeros
-            unc_teacher = zeros
-            td_prev = zeros
-            mem_prev = torch.zeros_like(self.prev_mem)
-            attn_prev = torch.zeros_like(self.prev_attn)
+            w_out = self.world.StepPosterior(hPrev, zPrev, visionIn=world_vis_in, actionEnc=a_enc_prev, sample=False)
 
-        critic_out = self.critic(
-            memory=mem_prev,
-            attn=attn_prev,
-            state=s_t,
-            rewardExt=rew_ext,
-            policyEntropyPrev=pe_prev,
-            uncertaintyTeacher=unc_teacher,
-            tdErrorPrev=td_prev,
-            done=done_prev,
-            edgeIndex=None,
-            edgeWeight=None,)
-        
-        td_sig = critic_out.tdError.view(B, 1)  
-        ent_sig = critic_out.rComps.get("entropy", torch.zeros(B, device=dev)).view(B, 1)
+        hPrev, zPrev = self.world.ExportState()
+
+        s_t = w_out["s_next"] # World State
+        r_t = w_out["r_pred"] # Prediction Rewards
+        d_t = w_out["d_prob"] # Termination Probability
+
+        critic_out = self.critic(memory=self.prev_mem,attn=self.prev_attn,state=s_t,rewardExt=r_t,policyEntropyPrev=self.prev_entropy,
+                                 uncertaintyTeacher=self.prev_unc,tdErrorPrev=self.prev_td,done=d_t,)
+
+        td_sig = critic_out.tdError.view(B, 1)
+        rInt_sig = critic_out.rInt.view(B, 1)
         unc_sig = critic_out.uncertainty.view(B, 1)
 
-        feat_b = self.attn(seq, tdError=td_sig) 
+        atten_out = self.attn(percs_seq, tdError=td_sig, uncertainty=unc_sig)
 
-        # 5) 记忆 C（受 TD/熵/奖励/不确定性影响）
-        # 这里作为奖励信号，使用内在奖励 rInt（与外部奖励无关，更稳定）
-        feat_c, mem_recall = self.mem(
-            feat_b,
-            tdError=td_sig,
-            entropy=ent_sig,
-            reward=critic_out.rInt.view(B, 1).detach(),
-            uncertainty=unc_sig,
-        )  # feat_c: [B,768]
+        mem_feat, mem_recall = self.mem(atten_out, tdError=td_sig,reward=rInt_sig)
 
-        # 6) 决策 D（可混合规划器的 prior）
-        final_det = bool(deterministicActor or (not sampleActions))
+        with torch.no_grad():
+            act_out = self.actor(stateFeat=mem_feat,sample=sampleActions,deterministic=deterministicActor)
+
+        mouseMu = act_out["mouse"]["mu"].detach()
+        mouseLogstd = act_out["mouse"]["logstd"].detach() 
+        skillLogits = act_out["keyboard"]["skill_logits"].detach()
+        baseLogits = act_out["keyboard"]["base_logits"].detach()
+        extraLogits = act_out["keyboard"]["extra_logits"].detach()
+        clickLogits = act_out["mouse"]["click_logits"].detach()
+
         prior = None
-        if self.use_planner and (self.planner is not None):
+        if self.use_planner:
             with torch.no_grad():
-                prior = self.planner.Plan(returnTrajectories=False)
+                prior = self.planner.Plan(mouseMu=mouseMu,mouseLogstd=mouseLogstd,skillLogits=skillLogits,
+                                          baseLogits=baseLogits,extraLogits=extraLogits,clickLogits=clickLogits,h0=hPrev.detach(),z0=zPrev.detach())
 
-        act_out = self.actor(
-            stateFeat=feat_c,
-            sample=True,                      # 始终 True，以生成 key_vec / mouse.a
-            deterministic=final_det,          # 由 sampleActions + deterministicActor 共同决定
-            prior=prior, mixW=0.30,
-            updateHebb=True,
-            returnKeysVec=True,
-            applyConstraints=True,
-        )
+        act_out = self.actor(stateFeat=mem_feat,sample=sampleActions,deterministic=deterministicActor,prior=prior)
 
-        key_vec = act_out["key_vec"]              # [B,106]
-        mouse_a = act_out["mouse"]["a"]           # [B,2]
+        key_vec = act_out["key_vec"] # [B,106]
+        mouse_a = act_out["mouse"]["a"]  # [B,2]
         entropy_scalar = act_out["entropy"].view(B, 1)
 
-        # 7) 写回 “上一时刻” 缓存
-        self.prev_mem = feat_c.detach()
-        self.prev_attn = feat_b.detach()
+        self.prev_mem = mem_feat.detach()
+        self.prev_attn = atten_out.detach()
         self.prev_state = s_t.detach()
         self.prev_key_vec = key_vec.detach()
         self.prev_mouse = mouse_a.detach()
 
-        # 这里做一个“上一时刻奖励/终止”的定义：
-        # 优先使用外部 reward/done，否则用世界模型回归的 r_t/d_t
         self.prev_reward = (rewardExt.detach() if rewardExt is not None else r_t.detach()).view(B)
         self.prev_done = (doneFlag.detach() if doneFlag is not None else d_t.detach()).view(B)
         self.prev_entropy = entropy_scalar.detach()
         self.prev_unc = unc_sig.detach()
         self.prev_td = td_sig.detach()
-        self.have_prev = True
 
         return {
             "decision": act_out,
             "world": {"state": s_t, "reward": r_t, "done": d_t},
             "critic": critic_out,
-            "features": {"perc": percs, "attn": feat_b, "mem": feat_c, "mem_recall": mem_recall},
-        }
+            "features": {"perc": percs_seq, "attn": atten_out, "mem": mem_feat, "mem_recall": mem_recall},}
 
-    # ----------------- 运行态保存/恢复 -----------------
     @torch.no_grad()
     def ExportBuffers(self) -> Dict[str, Any]:
         h, z = self.world.ExportState()
@@ -243,16 +207,11 @@ class BrainCore(nn.Module):
             "prev_entropy": self.prev_entropy,
             "prev_unc": self.prev_unc,
             "prev_td": self.prev_td,
-            "perc_buf": self.perc_buf,
-            "tlen": self.tlen,
-            "have_prev": torch.tensor([int(self.have_prev)], device=self.prev_mem.device),
-            "world_h": h, "world_z": z,
-        }
+            "world_h": h, "world_z": z,}
 
     @torch.no_grad()
     def ImportBuffers(self, state: Dict[str, Any]):
         device = next(self.parameters()).device
-        # 搬运到当前设备
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
                 state[k] = v.to(device)
@@ -266,64 +225,56 @@ class BrainCore(nn.Module):
         self.prev_entropy = state["prev_entropy"]
         self.prev_unc = state["prev_unc"]
         self.prev_td = state["prev_td"]
-        self.perc_buf = state["perc_buf"]
-        self.tlen = state["tlen"]
-        self.have_prev = bool(int(state["have_prev"].view(-1)[0].item()))
         self.world.ImportState(state["world_h"], state["world_z"])
 
 
 class Agent:
-    """
-    负责数据预处理、一步执行、保存/恢复（含优化器与随机种子）。
-    训练循环你可以在外层组织，此处仅提供基本接口。
-    """
     def __init__(self, brain: BrainCore, device: Union[str, torch.device] = "cpu"):
         self.device = torch.device(device)
         self.brain = brain.to(self.device)
 
-        # 优化器划分（你也可以按需调整分组/学习率）
         actor_params = (
             list(self.brain.perc.parameters())
             + list(self.brain.attn.parameters())
             + list(self.brain.mem.parameters())
-            + list(self.brain.actor.parameters())
-        )
+            + list(self.brain.actor.parameters()))
+        
         self.opt_actor = torch.optim.Adam(actor_params, lr=3e-4)
         self.opt_critic = torch.optim.Adam(self.brain.critic.parameters(), lr=2e-4)
         self.opt_world = torch.optim.Adam(self.brain.world.parameters(), lr=2e-4)
 
-    # --------- 简单图像预处理 ---------
-    def _preprocess_rgb(self, frame_np: np.ndarray, out_hw: int = 224) -> torch.Tensor:
-        if frame_np.ndim == 3 and frame_np.shape[2] == 3:
-            img = torch.from_numpy(frame_np).permute(2, 0, 1).float() / 255.0  # C,H,W
-            _, H, W = img.shape
-            side = min(H, W)
-            top = (H - side) // 2
-            left = (W - side) // 2
-            img = img[:, top:top + side, left:left + side]
-            img = F.interpolate(img.unsqueeze(0), (out_hw, out_hw), mode='bilinear', align_corners=False).squeeze(0)
-            return img
-        raise ValueError("Expected frame_np as HxWx3 array.")
+    def PreprocessRgb(frameNp: np.ndarray, outHw: int = 512, device: torch.device = None) -> torch.Tensor:
+        if frameNp.ndim != 3 or frameNp.shape[2] != 3:
+            raise ValueError("Expected frameNp as HxWx3 RGB array.")
 
-    def prep(self, imgs: Union[np.ndarray, List[np.ndarray]], device: Optional[torch.device] = None) -> torch.Tensor:
+        img = torch.from_numpy(frameNp).permute(2, 0, 1).contiguous().float() / 255.0  # [3,H,W]
+        img = img.unsqueeze(0)  # [1,3,H,W]
+        if device is not None:
+            img = img.to(device)
+
+        img = F.interpolate(img, size=(outHw, outHw), mode='bilinear',align_corners=False, antialias=True)
+
+        return img.squeeze(0)  # [3,outHw,outHw]
+
+    def Prep(self, imgs: Union[np.ndarray, List[np.ndarray]], device: Optional[torch.device] = None) -> torch.Tensor:
         if isinstance(imgs, torch.Tensor):
             return imgs.to(device or self.device)
         if isinstance(imgs, np.ndarray):
             imgs = [imgs]
-        t = torch.stack([self._preprocess_rgb(i) for i in imgs], dim=0)  # [B,3,H,W]
+        t = torch.stack([self.PreprocessRgb(i) for i in imgs], dim=0)  # [B,3,H,W]
         return t.to(device or self.device)
 
     @torch.no_grad()
-    def act(
+    def Act(
         self,
         frame_np: np.ndarray,
         reward: float = 0.0,
         done: bool = False,
         *,
         sample_actions: bool = True,
-        deterministic_actor: bool = False,
-    ):
-        frame = self.prep(frame_np)  # [1,3,H,W]
+        deterministic_actor: bool = False,):
+
+        frame = self.Prep(frame_np)  # [1,3,H,W]
         out = self.brain.Step(
             frame,
             rewardExt=torch.tensor([reward], device=self.device, dtype=torch.float32),
