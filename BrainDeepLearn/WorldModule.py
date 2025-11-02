@@ -653,6 +653,32 @@ class RSSMWorldModel(nn.Module):
         self.phys_ode = ODEPhysHead(deterDim=self.deter_dim, actDim=self.stoch_dim)
         self.mix_gate = nn.Sequential(GrowableLoRALinear(nn.Linear(self.deter_dim + 2*self.stoch_dim, 4)))
 
+    @torch.no_grad()
+    def InitWorldMemoryDocument(self, path: str):
+        dir_ = os.path.dirname(path)
+        if dir_ and (not os.path.exists(dir_)):
+            os.makedirs(dir_, exist_ok=True)
+
+        dev = self._mem_keys.device
+
+        payload = {
+            "mem_keys": torch.zeros_like(self._mem_keys, device=dev),
+            "mem_vals": torch.zeros_like(self._mem_vals, device=dev),
+            "mem_size": 0,
+            "mem_ptr": 0,
+
+            "h": torch.zeros(1, self.deter_dim, device=dev),
+            "z": torch.zeros(1, self.stoch_dim, device=dev),
+
+            "s4_x": torch.zeros(1, self.s4.N, device=dev),
+
+            "_A_prev": None,
+
+            "rng_cpu": torch.get_rng_state(),
+            "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,}
+
+        torch.save(payload, path)
+
 
     def SetMemoryOption(self, useMem: bool, path: str):
         self._use_memory = useMem
@@ -679,14 +705,16 @@ class RSSMWorldModel(nn.Module):
         
         torch.save(payload, p)
 
-    def LoadMemory(self, path: str, maplocation: Optional[str] = None, strict: bool = False):
+    def LoadMemory(self, path: str, mapLocation: Optional[str] = None, strict: bool = False):
         if not self._use_memory:
             return
         if not os.path.exists(path):
             if strict:
                 raise FileNotFoundError(path)
             return
-        payload = torch.load(path, map_location=maplocation or "cpu")
+        if os.path.getsize(path) == 0:
+            return
+        payload = torch.load(path, map_location=mapLocation, weights_only=False)
         keys = payload.get("mem_keys", None)
         vals = payload.get("mem_vals", None)
         size = int(payload.get("mem_size", 0))

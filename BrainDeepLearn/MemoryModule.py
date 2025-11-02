@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import os
 
 
 
@@ -1375,6 +1376,67 @@ class MemoryExtractor(nn.Module):
         self.svd_threshold = 5.0
 
     @torch.no_grad()
+    def InitMemoryDocument(self, path: str):
+        dir_ = os.path.dirname(path)
+        if dir_ and (not os.path.exists(dir_)):
+            os.makedirs(dir_, exist_ok=True)
+
+        dev = self.h_state.device
+
+        gws_snap = self.gws.Inspect()
+        sem = self.ltm.semantic
+        epi = self.ltm.episodic
+
+        state = {
+            "h_state": torch.zeros_like(self.h_state, device=dev),
+            "fast_weights": torch.zeros_like(self.fast_weights, device=dev),
+            "memory_keys": torch.zeros_like(self.memory_keys, device=dev),
+            "memory_values": torch.zeros_like(self.memory_values, device=dev),
+            "memory_importance": torch.zeros_like(self.memory_importance, device=dev),
+            "memory_corr": torch.zeros_like(self.memory_corr, device=dev),
+            "memory_steps": torch.zeros_like(self.memory_steps, device=dev),
+            "mem_ptr": torch.tensor(0, device=dev),
+            "time_step": torch.tensor(0, device=dev),
+            "memory_filled": torch.tensor(0, device=dev),
+
+            "_steps_since_svd": torch.tensor(0, device=dev),
+            "last_compress_step": torch.tensor(0, device=dev),
+            "memory_usage": torch.tensor(0.0, device=dev),
+            "svd_threshold": torch.tensor(5.0, device=dev),
+            "fro_norm_history": torch.zeros(0, device=dev),
+
+            "gws_keys": gws_snap["keys"].detach().clone().zero_(),
+            "gws_vals": gws_snap["vals"].detach().clone().zero_(),
+            "gws_priority": gws_snap["priority"].detach().clone().zero_(),
+            "gws_ttl": gws_snap["ttl"].detach().clone().zero_(),
+            "gws_last_step": gws_snap["last_step"].detach().clone().zero_(),
+            "gws_tag_id": gws_snap["tag_id"].detach().clone().zero_(),
+            "gws_owner_id": gws_snap["owner_id"].detach().clone().zero_(),
+            "gws_global_step": torch.tensor(0, device=dev),
+
+            "ltm_sem_emb": sem.emb.detach().clone().zero_().to(dev),
+            "ltm_sem_prio": sem.prio.detach().clone().zero_().to(dev),
+            "ltm_sem_touch": sem.touch.detach().clone().zero_().to(dev),
+            "ltm_sem_step": sem.step.detach().clone().zero_().to(dev),
+            "ltm_sem_filled": torch.tensor(0, device=dev),
+            "ltm_sem_global_step": torch.tensor(0, device=dev),
+
+            "ltm_epi_emb": epi.emb.detach().clone().zero_().to(dev),
+            "ltm_epi_prio": epi.prio.detach().clone().zero_().to(dev),
+            "ltm_epi_rew": epi.rew.detach().clone().zero_().to(dev),
+            "ltm_epi_step": epi.step.detach().clone().zero_().to(dev),
+            "ltm_epi_filled": torch.tensor(0, device=dev),
+            "ltm_epi_global_step": torch.tensor(0, device=dev),
+
+            "ns_prev_P_pre": None,
+            "ns_prev_P_post": None,
+
+            "rng_cpu": torch.get_rng_state(),
+            "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,}
+
+        torch.save(state, path)
+
+    @torch.no_grad()
     def SaveState(self, path: str):
         gws_snap = self.gws.Inspect()
         sem = self.ltm.semantic
@@ -1431,6 +1493,9 @@ class MemoryExtractor(nn.Module):
 
     @torch.no_grad()
     def LoadState(self, path: str):
+        if os.path.getsize(path) == 0:
+            return
+
         state = torch.load(path, weights_only=False)
 
         if "rng_cpu" in state:
