@@ -222,8 +222,14 @@ class IntrinsicRewardGenerator(nn.Module):
         novelty = (stateCurr - self.state_ema.to(device)).pow(2).mean(-1).sqrt()
         h = self.affect_net(torch.cat([memoryPrev, attnPrev, stateCurr], dim=-1))
 
-        if tdErrorPrev is not None: progress = -tdErrorPrev.abs()
-        else: progress = torch.tanh(self.progress_head(h).squeeze(-1))
+        if tdErrorPrev is not None:
+            td_ref = tdErrorPrev.detach()
+            prog_from_td = -td_ref.abs()
+            prog_pred = torch.tanh(self.progress_head(h).squeeze(-1))
+            alpha = 0.5
+            progress = alpha * prog_from_td + (1.0 - alpha) * prog_pred
+        else:
+            progress = torch.tanh(self.progress_head(h).squeeze(-1))
 
         policyEntropyPrev = self.MaybeDropoutTeacher(policyEntropyPrev, B, device)
         uncertainty = self.MaybeDropoutTeacher(uncertainty, B, device)
