@@ -58,8 +58,11 @@ class HebbianLinearFW(nn.Module):
         nn.init.orthogonal_(self.weight); 
         if self.bias is not None: nn.init.zeros_(self.bias)
         self.register_buffer("H", torch.zeros(outFeatures, inFeatures))
-        self.init_eta = initEta; self.init_lambda = initLambda
-        self.cap = cap; self.use_oja = useOja; self.detach_hebb = detachHebb
+        self.init_eta = initEta 
+        self.init_lambda = initLambda
+        self.cap = cap
+        self.use_oja = useOja
+        self.detach_hebb = detachHebb
 
     @torch.no_grad() 
     def ResetHebbianMemory(self): self.H.zero_()
@@ -664,7 +667,7 @@ class ValueEstimationExtractor(nn.Module):
             uncertainty=uncert_pred, extras=extras)
 
     @torch.no_grad()
-    def ResetHebb(self): 
+    def ResetHebbianMemory(self): 
         self.hebb_value.ResetHebbianMemory()
         self._prev_vhat=None
 
@@ -1491,7 +1494,7 @@ class TestValueEstimationMTool:
             est.rgen.teacher_dropout_prob = 0.0
 
             est.ResetMicroGraph()
-            est.ResetHebb()
+            est.ResetHebbianMemory()
             H0 = est.hebb_value.H.detach().clone()
 
             reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)

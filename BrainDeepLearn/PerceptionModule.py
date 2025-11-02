@@ -493,7 +493,7 @@ class CNNFeatureExtractor(nn.Module):
 
 class PerceiveExtractor(nn.Module):
     def __init__(self,
-                 imgSize: int = 224,
+                 imgSize: int = 512,
                  patchSize: int = 1,
                  embedDim: int = 512,
                  numHeads: int = 8,
@@ -918,8 +918,8 @@ class TestPerceptionMTool:
 
     def TestPerceiveExtractor(self):
         try:
-            model = PerceiveExtractor(imgSize=224, patchSize=1, embedDim=512, numHeads=8, numLayers=6, useHebbian=True).to(self.device)
-            x = torch.randn(2, 3, 224, 224, device=self.device)
+            model = PerceiveExtractor(imgSize=512, patchSize=1, embedDim=512, numHeads=8, numLayers=6, useHebbian=True).to(self.device)
+            x = torch.randn(2, 3, 512, 512, device=self.device)
             out = model(x)
             expected_dim = 512 * 2
             assert out.shape == (2, expected_dim), f"Output shape does not match: {out.shape}"

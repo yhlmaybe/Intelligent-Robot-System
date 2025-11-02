@@ -49,7 +49,7 @@ private slots:
 
     void TestValueEstimationModule();
 
-    void TestTrainAndDeploy();
+    void TestModuleTrain();
 };
 
 #endif // BRAINDEEPLEARNFORM_H

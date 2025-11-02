@@ -500,7 +500,13 @@ class SoftNeSyStructure(nn.Module):
 
         Ga = F.softmax(self.M_alo, dim=-1)
         top1 = (P.unsqueeze(1) * Ga.unsqueeze(0)).max(-1).values
-        alo = (F.relu(aloTau - top1) ** 2).mean()
+
+        if aloTau is None:
+            aloTau_t = self.tau 
+        else:
+            aloTau_t = top1.new_tensor(float(aloTau))
+
+        alo = (F.relu(aloTau_t - top1) ** 2).mean()
 
         W = torch.sigmoid(self.E) * (1.0 - self._eye)
         impl = (W.unsqueeze(0) * F.relu(P.unsqueeze(2) - P.unsqueeze(1))).mean()
@@ -636,7 +642,7 @@ class RSSMWorldModel(nn.Module):
         self.ResetHidden(batchSize=batchSize)
 
         if self._use_memory and self._mem_path:
-            self.LoadMemory(self._mem_path, map_location=None, strict=False)
+            self.LoadMemory(self._mem_path, mapLocation=None, strict=False)
 
         self.mem_val_to_e = nn.Sequential(nn.Linear(deterDim, stochDim), nn.LayerNorm(stochDim))
 
@@ -646,6 +652,15 @@ class RSSMWorldModel(nn.Module):
         self.phys_hnn = HNNPhysHead(deterDim=self.deter_dim, projDim=128)
         self.phys_ode = ODEPhysHead(deterDim=self.deter_dim, actDim=self.stoch_dim)
         self.mix_gate = nn.Sequential(GrowableLoRALinear(nn.Linear(self.deter_dim + 2*self.stoch_dim, 4)))
+
+
+    def SetMemoryOption(self, useMem: bool, path: str):
+        self._use_memory = useMem
+        if useMem:
+            self._mem_path = path
+            self.LoadMemory(path, mapLocation=None, strict=False)
+        else:
+            self._mem_path = None
 
     def SaveMemory(self, path: Optional[str] = None):
         if not self._use_memory:
@@ -664,14 +679,14 @@ class RSSMWorldModel(nn.Module):
         
         torch.save(payload, p)
 
-    def LoadMemory(self, path: str, map_location: Optional[str] = None, strict: bool = False):
+    def LoadMemory(self, path: str, maplocation: Optional[str] = None, strict: bool = False):
         if not self._use_memory:
             return
         if not os.path.exists(path):
             if strict:
                 raise FileNotFoundError(path)
             return
-        payload = torch.load(path, map_location=map_location or "cpu")
+        payload = torch.load(path, map_location=maplocation or "cpu")
         keys = payload.get("mem_keys", None)
         vals = payload.get("mem_vals", None)
         size = int(payload.get("mem_size", 0))
@@ -769,7 +784,7 @@ class RSSMWorldModel(nn.Module):
             lambdaExcl=self.ns_lambda_excl,
             lambdaAlo=self.ns_lambda_alo,
             lambdaImpl=self.ns_lambda_impl,
-            aloTau=0.60,)
+            aloTau=None,)
         
         return loss, stats
 

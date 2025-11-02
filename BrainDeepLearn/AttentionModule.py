@@ -640,7 +640,7 @@ class AttentionExtractor(nn.Module):
 
         return self.output_proj(out)
 
-    def ResetFastWeights(self) -> None:
+    def ResetHebbianMemory(self) -> None:
         for blk in self.temporal_blocks:
             blk.mhsa.ResetHebbianMemory()
         self.fusion.ResetHebbianMemory()

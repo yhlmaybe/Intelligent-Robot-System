@@ -22,7 +22,7 @@ QT_WARNING_PUSH
 QT_WARNING_DISABLE_DEPRECATED
 struct qt_meta_stringdata_BrainDeepLearnForm_t {
     QByteArrayData data[12];
-    char stringdata0[181];
+    char stringdata0[178];
 };
 #define QT_MOC_LITERAL(idx, ofs, len) \
     Q_STATIC_BYTE_ARRAY_DATA_HEADER_INITIALIZER_WITH_OFFSET(len, \
@@ -42,14 +42,14 @@ QT_MOC_LITERAL(7, 84, 16), // "TestMemoryModule"
 QT_MOC_LITERAL(8, 101, 18), // "TestDecisionModule"
 QT_MOC_LITERAL(9, 120, 15), // "TestWorldModule"
 QT_MOC_LITERAL(10, 136, 25), // "TestValueEstimationModule"
-QT_MOC_LITERAL(11, 162, 18) // "TestTrainAndDeploy"
+QT_MOC_LITERAL(11, 162, 15) // "TestModuleTrain"
 
     },
     "BrainDeepLearnForm\0AddData\0\0data\0"
     "CloseForm\0TestPerceptionModule\0"
     "TestAttentionModule\0TestMemoryModule\0"
     "TestDecisionModule\0TestWorldModule\0"
-    "TestValueEstimationModule\0TestTrainAndDeploy"
+    "TestValueEstimationModule\0TestModuleTrain"
 };
 #undef QT_MOC_LITERAL
 
@@ -105,7 +105,7 @@ void BrainDeepLearnForm::qt_static_metacall(QObject *_o, QMetaObject::Call _c, i
         case 5: _t->TestDecisionModule(); break;
         case 6: _t->TestWorldModule(); break;
         case 7: _t->TestValueEstimationModule(); break;
-        case 8: _t->TestTrainAndDeploy(); break;
+        case 8: _t->TestModuleTrain(); break;
         default: ;
         }
     }

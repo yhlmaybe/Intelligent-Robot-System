@@ -56,10 +56,6 @@ mutex
 atomic
 -
 
-/home/yhl/Documents/Intelligent-Robot-System/IRSFunction.cpp
-include/IRSFunction.h
-/home/yhl/Documents/Intelligent-Robot-System/include/IRSFunction.h
-
 /home/yhl/Documents/Intelligent-Robot-System/IRSGUI/BrainDeepLearnForm.h
 python3.8/Python.h
 -
@@ -173,10 +169,6 @@ tf2_ros/transform_broadcaster.h
 /home/yhl/Documents/Intelligent-Robot-System/include/IRSFunction.h
 ../MathematicalTool/MotionManager.h
 /home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/MotionManager.h
-
-/home/yhl/Documents/Intelligent-Robot-System/IRSParametersData.cpp
-include/IRSParametersData.h
-/home/yhl/Documents/Intelligent-Robot-System/include/IRSParametersData.h
 
 /home/yhl/Documents/Intelligent-Robot-System/MathematicalTool/KinematicTool.h
 kdl/chainfksolverpos_recursive.hpp
@@ -337,14 +329,6 @@ pcl/filters/conditional_removal.h
 -
 pcl/surface/gp3.h
 -
-
-/home/yhl/Documents/Intelligent-Robot-System/MsgManager.cpp
-include/MsgManager.h
-/home/yhl/Documents/Intelligent-Robot-System/include/MsgManager.h
-
-/home/yhl/Documents/Intelligent-Robot-System/PythonInteraction.cpp
-include/PythonInteraction.h
-/home/yhl/Documents/Intelligent-Robot-System/include/PythonInteraction.h
 
 /home/yhl/Documents/Intelligent-Robot-System/ServoControl/SCDrive.h
 python3.8/Python.h

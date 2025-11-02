@@ -98,7 +98,7 @@
 	"MOC_RELAXED_MODE" : false,
 	"MOC_SKIP" : [],
 	"MULTI_CONFIG" : false,
-	"PARALLEL" : 2,
+	"PARALLEL" : 4,
 	"PARSE_CACHE_FILE" : "/home/yhl/Documents/Intelligent-Robot-System/build/IRSGUI/CMakeFiles/IRSGUI_LIST_autogen.dir/ParseCache.txt",
 	"QT_MOC_EXECUTABLE" : "/usr/lib/qt5/bin/moc",
 	"QT_UIC_EXECUTABLE" : "/usr/lib/qt5/bin/uic",

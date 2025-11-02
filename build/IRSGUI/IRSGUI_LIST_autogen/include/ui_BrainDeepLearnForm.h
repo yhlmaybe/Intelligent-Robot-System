@@ -123,7 +123,7 @@ public:
         testWorldModule_pushButton->setShortcut(QApplication::translate("BrainDeepLearnForm", "Ctrl+S", nullptr));
 #endif // QT_NO_SHORTCUT
         testValueEstimationModule_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestValueEstimationModule", nullptr));
-        testTrainAndDeploy_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestTrainAndDeploy", nullptr));
+        testTrainAndDeploy_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestModuleTrain", nullptr));
         close_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "Close", nullptr));
     } // retranslateUi
 

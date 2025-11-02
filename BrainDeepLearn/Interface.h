@@ -65,7 +65,7 @@ public:
 
     bool TestValueEstimationModule();
 
-    bool TestTrainAndDeploy();
+    bool TestModuleTrain();
 
 private:
 

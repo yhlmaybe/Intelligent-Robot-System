@@ -125,8 +125,8 @@ bool BrainDeepLearnInterface::TestValueEstimationModule()
     return success;
 }
 
-bool BrainDeepLearnInterface::TestTrainAndDeploy()
+bool BrainDeepLearnInterface::TestModuleTrain()
 {
-    bool success = CALL_METHOD_NOARG("TestTrainAndDeploy");
+    bool success = CALL_METHOD_NOARG("TestModuleTrain");
     return success;
 }
