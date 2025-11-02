@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import shutil
 import traceback
 import os
+import math
 
 from torch.utils.data import Dataset, DataLoader
 
@@ -34,20 +35,34 @@ def ToDevice(x, device):
         return x.to(device)
     return x
 
+class BasicParameters:
+    IMAGE_SIZE = 512
+    IMAGE_SEQ_LEN = 16
+    MEMORY_MEMORY_PATH = "BrainDeepLearn/ModuleParameter/MemoryMemory.pt"
+    WORLD_MEMORY_PATH = "BrainDeepLearn/ModuleParameter/WorldMemory.pt"
+    MODULEPARAMETER_PATH = "BrainDeepLearn/ModuleParameter/module_parameter.pth"
+    CKPT_PATH_TRAIN = "BrainDeepLearn/Data/training_checkpoint.pth"
+
+    MEMORY_MEMORY_PATH_TEST = "BrainDeepLearn/TestData/MemoryMemory.pt"
+    WORLD_MEMORY_PATH_TEST = "BrainDeepLearn/TestData/WorldMemory.pt"
+    DATA_ROOT_PATH_TEST = "BrainDeepLearn/TestData"
+    CKPT_PATH_TEST = "BrainDeepLearn/TestData/training_test_checkpoint.pth"
+
+
 
 class BrainCore(nn.Module):
     def __init__(
         self,
         device: Optional[torch.device] = None,
         *,
-        seqLen: int = 2,
+        seqLen: int = BasicParameters.IMAGE_SEQ_LEN,
         plasticHebbian: bool = True,
         plasticOnlineLearning: bool = True,
         usePlanner: bool = True,):
         super().__init__()
         self.SEQ_LEN = seqLen
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.perc = PerceiveExtractor(imgSize=512,useHebbian=plasticHebbian)
+        self.perc = PerceiveExtractor(imgSize=BasicParameters.IMAGE_SIZE,useHebbian=plasticHebbian)
         self.attn = AttentionExtractor(sequenceLength=seqLen, hebbianRate=(0.01 if plasticHebbian else 0.0), useHebbian=plasticHebbian)
         self.mem = MemoryExtractor(hebbAlpha=(0.15 if plasticHebbian else 0.0), useHebbian=plasticHebbian)
         self.actor = DecisionExtractor(stateDim=768, includeNoSkill=True, useHebb=plasticHebbian)
@@ -285,38 +300,66 @@ class BrainCore(nn.Module):
 class Agent:
     def __init__(self,
                 brain: BrainCore,
+                isTrain: bool,
                 device: Union[str, torch.device] = "cpu",
                 *,
-                worldMemoryPath: str = "BrainDeepLearn/ModuleParameter/WorldMemory.pt",
-                memMemoryPath: str = "BrainDeepLearn/ModuleParameter/MemoryMemory.pt"):
+                worldMemoryPath: str = None,
+                memMemoryPath: str = None):
         self.device = torch.device(device)
+
+        self.brain = brain
+        self.is_train = isTrain
 
         self.wm_mem_path = worldMemoryPath
         self.mem_mem_path = memMemoryPath
 
-        if worldMemoryPath is not None and os.path.exists(worldMemoryPath):
-            self.brain.world.SetMemoryOption(True, worldMemoryPath)
+        if self.wm_mem_path is not None:
+            self.EnsureFile(self.wm_mem_path) 
+            self.brain.world.InitWorldMemoryDocument(self.wm_mem_path)
+            self.brain.world.SetMemoryOption(True, self.wm_mem_path)
+        else:
+            print(f"{self.wm_mem_path} is None")
 
-        if memMemoryPath is not None and os.path.exists(memMemoryPath):
-            self.brain.mem.LoadState(memMemoryPath)
+        if self.mem_mem_path is not None:
+            self.EnsureFile(self.mem_mem_path) 
+            self.brain.mem.InitMemoryDocument(self.mem_mem_path)
+            self.brain.mem.LoadState(self.mem_mem_path)
+        else:
+            print(f"{self.mem_mem_path} is None")
 
-        self.brain = brain.to(self.device)
+        self.brain.to(self.device)
 
-        actor_params = (
-            list(self.brain.perc.parameters())
-            + list(self.brain.attn.parameters())
-            + list(self.brain.mem.parameters())
-            + list(self.brain.actor.parameters()))
+        if isTrain:
+            actor_params = (
+                list(self.brain.perc.parameters())
+                + list(self.brain.attn.parameters())
+                + list(self.brain.mem.parameters())
+                + list(self.brain.actor.parameters()))
         
-        self.opt_actor = torch.optim.Adam(actor_params, lr=3e-4)
-        self.opt_critic = torch.optim.Adam(self.brain.critic.parameters(), lr=2e-4)
-        self.opt_world = torch.optim.Adam(self.brain.world.parameters(), lr=2e-4)
+            self.opt_actor = torch.optim.Adam(actor_params, lr=3e-4)
+            self.opt_critic = torch.optim.Adam(self.brain.critic.parameters(), lr=2e-4)
+            self.opt_world = torch.optim.Adam(self.brain.world.parameters(), lr=2e-4)
 
+    def EnsureFile(self, path: str) -> bool:
+        dir_ = os.path.dirname(path)
+        if dir_ and (not os.path.exists(dir_)):
+            os.makedirs(dir_, exist_ok=True)
+            print(f"[EnsureFile] created directory: {os.path.abspath(dir_)}")
+
+        created = False
+        if not os.path.exists(path):
+            torch.save({}, path)
+            created = True
+            print(f"[EnsureFile] created file: {os.path.abspath(path)}")
+        else:
+            size = os.path.getsize(path)
+            print(f"[EnsureFile] file already exists: {os.path.abspath(path)} (size={size} bytes)")
+
+        return created
 
     def Act(
             self,
             frames: torch.Tensor, # [B,T,C,H,W]
-            isTrain: bool,
             *,
             reward: Optional[torch.Tensor] = None,
             done: Optional[torch.Tensor] = None,
@@ -326,9 +369,9 @@ class Agent:
         frames = frames.to(self.device)
         B, T, C, H, W = frames.shape
         if T != self.brain.SEQ_LEN:
-            raise ValueError(f"Expected frames with sequence length 16, " f"but got {T}. Shape received: {tuple(frames.shape)}. ")
+                raise ValueError(f"Expected frames with sequence length {self.brain.SEQ_LEN}, but got {T}. " f"Shape received: {tuple(frames.shape)}.")
 
-        out = self.brain.Step(frames,rewardExt=reward,doneFlag=done,isTrain=isTrain,sampleActions=sampleActions,deterministicActor=deterministicActor,)
+        out = self.brain.Step(frames,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
         
         key_vec = out["decision"]["key_vec"] # [B, 106]
         mouse = out["decision"]["mouse"]["a"] # [B, 2]
@@ -337,6 +380,7 @@ class Agent:
         return key_vec, mouse, total_loss
 
     def Save(self, path: str):
+        if not self.is_train: return
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
         payload = {
@@ -354,6 +398,7 @@ class Agent:
         torch.save(payload, path)
 
     def Load(self, path: str, strict: bool = True, mapLocation: Optional[Union[str, torch.device]] = None):
+        if not self.is_train: return
         payload = torch.load(path, map_location=mapLocation or self.device)
         self.brain.load_state_dict(payload["brain"], strict=strict)
         self.opt_actor.load_state_dict(payload["opt_actor"])
@@ -391,7 +436,7 @@ class Agent:
         *,
         B: int,
         T: int,
-        size: Optional[Tuple[int, int]] = None,
+        size: Optional[Tuple[int, int]] = (BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE),
         device: Optional[torch.device] = None,) -> Dict[str, List]:
         assert len(imgs) == B * T, f"got {len(imgs)} images, but B*T = {B*T}"
 
@@ -477,7 +522,7 @@ class OfflineGameDataset(Dataset):
         self.mouse = sorted((p / "mouse").glob("*.npy"))
         self.reward = sorted((p / "reward").glob("*.npy")) 
         self.done = sorted((p / "done").glob("*.npy")) 
-        assert len(self.imgs) == len(self.keys) == len(self.mouse), "frames/keys/mouse The number of files is inconsistent."
+        assert len(self.imgs) == len(self.keys) == len(self.mouse)==len(self.reward) == len(self.done), "frames/keys/mouse/reward/done The number of files is inconsistent."
 
     def __len__(self) -> int:
         return len(self.imgs)
@@ -493,7 +538,7 @@ class OfflineGameDataset(Dataset):
 
 
 
-class TrainingController:
+class ModuleController:
     def __init__(self):
         self._lock = threading.Lock()
         self.status: Dict[str, Any] = {
@@ -540,9 +585,9 @@ class TrainingController:
 
 
 class ManagerFunction:
-    def __init__(self, device: Optional[str] = None, path : str = "BrainDeepLearn/Data/training_checkpoint.pth"):
+    def __init__(self, device: Optional[str] = None):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.controller = TrainingController()
+        self.controller = ModuleController()
 
         self.training_thread: Optional[threading.Thread] = None
         self.is_training = False
@@ -550,7 +595,9 @@ class ManagerFunction:
         self.deploy_thread: Optional[threading.Thread] = None
         self.deploying = False
 
-        self.checkpoint_path = path
+        self.checkpoint_path_train = BasicParameters.CKPT_PATH_TRAIN
+        self.checkpoint_path_test = BasicParameters.CKPT_PATH_TEST
+        self.module_parameter_path = BasicParameters.MODULEPARAMETER_PATH
 
         self.test = {
             "perception": TestPerceptionMTool(),
@@ -560,12 +607,21 @@ class ManagerFunction:
             "world": TestWorldMTool(),
             "value": TestValueEstimationMTool(),}
 
-    def StartTraining(self, root: str, epochs: int = 5, batchSize: int = 32, valSplit: float = 0.1, resume: bool = True):
+    def StartTraining(self, root: str, epochs: int = 5, batchSize: int = 32, valSplit: float = 0.1, resume: bool = True, isTest: bool = False):
         if self.is_training:
             self.controller.SetStatus("error", "Training is already running")
             return False
         self.is_training = True
-        self.training_thread = threading.Thread(target=self.TrainLoop, args=(root, epochs, batchSize, valSplit, resume), daemon=False)
+
+        ckpt_path = BasicParameters.CKPT_PATH_TEST if isTest else BasicParameters.CKPT_PATH_TRAIN
+        wm_mem_path = BasicParameters.WORLD_MEMORY_PATH_TEST if isTest else BasicParameters.WORLD_MEMORY_PATH
+        mem_mem_path = BasicParameters.MEMORY_MEMORY_PATH_TEST if isTest else BasicParameters.MEMORY_MEMORY_PATH
+
+        self.training_thread = threading.Thread(
+            target=self.TrainLoop, args=(
+                root, epochs, batchSize, valSplit, resume),
+                kwargs={"worldMemPath": wm_mem_path, "memMemPath": mem_mem_path, "ckptPath": ckpt_path}, 
+                daemon=False)
         self.training_thread.start()
         return True
 
@@ -593,14 +649,14 @@ class ManagerFunction:
     def GetTrainingStatus(self):
         return self.controller.GetStatus()
 
-    def TrainLoop(self, root: str, epochs: int, batchSize: int, valSplit: float, resume: bool):
+    def TrainLoop(self, root: str, epochs: int, batchSize: int, valSplit: float, resume: bool, *, worldMemPath: str = None, memMemPath: str = None, ckptPath: str = None):
         try:
             torch.autograd.set_detect_anomaly(True)
 
             ds = OfflineGameDataset(root)
 
             brain = BrainCore(device=self.device,plasticHebbian=True,plasticOnlineLearning=False,usePlanner=False,)
-            agent = Agent(brain, device=self.device)
+            agent = Agent(brain,isTrain=True, device=self.device, worldMemoryPath=worldMemPath, memMemoryPath=memMemPath)
 
             SEQ_LEN = agent.brain.SEQ_LEN
 
@@ -608,8 +664,8 @@ class ManagerFunction:
             best_val = float("inf")
             train_ds, val_ds = None, None
 
-            if resume and Path(self.checkpoint_path).exists():
-                start_epoch, best_val, train_ds, val_ds = self.LoadCheckpoint(brain, agent, ds)
+            if resume and Path(ckptPath).exists():
+                start_epoch, best_val, train_ds, val_ds = self.LoadCheckpoint(brain, agent, ds, ckptPath)
 
             if train_ds is None:
                 n_train = int(len(ds) * (1 - valSplit))
@@ -659,23 +715,23 @@ class ManagerFunction:
                             img_np = img_item.numpy()
                         else:
                             img_np = img_item 
-                        img_buf.append(img_np)
 
+                        img_buf.append(img_np)
                         key_buf.append(key_b[i])
                         mouse_buf.append(mouse_b[i])
                         reward_buf.append(reward_b[i])
                         done_buf.append(done_b[i])
 
-                        if len(img_buf) == SEQ_LEN:
-                            pack = agent.StackNpImagesKeysMouses(imgs=img_buf,keys=key_buf,mouse=mouse_buf,reward=reward_buf,done=done_buf,B=batchSize, T=SEQ_LEN,size=(512, 512),device=self.device,)
-
+                        if len(img_buf) == SEQ_LEN * batchSize:
+                            pack = agent.StackNpImagesKeysMouses(imgs=img_buf,keys=key_buf,mouse=mouse_buf,reward=reward_buf,done=done_buf,B=batchSize, T=SEQ_LEN,device=self.device,)
+                            
                             frames = pack["frames"][0]  
                             keys_t = pack["keys"][0] if pack["keys"] else None
                             mouse_t = pack["mouses"][0] if pack["mouses"] else None
                             reward_t = pack["rewards"][0] if pack["rewards"] else None
                             done_t = pack["dones"][0] if pack["dones"] else None
 
-                            key_pred, mouse_pred, model_loss = agent.Act(frames,isTrain=True,reward=reward_t,done=done_t,deterministicActor=False,)
+                            key_pred, mouse_pred, model_loss = agent.Act(frames,reward=reward_t,done=done_t,deterministicActor=False,)
 
                             bc_loss = torch.zeros((), device=self.device)
                             if keys_t is not None:
@@ -703,7 +759,7 @@ class ManagerFunction:
                             agent.opt_critic.step()
                             agent.opt_actor.step()
 
-                            """epoch_loss += float(loss.item())
+                            epoch_loss += float(loss.item())
                             nb += 1
 
                             self.controller.SetStatus("training","Training...",epoch=ep + 1,total_epochs=epochs,batch=bi,total_batches=len(train_dl),train_loss=float(loss.item()),)
@@ -754,13 +810,13 @@ class ManagerFunction:
                             v_done_buf.append(done_b[i])
 
                             if len(v_img_buf) == SEQ_LEN:
-                                v_pack = agent.StackNpImagesKeysMouses(imgs=v_img_buf,keys=v_key_buf,mouse=v_mouse_buf,reward=v_reward_buf,done=v_done_buf,B=batchSize,T=SEQ_LEN,size=(512, 512),device=self.device,)
+                                v_pack = agent.StackNpImagesKeysMouses(imgs=v_img_buf,keys=v_key_buf,mouse=v_mouse_buf,reward=v_reward_buf,done=v_done_buf,B=batchSize,T=SEQ_LEN,device=self.device,)
 
                                 v_frames = v_pack["frames"][0]
                                 v_keys_t = v_pack["keys"][0] if v_pack["keys"] else None
                                 v_mouse_t = v_pack["mouses"][0] if v_pack["mouses"] else None
 
-                                v_key_pred, v_mouse_pred, _ = agent.Act(v_frames,isTrain=False,reward=None,done=None,deterministicActor=True,)
+                                v_key_pred, v_mouse_pred, _ = agent.Act(v_frames,reward=None,done=None,deterministicActor=True,)
 
                                 cur_loss = torch.zeros((), device=self.device)
                                 if v_keys_t is not None:
@@ -799,7 +855,7 @@ class ManagerFunction:
                         "torch": torch.get_rng_state(),
                         "numpy": np.random.get_state(),},
                     "buffers": brain.ExportBuffers(),}
-                torch.save(ckpt, self.checkpoint_path)
+                torch.save(ckpt, ckptPath)
 
                 self.controller.SetStatus("training", f"Epoch {ep+1}/{epochs} done | train {avg_train:.4f} | val {avg_val:.4f}", val_loss=avg_val,)
 
@@ -808,7 +864,7 @@ class ManagerFunction:
                     break
 
             else:
-                self.controller.SetStatus("completed", "Training completed")"""
+                self.controller.SetStatus("completed", "Training completed")
 
         except Exception as e:
             tb = traceback.format_exc()
@@ -817,8 +873,8 @@ class ManagerFunction:
             self.is_training = False
 
 
-    def LoadCheckpoint(self, brain: BrainCore, agent: Agent, dataset: Dataset):
-        ckpt = torch.load(self.checkpoint_path, map_location=self.device)
+    def LoadCheckpoint(self, brain: BrainCore, agent: Agent, dataset: Dataset, path: str = None):
+        ckpt = torch.load(path,  map_location=self.device)
         brain.load_state_dict(ckpt["brain"])
         agent.opt_actor.load_state_dict(ckpt["opt_actor"])
         agent.opt_critic.load_state_dict(ckpt["opt_critic"])
@@ -839,15 +895,12 @@ class ManagerFunction:
         best_val = float(ckpt.get("best_val", float("inf")))
         return start_epoch, best_val, train_ds, val_ds
 
-    def StartDeployment(self, ckptPath: str, cameraIndex: int = 0,fps: int = 30, onlineLearn: bool = False,onlineEvery: float = 2.0, safetyLrScale: float = 0.1):
+    def StartDeployment(self, ckptPath: str, cameraIndex: int = 0, useHebbian: bool = True, usePlanner: bool = True):
         if self.deploying:
             return False
         self.deploying = True
-        self.deploy_thread = threading.Thread(
-            target=self.DeployLoop,
-            args=(ckptPath, cameraIndex, fps, onlineLearn, onlineEvery, safetyLrScale),
-            daemon=False)
-        
+        self.controller.stop_requested = False 
+        self.deploy_thread = threading.Thread(target=self.DeployLoop,args=(ckptPath, cameraIndex),kwargs={"useHebbian": useHebbian, "usePlanner": usePlanner},daemon=False,)
         self.deploy_thread.start()
         return True
 
@@ -860,58 +913,79 @@ class ManagerFunction:
             return True
         return False
 
-    def DeployLoop(
-        self,
-        ckptPath: str,
-        cameraIndex: int,
-        fps: int,
-        *,
-        useHebbian: bool = True,
-        usePlanner: bool = True,):
+    def DeployLoop(self, moduleParameterPath: str,cameraIndex: int,*,useHebbian: bool = True,usePlanner: bool = True,):
+        self.deploying = True
         try:
-            brain = BrainCore(device=self.device,plasticHebbian=useHebbian, plasticOnlineLearning=False,usePlanner=usePlanner,)
-            
-            sd = torch.load(ckptPath, map_location=self.device)
+            brain = BrainCore(device=self.device,plasticHebbian=useHebbian,plasticOnlineLearning=False,usePlanner=usePlanner,)
+
+            try:
+                sd = torch.load(moduleParameterPath, map_location=self.device, weights_only=True)
+            except TypeError:
+                sd = torch.load(moduleParameterPath, map_location=self.device)
+
             if isinstance(sd, dict) and "brain" in sd:
                 brain.load_state_dict(sd["brain"], strict=False)
             else:
                 brain.load_state_dict(sd, strict=False)
+
+            brain.to(self.device)
             brain.eval()
 
-            agent = Agent(brain, device=self.device)
+            agent = Agent(brain,isTrain=False,device=self.device,worldMemoryPath=BasicParameters.WORLD_MEMORY_PATH,memMemoryPath=BasicParameters.MEMORY_MEMORY_PATH,)
+            agent.ResetBrainState()
+
             seq_len = brain.SEQ_LEN
+            rm_len = math.ceil(seq_len * 9 / 10)
 
             if iio is None:
                 raise RuntimeError("imageio.v3 cant use")
 
-            frame_buf: List[np.ndarray] = []
             self.controller.SetStatus("deploying", "Deployment started")
+
+            code_to_name: dict[int, str] = {}
+            all_codes = []
+            for grp, mp in KEYBOARD_LAYOUT.items():
+                for name, code in mp.items():
+                    code_to_name.setdefault(code, name)
+                    all_codes.append(code)
+            max_code = max(all_codes)
+
+            frame_buf: List[np.ndarray] = []
 
             with iio.imopen(f"<video{cameraIndex}>", "r") as cam:
                 for frame_np in cam:
                     if self.controller.ShouldStop():
                         break
-                    t0 = time.time()
 
                     frame_buf.append(frame_np)
 
                     if len(frame_buf) < seq_len:
-                        self.controller.SetStatus("deploying", f"warming up... {len(frame_buf)}/{seq_len}")
-                        elapsed = time.time() - t0
-                        time.sleep(max(0.0, 1.0 / max(1, fps) - elapsed))
                         continue
 
-                    pack = agent.StackNpImagesKeysMouses(imgs=frame_buf[-seq_len:], B=1,T=seq_len,size=(512, 512),device=self.device,)
-                    frames = pack["frames"][0]  # [1, T, 3, H, W]
+                    pack = agent.StackNpImagesKeysMouses(imgs=frame_buf,B=1, T=seq_len,device=self.device,)
+                    frames = pack["frames"][0]
 
-                    key_vec, mouse, _ = agent.Act(frames,isTrain=False,reward=None,done=None,sampleActions=True,deterministicActor=False,)
+                    key_vec, mouse, _ = agent.Act(frames,reward=None,done=None,sampleActions=True,deterministicActor=True,)
 
-                    kb_bits = "".join("1" if v > 0.5 else "0" for v in key_vec[0, :8].tolist())
-                    latency = (time.time() - t0) * 1000.0
-                    self.controller.SetStatus("deploying",f"keys:{kb_bits} mouse:dx={float(mouse[0,0]):.3f},dy={float(mouse[0,1]):.3f} | latency={latency:.1f}ms")
+                    kv = key_vec[0].detach().cpu()
+                    ms = mouse[0].detach().cpu()
 
-                    elapsed = time.time() - t0
-                    time.sleep(max(0.0, 1.0 / max(1, fps) - elapsed))
+                    pressed_names: list[str] = []
+                    for code in range(max_code + 1):
+                        if float(kv[code]) > 0.5:
+                            pressed_names.append(code_to_name.get(code, f"Key{code}"))
+
+                    if float(kv[max_code + 1]) > 0.5:
+                        pressed_names.append("MouseLeft")
+                    if float(kv[max_code + 2]) > 0.5:
+                        pressed_names.append("MouseRight")
+
+                    names_str = "[" + ", ".join(pressed_names) + "]" if pressed_names else "[]"
+
+                    self.controller.SetStatus("deploying",(f"keys:{names_str} "f"mouse:dx={float(ms[0]):.3f},dy={float(ms[1]):.3f}"),)
+
+                    drop_n = len(frame_buf) - rm_len
+                    del frame_buf[:drop_n]
 
             self.controller.SetStatus("stopped", "Deployment stopped")
 
@@ -975,22 +1049,20 @@ class ManagerFunction:
         finally:
             if cleanup:
                 try:
-                    import shutil
                     shutil.rmtree(dataRoot, ignore_errors=True)
                 except Exception as e:
                     print(f"[MonitorTraining] cleanup failed: {e}")
 
 
-
     def TestModuleTrain(
         self,
         *,
-        dataRoot: str = "BrainDeepLearn/TestData",
+        dataRoot: str = BasicParameters.DATA_ROOT_PATH_TEST,
         nSamples: int = 64,
         epochs: int = 1,
         batchSize: int = 1,
-        val_split: float = 0.2,
-        ckpt_path: Optional[str] = None,
+        valSplit: float = 0.2,
+        ckptPath: str = BasicParameters.CKPT_PATH_TEST,
         seed: int = 42,
         cleanup: bool = False,) -> Dict[str, Any]:
         try:
@@ -1019,7 +1091,7 @@ class ManagerFunction:
                 extra_codes += [KEYBOARD_LAYOUT[grp][k] for k in KEYBOARD_LAYOUT[grp]]
             skill_codes = [KEYBOARD_LAYOUT["skill_keys"][k] for k in KEYBOARD_LAYOUT["skill_keys"]]
 
-            H, W = 512, 512
+            H, W = BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE
             for i in range(nSamples):
                 img = rng.integers(0, 256, size=(H, W, 3), dtype=np.uint8)
                 iio.imwrite(str(root / "frames" / f"{i:05d}.png"), img)
@@ -1045,21 +1117,17 @@ class ManagerFunction:
                 done = rng.normal(loc=0.0, scale=2.0, size=(2,)).astype(np.float32)
                 np.save(str(root / "done" / f"{i:05d}.npy"), done)
 
-            ckpt = ckpt_path or self.checkpoint_path
             print("[SmokeTest] start train...")
 
-            #ok = self.StartTraining(root=str(root),epochs=epochs,batchSize=batchSize,valSplit=val_split,resume=False,)
+            #ok = self.StartTraining(root=str(root),epochs=epochs,batchSize=batchSize,valSplit=valSplit,resume=False, isTest=True)
 
             #if not ok:
                 #raise RuntimeError("StartTraining returns False (training may already be running)")
 
-
             #t = threading.Thread(target=self.MonitorTraining,args=(cleanup, str(root)),daemon=False,)
             #t.start()
 
-            self.TrainLoop(root=str(root), epochs=epochs, batchSize=1, valSplit=val_split, resume=False)
-
-            print("[SmokeTest] train complete, checkpoint:", ckpt)
+            self.TrainLoop(root, epochs, batchSize, valSplit, False, worldMemPath=BasicParameters.WORLD_MEMORY_PATH_TEST, memMemPath=BasicParameters.MEMORY_MEMORY_PATH_TEST,ckptPath=BasicParameters.CKPT_PATH_TEST)
 
             if cleanup:
                 try:
@@ -1068,7 +1136,7 @@ class ManagerFunction:
                     pass
 
             return {
-                "checkpoint": ckpt,
+                "checkpoint": ckptPath,
                 "data_root": str(root),}
         
         except Exception as e:
