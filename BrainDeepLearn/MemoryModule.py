@@ -1487,7 +1487,17 @@ class MemoryExtractor(nn.Module):
             "ns_prev_P_post": (self._ns_prev_P_post.clone() if (self._ns_prev_P_post is not None) else None),
 
             "rng_cpu": torch.get_rng_state(),
-            "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,}
+            "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            
+            "sym_mem_Pstore": self.sym_mem.Pstore.clone(),
+            "sym_mem_prio": self.sym_mem.prio.clone(),
+            "sym_mem_step": self.sym_mem.step.clone(),
+            "sym_mem_touch": self.sym_mem.touch.clone(),
+            "sym_mem_filled": torch.tensor(self.sym_mem.filled),
+            "sym_mem_global_step": torch.tensor(self.sym_mem.global_step),
+
+            "ns_penalty_vec": (self._ns_penalty_vec.clone() if self._ns_penalty_vec is not None else None),}
+    
         
         torch.save(state, path)
 
@@ -1559,11 +1569,20 @@ class MemoryExtractor(nn.Module):
             epi.global_step = int(state["ltm_epi_global_step"].item())
 
         if "ns_prev_P_pre" in state:
-            self._ns_prev_P_pre = (state["ns_prev_P_pre"].to(self.h_state.device)
-                                    if state["ns_prev_P_pre"] is not None else None)
+            self._ns_prev_P_pre = (state["ns_prev_P_pre"].to(self.h_state.device) if state["ns_prev_P_pre"] is not None else None)
         if "ns_prev_P_post" in state:
-            self._ns_prev_P_post = (state["ns_prev_P_post"].to(self.h_state.device)
-                                    if state["ns_prev_P_post"] is not None else None)
+            self._ns_prev_P_post = (state["ns_prev_P_post"].to(self.h_state.device) if state["ns_prev_P_post"] is not None else None)
+            
+        if "sym_mem_Pstore" in state:
+            self.sym_mem.Pstore.copy_(state["sym_mem_Pstore"].to(self.sym_mem.Pstore.device))
+            self.sym_mem.prio.copy_(state["sym_mem_prio"].to(self.sym_mem.prio.device))
+            self.sym_mem.step.copy_(state["sym_mem_step"].to(self.sym_mem.step.device))
+            self.sym_mem.touch.copy_(state["sym_mem_touch"].to(self.sym_mem.touch.device))
+            self.sym_mem.filled = int(state["sym_mem_filled"].item())
+            self.sym_mem.global_step = int(state["sym_mem_global_step"].item())
+
+        if "ns_penalty_vec" in state:
+            self._ns_penalty_vec = (None if state["ns_penalty_vec"] is None else state["ns_penalty_vec"].to(self.h_state.device))
 
     @torch.no_grad()
     def Reason(self, goal: Optional[torch.Tensor] = None, steps: int = 3) -> torch.Tensor:
