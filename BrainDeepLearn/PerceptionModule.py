@@ -749,14 +749,15 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
         **kwargs,) -> torch.Tensor:
 
-        featIn = self.base.cnn_extractor(x)
-        feat = self.base.cnn_feat_adapter(featIn)
+        feat_raw = self.base.cnn_extractor(x) 
 
         deltaFeat2D = deltasPerLayer[0].get("feat", None)
         if deltaFeat2D is not None:
             C = deltaFeat2D.size(0)
-            w1x1 = deltaFeat2D.view(C, C, 1, 1)
-            feat = feat + F.conv2d(featIn, w1x1, bias=None, stride=1, padding=0)
+            w1x1 = deltaFeat2D.view(C, C, 1, 1).to(feat_raw.dtype).to(feat_raw.device)
+            feat_raw = feat_raw + F.conv2d(feat_raw, w1x1, bias=None, stride=1, padding=0)
+
+        feat = self.base.cnn_feat_adapter(feat_raw)
 
         if hasattr(self.base.patch_embed, "Preprocess"):
             feat = self.base.patch_embed.Preprocess(feat)
@@ -765,6 +766,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         baseDelta = self.base.patch_adapter.DeltaWeight()
         if baseDelta is not None:
             W_eff = W_eff + baseDelta
+
         deltaPatch2D = deltasPerLayer[0].get("patch", None)
         if deltaPatch2D is not None:
             E, Ckhw = deltaPatch2D.shape
@@ -777,7 +779,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             stride=self.base.patch_embed.stride,
             padding=self.base.patch_embed.padding,
             dilation=self.base.patch_embed.dilation,
-            groups=self.base.patch_embed.groups)
+            groups=self.base.patch_embed.groups,)
 
         B, E, Ph, Pw = patches.shape
         tokens = rearrange(patches, 'b c h w -> b (h w) c')
