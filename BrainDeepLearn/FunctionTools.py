@@ -59,9 +59,44 @@ class BaseOnlineWrapper(nn.Module):
     def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
         raise NotImplementedError
 
+
+    def GetCurrentSimDeltas(self, *, detach: bool = True, clone: bool = True, skipZeros: bool = True) -> List[Dict[str, Optional[torch.Tensor]]]:
+
+        deltas: List[Dict[str, Optional[torch.Tensor]]] = []
+        Z0_cache: Dict[Tuple[int,int,torch.device,torch.dtype], torch.Tensor] = {}
+
+        for layerIdx in range(self.layerCount):
+            row: Dict[str, Optional[torch.Tensor]] = {}
+            for name, spec in self.sites.items():
+                slot = self.cand[name][layerIdx]
+                if len(slot["A"]) == 0:
+                    if skipZeros:
+                        row[name] = None
+                    else:
+                        k = (spec.outDim, spec.inDim, self.deviceRef, self.dtypeRef)
+                        if k not in Z0_cache:
+                            Z0_cache[k] = torch.zeros(spec.outDim, spec.inDim,device=self.deviceRef, dtype=self.dtypeRef)
+                        row[name] = Z0_cache[k]
+                    continue
+
+                delta = torch.zeros(spec.outDim, spec.inDim,device=self.deviceRef, dtype=self.dtypeRef)
+
+                for a, b, s in zip(slot["A"], slot["B"], slot["s"]):
+                    delta = delta + self.sites[name].composeFn(a, b, s)
+
+                if skipZeros and torch.allclose(delta, torch.zeros_like(delta)):
+                    row[name] = None
+                else:
+                    if detach: delta = delta.detach()
+                    if clone: delta = delta.clone()
+                    row[name] = delta
+            deltas.append(row)
+        return deltas
+
+
     def ForwardWithDeltas(
         self,
-        x: torch.Tensor,
+        x,
         keyPaddingMask: Optional[torch.Tensor],
         tdError: Optional[torch.Tensor],
         uncertainty: Optional[torch.Tensor],
@@ -75,12 +110,13 @@ class BaseOnlineWrapper(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x,
         keyPaddingMask: Optional[torch.Tensor] = None,
         tdError: Optional[torch.Tensor] = None,
-        uncertainty: Optional[torch.Tensor] = None,) -> torch.Tensor:
+        uncertainty: Optional[torch.Tensor] = None,
+        **kwargs,) -> torch.Tensor:
         deltas = [self.ComposeLayerDelta(layerIdx) for layerIdx in range(self.layerCount)]
-        return self.ForwardWithDeltas(x, keyPaddingMask, tdError, uncertainty, deltas)
+        return self.ForwardWithDeltas(x, keyPaddingMask, tdError, uncertainty, deltas, **kwargs)
 
     def train(self, mode: bool = True):
         super().train(mode)
