@@ -747,70 +747,63 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         tdError: Optional[torch.Tensor],
         uncertainty: Optional[torch.Tensor],
         deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
-        **kwargs,) -> torch.Tensor:
-
-        feat_raw = self.base.cnn_extractor(x) 
+        **kwargs,
+    ) -> torch.Tensor:
+        feat = self.base.cnn_extractor(x)
+        feat = self.base.cnn_feat_adapter(feat)
 
         deltaFeat2D = deltasPerLayer[0].get("feat", None)
         if deltaFeat2D is not None:
             C = deltaFeat2D.size(0)
-            w1x1 = deltaFeat2D.view(C, C, 1, 1).to(feat_raw.dtype).to(feat_raw.device)
-            feat_raw = feat_raw + F.conv2d(feat_raw, w1x1, bias=None, stride=1, padding=0)
+            w1x1 = deltaFeat2D.view(C, C, 1, 1).to(device=feat.device, dtype=feat.dtype)
+            feat = feat + F.conv2d(feat, w1x1, bias=None, stride=1, padding=0)
 
-        feat = self.base.cnn_feat_adapter(feat_raw)
-
+        feat_patch = feat
         if hasattr(self.base.patch_embed, "Preprocess"):
-            feat = self.base.patch_embed.Preprocess(feat)
+            feat_patch = self.base.patch_embed.Preprocess(feat_patch)
 
         W_eff = self.base.patch_embed.weight
-        baseDelta = self.base.patch_adapter.DeltaWeight()
-        if baseDelta is not None:
-            W_eff = W_eff + baseDelta
+        base_delta = self.base.patch_adapter.DeltaWeight()
+        if base_delta is not None:
+            W_eff = W_eff + base_delta
 
         deltaPatch2D = deltasPerLayer[0].get("patch", None)
         if deltaPatch2D is not None:
             E, Ckhw = deltaPatch2D.shape
-            C = self.base.patch_embed.in_channels
+            C_in = self.base.patch_embed.in_channels
             kh, kw = self.base.patch_embed.kernel_size
-            W_eff = W_eff + deltaPatch2D.view(E, C, kh, kw)
+            W_eff = W_eff + deltaPatch2D.view(E, C_in, kh, kw).to(device=feat_patch.device, dtype=feat_patch.dtype)
 
-        patches = F.conv2d(
-            feat, W_eff, bias=None,
-            stride=self.base.patch_embed.stride,
-            padding=self.base.patch_embed.padding,
-            dilation=self.base.patch_embed.dilation,
-            groups=self.base.patch_embed.groups,)
+        patches = F.conv2d(feat_patch,W_eff,bias=None,stride=self.base.patch_embed.stride,
+            padding=self.base.patch_embed.padding,dilation=self.base.patch_embed.dilation,groups=self.base.patch_embed.groups,)
 
-        B, E, Ph, Pw = patches.shape
-        tokens = rearrange(patches, 'b c h w -> b (h w) c')
-        cls = repeat(self.base.cls_token, '1 1 d -> b 1 d', b=B)
-        xTok = torch.cat([cls, tokens], dim=1)
+        B, C, Ph, Pw = patches.shape
+        patches = rearrange(patches, "b c h w -> b (h w) c")
+        cls_tokens = repeat(self.base.cls_token, "1 1 d -> b 1 d", b=B)
+        xTok = torch.cat([cls_tokens, patches], dim=1)
         xTok = xTok + self.base.pos_embed
         xTok = self.base.pos_drop(xTok)
 
         for i, layer in enumerate(self.base.transformer_layers):
-            xLayer = layer(xTok)
-            xBase = self.base.token_adapters[i](xLayer)
+            xTok = layer(xTok)
+            xTok = self.base.token_adapters[i](xTok)
             deltaTok2D = deltasPerLayer[i].get("token", None)
             if deltaTok2D is not None:
-                xTok = xBase + (xLayer @ deltaTok2D.t())
-            else:
-                xTok = xBase
+                xTok = xTok + (xTok @ deltaTok2D.t())
 
         xTok = self.base.encoder_norm(xTok)
-
-        clsRep = xTok[:, 0, :]
-        mlpOut = self.base.mlp(clsRep)
-        gate = self.base.adaptive_gate(mlpOut)
-        out = gate * mlpOut + (1 - gate) * clsRep
+        cls_rep = xTok[:, 0, :]
+        mlp_out = self.base.mlp(cls_rep)
+        gate = self.base.adaptive_gate(mlp_out)
+        out = gate * mlp_out + (1 - gate) * cls_rep
         out = self.base.output_norm(out)
 
-        patchTokens = xTok[:, 1:, :]
-        patchScores = self.base.patch_aggregator(patchTokens).squeeze(-1)
-        patchWeights = torch.softmax(patchScores, dim=1)
-        globalPatch = (patchTokens * patchWeights.unsqueeze(-1)).sum(dim=1)
+        patch_tokens = xTok[:, 1:, :]
+        patch_scores = self.base.patch_aggregator(patch_tokens).squeeze(-1)
+        patch_weights = F.softmax(patch_scores, dim=1)
+        global_patch = (patch_tokens * patch_weights.unsqueeze(-1)).sum(dim=1)
 
-        return torch.cat([out, globalPatch], dim=1)
+        return torch.cat([out, global_patch], dim=1)
 
     @torch.no_grad()
     def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
