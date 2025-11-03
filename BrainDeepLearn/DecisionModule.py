@@ -1122,10 +1122,11 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
 
 
 class CEMPlanner(nn.Module):
-    def __init__(self,worldModel: nn.Module,baseCodes: List[int],skillCodes: List[int],extraCodes: List[int],maxCode: int,hasNoSkill: bool = True, horizon: int = 5, N: int = 64,
-                 elite: int = 8,iters: int = 3,gamma: float = 0.99,temperature: float = 1.0,momentum: float = 0.15,laplace: float = 1.0,minVar: float = 1e-4,epsBern: float = 1e-4):
+    def __init__(self,worldModel: nn.Module, wmIsOnlineWrapper: bool ,baseCodes: List[int],skillCodes: List[int],extraCodes: List[int],maxCode: int,hasNoSkill: bool = True, horizon: int = 5, 
+                 N: int = 64,elite: int = 8,iters: int = 3,gamma: float = 0.99,temperature: float = 1.0,momentum: float = 0.15,laplace: float = 1.0,minVar: float = 1e-4,epsBern: float = 1e-4):
         super().__init__()
         self.wm = worldModel
+        self.wm_is_online_wrapper = wmIsOnlineWrapper
         self.horizon = int(horizon)
         self.N = int(N)
         self.elite = int(elite)
@@ -1230,8 +1231,10 @@ class CEMPlanner(nn.Module):
         if h_prev is None or z_prev is None:
             h_prev, z_prev = self.wm.ExportState()
             if h_prev is None or h_prev.size(0) != B or h_prev.device != device:
-                h_prev = torch.zeros(B, self.wm.deter_dim, device=device)
-                z_prev = torch.zeros(B, self.wm.stoch_dim, device=device)
+                d_dim = self.wm.base.deter_dim if self.wm_is_online_wrapper else self.wm.deter_dim
+                s_dim = self.wm.base.stoch_dim if self.wm_is_online_wrapper else self.wm.stoch_dim
+                h_prev = torch.zeros(B, d_dim, device=device)
+                z_prev = torch.zeros(B, s_dim, device=device)
 
         for _ in range(self.iters):
             eps = torch.randn(H, B, N, 2, device=device)
@@ -1270,11 +1273,12 @@ class CEMPlanner(nn.Module):
                     self.base_codes_buf, self.skill_codes_buf, self.extra_codes_buf,
                     self.max_code, self.has_no_skill)
 
-                a_enc = self.wm.action_encoder(key_vec, a_mouse_t)
-                try:
+                if self.wm_is_online_wrapper:
+                    a_enc = self.wm.base.action_encoder(key_vec, a_mouse_t)
+                    h, z, s_next, r_t, d_t = self.wm.StepPriorWithDeltas(h, z, a_enc, sample=False)
+                else:
+                    a_enc = self.wm.action_encoder(key_vec, a_mouse_t)
                     h, z, s_next, r_t, d_t = self.wm.StepPriorOnly(h, z, a_enc, sample=False)
-                except TypeError:
-                    h, z, s_next, r_t, d_t = self.wm.StepPriorOnly(h, z, a_enc)
 
                 r_t = r_t.view(B, N)
                 d_t = d_t.view(B, N)
@@ -1348,7 +1352,7 @@ class DecisionPlannerExtractor:
     def __init__(self):
         pass
 
-    def BuildPlanner(self, worldModel: nn.Module,KEYBOARD_LAYOUT: Dict[str, Dict[str, int]],includeNoSkill: bool = True,**cemKwargs) -> CEMPlanner:
+    def BuildPlanner(self, worldModel: nn.Module,wmIsOnlineWrapper: bool, KEYBOARD_LAYOUT: Dict[str, Dict[str, int]],includeNoSkill: bool = True,**cemKwargs) -> CEMPlanner:
         base_codes = [KEYBOARD_LAYOUT["base_keys"][k] for k in KEYBOARD_LAYOUT["base_keys"].keys()]
         skill_codes = [KEYBOARD_LAYOUT["skill_keys"][k] for k in KEYBOARD_LAYOUT["skill_keys"].keys()]
         extra_codes = []
@@ -1360,7 +1364,7 @@ class DecisionPlannerExtractor:
             all_codes += list(grp.values())
         max_code = max(all_codes)
 
-        return CEMPlanner(worldModel=worldModel,baseCodes=base_codes,skillCodes=skill_codes,extraCodes=extra_codes,maxCode=max_code,hasNoSkill=includeNoSkill,**cemKwargs)
+        return CEMPlanner(worldModel=worldModel,wmIsOnlineWrapper=wmIsOnlineWrapper,baseCodes=base_codes,skillCodes=skill_codes,extraCodes=extra_codes,maxCode=max_code,hasNoSkill=includeNoSkill,**cemKwargs)
 
 
 
@@ -1373,7 +1377,7 @@ class TestDecisionMTool:
         self.skill_names = list(KEYBOARD_LAYOUT["skill_keys"].keys())
         self.extra_groups = ["menu_keys", "system_keys", "alpha_keys"]
 
-        self.base_codes  = [KEYBOARD_LAYOUT["base_keys"][k]  for k in self.base_names]
+        self.base_codes = [KEYBOARD_LAYOUT["base_keys"][k]  for k in self.base_names]
         self.skill_codes = [KEYBOARD_LAYOUT["skill_keys"][k] for k in self.skill_names]
         self.extra_codes = []
         for g in self.extra_groups:
@@ -1445,6 +1449,7 @@ class TestDecisionMTool:
             wm.ResetHidden(B=2, device=self.device)
             planner = CEMPlanner(
                 worldModel=wm,
+                wmIsOnlineWrapper=False,
                 baseCodes=self.base_codes,
                 skillCodes=self.skill_codes,
                 extraCodes=self.extra_codes,
