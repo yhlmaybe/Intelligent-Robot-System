@@ -749,7 +749,7 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
                           uncertainty: Optional[torch.Tensor],
                           deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]], 
                           **kwargs):
-        
+
         allowed = {"rewardExt", "policyEntropyPrev", "done"}
         unknown = set(kwargs) - allowed
         if unknown:
@@ -759,58 +759,68 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         policyEntropyPrev = kwargs.get("policyEntropyPrev", None)
         done = kwargs.get("done", None)
 
-        memory, attn, state = self.EnsureInputs(x)
         base = self.base
+
+        memory, attn, state = self.EnsureInputs(x)
         B, device = state.size(0), state.device
 
         d_fc1 = deltasPerLayer[0].get("fc1", None)
-        h = self.LinearWithDelta(base.fc1, torch.cat([memory, attn, state], dim=-1), d_fc1, getattr(base, "fc1_adapter", None))
+        h = self.LinearWithDelta(base.fc1,torch.cat([memory, attn, state], dim=-1),d_fc1,getattr(base, "fc1_adapter", None),)
         h = F.gelu(h)
-        h = base.norm1(h) if base.norm1 is not None else h
+        if base.norm1 is not None:
+            h = base.norm1(h)
 
         d_fc2 = deltasPerLayer[1].get("fc2", None)
-        h = self.LinearWithDelta(base.fc2, h, d_fc2, getattr(base, "fc2_adapter", None))
+        h = self.LinearWithDelta(base.fc2,h,d_fc2,getattr(base, "fc2_adapter", None),)
         h = F.gelu(h)
-        h = base.norm2(h) if base.norm2 is not None else h
+        if base.norm2 is not None:
+            h = base.norm2(h)
 
         d_uh = deltasPerLayer[1].get("uhead", None)
-        uncert_raw = self.LinearWithDelta(base.uncert_head, h, d_uh, getattr(base, "uncert_adapter", None)).squeeze(-1)
+        uncert_raw = self.LinearWithDelta(base.uncert_head,h,d_uh,getattr(base, "uncert_adapter", None),).squeeze(-1)
         uncert_pred = F.softplus(uncert_raw)
         uncert_pred_fallback = uncert_pred.detach()
 
-        irg_out = base.rgen(memoryPrev=memory, attnPrev=attn, stateCurr=state,
-                            policyEntropyPrev=policyEntropyPrev,
-                            uncertainty=(uncertainty if uncertainty is not None else uncert_pred_fallback),
-                            tdErrorPrev=tdError)
+        irg_out = base.rgen(
+            memoryPrev=memory,
+            attnPrev=attn,
+            stateCurr=state,
+            policyEntropyPrev=policyEntropyPrev,
+            uncertainty=(uncertainty if uncertainty is not None else uncert_pred_fallback),
+            tdErrorPrev=tdError,)
         
-        r_int, eT, comps = irg_out.rInt.detach(), irg_out.eT, irg_out.components
+        r_int = irg_out.rInt.detach()
+        eT = irg_out.eT
+        comps = irg_out.components
 
         if base.use_hebb:
             hebb_eta = eT[..., 1].clamp_min(0).tanh() * 0.01
             hebb_lam = torch.full((B,), 0.1, device=device)
 
             mix = torch.sigmoid(base.mix_gate(h)).squeeze(-1).clamp(1e-3, 1 - 1e-3)
-
             beta_mix = mix.detach()
-            v_hebb, hebb_extras = base.hebb_value(h, eta=hebb_eta, lam=hebb_lam, betaMix=beta_mix)
+
+            v_hebb, hebb_extras = base.hebb_value(h,eta=hebb_eta,lam=hebb_lam,betaMix=beta_mix,)
 
             d_vh = deltasPerLayer[1].get("vhead", None)
-            v_param= self.LinearWithDelta(base.value_head, h, d_vh, getattr(base, "value_adapter", None)).squeeze(-1)
+            v_param = self.LinearWithDelta(base.value_head,h,d_vh,getattr(base, "value_adapter", None),).squeeze(-1)
 
             value = (1.0 - mix) * v_param + mix * v_hebb.squeeze(-1)
         else:
             d_vh = deltasPerLayer[1].get("vhead", None)
-            value = self.LinearWithDelta(base.value_head, h, d_vh, getattr(base, "value_adapter", None)).squeeze(-1)
+            value = self.LinearWithDelta(base.value_head,h,d_vh,getattr(base, "value_adapter", None),).squeeze(-1)
             hebb_extras = {"H_norm": torch.tensor(0.0, device=device)}
             mix = torch.zeros(B, device=device)
 
-        if rewardExt is None: r_used = base.wInt * r_int
-        else: r_used = base.wExt * rewardExt.to(device) + base.wInt * r_int
+        if rewardExt is None:
+            r_used = base.wInt * r_int
+        else:
+            r_used = base.wExt * rewardExt.to(device) + base.wInt * r_int
 
         gamma = eT[..., 2]
         if base.stopGrad_r_gamma:
             r_used = r_used.detach()
-            gamma  = gamma.detach()
+            gamma = gamma.detach()
         if done is not None:
             gamma = gamma * (1.0 - done.float())
 
@@ -821,7 +831,7 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         edges = base.micro.PreviewEdges(
             zNow=h.detach().mean(dim=0) if B > 1 else h.detach().squeeze(0),
             rNow=r_used.mean().detach(),
-            gNow=gamma.mean().detach())
+            gNow=gamma.mean().detach(),)
         if edges["w"].numel() > 0:
             e_cycle = edges["R"] - (edges["v_hist"].detach() - edges["Gamma"] * value.mean())
             loss_cycle = ((edges["w"] * (e_cycle ** 2)).sum() / edges["w"].sum().clamp_min(1.0)) * base.wCycle
@@ -829,13 +839,16 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
             loss_cycle = value.new_zeros(())
 
         if base._prev_vhat is not None:
-            loss_glue1 = F.mse_loss(base._prev_vhat.to(device), value.mean()) * base.wGlue1
+            loss_glue1 = F.mse_loss(base._prev_vhat.to(device),value.mean(),) * base.wGlue1
         else:
             loss_glue1 = value.new_zeros(())
 
         if (uncertainty is not None) and (base.wUncertTeacher > 0):
             m = torch.isfinite(uncertainty)
-            loss_unc = base.wUncertTeacher * F.mse_loss(uncert_pred[m], uncertainty[m]) if m.any() else 1e-4 * uncert_pred.mean()
+            if m.any():
+                loss_unc = base.wUncertTeacher * F.mse_loss(uncert_pred[m], uncertainty[m])
+            else:
+                loss_unc = 1e-4 * uncert_pred.mean()
         elif base.wUncertTeacher > 0:
             loss_unc = 1e-4 * uncert_pred.mean()
         else:
@@ -849,16 +862,19 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
                 if m.any():
                     loss_ent = F.mse_loss(e_pred[m], policyEntropyPrev[m]) * base.wEntropyTeacher
 
-        loss_git = base.git(base.value_head, transp_extras, adapter=getattr(base, "value_adapter", None))
+        loss_git = base.git(
+            base.value_head,
+            transp_extras,
+            adapter=getattr(base, "value_adapter", None),)
 
         loss_mixgate = torch.tensor(0.0, device=device)
-        if hasattr(base, "wMixGateReg") and base.wMixGateReg > 0:
+        if getattr(base, "wMixGateReg", 0.0) > 0:
             loss_mixgate = base.wMixGateReg * ((mix - 0.5) ** 2).mean()
 
         total_loss = (
             loss_td + loss_cycle + loss_glue1 + loss_unc + loss_git +
             comps.get("reg_gate", value.new_zeros(())).mean() +
-            comps.get("reg_eT",   value.new_zeros(())).mean() +
+            comps.get("reg_eT", value.new_zeros(())).mean() +
             loss_ent + loss_mixgate)
 
         alive = (done is None) or (done.float().mean() < 0.5)
@@ -867,8 +883,8 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
                 zNow=h.detach().mean(dim=0) if B > 1 else h.detach().squeeze(0),
                 vNow=value.mean().detach(),
                 rNow=r_used.mean().detach(),
-                gNow=gamma.mean().detach())
-            
+                gNow=gamma.mean().detach(),)
+
         base._prev_vhat = v_next_hat.mean().detach()
 
         extras: Dict[str, torch.Tensor] = {
@@ -889,9 +905,14 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
             "mix_gt_half": (mix > 0.5).float().mean().detach(),}
 
         return GeoTropicalOut(
-            value=value, tdError=delta, loss=total_loss, eT=eT, rInt=r_int,
+            value=value,
+            tdError=delta,
+            loss=total_loss,
+            eT=eT,
+            rInt=r_int,
             rComps={k: v.detach() for k, v in comps.items()},
-            uncertainty=uncert_pred, extras=extras)
+            uncertainty=uncert_pred,
+            extras=extras,)
 
     @torch.no_grad()
     def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
