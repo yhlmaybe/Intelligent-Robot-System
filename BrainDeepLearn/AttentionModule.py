@@ -701,10 +701,10 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
     def ForwardWithDeltas(
         self,
         x: torch.Tensor,  # (B,S,E)
-        keyPaddingMask: Optional[torch.Tensor],
-        tdError: Optional[torch.Tensor],
-        uncertainty: Optional[torch.Tensor],
-        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        tdError: Optional[torch.Tensor] = None,
+        uncertainty: Optional[torch.Tensor] = None,
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]] = None,
         **kwargs,) -> torch.Tensor:
         B, S, E = x.shape
         num_caps = int(self.base.num_caps)

@@ -97,11 +97,11 @@ class BaseOnlineWrapper(nn.Module):
     def ForwardWithDeltas(
         self,
         x,
-        keyPaddingMask: Optional[torch.Tensor],
-        tdError: Optional[torch.Tensor],
-        uncertainty: Optional[torch.Tensor],
-        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
-        **kwargs, ):
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        tdError: Optional[torch.Tensor] = None,
+        uncertainty: Optional[torch.Tensor] = None,
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]] = None,
+        **kwargs,):
         raise NotImplementedError
 
     @torch.no_grad()

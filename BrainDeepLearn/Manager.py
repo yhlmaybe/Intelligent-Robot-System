@@ -61,6 +61,7 @@ class BrainCore(nn.Module):
         usePlanner: bool = True,):
         super().__init__()
         self.SEQ_LEN = seqLen
+        self.is_online_learning = plasticOnlineLearning
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.perc = PerceiveExtractor(imgSize=BasicParameters.IMAGE_SIZE,useHebbian=plasticHebbian)
         self.attn = AttentionExtractor(sequenceLength=seqLen, hebbianRate=(0.01 if plasticHebbian else 0.0), useHebbian=plasticHebbian)
@@ -69,10 +70,18 @@ class BrainCore(nn.Module):
         self.world = RSSMWorldModel(visionDim=1024)
         self.critic = ValueEstimationExtractor(memoryDim=768, attnDim=1024, stateDim=512, useHebb=plasticHebbian)
 
+        if plasticOnlineLearning:
+            self.perc = PerceptionOnlineWrapper(self.perc)
+            self.attn = AttentionOnlineWrapper(self.attn)
+            self.actor = DecisionOnlineWrapper(self.actor)
+            self.world = WorldModelOnlineWrapper(self.world)
+            self.critic =ValueEstimationOnlineWrapper(self.critic)
+
         self.use_planner = usePlanner
 
         self.planner = DecisionPlannerExtractor().BuildPlanner(
             worldModel=self.world,
+            wmIsOnlineWrapper=plasticOnlineLearning,
             KEYBOARD_LAYOUT=KEYBOARD_LAYOUT,
             includeNoSkill=True,
             horizon=5, N=64, elite=8, iters=3,
@@ -150,7 +159,11 @@ class BrainCore(nn.Module):
         hPrev, zPrev = self.world.ExportState()
 
         if isTrain:
-            w_out = self.world.ForwardTrainSeq(visionSeq=world_vis_in,keysVec= self.prev_key_vec, mouseSeq=self.prev_mouse, h0=hPrev, z0=zPrev,rewardSeq=rewardExt,doneSeq=doneFlag)
+            if self.is_online_learning:
+                wm_kwargs = {"keysVec": self.prev_key_vec,"mouseSeq": self.prev_mouse,"h0": hPrev,"z0": zPrev,"rewardSeq": rewardExt,"doneSeq": doneFlag,}
+                w_out = self.world()
+            else: 
+                w_out = self.world.ForwardTrainSeq(visionSeq=world_vis_in,keysVec= self.prev_key_vec, mouseSeq=self.prev_mouse, h0=hPrev, z0=zPrev,rewardSeq=rewardExt,doneSeq=doneFlag)
         else:
             w_out = self.world.StepPosterior(hPrev, zPrev, visionIn=world_vis_in, actionEnc=a_enc_prev, sample=False)
 

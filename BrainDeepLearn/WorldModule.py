@@ -1332,10 +1332,10 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
     def ForwardWithDeltas(
         self,
         x: torch.Tensor,
-        keyPaddingMask: Optional[torch.Tensor],
-        tdError: Optional[torch.Tensor],
-        uncertainty: Optional[torch.Tensor],
-        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        tdError: Optional[torch.Tensor] = None,
+        uncertainty: Optional[torch.Tensor] = None,
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]] = None,
         **kwargs,) -> Dict[str, torch.Tensor]:
 
         wm = self.base  

@@ -743,12 +743,11 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
     def ForwardWithDeltas(
         self,
         x: torch.Tensor,
-        keyPaddingMask: Optional[torch.Tensor],
-        tdError: Optional[torch.Tensor],
-        uncertainty: Optional[torch.Tensor],
-        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
-        **kwargs,
-    ) -> torch.Tensor:
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        tdError: Optional[torch.Tensor] = None,
+        uncertainty: Optional[torch.Tensor] = None,
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]] = None,
+        **kwargs,) -> torch.Tensor:
         feat = self.base.cnn_extractor(x)
         feat = self.base.cnn_feat_adapter(feat)
 

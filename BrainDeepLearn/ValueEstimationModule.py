@@ -75,9 +75,9 @@ class HebbianLinearFW(nn.Module):
         self.H.mul_(scale)
 
     def forward(self, x: torch.Tensor, *,
-                eta: Optional[torch.Tensor] = None,
-                lam: Optional[torch.Tensor] = None,
-                betaMix: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        eta: Optional[torch.Tensor] = None,
+        lam: Optional[torch.Tensor] = None,
+        betaMix: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         scale = 0.0 if betaMix is None else betaMix.detach().mean()
         W_eff = self.weight + scale * self.H
         y = F.linear(x, W_eff, self.bias)
@@ -128,16 +128,17 @@ class IntrinsicRewardOut(NamedTuple):
 
 class IntrinsicRewardGenerator(nn.Module):
     def __init__(self, memoryDim: int = 768, attnDim: int = 1024, stateDim: int = 256, *,
-                 hidden: int = 256, alphaNovelty: float = 1.0, alphaEntropy: float = 0.2,
-                 alphaProgress: float = 0.5, alphaUncertPenalty: float = 0.5,
-                 rClip: float = 5.0, tau0: float = 1.0, beta: float = 1.0,
-                 lr0: float = 1.0,  kappa: float = 0.5, gamma0: float = 0.99, delta: float = 0.02,
-                 tauMin: Optional[float] = None, tauMax: Optional[float] = 10.0,
-                 lrMin: Optional[float]  = 0.25, lrMax: Optional[float]  = 3.0,
-                 gammaMin: float = 0.90, gammaMax: float = 0.9999,
-                 emaMomentum: float = 0.99, teacherDropoutProb: float = 0.1,
-                 gateReg: float = 1e-3, eTAnchor: float = 1e-3):
+        hidden: int = 256, alphaNovelty: float = 1.0, alphaEntropy: float = 0.2,
+        alphaProgress: float = 0.5, alphaUncertPenalty: float = 0.5,
+        rClip: float = 5.0, tau0: float = 1.0, beta: float = 1.0,
+        lr0: float = 1.0,  kappa: float = 0.5, gamma0: float = 0.99, delta: float = 0.02,
+        tauMin: Optional[float] = None, tauMax: Optional[float] = 10.0,
+        lrMin: Optional[float]  = 0.25, lrMax: Optional[float]  = 3.0,
+        gammaMin: float = 0.90, gammaMax: float = 0.9999,
+        emaMomentum: float = 0.99, teacherDropoutProb: float = 0.1,
+        gateReg: float = 1e-3, eTAnchor: float = 1e-3):
         super().__init__()
+
         self.alpha_novelty = alphaNovelty
         self.alpha_entropy = alphaEntropy
         self.alpha_progress = alphaProgress
@@ -209,13 +210,13 @@ class IntrinsicRewardGenerator(nn.Module):
         return t
 
     def forward(self,
-                memoryPrev: torch.Tensor, 
-                attnPrev: torch.Tensor, 
-                stateCurr: torch.Tensor, 
-                *,
-                policyEntropyPrev: Optional[torch.Tensor] = None,
-                uncertainty: Optional[torch.Tensor] = None,
-                tdErrorPrev: Optional[torch.Tensor] = None) -> IntrinsicRewardOut:
+        memoryPrev: torch.Tensor, 
+        attnPrev: torch.Tensor, 
+        stateCurr: torch.Tensor, 
+        *,
+        policyEntropyPrev: Optional[torch.Tensor] = None,
+        uncertainty: Optional[torch.Tensor] = None,
+        tdErrorPrev: Optional[torch.Tensor] = None) -> IntrinsicRewardOut:
         
         B, device = stateCurr.size(0), stateCurr.device
         self.UpdateStateEma(stateCurr)
@@ -481,15 +482,15 @@ class GeoTropicalOut(NamedTuple):
 
 class ValueEstimationExtractor(nn.Module):
     def __init__(self,
-                 memoryDim: int = 768, attnDim: int = 1024, stateDim: int = 256, *,
-                 hidden: int = 2048, useLayerNorm: bool = True, irgKwargs: Optional[dict] = None,
-                 wExt: float = 1.0, wInt: float = 1.0, stopGradRGamma: bool = True,
-                 useSoftTrop: bool = True, tropTemp: float = 0.2, epsA: float = 1e-3,
-                 wTD: float = 1.0, wCycle: float = 1e-2,  wGlue1: float = 1e-2, 
-                 microMaxAnchors: int = 256, microTopK: int = 4, microDistTau: float = 0.5, microLenPower: float = 0.5,
-                 wUncertTeacher: float = 1e-2, wEntropyTeacher: float = 1e-3,
-                 wGITScale: float = 1e-3, wGITShift: float = 1e-3, wGITSign: float = 1e-3,
-                 useHebb: bool = True, hebbCap: float = 1.0, hebbOja: bool = True, detachHebbGrad: bool = True,):
+        memoryDim: int = 768, attnDim: int = 1024, stateDim: int = 256, *,
+        hidden: int = 2048, useLayerNorm: bool = True, irgKwargs: Optional[dict] = None,
+        wExt: float = 1.0, wInt: float = 1.0, stopGradRGamma: bool = True,
+        useSoftTrop: bool = True, tropTemp: float = 0.2, epsA: float = 1e-3,
+        wTD: float = 1.0, wCycle: float = 1e-2,  wGlue1: float = 1e-2, 
+        microMaxAnchors: int = 256, microTopK: int = 4, microDistTau: float = 0.5, microLenPower: float = 0.5,
+        wUncertTeacher: float = 1e-2, wEntropyTeacher: float = 1e-3,
+        wGITScale: float = 1e-3, wGITShift: float = 1e-3, wGITSign: float = 1e-3,
+        useHebb: bool = True, hebbCap: float = 1.0, hebbOja: bool = True, detachHebbGrad: bool = True,):
         super().__init__()
 
         if irgKwargs is None:
@@ -549,15 +550,15 @@ class ValueEstimationExtractor(nn.Module):
         return h
 
     def forward(self,
-                memory: torch.Tensor, 
-                attn: torch.Tensor, 
-                state: torch.Tensor, 
-                *,
-                rewardExt: Optional[torch.Tensor] = None,
-                policyEntropyPrev: Optional[torch.Tensor] = None,
-                uncertaintyTeacher: Optional[torch.Tensor] = None,
-                tdErrorPrev: Optional[torch.Tensor] = None,
-                done: Optional[torch.Tensor] = None) -> GeoTropicalOut:
+        memory: torch.Tensor, 
+        attn: torch.Tensor, 
+        state: torch.Tensor, 
+        *,
+        rewardExt: Optional[torch.Tensor] = None,
+        policyEntropyPrev: Optional[torch.Tensor] = None,
+        uncertaintyTeacher: Optional[torch.Tensor] = None,
+        tdErrorPrev: Optional[torch.Tensor] = None,
+        done: Optional[torch.Tensor] = None) -> GeoTropicalOut:
 
         B, device = state.size(0), state.device
         x = torch.cat([memory, attn, state], dim=-1)
@@ -685,15 +686,16 @@ class ValueEstimationExtractor(nn.Module):
 
 class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
     def __init__(self, 
-                 base: nn.Module, 
-                 initRankEach: int = 0, 
-                 autoRank: bool = True,
-                 evThreshold: float = 0.90, 
-                 gradEma: float = 0.9,
-                 maxRankFc1: int = 128, 
-                 maxRankFc2: int = 128,
-                 maxRankVHead: int = 64,  
-                 maxRankUHead: int = 64,):
+        base: nn.Module, 
+        initRankEach: int = 0, 
+        autoRank: bool = True,
+        evThreshold: float = 0.90, 
+        gradEma: float = 0.9,
+        maxRankFc1: int = 128, 
+        maxRankFc2: int = 128,
+        maxRankVHead: int = 64,  
+        maxRankUHead: int = 64,):
+
         self.maxRankFc1 = int(maxRankFc1)
         self.maxRankFc2 = int(maxRankFc2)
         self.maxRankVHead= int(maxRankVHead)
@@ -702,9 +704,10 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
 
     @staticmethod
     def LinearWithDelta(layer: nn.Linear, 
-                        x: torch.Tensor,
-                        delta_mat: Optional[torch.Tensor] = None,
-                        base_adapter: Optional[nn.Module] = None) -> torch.Tensor:
+        x: torch.Tensor,
+        delta_mat: Optional[torch.Tensor] = None,
+        base_adapter: Optional[nn.Module] = None) -> torch.Tensor:
+
         W_eff = layer.weight
         if (base_adapter is not None) and hasattr(base_adapter, "DeltaWeight"):
             base_delta = base_adapter.DeltaWeight()
@@ -743,12 +746,12 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
             "uhead": SiteSpec("uhead", L, H, 1, self.maxRankUHead, lambda r,dv,dt: alloc(r, H, 1, dv, dt), compose),}
 
     def ForwardWithDeltas(self, 
-                          x, 
-                          keyPaddingMask: Optional[torch.Tensor],
-                          tdError: Optional[torch.Tensor],
-                          uncertainty: Optional[torch.Tensor],
-                          deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]], 
-                          **kwargs):
+        x, 
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        tdError: Optional[torch.Tensor] = None,
+        uncertainty: Optional[torch.Tensor] = None,
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]] = None, 
+        **kwargs):
 
         allowed = {"rewardExt", "policyEntropyPrev", "done"}
         unknown = set(kwargs) - allowed
