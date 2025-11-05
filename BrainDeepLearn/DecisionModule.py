@@ -864,33 +864,40 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
     @torch.no_grad()
     def ForwardWithDeltas(
         self,
-        x: torch.Tensor,
+        x,
         keyPaddingMask: Optional[torch.Tensor] = None,
         tdError: Optional[torch.Tensor] = None,
         uncertainty: Optional[torch.Tensor] = None,
         deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]] = None,
         **kwargs,) -> Dict[str, Any]:
 
-        D = deltasPerLayer[0] if (deltasPerLayer and len(deltasPerLayer) > 0) else {}
-
+        sample: bool = kwargs.pop("sample", True)
+        deterministic: bool = kwargs.pop("deterministic", False)
+        prevOptionOnehot: Optional[torch.Tensor] = kwargs.pop("prevOptionOnehot", None)
         prior: Optional[Dict[str, Dict[str, torch.Tensor]]] = kwargs.pop("prior", None)
         mixW: float = float(kwargs.pop("mixW", 0.25))
-        prevOptionOnehot: Optional[torch.Tensor] = kwargs.pop("prevOptionOnehot", None)
-        if (prevOptionOnehot is None) and (keyPaddingMask is not None):
-            prevOptionOnehot = keyPaddingMask
+        returnKeysVec: bool = kwargs.pop("returnKeysVec", True)
+        applyConstraints: bool = kwargs.pop("applyConstraints", True)
+
+        D = deltasPerLayer[0] if (deltasPerLayer and len(deltasPerLayer) > 0) else {}
 
         B = x.size(0)
         device = x.device
         K = self.base.option.K
 
-        has_prev = (prevOptionOnehot is not None) and (prevOptionOnehot.dim() == 2) and (prevOptionOnehot.size(1) == K)
+        if (prevOptionOnehot is None) and (keyPaddingMask is not None):
+            prevOptionOnehot = keyPaddingMask
+
+        has_prev = ((prevOptionOnehot is not None) and (prevOptionOnehot.dim() == 2) and (prevOptionOnehot.size(1) == K))
+        
         prev = (prevOptionOnehot.detach().to(dtype=x.dtype, device=device) if has_prev else torch.zeros(B, K, dtype=x.dtype, device=device))
+
 
         for i, blk in enumerate(self.base.feature_net):
             if isinstance(blk, SwiGLUBlock):
                 h_norm = blk.ln(x)
 
-                fc1_out = blk.fc1(h_norm) 
+                fc1_out = blk.fc1(h_norm)
                 d_fc1 = D.get(f"feat{i}_fc1", None)
                 if d_fc1 is not None:
                     fc1_out = fc1_out + F.linear(h_norm, d_fc1, bias=None)
@@ -898,7 +905,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
                 a, b = fc1_out.chunk(2, dim=-1)
                 mid = F.silu(a) * b
 
-                fc2_out = blk.fc2(mid)  
+                fc2_out = blk.fc2(mid)
                 d_fc2 = D.get(f"feat{i}_fc2", None)
                 if d_fc2 is not None:
                     fc2_out = fc2_out + F.linear(mid, d_fc2, bias=None)
@@ -910,35 +917,38 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         x = self.base.hebb(x, update=self.base.use_hebb_online)
 
         z_lin = self.base.to_z(x)
-
         if D.get("toz") is not None:
             z_lin = z_lin + F.linear(x, D["toz"], bias=None)
         z = F.silu(z_lin)
 
         h_k = self.base.keyboard.backbone(z)
-
         base_logits = self.base.keyboard.base_head(h_k)
         skill_logits = self.base.keyboard.skill_head(h_k)
         extra_logits = self.base.keyboard.extra_head(h_k)
-
-        if D.get("kbd_base") is not None: base_logits = base_logits + F.linear(h_k, D["kbd_base"], bias=None)
-        if D.get("kbd_skill") is not None: skill_logits = skill_logits + F.linear(h_k, D["kbd_skill"], bias=None)
-        if D.get("kbd_extra") is not None: extra_logits = extra_logits + F.linear(h_k, D["kbd_extra"], bias=None)
+        if D.get("kbd_base") is not None:
+            base_logits = base_logits + F.linear(h_k, D["kbd_base"], bias=None)
+        if D.get("kbd_skill") is not None:
+            skill_logits = skill_logits + F.linear(h_k, D["kbd_skill"], bias=None)
+        if D.get("kbd_extra") is not None:
+            extra_logits = extra_logits + F.linear(h_k, D["kbd_extra"], bias=None)
 
         h_m = self.base.mouse.backbone(z)
-
         mu = self.base.mouse.mu_head(h_m)
         logstd = self.base.mouse.logstd_head(h_m)
-        if D.get("mouse_mu") is not None: mu = mu + F.linear(h_m, D["mouse_mu"], bias=None)
-        if D.get("mouse_ls") is not None: logstd = logstd + F.linear(h_m, D["mouse_ls"], bias=None)
+        if D.get("mouse_mu") is not None:
+            mu = mu + F.linear(h_m, D["mouse_mu"], bias=None)
+        if D.get("mouse_ls") is not None:
+            logstd = logstd + F.linear(h_m, D["mouse_ls"], bias=None)
         logstd = torch.clamp(logstd, self.base.logstd_low, self.base.logstd_high)
 
         c0 = self.base.mouse.click_head[0](h_m)
-        if D.get("click0") is not None: c0 = c0 + F.linear(h_m, D["click0"], bias=None)
+        if D.get("click0") is not None:
+            c0 = c0 + F.linear(h_m, D["click0"], bias=None)
         c0 = F.relu(c0)
-
         click_logits = self.base.mouse.click_head[2](c0)
-        if D.get("click2") is not None: click_logits = click_logits + F.linear(c0, D["click2"], bias=None)
+        if D.get("click2") is not None:
+            click_logits = click_logits + F.linear(c0, D["click2"], bias=None)
+        click_logits = self.base.Safe(click_logits, 60.0)
 
         h_o = self.base.option.enc(z)
 
@@ -950,14 +960,11 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         if D.get("opt_psi") is not None:
             psi_flat = psi_flat + F.linear(h_o, D["opt_psi"], bias=None)
 
-        K = self.base.option.K
-
         psi_all = psi_flat.view(-1, K, self.base.option.psiDim)
-        psi_all = psi_all * self.base.option.psi_amp_global * self.base.option.psi_amp_per_option.view(1, K, 1)
+        psi_all = (psi_all * self.base.option.psi_amp_global * self.base.option.psi_amp_per_option.view(1, K, 1))
         psi_all = self.base.Safe(psi_all, 30.0)
 
         b0_in = torch.cat([h_o, (prev if has_prev else torch.zeros_like(prev))], dim=-1)
-
         b0 = self.base.option.beta_head[0](b0_in)
         if D.get("opt_beta0") is not None:
             b0 = b0 + F.linear(b0_in, D["opt_beta0"], bias=None)
@@ -965,23 +972,22 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         beta = self.base.option.beta_head[2](b0)
         if D.get("opt_beta2") is not None:
             beta = beta + F.linear(b0, D["opt_beta2"], bias=None)
-        beta = torch.sigmoid(beta).clamp(1e-6, 1.0 - 1.0e-6)
+        beta = torch.sigmoid(beta).clamp(1e-6, 1.0 - 1e-6)
 
         trans_eff = self.base.option.trans_adapter(self.base.option.trans)
         if D.get("opt_trans") is not None:
             trans_eff = trans_eff + D["opt_trans"]
-
         trans_eff = torch.nan_to_num(trans_eff, nan=0.0).clamp(-10.0, 10.0)
 
-        option_logits = self.base.Safe(opt_logits_base + (prev @ trans_eff if has_prev else 0.0), 60.0)
+        option_logits = self.base.Safe(opt_logits_base + (prev @ trans_eff if has_prev else 0.0),60.0,)
 
         p_new = self.base.SafeSoftmax(option_logits, dim=-1)
-
         w_t = (1.0 - beta) * prev + beta * p_new if has_prev else p_new
 
         sp = F.softplus
+
         def mix_psi(amp_param: torch.nn.Parameter) -> torch.Tensor:
-            amp = torch.sigmoid(amp_param).unsqueeze(0) 
+            amp = torch.sigmoid(amp_param).unsqueeze(0)
             return (w_t.unsqueeze(-1) * psi_all * amp).sum(dim=1)
 
         psi_cond_base = mix_psi(self.base.psi_amp["base"])
@@ -998,8 +1004,8 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         ls_psi = self.base.psi_to["logstd"](psi_cond_ls)
         click_psi = self.base.psi_to["click"](psi_cond_click)
 
-        def gate(gparam: torch.nn.Parameter) -> torch.Tensor:
-            s = sp(gparam)
+        def gate(gp: torch.nn.Parameter) -> torch.Tensor:
+            s = sp(gp)
             return s / (s + 1.0)
 
         w_base = gate(self.base.g_base)
@@ -1022,31 +1028,32 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         logstd = torch.clamp(logstd, self.base.logstd_low, self.base.logstd_high)
 
         click_logits = w_click * click_psi + (1.0 - w_click) * click_logits
-        
         click_logits = self.base.Safe(click_logits, 60.0)
 
         if prior is not None:
-            base_logits = MixLogits(base_logits,  prior.get("base",  {}).get("logits", None), mixW)
+            base_logits = MixLogits(base_logits, prior.get("base", {}).get("logits", None), mixW)
             extra_logits = MixLogits(extra_logits, prior.get("extra", {}).get("logits", None), mixW)
             skill_logits = MixLogits(skill_logits, prior.get("skill", {}).get("logits", None), mixW)
-            mu, logstd = MixGauss(mu, logstd, prior.get("mouse", {}).get("mu",  None), prior.get("mouse", {}).get("var", None), mixW)
-            
+            mu, logstd = MixGauss(mu,logstd,prior.get("mouse", {}).get("mu", None),prior.get("mouse", {}).get("var", None),mixW,)
             click_logits = MixLogits(click_logits, prior.get("click", {}).get("logits", None), mixW)
- 
 
         comps = self.base.EntropyComponents(base_logits, extra_logits, skill_logits, logstd)
         entropy_scalar = self.base.AggregateEntropy(comps)
 
-        return {
+        out: Dict[str, Any] = {
             "z": z,
             "entropy": entropy_scalar,
             "entropy_components": {
-                "base": comps["ent_base"], "extra": comps["ent_extra"],
-                "skill": comps["ent_skill"], "mouse": comps["ent_mouse"],
-                "base_norm": comps["base_norm"], "extra_norm": comps["extra_norm"],
-                "skill_norm": comps["skill_norm"], "mouse_norm": comps["mouse_norm"],},
+                "base": comps["ent_base"],
+                "extra": comps["ent_extra"],
+                "skill": comps["ent_skill"],
+                "mouse": comps["ent_mouse"],
+                "base_norm": comps["base_norm"],
+                "extra_norm": comps["extra_norm"],
+                "skill_norm": comps["skill_norm"],
+                "mouse_norm": comps["mouse_norm"],},
             "keyboard": {
-                "base_logits":  base_logits,
+                "base_logits": base_logits,
                 "skill_logits": skill_logits,
                 "extra_logits": extra_logits,},
             "mouse": {
@@ -1057,6 +1064,104 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
                 "logits": option_logits,
                 "psi_all": psi_all,
                 "beta": beta,},}
+
+        if sample:
+            def sanitize_(t: torch.Tensor, clip: float = 60.0) -> torch.Tensor:
+                return torch.nan_to_num(t, nan=0.0, posinf=clip, neginf=-clip).clamp(-clip, clip)
+
+            base_logits_s = sanitize_(base_logits)
+            extra_logits_s = sanitize_(extra_logits)
+            skill_logits_s = sanitize_(skill_logits)
+            click_logits_s = sanitize_(click_logits)
+            option_logits_s = sanitize_(option_logits)
+            beta_s = torch.nan_to_num(beta, nan=0.0, posinf=1.0, neginf=0.0).clamp(1e-6, 1.0 - 1e-6)
+
+            if deterministic:
+                base_act = (torch.sigmoid(base_logits_s) > 0.5).float()
+                extra_act = (torch.sigmoid(extra_logits_s) > 0.5).float()
+                skill_idx = torch.argmax(skill_logits_s, dim=-1)
+                clicks = (torch.sigmoid(click_logits_s) > 0.5).float()
+
+                mouse_a = mu
+
+                logp_base = StableLogProbBernoulli(base_logits_s, base_act)
+                logp_extra = StableLogProbBernoulli(extra_logits_s, extra_act)
+                logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx)
+
+                LOG_TWO_PI = math.log(2.0 * math.pi)
+                logp_mouse = -0.5 * (2.0 * logstd + LOG_TWO_PI).sum(-1)
+            else:
+                base_prob = torch.sigmoid(base_logits_s).clamp(1e-6, 1.0 - 1e-6)
+                extra_prob = torch.sigmoid(extra_logits_s).clamp(1e-6, 1.0 - 1e-6)
+                base_act = torch.bernoulli(base_prob)
+                extra_act = torch.bernoulli(extra_prob)
+
+                skill_idx = torch.distributions.Categorical(logits=skill_logits_s).sample()
+
+                std = torch.exp(logstd)
+                eps = torch.randn_like(std)
+                mouse_a = mu + eps * std
+
+                click_prob = torch.sigmoid(click_logits_s).clamp(1e-6, 1.0 - 1.0e-6)
+                clicks = torch.bernoulli(click_prob)
+
+                logp_base = StableLogProbBernoulli(base_logits_s, base_act)
+                logp_extra = StableLogProbBernoulli(extra_logits_s, extra_act)
+                logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx)
+                dist_mouse = torch.distributions.Normal(mu, std)
+                logp_mouse = dist_mouse.log_prob(mouse_a.detach()).sum(-1)
+
+            out["keyboard"].update({
+                    "base_act": base_act,
+                    "extra_act": extra_act,
+                    "skill_idx": skill_idx,
+                    "logp_base": logp_base,
+                    "logp_extra": logp_extra,
+                    "logp_skill": logp_skill,})
+
+            out["mouse"].update({"a": mouse_a, "logp": logp_mouse,"click_sample": clicks,})
+
+            prev_idx = (
+                torch.argmax(prevOptionOnehot, dim=-1)
+                if prevOptionOnehot is not None
+                else torch.zeros(B, dtype=torch.long, device=device))
+            
+            if deterministic:
+                terminate = (beta_s > 0.5).float()
+                new_idx = torch.argmax(option_logits_s, dim=-1)
+            else:
+                terminate = torch.bernoulli(beta_s)
+                new_idx = torch.distributions.Categorical(logits=option_logits_s).sample()
+
+            term_mask = terminate.squeeze(-1).bool()
+            opt_idx = torch.where(term_mask, new_idx, prev_idx)
+
+            psi = psi_all[torch.arange(B, device=device), opt_idx]
+
+            dist_opt = torch.distributions.Categorical(logits=option_logits_s)
+            logp_new = dist_opt.log_prob(new_idx)
+            logp_opt = torch.where(term_mask, logp_new, torch.zeros_like(logp_new))
+
+            b = beta_s.squeeze(-1)
+            t = terminate.squeeze(-1)
+            log_beta = t * b.log() + (1 - t) * (1 - b).log()
+
+            out["option"].update({
+                    "opt_idx": opt_idx,
+                    "terminate": terminate,
+                    "psi": psi,
+                    "logp_option": logp_opt,
+                    "logp_beta": log_beta,})
+
+            opt_onehot = torch.nn.functional.one_hot(opt_idx, num_classes=K).float().to(device)
+            out["option"]["opt_onehot"] = opt_onehot.detach()
+
+            if returnKeysVec:
+                keyvec_raw = self.base.ToKeysVec(base_act, extra_act, skill_idx, clicks)
+                out["keyvec_raw"] = keyvec_raw
+                out["key_vec"] = (self.base.ApplyConstraints(keyvec_raw) if applyConstraints else keyvec_raw)
+
+        return out
 
     @torch.no_grad()
     def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
