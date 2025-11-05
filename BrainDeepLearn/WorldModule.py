@@ -1340,22 +1340,13 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
 
         wm = self.base  
 
-        if isinstance(x, dict):
-            vision = x["visionSeq"] if "visionSeq" in x else x["vision"]
-            keys = x["keysVec"] if "keysVec" in x else x["keys"]
-            mouse = x["mouseSeq"]  if "mouseSeq" in x else x["mouse"]
-            h0 = x.get("h0") or x.get("hPrev")
-            z0 = x.get("z0") or x.get("zPrev")
-            rewardSeq = x.get("rewardSeq")
-            doneSeq  = x.get("doneSeq")
-        else:
-            vision = x
-            keys = kwargs["keysVec"] if "keysVec" in kwargs else kwargs["keys"]
-            mouse = kwargs["mouseSeq"] if "mouseSeq" in kwargs else kwargs["mouse"]
-            h0 = kwargs.get("h0") or kwargs.get("hPrev")
-            z0 = kwargs.get("z0") or kwargs.get("zPrev")
-            rewardSeq = kwargs.get("rewardSeq")
-            doneSeq = kwargs.get("doneSeq")
+        vision = x
+        keys = kwargs["keysVec"] if "keysVec" in kwargs else kwargs["keys"]
+        mouse = kwargs["mouseSeq"] if "mouseSeq" in kwargs else kwargs["mouse"]
+        h0 = kwargs.get("h0") or kwargs.get("hPrev")
+        z0 = kwargs.get("z0") or kwargs.get("zPrev")
+        rewardSeq = kwargs.get("rewardSeq")
+        doneSeq = kwargs.get("doneSeq")
 
         B = vision.size(0)
         device = vision.device
@@ -2060,12 +2051,6 @@ class TestWorldMTool:
         mouse = torch.randn(B, 2, device=self.device)
         return vision, keys, mouse
 
-    def MKX(self, vision, keys, mouse, sample=False, hPrev=None, zPrev=None):
-        x = {"vision": vision, "keys": keys, "mouse": mouse, "sample": sample}
-        if hPrev is not None: x["hPrev"] = hPrev
-        if zPrev is not None: x["zPrev"] = zPrev
-        return x
-
     def SeedNonzeroCandidates(self, wrapper, scale=1e-3):
         with torch.no_grad():
             for _, layer_list in wrapper.cand.items():
@@ -2208,17 +2193,19 @@ class TestWorldMTool:
             wrapper = WorldModelOnlineWrapper(self.wm, initRankEach=0, autoRank=False).to(self.device)
             wrapper.train()
             B = 4
-            vision, keys, mouse = self.Batch(B, keyIdx=(17,57))
+            vision, keys, mouse = self.Batch(B, keyIdx=(17, 57))
             self.wm.ResetHidden(batchSize=B)
-            out = wrapper(self.MKX(vision, keys, mouse, sample=False))
-            ok = ( ("h_next" in out) and ("z_next" in out) and ("s_next" in out)
-                   and ("r_pred" in out) and ("d_prob" in out)
-                   and out["s_next"].shape == (B, self.wm.state_dim))
+
+            out = wrapper(vision,keysVec=keys,mouseSeq=mouse,sample=False,)
+
+            ok = (("h_next" in out) and ("z_next" in out) and ("s_next" in out) and ("r_pred" in out) and ("d_prob" in out) and out["s_next"].shape == (B, self.wm.state_dim))
+            
             print("Wrapper API basics " + ("passed." if ok else "failed."))
             return ok
         except Exception as e:
             print(f"Wrapper API basics FAILED: {type(e).__name__}: {e}")
             return False
+
 
     def TestForwardWithDeltasInjection(self):
         try:
@@ -2228,10 +2215,11 @@ class TestWorldMTool:
             vision, keys, mouse = self.Batch(B, keyIdx=(31,))
             self.wm.ResetHidden(batchSize=B)
 
-            out0 = wrapper.ForwardWithDeltas(self.MKX(vision, keys, mouse, sample=False), None, None, None, [{}])
+            out0 = wrapper.ForwardWithDeltas(vision, None, None, None, [{}], keysVec=keys, mouseSeq=mouse, sample=False,)
+
             Z = self.wm.stoch_dim
             A = torch.randn(Z, self.wm.action_dim, device=self.device) * 1e-3
-            out1 = wrapper.ForwardWithDeltas(self.MKX(vision, keys, mouse, sample=False), None, None, None, [{"act": A}])
+            out1 = wrapper.ForwardWithDeltas(vision,None, None, None,[{"act": A}],keysVec=keys,mouseSeq=mouse,sample=False,)
 
             diff = (out0["s_next"] - out1["s_next"]).abs().mean().item()
             ok = diff > 1e-7
@@ -2240,7 +2228,7 @@ class TestWorldMTool:
         except Exception as e:
             print(f"ForwardWithDeltas injection FAILED: {type(e).__name__}: {e}")
             return False
-
+        
     def TestCommitOneGrowAndValueChange(self):
         try:
             wrapper = WorldModelOnlineWrapper(self.wm, initRankEach=0, autoRank=False).to(self.device)
@@ -2262,10 +2250,10 @@ class TestWorldMTool:
             with torch.no_grad():
                 last_alpha = lo.alpha[-1].clone()
                 lo.alpha[-1].zero_()
-                out_before = wrapper(self.MKX(vision, keys, mouse, sample=False))
+                out_before = wrapper(vision,keysVec=keys,mouseSeq=mouse,sample=False,)
                 lo.alpha[-1].copy_(last_alpha)
 
-            out_after = wrapper(self.MKX(vision, keys, mouse, sample=False))
+            out_after = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False,)
             change = (out_after["s_next"] - out_before["s_next"]).abs().mean().item()
 
             ok = grew and (change > 1e-7)
@@ -2274,7 +2262,7 @@ class TestWorldMTool:
         except Exception as e:
             print(f"CommitOne grow & effect FAILED: {type(e).__name__}: {e}")
             return False
-
+        
     def TestGradFlowCandidates(self):
         try:
             wrapper = WorldModelOnlineWrapper(self.wm, initRankEach=2, autoRank=False).to(self.device)
@@ -2285,10 +2273,11 @@ class TestWorldMTool:
             vision, keys, mouse = self.Batch(B, keyIdx=(45,))
             self.wm.ResetHidden(batchSize=B)
 
-            out = wrapper(self.MKX(vision, keys, mouse, sample=False))
-            loss = ( F.mse_loss(out["r_pred"], torch.zeros_like(out["r_pred"])) +
-                     0.5 * F.binary_cross_entropy(out["d_prob"], torch.zeros_like(out["d_prob"])) +
-                     0.1 * F.mse_loss(out["s_next"], torch.zeros_like(out["s_next"])) )
+            out = wrapper(vision,keysVec=keys,mouseSeq=mouse, sample=False,)
+
+            loss = (F.mse_loss(out["r_pred"], torch.zeros_like(out["r_pred"]))
+                + 0.5 * F.binary_cross_entropy(out["d_prob"], torch.zeros_like(out["d_prob"]))
+                + 0.1 * F.mse_loss(out["s_next"], torch.zeros_like(out["s_next"])))
 
             params = list(wrapper.CandParameters())
             if len(params) == 0:
@@ -2321,21 +2310,24 @@ class TestWorldMTool:
             opt = torch.optim.Adam(list(wrapper.CandParameters()), lr=2e-3)
 
             B = 8
-            vision, keys, mouse = self.Batch(B, keyIdx=(31,49))
+            vision, keys, mouse = self.Batch(B, keyIdx=(31, 49))
             self.wm.ResetHidden(batchSize=B)
 
             watch = None
             for p in wrapper.CandParameters():
-                watch = p; break
+                watch = p
+                break
             before = watch.detach().clone() if watch is not None else None
 
             steps = 40
             losses = []
             for t in range(1, steps + 1):
-                out = wrapper(self.MKX(vision, keys, mouse, sample=False))
-                loss = ( F.mse_loss(out["r_pred"], torch.zeros_like(out["r_pred"])) +
-                         0.5 * F.binary_cross_entropy(out["d_prob"], torch.zeros_like(out["d_prob"])) +
-                         0.1 * F.mse_loss(out["s_next"], torch.zeros_like(out["s_next"])) )
+                out = wrapper( vision, keysVec=keys, mouseSeq=mouse, sample=False,)
+                
+                loss = (F.mse_loss(out["r_pred"], torch.zeros_like(out["r_pred"]))
+                    + 0.5 * F.binary_cross_entropy(out["d_prob"], torch.zeros_like(out["d_prob"]))
+                    + 0.1 * F.mse_loss(out["s_next"], torch.zeros_like(out["s_next"])))
+                
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(list(wrapper.CandParameters()), 3.0)
@@ -2436,16 +2428,17 @@ class TestWorldMTool:
             vision, keys, mouse = self.Batch(B, keyIdx=(31,))
             self.wm.ResetHidden(batchSize=B)
 
-            x1 = self.MKX(vision, keys, mouse, sample=False)
-            out1 = wrapper(x1)
-            mu_q_star = out1["mu_q"].detach(); logstd_q_star = out1["logstd_q"].detach()
+            out1 = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False,)
 
-            x2 = self.MKX(vision, keys, mouse, sample=False)
-            out2 = wrapper(x2)
+            mu_q_star = out1["mu_q"].detach()
+            logstd_q_star = out1["logstd_q"].detach()
 
-            base_loss = ( F.mse_loss(out2["r_pred"], torch.zeros_like(out2["r_pred"])) +
-                          0.5 * F.binary_cross_entropy(out2["d_prob"], torch.zeros_like(out2["d_prob"])) +
-                          0.1 * F.mse_loss(out2["s_next"], torch.zeros_like(out2["s_next"])) )
+            out2 = wrapper( vision, keysVec=keys, mouseSeq=mouse, sample=False,)
+
+            base_loss = (F.mse_loss(out2["r_pred"], torch.zeros_like(out2["r_pred"]))
+                + 0.5 * F.binary_cross_entropy(out2["d_prob"], torch.zeros_like(out2["d_prob"]))
+                + 0.1 * F.mse_loss(out2["s_next"], torch.zeros_like(out2["s_next"])))
+            
             kl_prior = KLDiagNormal(mu_q_star, logstd_q_star, out2["mu_p"], out2["logstd_p"]).mean()
             loss = base_loss + 0.1 * kl_prior
 
@@ -2456,11 +2449,14 @@ class TestWorldMTool:
 
             def site_ok(name: str) -> bool:
                 slot = wrapper.cand[name][0]
+
                 def hasg(lst):
                     return any((p.grad is not None) and torch.isfinite(p.grad).all().item() and (p.grad.abs().sum().item() > 0) for p in lst)
+                
                 return hasg(slot["A"]) and hasg(slot["B"]) and hasg(slot["s"])
 
             missing = [name for name in ["obs1","obs2","act","prior","post","state","rew1","rew2","done1","done2"] if not site_ok(name)]
+            
             ok_all = (len(missing) == 0)
             print(f"Grad coverage (candidates) {'passed' if ok_all else 'failed'}; missing/no-grad: {missing}")
             return ok_all
@@ -2470,7 +2466,7 @@ class TestWorldMTool:
 
     def TestParityPosterior(self):
         try:
-            torch.manual_seed(0) 
+            torch.manual_seed(0)
             wm = self.wm
             wrapper = WorldModelOnlineWrapper(wm, initRankEach=0, autoRank=False).to(self.device)
             wrapper.eval()
@@ -2486,11 +2482,9 @@ class TestWorldMTool:
             a_enc = wm.action_encoder(keys, mouse)
             out_base = wm.StepPosterior(h0, z0, vision, a_enc, sample=False)
 
-            x = self.MKX(vision, keys, mouse, sample=False, hPrev=h0, zPrev=z0)
-            out_wrap = wrapper.ForwardWithDeltas(x, None, None, None, [{}])
+            out_wrap = wrapper.ForwardWithDeltas(vision, None, None, None, [{}], keysVec=keys, mouseSeq=mouse, sample=False, hPrev=h0, zPrev=z0,)
 
-            must_keys = [
-                "h_next", "z_next", "s_next",
+            must_keys = ["h_next", "z_next", "s_next",
                 "r_pred", "d_prob",
                 "mu_p", "logstd_p", "mu_q", "logstd_q",]
 
@@ -2528,16 +2522,10 @@ class TestWorldMTool:
 
             h1, z1, s1, r1, d1 = wm.StepPriorOnly(h0, z0, a_enc, sample=False)
 
-            ok_shapes = (
-                h1.shape == (B, wm.deter_dim)
-                and z1.shape == (B, wm.stoch_dim)
-                and s1.shape == (B, wm.state_dim)
-                and r1.shape == (B,)
-                and d1.shape == (B,))
+            ok_shapes = (h1.shape == (B, wm.deter_dim) and z1.shape == (B, wm.stoch_dim) and s1.shape == (B, wm.state_dim) and r1.shape == (B,) and d1.shape == (B,))
 
             vision = torch.randn(B, wm.vision_dim, device=self.device)
-            x = self.MKX(vision, keys, mouse, sample=False, hPrev=h0, zPrev=z0)
-            _ = wrapper.ForwardWithDeltas(x, None, None, None, [{}])
+            _ = wrapper.ForwardWithDeltas(vision, None, None, None, [{}], keysVec=keys, mouseSeq=mouse, sample=False, hPrev=h0, zPrev=z0,)
 
             print("Parity prior (base StepPriorOnly shape) " + ("passed." if ok_shapes else "failed."))
             return ok_shapes
@@ -2545,6 +2533,7 @@ class TestWorldMTool:
         except Exception as e:
             print(f"Parity prior FAILED: {type(e).__name__}: {e}")
             return False
+        
 
     def RunAll(self):
         results = {
