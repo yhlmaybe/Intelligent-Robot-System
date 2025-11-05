@@ -14,6 +14,7 @@
 #include <QtWidgets/QGridLayout>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QPushButton>
+#include <QtWidgets/QRadioButton>
 #include <QtWidgets/QTextBrowser>
 #include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QWidget>
@@ -24,8 +25,6 @@ class Ui_BrainDeepLearnForm
 {
 public:
     QGridLayout *gridLayout;
-    QHBoxLayout *horizontalLayout;
-    QTextBrowser *message_textBrowser;
     QVBoxLayout *verticalLayout;
     QPushButton *trainModule_pushButton;
     QPushButton *testPerceptionModule_pushButton;
@@ -35,25 +34,19 @@ public:
     QPushButton *testWorldModule_pushButton;
     QPushButton *testValueEstimationModule_pushButton;
     QPushButton *testTrainAndDeploy_pushButton;
+    QHBoxLayout *horizontalLayout_3;
+    QRadioButton *onlineLearning_radioButton;
     QPushButton *close_pushButton;
+    QHBoxLayout *horizontalLayout;
+    QTextBrowser *message_textBrowser;
 
     void setupUi(QWidget *BrainDeepLearnForm)
     {
         if (BrainDeepLearnForm->objectName().isEmpty())
             BrainDeepLearnForm->setObjectName(QString::fromUtf8("BrainDeepLearnForm"));
-        BrainDeepLearnForm->resize(626, 495);
+        BrainDeepLearnForm->resize(624, 538);
         gridLayout = new QGridLayout(BrainDeepLearnForm);
         gridLayout->setObjectName(QString::fromUtf8("gridLayout"));
-        horizontalLayout = new QHBoxLayout();
-        horizontalLayout->setObjectName(QString::fromUtf8("horizontalLayout"));
-        message_textBrowser = new QTextBrowser(BrainDeepLearnForm);
-        message_textBrowser->setObjectName(QString::fromUtf8("message_textBrowser"));
-
-        horizontalLayout->addWidget(message_textBrowser);
-
-
-        gridLayout->addLayout(horizontalLayout, 0, 0, 1, 1);
-
         verticalLayout = new QVBoxLayout();
         verticalLayout->setObjectName(QString::fromUtf8("verticalLayout"));
         trainModule_pushButton = new QPushButton(BrainDeepLearnForm);
@@ -99,10 +92,30 @@ public:
 
         gridLayout->addLayout(verticalLayout, 0, 1, 1, 1);
 
+        horizontalLayout_3 = new QHBoxLayout();
+        horizontalLayout_3->setObjectName(QString::fromUtf8("horizontalLayout_3"));
+        onlineLearning_radioButton = new QRadioButton(BrainDeepLearnForm);
+        onlineLearning_radioButton->setObjectName(QString::fromUtf8("onlineLearning_radioButton"));
+
+        horizontalLayout_3->addWidget(onlineLearning_radioButton);
+
+
+        gridLayout->addLayout(horizontalLayout_3, 0, 3, 1, 1);
+
         close_pushButton = new QPushButton(BrainDeepLearnForm);
         close_pushButton->setObjectName(QString::fromUtf8("close_pushButton"));
 
-        gridLayout->addWidget(close_pushButton, 1, 0, 1, 1);
+        gridLayout->addWidget(close_pushButton, 2, 0, 1, 1);
+
+        horizontalLayout = new QHBoxLayout();
+        horizontalLayout->setObjectName(QString::fromUtf8("horizontalLayout"));
+        message_textBrowser = new QTextBrowser(BrainDeepLearnForm);
+        message_textBrowser->setObjectName(QString::fromUtf8("message_textBrowser"));
+
+        horizontalLayout->addWidget(message_textBrowser);
+
+
+        gridLayout->addLayout(horizontalLayout, 0, 0, 1, 1);
 
 
         retranslateUi(BrainDeepLearnForm);
@@ -124,6 +137,7 @@ public:
 #endif // QT_NO_SHORTCUT
         testValueEstimationModule_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestValueEstimationModule", nullptr));
         testTrainAndDeploy_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "TestModuleTrain", nullptr));
+        onlineLearning_radioButton->setText(QApplication::translate("BrainDeepLearnForm", "Online Learning", nullptr));
         close_pushButton->setText(QApplication::translate("BrainDeepLearnForm", "Close", nullptr));
     } // retranslateUi
 

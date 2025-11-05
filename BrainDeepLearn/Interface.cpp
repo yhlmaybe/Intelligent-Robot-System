@@ -125,8 +125,8 @@ bool BrainDeepLearnInterface::TestValueEstimationModule()
     return success;
 }
 
-bool BrainDeepLearnInterface::TestModuleTrain()
+bool BrainDeepLearnInterface::TestModuleTrain(bool onlineLearning)
 {
-    bool success = CALL_METHOD_NOARG("TestModuleTrain");
+    bool success = CALL_METHOD_RET_BOOL("TestModuleTrain", "b", onlineLearning);
     return success;
 }

@@ -118,6 +118,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/BrainDeepLearnForm.cpp.o
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QGridLayout
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QHBoxLayout
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QPushButton
+ /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QRadioButton
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QScrollBar
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QTextBrowser
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QVBoxLayout
@@ -133,6 +134,7 @@ IRSGUI/CMakeFiles/IRSGUI_LIST.dir/BrainDeepLearnForm.cpp.o
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qlayout.h
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qlayoutitem.h
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qpushbutton.h
+ /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qradiobutton.h
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qscrollbar.h
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qsizepolicy.h
  /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qtextbrowser.h

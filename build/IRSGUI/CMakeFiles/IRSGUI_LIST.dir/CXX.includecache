@@ -13632,6 +13632,10 @@ qplaintextedit.h
 qpushbutton.h
 /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qpushbutton.h
 
+/usr/include/x86_64-linux-gnu/qt5/QtWidgets/QRadioButton
+qradiobutton.h
+/usr/include/x86_64-linux-gnu/qt5/QtWidgets/qradiobutton.h
+
 /usr/include/x86_64-linux-gnu/qt5/QtWidgets/QScrollBar
 qscrollbar.h
 /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qscrollbar.h
@@ -13882,6 +13886,12 @@ QtWidgets/qtwidgetsglobal.h
 QtWidgets/qabstractbutton.h
 -
 
+/usr/include/x86_64-linux-gnu/qt5/QtWidgets/qradiobutton.h
+QtWidgets/qtwidgetsglobal.h
+-
+QtWidgets/qabstractbutton.h
+-
+
 /usr/include/x86_64-linux-gnu/qt5/QtWidgets/qrubberband.h
 QtWidgets/qtwidgetsglobal.h
 -
@@ -14042,6 +14052,8 @@ QtWidgets/QGridLayout
 QtWidgets/QHBoxLayout
 -
 QtWidgets/QPushButton
+-
+QtWidgets/QRadioButton
 -
 QtWidgets/QTextBrowser
 -

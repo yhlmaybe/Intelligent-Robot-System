@@ -81,5 +81,12 @@ void BrainDeepLearnForm::TestValueEstimationModule()
 
 void BrainDeepLearnForm::TestModuleTrain()
 {
-    brainDeepLearn->TestModuleTrain();
+    if(ui->onlineLearning_radioButton->isChecked())
+    {
+        brainDeepLearn->TestModuleTrain(true);
+    }
+    else
+    {
+        brainDeepLearn->TestModuleTrain(false);
+    }
 }

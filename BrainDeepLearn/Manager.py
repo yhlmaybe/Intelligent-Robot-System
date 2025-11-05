@@ -38,6 +38,8 @@ def ToDevice(x, device):
 class BasicParameters:
     IMAGE_SIZE = 512
     IMAGE_SEQ_LEN = 16
+    IMAGE_RM_LEN = math.ceil(IMAGE_SEQ_LEN * 9 / 10)
+
     MEMORY_MEMORY_PATH = "BrainDeepLearn/ModuleParameter/MemoryMemory.pt"
     WORLD_MEMORY_PATH = "BrainDeepLearn/ModuleParameter/WorldMemory.pt"
     MODULEPARAMETER_PATH = "BrainDeepLearn/ModuleParameter/module_parameter.pth"
@@ -138,6 +140,9 @@ class BrainCore(nn.Module):
         sampleActions: bool = True,
         deterministicActor: bool = False,) -> Dict[str, Any]:
 
+        if self.is_online_learning and not isTrain:
+            raise RuntimeError(f"Wrappers can only be used during training, but isTrain is {isTrain}, isUseWrappers is {self.is_online_learning}")
+
         B, T, C, H, W = frames.shape
         dev = frames.device
         self.EnsureB(B, dev)
@@ -161,7 +166,7 @@ class BrainCore(nn.Module):
         if isTrain:
             if self.is_online_learning:
                 wm_kwargs = {"keysVec": self.prev_key_vec,"mouseSeq": self.prev_mouse,"h0": hPrev,"z0": zPrev,"rewardSeq": rewardExt,"doneSeq": doneFlag,}
-                w_out = self.world()
+                w_out = self.world(world_vis_in, kwargs=wm_kwargs)
             else: 
                 w_out = self.world.ForwardTrainSeq(visionSeq=world_vis_in,keysVec= self.prev_key_vec, mouseSeq=self.prev_mouse, h0=hPrev, z0=zPrev,rewardSeq=rewardExt,doneSeq=doneFlag)
         else:
@@ -173,8 +178,13 @@ class BrainCore(nn.Module):
         r_t = w_out["r_pred"] # Prediction Rewards
         d_t = w_out["d_prob"] # Termination Probability
 
-        critic_out = self.critic(memory=self.prev_mem,attn=self.prev_attn,state=s_t,rewardExt=r_t,policyEntropyPrev=self.prev_entropy,
-                                 uncertaintyTeacher=self.prev_unc,tdErrorPrev=self.prev_td,done=d_t,)
+        if self.is_online_learning:
+            value_kwargs = {"rewardExt": r_t, "policyEntropyPrev": self.prev_entropy, "done": d_t}
+            value_x = {"memory": self.prev_mem,"attn": self.prev_attn, "state": s_t}
+            critic_out = self.critic(x=value_x, tdError=self.prev_td, uncertainty= self.prev_unc, kwargs=value_kwargs)
+        else:
+            critic_out = self.critic(memory=self.prev_mem,attn=self.prev_attn,state=s_t,rewardExt=r_t,policyEntropyPrev=self.prev_entropy,
+                                    uncertaintyTeacher=self.prev_unc,tdErrorPrev=self.prev_td,done=d_t,)
 
         td_sig = critic_out.tdError
         rInt_sig = critic_out.rInt
@@ -187,7 +197,11 @@ class BrainCore(nn.Module):
         mem_extra_loss = self.mem.GetInternalLoss()
 
         with torch.no_grad():
-            act_out = self.actor(stateFeat=mem_feat,sample=sampleActions,deterministic=deterministicActor,prevOptionOnehot=self.prev_option_onehot)
+            if self.is_online_learning:
+                actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionOnehot": self.prev_option_onehot}
+                act_out = self.actor(x=mem_feat,kwargs=actor_kwargs)
+            else:    
+                act_out = self.actor(stateFeat=mem_feat,sample=sampleActions,deterministic=deterministicActor,prevOptionOnehot=self.prev_option_onehot)
 
         mouseMu = act_out["mouse"]["mu"].detach()
         mouseLogstd = act_out["mouse"]["logstd"].detach() 
@@ -201,8 +215,12 @@ class BrainCore(nn.Module):
             with torch.no_grad():
                 prior = self.planner.Plan(mouseMu=mouseMu,mouseLogstd=mouseLogstd,skillLogits=skillLogits,
                                           baseLogits=baseLogits,extraLogits=extraLogits,clickLogits=clickLogits,h0=hPrev.detach(),z0=zPrev.detach())
-
-        act_out = self.actor(stateFeat=mem_feat,sample=sampleActions,deterministic=deterministicActor,prevOptionOnehot=self.prev_option_onehot,prior=prior)
+        
+        if self.is_online_learning:
+            actor_kwargs["prior"] = prior
+            act_out = self.actor(x=mem_feat,kwargs=actor_kwargs)
+        else:
+            act_out = self.actor(stateFeat=mem_feat,sample=sampleActions,deterministic=deterministicActor,prevOptionOnehot=self.prev_option_onehot,prior=prior)
 
         key_vec = act_out["key_vec"] # [B,106]
         mouse_a = act_out["mouse"]["a"]  # [B,2]
@@ -310,14 +328,16 @@ class BrainCore(nn.Module):
         self.world.ImportState(state["world_h"], state["world_z"])
 
 
+
 class Agent:
     def __init__(self,
-                brain: BrainCore,
-                isTrain: bool,
-                device: Union[str, torch.device] = "cpu",
-                *,
-                worldMemoryPath: str = None,
-                memMemoryPath: str = None):
+        brain: BrainCore,
+        isTrain: bool,
+        device: Union[str, torch.device] = "cpu",
+        *,
+        worldMemoryPath: str = None,
+        memMemoryPath: str = None):
+
         self.device = torch.device(device)
 
         self.brain = brain
@@ -371,13 +391,13 @@ class Agent:
         return created
 
     def Act(
-            self,
-            frames: torch.Tensor, # [B,T,C,H,W]
-            *,
-            reward: Optional[torch.Tensor] = None,
-            done: Optional[torch.Tensor] = None,
-            sampleActions: bool = True,
-            deterministicActor: bool = False,):
+        self,
+        frames: torch.Tensor, # [B,T,C,H,W]
+        *,
+        reward: Optional[torch.Tensor] = None,
+        done: Optional[torch.Tensor] = None,
+        sampleActions: bool = True,
+        deterministicActor: bool = False,):
 
         frames = frames.to(self.device)
         B, T, C, H, W = frames.shape
@@ -525,6 +545,20 @@ class Agent:
             "dones": [done_tensor] if done_tensor is not None else [],}
 
 
+    def UpdateWrappers(self, wrappers, action: str, **kwargs):
+        results = []
+        for w in wrappers:
+            out = w.Update(action, **kwargs)
+            results.append(out)
+        return results
+    
+    def UpdateAllWrappers(self, action: str, **kwargs):
+        wrappers = [self.brain.perc, self.brain.attn, self.brain.actor, self.brain.world, self.brain.critic]
+        results = []
+        for w in wrappers:
+            out = w.Update(action, **kwargs)
+            results.append(out)
+        return results
 
 
 class OfflineGameDataset(Dataset):
@@ -620,7 +654,7 @@ class ManagerFunction:
             "world": TestWorldMTool(),
             "value": TestValueEstimationMTool(),}
 
-    def StartTraining(self, root: str, epochs: int = 5, batchSize: int = 32, valSplit: float = 0.1, resume: bool = True, isTest: bool = False):
+    def StartTraining(self, root: str, epochs: int = 5, batchSize: int = 32, valSplit: float = 0.1, resume: bool = True, onlineLearning:bool = False,isTest: bool = False):
         if self.is_training:
             self.controller.SetStatus("error", "Training is already running")
             return False
@@ -632,7 +666,7 @@ class ManagerFunction:
 
         self.training_thread = threading.Thread(
             target=self.TrainLoop, args=(
-                root, epochs, batchSize, valSplit, resume),
+                root, epochs, batchSize, valSplit, resume, onlineLearning),
                 kwargs={"worldMemPath": wm_mem_path, "memMemPath": mem_mem_path, "ckptPath": ckpt_path}, 
                 daemon=False)
         self.training_thread.start()
@@ -662,14 +696,18 @@ class ManagerFunction:
     def GetTrainingStatus(self):
         return self.controller.GetStatus()
 
-    def TrainLoop(self, root: str, epochs: int, batchSize: int, valSplit: float, resume: bool, *, worldMemPath: str = None, memMemPath: str = None, ckptPath: str = None):
+    def TrainLoop(self,root: str, epochs: int, batchSize: int, valSplit: float, resume: bool, onlineLearning = False, *, worldMemPath: str = None, memMemPath: str = None, ckptPath: str = None,):
         try:
             torch.autograd.set_detect_anomaly(True)
 
             ds = OfflineGameDataset(root)
 
-            brain = BrainCore(device=self.device,plasticHebbian=True,plasticOnlineLearning=False,usePlanner=False,)
-            agent = Agent(brain,isTrain=True, device=self.device, worldMemoryPath=worldMemPath, memMemoryPath=memMemPath)
+            brain = BrainCore(device=self.device, plasticHebbian=True, plasticOnlineLearning=onlineLearning, usePlanner=False,)
+
+            agent = Agent(brain, isTrain=True, device=self.device, worldMemoryPath=worldMemPath, memMemoryPath=memMemPath,)
+
+            if onlineLearning:
+                agent.UpdateAllWrappers("autogrow")
 
             SEQ_LEN = agent.brain.SEQ_LEN
 
@@ -677,15 +715,29 @@ class ManagerFunction:
             best_val = float("inf")
             train_ds, val_ds = None, None
 
+            testSplit = 0.1
+
             if resume and Path(ckptPath).exists():
                 start_epoch, best_val, train_ds, val_ds = self.LoadCheckpoint(brain, agent, ds, ckptPath)
 
             if train_ds is None:
-                n_train = int(len(ds) * (1 - valSplit))
-                train_ds, val_ds = torch.utils.data.random_split(ds, [n_train, len(ds) - n_train])
+                n_total = len(ds)
+                n_test = int(n_total * testSplit)
+                n_val = int(n_total * valSplit)
+                n_train = n_total - n_val - n_test
+                train_ds, val_ds, test_ds = torch.utils.data.random_split(
+                    ds, [n_train, n_val, n_test])
+            else:
+                n_used = len(train_ds) + len(val_ds)
+                n_left = len(ds) - n_used
+                if n_left > 0:
+                    test_ds, = torch.utils.data.random_split(ds, [n_left])
+                else:
+                    test_ds = val_ds
 
-            train_dl = DataLoader(train_ds,batch_size=batchSize,shuffle=False,num_workers=0,pin_memory=True,)
-            val_dl = DataLoader(val_ds,batch_size=batchSize,shuffle=False,num_workers=0,)
+            train_dl = DataLoader(train_ds, batch_size=batchSize, shuffle=False, num_workers=0, pin_memory=True,)
+            val_dl = DataLoader(val_ds, batch_size=batchSize, shuffle=False, num_workers=0)
+            test_dl = DataLoader(test_ds, batch_size=batchSize, shuffle=False, num_workers=0)
 
             bce = nn.BCELoss()
             mse = nn.MSELoss()
@@ -693,10 +745,17 @@ class ManagerFunction:
             all_codes = []
             for grp in KEYBOARD_LAYOUT.values():
                 all_codes += list(grp.values())
-            max_code = max(all_codes)
-            keys_dim = max_code + 1 + 2  
 
-            self.controller.SetStatus("training","Training started",epoch=start_epoch,total_epochs=epochs,batch=0,total_batches=len(train_dl),)
+            max_code = max(all_codes)
+            keys_dim = max_code + 1 + 2
+
+            patience = 5 
+            min_delta = 1e-4 
+            no_improve = 0
+            target_acc = 0.90 
+            max_gap = 0.1
+
+            self.controller.SetStatus("training", "Training started", epoch=start_epoch, total_epochs=epochs, batch=0, total_batches=len(train_dl),)
 
             for ep in range(start_epoch, epochs):
                 if self.controller.ShouldStop():
@@ -709,7 +768,7 @@ class ManagerFunction:
 
                 brain.train()
                 epoch_loss = 0.0
-                nb = 0 
+                nb = 0
 
                 img_buf: List[np.ndarray] = []
                 key_buf: List[Any] = []
@@ -725,9 +784,9 @@ class ManagerFunction:
                     for i in range(B_cur):
                         img_item = img_b[i]
                         if isinstance(img_item, torch.Tensor):
-                            img_np = img_item.numpy()
+                            img_np = img_item.cpu().numpy()
                         else:
-                            img_np = img_item 
+                            img_np = img_item
 
                         img_buf.append(img_np)
                         key_buf.append(key_b[i])
@@ -736,20 +795,20 @@ class ManagerFunction:
                         done_buf.append(done_b[i])
 
                         if len(img_buf) == SEQ_LEN * batchSize:
-                            pack = agent.StackNpImagesKeysMouses(imgs=img_buf,keys=key_buf,mouse=mouse_buf,reward=reward_buf,done=done_buf,B=batchSize, T=SEQ_LEN,device=self.device,)
-                            
-                            frames = pack["frames"][0]  
-                            keys_t = pack["keys"][0] if pack["keys"] else None
-                            mouse_t = pack["mouses"][0] if pack["mouses"] else None
-                            reward_t = pack["rewards"][0] if pack["rewards"] else None
-                            done_t = pack["dones"][0] if pack["dones"] else None
+                            pack = agent.StackNpImagesKeysMouses(imgs=img_buf, keys=key_buf, mouse=mouse_buf, reward=reward_buf, done=done_buf, B=batchSize, T=SEQ_LEN, device=self.device,)
 
-                            key_pred, mouse_pred, model_loss = agent.Act(frames,reward=reward_t,done=done_t,deterministicActor=False,)
+                            frames = pack["frames"]
+                            keys_t = pack["keys"] if pack["keys"] else None
+                            mouse_t = pack["mouses"] if pack["mouses"] else None
+                            reward_t = pack["rewards"] if pack["rewards"] else None
+                            done_t = pack["dones"] if pack["dones"] else None
+
+                            key_pred, mouse_pred, model_loss = agent.Act(frames, reward=reward_t, done=done_t, deterministicActor=False,)
 
                             bc_loss = torch.zeros((), device=self.device)
                             if keys_t is not None:
                                 K_use = min(keys_t.size(1), keys_dim)
-                                bc_loss = bc_loss + bce(key_pred[:, :K_use],keys_t[:, :K_use].float(),)
+                                bc_loss = bc_loss + bce(key_pred[:, :K_use], keys_t[:, :K_use].float())
                             if mouse_t is not None:
                                 bc_loss = bc_loss + 0.05 * mse(mouse_pred, mouse_t)
 
@@ -760,13 +819,17 @@ class ManagerFunction:
                             agent.opt_actor.zero_grad(set_to_none=True)
 
                             loss.backward()
+                            if onlineLearning:
+                                agent.UpdateAllWrappers("accumulategrads")
+                                agent.UpdateAllWrappers("autogrow")
+
                             torch.nn.utils.clip_grad_norm_(brain.parameters(), 1.0)
 
                             for name, p in brain.named_parameters():
                                 if p.grad is None:
                                     print("NO GRAD:", name)
                                 elif not torch.isfinite(p.grad).all():
-                                    print("BAD GRAD:", name, p.grad.min(), p.grad.max())
+                                    print("BAD GRAD:", name, p.grad.min(), p.grad.max(),)
 
                             agent.opt_world.step()
                             agent.opt_critic.step()
@@ -775,7 +838,7 @@ class ManagerFunction:
                             epoch_loss += float(loss.item())
                             nb += 1
 
-                            self.controller.SetStatus("training","Training...",epoch=ep + 1,total_epochs=epochs,batch=bi,total_batches=len(train_dl),train_loss=float(loss.item()),)
+                            self.controller.SetStatus("training", "Training...", epoch=ep + 1, total_epochs=epochs, batch=bi, total_batches=len(train_dl), train_loss=float(loss.item()),)
 
                             img_buf.clear()
                             key_buf.clear()
@@ -791,86 +854,117 @@ class ManagerFunction:
 
                 avg_train = epoch_loss / max(1, nb)
 
-                self.controller.SetStatus("training", f"Epoch {ep+1}/{epochs} done, avg_train={avg_train:.4f}",epoch=ep + 1,total_epochs=epochs,)
+                self.controller.SetStatus("training", f"Epoch {ep+1}/{epochs} done, avg_train={avg_train:.4f}", epoch=ep + 1, total_epochs=epochs,)
 
                 if self.controller.ShouldStop():
                     break
 
-                brain.eval()
-                val_loss = 0.0
-                nbv = 0
+                def eval_split(dl):
+                    brain.eval()
+                    split_loss = 0.0
+                    split_batches = 0
+                    total_correct = 0
+                    total_elems = 0
 
-                v_img_buf: List[np.ndarray] = []
-                v_key_buf: List[Any] = []
-                v_mouse_buf: List[Any] = []
-                v_reward_buf: List[Any] = []
-                v_done_buf: List[Any] = []
+                    v_img_buf: List[np.ndarray] = []
+                    v_key_buf: List[Any] = []
+                    v_mouse_buf: List[Any] = []
+                    v_reward_buf: List[Any] = []
+                    v_done_buf: List[Any] = []
 
-                with torch.no_grad():
-                    for vb, (img_b, key_b, mouse_b, reward_b, done_b) in enumerate(val_dl, start=1):
-                        B_cur = img_b.shape[0]
-                        for i in range(B_cur):
-                            img_item = img_b[i]
-                            if isinstance(img_item, torch.Tensor):
-                                img_np = img_item.numpy()
-                            else:
-                                img_np = img_item
+                    with torch.no_grad():
+                        for (img_b, key_b, mouse_b, reward_b, done_b) in dl:
+                            B_cur = img_b.shape[0]
+                            for i in range(B_cur):
+                                img_item = img_b[i]
+                                if isinstance(img_item, torch.Tensor):
+                                    img_np = img_item.cpu().numpy()
+                                else:
+                                    img_np = img_item
 
-                            v_img_buf.append(img_np)
-                            v_key_buf.append(key_b[i])
-                            v_mouse_buf.append(mouse_b[i])
-                            v_reward_buf.append(reward_b[i])
-                            v_done_buf.append(done_b[i])
+                                v_img_buf.append(img_np)
+                                v_key_buf.append(key_b[i])
+                                v_mouse_buf.append(mouse_b[i])
+                                v_reward_buf.append(reward_b[i])
+                                v_done_buf.append(done_b[i])
 
-                            if len(v_img_buf) == SEQ_LEN:
-                                v_pack = agent.StackNpImagesKeysMouses(imgs=v_img_buf,keys=v_key_buf,mouse=v_mouse_buf,reward=v_reward_buf,done=v_done_buf,B=batchSize,T=SEQ_LEN,device=self.device,)
+                                if len(v_img_buf) == SEQ_LEN * batchSize:
+                                    v_pack = agent.StackNpImagesKeysMouses(imgs=v_img_buf, keys=v_key_buf, mouse=v_mouse_buf, reward=v_reward_buf, done=v_done_buf, B=batchSize, T=SEQ_LEN, device=self.device,)
 
-                                v_frames = v_pack["frames"][0]
-                                v_keys_t = v_pack["keys"][0] if v_pack["keys"] else None
-                                v_mouse_t = v_pack["mouses"][0] if v_pack["mouses"] else None
+                                    v_frames = v_pack["frames"]
+                                    v_keys_t = v_pack["keys"] if v_pack["keys"] else None
+                                    v_mouse_t = (v_pack["mouses"] if v_pack["mouses"] else None)
 
-                                v_key_pred, v_mouse_pred, _ = agent.Act(v_frames,reward=None,done=None,deterministicActor=True,)
+                                    v_key_pred, v_mouse_pred, _ = agent.Act(v_frames, reward=None, done=None, deterministicActor=True,)
 
-                                cur_loss = torch.zeros((), device=self.device)
-                                if v_keys_t is not None:
-                                    K_use = min(v_key_pred.size(1), v_keys_t.size(1), keys_dim)
-                                    cur_loss = cur_loss + bce(v_key_pred[:, :K_use],v_keys_t[:, :K_use].float(),)
-                                if v_mouse_t is not None:
-                                    cur_loss = cur_loss + 0.05 * mse(v_mouse_pred, v_mouse_t)
+                                    cur_loss = torch.zeros((), device=self.device)
+                                    if v_keys_t is not None:
+                                        K_use = min(v_key_pred.size(1), v_keys_t.size(1), keys_dim,)
+                                        cur_loss = cur_loss + bce(v_key_pred[:, :K_use], v_keys_t[:, :K_use].float(),)
 
-                                val_loss += float(cur_loss.item())
-                                nbv += 1
+                                        pred_bin = (v_key_pred[:, :K_use] > 0.5).float()
+                                        tgt_bin = v_keys_t[:, :K_use].float()
+                                        total_correct += (pred_bin == tgt_bin).float().sum().item()
+                                        total_elems += pred_bin.numel()
 
-                                v_img_buf.clear()
-                                v_key_buf.clear()
-                                v_mouse_buf.clear()
-                                v_reward_buf.clear()
-                                v_done_buf.clear()
+                                    if v_mouse_t is not None:
+                                        cur_loss = cur_loss + 0.05 * mse(v_mouse_pred, v_mouse_t)
 
-                avg_val = val_loss / max(1, nbv)
-                best_val = min(best_val, avg_val)
+                                    split_loss += float(cur_loss.item())
+                                    split_batches += 1
 
-                ckpt = {
-                    "epoch": ep + 1,
-                    "best_val": best_val,
-                    "brain": brain.state_dict(),
-                    "opt_actor": agent.opt_actor.state_dict(),
-                    "opt_critic": agent.opt_critic.state_dict(),
-                    "opt_world": agent.opt_world.state_dict(),
-                    "train_indices": list(train_ds.indices)
-                    if hasattr(train_ds, "indices")
-                    else None,
-                    "val_indices": list(val_ds.indices)
-                    if hasattr(val_ds, "indices")
-                    else None,
-                    "rng": {
-                        "python": random.getstate(),
-                        "torch": torch.get_rng_state(),
-                        "numpy": np.random.get_state(),},
-                    "buffers": brain.ExportBuffers(),}
-                torch.save(ckpt, ckptPath)
+                                    v_img_buf.clear()
+                                    v_key_buf.clear()
+                                    v_mouse_buf.clear()
+                                    v_reward_buf.clear()
+                                    v_done_buf.clear()
 
-                self.controller.SetStatus("training", f"Epoch {ep+1}/{epochs} done | train {avg_train:.4f} | val {avg_val:.4f}", val_loss=avg_val,)
+                    avg_split_loss = split_loss / max(1, split_batches)
+                    split_acc = (total_correct / total_elems if total_elems > 0 else 0.0)
+                    return avg_split_loss, split_acc
+
+                avg_val, val_acc = eval_split(val_dl)
+                test_loss, test_acc = eval_split(test_dl)
+
+                improved = (best_val - avg_val) > min_delta
+                if improved:
+                    best_val = avg_val
+                    no_improve = 0
+
+                    ckpt = {
+                        "epoch": ep + 1,
+                        "best_val": best_val,
+                        "brain": brain.state_dict(),
+                        "opt_actor": agent.opt_actor.state_dict(),
+                        "opt_critic": agent.opt_critic.state_dict(),
+                        "opt_world": agent.opt_world.state_dict(),
+                        "train_indices": list(train_ds.indices)
+                        if hasattr(train_ds, "indices")
+                        else None,
+                        "val_indices": list(val_ds.indices)
+                        if hasattr(val_ds, "indices")
+                        else None,
+                        "rng": {
+                            "python": random.getstate(),
+                            "torch": torch.get_rng_state(),
+                            "numpy": np.random.get_state(),},
+                        "buffers": brain.ExportBuffers(),}
+                    torch.save(ckpt, ckptPath)
+                else:
+                    no_improve += 1
+
+                self.controller.SetStatus(
+                    "training",
+                    (f"Epoch {ep+1}/{epochs} done | " f"train {avg_train:.4f} | " f"val {avg_val:.4f}, acc={val_acc:.3f} | " f"test {test_loss:.4f}, acc={test_acc:.3f}"), val_loss=avg_val,)
+
+                if (val_acc >= target_acc and test_acc >= target_acc and abs(val_acc - test_acc) <= max_gap):
+                    self.controller.SetStatus("completed", f"Val/Test accuracies high & close: val={val_acc:.3f}, test={test_acc:.3f}",)
+                    agent.UpdateAllWrappers("commit")
+                    break
+
+                if no_improve >= patience:
+                    self.controller.SetStatus("completed", "Validation stabilized, early stop.")
+                    break
 
                 if self.controller.ShouldStop():
                     self.controller.SetStatus("stopped", "Training stopped")
@@ -948,7 +1042,7 @@ class ManagerFunction:
             agent.ResetBrainState()
 
             seq_len = brain.SEQ_LEN
-            rm_len = math.ceil(seq_len * 9 / 10)
+            rm_len = BasicParameters.IMAGE_RM_LEN
 
             if iio is None:
                 raise RuntimeError("imageio.v3 cant use")
@@ -1069,6 +1163,7 @@ class ManagerFunction:
 
     def TestModuleTrain(
         self,
+        onlineLearning: bool,
         *,
         dataRoot: str = BasicParameters.DATA_ROOT_PATH_TEST,
         nSamples: int = 64,
@@ -1132,15 +1227,15 @@ class ManagerFunction:
 
             print("[SmokeTest] start train...")
 
-            #ok = self.StartTraining(root=str(root),epochs=epochs,batchSize=batchSize,valSplit=valSplit,resume=False, isTest=True)
+            ok = self.StartTraining(root=str(root),epochs=epochs,batchSize=batchSize,valSplit=valSplit,resume=False, isTest=True)
 
-            #if not ok:
-                #raise RuntimeError("StartTraining returns False (training may already be running)")
+            if not ok:
+                raise RuntimeError("StartTraining returns False (training may already be running)")
 
-            #t = threading.Thread(target=self.MonitorTraining,args=(cleanup, str(root)),daemon=False,)
-            #t.start()
+            t = threading.Thread(target=self.MonitorTraining,args=(cleanup, str(root)),daemon=False,)
+            t.start()
 
-            self.TrainLoop(root, epochs, batchSize, valSplit, False, worldMemPath=BasicParameters.WORLD_MEMORY_PATH_TEST, memMemPath=BasicParameters.MEMORY_MEMORY_PATH_TEST,ckptPath=BasicParameters.CKPT_PATH_TEST)
+            self.TrainLoop(root, epochs, batchSize, valSplit, False, onlineLearning, worldMemPath=BasicParameters.WORLD_MEMORY_PATH_TEST, memMemPath=BasicParameters.MEMORY_MEMORY_PATH_TEST,ckptPath=BasicParameters.CKPT_PATH_TEST)
 
             if cleanup:
                 try:
