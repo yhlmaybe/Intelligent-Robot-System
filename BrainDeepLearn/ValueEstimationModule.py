@@ -753,11 +753,6 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]] = None, 
         **kwargs):
 
-        allowed = {"rewardExt", "policyEntropyPrev", "done"}
-        unknown = set(kwargs) - allowed
-        if unknown:
-            raise TypeError(f"Unknown kwargs in ForwardWithDeltas: {unknown}")
-
         rewardExt = kwargs.get("rewardExt", None)
         policyEntropyPrev = kwargs.get("policyEntropyPrev", None)
         done = kwargs.get("done", None)
@@ -1746,33 +1741,6 @@ class TestValueEstimationMTool:
             print(f"GradFlowCoverage error: {e}")
             return False
 
-    def TestWrapperKwargsValidation(self) -> bool:
-        try:
-            B = 3
-            mem, attn, state = self.RandBatch(B)
-            est = ValueEstimationExtractor(memoryDim=self.mem_dim,attnDim=self.attn_dim,stateDim=self.state_dim,useLayerNorm=True).to(self.device)
-            wrapper = ValueEstimationOnlineWrapper(est, initRankEach=0, autoRank=False)
-
-            try:
-                _ = wrapper.ForwardWithDeltas(
-                    x=(mem, attn, state),
-                    keyPaddingMask=None,
-                    tdError=None,
-                    uncertainty=None,
-                    deltasPerLayer=[{"fc1": None}, {"fc2": None, "vhead": None, "uhead": None}],
-                    mysterious_key=torch.tensor(1.0, device=self.device), )
-            except TypeError:
-                print("WrapperKwargsValidation pass")
-                return True
-            except Exception as e:
-                print(f"WrapperKwargsValidation wrong exception: {e}")
-                return False
-            print("WrapperKwargsValidation fail (no exception)")
-            return False
-        except Exception as e:
-            print(f"WrapperKwargsValidation error: {e}")
-            return False
-
     def RunAll(self):
         results = {
             "LoRAForwardEquivalence": self.TestLoRAForwardEquivalence(),
@@ -1784,7 +1752,6 @@ class TestValueEstimationMTool:
             "SimThenCommitVHead": self.TestSimThenCommitVHead(),
             "WrapperTempDeltasTrainable": self.TestWrapperTempDeltasTrainable(),
             "GradFlowCoverage": self.TestGradFlowCoverage(),
-            "WrapperKwargsValidation": self.TestWrapperKwargsValidation(),
             "IntrinsicRewardGenerator": self.TestIntrinsicRewardGenerator(),
             "ForwardNoReward": self.TestForwardNoReward(),
             "ForwardWithReward": self.TestForwardWithReward(),
