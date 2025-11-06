@@ -1,3 +1,0 @@
-file(REMOVE_RECURSE
-  "libIRSGUI_LIST.a"
-)

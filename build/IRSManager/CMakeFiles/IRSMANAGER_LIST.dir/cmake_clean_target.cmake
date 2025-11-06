@@ -1,3 +1,0 @@
-file(REMOVE_RECURSE
-  "libIRSMANAGER_LIST.a"
-)

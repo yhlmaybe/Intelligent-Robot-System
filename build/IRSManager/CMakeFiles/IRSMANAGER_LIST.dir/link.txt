@@ -1,2 +1,0 @@
-/usr/bin/ar qc libIRSMANAGER_LIST.a  CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreManager.cpp.o CMakeFiles/IRSMANAGER_LIST.dir/IRSCoreModule.cpp.o
-/usr/bin/ranlib libIRSMANAGER_LIST.a
