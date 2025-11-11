@@ -27,6 +27,8 @@ namespace PythonInteraction
 
         bool SetPrintCallback(PrintCB cb);
 
+        void EnsureStdoutRedirected();
+
     private:
         PrintCB printCb;
         

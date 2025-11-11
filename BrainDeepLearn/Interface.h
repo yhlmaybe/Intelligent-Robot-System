@@ -12,6 +12,9 @@
 #include <cstdio>
 #include <mutex>
 #include <atomic>
+#include <thread>
+
+#include "../include/PythonInteraction.h"
 
 #define CALL_METHOD_RET_BOOL(name, fmt, ...) \
     ([&]{ \
@@ -41,15 +44,17 @@ class BrainDeepLearnInterface
 public:
     using StatusValue = boost::variant<int, double, std::string>;
     using StatusMap = std::map<std::string, StatusValue>;
-    using PrintCB = std::function<void(const char*, std::size_t)>;
+    using PyTask = std::function<void()>;
 
-    BrainDeepLearnInterface();
+    BrainDeepLearnInterface(std::shared_ptr<PythonInteraction::Manager> mag, std::function<void(std::string)> printCallBack = nullptr);
     ~BrainDeepLearnInterface();
 
     bool StartTraining(std::string& root, int epochs = 5, int batchSize = 32, double valSplit = 0.1, int imagineHorizon = 5, bool resume = true);
-    bool StopTraining();
-    bool PauseTraining();
-    bool ResumeTraining();
+    bool Stop();
+    bool Pause();
+    bool Resume();
+
+    bool RunPythonAsync(PyTask task);
 
     bool GetTrainingStatus(StatusMap& status);
 
@@ -69,10 +74,19 @@ public:
 
 private:
 
+    std::shared_ptr<PythonInteraction::Manager> pyManager = nullptr;
+
+    std::function<void(std::string)> printMessageCB = nullptr;
+
     PyObject* pModule = nullptr;
     PyObject* pManagerObj = nullptr;
 
+    std::thread brThread;
+    std::atomic<bool> brThreadRunning{false};
+
     void Init();
+
+    void PrintMessage(std::string str);
 };
 
 

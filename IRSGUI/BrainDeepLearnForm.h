@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "../BrainDeepLearn/Interface.h"
+#include "../include/PythonInteraction.h"
 
 namespace Ui {
 class BrainDeepLearnForm;
@@ -17,12 +18,14 @@ class BrainDeepLearnForm : public QWidget
     Q_OBJECT
 
 public:
-    explicit BrainDeepLearnForm(QWidget *parent = nullptr);
+    explicit BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manager> mag, QWidget *parent = nullptr);
     ~BrainDeepLearnForm();
 
 private:
     Ui::BrainDeepLearnForm *ui;
     mutable std::mutex message_mtx;
+
+    std::shared_ptr<PythonInteraction::Manager> pyManager = nullptr;
 
     BrainDeepLearnForm(const BrainDeepLearnForm&) = delete;
     BrainDeepLearnForm& operator = (const BrainDeepLearnForm&) = delete;

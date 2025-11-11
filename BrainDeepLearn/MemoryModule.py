@@ -156,7 +156,7 @@ class SymbolicMemory(nn.Module):
         super().__init__()
         self.K = k
         self.capacity = capacity
-        self.register_buffer("Pstore", torch.zeros(capacity, k, dtype=torch.float16))
+        self.register_buffer("Pstore", torch.zeros(capacity, k, dtype=torch.float32))
         self.register_buffer("prio", torch.zeros(capacity))
         self.register_buffer("step", torch.zeros(capacity, dtype=torch.long))
         self.register_buffer("touch", torch.zeros(capacity, dtype=torch.long))
@@ -301,8 +301,8 @@ class GlobalWorkspace(nn.Module):
               replacePolicy: str = "soft"):
         
         device = self.keys.device
-        key = F.normalize(key.detach().to(device), dim=-1)
-        val = F.normalize(val.detach().to(device), dim=-1)
+        key = F.normalize(key.detach().to(device=device, dtype=self.keys.dtype), dim=-1)
+        val = F.normalize(val.detach().to(device=device, dtype=self.vals.dtype), dim=-1)
         ttl = int(ttl) if ttl is not None else self.default_ttl
         pr_t = torch.as_tensor(priority, dtype=self.priority.dtype, device=self.priority.device)
 
@@ -924,144 +924,143 @@ class MemoryExtractor(nn.Module):
 
         self.ResetInternalLoss()
 
-        with torch.autocast(device_type=x.device.type, dtype=dtype, enabled=amp_enable):
-            B, device = x.size(0), x.device
-            if reset:
-                self.ResetAll()
-            elif softReset:
-                self.SoftReset()
+        B, device = x.size(0), x.device
+        if reset:
+            self.ResetAll()
+        elif softReset:
+            self.SoftReset()
 
-            if self.h_state.device != device:
-                self.h_state = self.h_state.to(device)
-            if self.h_state.size(0) != B:
-                self.h_state.resize_(B, self.ssm_state_dim).zero_()
+        if self.h_state.device != device:
+            self.h_state = self.h_state.to(device)
+        if self.h_state.size(0) != B:
+            self.h_state.resize_(B, self.ssm_state_dim).zero_()
 
-            self.time_step += 1
+        self.time_step += 1
 
-            self.gws.StepTick()
-            self.ltm.StepTick()
-            self.sym_mem.StepTick()
+        self.gws.StepTick()
+        self.ltm.StepTick()
+        self.sym_mem.StepTick()
 
-            h_prev = self.h_state.detach()
+        h_prev = self.h_state.detach()
 
-            h_new = self.h_state @ self.A_full.t() + self.B_mat(x)
+        h_new = self.h_state @ self.A_full.t() + self.B_mat(x)
 
-            gb = 0.1 + 0.8 * torch.sigmoid(self.grad_bridge) 
+        gb = 0.1 + 0.8 * torch.sigmoid(self.grad_bridge) 
 
-            h_mix = gb * h_new + (1.0 - gb) * h_prev
+        h_mix = gb * h_new + (1.0 - gb) * h_prev
 
-            y_ssm = self.C_mat(h_mix) + self.D_mat(x)
+        y_ssm = self.C_mat(h_mix) + self.D_mat(x)
 
-            key, val = self.EncodeKV(h_mix)
+        key, val = self.EncodeKV(h_mix)
 
-            self.h_state = h_mix.detach()
+        self.h_state = h_mix.detach()
 
-            importance = self.importance_net(h_mix)
-            gate_local = self.local_gate(h_mix)
+        importance = self.importance_net(h_mix)
+        gate_local = self.local_gate(h_mix)
 
-            neuromod = self.GetNeuromod(tdError)
-            self.UpdateMemoryUtilization()
-            self.AutoCompress()
+        neuromod = self.GetNeuromod(tdError)
+        self.UpdateMemoryUtilization()
+        self.AutoCompress()
 
-            td_feat = tdError.view(-1, 1) if tdError is not None else torch.zeros(B, 1, device=device)
-            kv_feat = self.KvStats(key) 
-            phi = torch.cat([self.ctrl_norm(h_mix), key, kv_feat, importance, gate_local, td_feat], dim=-1)
+        td_feat = tdError.view(-1, 1) if tdError is not None else torch.zeros(B, 1, device=device)
+        kv_feat = self.KvStats(key) 
+        phi = torch.cat([self.ctrl_norm(h_mix), key, kv_feat, importance, gate_local, td_feat], dim=-1)
 
-            ctrl = self.ctrl_head(phi) 
-            a_raw, b_raw, f_raw, bias_raw = ctrl.split(1, dim=-1)
+        ctrl = self.ctrl_head(phi) 
+        a_raw, b_raw, f_raw, bias_raw = ctrl.split(1, dim=-1)
 
-            a = (0.7 + 0.6 * torch.sigmoid(a_raw)).squeeze(-1)
+        a = (0.7 + 0.6 * torch.sigmoid(a_raw)).squeeze(-1)
 
-            b = (0.97 + 0.03 * torch.sigmoid(b_raw)).squeeze(-1)
+        b = (0.97 + 0.03 * torch.sigmoid(b_raw)).squeeze(-1)
 
-            fusion_gate = torch.sigmoid(f_raw).squeeze(-1)
+        fusion_gate = torch.sigmoid(f_raw).squeeze(-1)
 
-            gate_bias = 0.5 * torch.tanh(bias_raw).squeeze(-1)
+        gate_bias = 0.5 * torch.tanh(bias_raw).squeeze(-1)
 
-            reg = (a - 1.0).abs().mean() + (b - 1.0).abs().mean() + (fusion_gate - 0.5).abs().mean() + gate_bias.abs().mean()
-            self.AddInternalLoss(1e-4 * reg)
+        reg = (a - 1.0).abs().mean() + (b - 1.0).abs().mean() + (fusion_gate - 0.5).abs().mean() + gate_bias.abs().mean()
+        self.AddInternalLoss(1e-4 * reg)
 
-            if self.ns_enable:
-                P_pre, per_pre, rule_pre, importance = self.NsPreWrite(val, importance)
-                self.AddInternalLoss(self.ns_lambda * rule_pre)
+        if self.ns_enable:
+            P_pre, per_pre, rule_pre, importance = self.NsPreWrite(val, importance)
+            self.AddInternalLoss(self.ns_lambda * rule_pre)
 
-                with torch.no_grad():
-                    for i in range(B):
-                        self.sym_mem.Store(P_pre[i], score=float(importance[i].item()))
-            else:
-                rule_pre = torch.zeros([], device=h_new.device)
+            with torch.no_grad():
+                for i in range(B):
+                    self.sym_mem.Store(P_pre[i], score=float(importance[i].item()))
+        else:
+            rule_pre = torch.zeros([], device=h_new.device)
 
-            self.LtmOnlineStore(key, val, importance, tdError=tdError, reward=reward)
+        self.LtmOnlineStore(key, val, importance, tdError=tdError, reward=reward)
        
-            fw_local = self.BuildFastWeights(key, gate_local, neuromod, a, b) if self.enable_hebb_update else None
+        fw_local = self.BuildFastWeights(key, gate_local, neuromod, a, b) if self.enable_hebb_update else None
 
-            mem_recall = self.Retrieve(key, fusion_gate, importance=importance, localGate=gate_local, fwOverride=fw_local)
+        mem_recall = self.Retrieve(key, fusion_gate, importance=importance, localGate=gate_local, fwOverride=fw_local)
 
-            self.HebbianUpdate(key, gate_local, neuromod, a, b)
-            self.KvWrite(key, val, importance)
+        self.HebbianUpdate(key, gate_local, neuromod, a, b)
+        self.KvWrite(key, val, importance)
 
-            ltm_recall, sem_vecs, sem_w, epi_vecs, epi_w = self.ltm.Retrieve(key, topkSem=self.ltm_topk_sem, topkEpi=self.ltm_topk_epi)
+        ltm_recall, sem_vecs, sem_w, epi_vecs, epi_w = self.ltm.Retrieve(key, topkSem=self.ltm_topk_sem, topkEpi=self.ltm_topk_epi)
 
-            msg = torch.cat([h_new, y_ssm, mem_recall], dim=-1)
-            ws_val = F.normalize(self.gws_summary(msg), dim=-1)
+        msg = torch.cat([h_new, y_ssm, mem_recall], dim=-1)
+        ws_val = F.normalize(self.gws_summary(msg), dim=-1)
 
-            mem_recall_base = mem_recall.detach() 
-            if self.gws_align_weight > 0:
-                loss_gws_align = self.gws_align_weight * (1 - F.cosine_similarity(ws_val, mem_recall_base, dim=-1)).mean()
-                self.AddInternalLoss(loss_gws_align)
+        mem_recall_base = mem_recall.detach() 
+        if self.gws_align_weight > 0:
+            loss_gws_align = self.gws_align_weight * (1 - F.cosine_similarity(ws_val, mem_recall_base, dim=-1)).mean()
+            self.AddInternalLoss(loss_gws_align)
 
-            for i in range(B):
-                self.gws.Write(key[i], ws_val[i], priority=float(importance[i].item()), ttl=6, tagId=1, ownerId=self.owner_id)
+        for i in range(B):
+            self.gws.Write(key[i], ws_val[i], priority=float(importance[i].item()), ttl=6, tagId=1, ownerId=self.owner_id)
 
-            gws_read, _ = self.gws.Attend(key, topk=4)
-            fuse_gate = self.gws_gate(torch.cat([gws_read, mem_recall], dim=-1))
-            mem_recall = fuse_gate * gws_read + (1 - fuse_gate) * mem_recall
+        gws_read, _ = self.gws.Attend(key, topk=4)
+        fuse_gate = self.gws_gate(torch.cat([gws_read, mem_recall], dim=-1))
+        mem_recall = fuse_gate * gws_read + (1 - fuse_gate) * mem_recall
 
-            if self.ltm_inject:
-                gamma_ltm = self.ltm_gate(torch.cat([key, mem_recall, ltm_recall, gws_read], dim=-1))
-                mem_recall = (1.0 - gamma_ltm) * mem_recall + gamma_ltm * ltm_recall
+        if self.ltm_inject:
+            gamma_ltm = self.ltm_gate(torch.cat([key, mem_recall, ltm_recall, gws_read], dim=-1))
+            mem_recall = (1.0 - gamma_ltm) * mem_recall + gamma_ltm * ltm_recall
 
-            if self.ns_enable:
-                P_post, per_post, rule_post, damp, mem_recall = self.NsPostRead(mem_recall)
-                self.ns_last = {
-                    "P_pre": P_pre.detach() if 'P_pre' in locals() else None,
-                    "P_post": P_post.detach(),
-                    "per_sample_pre": per_pre.detach() if 'per_pre' in locals() else None,
-                    "per_sample_post": per_post.detach(),
-                    "rule_loss_pre": (self.ns_lambda * rule_pre).detach() if 'rule_pre' in locals() else torch.zeros([], device=mem_recall.device),
-                    "rule_loss_post": (self.ns_lambda * rule_post).detach(),}
-                self.AddInternalLoss(self.ns_lambda * rule_post)
-            else:
-                self.ns_last = {}
+        if self.ns_enable:
+            P_post, per_post, rule_post, damp, mem_recall = self.NsPostRead(mem_recall)
+            self.ns_last = {
+                "P_pre": P_pre.detach() if 'P_pre' in locals() else None,
+                "P_post": P_post.detach(),
+                "per_sample_pre": per_pre.detach() if 'per_pre' in locals() else None,
+                "per_sample_post": per_post.detach(),
+                "rule_loss_pre": (self.ns_lambda * rule_pre).detach() if 'rule_pre' in locals() else torch.zeros([], device=mem_recall.device),
+                "rule_loss_post": (self.ns_lambda * rule_post).detach(),}
+            self.AddInternalLoss(self.ns_lambda * rule_post)
+        else:
+            self.ns_last = {}
 
-            Qsym = self.sym_query(key)
-            sym_recall = self.sym_mem.Retrieve(Qsym, topK=8) 
+        Qsym = self.sym_query(key)
+        sym_recall = self.sym_mem.Retrieve(Qsym, topK=8) 
 
-            P_cur = P_post if self.ns_enable else Qsym 
-            sym_vec = self.sym_embed(P_cur, sym_recall)
+        P_cur = P_post if self.ns_enable else Qsym 
+        sym_vec = self.sym_embed(P_cur, sym_recall)
 
-            g_sym = self.sym_fuse_gate(torch.cat([mem_recall, sym_vec], dim=-1))
-            mem_recall = (1.0 - g_sym) * mem_recall + g_sym * sym_vec
+        g_sym = self.sym_fuse_gate(torch.cat([mem_recall, sym_vec], dim=-1))
+        mem_recall = (1.0 - g_sym) * mem_recall + g_sym * sym_vec
 
-            if tdError is not None:
-                mem_recall = self.ApplyOutputGate(mem_recall, tdError, gate_bias)
+        if tdError is not None:
+            mem_recall = self.ApplyOutputGate(mem_recall, tdError, gate_bias)
 
-            fused = self.fusion(torch.cat([y_ssm, mem_recall], dim=-1))
-            output = self.norm(fused)
+        fused = self.fusion(torch.cat([y_ssm, mem_recall], dim=-1))
+        output = self.norm(fused)
 
-            self._ltm_cache = {
-                "step": self.time_step,
-                "sem_vecs": sem_vecs,
-                "sem_w": sem_w,
-                "epi_vecs": epi_vecs,
-                "epi_w": epi_w,
-                "ltm_recall": ltm_recall.detach(),
-                "mem_recall": mem_recall.detach(),}
+        self._ltm_cache = {
+            "step": self.time_step,
+            "sem_vecs": sem_vecs,
+            "sem_w": sem_w,
+            "epi_vecs": epi_vecs,
+            "epi_w": epi_w,
+            "ltm_recall": ltm_recall.detach(),
+            "mem_recall": mem_recall.detach(),}
 
-            if (self.time_step % self.consolidate_every) == 0:
-                self.ConsolidateFromGWS()
-            if (self.time_step % self.rehearse_every) == 0:
-                self.RehearseFromLTM(batch=min(8, self.memory_filled if self.memory_filled > 0 else 1))
+        if (self.time_step % self.consolidate_every) == 0:
+            self.ConsolidateFromGWS()
+        if (self.time_step % self.rehearse_every) == 0:
+            self.RehearseFromLTM(batch=min(8, self.memory_filled if self.memory_filled > 0 else 1))
 
         return output.float(), mem_recall.float()
 
@@ -1460,13 +1459,13 @@ class MemoryExtractor(nn.Module):
             "svd_threshold": torch.tensor(self.svd_threshold, dtype=torch.float32),
             "fro_norm_history": torch.tensor(self.fro_norm_history, dtype=torch.float32),
 
-            "gws_keys": gws_snap["keys"],
-            "gws_vals": gws_snap["vals"],
-            "gws_priority": gws_snap["priority"],
-            "gws_ttl": gws_snap["ttl"],
-            "gws_last_step": gws_snap["last_step"],
-            "gws_tag_id": gws_snap["tag_id"],
-            "gws_owner_id": gws_snap["owner_id"],
+            "gws_keys": gws_snap["keys"].clone(),
+            "gws_vals": gws_snap["vals"].clone(),
+            "gws_priority": gws_snap["priority"].clone(),
+            "gws_ttl": gws_snap["ttl"].clone(),
+            "gws_last_step": gws_snap["last_step"].clone(),
+            "gws_tag_id": gws_snap["tag_id"].clone(),
+            "gws_owner_id": gws_snap["owner_id"].clone(),
             "gws_global_step": torch.tensor(self.gws.global_step),
 
             "ltm_sem_emb": sem.emb.clone(),
@@ -1497,7 +1496,6 @@ class MemoryExtractor(nn.Module):
             "sym_mem_global_step": torch.tensor(self.sym_mem.global_step),
 
             "ns_penalty_vec": (self._ns_penalty_vec.clone() if self._ns_penalty_vec is not None else None),}
-    
         
         torch.save(state, path)
 

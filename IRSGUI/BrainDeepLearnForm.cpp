@@ -1,7 +1,7 @@
 #include "BrainDeepLearnForm.h"
 #include "ui_BrainDeepLearnForm.h"
 
-BrainDeepLearnForm::BrainDeepLearnForm(QWidget *parent) :
+BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manager> mag, QWidget *parent):
     QWidget(parent),
     ui(new Ui::BrainDeepLearnForm)
 {
@@ -10,8 +10,7 @@ BrainDeepLearnForm::BrainDeepLearnForm(QWidget *parent) :
 
     ui->setupUi(this);
 
-    brainDeepLearn = std::make_shared<BrainDeepLearnInterface>();
-
+    brainDeepLearn = std::make_shared<BrainDeepLearnInterface>(mag);
 
     connect(ui->testPerceptionModule_pushButton, SIGNAL(clicked()), this, SLOT(TestPerceptionModule()));
     connect(ui->testAttentionModulel_pushButton, SIGNAL(clicked()), this, SLOT(TestAttentionModule()));
@@ -23,6 +22,7 @@ BrainDeepLearnForm::BrainDeepLearnForm(QWidget *parent) :
 
     connect(ui->close_pushButton, SIGNAL(clicked()), this, SLOT(CloseForm()));
 }
+
 
 BrainDeepLearnForm::~BrainDeepLearnForm()
 {

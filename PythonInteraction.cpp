@@ -20,51 +20,80 @@ namespace PythonInteraction
         Py_TYPE(self)->tp_free((PyObject *)self);
     }
 
-    static PyObject *RWrite(RedirectObj *self, PyObject *args)
+    static PyObject* RWrite(RedirectObj *self, PyObject *args)
     {
-        const char *buf;
-        Py_ssize_t len;
-        if (!PyArg_ParseTuple(args, "s#", &buf, &len))
-            return nullptr;
+        const char *buf = nullptr;
+        Py_ssize_t py_len = 0;
 
-        PyThreadState *tstate = PyThreadState_GET();
-        PyFrameObject *frame = tstate->frame;
-        while (frame && !frame->f_globals)
-            frame = frame->f_back;
+        if (!PyArg_ParseTuple(args, "s#", &buf, &py_len)) 
+        {
+            Py_RETURN_NONE;
+        }
+
+        if (py_len < 0) 
+        {
+            py_len = 0;
+        }
+
+        const Py_ssize_t MAX_REASONABLE = 1024 * 1024;
+
+        if (py_len > MAX_REASONABLE) 
+        {
+            py_len = static_cast<Py_ssize_t>(std::strlen(buf));
+        }
+
+        const std::size_t len = static_cast<std::size_t>(py_len);
 
         std::string modname = "<unknown>";
-        if (frame)
         {
-            PyObject *name_obj = PyDict_GetItemString(frame->f_globals, "__name__");
-            if (name_obj && PyUnicode_Check(name_obj))
+            PyThreadState *tstate = PyThreadState_GET();
+            PyFrameObject *frame = tstate ? tstate->frame : nullptr;
+            while (frame && !frame->f_globals) 
             {
-                modname = PyUnicode_AsUTF8(name_obj);
+                frame = frame->f_back;
+            }
+
+            if (frame) 
+            {
+                PyObject *name_obj = PyDict_GetItemString(frame->f_globals, "__name__");
+                if (name_obj && PyUnicode_Check(name_obj)) {
+                    modname = PyUnicode_AsUTF8(name_obj);
+                }
             }
         }
 
-        if (!self->valid.load(std::memory_order_acquire))
+        if (!self->valid.load(std::memory_order_acquire)) 
+        {
             Py_RETURN_NONE;
+        }
 
         Manager::PrintCB cb_copy;
         {
             std::lock_guard<std::mutex> lk(print_callback_mutex);
-            if (!self->cb || !*self->cb)
+            if (!self->cb || !*self->cb) 
+            {
                 Py_RETURN_NONE;
+            }
             cb_copy = *self->cb;
         }
 
-        try
+        try 
         {
-            cb_copy(buf, static_cast<std::size_t>(len), modname);
+            cb_copy(buf, len, modname);
         }
-        catch (const std::exception &e)
+        catch (const std::bad_alloc&) 
+        {
+            fprintf(stderr, "[PrintCB %s] bad_alloc (log chunk too large?)\n", modname.c_str());
+        }
+        catch (const std::exception &e) 
         {
             fprintf(stderr, "[PrintCB ex %s] %s\n", modname.c_str(), e.what());
         }
-        catch (...)
+        catch (...) 
         {
             fprintf(stderr, "[PrintCB unknown ex %s]\n", modname.c_str());
         }
+
         Py_RETURN_NONE;
     }
 
@@ -143,6 +172,8 @@ namespace PythonInteraction
         RedirectType.tp_methods = RMethods;
         RedirectType.tp_dealloc = (destructor)Redirect_dealloc;
         RedirectType.tp_new = PyType_GenericNew;
+        RedirectType.tp_getattro = PyObject_GenericGetAttr;
+        RedirectType.tp_setattro = PyObject_GenericSetAttr;
 
         return PyType_Ready(&RedirectType) == 0;
     }
@@ -160,25 +191,30 @@ namespace PythonInteraction
 
     void Manager::Init()
     {
-        PyGILState_STATE g = PyGILState_Ensure();
-
         PyObject *sys = PyImport_ImportModule("sys");
         originalStdout = PySys_GetObject("stdout");
         Py_XINCREF(originalStdout);
         Py_DECREF(sys);
-
-        PyGILState_Release(g);
     }
 
     Manager::Manager()
     {
         Py_Initialize();
         PyEval_InitThreads();
+
+        PyRun_SimpleString(
+            "import debugpy\n"
+            "debugpy.listen(('0.0.0.0', 9999))\n"
+            "print('Python debug waiting on 9999...')\n"
+            "debugpy.wait_for_client()\n"
+            "print('Python debugger attached')\n");
+
         PyRun_SimpleString("import sys");
         PyRun_SimpleString("sys.path.append('./ServoControl')");
         PyRun_SimpleString("sys.path.append('./BrainDeepLearn')");
 
         Init();
+        PyEval_SaveThread();
     }
 
     Manager::~Manager()
@@ -200,12 +236,29 @@ namespace PythonInteraction
         return InstallRedirect();
     }
 
+    void Manager::EnsureStdoutRedirected()
+    {
+        PyGILState_STATE g = PyGILState_Ensure();
+
+        PyObject* sys = PyImport_ImportModule("sys");
+        if (sys && pRedirectObj) 
+        {
+            PySys_SetObject("stdout", pRedirectObj);
+            Py_DECREF(sys);
+        }
+
+        PyGILState_Release(g);
+    }
+
     bool Manager::InstallRedirect()
     {
-        if (!EnsureRedirectType())
-            return false;
-
         PyGILState_STATE g = PyGILState_Ensure();
+
+        if (!EnsureRedirectType())
+        {
+            PyGILState_Release(g);
+            return false;
+        }
 
         PyObject *newRedirect = NewRedirect(&printCb);
         if (!newRedirect)

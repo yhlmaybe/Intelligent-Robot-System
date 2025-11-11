@@ -29,13 +29,21 @@ void BrainDeepLearnInterface::Init()
     PyGILState_Release(g);
 }
 
-BrainDeepLearnInterface::BrainDeepLearnInterface() 
+BrainDeepLearnInterface::BrainDeepLearnInterface(std::shared_ptr<PythonInteraction::Manager> mag, std::function<void(std::string)> printCallBack) 
 {
     Init();
+    pyManager = mag;
+    printMessageCB = printCallBack;
 }
 
 BrainDeepLearnInterface::~BrainDeepLearnInterface() 
 {
+    if(brThread.joinable())
+    {
+        Stop();
+        brThread.join();
+    }
+
     PyGILState_STATE g = PyGILState_Ensure();
     Py_XDECREF(pManagerObj);
     Py_XDECREF(pModule);
@@ -43,24 +51,79 @@ BrainDeepLearnInterface::~BrainDeepLearnInterface()
     PyGILState_Release(g);
 }
 
+void BrainDeepLearnInterface::PrintMessage(std::string str)
+{
+    if(printMessageCB)
+    {
+        printMessageCB(str);
+    }
+    else
+    {
+        std::fprintf(stderr, "%s\n", str.c_str());
+    }
+}
+
 bool BrainDeepLearnInterface::StartTraining(std::string& root, int epochs, int batchSize, double valSplit, int imagineHorizon, bool resume) 
 {
     return CALL_METHOD_RET_BOOL("StartTraining", "siiidi", root.c_str(), epochs, batchSize, valSplit, imagineHorizon, resume?1:0);
 }
 
-bool BrainDeepLearnInterface::StopTraining()
+bool BrainDeepLearnInterface::Stop()
 { 
-    return CALL_METHOD_NOARG("StopTraining"); 
+    return CALL_METHOD_NOARG("Stop"); 
 }
 
-bool BrainDeepLearnInterface::PauseTraining() 
+bool BrainDeepLearnInterface::Pause() 
 { 
-    return CALL_METHOD_NOARG("PauseTraining"); 
+    return CALL_METHOD_NOARG("Pause"); 
 }
 
-bool BrainDeepLearnInterface::ResumeTraining() 
+bool BrainDeepLearnInterface::Resume() 
 { 
-    return CALL_METHOD_NOARG("ResumeTraining"); 
+    return CALL_METHOD_NOARG("Resume"); 
+}
+
+bool BrainDeepLearnInterface::RunPythonAsync(PyTask task)
+{
+    if (brThreadRunning.load(std::memory_order_acquire)) 
+    {
+        PrintMessage("The task is in progress");
+        return false;
+    }
+
+    brThreadRunning.store(true, std::memory_order_release);
+
+    if (brThread.joinable()) 
+    {
+        brThread.join();
+    }
+
+    brThread = std::thread([this, task = std::move(task)]() mutable 
+    {
+        PyGILState_STATE g = PyGILState_Ensure();
+
+        pyManager->EnsureStdoutRedirected();
+
+        try 
+        {
+            task(); 
+        } 
+        catch (const std::exception& e) 
+        {
+            fprintf(stderr, "Exception in Python async task: %s\n", e.what());
+        } catch (...) 
+        {
+            fprintf(stderr, "Unknown exception in Python async task\n");
+        }
+
+        PyGILState_Release(g);
+
+        brThreadRunning.store(false, std::memory_order_release);
+
+        PrintMessage("The task is complete");
+    });
+
+    return true;
 }
 
 bool BrainDeepLearnInterface::GetTrainingStatus(StatusMap& status) 
@@ -79,7 +142,7 @@ bool BrainDeepLearnInterface::GetTrainingStatus(StatusMap& status)
         if (PyUnicode_Check(key)) 
         {
             std::string k = PyUnicode_AsUTF8(key);
-            if (PyLong_Check(val))       status[k] = (int)PyLong_AsLong(val);
+            if (PyLong_Check(val)) status[k] = (int)PyLong_AsLong(val);
             else if (PyFloat_Check(val)) status[k] = PyFloat_AsDouble(val);
             else if (PyUnicode_Check(val)) status[k] = std::string(PyUnicode_AsUTF8(val));
         }
@@ -91,42 +154,56 @@ bool BrainDeepLearnInterface::GetTrainingStatus(StatusMap& status)
 
 bool BrainDeepLearnInterface::TestPerceptionModule()
 {
-    bool success = CALL_METHOD_NOARG("TestPerceptionModule");
-    return success;
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("TestPerceptionModule");
+    });
 }
 
 bool BrainDeepLearnInterface::TestAttentionModule()
 {
-    bool success = CALL_METHOD_NOARG("TestAttentionModule");
-    return success;
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("TestAttentionModule");
+    });
 }
 
 bool BrainDeepLearnInterface::TestMemoryModule()
 {
-    bool success = CALL_METHOD_NOARG("TestMemoryModule");
-    return success;
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("TestMemoryModule");
+    });
 }
 
 bool BrainDeepLearnInterface::TestDecisionModule()
 {
-    bool success = CALL_METHOD_NOARG("TestDecisionModule");
-    return success;
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("TestDecisionModule");
+    });
 }
 
 bool BrainDeepLearnInterface::TestWorldModule()
 {
-    bool success = CALL_METHOD_NOARG("TestWorldModule");
-    return success;
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("TestWorldModule");
+    });
 }
 
 bool BrainDeepLearnInterface::TestValueEstimationModule()
 {
-    bool success = CALL_METHOD_NOARG("TestValueEstimationModule");
-    return success;
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("TestValueEstimationModule");
+    });
 }
 
 bool BrainDeepLearnInterface::TestModuleTrain(bool onlineLearning)
 {
-    bool success = CALL_METHOD_RET_BOOL("TestModuleTrain", "b", onlineLearning);
-    return success;
+    return RunPythonAsync([this, onlineLearning]()
+    {
+        (void)CALL_METHOD_RET_BOOL("TestModuleTrain", "b", onlineLearning);
+    });
 }

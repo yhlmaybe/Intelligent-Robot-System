@@ -150,8 +150,12 @@ class S4DCell(nn.Module):
         denom = (1 - k).clamp_min(1e-6)
         return num / denom
 
-    def ResetState(self, batch: int):
-        self.x = torch.zeros(batch, self.N)
+    def ResetState(self, batch: int, device: Optional[torch.device] = None, dtype=None):
+        if device is None:
+            device = self.x.device if hasattr(self, "x") else torch.device("cpu")
+        if dtype is None:
+            dtype = self.x.dtype if hasattr(self, "x") else torch.float32
+        self.x = torch.zeros(batch, self.N, device=device, dtype=dtype)
 
     def Step(self, zPrev: torch.Tensor, aT: torch.Tensor, *, updateState: bool = True) -> torch.Tensor:
         u = torch.cat([zPrev, aT], dim=-1)
@@ -366,9 +370,13 @@ class ConnNet(nn.Module):
         euler = sBase + dt * torch.einsum("bij,bj->bi", A, sBase)
 
         I = torch.eye(S, device=A.device, dtype=A.dtype).unsqueeze(0).expand(B, S, S)
-        lhs = I - 0.5 * dt * A 
-        rhs_vec = torch.einsum("bij,bj->bi", I + 0.5 * dt * A, sBase) 
-        cayley = torch.linalg.solve(lhs, rhs_vec.unsqueeze(-1)).squeeze(-1)  
+        lhs = I - 0.5 * dt * A
+        rhs_vec = torch.einsum("bij,bj->bi", I + 0.5 * dt * A, sBase)
+
+        lhs = lhs.contiguous()
+        rhs = rhs_vec.unsqueeze(-1).contiguous()
+
+        cayley = torch.linalg.solve(lhs, rhs).squeeze(-1)
 
         mode = self.transport
         if mode == "euler":
@@ -376,8 +384,8 @@ class ConnNet(nn.Module):
         if mode == "cayley":
             return cayley
 
-        fro = A.pow(2).mean(dim=(1, 2)).sqrt() 
-        mask = (fro > 0.75).to(A.dtype).view(B, 1)  
+        fro = A.pow(2).mean(dim=(1, 2)).sqrt()
+        mask = (fro > 0.75).to(A.dtype).view(B, 1)
         return mask * cayley + (1.0 - mask) * euler
 
     def ComputeGeomReg(self, A, prevA=None):
@@ -782,9 +790,10 @@ class RSSMWorldModel(nn.Module):
         return vals[0] if single else vals
 
     def ResetHidden(self, batchSize: int = 1):
-        self._h = torch.zeros(batchSize, self.deter_dim)
-        self._z = torch.zeros(batchSize, self.stoch_dim)
-        self.s4.ResetState(batchSize)
+        device = next(self.parameters()).device
+        self._h = torch.zeros(batchSize, self.deter_dim, device=device)
+        self._z = torch.zeros(batchSize, self.stoch_dim, device=device)
+        self.s4.ResetState(batchSize, device=device)
         self._A_prev = None
 
     def ExportState(self) -> Tuple[torch.Tensor, torch.Tensor]:

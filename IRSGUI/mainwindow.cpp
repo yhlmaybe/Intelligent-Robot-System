@@ -81,7 +81,7 @@ MainWindow::MainWindow(QWidget *parent) :
 
     joint_datas_form = new JointDatasForm();
     end_effector_datas_form = new EndEffectorDatasForm();
-    brain_deep_learn_form = new BrainDeepLearnForm();
+    brain_deep_learn_form = new BrainDeepLearnForm(py_manager);
 
     forms.push_back(joint_datas_form);
     forms.push_back(end_effector_datas_form);
@@ -132,7 +132,26 @@ void MainWindow::Initiate()
     if (!is_initial)
     {
         py_manager = std::make_shared<PythonInteraction::Manager>();
-        py_manager->SetPrintCallback([this](const char* p, std::size_t n, const std::string& name) {this->SetPythonMessageToTextBrowser(p, int(n), name);});
+        py_manager->SetPrintCallback([this](const char* p, std::size_t n, const std::string& name) 
+        {
+            std::string text(p, n);
+            std::string module = name;
+
+            QMetaObject::invokeMethod
+            (
+                this,
+                [
+                    this,
+                    text = std::move(text),
+                    module = std::move(module)
+                ]() mutable
+                {
+                    this->SetPythonMessageToTextBrowser(text.c_str(), static_cast<int>(text.size()), module);
+                },
+                Qt::QueuedConnection
+            );
+
+        });
 
         //servo_manager = std::make_shared<ServoTools>();
     }
