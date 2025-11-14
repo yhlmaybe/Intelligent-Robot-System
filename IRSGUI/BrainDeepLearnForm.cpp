@@ -8,9 +8,22 @@ BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manage
     setWindowFlags(Qt::Window | Qt::CustomizeWindowHint | Qt::WindowTitleHint);
     setAttribute(Qt::WA_DeleteOnClose);
 
+    qRegisterMetaType<QTextCursor>("QTextCursor");
+
     ui->setupUi(this);
 
-    brainDeepLearn = std::make_shared<BrainDeepLearnInterface>(mag);
+    brainDeepLearn = std::make_shared<BrainDeepLearnInterface>(mag, [this](std::string msg)
+    {
+        QString qMsg = QString::fromStdString(msg);
+
+        QMetaObject::invokeMethod(
+            this,
+            [this, qMsg]() 
+            {
+                AddData(qMsg);
+            },
+            Qt::QueuedConnection);
+    });
 
     connect(ui->testPerceptionModule_pushButton, SIGNAL(clicked()), this, SLOT(TestPerceptionModule()));
     connect(ui->testAttentionModulel_pushButton, SIGNAL(clicked()), this, SLOT(TestAttentionModule()));
@@ -18,7 +31,15 @@ BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manage
     connect(ui->testDecisionModule_pushButton, SIGNAL(clicked()), this, SLOT(TestDecisionModule()));
     connect(ui->testWorldModule_pushButton, SIGNAL(clicked()), this, SLOT(TestWorldModule()));
     connect(ui->testValueEstimationModule_pushButton, SIGNAL(clicked()), this, SLOT(TestValueEstimationModule()));
-    connect(ui->testTrainAndDeploy_pushButton, SIGNAL(clicked()), this, SLOT(TestModuleTrain()));
+    connect(ui->testTrainAndDeploy_pushButton, SIGNAL(clicked()), this, SLOT(TestTrainModule()));
+
+    connect(ui->trainModule_pushButton, SIGNAL(clicked()), this, SLOT(TrainModule()));
+    connect(ui->deployModule_pushButton, SIGNAL(clicked()), this, SLOT(DeployModule()));
+    connect(ui->stop_pushButton, SIGNAL(clicked()), this, SLOT(StopModule()));
+    connect(ui->pause_pushButton, SIGNAL(clicked()), this, SLOT(PauseModule()));
+    connect(ui->resume_pushButton, SIGNAL(clicked()), this, SLOT(ResumeModule()));
+    connect(ui->saveParameter_pushButton, SIGNAL(clicked()), this, SLOT(ExportParmFromCheckpoint()));
+    connect(ui->resetState_pushButton, SIGNAL(clicked()), this, SLOT(ResetHebbianMemory()));
 
     connect(ui->close_pushButton, SIGNAL(clicked()), this, SLOT(CloseForm()));
 }
@@ -79,9 +100,9 @@ void BrainDeepLearnForm::TestValueEstimationModule()
     brainDeepLearn->TestValueEstimationModule();
 }
 
-void BrainDeepLearnForm::TestModuleTrain()
+void BrainDeepLearnForm::TestTrainModule()
 {
-    if(ui->onlineLearning_radioButton->isChecked())
+    if(ui->onlineLearning_checkBox->isChecked())
     {
         brainDeepLearn->TestModuleTrain(true);
     }
@@ -89,4 +110,39 @@ void BrainDeepLearnForm::TestModuleTrain()
     {
         brainDeepLearn->TestModuleTrain(false);
     }
+}
+
+void BrainDeepLearnForm::TrainModule()
+{
+    brainDeepLearn->TrainModule();
+}
+
+void BrainDeepLearnForm::ExportParmFromCheckpoint()
+{
+    brainDeepLearn->ExportParmFromCheckpoint(ui->saveParmOverride_checkBox->isChecked());
+}
+
+void BrainDeepLearnForm::DeployModule()
+{
+    brainDeepLearn->DeployModule();
+}
+
+void BrainDeepLearnForm::StopModule()
+{
+    brainDeepLearn->Stop();
+}
+
+void BrainDeepLearnForm::PauseModule()
+{
+    brainDeepLearn->Pause();
+}
+
+void BrainDeepLearnForm::ResumeModule()
+{
+    brainDeepLearn->Resume();
+}
+
+void BrainDeepLearnForm::ResetHebbianMemory()
+{
+    brainDeepLearn->ResetHebbianMemory();
 }

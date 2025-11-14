@@ -42,9 +42,10 @@ class BasicParameters:
     IMAGE_SEQ_LEN = 16
     IMAGE_RM_LEN = math.ceil(IMAGE_SEQ_LEN * 9 / 10)
 
-    MEMORY_MEMORY_PATH = "BrainDeepLearn/ModuleParameter/MemoryMemory.pt"
-    WORLD_MEMORY_PATH = "BrainDeepLearn/ModuleParameter/WorldMemory.pt"
-    MODULEPARAMETER_PATH = "BrainDeepLearn/ModuleParameter/module_parameter.pth"
+    MEMORY_MEMORY_PATH = "BrainDeepLearn/Data/MemoryMemory.pt"
+    WORLD_MEMORY_PATH = "BrainDeepLearn/Data/WorldMemory.pt"
+    MODULEPARAMETER_PATH = "BrainDeepLearn/Data/module_parameter.pth"
+    DATA_ROOT_PATH = "BrainDeepLearn/Data"
     CKPT_PATH_TRAIN = "BrainDeepLearn/Data/training_checkpoint.pth"
 
     MEMORY_MEMORY_PATH_TEST = "BrainDeepLearn/TestData/MemoryMemory.pt"
@@ -364,6 +365,8 @@ class Agent:
 
         self.brain.to(self.device)
 
+        self.ResetHebbianMemory()
+
         if isTrain:
             actor_params = (
                 list(self.brain.perc.parameters())
@@ -594,6 +597,7 @@ class ModuleController:
             "trace": ""}
         self.stop_requested = False
         self.pause_requested = False
+        self.reset_hebbian = False
 
     def SetStatus(self, state: str, message: str, **kwargs):
         with self._lock:
@@ -606,6 +610,15 @@ class ModuleController:
     def GetStatus(self) -> Dict[str, Any]:
         with self._lock:
             return dict(self.status)
+        
+    def ResteStatus(self):
+        self.status: Dict[str, Any] = {
+            "state": "idle",
+            "epoch": 0, "total_epochs": 0,
+            "batch": 0, "total_batches": 0,
+            "train_loss": 0.0, "val_loss": 0.0,
+            "message": "Waiting to start",
+            "trace": ""}
 
     def RequestStop(self):
         with self._lock:
@@ -614,6 +627,14 @@ class ModuleController:
     def RequestPause(self):
         with self._lock:
             self.pause_requested = True
+
+    def RequestResetHebbian(self):
+        with self._lock:
+            self.reset_hebbian = True
+
+    def RequestCancelResetHebbian(self):
+        with self._lock:
+            self.reset_hebbian = False
 
     def RequestResume(self):
         with self._lock:
@@ -626,6 +647,10 @@ class ModuleController:
     def ShouldPause(self) -> bool:
         with self._lock:
             return self.pause_requested
+        
+    def ShouldResetHebbian(self) -> bool:
+        with self._lock:
+            return self.reset_hebbian
 
 
 class ManagerFunction:
@@ -634,11 +659,8 @@ class ManagerFunction:
         self.controller = ModuleController()
 
         self.br_thread: Optional[threading.Thread] = None
+        self.message_thread: Optional[threading.Thread] = None
         self.is_begin = False
-
-        self.checkpoint_path_train = BasicParameters.CKPT_PATH_TRAIN
-        self.checkpoint_path_test = BasicParameters.CKPT_PATH_TEST
-        self.module_parameter_path = BasicParameters.MODULEPARAMETER_PATH
 
         self.test = {
             "perception": TestPerceptionMTool(),
@@ -648,15 +670,16 @@ class ManagerFunction:
             "world": TestWorldMTool(),
             "value": TestValueEstimationMTool(),}
 
-    def StartTraining(self, root: str, epochs: int = 5, batchSize: int = 32, valSplit: float = 0.1, resume: bool = True, onlineLearning:bool = False,isTest: bool = False):
+    def StartTraining(self, epochs: int = 5, batchSize: int = 32, valSplit: float = 0.1, resume: bool = True, onlineLearning:bool = False,isTest: bool = False):
         if self.is_begin:
-            self.controller.SetStatus("error", "Training is already running")
+            self.controller.SetStatus("recur", "Training or Deploy is already running")
             return False
         self.is_begin = True
 
         ckpt_path = BasicParameters.CKPT_PATH_TEST if isTest else BasicParameters.CKPT_PATH_TRAIN
         wm_mem_path = BasicParameters.WORLD_MEMORY_PATH_TEST if isTest else BasicParameters.WORLD_MEMORY_PATH
         mem_mem_path = BasicParameters.MEMORY_MEMORY_PATH_TEST if isTest else BasicParameters.MEMORY_MEMORY_PATH
+        root = BasicParameters.DATA_ROOT_PATH_TEST if isTest else BasicParameters.DATA_ROOT_PATH
 
         self.br_thread = threading.Thread(
             target=self.TrainLoop, args=(
@@ -671,6 +694,12 @@ class ManagerFunction:
             self.controller.RequestStop()
             if self.br_thread is not None:
                 self.br_thread.join()
+                self.br_thread = None
+
+            if self.message_thread is not None:
+                self.message_thread.join()
+                self.message_thread = None
+
             self.is_begin = False
             return True
         return False
@@ -686,8 +715,14 @@ class ManagerFunction:
             self.controller.RequestResume()
             return True
         return False
+    
+    def ResetHebbianMemory(self):
+        if self.is_begin:
+            self.controller.RequestResetHebbian()
+            return True
+        return False
 
-    def GetTrainingStatus(self):
+    def GetCurrentStatus(self):
         return self.controller.GetStatus()
 
     def TrainLoop(self,root: str, epochs: int, batchSize: int, valSplit: float, resume: bool, onlineLearning = False, *, worldMemPath: str = None, memMemPath: str = None, ckptPath: str = None,):
@@ -796,6 +831,10 @@ class ManagerFunction:
                             mouse_t = pack["mouses"]
                             reward_t = pack["rewards"]
                             done_t = pack["dones"]
+
+                            if self.controller.ShouldResetHebbian():
+                                agent.ResetHebbianMemory()
+                                self.controller.RequestCancelResetHebbian()
 
                             key_pred, mouse_pred, model_loss = agent.Act(frames, reward=reward_t, done=done_t, deterministicActor=False,)
 
@@ -974,6 +1013,45 @@ class ManagerFunction:
             self.is_begin = False
 
 
+
+
+    def ExportParamsFromCheckpoint(
+        self,
+        overwrite: bool = False,
+        *,
+        ckptPath: str = BasicParameters.CKPT_PATH_TRAIN,
+        outPath: str = BasicParameters.MODULEPARAMETER_PATH,) -> None:
+
+        ckpt_path = Path(ckptPath)
+        out_path = Path(outPath)
+
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+
+        raw = torch.load(str(ckpt_path), map_location="cpu")
+        if "brain" not in raw:
+            raise KeyError(f"checkpoint {ckpt_path} has no 'brain' field")
+
+        params = {"brain": raw["brain"],}
+
+        if out_path.exists() and not overwrite:
+            stem = out_path.stem
+            suffix = out_path.suffix
+            parent = out_path.parent
+
+            idx = 1
+            while True:
+                cand = parent / f"{stem}_{idx}{suffix}"
+                if not cand.exists():
+                    out_path = cand
+                    print(f"[ExportParamsOnly] target exists, save to {out_path} instead")
+                    break
+                idx += 1
+
+        torch.save(params, str(out_path))
+        print(f"[ExportParamsOnly] saved params to {out_path}")
+
+
     def LoadCheckpoint(self, brain: BrainCore, agent: Agent, dataset: Dataset, path: str = None):
         ckpt = torch.load(path,  map_location=self.device)
         brain.load_state_dict(ckpt["brain"])
@@ -996,25 +1074,35 @@ class ManagerFunction:
         best_val = float(ckpt.get("best_val", float("inf")))
         return start_epoch, best_val, train_ds, val_ds
 
-    def StartDeployment(self, ckptPath: str, cameraIndex: int = 0, useHebbian: bool = True, usePlanner: bool = True):
+    def StartDeployment(self, cameraIndex: int = 0, useHebbian: bool = True, usePlanner: bool = True):
         if self.is_begin:
+            self.controller.SetStatus("recur", "Training or Deploy is already running")
             return False
         self.is_begin = True
         self.controller.stop_requested = False 
-        self.br_thread = threading.Thread(target=self.DeployLoop,args=(ckptPath, cameraIndex),kwargs={"useHebbian": useHebbian, "usePlanner": usePlanner},daemon=False,)
+        self.br_thread = threading.Thread(target=self.DeployLoop,args=(cameraIndex,),kwargs={"useHebbian": useHebbian, "usePlanner": usePlanner},daemon=False,)
         self.br_thread.start()
         return True
 
 
-    def DeployLoop(self, moduleParameterPath: str,cameraIndex: int,*,useHebbian: bool = True,usePlanner: bool = True,):
-        self.is_begin = True
+    def DeployLoop(self, cameraIndex: int,* ,useHebbian: bool = True, usePlanner: bool = True,):
         try:
             brain = BrainCore(device=self.device,plasticHebbian=useHebbian,plasticOnlineLearning=False,usePlanner=usePlanner,)
 
-            try:
-                sd = torch.load(moduleParameterPath, map_location=self.device, weights_only=True)
-            except TypeError:
-                sd = torch.load(moduleParameterPath, map_location=self.device)
+            model_path = BasicParameters.MODULEPARAMETER_PATH
+
+            if os.path.exists(model_path):
+                try:
+                    sd = torch.load(model_path, map_location=self.device, weights_only=True)
+                except Exception as e:
+                    print(f"Safe mode loading failed: {e}, try the normal mode")
+                    sd = torch.load(model_path, map_location=self.device)
+            else:
+                msg = f"The module file is not exit: {model_path}"
+                print(msg)
+                sd = None
+                self.controller.SetStatus("error", msg)
+                return 
 
             if isinstance(sd, dict) and "brain" in sd:
                 brain.load_state_dict(sd["brain"], strict=False)
@@ -1056,7 +1144,11 @@ class ManagerFunction:
                         continue
 
                     pack = agent.StackNpImagesKeysMouses(imgs=frame_buf,B=1, T=seq_len,device=self.device,)
-                    frames = pack["frames"][0]
+                    frames = pack["frames"]
+
+                    if self.controller.ShouldResetHebbian():
+                        agent.ResetHebbianMemory()
+                        self.controller.RequestCancelResetHebbian()
 
                     key_vec, mouse, _ = agent.Act(frames,reward=None,done=None,sampleActions=True,deterministicActor=True,)
 
@@ -1089,6 +1181,7 @@ class ManagerFunction:
             self.is_begin = False
 
 
+
     def TestPerceptionModule(self):
         t = self.test["perception"]
         return t.RunAll()
@@ -1114,10 +1207,10 @@ class ManagerFunction:
         return t.RunAll()
     
 
-    def MonitorTraining(self, cleanup: bool, dataRoot: str):
+    def MonitorTraining(self):
         try:
             while True:
-                st = self.GetTrainingStatus()
+                st = self.GetCurrentStatus()
                 print(
                     f"[TRAIN] {st['state']} | epoch {st['epoch']}/{st['total_epochs']} "
                     f"| batch {st['batch']}/{st['total_batches']} "
@@ -1131,6 +1224,7 @@ class ManagerFunction:
                         print("===================================\n")
 
                 if st["state"] in ("completed", "stopped", "error"):
+                    self.controller.ResteStatus()
                     break
 
                 time.sleep(1)
@@ -1139,12 +1233,29 @@ class ManagerFunction:
             print(f"[MonitorTraining] monitor raised: {e}")
             print(traceback.format_exc())
 
-        finally:
-            if cleanup:
-                try:
-                    shutil.rmtree(dataRoot, ignore_errors=True)
-                except Exception as e:
-                    print(f"[MonitorTraining] cleanup failed: {e}")
+
+    def MonitorDeployment(self):
+        try:
+            while True:
+                st = self.GetCurrentStatus()
+                print(f"[DEPLOY] {st['state']} | msg={st['message']}")
+
+                if st["state"] == "error":
+                    trace = st.get("trace")
+                    if trace:
+                        print("\n====== DEPLOY ERROR TRACEBACK ======\n")
+                        print(trace)
+                        print("====================================\n")
+
+                if st["state"] in ("stopped", "error"):
+                    self.controller.ResteStatus()
+                    break
+
+                time.sleep(0.5)
+
+        except Exception as e:
+            print(f"[MonitorDeployment] monitor raised: {e}")
+            print(traceback.format_exc())
 
 
     def TestModuleTrain(
@@ -1157,6 +1268,9 @@ class ManagerFunction:
         batchSize: int = 1,
         valSplit: float = 0.2,
         seed: int = 42,) -> Dict[str, Any]:
+        if self.is_begin:
+            return {"False": False, "msg": "StartTraining returns False (training may already be running)"} 
+
         try:
             if iio is None:
                 raise RuntimeError("imageio.v3 error")
@@ -1211,39 +1325,89 @@ class ManagerFunction:
 
             print("[SmokeTest] start train...")
 
-            ok = self.StartTraining(root=str(root),epochs=epochs,batchSize=batchSize,valSplit=valSplit,resume=False, onlineLearning=onlineLearning, isTest=True)
+            ok = self.StartTraining(epochs=epochs,batchSize=batchSize,valSplit=valSplit,resume=False, onlineLearning=onlineLearning, isTest=True)
 
             if not ok:
                 print("StartTraining returns False (training may already be running)")
+                return {"False": False, "msg": "StartTraining returns False (training may already be running)"}
 
-            while True:
-                st = self.GetTrainingStatus()
-                print(
-                    f"[TRAIN] {st['state']} | epoch {st['epoch']}/{st['total_epochs']} "
-                    f"| batch {st['batch']}/{st['total_batches']} "
-                    f"| train_loss={st['train_loss']:.4f} | msg={st['message']}")
-
-                if st["state"] == "error":
-                    trace = st.get("trace")
-                    if trace:
-                        print("\n====== TRAIN ERROR TRACEBACK ======\n")
-                        print(trace)
-                        print("===================================\n")
-
-                if st["state"] in ("completed", "stopped", "error"):
-                    break
-
-                time.sleep(2)
-                
-
-            #t = threading.Thread(target=self.MonitorTraining,args=(cleanup, str(root)),daemon=False,)
-            #t.start()
+            self.message_thread = threading.Thread(target=self.MonitorTraining,args=(),daemon=False,)
+            self.message_thread.start()
 
             #self.TrainLoop(root, epochs, batchSize, valSplit, False, onlineLearning, worldMemPath=BasicParameters.WORLD_MEMORY_PATH_TEST, memMemPath=BasicParameters.MEMORY_MEMORY_PATH_TEST,ckptPath=BasicParameters.CKPT_PATH_TEST)
         
-            return True
+            return {"ok": True}
 
         except Exception as e:
             print(f"TestModuleTrain failed with error: {e}")
+            print(f"Traceback: {traceback.format_exc()}")
+            raise
+
+    def TrainModule(
+        self,
+        onlineLearning: bool,
+        epochs: int = 6,
+        batchSize: int = 1,
+        valSplit: float = 0.2,
+        isResume: bool = False,
+        *,
+        dataRoot: str = BasicParameters.DATA_ROOT_PATH,) -> Dict[str, Any]:
+        try:
+            root = Path(dataRoot)
+
+            def has_existing_data(p: Path) -> bool:
+                frames_dir = p / "frames"
+                keys_dir = p / "keys"
+                mouse_dir = p / "mouse"
+                reward_dir = p / "reward"
+                done_dir = p / "done"
+                if not (frames_dir.exists() and keys_dir.exists() and mouse_dir.exists() and reward_dir.exists() and done_dir.exists()):
+                    return False
+                if not any(frames_dir.glob("*.png")):
+                    return False
+                return True
+
+            if not has_existing_data(root):
+                print(f"[Train] no dataset found at {root}, please prepare frames/keys/mouse/reward/done first.")
+                return {"ok": False, "msg": "no dataset"}
+
+            print(f"[Train] use existing dataset at: {root}")
+
+            ok = self.StartTraining(epochs=epochs, batchSize=batchSize, valSplit=valSplit, resume=isResume, onlineLearning=onlineLearning,isTest=False,)
+
+            if not ok:
+                print("StartTraining returns False (training may already be running)")
+                return {"False": False, "msg": "StartTraining returns False (training may already be running)"}
+
+            self.message_thread = threading.Thread(target=self.MonitorTraining,args=(),daemon=False,)
+            self.message_thread.start()
+
+            return {"ok": True}
+
+        except Exception as e:
+            print(f"ModuleTrain failed with error: {e}")
+            print(f"Traceback: {traceback.format_exc()}")
+            raise
+
+
+    def DeployModule(
+        self,
+        cameraIndex: int = 0,
+        useHebbian: bool = True,
+        usePlanner: bool = True,) -> Dict[str, Any]:
+        try:
+            ok = self.StartDeployment(cameraIndex=cameraIndex, useHebbian=useHebbian, usePlanner=usePlanner,)
+
+            if not ok:
+                print("StartDeployment returns False (deployment may already be running)")
+                return {"ok": False, "msg": "already_running"}
+
+            self.message_thread = threading.Thread(target=self.MonitorDeployment,args=(),daemon=False,)
+            self.message_thread.start()
+
+            return {"ok": True}
+
+        except Exception as e:
+            print(f"DeployModule failed with error: {e}")
             print(f"Traceback: {traceback.format_exc()}")
             raise

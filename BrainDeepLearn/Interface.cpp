@@ -63,24 +63,60 @@ void BrainDeepLearnInterface::PrintMessage(std::string str)
     }
 }
 
-bool BrainDeepLearnInterface::StartTraining(std::string& root, int epochs, int batchSize, double valSplit, int imagineHorizon, bool resume) 
+bool BrainDeepLearnInterface::TrainModule(bool isOnlineLearning, int epochs, int batchSize, double valSplit, bool resume) 
 {
-    return CALL_METHOD_RET_BOOL("StartTraining", "siiidi", root.c_str(), epochs, batchSize, valSplit, imagineHorizon, resume?1:0);
+    return RunPythonAsync([this, isOnlineLearning, epochs, batchSize, valSplit, resume]()
+    {
+        (void)CALL_METHOD_RET_BOOL("TrainModule", "biidi", isOnlineLearning, epochs, batchSize, valSplit, resume?1:0);
+    });
+}
+
+bool BrainDeepLearnInterface::DeployModule(int cameraIndex, bool useHebbian, bool usePlanner)
+{
+    return RunPythonAsync([this, cameraIndex, useHebbian, usePlanner]()
+    {
+        (void)CALL_METHOD_RET_BOOL("DeployModule", "ibb", cameraIndex, useHebbian, usePlanner);
+    });
+}
+
+bool BrainDeepLearnInterface::ExportParmFromCheckpoint(bool isOverride)
+{
+    return RunPythonAsync([this, isOverride]()
+    {
+        (void)CALL_METHOD_RET_BOOL("ExportParamsFromCheckpoint", "b", isOverride); 
+    });
 }
 
 bool BrainDeepLearnInterface::Stop()
 { 
-    return CALL_METHOD_NOARG("Stop"); 
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("Stop"); 
+    });
 }
 
 bool BrainDeepLearnInterface::Pause() 
 { 
-    return CALL_METHOD_NOARG("Pause"); 
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("Pause"); 
+    });
 }
 
 bool BrainDeepLearnInterface::Resume() 
 { 
-    return CALL_METHOD_NOARG("Resume"); 
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("Resume"); 
+    });
+}
+
+bool BrainDeepLearnInterface::ResetHebbianMemory()
+{
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("ResetHebbianMemory"); 
+    });
 }
 
 bool BrainDeepLearnInterface::RunPythonAsync(PyTask task)
@@ -126,11 +162,11 @@ bool BrainDeepLearnInterface::RunPythonAsync(PyTask task)
     return true;
 }
 
-bool BrainDeepLearnInterface::GetTrainingStatus(StatusMap& status) 
+bool BrainDeepLearnInterface::GetCurrentStatus(StatusMap& status) 
 {
     if (!pManagerObj) return false;
     PyGILState_STATE g = PyGILState_Ensure();
-    PyObject* r = PyObject_CallMethod(pManagerObj, "GetTrainingStatus", nullptr);
+    PyObject* r = PyObject_CallMethod(pManagerObj, "GetCurrentStatus", nullptr);
     if (!r || !PyDict_Check(r)) 
     { 
         Py_XDECREF(r); PyGILState_Release(g); return false; 

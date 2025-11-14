@@ -52,7 +52,21 @@ private slots:
 
     void TestValueEstimationModule();
 
-    void TestModuleTrain();
+    void TestTrainModule();
+
+    void TrainModule();
+
+    void ExportParmFromCheckpoint();
+
+    void DeployModule();
+
+    void StopModule();
+
+    void PauseModule();
+
+    void ResumeModule();
+
+    void ResetHebbianMemory();
 };
 
 #endif // BRAINDEEPLEARNFORM_H

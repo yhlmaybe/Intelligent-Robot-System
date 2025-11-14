@@ -49,14 +49,23 @@ public:
     BrainDeepLearnInterface(std::shared_ptr<PythonInteraction::Manager> mag, std::function<void(std::string)> printCallBack = nullptr);
     ~BrainDeepLearnInterface();
 
-    bool StartTraining(std::string& root, int epochs = 5, int batchSize = 32, double valSplit = 0.1, int imagineHorizon = 5, bool resume = true);
+    bool TrainModule(bool isOnlineLearning = false, int epochs = 5, int batchSize = 1, double valSplit = 0.1, bool resume = true);
+
+    bool DeployModule(int cameraIndex = 0, bool useHebbian = true, bool usePlanner = true);
+
+    bool ExportParmFromCheckpoint(bool isOverride);
+
     bool Stop();
+
     bool Pause();
+
     bool Resume();
+
+    bool ResetHebbianMemory();
 
     bool RunPythonAsync(PyTask task);
 
-    bool GetTrainingStatus(StatusMap& status);
+    bool GetCurrentStatus(StatusMap& status);
 
     bool TestPerceptionModule();
 
