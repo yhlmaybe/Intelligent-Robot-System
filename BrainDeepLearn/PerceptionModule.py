@@ -675,10 +675,10 @@ class PerceiveExtractor(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def ResetHebbianMemory(self):
-        for module in self.modules():
-            if hasattr(module, 'ResetHebbianMemory'):
-                module.ResetHebbianMemory()
+    def ResetHebbianMemory(self): 
+        for name, m in self.named_children(): 
+            if hasattr(m, "ResetHebbianMemory"): 
+                m.ResetHebbianMemory()
 
 
 
