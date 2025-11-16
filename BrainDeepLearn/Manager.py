@@ -72,7 +72,7 @@ class BrainCore(nn.Module):
         self.attn = AttentionExtractor(sequenceLength=seqLen, hebbianRate=(0.01 if plasticHebbian else 0.0), useHebbian=plasticHebbian)
         self.mem = MemoryExtractor(hebbAlpha=(0.15 if plasticHebbian else 0.0), useHebbian=plasticHebbian)
         self.actor = DecisionExtractor(stateDim=768, includeNoSkill=True, useHebb=plasticHebbian)
-        self.world = RSSMWorldModel(visionDim=1024)
+        self.world = RSSMWorldModel(visionDim=1024, useMemory=True)
         self.critic = ValueEstimationExtractor(memoryDim=768, attnDim=1024, stateDim=512, useHebb=plasticHebbian)
 
         if plasticOnlineLearning:
@@ -385,7 +385,7 @@ class Agent:
             actor_params = (
                 list(self.brain.perc.parameters())
                 + list(self.brain.attn.parameters())
-                + list(self.brain.mem.parameters())
+                + ([] if self.brain.is_online_learning else list(self.brain.mem.parameters()))
                 + list(self.brain.actor.parameters()))
         
             self.opt_actor = torch.optim.Adam(actor_params, lr=3e-4)
@@ -884,6 +884,8 @@ class ManagerFunction:
                             torch.nn.utils.clip_grad_norm_(brain.parameters(), 1.0)
 
                             for name, p in brain.named_parameters():
+                                if not p.requires_grad:
+                                    continue
                                 if p.grad is None:
                                     print("NO GRAD:", name)
                                 elif not torch.isfinite(p.grad).all():
