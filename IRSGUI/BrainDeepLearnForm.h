@@ -40,6 +40,8 @@ private slots:
 
     void CloseForm();
 
+    void ClearText();
+
     void TestPerceptionModule();
 
     void TestAttentionModule();

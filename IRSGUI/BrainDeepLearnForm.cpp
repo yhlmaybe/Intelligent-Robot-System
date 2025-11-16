@@ -41,6 +41,7 @@ BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manage
     connect(ui->saveParameter_pushButton, SIGNAL(clicked()), this, SLOT(ExportParmFromCheckpoint()));
     connect(ui->resetState_pushButton, SIGNAL(clicked()), this, SLOT(ResetHebbianMemory()));
 
+    connect(ui->clear_pushButton, SIGNAL(clicked()), this, SLOT(ClearText()));
     connect(ui->close_pushButton, SIGNAL(clicked()), this, SLOT(CloseForm()));
 }
 
@@ -68,6 +69,11 @@ void BrainDeepLearnForm::AddData(QString data)
 void BrainDeepLearnForm::CloseForm()
 {
     this->hide();
+}
+
+void BrainDeepLearnForm::ClearText()
+{
+    ui->message_textBrowser->clear();
 }
 
 void BrainDeepLearnForm::TestPerceptionModule()
