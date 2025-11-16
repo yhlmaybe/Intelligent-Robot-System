@@ -871,13 +871,13 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]] = None,
         **kwargs,) -> Dict[str, Any]:
 
-        sample: bool = kwargs.pop("sample", True)
-        deterministic: bool = kwargs.pop("deterministic", False)
-        prevOptionOnehot: Optional[torch.Tensor] = kwargs.pop("prevOptionOnehot", None)
-        prior: Optional[Dict[str, Dict[str, torch.Tensor]]] = kwargs.pop("prior", None)
-        mixW: float = float(kwargs.pop("mixW", 0.25))
-        returnKeysVec: bool = kwargs.pop("returnKeysVec", True)
-        applyConstraints: bool = kwargs.pop("applyConstraints", True)
+        sample: bool = kwargs.get("sample", True)
+        deterministic: bool = kwargs.get("deterministic", False)
+        prevOptionOnehot: Optional[torch.Tensor] = kwargs.get("prevOptionOnehot", None)
+        prior: Optional[Dict[str, Dict[str, torch.Tensor]]] = kwargs.get("prior", None)
+        mixW: float = float(kwargs.get("mixW", 0.25))
+        returnKeysVec: bool = kwargs.get("returnKeysVec", True)
+        applyConstraints: bool = kwargs.get("applyConstraints", True)
 
         D = deltasPerLayer[0] if (deltasPerLayer and len(deltasPerLayer) > 0) else {}
 

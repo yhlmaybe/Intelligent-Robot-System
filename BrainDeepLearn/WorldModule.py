@@ -1350,11 +1350,11 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         wm = self.base  
 
         vision = x
-        keys = kwargs["keysVec"] if "keysVec" in kwargs else kwargs["keys"]
-        mouse = kwargs["mouseSeq"] if "mouseSeq" in kwargs else kwargs["mouse"]
-        h0 = kwargs.get("h0") or kwargs.get("hPrev")
-        z0 = kwargs.get("z0") or kwargs.get("zPrev")
-        rewardSeq = kwargs.get("rewardSeq")
+        keys = kwargs["keysVec"]
+        mouse = kwargs["mouseSeq"]
+        h0 = kwargs.get("h0", None)
+        z0 = kwargs.get("z0", None)
+        rewardSeq = kwargs.get("rewardSeq", None)
         doneSeq = kwargs.get("doneSeq")
 
         B = vision.size(0)

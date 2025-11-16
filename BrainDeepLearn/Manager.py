@@ -62,7 +62,7 @@ class BrainCore(nn.Module):
         *,
         seqLen: int = BasicParameters.IMAGE_SEQ_LEN,
         plasticHebbian: bool = True,
-        plasticOnlineLearning: bool = True,
+        plasticOnlineLearning: bool = False,
         usePlanner: bool = True,):
         super().__init__()
         self.SEQ_LEN = seqLen
@@ -100,11 +100,11 @@ class BrainCore(nn.Module):
         self.keyvec_dim = (self.max_code + 1) + 2  # 106
 
         self._buf_B = 0
-        self.ResetBuffers(B=1, device=self.device)
+        self.ResetBuffers(B=1, isOnlineLearning=self.is_online_learning,device=self.device)
         self.to(self.device)
 
     @torch.no_grad()
-    def ResetBuffers(self, B: int = 1, device: Optional[torch.device] = None):
+    def ResetBuffers(self, B: int = 1, isOnlineLearning: bool = False, device: Optional[torch.device] = None):
         device = device or self.device
 
         def z(*s, dtype=torch.float32):
@@ -117,7 +117,10 @@ class BrainCore(nn.Module):
         self.prev_key_vec = z(self.keyvec_dim) 
         self.prev_mouse = z(2)
 
-        self.prev_option_onehot = z(self.actor.num_options)
+        if isOnlineLearning:
+            self.prev_option_onehot = z(self.actor.base.num_options)
+        else:
+            self.prev_option_onehot = z(self.actor.num_options)
 
         self.prev_reward = z()
         self.prev_done = z() 
@@ -128,10 +131,13 @@ class BrainCore(nn.Module):
         self._buf_B = B
 
     @torch.no_grad()
-    def EnsureB(self, B: int, device: torch.device):
+    def EnsureB(self, B: int, isOnlineLearning, device: torch.device):
         if (self._buf_B != B) or (self.prev_mem.device != device):
-            self.ResetBuffers(B, device)
-            self.world.ResetHidden(batchSize=B)
+            self.ResetBuffers(B, isOnlineLearning, device)
+            if isOnlineLearning:
+                self.world.base.ResetHidden(batchSize=B)
+            else:
+                self.world.ResetHidden(batchSize=B)
 
     def Step(
         self,
@@ -148,7 +154,7 @@ class BrainCore(nn.Module):
 
         B, T, C, H, W = frames.shape
         dev = frames.device
-        self.EnsureB(B, dev)
+        self.EnsureB(B,self.is_online_learning, dev)
 
         if T != self.SEQ_LEN:
             raise ValueError(f"Expected sequence length {self.SEQ_LEN}, but got {T}. "f"frames.shape={tuple(frames.shape)}")
@@ -162,14 +168,18 @@ class BrainCore(nn.Module):
 
         with torch.no_grad():
             world_vis_in = self.attn(percs_seq)
+        
+        if self.is_online_learning:
+            a_enc_prev = self.world.base.action_encoder(self.prev_key_vec, self.prev_mouse)
+        else:
+            a_enc_prev = self.world.action_encoder(self.prev_key_vec, self.prev_mouse)
 
-        a_enc_prev = self.world.action_encoder(self.prev_key_vec, self.prev_mouse)
         hPrev, zPrev = self.world.ExportState()
 
         if isTrain:
             if self.is_online_learning:
-                wm_kwargs = {"keysVec": self.prev_key_vec,"mouseSeq": self.prev_mouse,"h0": hPrev,"z0": zPrev,"rewardSeq": rewardExt,"doneSeq": doneFlag,}
-                w_out = self.world(world_vis_in, kwargs=wm_kwargs)
+                wm_kwargs = {"keysVec": self.prev_key_vec,"mouseSeq": self.prev_mouse,"h0": hPrev,"z0": zPrev,"rewardSeq": rewardExt,"doneSeq": doneFlag}
+                w_out = self.world(world_vis_in, **wm_kwargs)
             else: 
                 w_out = self.world.ForwardTrainSeq(visionSeq=world_vis_in,keysVec= self.prev_key_vec, mouseSeq=self.prev_mouse, h0=hPrev, z0=zPrev,rewardSeq=rewardExt,doneSeq=doneFlag)
         else:
@@ -184,7 +194,7 @@ class BrainCore(nn.Module):
         if self.is_online_learning:
             value_kwargs = {"rewardExt": r_t, "policyEntropyPrev": self.prev_entropy, "done": d_t}
             value_x = {"memory": self.prev_mem,"attn": self.prev_attn, "state": s_t}
-            critic_out = self.critic(x=value_x, tdError=self.prev_td, uncertainty= self.prev_unc, kwargs=value_kwargs)
+            critic_out = self.critic(x=value_x, tdError=self.prev_td, uncertainty= self.prev_unc, **value_kwargs)
         else:
             critic_out = self.critic(memory=self.prev_mem,attn=self.prev_attn,state=s_t,rewardExt=r_t,policyEntropyPrev=self.prev_entropy,
                                     uncertaintyTeacher=self.prev_unc,tdErrorPrev=self.prev_td,done=d_t,)
@@ -202,7 +212,7 @@ class BrainCore(nn.Module):
         with torch.no_grad():
             if self.is_online_learning:
                 actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionOnehot": self.prev_option_onehot}
-                act_out = self.actor(x=mem_feat,kwargs=actor_kwargs)
+                act_out = self.actor(x=mem_feat,**actor_kwargs)
             else:    
                 act_out = self.actor(stateFeat=mem_feat,sample=sampleActions,deterministic=deterministicActor,prevOptionOnehot=self.prev_option_onehot)
 
@@ -351,8 +361,12 @@ class Agent:
 
         if self.wm_mem_path is not None:
             self.EnsureFile(self.wm_mem_path) 
-            self.brain.world.InitWorldMemoryDocument(self.wm_mem_path)
-            self.brain.world.SetMemoryOption(True, self.wm_mem_path)
+            if self.brain.is_online_learning:
+                self.brain.world.base.InitWorldMemoryDocument(self.wm_mem_path)
+                self.brain.world.base.SetMemoryOption(True, self.wm_mem_path)
+            else:
+                self.brain.world.InitWorldMemoryDocument(self.wm_mem_path)
+                self.brain.world.SetMemoryOption(True, self.wm_mem_path)
         else:
             print(f"{self.wm_mem_path} is None")
 
@@ -453,16 +467,27 @@ class Agent:
             traceback.print_exc()
 
 
-    def ResetBrainState(self):
-        self.brain.world.ResetHidden(batchSize=1)
-        self.brain.ResetBuffers(B=1, device=self.device)
+    def ResetBrainState(self, isOnlineLearning: bool):
+        if isOnlineLearning:
+            self.brain.world.base.ResetHidden(batchSize=1)
+        else:
+            self.brain.world.ResetHidden(batchSize=1)
+
+        self.brain.ResetBuffers(B=1, isOnlineLearning=isOnlineLearning, device=self.device)
 
     def ResetHebbianMemory(self):
-        self.brain.perc.ResetHebbianMemory()
-        self.brain.attn.ResetHebbianMemory()
+        if self.brain.is_online_learning:
+            self.brain.perc.base.ResetHebbianMemory()
+            self.brain.attn.base.ResetHebbianMemory()
+            self.brain.actor.base.ResetHebbianMemory()
+            self.brain.critic.base.ResetHebbianMemory()
+        else:
+            self.brain.perc.ResetHebbianMemory()
+            self.brain.attn.ResetHebbianMemory()
+            self.brain.actor.ResetHebbianMemory()
+            self.brain.critic.ResetHebbianMemory()
+
         self.brain.mem.ResetHebbianMemory()
-        self.brain.actor.ResetHebbianMemory()
-        self.brain.critic.ResetHebbianMemory()
 
     def StackNpImagesKeysMouses(
         self,
@@ -805,7 +830,7 @@ class ManagerFunction:
                 reward_buf: List[Any] = []
                 done_buf: List[Any] = []
 
-                agent.ResetBrainState()
+                agent.ResetBrainState(isOnlineLearning=onlineLearning)
 
                 for bi, (img_b, key_b, mouse_b, reward_b, done_b) in enumerate(train_dl, start=1):
                     B_cur = img_b.shape[0]
@@ -1113,7 +1138,7 @@ class ManagerFunction:
             brain.eval()
 
             agent = Agent(brain,isTrain=False,device=self.device,worldMemoryPath=BasicParameters.WORLD_MEMORY_PATH,memMemoryPath=BasicParameters.MEMORY_MEMORY_PATH,)
-            agent.ResetBrainState()
+            agent.ResetBrainState(isOnlineLearning=False)
 
             seq_len = brain.SEQ_LEN
             rm_len = BasicParameters.IMAGE_RM_LEN
