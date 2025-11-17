@@ -585,6 +585,36 @@ class Agent:
             results.append(out)
         return results
 
+    def GetModuleParamsCount(self, onlyTrainable: bool = True):
+        per_module_counts = {}
+        for child_name, child in self.brain.named_children():
+            n = 0
+            for p in child.parameters():
+                if onlyTrainable and not p.requires_grad:
+                    continue
+                n += p.numel()
+            per_module_counts[child_name] = n
+
+        total = 0
+        for p in self.brain.parameters():
+            if onlyTrainable and not p.requires_grad:
+                continue
+            total += p.numel()
+
+        summed_children = sum(per_module_counts.values())
+        other = total - summed_children
+
+        kind = "trainable" if onlyTrainable else "all"
+        print(f"===== Parameter counts ({kind}) =====")
+        for name, n in per_module_counts.items():
+            print(f"{name:15s}: {n:,}")
+        if other > 0:
+            print(f"{'(other)':15s}: {other:,}")
+        print("----------------------------------")
+        print(f"TOTAL {kind} params: {total:,}")
+        return total
+
+
 
 class OfflineGameDataset(Dataset):
     def __init__(self, root: str) -> None:
