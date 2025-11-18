@@ -1368,6 +1368,9 @@ class MemoryExtractor(nn.Module):
 
         self.sym_mem = SymbolicMemory(k=self.ns_K, capacity=self.sym_capacity)
 
+    def GetLastNS(self):
+        return self.ns_last
+
     def ResetHebbianMemory(self):
         self.fast_weights.zero_()
         self._steps_since_svd = 0
