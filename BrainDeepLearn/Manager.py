@@ -271,29 +271,28 @@ class BrainCore(nn.Module):
             losses["world_loss_ns"] = w_out.get("loss_ns", 0.0)
             losses["world_loss_ns_distill"] = w_out.get("loss_ns_distill", 0.0)
             losses["world_loss_ns_prior_logic"] = w_out.get("loss_ns_prior_logic", 0.0)
-        else:
-            world_loss_main = torch.zeros((), device=dev)
 
-        critic_loss = critic_out.loss
-        losses["critic_loss"] = critic_loss
-        ent = entropy_scalar.mean()
-        ent_loss = -0.001 * ent 
-        actor_logp_loss = 0.0
 
-        if "option" in act_out:
-            opt_out = act_out["option"]
-            if "logp_option" in opt_out:
-                actor_logp_loss = actor_logp_loss - 0.01 * opt_out["logp_option"].mean()
-            if "logp_beta" in opt_out:
-                actor_logp_loss = actor_logp_loss - 0.01 * opt_out["logp_beta"].mean()
+            critic_loss = critic_out.loss
+            losses["critic_loss"] = critic_loss
+            ent = entropy_scalar.mean()
+            ent_loss = -0.001 * ent 
+            actor_logp_loss = 0.0
+
+            if "option" in act_out:
+                opt_out = act_out["option"]
+                if "logp_option" in opt_out:
+                    actor_logp_loss = actor_logp_loss - 0.01 * opt_out["logp_option"].mean()
+                if "logp_beta" in opt_out:
+                    actor_logp_loss = actor_logp_loss - 0.01 * opt_out["logp_beta"].mean()
         
-        actor_loss = ent_loss + actor_logp_loss
-        losses["actor_loss"] = actor_loss
-        losses["entropy"] = ent
-        losses["memory_loss"] = mem_extra_loss
+            actor_loss = ent_loss + actor_logp_loss
+            losses["actor_loss"] = actor_loss
+            losses["entropy"] = ent
+            losses["memory_loss"] = mem_extra_loss
 
-        total_loss = world_loss_main + critic_loss + actor_loss + mem_extra_loss
-        losses["total_loss"] = total_loss
+            total_loss = world_loss_main + critic_loss + actor_loss + mem_extra_loss
+            losses["total_loss"] = total_loss
 
         return {
             "decision": act_out,
@@ -423,13 +422,19 @@ class Agent:
         if T != self.brain.SEQ_LEN:
                 raise ValueError(f"Expected frames with sequence length {self.brain.SEQ_LEN}, but got {T}. " f"Shape received: {tuple(frames.shape)}.")
 
-        out = self.brain.Step(frames,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
-        
-        key_vec = out["decision"]["key_vec"] # [B, 106]
-        mouse = out["decision"]["mouse"]["a"] # [B, 2]
-        total_loss = out["losses"]["total_loss"]
+        if self.is_train:
+            out = self.brain.Step(frames,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
+            key_vec = out["decision"]["key_vec"] # [B, 106]
+            mouse = out["decision"]["mouse"]["a"] # [B, 2]
+            total_loss = out["losses"]["total_loss"]
+            return key_vec, mouse, total_loss
+        else:  
+            with torch.no_grad:  
+                out = self.brain.Step(frames,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
+                key_vec = out["decision"]["key_vec"] # [B, 106]
+                mouse = out["decision"]["mouse"]["a"] # [B, 2]
+                return key_vec, mouse 
 
-        return key_vec, mouse, total_loss
 
     def Save(self, path: str):
         if not self.is_train: return
