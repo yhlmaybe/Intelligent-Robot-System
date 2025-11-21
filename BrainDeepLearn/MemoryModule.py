@@ -760,7 +760,7 @@ class MemoryExtractor(nn.Module):
         self.ns_alpha_out = 0.2
         self.ns_retrieve_boost = 0.3
 
-        self.ns_K: int = 80
+        self.ns_K: int = 128
         self.sym_capacity: int = 4096 
         self.ns_gExcl: int = 5  
         self.ns_gOr: int = 5 

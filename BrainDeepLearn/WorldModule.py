@@ -623,7 +623,7 @@ class RSSMWorldModel(nn.Module):
         self._ns_enabled = bool(nsEnabled)
         self._ns_bias_prior = bool(nsBiasPrior)
  
-        self._ns_K: int = 60
+        self._ns_K: int = 128
         self.ns_struct = SoftNeSyStructure(k=self._ns_K, gExcl=8, gAlo=8, tauInit=1.0)
 
         self.ns_head_prior = NeSyHead(deterDim, self._ns_K, hidden=1024, experts=4)
