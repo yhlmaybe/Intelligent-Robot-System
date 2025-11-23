@@ -78,6 +78,7 @@ class HebbianLinearFW(nn.Module):
         eta: Optional[torch.Tensor] = None,
         lam: Optional[torch.Tensor] = None,
         betaMix: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
         scale = 0.0 if betaMix is None else betaMix.detach().mean()
         W_eff = self.weight + scale * self.H
         y = F.linear(x, W_eff, self.bias)
@@ -160,9 +161,9 @@ class IntrinsicRewardGenerator(nn.Module):
 
         self.affect_net = nn.Sequential(
             nn.Linear(in_dim, hidden), 
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(hidden, hidden), 
-            nn.ReLU(),)
+            nn.SiLU(),)
         
         self.progress_head = nn.Linear(hidden, 1)
 
@@ -170,13 +171,13 @@ class IntrinsicRewardGenerator(nn.Module):
 
         self.entropy_from_h = nn.Sequential(
             nn.Linear(hidden, mid), 
-            nn.ReLU(), 
+            nn.SiLU(), 
             nn.Linear(mid, 1), 
             nn.Softplus())
         
         self.uncert_from_h = nn.Sequential(
             nn.Linear(hidden, mid), 
-            nn.ReLU(), 
+            nn.SiLU(), 
             nn.Linear(mid, 1), 
             nn.Softplus())
 
@@ -327,9 +328,9 @@ class TropicalAffineTransport(nn.Module):
         super().__init__()
         self.trop = MaxPlusLinear(inFeatures=hDim+1, outFeatures=1, useSoft=useSoftTrop, temperature=temp)
 
-        self.a_net = nn.Sequential(nn.Linear(hDim, hDim//2), nn.ReLU(), nn.Linear(hDim//2, 1))
-        self.b_net = nn.Sequential(nn.Linear(hDim, hDim//2), nn.ReLU(), nn.Linear(hDim//2, 1))
-        self.g_net = nn.Sequential(nn.Linear(hDim, hDim//2), nn.ReLU(), nn.Linear(hDim//2, 1), nn.Sigmoid())
+        self.a_net = nn.Sequential(nn.Linear(hDim, hDim//2), nn.SiLU(), nn.Linear(hDim//2, 1))
+        self.b_net = nn.Sequential(nn.Linear(hDim, hDim//2), nn.SiLU(), nn.Linear(hDim//2, 1))
+        self.g_net = nn.Sequential(nn.Linear(hDim, hDim//2), nn.SiLU(), nn.Linear(hDim//2, 1), nn.Sigmoid())
 
         self.epsA = epsA
         for m in self.modules():
@@ -468,12 +469,188 @@ class TemporalMicroGraph(nn.Module):
 
 
 
+class EmotionCore(nn.Module):
+    def __init__(
+        self,
+        *,
+        stateDim: int,
+        memoryDim: int,
+        attnDim: int,
+        emotionDim: int = 64,
+        fastHidden: int = 128,
+        slowHidden: int = 128,
+        moodDecay: float = 0.95,
+        useInternalGate: bool = True, 
+        useHebbHead: bool = True):
+        super().__init__()
+
+        self.stateDim = stateDim
+        self.memoryDim = memoryDim
+        self.attnDim = attnDim
+        self.emotionDim = emotionDim
+        self.fastHidden = fastHidden
+        self.slowHidden = slowHidden
+        self.moodDecay = float(moodDecay)
+        self.useInternalGate = useInternalGate
+        self.useHebbHead = useHebbHead
+
+        fast_in_dim = stateDim + attnDim
+        
+        self.fast_net = nn.Sequential(
+            nn.Linear(fast_in_dim, fastHidden),
+            nn.SiLU(),
+            nn.Linear(fastHidden, fastHidden),
+            nn.SiLU(),)
+        
+        if useHebbHead:
+            self.fast_head = HebbianLinearFW(inFeatures=fastHidden,outFeatures=emotionDim, bias=True,initEta=1e-3, initLambda=0.05,cap=1.0,useOja=True,detachHebb=True,)
+        else:
+            self.fast_head = nn.Linear(fastHidden, emotionDim)
+
+        slow_in_dim = stateDim + memoryDim + attnDim
+        self.slow_cell = nn.LSTMCell(input_size=slow_in_dim, hidden_size=slowHidden)
+
+        if useHebbHead:
+            self.slow_head = HebbianLinearFW(inFeatures=slowHidden,outFeatures=emotionDim, bias=True,initEta=1e-3,initLambda=0.05, cap=1.0,useOja=True, detachHebb=True,)
+        else:
+            self.slow_head = nn.Linear(slowHidden, emotionDim)
+
+        self.register_buffer("h", torch.zeros(1, slowHidden), persistent=False)
+        self.register_buffer("c", torch.zeros(1, slowHidden), persistent=False)
+        self.register_buffer("mood", torch.zeros(1, emotionDim), persistent=False)
+
+        self.w_fast = nn.Parameter(torch.tensor(0.5))
+        self.w_slow = nn.Parameter(torch.tensor(0.5))
+        self.w_mood = nn.Parameter(torch.tensor(0.1))
+
+        self.beta_fast_param = nn.Parameter(torch.tensor(0.0)) 
+        self.beta_slow_param = nn.Parameter(torch.tensor(0.0))
+
+        if useInternalGate:
+            gate_in_dim = memoryDim + attnDim + stateDim
+            hidden_gate = max(32, gate_in_dim // 2)
+            self.gate_net = nn.Sequential(
+                nn.Linear(gate_in_dim, hidden_gate),
+                nn.SiLU(),
+                nn.Linear(hidden_gate, emotionDim),
+                nn.Sigmoid(),)
+        else:
+            self.gate_net = None
+
+
+    def ResetParams(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        if self.gate_net is not None:
+            last = self.gate_net[-2]
+            if isinstance(last, nn.Linear):
+                nn.init.zeros_(last.weight)
+                nn.init.constant_(last.bias, 2.0) 
+
+        with torch.no_grad():
+            self.w_fast.fill_(0.5)
+            self.w_slow.fill_(0.5)
+            self.w_mood.fill_(0.1)
+
+    @torch.no_grad()
+    def ResetState(self, batchSize: int = 1, device: Optional[torch.device] = None):
+        if device is None:
+            device = self.h.device
+        self.h = torch.zeros(batchSize, self.slowHidden, device=device)
+        self.c = torch.zeros(batchSize, self.slowHidden, device=device)
+        self.mood = torch.zeros(batchSize, self.emotionDim, device=device)
+
+
+    def EnsureStateShape(self, B: int, device: torch.device):
+        if self.h is None or self.h.size(0) != B or self.h.device != device:
+            self.ResetState(B, device)
+
+    def forward(
+        self,
+        memoryPrev: torch.Tensor, 
+        attnPrev: torch.Tensor, 
+        stateCurr: torch.Tensor,) -> torch.Tensor:
+
+        B, device = stateCurr.size(0), stateCurr.device
+        self.EnsureStateShape(B, device)
+
+        h_prev = self.h
+        c_prev = self.c
+        mood_prev = self.mood
+
+        fast_in = torch.cat([stateCurr, attnPrev], dim=-1)
+        fast_h = self.fast_net(fast_in)
+
+        if self.useHebbHead:
+            beta_fast = torch.sigmoid(self.beta_fast_param)
+            fast_raw, fast_extras = self.fast_head(fast_h, betaMix=beta_fast)
+        else:
+            fast_raw = self.fast_head(fast_h)
+
+        emotion_fast = torch.tanh(fast_raw)
+
+        slow_in = torch.cat([stateCurr, memoryPrev, attnPrev], dim=-1) 
+        h_t, c_t = self.slow_cell(slow_in, (h_prev, c_prev)) 
+
+        if self.useHebbHead:
+            beta_slow = torch.sigmoid(self.beta_slow_param)
+            slow_raw, slow_extras = self.slow_head(h_t, betaMix=beta_slow)
+        else:
+            slow_raw = self.slow_head(h_t)
+
+        emotion_slow = torch.tanh(slow_raw)  
+
+        decay = self.moodDecay
+        mood_t = decay * mood_prev + (1.0 - decay) * emotion_slow  
+
+        w_fast = F.softplus(self.w_fast)
+        w_slow = F.softplus(self.w_slow)
+        w_mood = F.softplus(self.w_mood)
+
+        w_sum = (w_fast + w_slow + w_mood).clamp_min(1e-6)
+        wf = w_fast / w_sum
+        ws = w_slow / w_sum
+        wm = w_mood / w_sum
+
+        wf_b = wf.view(1, 1)
+        ws_b = ws.view(1, 1)
+        wm_b = wm.view(1, 1)
+
+        emotion_raw = (wf_b * emotion_fast + ws_b * emotion_slow + wm_b * mood_t) 
+
+        if self.gate_net is not None:
+            gate_in = torch.cat([memoryPrev, attnPrev, stateCurr], dim=-1)  
+            gate = self.gate_net(gate_in) 
+        else:
+            gate = torch.ones_like(emotion_raw)
+
+        gate = gate.clamp(0.0, 1.0)
+        emotion = torch.tanh(emotion_raw * (1.0 + gate))  
+
+        self.h = h_t.detach()
+        self.c = c_t.detach()
+        self.mood = mood_t.detach()
+
+        return emotion
+
+    @torch.no_grad()
+    def ResetHebbianMemory(self):
+        if self.useHebbHead:
+            self.slow_head.ResetHebbianMemory()
+            self.fast_head.ResetHebbianMemory()
+
+
 class GeoTropicalOut(NamedTuple):
     value: torch.Tensor
     tdError: torch.Tensor
     loss: torch.Tensor
     eT: torch.Tensor
     rInt: torch.Tensor
+    emotion: torch.Tensor 
     rComps: Dict[str, torch.Tensor]
     uncertainty: torch.Tensor
     extras: Dict[str, torch.Tensor]
@@ -483,6 +660,7 @@ class GeoTropicalOut(NamedTuple):
 class ValueEstimationExtractor(nn.Module):
     def __init__(self,
         memoryDim: int = 768, attnDim: int = 1024, stateDim: int = 256, *,
+        emotionDim: int = 64, 
         hidden: int = 2048, useLayerNorm: bool = True, irgKwargs: Optional[dict] = None,
         wExt: float = 1.0, wInt: float = 1.0, stopGradRGamma: bool = True,
         useSoftTrop: bool = True, tropTemp: float = 0.2, epsA: float = 1e-3,
@@ -518,6 +696,9 @@ class ValueEstimationExtractor(nn.Module):
 
         self.mix_gate = nn.Linear(H, 1)
 
+        self.emotion_dim = emotionDim
+        self.emotion_core = EmotionCore(stateDim=stateDim, memoryDim=memoryDim,attnDim=attnDim, emotionDim=emotionDim)
+
         self.wMixGateReg = 1e-3
 
         self.transport = TropicalAffineTransport(H, useSoftTrop, tropTemp, epsA)
@@ -542,6 +723,8 @@ class ValueEstimationExtractor(nn.Module):
         nn.init.zeros_(self.mix_gate.weight)
         nn.init.constant_(self.mix_gate.bias, -2.0)  
 
+        self.emotion_core.ResetParams()
+
     def Trunk(self, x: torch.Tensor) -> torch.Tensor:
         h = F.gelu(self.fc1_adapter(x))
         h = self.norm1(h) if self.norm1 is not None else h
@@ -563,6 +746,8 @@ class ValueEstimationExtractor(nn.Module):
         B, device = state.size(0), state.device
         x = torch.cat([memory, attn, state], dim=-1)
         h = self.Trunk(x)
+
+        emotion = self.emotion_core(memoryPrev=memory,attnPrev=attn, stateCurr=state,)
 
         uncert_raw = self.uncert_adapter(h).squeeze(-1)
         uncert_pred_fallback = F.softplus(uncert_raw).detach()
@@ -670,17 +855,20 @@ class ValueEstimationExtractor(nn.Module):
 
         return GeoTropicalOut(
             value=value, tdError=delta, loss=total_loss, eT=eT, rInt=r_int,
+            emotion=emotion,
             rComps={k: v.detach() for k, v in comps.items()},
             uncertainty=uncert_pred, extras=extras)
 
     @torch.no_grad()
     def ResetHebbianMemory(self): 
         self.hebb_value.ResetHebbianMemory()
+        self.emotion_core.ResetHebbianMemory()
         self._prev_vhat=None
 
     @torch.no_grad()
-    def ResetMicroGraph(self): 
+    def ResetState(self): 
         self.micro.Reset(device=None)
+        self.emotion_core.ResetState()
         self._prev_vhat = None
 
 
@@ -1518,7 +1706,7 @@ class TestValueEstimationMTool:
             est.eval()
             est.rgen.teacher_dropout_prob = 0.0
 
-            est.ResetMicroGraph()
+            est.ResetState()
             est.ResetHebbianMemory()
             H0 = est.hebb_value.H.detach().clone()
 
@@ -1534,7 +1722,7 @@ class TestValueEstimationMTool:
                 done=done)
 
             est.hebb_value.H.copy_(H0) 
-            est.ResetMicroGraph()
+            est.ResetState()
 
             rgen_state = {k: v.clone() for k, v in est.rgen.state_dict().items()}
             est.rgen.load_state_dict(rgen_state, strict=True)
@@ -1612,7 +1800,7 @@ class TestValueEstimationMTool:
 
             deltas_none = [ {"fc1": None}, {"fc2": None, "vhead": None, "uhead": None} ]
 
-            est.ResetMicroGraph()
+            est.ResetState()
 
             out_after = wrapper.ForwardWithDeltas(
                 x=(mem, attn, state),
