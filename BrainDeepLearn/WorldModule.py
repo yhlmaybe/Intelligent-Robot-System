@@ -301,21 +301,21 @@ class FilmResidual(nn.Module):
 
 class ConnNet(nn.Module):
     def __init__(self,
-                 stateDim: int,
-                 actDim: int,
-                 *,
-                 hidden: int = 512,
-                 numBlocks: int = 3,
-                 rank: int = 8,
-                 useFull: bool = True,
-                 useLowrank: bool = True,
-                 transport: str = "auto",
-                 dt: float = 1.0,
-                 lambdaFro: float = 1e-4,
-                 lambdaL1: float = 1e-5,
-                 lambdaSmooth: float = 3e-5,
-                 normClip: float = 0.8,
-                 wrapLinear=None):
+        stateDim: int,
+        actDim: int,
+        *,
+        hidden: int = 512,
+        numBlocks: int = 3,
+        rank: int = 8,
+        useFull: bool = True,
+        useLowrank: bool = True,
+        transport: str = "auto",
+        dt: float = 1.0,
+        lambdaFro: float = 1e-4,
+        lambdaL1: float = 1e-5,
+        lambdaSmooth: float = 3e-5,
+        normClip: float = 0.8,
+        wrapLinear=None):
         super().__init__()
         self.S = int(stateDim)
         self.A = int(actDim)
@@ -545,7 +545,7 @@ class RSSMWorldModel(nn.Module):
         stochDim: int = 64,
         stateDim: int = 512,
         useDecoder: bool = True,
-        useMemory: bool = False,
+        useMemory: bool = True,
         memoryCapacity: int = 4096,
         memoryPath: Optional[str] = None,
         memoryAutosaveEvery: int = 0,
@@ -1176,7 +1176,29 @@ class RSSMWorldModel(nn.Module):
             p.requires_grad_(True)
         return float(loss.detach().item())
 
+    def ExportWorldMemoryBank(
+        self,
+        batchSize: int,
+        device: torch.device,
+        maxItems: Optional[int] = None,) -> Tuple[torch.Tensor, torch.Tensor]:
 
+        if (not self._use_memory) or (self._mem_size == 0):
+            N = 1
+            bank1 = torch.zeros(N, self.deter_dim, device=device)
+        else:
+            vals = self._mem_vals[: self._mem_size].to(device) 
+            N = vals.size(0)
+
+            if (maxItems is not None) and (N > maxItems):
+                idx = torch.randperm(N, device=device)[:maxItems]
+                vals = vals[idx]
+                N = maxItems
+
+            bank1 = vals
+
+        memoryBank = bank1.unsqueeze(0).expand(batchSize, N, -1).contiguous()
+
+        return memoryBank
 
 class WorldModelOnlineWrapper(BaseOnlineWrapper):
     def __init__(
