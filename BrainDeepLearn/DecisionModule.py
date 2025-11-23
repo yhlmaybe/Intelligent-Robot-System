@@ -179,11 +179,12 @@ class MatLoRAAdapter(nn.Module):
 
 
 class HebbianPlasticityLayer(nn.Module):
-    def __init__(self, inDim: int, outDim: int, rate: float = 1e-3, decay: float = 0.995, maxRowNorm: float = 2.0):
+    def __init__(self, inDim: int, outDim: int, rate: float = 1e-3, decay: float = 0.995, maxRowNorm: float = 2.0, useHebbian : bool = True):
         super().__init__()
         self.rate = rate
         self.decay = decay
         self.max_row_norm = maxRowNorm
+        self.use_hebbian = useHebbian
         self.base = nn.Parameter(torch.randn(outDim, inDim) * 0.02)
         self.register_buffer("hebb", torch.zeros(outDim, inDim))
 
@@ -193,10 +194,15 @@ class HebbianPlasticityLayer(nn.Module):
         scale = (self.max_row_norm / row_norm).clamp_max(1.0)
         self.hebb.mul_(scale)
 
-    def forward(self, x: torch.Tensor, update: bool = False):
-        w = self.base + self.hebb
+    def forward(self, x: torch.Tensor):
+        if self.use_hebbian:
+            w = self.base + self.hebb
+        else:
+            w = self.base
+
         out = F.linear(x, w)
-        if update:
+
+        if self.use_hebbian:
             with torch.no_grad():
                 pre = x.detach()
                 post = out.detach()
@@ -326,19 +332,36 @@ class DecisionExtractor(nn.Module):
         self,
         stateDim: int = 768,
         includeNoSkill: bool = True,
-        useHebb: bool = False,
+        useHebb: bool = True,
         optionNum: int = 80,
         psiDim: int = 384,
+        intentDim: int = 256,
+        intentHidden: int = 512,
         *,
         entropyWeights: Tuple[float, float, float, float] = (0.3, 0.2, 0.4, 0.1),
         logstdBounds: Tuple[float, float] = (-5.0, 2.0),):
         super().__init__()
 
+        self.stateDim = stateDim
+        self.intentDim = intentDim
+
+        self.intent_gain = nn.Sequential(
+            nn.LayerNorm(self.intentDim),
+            nn.Linear(self.intentDim, intentHidden),
+            nn.SiLU(),
+            nn.Linear(intentHidden, self.stateDim),)
+        
+        self.intent_bias = nn.Sequential(
+            nn.LayerNorm(self.intentDim),
+            nn.Linear(self.intentDim, intentHidden),
+            nn.SiLU(),
+            nn.Linear(intentHidden, self.stateDim),)  
+
         self.feature_net = nn.Sequential(
             SwiGLUBlock(dim=stateDim, hidden=1024, p=0.1),
             SwiGLUBlock(dim=stateDim, hidden=1024, p=0.1))
         
-        self.hebb = HebbianPlasticityLayer(stateDim, stateDim)
+        self.hebb = HebbianPlasticityLayer(stateDim, stateDim, useHebbian=useHebb)
         self.to_z = nn.Linear(stateDim, 512)
         self.use_hebb_online = useHebb
 
@@ -437,10 +460,21 @@ class DecisionExtractor(nn.Module):
     @staticmethod
     def SafeSoftmax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
          return torch.softmax(DecisionExtractor.Safe(logits, 60.0), dim=dim)
+    
+    def FuseIntent(self, stateFeat: torch.Tensor, intentFeat: torch.Tensor) -> torch.Tensor:
+        intentFeat = intentFeat.to(device=stateFeat.device, dtype=stateFeat.dtype)
 
-    def Encode(self, stateFeat: torch.Tensor) -> torch.Tensor:
-        x = self.feature_net(stateFeat)
-        x = self.hebb(x, update=(self.use_hebb_online))
+        gain = torch.tanh(self.intent_gain(intentFeat))  
+        bias = self.intent_bias(intentFeat) 
+
+        return stateFeat * (1.0 + gain) + bias
+
+    def Encode(self, stateFeat: torch.Tensor, intentFeat: torch.Tensor) -> torch.Tensor:
+        x = self.FuseIntent(stateFeat, intentFeat) 
+
+        x = self.feature_net(x)
+        x = self.hebb(x)
+
         z = F.silu(self.to_z(x))
         return z
 
@@ -537,7 +571,8 @@ class DecisionExtractor(nn.Module):
 
     def forward(
         self,
-        stateFeat: torch.Tensor,                            
+        stateFeat: torch.Tensor,
+        intentFeat: torch.Tensor,                        
         *,
         sample: bool = True, # Whether to perform sampling output specific actions
         deterministic: bool = False, # True indicates that the sample will be taken from the mean or a greedy sample; False indicates that the sample will be taken randomly (to increase the exploratory nature of the process)
@@ -549,7 +584,7 @@ class DecisionExtractor(nn.Module):
         
         B = stateFeat.size(0)
 
-        z = self.Encode(stateFeat)
+        z = self.Encode(stateFeat, intentFeat)
         if prevOptionOnehot is not None:
             prevOptionOnehot = prevOptionOnehot.detach().clone()
         
@@ -878,6 +913,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         mixW: float = float(kwargs.get("mixW", 0.25))
         returnKeysVec: bool = kwargs.get("returnKeysVec", True)
         applyConstraints: bool = kwargs.get("applyConstraints", True)
+        intentFeat: torch.Tensor = kwargs.get("intentFeat", None)
 
         D = deltasPerLayer[0] if (deltasPerLayer and len(deltasPerLayer) > 0) else {}
 
@@ -892,6 +928,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         
         prev = (prevOptionOnehot.detach().to(dtype=x.dtype, device=device) if has_prev else torch.zeros(B, K, dtype=x.dtype, device=device))
 
+        x = self.base.FuseIntent(x, intentFeat)
 
         for i, blk in enumerate(self.base.feature_net):
             if isinstance(blk, SwiGLUBlock):
@@ -914,7 +951,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
             else:
                 x = blk(x)
 
-        x = self.base.hebb(x, update=self.base.use_hebb_online)
+        x = self.base.hebb(x)
 
         z_lin = self.base.to_z(x)
         if D.get("toz") is not None:
@@ -1743,7 +1780,7 @@ class TestDecisionMTool:
             out1 = model(x, sample=False, prevOptionOnehot=prev1, returnKeysVec=False)
 
             with torch.no_grad():
-                h = model.option.enc(F.silu(model.to_z(model.hebb(model.feature_net(x), update=False))))
+                h = model.option.enc(F.silu(model.to_z(model.hebb(model.feature_net(x)))))
                 trans_eff = model.option.trans_adapter(model.option.trans)
                 expect = prev1 @ trans_eff
             diff = (out1["option"]["logits"] - out0["option"]["logits"] - expect).abs().max().item()
@@ -1785,7 +1822,7 @@ class TestDecisionMTool:
             B = 4
             x = torch.randn(B, 128, device=self.device)
 
-            h = model.keyboard.backbone(F.silu(model.to_z(model.hebb(model.feature_net(x), update=False))))
+            h = model.keyboard.backbone(F.silu(model.to_z(model.hebb(model.feature_net(x)))))
             out_dim = model.keyboard.base_head.target.out_features
             in_dim = model.keyboard.base_head.target.in_features
             deltaW = torch.randn(out_dim, in_dim, device=self.device) * 1e-3
@@ -1822,7 +1859,7 @@ class TestDecisionMTool:
             B = torch.zeros(out_dim, addRank, device=self.device) * 1e-4
 
             x = torch.randn(5, 128, device=self.device)
-            h = model.keyboard.backbone(F.relu(model.to_z(model.hebb(model.feature_net(x), update=False))))
+            h = model.keyboard.backbone(F.relu(model.to_z(model.hebb(model.feature_net(x)))))
             with torch.no_grad():
                 y_base = model.keyboard.base_head(h).detach()
 
