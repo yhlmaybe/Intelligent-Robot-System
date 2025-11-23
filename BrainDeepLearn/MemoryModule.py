@@ -614,9 +614,9 @@ class MemoryExtractor(nn.Module):
         self,
         inputDim: int = 1024,
         ssmStateDim: int = 1024,
-        memoryDim: int = 768,
-        memorySize: int = 400,
-        outputDim: int = 768,
+        memoryDim: int = 1024,
+        memorySize: int = 512,
+        outputDim: int = 1024,
         hebbAlpha: float = 0.15,
         decayFactor: float = 0.95,
         topk: int = 8,
@@ -633,7 +633,8 @@ class MemoryExtractor(nn.Module):
         gwsTtl: int = 8,
         consolidateEvery: int = 200,
         rehearseEvery: int = 300,
-        ownerId: int = 1,) -> None:
+        ownerId: int = 1,
+        emotionDim: int = 64,) -> None:
         super().__init__()
 
         self.ssm_state_dim = ssmStateDim
@@ -686,6 +687,44 @@ class MemoryExtractor(nn.Module):
         self.register_buffer("memory_importance", torch.zeros(memorySize))
         self.register_buffer("memory_steps", torch.zeros(memorySize, dtype=torch.long))
         self.register_buffer("memory_corr", torch.zeros(memorySize))
+
+        self.emotion_dim = int(emotionDim)
+
+        self.register_buffer("memory_emotion", torch.zeros(memorySize, self.emotion_dim, dtype=torch.float16),)
+
+        self.emo_write_proj = nn.Sequential(
+            nn.Linear(self.emotion_dim, self.memory_dim),
+            nn.SiLU(),
+            nn.Linear(self.memory_dim, self.memory_dim),)
+
+        self.emo_read_proj = nn.Sequential(
+            nn.Linear(self.emotion_dim, self.memory_dim),
+            nn.SiLU(),
+            nn.Linear(self.memory_dim, self.memory_dim),)
+
+        self.emo_content_gate = nn.Sequential(
+            nn.Linear(self.memory_dim * 2, 1024),
+            nn.SiLU(),
+            nn.Linear(1024, 256),
+            nn.SiLU(),
+            nn.Linear(256, 1),
+            nn.Sigmoid(),)
+
+        self.td_affect_gate = nn.Sequential(
+            nn.Linear(1 + self.emotion_dim, 512),
+            nn.SiLU(),
+            nn.Linear(512, 64),
+            nn.SiLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),)
+        
+        self.emo_val_mod = nn.Sequential(
+            nn.Linear(self.emotion_dim, 512),
+            nn.SiLU(),
+            nn.Linear(512, 2 * self.memory_dim),)
+
+        self.emo_write_alpha = nn.Parameter(torch.tensor(0.3))
+
 
         self.mem_ptr = 0
         self.time_step = 0
@@ -746,7 +785,7 @@ class MemoryExtractor(nn.Module):
 
         self.gws = gws if gws is not None else GlobalWorkspace(dim=memoryDim, slots=gwsSlots, defaultTtl=gwsTtl)
         self.ltm = ltm if ltm is not None else LongTermMemory(dim=memoryDim)
-        self.gws_summary = nn.Linear(ssmStateDim + outputDim + memoryDim, memoryDim)
+        self.gws_summary = nn.Linear(ssmStateDim + outputDim + memoryDim + self.emotion_dim, memoryDim,)
 
         self.gws_gate = nn.Sequential(
             nn.Linear(memoryDim * 2, 128), 
@@ -912,15 +951,13 @@ class MemoryExtractor(nn.Module):
 
 
     def forward(self,
-                x: torch.Tensor,
-                *,
-                tdError: Optional[torch.Tensor] = None,
-                reward: Optional[torch.Tensor] = None,
-                reset: bool = False,
-                softReset: bool = False,) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        amp_enable = self.use_amp and x.is_cuda
-        dtype = torch.float16 if x.is_cuda else torch.bfloat16
+        x: torch.Tensor,
+        *,
+        tdError: Optional[torch.Tensor] = None,
+        emotion: Optional[torch.Tensor] = None,
+        reward: Optional[torch.Tensor] = None,
+        reset: bool = False,
+        softReset: bool = False,) -> Tuple[torch.Tensor, torch.Tensor]:
 
         self.ResetInternalLoss()
 
@@ -952,6 +989,16 @@ class MemoryExtractor(nn.Module):
         y_ssm = self.C_mat(h_mix) + self.D_mat(x)
 
         key, val = self.EncodeKV(h_mix)
+
+        emo_emb = self.emo_write_proj(emotion)  
+        emo_emb = F.normalize(emo_emb, dim=-1)
+
+        mod = self.emo_val_mod(emotion) 
+        gamma, beta = mod.chunk(2, dim=-1)
+        gamma = torch.tanh(gamma)
+        beta  = torch.tanh(beta)
+
+        val = F.normalize((1 + gamma) * val + beta, dim=-1)
 
         self.h_state = h_mix.detach()
 
@@ -990,18 +1037,18 @@ class MemoryExtractor(nn.Module):
         else:
             rule_pre = torch.zeros([], device=h_new.device)
 
-        self.LtmOnlineStore(key, val, importance, tdError=tdError, reward=reward)
+        self.LtmOnlineStore(key, val, importance, tdError=tdError, reward=reward, emotion=emotion,)
        
         fw_local = self.BuildFastWeights(key, gate_local, neuromod, a, b) if self.enable_hebb_update else None
 
-        mem_recall = self.Retrieve(key, fusion_gate, importance=importance, localGate=gate_local, fwOverride=fw_local)
+        mem_recall = self.Retrieve(key,fusion_gate,importance=importance,localGate=gate_local, fwOverride=fw_local,emotion=emotion,tdError=tdError)
 
         self.HebbianUpdate(key, gate_local, neuromod, a, b)
-        self.KvWrite(key, val, importance)
+        self.KvWrite(key, val, importance, emotion=emotion)
 
         ltm_recall, sem_vecs, sem_w, epi_vecs, epi_w = self.ltm.Retrieve(key, topkSem=self.ltm_topk_sem, topkEpi=self.ltm_topk_epi)
 
-        msg = torch.cat([h_new, y_ssm, mem_recall], dim=-1)
+        msg = torch.cat([h_new, y_ssm, mem_recall, emotion], dim=-1)
         ws_val = F.normalize(self.gws_summary(msg), dim=-1)
 
         mem_recall_base = mem_recall.detach() 
@@ -1009,8 +1056,11 @@ class MemoryExtractor(nn.Module):
             loss_gws_align = self.gws_align_weight * (1 - F.cosine_similarity(ws_val, mem_recall_base, dim=-1)).mean()
             self.AddInternalLoss(loss_gws_align)
 
+        affect_mag = tdError.view(-1).abs()
+        prio = importance.view(-1) * (1.0 + 0.5 * affect_mag).clamp(0.5, 2.0)
+
         for i in range(B):
-            self.gws.Write(key[i], ws_val[i], priority=float(importance[i].item()), ttl=6, tagId=1, ownerId=self.owner_id)
+            self.gws.Write(key[i],ws_val[i],priority=float(prio[i].item()),ttl=6,tagId=1,ownerId=self.owner_id,)
 
         gws_read, _ = self.gws.Attend(key, topk=4)
         fuse_gate = self.gws_gate(torch.cat([gws_read, mem_recall], dim=-1))
@@ -1143,7 +1193,7 @@ class MemoryExtractor(nn.Module):
 
 
     @torch.no_grad()
-    def KvWrite(self, key: torch.Tensor, val: torch.Tensor, importance: torch.Tensor) -> None:
+    def KvWrite(self,key: torch.Tensor,val: torch.Tensor,importance: torch.Tensor,emotion: Optional[torch.Tensor] = None) -> None:
         n = key.size(0); device = key.device
         if self.memory_filled < self.memory_size:
             n = min(n, self.memory_size - self.memory_filled)
@@ -1168,40 +1218,62 @@ class MemoryExtractor(nn.Module):
                 self.memory_corr[idx].fill_(1.0)
         else:
             self.memory_corr[idx].fill_(1.0)
+
         self.memory_keys[idx] = key[:n].detach().half()
         self.memory_values[idx] = val[:n].detach().half()
         self.memory_importance[idx] = importance[:n].squeeze().detach()
         self.memory_steps[idx] = self.time_step
+        self.memory_emotion[idx] = emotion[:n].detach().to(self.memory_emotion.dtype)
 
     @torch.no_grad()
-    def LtmOnlineStore(self, key, val, importance, tdError=None, reward=None):
+    def LtmOnlineStore(self, key, val, importance, tdError=None, reward=None, emotion=None):
         B = key.size(0)
+        device = key.device
+
         imp = importance.view(-1)
-        td  = tdError.view(-1).abs() if tdError is not None else torch.zeros(B, device=key.device)
+        td  = tdError.view(-1).abs() if tdError is not None else torch.zeros(B, device=device)
         mask = (imp > self.ltm_online_imp_thresh) | (td > self.ltm_online_td_thresh)
         idx = torch.nonzero(mask, as_tuple=False).flatten()
+        if idx.numel() == 0:
+            return
+
+        emo_vec_all = self.emo_read_proj(emotion.to(device)) 
+        emo_vec_all = F.normalize(emo_vec_all, dim=-1)
+
         for i in idx.tolist():
-            self.ltm.semantic.Store(val[i], score=float(imp[i].item()))
-            self.ltm.episodic.Store(
-                key[i],
-                reward=float(0.0 if reward is None else reward[i].item()),
-                score=float(imp[i].item()),)
+            sem_vec = val[i]
+            epi_vec = key[i]
+
+            if emo_vec_all is not None:
+                sem_vec = F.normalize(sem_vec + 0.5 * emo_vec_all[i], dim=-1)
+                epi_vec = F.normalize(epi_vec + 0.5 * emo_vec_all[i], dim=-1)
+
+            self.ltm.semantic.Store(sem_vec,score=float(imp[i].item()),)
+
+            self.ltm.episodic.Store(epi_vec,reward=float(0.0 if reward is None else reward[i].item()),score=float(imp[i].item()),)
 
     def Retrieve(self,
-             query: torch.Tensor,
-             fusionGate: torch.Tensor,
-             *,
-             importance: Optional[torch.Tensor] = None,
-             localGate: Optional[torch.Tensor] = None,
-             fwOverride: Optional[torch.Tensor] = None) -> torch.Tensor:
+                 query: torch.Tensor,
+                 fusionGate: torch.Tensor,
+                 *,
+                 importance: Optional[torch.Tensor] = None,
+                 localGate: Optional[torch.Tensor] = None,
+                 fwOverride: Optional[torch.Tensor] = None,
+                 emotion: Optional[torch.Tensor] = None, 
+                 tdError: Optional[torch.Tensor] = None) -> torch.Tensor:
         fw_base = self.fast_weights if self.enable_hebb_update else torch.zeros_like(self.fast_weights)
         fw = fwOverride if fwOverride is not None else fw_base
 
         fast_part = (query.to(fw.dtype)) @ fw
         fast_part = fast_part.to(query.dtype)
 
+        mem_task = None 
+        mem_affect = None 
+
         if self.memory_filled == 0:
             kv_part = torch.zeros_like(fast_part)
+            mem_task = kv_part
+            mem_affect = kv_part
         else:
             keys = self.memory_keys[:self.memory_filled].float()
             values = self.memory_values[:self.memory_filled].float()
@@ -1229,8 +1301,38 @@ class MemoryExtractor(nn.Module):
             all_false = ~mask.any(dim=-1, keepdim=True)
             top_sim_eff = torch.where(all_false, top_sim, masked_top)
             attn_weights = F.softmax(top_sim_eff.float(), dim=-1)
-            vals = values[top_idx]
-            kv_part = torch.einsum('bk,bkd->bd', attn_weights, vals)
+
+            vals = values[top_idx]  
+            mem_task = torch.einsum('bk,bkd->bd', attn_weights, vals) 
+
+            emo_vals = self.memory_emotion[:self.memory_filled].float() 
+            emo_sel = emo_vals[top_idx] 
+            emo_q = emotion.to(emo_sel.device).unsqueeze(1) 
+
+            emo_sim = F.cosine_similarity(emo_sel,emo_q.expand_as(emo_sel),dim=-1,)
+
+            emo_w = F.softmax(emo_sim, dim=-1) 
+
+            mem_affect = torch.einsum('bk,bkd->bd', emo_w, vals) 
+
+            emo_vec = torch.einsum('bk,bkd->bd', emo_w, emo_sel) 
+            emo_embed = self.emo_read_proj(emo_vec) 
+
+            emo_gate = self.emo_content_gate(torch.cat([mem_affect, emo_embed], dim=-1)) 
+            mem_affect = (1.0 - emo_gate) * mem_affect + emo_gate * emo_embed
+
+            kv_part = mem_task
+
+            B = query.size(0)
+            if tdError is not None:
+                td_abs = tdError.view(B, 1).abs()
+            else:
+                td_abs = torch.zeros(B, 1, device=query.device)
+
+            gate_feat = torch.cat([td_abs, emotion.to(query.device)], dim=-1)  
+            gamma = self.td_affect_gate(gate_feat) 
+
+            kv_part = gamma * mem_task + (1.0 - gamma) * mem_affect
 
         fusion_input = torch.cat([query, fast_part, kv_part], dim=-1)
         gate = self.fusion_gate_net(fusion_input) 
@@ -1349,6 +1451,8 @@ class MemoryExtractor(nn.Module):
         self.memory_importance.zero_()
         self.memory_steps.zero_()
         self.memory_corr.zero_()
+        self.memory_emotion.zero_()
+
         self.mem_ptr = 0
         self.time_step = 0
         self.memory_filled = 0
@@ -1393,6 +1497,7 @@ class MemoryExtractor(nn.Module):
             "h_state": torch.zeros_like(self.h_state, device=dev),
             "fast_weights": torch.zeros_like(self.fast_weights, device=dev),
             "memory_keys": torch.zeros_like(self.memory_keys, device=dev),
+            "memory_emotion": torch.zeros_like(self.memory_emotion, device=dev),
             "memory_values": torch.zeros_like(self.memory_values, device=dev),
             "memory_importance": torch.zeros_like(self.memory_importance, device=dev),
             "memory_corr": torch.zeros_like(self.memory_corr, device=dev),
@@ -1452,6 +1557,7 @@ class MemoryExtractor(nn.Module):
             "memory_importance": self.memory_importance.clone(),
             "memory_corr": self.memory_corr.clone(),
             "memory_steps": self.memory_steps.clone(),
+            "memory_emotion": self.memory_emotion.clone(),
             "mem_ptr": torch.tensor(self.mem_ptr),
             "time_step": torch.tensor(self.time_step),
             "memory_filled": torch.tensor(self.memory_filled),
@@ -1526,6 +1632,7 @@ class MemoryExtractor(nn.Module):
         self.memory_importance.copy_(state["memory_importance"].to(self.memory_importance.device))
         self.memory_corr.copy_(state["memory_corr"].to(self.memory_corr.device))
         self.memory_steps.copy_(state["memory_steps"].to(self.memory_steps.device))
+        self.memory_emotion.copy_(state["memory_emotion"].to(self.memory_emotion.device))
         self.mem_ptr = int(state["mem_ptr"].item())
         self.time_step = int(state["time_step"].item())
         self.memory_filled = int(state["memory_filled"].item())
@@ -1602,6 +1709,55 @@ class MemoryExtractor(nn.Module):
             q = hyp
         return hyp
 
+
+    @torch.no_grad()
+    def ExportMemoryBank(
+        self,
+        batchSize: int,
+        device: torch.device,
+        maxItems: Optional[int] = None,) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        chunks = []
+
+        if self.memory_filled > 0:
+            short_vals = self.memory_values[:self.memory_filled].float().to(device)
+            chunks.append(short_vals) 
+
+        gws_snap = self.gws.Inspect()
+        gws_vals = gws_snap["vals"] 
+        gws_prio = gws_snap["priority"]
+        gws_ttl = gws_snap["ttl"]
+        alive = (gws_ttl > 0) & (gws_prio > 0)
+        if alive.any():
+            gws_alive = gws_vals[alive].float().to(device)  
+            chunks.append(gws_alive)
+
+        sem = self.ltm.semantic
+        if sem.filled > 0:
+            sem_emb = sem.emb[:sem.filled].float().to(device) 
+            chunks.append(sem_emb)
+
+        epi = self.ltm.episodic
+        if epi.filled > 0:
+            epi_emb = epi.emb[:epi.filled].float().to(device) 
+            chunks.append(epi_emb)
+
+        if not chunks:
+            N = 1
+            bank1 = torch.zeros(N, self.memory_dim, device=device)
+        else:
+            bank1 = torch.cat(chunks, dim=0) 
+            N = bank1.size(0)
+
+        if (maxItems is not None) and (N > maxItems):
+            idx = torch.randperm(N, device=device)[:maxItems]
+            bank1 = bank1[idx]
+            N = maxItems
+
+        memoryBank = bank1.unsqueeze(0).expand(batchSize, N, -1).contiguous() 
+
+        return memoryBank
+    
 
 
 class TestMemoryMTool:
