@@ -54,10 +54,22 @@ class TextEncoder(nn.Module):
 
         scores = self.att_proj(out).squeeze(-1)
         scores = scores.masked_fill(~mask, float("-inf"))
-        attn = F.softmax(scores, dim=-1)  
-        attn_exp = attn.unsqueeze(-1)  
 
-        text_repr = (out * attn_exp).sum(dim=1) 
+        no_token = ~mask.any(dim=1)
+
+        if no_token.any():
+            scores = scores.clone()
+            scores[no_token] = 0.0
+
+        attn = F.softmax(scores, dim=-1) 
+
+        if no_token.any():
+            attn = attn.clone()
+            attn[no_token] = 0.0
+
+        attn_exp = attn.unsqueeze(-1) 
+        text_repr = (out * attn_exp).sum(dim=1)  
+
         return text_repr
 
 
@@ -165,12 +177,12 @@ class IntentionExtractor(nn.Module):
     def __init__(
         self,
         *,
-        vocabSize: int = 4096,
+        vocabSize: int = 6624,
         paddingIdx: int = 0,
-        maxSeqLen: int = 32,
+        maxSeqLen: int = 64,
         dimEmbed: int = 512,
         dimEncoderHidden: int = 512,
-        numEncoderLayers: int = 2,
+        numEncoderLayers: int = 3,
         encoderDropout: float = 0.1,
         dimSem: int = 512,
         consDim: int = 1024,
@@ -258,6 +270,19 @@ class IntentionExtractor(nn.Module):
 
         self.beta_ocr = nn.Parameter(torch.tensor(0.1))
         self.beta_ext = nn.Parameter(torch.tensor(0.1))
+
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dimSem,
+            nhead=8, 
+            dim_feedforward=dimSem * 4, 
+            dropout=encoderDropout,
+            batch_first=True,
+            activation="gelu",)
+        
+        self.intentTransformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+
+        self.beta_trans = nn.Parameter(torch.tensor(0.3))
 
     def LoadOcrDict(self, dictPath: str) -> None:
         ch2id: Dict[str, int] = {}
@@ -487,6 +512,48 @@ class IntentionExtractor(nn.Module):
                 extras["sem_ocr_raw"] = sem_ocr.detach()
             if has_ext and sem_ext is not None:
                 extras["sem_ext_raw"] = sem_ext.detach()
+
+        token_list = []
+        mask_list = []
+
+        if cons_sem is not None:
+            token_list.append(cons_sem) 
+            mask_list.append(torch.ones(batch_size, dtype=torch.bool, device=device))
+        else:
+            token_list.append(torch.zeros(batch_size, self.dimSem, device=device))
+            mask_list.append(torch.zeros(batch_size, dtype=torch.bool, device=device))
+
+        if sem_ocr is not None and has_ocr:
+            token_list.append(sem_ocr)
+            mask_list.append(torch.ones(batch_size, dtype=torch.bool, device=device))
+        else:
+            token_list.append(torch.zeros(batch_size, self.dimSem, device=device))
+            mask_list.append(torch.zeros(batch_size, dtype=torch.bool, device=device))
+
+        if sem_ext is not None and has_ext:
+            token_list.append(sem_ext)
+            mask_list.append(torch.ones(batch_size, dtype=torch.bool, device=device))
+        else:
+            token_list.append(torch.zeros(batch_size, self.dimSem, device=device))
+            mask_list.append(torch.zeros(batch_size, dtype=torch.bool, device=device))
+
+        tokens = torch.stack(token_list, dim=1)  
+        token_mask = torch.stack(mask_list, dim=1) 
+
+        if token_mask.any():
+            src_key_padding_mask = ~token_mask 
+
+            trans_out = self.intentTransformer(tokens,src_key_padding_mask=src_key_padding_mask,) 
+
+            mask_float = token_mask.float().unsqueeze(-1) 
+            sum_vec = (trans_out * mask_float).sum(dim=1)
+            denom = mask_float.sum(dim=1).clamp(min=1.0)
+            fused = sum_vec / denom 
+
+            intentSem = intentSem + self.beta_trans * fused
+
+            extras["intent_trans_norm"] = fused.norm(dim=-1).detach()
+            extras["intent_trans_mask_sum"] = mask_float.sum(dim=1).squeeze(-1).detach()
 
         symbol_logits = F.linear(intentSem, self.conceptEmb, self.conceptBias)
         symProbs = self.reasoner(symbol_logits, self.conceptEmb)
