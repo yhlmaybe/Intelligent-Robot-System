@@ -257,14 +257,6 @@ class ConsciousnessExtractor(nn.Module):
             ConsciousHebbianLinear(in_dev,self.dev_dim,useHebb=useHebb,),
             nn.LayerNorm(self.dev_dim),
             nn.Tanh(),)
-
-        self.monitor_head = nn.Sequential(
-            nn.Linear(self.self_dim + self.intent_dim, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Linear(512, 128),
-            nn.GELU(),
-            nn.Linear(128, 3),)
         
         self.mem_query_net = nn.Sequential(
             nn.LayerNorm(self.self_dim),
@@ -466,16 +458,7 @@ class ConsciousnessExtractor(nn.Module):
 
         new_state = ConsciousnessState(dev_trace=new_dev, step=new_step)
 
-        monitor_vec = torch.cat([self_sem, intent_sem], dim=-1) 
-        monitor = self.monitor_head(monitor_vec)
-        self_energy = monitor[:, 0]
-        intent_energy = monitor[:, 1]
-        entropy_like = monitor[:, 2]
-
         extras: Dict[str, torch.Tensor] = {
-            "self_energy": self_energy.detach(),
-            "intent_energy": intent_energy.detach(),
-            "entropy_like": entropy_like.detach(),
             "gate_lang_raw": gate_lang.detach(),
             "gate_world_raw": gate_world.detach(),
             "gate_memory_raw": gate_memory.detach(),
@@ -501,3 +484,429 @@ class ConsciousnessExtractor(nn.Module):
         for _, m in self.named_children():
             if hasattr(m, "ResetHebbianMemory"):
                 m.ResetHebbianMemory()
+
+
+
+class TestConsciousMTool:
+    def __init__(self, device: Optional[torch.device] = None):
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch.manual_seed(42)
+
+        self.mem_dim = 128
+        self.world_dim = 64
+        self.dev_dim = 64
+        self.self_dim = 128
+        self.intent_dim = 128
+        self.n_self_blocks = 3
+        self.n_intent_blocks = 3
+        self.hyper_hidden = 256
+
+
+    def BuildModel(self, useHebb: bool = True) -> "ConsciousnessExtractor":
+        model = ConsciousnessExtractor(
+            memItemDim=self.mem_dim,
+            worldItemDim=self.world_dim,
+            devDim=self.dev_dim,
+            selfDim=self.self_dim,
+            intentDim=self.intent_dim,
+            nSelfBlocks=self.n_self_blocks,
+            nIntentBlocks=self.n_intent_blocks,
+            hyperHiddenDim=self.hyper_hidden,
+            topKMem=4,
+            randKMem=2,
+            topKWorld=4,
+            randKWorld=2,
+            useHebb=useHebb,).to(self.device)
+        
+        model.train()
+        return model
+
+    def DummyBanks(self, B: int = 8, Nm: int = 10, Nw: int = 7) -> Tuple[torch.Tensor, torch.Tensor]:
+        mem = torch.randn(B, Nm, self.mem_dim, device=self.device)
+        world = torch.randn(B, Nw, self.world_dim, device=self.device)
+        return mem, world
+
+
+    def TestForwardShapes(self) -> bool:
+        try:
+            model = self.BuildModel(useHebb=True)
+            mem, world = self.DummyBanks(B=4, Nm=9, Nw=6)
+
+            out = model(mem, world, prevState=None, detachBase=True)
+
+            assert out.self_sem.shape == (4, self.self_dim), f"self_sem shape wrong: {out.self_sem.shape}"
+            assert out.intent_sem.shape == (4, self.intent_dim), f"intent_sem shape wrong: {out.intent_sem.shape}"
+            assert out.gate_lang.shape == (4,), f"gate_lang shape wrong: {out.gate_lang.shape}"
+            assert out.gate_world.shape == (4,), f"gate_world shape wrong: {out.gate_world.shape}"
+            assert out.gate_memory.shape == (4,), f"gate_memory shape wrong: {out.gate_memory.shape}"
+            assert out.new_state.dev_trace.shape == (4, self.dev_dim), f"dev_trace shape wrong: {out.new_state.dev_trace.shape}"
+            assert out.new_state.step.shape == (4,), f"step shape wrong: {out.new_state.step.shape}"
+
+            for k in [
+                "gate_lang_raw", "gate_world_raw", "gate_memory_raw",
+                "dev_trace_norm", "mem_score_mean", "world_score_mean",
+                "mem_n_items", "world_n_items",
+                "mem_focus_norm", "world_focus_norm",]:
+
+                assert k in out.extras, f"extras missing key: {k}"
+
+            print("TestForwardShapes passed.")
+            return True
+        except AssertionError as e:
+            print("TestForwardShapes failed:", e)
+            return False
+        except Exception as e:
+            print("TestForwardShapes error:", e)
+            return False
+
+    def TestStateFlow(self) -> bool:
+        try:
+            model = self.BuildModel(useHebb=True)
+            B = 3
+            mem, world = self.DummyBanks(B=B, Nm=8, Nw=5)
+            state = model.InitialState(batchSize=B, device=self.device)
+
+            steps = []
+            norms = []
+            for _ in range(5):
+                out = model(mem, world, prevState=state, detachBase=True)
+                state = out.new_state
+                steps.append(state.step.detach().cpu())
+                norms.append(state.dev_trace.norm(dim=-1).detach().cpu())
+
+            steps = torch.stack(steps, dim=0)  
+            assert torch.all(steps[1:] > steps[:-1]), f"step not strictly increasing:\n{steps}"
+
+            diff = (norms[-1] - norms[0]).abs().sum().item()
+            assert diff > 1e-6, "dev_trace norm did not change across steps; dynamics may be stuck."
+
+            print("TestStateFlow passed.")
+            return True
+        except AssertionError as e:
+            print("TestStateFlow failed:", e)
+            return False
+        except Exception as e:
+            print("TestStateFlow error:", e)
+            return False
+
+    def TestConsciousHebbianLinearLifecycle(self) -> bool:
+        try:
+            lin = ConsciousHebbianLinear(inFeatures=16, outFeatures=12, hebbAlpha=0.1, useHebb=True,).to(self.device)
+
+            x = torch.randn(5, 16, device=self.device)
+            with torch.no_grad():
+                n0 = lin.hebb.norm().item()
+                for _ in range(3):
+                    _ = lin(x)
+                n1 = lin.hebb.norm().item()
+                assert n1 > n0 + 1e-12, f"hebb did not grow: before={n0:.3e}, after={n1:.3e}"
+
+                lin.ResetHebbianMemory()
+                n2 = lin.hebb.norm().item()
+                assert n2 < 1e-12, f"hebb not cleared to zero: now={n2:.3e}"
+
+            print("TestConsciousHebbianLinearLifecycle passed.")
+            return True
+        except AssertionError as e:
+            print("TestConsciousHebbianLinearLifecycle failed:", e)
+            return False
+        except Exception as e:
+            print("TestConsciousHebbianLinearLifecycle error:", e)
+            return False
+
+    def TestModuleResetHebbianMemory(self) -> bool:
+        try:
+            model = self.BuildModel(useHebb=True)
+            mem, world = self.DummyBanks(B=4, Nm=9, Nw=6)
+
+            with torch.no_grad():
+                for _ in range(3):
+                    _ = model(mem, world, prevState=None, detachBase=True)
+
+            hebb_norm_before = []
+            for m in model.modules():
+                if hasattr(m, "hebb"):
+                    hebb_norm_before.append(m.hebb.norm().item())
+            assert len(hebb_norm_before) > 0, "No hebb buffers found in model."
+            assert any(n > 1e-9 for n in hebb_norm_before), "All hebb norms are zero before reset; nothing to test."
+
+            model.ResetHebbianMemory()
+            hebb_norm_after = []
+            for m in model.modules():
+                if hasattr(m, "hebb"):
+                    hebb_norm_after.append(m.hebb.norm().item())
+            assert all(n < 1e-12 for n in hebb_norm_after), f"Some hebb buffers not cleared: {hebb_norm_after}"
+
+            print("TestModuleResetHebbianMemory passed.")
+            return True
+        except AssertionError as e:
+            print("TestModuleResetHebbianMemory failed:", e)
+            return False
+        except Exception as e:
+            print("TestModuleResetHebbianMemory error:", e)
+            return False
+
+    def TrainStepSmoke(self) -> bool:
+        try:
+            model = self.BuildModel(useHebb=True)
+            head = nn.Linear(self.self_dim + self.intent_dim, 32).to(self.device)
+
+            model.train()
+            head.train()
+            opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
+
+            B = 4
+            mem, world = self.DummyBanks(B=B, Nm=7, Nw=5)
+            target = torch.randn(B, 32, device=self.device)
+
+            prev = model.InitialState(batchSize=B, device=self.device)
+            prev = ConsciousnessState(dev_trace=prev.dev_trace.detach(),step=prev.step.detach())
+
+            out = model(mem, world, prevState=prev, detachBase=False)
+            rep = torch.cat([out.self_sem, out.intent_sem], dim=-1)
+            pred = head(rep)
+            base_loss = F.mse_loss(pred, target)
+
+            dev_loss = out.new_state.dev_trace.pow(2).mean()
+            gates = torch.stack([out.gate_lang, out.gate_world, out.gate_memory], dim=-1)
+            gate_loss = gates.pow(2).mean()
+
+            loss = base_loss + 0.1 * (dev_loss + gate_loss)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+
+            grads_ok = True
+            for n, p in model.named_parameters():
+                if p.requires_grad:
+                    if p.grad is None:
+                        print("Missing grad at:", n)
+                        grads_ok = False
+                        break
+                    if not torch.isfinite(p.grad).all():
+                        print("Non-finite grad at:", n)
+                        grads_ok = False
+                        break
+
+            if head.weight.grad is None or not torch.isfinite(head.weight.grad).all():
+                grads_ok = False
+
+            assert grads_ok, "Some parameters have None or non-finite grad."
+            opt.step()
+
+            print("TrainStepSmoke passed.")
+            return True
+        except AssertionError as e:
+            print("TrainStepSmoke failed:", e)
+            return False
+        except Exception as e:
+            print("TrainStepSmoke error:", e)
+            return False
+
+    def NormalTrainingConvergence(self, steps: int = 80, logEvery: int = 20) -> bool:
+        try:
+            model = self.BuildModel(useHebb=True)
+            head = nn.Linear(self.self_dim + self.intent_dim, 32).to(self.device)
+
+            model.train()
+            head.train()
+            opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
+
+            B = 16
+            mem, world = self.DummyBanks(B=B, Nm=10, Nw=7)
+            target = torch.randn(B, 32, device=self.device)
+
+            with torch.no_grad():
+                out0 = model(mem, world, prevState=None, detachBase=False)
+                rep0 = torch.cat([out0.self_sem, out0.intent_sem], dim=-1)
+                pred0 = head(rep0)
+                base0 = F.mse_loss(pred0, target)
+
+                dev0 = out0.new_state.dev_trace.pow(2).mean()
+                gates0 = torch.stack([out0.gate_lang, out0.gate_world, out0.gate_memory], dim=-1)
+                gate0 = gates0.pow(2).mean()
+
+                start = (base0 + 0.1 * (dev0 + gate0)).item()
+
+            last_loss = start
+            for t in range(1, steps + 1):
+                out = model(mem, world, prevState=None, detachBase=False)
+                rep = torch.cat([out.self_sem, out.intent_sem], dim=-1)
+                pred = head(rep)
+                base_loss = F.mse_loss(pred, target)
+
+                dev_loss = out.new_state.dev_trace.pow(2).mean()
+                gates = torch.stack([out.gate_lang, out.gate_world, out.gate_memory], dim=-1)
+                gate_loss = gates.pow(2).mean()
+
+                loss = base_loss + 0.1 * (dev_loss + gate_loss)
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+
+                last_loss = loss.item()
+                if (t % logEvery) == 0 or t == 1:
+                    print(f"[ConsciousTrain] step {t}/{steps} | total_loss={last_loss:.6f}")
+
+            with torch.no_grad():
+                out1 = model(mem, world, prevState=None, detachBase=False)
+                rep1 = torch.cat([out1.self_sem, out1.intent_sem], dim=-1)
+                pred1 = head(rep1)
+                base1 = F.mse_loss(pred1, target)
+
+                dev1 = out1.new_state.dev_trace.pow(2).mean()
+                gates1 = torch.stack([out1.gate_lang, out1.gate_world, out1.gate_memory], dim=-1)
+                gate1 = gates1.pow(2).mean()
+
+                end = (base1 + 0.1 * (dev1 + gate1)).item()
+
+            print(f"\n[ConsciousTrain] loss start={start:.6f} -> end={end:.6f}")
+            assert end <= 0.8 * start, "Training did not show sufficient convergence (<20% decline)."
+
+            print("NormalTrainingConvergence passed.")
+            return True
+        except AssertionError as e:
+            print("NormalTrainingConvergence failed:", e)
+            return False
+        except Exception as e:
+            print("NormalTrainingConvergence error:", e)
+            return False
+
+    def GradCoverageReport(self) -> bool:
+        try:
+            model = self.BuildModel(useHebb=True)
+            head = nn.Linear(self.self_dim + self.intent_dim, 32).to(self.device)
+            model.train()
+            head.train()
+
+            B = 8
+            mem, world = self.DummyBanks(B=B, Nm=9, Nw=6)
+            target = torch.randn(B, 32, device=self.device)
+
+            out = model(mem, world, prevState=None, detachBase=False)
+            rep = torch.cat([out.self_sem, out.intent_sem], dim=-1)
+            pred = head(rep)
+            base_loss = F.mse_loss(pred, target)
+
+            dev_loss = out.new_state.dev_trace.pow(2).mean()
+            gates = torch.stack([out.gate_lang, out.gate_world, out.gate_memory], dim=-1)
+            gate_loss = gates.pow(2).mean()
+
+            loss = base_loss + 0.1 * (dev_loss + gate_loss)
+
+            opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+
+            named: Dict[str, torch.nn.Parameter] = {}
+            for n, p in model.named_parameters():
+                named[n] = p
+            for k, v in head.named_parameters():
+                named["head." + k] = v
+
+            total_trainable = sum(1 for p in named.values() if p.requires_grad)
+            total_with_grad = sum(
+                1 for p in named.values()
+                if p.requires_grad and (p.grad is not None))
+            ratio = total_with_grad / max(1, total_trainable)
+
+            missing_any = [n for n, p in named.items() if p.requires_grad and (p.grad is None)]
+            assert len(missing_any) == 0, f"Some trainable params have no grad: {missing_any}"
+
+            print(f"GradCoverageReport passed. grad_ratio={ratio:.2%}")
+            return True
+        except AssertionError as e:
+            print("GradCoverageReport failed:", e)
+            return False
+        except Exception as e:
+            print("GradCoverageReport error:", e)
+            return False
+
+    def DetachBaseSwitchEffect(self) -> bool:
+        try:
+            model = self.BuildModel(useHebb=False)
+            B = 4
+            mem, world = self.DummyBanks(B=B, Nm=8, Nw=5)
+
+            base_params = []
+            for n, p in model.named_parameters():
+                if (n.startswith("mem_score_net.")
+                    or n.startswith("world_score_net.")
+                    or n.startswith("mem_agg_proj.")
+                    or n.startswith("world_agg_proj.")):
+                    base_params.append(p)
+            assert len(base_params) > 0, "No base scoring params found."
+
+            model.zero_grad(set_to_none=True)
+            out1 = model(mem, world, prevState=None, detachBase=True)
+            loss1 = out1.self_sem.mean() + out1.intent_sem.mean()
+            loss1.backward()
+
+            has_grad_detached = any(p.grad is not None for p in base_params)
+            assert not has_grad_detached, "Base scoring modules should have NO grad when detachBase=True"
+
+            model.zero_grad(set_to_none=True)
+            out2 = model(mem, world, prevState=None, detachBase=False)
+            loss2 = out2.self_sem.mean() + out2.intent_sem.mean()
+            loss2.backward()
+
+            has_grad_attached = any(
+                (p.grad is not None) and torch.isfinite(p.grad).all()
+                for p in base_params)
+            assert has_grad_attached, "Base scoring modules should GET grad when detachBase=False"
+
+            print("DetachBaseSwitchEffect passed.")
+            return True
+        except AssertionError as e:
+            print("DetachBaseSwitchEffect failed:", e)
+            return False
+        except Exception as e:
+            print("DetachBaseSwitchEffect error:", e)
+            return False
+
+    def QueryTopKEdgeCases(self) -> bool:
+        try:
+            model = self.BuildModel(useHebb=False)
+            B = 2
+            D = self.mem_dim
+
+            bank_empty = torch.zeros(B, 0, D, device=self.device)
+            q = torch.randn(B, D, device=self.device)
+            focus, idx, w = model.QueryTopK(bank_empty, q, topK=4)
+            assert focus.shape == (B, D)
+            assert idx.shape == (B, 0)
+            assert w.shape == (B, 0)
+
+            bank = torch.randn(B, 5, D, device=self.device)
+            focus2, idx2, w2 = model.QueryTopK(bank, q, topK=0)
+            assert focus2.shape == (B, D)
+            assert idx2.shape == (B, 0)
+            assert w2.shape == (B, 0)
+
+            print("QueryTopKEdgeCases passed.")
+            return True
+        except AssertionError as e:
+            print("QueryTopKEdgeCases failed:", e)
+            return False
+        except Exception as e:
+            print("QueryTopKEdgeCases error:", e)
+            return False
+
+
+    def RunAll(self) -> Dict[str, bool]:
+        results = {
+            "ForwardShapes": self.TestForwardShapes(),
+            "StateFlow": self.TestStateFlow(),
+            "ConsciousHebbianLinearLifecycle": self.TestConsciousHebbianLinearLifecycle(),
+            "ModuleResetHebbianMemory": self.TestModuleResetHebbianMemory(),
+            "TrainStepSmoke": self.TrainStepSmoke(),
+            "NormalTrainingConvergence": self.NormalTrainingConvergence(),
+            "GradCoverageReport": self.GradCoverageReport(),
+            "DetachBaseSwitchEffect": self.DetachBaseSwitchEffect(),
+            "QueryTopKEdgeCases": self.QueryTopKEdgeCases(),}
+        
+        passed = sum(1 for v in results.values() if v)
+        print(f"\nConsciousness module tests: {passed}/{len(results)} passed.")
+        return results
+
