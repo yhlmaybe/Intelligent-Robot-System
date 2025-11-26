@@ -492,17 +492,18 @@ class CNNFeatureExtractor(nn.Module):
 
 
 class PerceiveExtractor(nn.Module):
-    def __init__(self,
-                 imgSize: int = 512,
-                 patchSize: int = 1,
-                 embedDim: int = 512,
-                 numHeads: int = 8,
-                 numLayers: int = 6,
-                 hebbRate: float = 0.01,
-                 useHebbian: bool = True,
-                 baseChannels: int = 64,
-                 dropout: float = 0.1,
-                 posDrop: float = 0.1):
+    def __init__(
+        self,
+        imgSize: int = 512,
+        patchSize: int = 1,
+        embedDim: int = 512,
+        numHeads: int = 8,
+        numLayers: int = 6,
+        hebbRate: float = 0.01,
+        useHebbian: bool = True,
+        baseChannels: int = 64,
+        dropout: float = 0.1,
+        posDrop: float = 0.1):
         super().__init__()
 
         assert embedDim % numHeads == 0, "embed_dim must be divisible by num_heads"
