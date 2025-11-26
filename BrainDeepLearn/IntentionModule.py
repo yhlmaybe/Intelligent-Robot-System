@@ -222,7 +222,7 @@ class IntentionExtractor(nn.Module):
             numLayers=numEncoderLayers,
             dropout=encoderDropout,
             paddingIdx=self.pad_idx,)
-        
+
         encoder_out_dim = self.encoder.out_dim
 
         self.semProj = nn.Sequential(
@@ -251,7 +251,6 @@ class IntentionExtractor(nn.Module):
         self.lossLambdaEntropy = float(lossLambdaEntropy)
 
         fuse_ocr_in = dimSem * 7
-
         self.fuse_ocr_gate = nn.Sequential(
             nn.Linear(fuse_ocr_in, dimSem),
             nn.LayerNorm(dimSem),
@@ -260,7 +259,6 @@ class IntentionExtractor(nn.Module):
             nn.Sigmoid(),)
 
         fuse_ext_in = dimSem * 4
-
         self.fuse_ext_gate = nn.Sequential(
             nn.Linear(fuse_ext_in, dimSem),
             nn.LayerNorm(dimSem),
@@ -271,17 +269,15 @@ class IntentionExtractor(nn.Module):
         self.beta_ocr = nn.Parameter(torch.tensor(0.1))
         self.beta_ext = nn.Parameter(torch.tensor(0.1))
 
-
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=dimSem,
-            nhead=8, 
-            dim_feedforward=dimSem * 4, 
+            nhead=8,
+            dim_feedforward=dimSem * 4,
             dropout=encoderDropout,
             batch_first=True,
             activation="gelu",)
         
         self.intentTransformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
-
         self.beta_trans = nn.Parameter(torch.tensor(0.3))
 
     def LoadOcrDict(self, dictPath: str) -> None:
@@ -295,7 +291,7 @@ class IntentionExtractor(nn.Module):
                     continue
                 ch = token
                 if ch not in ch2id:
-                    ch_id = len(id2ch) + 1 
+                    ch_id = len(id2ch) + 1
                     ch2id[ch] = ch_id
                     id2ch.append(ch)
 
@@ -305,10 +301,13 @@ class IntentionExtractor(nn.Module):
         self.ch2id = ch2id
         self.id2ch = id2ch
 
-
     def TokenizeBatch(self, texts: List[str], device: torch.device) -> torch.Tensor:
         batch_size = len(texts)
-        tokens = torch.full((batch_size, self.max_seq_len), self.pad_idx, dtype=torch.long, device=device,)
+        tokens = torch.full(
+            (batch_size, self.max_seq_len),
+            self.pad_idx,
+            dtype=torch.long,
+            device=device,)
 
         if self.ch2id:
             for i, s in enumerate(texts):
@@ -348,7 +347,7 @@ class IntentionExtractor(nn.Module):
         texts: List[str],
         device: torch.device,) -> torch.Tensor:
         batch_size = len(texts)
-        _ = batch_size  
+        _ = batch_size
 
         valid = []
         normed = []
@@ -361,12 +360,12 @@ class IntentionExtractor(nn.Module):
                 normed.append(s2)
                 valid.append(len(s2) > 0)
 
-        token_ids = self.TokenizeBatch(normed, device=device) 
-        text_repr = self.encoder(token_ids) 
+        token_ids = self.TokenizeBatch(normed, device=device)
+        text_repr = self.encoder(token_ids)
         lang_sem = self.semProj(text_repr)
 
-        mask_valid = torch.tensor(valid, dtype=torch.bool, device=device) 
-        lang_sem = lang_sem * mask_valid.unsqueeze(-1) 
+        mask_valid = torch.tensor(valid, dtype=torch.bool, device=device)
+        lang_sem = lang_sem * mask_valid.unsqueeze(-1)
 
         return lang_sem
 
@@ -381,7 +380,6 @@ class IntentionExtractor(nn.Module):
                 merged.append(" ".join(parts))
         return merged
 
-
     def forward(
         self,
         consState: Optional[torch.Tensor],
@@ -393,7 +391,6 @@ class IntentionExtractor(nn.Module):
         device = self.conceptEmb.device
 
         batch_size: Optional[int] = None
-
         if consState is not None:
             consState = consState.to(device)
             batch_size = consState.size(0)
@@ -408,144 +405,114 @@ class IntentionExtractor(nn.Module):
             if batch_size is None:
                 batch_size = len(extTexts)
             elif len(extTexts) != batch_size:
-                raise ValueError(f"IntentionExtractor: batch mismatch, consState/ocr vs extTexts={len(extTexts)}")
+                raise ValueError( f"IntentionExtractor: batch mismatch, consState/ocr vs extTexts={len(extTexts)}")
 
         if batch_size is None:
             return None, None, {}
 
         cons_sem: Optional[torch.Tensor] = None
         if consState is not None:
-            cons_sem = self.consNorm(self.consProj(consState)) 
+            cons_sem = self.consNorm(self.consProj(consState))
+            has_cons_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        else:
+            has_cons_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        sem_ocr: Optional[torch.Tensor] = None
-        has_ocr: bool = False
         if ocrTexts is not None:
-            merged = self.MergeOcrTexts(ocrTexts) 
-            sem_ocr = self.EncodeStrings(merged, device=device) 
-            has_ocr = bool(sem_ocr.abs().sum(dim=-1).gt(0).any().item())
+            merged = self.MergeOcrTexts(ocrTexts)
+            sem_ocr = self.EncodeStrings(merged, device=device)
+            has_ocr_mask = sem_ocr.abs().sum(dim=-1).gt(0)
+        else:
+            sem_ocr = torch.zeros(batch_size, self.dimSem, device=device)
+            has_ocr_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        sem_ext: Optional[torch.Tensor] = None
-        has_ext: bool = False
         if extTexts is not None:
             normed = [("" if t is None else str(t)) for t in extTexts]
             sem_ext = self.EncodeStrings(normed, device=device)
-            has_ext = bool(sem_ext.abs().sum(dim=-1).gt(0).any().item())
+            has_ext_mask = sem_ext.abs().sum(dim=-1).gt(0)
+        else:
+            sem_ext = torch.zeros(batch_size, self.dimSem, device=device)
+            has_ext_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         extras: Dict[str, torch.Tensor] = {}
 
-        if not has_ocr and not has_ext:
-            if cons_sem is None:
-                return None, None, extras
-
-            intentSem = cons_sem
-            symbol_logits = F.linear(intentSem, self.conceptEmb, self.conceptBias)
-            symProbs = self.reasoner(symbol_logits, self.conceptEmb)
-
-            extras["cons_sem"] = cons_sem.detach()
-            return intentSem, symProbs, extras
+        if (cons_sem is None) and (not has_ocr_mask.any()) and (not has_ext_mask.any()):
+            return None, None, extras
 
         if cons_sem is not None:
-            base = cons_sem  
+            base = cons_sem
             extras["cons_sem"] = cons_sem.detach()
-
-            if has_ocr and sem_ocr is not None:
-                if has_ext and sem_ext is not None:
-                    ext_for_ocr = sem_ext
-                else:
-                    ext_for_ocr = torch.zeros_like(sem_ocr)
-
-                feat_ocr = torch.cat([
-                        base,
-                        sem_ocr,
-                        torch.abs(base - sem_ocr),
-                        base * sem_ocr,
-                        ext_for_ocr,
-                        torch.abs(ext_for_ocr - sem_ocr),
-                        ext_for_ocr * sem_ocr,],dim=-1, )
-
-                gate_ocr = self.fuse_ocr_gate(feat_ocr) 
-                sem_ocr_fused = gate_ocr * sem_ocr 
-
-                base = base + self.beta_ocr * sem_ocr_fused
-
-                extras["sem_ocr_raw"] = sem_ocr.detach()
-                extras["sem_ocr_fused"] = sem_ocr_fused.detach()
-                extras["gate_ocr"] = gate_ocr.detach()
-
-            intentSem = base
-
-            if has_ext and sem_ext is not None:
-                feat_ext = torch.cat([
-                        base,
-                        sem_ext,
-                        torch.abs(base - sem_ext),
-                        base * sem_ext,],dim=-1,)
-
-                gate_ext = self.fuse_ext_gate(feat_ext) 
-
-                if prioritizeExt:
-                    gamma = gate_ext 
-                    intentSem = (1.0 - gamma) * base + gamma * sem_ext
-                    extras["gamma_ext"] = gamma.detach()
-                else:
-                    sem_ext_fused = gate_ext * sem_ext
-                    intentSem = base + self.beta_ext * sem_ext_fused
-                    extras["sem_ext_fused"] = sem_ext_fused.detach()
-
-                extras["sem_ext_raw"] = sem_ext.detach()
-                extras["gate_ext"] = gate_ext.detach()
-
         else:
-            sources = []
-            if has_ocr and sem_ocr is not None:
-                sources.append(sem_ocr)
-            if has_ext and sem_ext is not None:
-                sources.append(sem_ext)
+            base = torch.zeros(batch_size, self.dimSem, device=device)
 
-            if len(sources) == 0:
-                return None, None, extras
+        ext_for_ocr = sem_ext 
 
-            stacked = torch.stack(sources, dim=0) 
-            intentSem = stacked.mean(dim=0)  
+        feat_ocr = torch.cat([
+                base,
+                sem_ocr,
+                torch.abs(base - sem_ocr),
+                base * sem_ocr,
+                ext_for_ocr,
+                torch.abs(ext_for_ocr - sem_ocr),
+                ext_for_ocr * sem_ocr,],dim=-1,) 
 
-            if has_ocr and sem_ocr is not None:
-                extras["sem_ocr_raw"] = sem_ocr.detach()
-            if has_ext and sem_ext is not None:
-                extras["sem_ext_raw"] = sem_ext.detach()
+        gate_ocr = self.fuse_ocr_gate(feat_ocr)
+        sem_ocr_fused = gate_ocr * sem_ocr 
 
-        token_list = []
-        mask_list = []
+        ocr_mask_float = has_ocr_mask.unsqueeze(-1).float()
+        base = base + self.beta_ocr * (sem_ocr_fused * ocr_mask_float)
+
+        extras["sem_ocr_raw"] = sem_ocr.detach()
+        extras["sem_ocr_fused"] = sem_ocr_fused.detach()
+        extras["gate_ocr"] = gate_ocr.detach()
+        extras["has_ocr_mask"] = has_ocr_mask.detach()
+
+        feat_ext = torch.cat([
+                base,
+                sem_ext,
+                torch.abs(base - sem_ext),
+                base * sem_ext,],dim=-1,) 
+
+        gate_ext = self.fuse_ext_gate(feat_ext)
+
+        has_ext_mask_float = has_ext_mask.unsqueeze(-1).float()
+        has_ext_mask_exp = has_ext_mask.unsqueeze(-1) 
+
+        if prioritizeExt:
+            gamma = 0.5 + 0.5 * gate_ext  
+            candidate = (1.0 - gamma) * base + gamma * sem_ext
+            intentSem = torch.where(has_ext_mask_exp, candidate, base)
+
+            extras["gamma_ext"] = gamma.detach()
+        else:
+            sem_ext_fused = gate_ext * sem_ext
+            intentSem = base + self.beta_ext * (sem_ext_fused * has_ext_mask_float)
+            extras["sem_ext_fused"] = sem_ext_fused.detach()
+
+        extras["sem_ext_raw"] = sem_ext.detach()
+        extras["gate_ext"] = gate_ext.detach()
+        extras["has_ext_mask"] = has_ext_mask.detach()
 
         if cons_sem is not None:
-            token_list.append(cons_sem) 
-            mask_list.append(torch.ones(batch_size, dtype=torch.bool, device=device))
+            cons_token = cons_sem
         else:
-            token_list.append(torch.zeros(batch_size, self.dimSem, device=device))
-            mask_list.append(torch.zeros(batch_size, dtype=torch.bool, device=device))
+            cons_token = torch.zeros(batch_size, self.dimSem, device=device)
 
-        if sem_ocr is not None and has_ocr:
-            token_list.append(sem_ocr)
-            mask_list.append(torch.ones(batch_size, dtype=torch.bool, device=device))
-        else:
-            token_list.append(torch.zeros(batch_size, self.dimSem, device=device))
-            mask_list.append(torch.zeros(batch_size, dtype=torch.bool, device=device))
+        tokens = torch.stack([
+                cons_token,
+                sem_ocr,
+                sem_ext,],dim=1,)
 
-        if sem_ext is not None and has_ext:
-            token_list.append(sem_ext)
-            mask_list.append(torch.ones(batch_size, dtype=torch.bool, device=device))
-        else:
-            token_list.append(torch.zeros(batch_size, self.dimSem, device=device))
-            mask_list.append(torch.zeros(batch_size, dtype=torch.bool, device=device))
-
-        tokens = torch.stack(token_list, dim=1)  
-        token_mask = torch.stack(mask_list, dim=1) 
+        token_mask = torch.stack([
+                has_cons_mask,
+                has_ocr_mask,
+                has_ext_mask,], dim=1,) 
 
         if token_mask.any():
             src_key_padding_mask = ~token_mask 
 
-            trans_out = self.intentTransformer(tokens,src_key_padding_mask=src_key_padding_mask,) 
+            trans_out = self.intentTransformer(tokens,src_key_padding_mask=src_key_padding_mask,)
 
-            mask_float = token_mask.float().unsqueeze(-1) 
+            mask_float = token_mask.float().unsqueeze(-1)  
             sum_vec = (trans_out * mask_float).sum(dim=1)
             denom = mask_float.sum(dim=1).clamp(min=1.0)
             fused = sum_vec / denom 
@@ -560,10 +527,10 @@ class IntentionExtractor(nn.Module):
 
         return intentSem, symProbs, extras
 
-
     def GetInternalLoss(
         self,
         symProbs: torch.Tensor,) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
         total_loss, stats = self.reasoner.GetInternalLoss(
             conceptEmb=self.conceptEmb,
             symProbs=symProbs,
@@ -572,3 +539,4 @@ class IntentionExtractor(nn.Module):
             lambdaEntropy=self.lossLambdaEntropy,)
         
         return total_loss, stats
+
