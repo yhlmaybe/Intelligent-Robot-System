@@ -51,6 +51,8 @@ public:
 
     bool TrainModule(bool isOnlineLearning = false, int epochs = 5, int batchSize = 1, double valSplit = 0.1, bool resume = true);
 
+    bool TrainOCRModule(bool isOnlineLearning = false, int epochs = 5, int batchSize = 1, double valSplit = 0.1, bool resume = true);
+
     bool DeployModule(int cameraIndex = 0, bool useHebbian = true, bool usePlanner = true);
 
     bool ExportParmFromCheckpoint(bool isOverride);
@@ -79,7 +81,15 @@ public:
 
     bool TestValueEstimationModule();
 
+    bool TestConsciousnessModule();
+
+    bool TestIntentionModule();
+
+    bool TestOCRModule();
+
     bool TestModuleTrain(bool onlineLearning);
+
+    bool TestOCRModuleTrain(bool onlineLearning);
 
 private:
 

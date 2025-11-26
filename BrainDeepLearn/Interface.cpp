@@ -71,6 +71,14 @@ bool BrainDeepLearnInterface::TrainModule(bool isOnlineLearning, int epochs, int
     });
 }
 
+bool BrainDeepLearnInterface::TrainOCRModule(bool isOnlineLearning, int epochs, int batchSize, double valSplit, bool resume) 
+{
+    return RunPythonAsync([this, isOnlineLearning, epochs, batchSize, valSplit, resume]()
+    {
+        (void)CALL_METHOD_RET_BOOL("TrainOCRModule", "biidi", isOnlineLearning, epochs, batchSize, valSplit, resume?1:0);
+    });
+}
+
 bool BrainDeepLearnInterface::DeployModule(int cameraIndex, bool useHebbian, bool usePlanner)
 {
     return RunPythonAsync([this, cameraIndex, useHebbian, usePlanner]()
@@ -236,10 +244,42 @@ bool BrainDeepLearnInterface::TestValueEstimationModule()
     });
 }
 
+bool BrainDeepLearnInterface::TestConsciousnessModule()
+{
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("TestConsciousnessModule");
+    });
+}
+
+bool BrainDeepLearnInterface::TestIntentionModule()
+{
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("TestIntentionModule");
+    });
+}
+
+bool BrainDeepLearnInterface::TestOCRModule()
+{
+    return RunPythonAsync([this]()
+    {
+        (void)CALL_METHOD_NOARG("TestOCRModule");
+    });
+}
+
 bool BrainDeepLearnInterface::TestModuleTrain(bool onlineLearning)
 {
     return RunPythonAsync([this, onlineLearning]()
     {
         (void)CALL_METHOD_RET_BOOL("TestModuleTrain", "b", onlineLearning);
+    });
+}
+
+bool BrainDeepLearnInterface::TestOCRModuleTrain(bool onlineLearning)
+{
+    return RunPythonAsync([this, onlineLearning]()
+    {
+        (void)CALL_METHOD_RET_BOOL("TestOCRModuleTrain", "b", onlineLearning);
     });
 }
