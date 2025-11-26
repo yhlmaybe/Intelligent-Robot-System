@@ -56,7 +56,19 @@ private slots:
 
     void TestTrainModule();
 
+    void TestTrainOCRModule();
+
+    void TestConsciousnessModule();
+
+    void TestIntentionModule();
+
+    void TestOCRModule();
+
+
+
     void TrainModule();
+
+    void TrainOCRModule();
 
     void ExportParmFromCheckpoint();
 

@@ -31,9 +31,14 @@ BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manage
     connect(ui->testDecisionModule_pushButton, SIGNAL(clicked()), this, SLOT(TestDecisionModule()));
     connect(ui->testWorldModule_pushButton, SIGNAL(clicked()), this, SLOT(TestWorldModule()));
     connect(ui->testValueEstimationModule_pushButton, SIGNAL(clicked()), this, SLOT(TestValueEstimationModule()));
-    connect(ui->testTrainAndDeploy_pushButton, SIGNAL(clicked()), this, SLOT(TestTrainModule()));
+    connect(ui->testTrainModule_pushButton, SIGNAL(clicked()), this, SLOT(TestTrainModule()));
+    connect(ui->testTrainOCRModule_pushButton, SIGNAL(clicked()), this, SLOT(TestTrainOCRModule()));
+    connect(ui->testConsciousnessModule_pushButton, SIGNAL(clicked()), this, SLOT(TestConsciousnessModule()));
+    connect(ui->testIntentionModule_pushButton, SIGNAL(clicked()), this, SLOT(TestIntentionModule()));
+    connect(ui->testOCRModule_pushButton, SIGNAL(clicked()), this, SLOT(TestOCRModule()));
 
     connect(ui->trainModule_pushButton, SIGNAL(clicked()), this, SLOT(TrainModule()));
+    connect(ui->trainOCRModule_pushButton, SIGNAL(clicked()), this, SLOT(TrainOCRModule()));
     connect(ui->deployModule_pushButton, SIGNAL(clicked()), this, SLOT(DeployModule()));
     connect(ui->stop_pushButton, SIGNAL(clicked()), this, SLOT(StopModule()));
     connect(ui->pause_pushButton, SIGNAL(clicked()), this, SLOT(PauseModule()));
@@ -118,10 +123,43 @@ void BrainDeepLearnForm::TestTrainModule()
     }
 }
 
+void BrainDeepLearnForm::TestTrainOCRModule()
+{
+    if(ui->onlineLearning_checkBox->isChecked())
+    {
+        brainDeepLearn->TestOCRModuleTrain(true);
+    }
+    else
+    {
+        brainDeepLearn->TestOCRModuleTrain(false);
+    }
+}
+
+void BrainDeepLearnForm::TestConsciousnessModule()
+{
+    brainDeepLearn->TestConsciousnessModule();
+}
+
+void BrainDeepLearnForm::TestIntentionModule()
+{
+    brainDeepLearn->TestIntentionModule();
+}
+
+void BrainDeepLearnForm::TestOCRModule()
+{
+    brainDeepLearn->TestOCRModule();
+}
+
 void BrainDeepLearnForm::TrainModule()
 {
     brainDeepLearn->TrainModule();
 }
+
+void BrainDeepLearnForm::TrainOCRModule()
+{
+    brainDeepLearn->TrainOCRModule();
+}
+
 
 void BrainDeepLearnForm::ExportParmFromCheckpoint()
 {
