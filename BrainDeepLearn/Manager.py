@@ -25,6 +25,9 @@ from MemoryModule import MemoryExtractor, TestMemoryMTool
 from DecisionModule import DecisionExtractor, DecisionOnlineWrapper, KEYBOARD_LAYOUT, TestDecisionMTool, DecisionPlannerExtractor
 from WorldModule import RSSMWorldModel, WorldModelOnlineWrapper, TestWorldMTool
 from ValueEstimationModule import ValueEstimationExtractor,ValueEstimationOnlineWrapper, TestValueEstimationMTool
+from ConsciousnessModule import ConsciousnessExtractor,TestConsciousMTool
+from IntentionModule import IntentionExtractor, IntentionOnlineWrapper, TestIntentionMTool
+from OCRModule import OCREngineExtractor, TestOCRMTool
 
 try:
     import imageio.v3 as iio
@@ -728,7 +731,10 @@ class ManagerFunction:
             "memory": TestMemoryMTool(),
             "decision": TestDecisionMTool(),
             "world": TestWorldMTool(),
-            "value": TestValueEstimationMTool(),}
+            "value": TestValueEstimationMTool(),
+            "consciousness": TestConsciousMTool(),
+            "OCR": TestOCRMTool(),
+            "intention": TestIntentionMTool(),}
 
     def StartTraining(self, epochs: int = 5, batchSize: int = 32, valSplit: float = 0.1, resume: bool = True, onlineLearning:bool = False,isTest: bool = False):
         if self.is_begin:
@@ -1266,6 +1272,18 @@ class ManagerFunction:
 
     def TestValueEstimationModule(self):
         t = self.test["value"]
+        return t.RunAll()
+    
+    def TestConsciousnessModule(self):
+        t = self.test["consciousness"]
+        return t.RunAll()
+    
+    def TestIntentionModule(self):
+        t = self.test["intention"]
+        return t.RunAll()
+    
+    def TestOCRModule(self):
+        t = self.test["OCR"]
         return t.RunAll()
     
 

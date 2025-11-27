@@ -339,11 +339,7 @@ class OCREngineExtractor(nn.Module):
         self.idx2Char = ["<blank>"] + list(vocabChars)
         self.char2Idx = {c: i for i, c in enumerate(self.idx2Char)}
 
-        self.recognizer = CRNNRecognizer(
-            imgH=32,
-            inCh=1,
-            nClasses=len(self.idx2Char),
-            rnnHidden=256,)
+        self.recognizer = CRNNRecognizer(imgH=32,inCh=1, nClasses=len(self.idx2Char), rnnHidden=256,)
 
 
     def LoadOcrVocabFromTxt(dictPath: str, *, encoding: str = "utf-8") -> str:
