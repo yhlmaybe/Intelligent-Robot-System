@@ -1665,16 +1665,20 @@ class TestDecisionMTool:
         try:
             layer = HebbianPlasticityLayer(128, 64).to(self.device)
             x = torch.randn(8, 128, device=self.device)
-            y0 = layer(x, update=False)
-            y1 = layer(x, update=True)
+
+            y0 = layer(x)
+            y1 = layer(x)
+
             if y0.shape != (8, 64) or y1.shape != (8, 64):
                 print("HebbianPlasticityLayer shape does not match")
                 return False
+
             with torch.no_grad():
                 changed = layer.hebb.abs().sum().item() > 0
             if not changed:
                 print("The Hebb buffer is not updated online")
                 return False
+
             print("HebbianPlasticityLayer pass")
             return True
         except Exception as e:
@@ -1737,7 +1741,9 @@ class TestDecisionMTool:
             model.eval()
             B = 3
             x = torch.randn(B, 1024, device=self.device)
-            out = model(x, sample=False, prior=None, returnKeysVec=False, applyConstraints=True)
+            intent = torch.randn(B, model.intentDim, device=self.device)
+
+            out = model(x, intent, sample=False, prior=None, returnKeysVec=False, applyConstraints=True)
             kb, ms, opt = out["keyboard"], out["mouse"], out["option"]
             checks = [
                 kb["base_logits"].shape  == (B, self.num_base),
@@ -1747,10 +1753,12 @@ class TestDecisionMTool:
                 ms["logstd"].shape == (B, 2),
                 ms["click_logits"].shape == (B, 2),
                 opt["psi_all"].shape == (B, model.num_options, model.option.psiDim),]
+            
             if not all(checks):
                 print("DecisionExtractor forward output dimension does not match")
                 return False
-            out2 = model(x, sample=True, deterministic=False, prior=None, returnKeysVec=True, applyConstraints=True)
+
+            out2 = model(x, intent, sample=True, deterministic=False, prior=None, returnKeysVec=True, applyConstraints=True)
             key_vec = out2["key_vec"]
             if key_vec.shape != (B, self.keyvec_dim):
                 print("key_vec shape does not match")
@@ -1773,16 +1781,18 @@ class TestDecisionMTool:
             model.option.trans_adapter.Grow(addRank=1)
 
             x = torch.randn(2, 256, device=self.device)
+            intent = torch.randn(2, model.intentDim, device=self.device)
             prev0 = torch.zeros(2, K, device=self.device)
             prev1 = torch.zeros(2, K, device=self.device); prev1[:, 0] = 1.0
 
-            out0 = model(x, sample=False, prevOptionOnehot=prev0, returnKeysVec=False)
-            out1 = model(x, sample=False, prevOptionOnehot=prev1, returnKeysVec=False)
+            out0 = model(x, intent, sample=False, prevOptionOnehot=prev0, returnKeysVec=False)
+            out1 = model(x, intent, sample=False, prevOptionOnehot=prev1, returnKeysVec=False)
 
             with torch.no_grad():
-                h = model.option.enc(F.silu(model.to_z(model.hebb(model.feature_net(x)))))
+                z = model.Encode(x, intent)
                 trans_eff = model.option.trans_adapter(model.option.trans)
                 expect = prev1 @ trans_eff
+
             diff = (out1["option"]["logits"] - out0["option"]["logits"] - expect).abs().max().item()
             if diff >= 1e-5:
                 print(f"prev@trans_eff mismatched functions: diff={diff:.2e}")
@@ -1821,18 +1831,22 @@ class TestDecisionMTool:
             model.eval()
             B = 4
             x = torch.randn(B, 128, device=self.device)
+            intent = torch.randn(B, model.intentDim, device=self.device)
 
-            h = model.keyboard.backbone(F.silu(model.to_z(model.hebb(model.feature_net(x)))))
+            with torch.no_grad():
+                z = model.Encode(x, intent)
+                h = model.keyboard.backbone(z)
+
             out_dim = model.keyboard.base_head.target.out_features
             in_dim = model.keyboard.base_head.target.in_features
             deltaW = torch.randn(out_dim, in_dim, device=self.device) * 1e-3
             D = {"kbd_base": deltaW}
 
-            outD = wrapper.ForwardWithDeltas(x, keyPaddingMask=None, tdError=None, uncertainty=None, deltasPerLayer=[D])
-            out0 = wrapper.ForwardWithDeltas(x, keyPaddingMask=None, tdError=None, uncertainty=None, deltasPerLayer=[{}])
+            outD = wrapper.ForwardWithDeltas(x,keyPaddingMask=None,tdError=None,uncertainty=None,deltasPerLayer=[D],intentFeat=intent,)
+            out0 = wrapper.ForwardWithDeltas(x,keyPaddingMask=None,tdError=None,uncertainty=None,deltasPerLayer=[{}],intentFeat=intent,)
 
             sp = F.softplus
-            w_base = sp(model.g_base) / (sp(model.g_base) + 1.0) 
+            w_base = sp(model.g_base) / (sp(model.g_base) + 1.0)
             expect = (1.0 - w_base) * F.linear(h, deltaW, bias=None)
             
             err = (outD["keyboard"]["base_logits"] - out0["keyboard"]["base_logits"] - expect).abs().max().item()
@@ -1859,8 +1873,10 @@ class TestDecisionMTool:
             B = torch.zeros(out_dim, addRank, device=self.device) * 1e-4
 
             x = torch.randn(5, 128, device=self.device)
-            h = model.keyboard.backbone(F.relu(model.to_z(model.hebb(model.feature_net(x)))))
+            intent = torch.randn(5, model.intentDim, device=self.device)
             with torch.no_grad():
+                z = model.Encode(x, intent)
+                h = model.keyboard.backbone(z)
                 y_base = model.keyboard.base_head(h).detach()
 
             ok = wrapper.CommitOne("kbd_base", layerIdx=0, a=A, b=B, scale=1e-3)
@@ -1897,19 +1913,22 @@ class TestDecisionMTool:
             opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
             x_fix = torch.randn(B, in_dim, device=self.device)
+            intent_fix = torch.randn(B, model.intentDim, device=self.device)
             K = model.num_options
             prev_fix = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
 
             with torch.no_grad():
-                out0 = model(x_fix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev_fix, returnKeysVec=False)
+                out0 = model(x_fix, intent_fix, sample=True, deterministic=False,prior=None, prevOptionOnehot=prev_fix, returnKeysVec=False)
                 start_loss = self.DecisionOnlyLoss(out0, entCoef=0.0).item()
 
             for t in range(steps):
                 x = torch.randn(B, in_dim, device=self.device)
+                intent = torch.randn(B, model.intentDim, device=self.device)
                 prev = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
 
                 self.ZeroAllGrads(model)
-                out = model(x, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev, returnKeysVec=False)
+                out = model(x, intent, sample=True, deterministic=False,prior=None, prevOptionOnehot=prev, returnKeysVec=False)
+               
                 adv = {
                     "option": torch.full((B,), 1.5, device=self.device),
                     "beta": torch.full((B,), 0.5, device=self.device),
@@ -2004,16 +2023,19 @@ class TestDecisionMTool:
 
             B = 8
             x = torch.randn(B, in_dim, device=self.device)
+            intent = torch.randn(B, model.intentDim, device=self.device)
             K = model.num_options
             prev = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
 
-            out = model(x, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev, returnKeysVec=False)
+            out = model(x, intent, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev, returnKeysVec=False)
             loss = self.DecisionOnlyLoss(out, entCoef=0.0)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
 
-            if (model.feature_net[0].fc1.target.weight.grad is None) or (model.keyboard.base_head.target.weight.grad is None) or (model.mouse.mu_head.target.weight.grad is None):
+            if (model.feature_net[0].fc1.target.weight.grad is None) or \
+               (model.keyboard.base_head.target.weight.grad is None) or \
+               (model.mouse.mu_head.target.weight.grad is None):
                 print("Training Smoke: Critical Gradient Missing (decision-only)")
                 return False
             
@@ -2033,9 +2055,10 @@ class TestDecisionMTool:
             B = 16
             for t in range(steps):
                 x = torch.randn(B, in_dim, device=self.device)
+                intent = torch.randn(B, model.intentDim, device=self.device)
                 K = model.num_options
                 prev = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
-                out = model(x, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev, returnKeysVec=False)
+                out = model(x, intent, sample=True, deterministic=False,prior=None, prevOptionOnehot=prev, returnKeysVec=False)
 
                 loss = self.DecisionOnlyLoss(out, entCoef=0.0)
                 opt.zero_grad(set_to_none=True)
@@ -2066,9 +2089,10 @@ class TestDecisionMTool:
             B = 16
             for _ in range(steps):
                 x = torch.randn(B, in_dim, device=self.device)
+                intent = torch.randn(B, model.intentDim, device=self.device)
                 K = model.num_options
                 prev = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
-                out = model(x, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev, returnKeysVec=False)
+                out = model(x, intent, sample=True, deterministic=False,prior=None, prevOptionOnehot=prev, returnKeysVec=False)
                 loss = self.DecisionOnlyLoss(out, entCoef=0.0)
 
                 opt.zero_grad(set_to_none=True)
@@ -2100,6 +2124,7 @@ class TestDecisionMTool:
 
             B = 32
             xfix = torch.randn(B, in_dim, device=device)
+            intent_fix = torch.randn(B, model.intentDim, device=device)
             K = model.num_options
             prevfix = F.one_hot(torch.randint(0, K, (B,), device=device), num_classes=K).float()
 
@@ -2159,7 +2184,7 @@ class TestDecisionMTool:
                 return {"base": z, "extra": z, "skill": z, "mouse": z, "click": z, "option": z, "beta": z}
 
             with torch.no_grad():
-                out0 = model(xfix, sample=True, deterministic=False, prevOptionOnehot=prevfix, returnKeysVec=False)
+                out0 = model(xfix, intent_fix, sample=True, deterministic=False, prevOptionOnehot=prevfix, returnKeysVec=False)
                 m0 = metrics(out0)
                 start_proxy = float(m0["proxy"].mean().item())
                 start_pack = {k: float(v.mean().item()) for k, v in m0.items() if k != "proxy"}
@@ -2170,7 +2195,7 @@ class TestDecisionMTool:
 
             ent_coef = 0.0 
             for t in range(1, steps + 1):
-                out = model(xfix, sample=True, deterministic=False, prevOptionOnehot=prevfix, returnKeysVec=False)
+                out = model(xfix, intent_fix, sample=True, deterministic=False, prevOptionOnehot=prevfix, returnKeysVec=False)
 
                 base_loss = self.DecisionOnlyLoss(out, adv=zero_adv(out), entCoef=ent_coef)
                 shape_loss = shaping_loss(out)
@@ -2193,7 +2218,7 @@ class TestDecisionMTool:
                             f"opt0={m['opt0'].mean():.3f} beta={m['beta'].mean():.3f}")
 
             with torch.no_grad():
-                out1 = model(xfix, sample=True, deterministic=False, prevOptionOnehot=prevfix, returnKeysVec=False)
+                out1 = model(xfix, intent_fix, sample=True, deterministic=False, prevOptionOnehot=prevfix, returnKeysVec=False)
                 m1 = metrics(out1)
                 end_proxy = float(m1["proxy"].mean().item())
                 end_pack = {k: float(v.mean().item()) for k, v in m1.items() if k != "proxy"}
@@ -2294,12 +2319,12 @@ class TestDecisionMTool:
             opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=1e-3)
 
             x = torch.randn(B, in_dim, device=self.device)
+            intent = torch.randn(B, model.intentDim, device=self.device)
             K = model.num_options
             prev_onehot = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
 
             self.ZeroAllGrads(model)
-            out = model(x, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev_onehot, returnKeysVec=False)
-
+            out = model(x, intent, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev_onehot, returnKeysVec=False)
             adv = {
                 "option": torch.full((B,), 1.5, device=self.device),
                 "beta": torch.full((B,), 0.7, device=self.device),
@@ -2388,7 +2413,7 @@ class TestDecisionMTool:
             print("Grad routing test error:", type(e).__name__, e)
             return False
 
-    def StressTestPlannerAndDecision(self,horizon: int = 6, N: int = 96, elite: int = 12,iters: int = 3, train_steps: int = 150) -> bool:
+    def StressTestPlannerAndDecision(self, horizon: int = 6, N: int = 96,elite: int = 12, iters: int = 3, train_steps: int = 150) -> bool:
         try:
             wm, planner = self.BuildPlanner(horizon=horizon, N=N, elite=elite, iters=iters)
             if planner is None:
@@ -2404,11 +2429,12 @@ class TestDecisionMTool:
             opt = torch.optim.Adam(model.parameters(), lr=2e-4)
 
             x = torch.randn(B, in_dim, device=self.device)
+            intent = torch.randn(B, model.intentDim, device=self.device)
             K = model.num_options
             prev_onehot = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
 
             for t in range(train_steps):
-                out = model(x, sample=True, deterministic=False, prior=prior, mixW=0.3, prevOptionOnehot=prev_onehot, returnKeysVec=False)
+                out = model(x, intent, sample=True, deterministic=False, prior=prior, mixW=0.3, prevOptionOnehot=prev_onehot, returnKeysVec=False)
                 loss = self.DecisionOnlyLoss(out, entCoef=0.01)
 
                 opt.zero_grad(set_to_none=True)
