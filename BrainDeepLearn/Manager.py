@@ -431,12 +431,12 @@ class Agent:
             mouse = out["decision"]["mouse"]["a"] # [B, 2]
             total_loss = out["losses"]["total_loss"]
             return key_vec, mouse, total_loss
-        else:  
-            with torch.no_grad:  
+        else:
+            with torch.no_grad():
                 out = self.brain.Step(frames,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
                 key_vec = out["decision"]["key_vec"] # [B, 106]
                 mouse = out["decision"]["mouse"]["a"] # [B, 2]
-                return key_vec, mouse 
+                return key_vec, mouse
 
 
     def Save(self, path: str):
