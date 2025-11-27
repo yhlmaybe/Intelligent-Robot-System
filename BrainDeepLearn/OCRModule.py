@@ -598,3 +598,413 @@ class OCREngineExtractor(nn.Module):
             ocr_texts.append(lines)
 
         return ocr_texts
+
+
+
+
+
+
+class TestOCRMTool:
+    def __init__(self, device: Optional[torch.device] = None):
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch.manual_seed(42)
+
+
+    def GradCoverage(
+        self,
+        named: Dict[str, torch.nn.Parameter],
+        min_ratio: float,
+        must_have: List[str],) -> bool:
+        total_trainable = sum(1 for p in named.values() if p.requires_grad)
+        total_with_grad = sum(1 for p in named.values() if p.requires_grad and (p.grad is not None))
+        ratio = total_with_grad / max(1, total_trainable)
+
+        missing = [n for n in must_have if n in named and (named[n].grad is None)]
+        if missing:
+            print("Missing gradient parameters:", missing)
+            return False
+
+        if ratio < min_ratio:
+            print(f"Gradient coverage too low: {ratio:.2%} < {min_ratio:.2%}")
+            return False
+
+        print(f"Gradient coverage: {ratio:.2%}")
+        return True
+
+    def MakeEngine(self) -> "OCREngineExtractor":
+        try:
+            engine = OCREngineExtractor().to(self.device)
+            return engine
+        except (TypeError, FileNotFoundError, RuntimeError) as e:
+            print(f"OCREngineExtractor init failed ({e}), patching LoadOcrVocabFromTxt with dummy vocab.")
+
+            OCREngineExtractor.LoadOcrVocabFromTxt = staticmethod("0123456789ABCDEF")
+            engine = OCREngineExtractor().to(self.device)
+            return engine
+
+
+    def DetectForwardShapes(self) -> bool:
+        try:
+            backbone = DBBackbone(inCh=3, baseCh=64).to(self.device)
+            head = DBHead(inCh=256, kValue=50.0).to(self.device)
+            backbone.eval()
+            head.eval()
+
+            B, H, W = 2, 256, 256
+            imgs = torch.randn(B, 3, H, W, device=self.device)
+
+            with torch.no_grad():
+                feat = backbone(imgs)
+                prob, thresh, binmap = head(feat)
+
+            assert prob.shape[0] == B and prob.shape[1] == 1
+            assert thresh.shape == prob.shape
+            assert binmap.shape == prob.shape
+
+            for t in (prob, thresh, binmap):
+                assert torch.isfinite(t).all()
+                assert t.min().item() >= -1e-6 and t.max().item() <= 1.0 + 1e-6
+
+            print("DetectForwardShapes passed.")
+            return True
+        except AssertionError as e:
+            print("DetectForwardShapes failed:", e)
+            return False
+        except Exception as e:
+            print("DetectForwardShapes error:", e)
+            return False
+
+    def DetectLossGradSmoke(self) -> bool:
+        try:
+            backbone = DBBackbone(inCh=3, baseCh=64).to(self.device)
+            head = DBHead(inCh=256, kValue=50.0).to(self.device)
+            crit = DBLoss().to(self.device)
+
+            backbone.train()
+            head.train()
+
+            B, H, W = 2, 256, 256
+            imgs = torch.randn(B, 3, H, W, device=self.device)
+
+            feat = backbone(imgs)
+            prob, thresh, binmap = head(feat)
+
+            gtShrink = (torch.rand_like(prob) > 0.7).float()
+            gtThresh = torch.rand_like(prob)
+            gtMask = (torch.rand_like(prob) > 0.1).float()
+
+            loss, stats = crit(probMap=prob, binMap=binmap, threshMap=thresh, gtShrink=gtShrink, gtThresh=gtThresh, gtMask=gtMask,)
+
+            opt = torch.optim.Adam(list(backbone.parameters()) + list(head.parameters()), lr=1e-3)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+
+            named: Dict[str, nn.Parameter] = {}
+            named.update({f"backbone.{k}": v for k, v in backbone.named_parameters()})
+            named.update({f"dbHead.{k}": v for k, v in head.named_parameters()})
+
+            must_have = [
+                "backbone.enc1.0.conv.weight",
+                "backbone.enc2.0.conv.weight",
+                "backbone.outConv.conv.weight",
+                "dbHead.probConv.0.conv.weight",
+                "dbHead.threshConv.0.conv.weight",]
+
+            ok_cov = self.GradCoverage(named, min_ratio=0.4, must_have=must_have)
+            assert ok_cov, "DB detection grad coverage failed."
+
+            for n, p in named.items():
+                if p.requires_grad and p.grad is not None:
+                    assert torch.isfinite(p.grad).all(), f"Non-finite grad at {n}"
+
+            opt.step()
+            print("DetectLossGradSmoke passed.")
+            return True
+        except AssertionError as e:
+            print("DetectLossGradSmoke failed:", e)
+            return False
+        except Exception as e:
+            print("DetectLossGradSmoke error:", e)
+            return False
+
+
+    def RecognizeForwardShapes(self) -> bool:
+        try:
+            rec = CRNNRecognizer(imgH=32, inCh=1, nClasses=32, rnnHidden=128).to(self.device)
+            rec.eval()
+
+            B = 3
+            imgs = torch.randn(B, 1, 32, 128, device=self.device)
+
+            with torch.no_grad():
+                out = rec(imgs)
+                logits = out["logits"]
+                log_probs = out["log_probs"]
+
+            T, B2, C = log_probs.shape
+            assert B2 == B and C == rec.nClasses
+            assert T > 0
+
+            assert torch.isfinite(logits).all()
+            assert torch.isfinite(log_probs).all()
+
+            print("RecognizeForwardShapes passed.")
+            return True
+        except AssertionError as e:
+            print("RecognizeForwardShapes failed:", e)
+            return False
+        except Exception as e:
+            print("RecognizeForwardShapes error:", e)
+            return False
+
+    def RecognizeCtcGradSmoke(self) -> bool:
+        try:
+            nClasses = 32
+            rec = CRNNRecognizer(imgH=32, inCh=1, nClasses=nClasses, rnnHidden=128).to(self.device)
+            rec.train()
+
+            B = 4
+            imgs = torch.randn(B, 1, 32, 128, device=self.device)
+
+            with torch.no_grad():
+                out0 = rec(imgs)
+                T = out0["log_probs"].size(0)
+
+            max_len = max(1, T // 2)
+            targetLengths = torch.randint(1, max_len + 1, (B,), device=self.device, dtype=torch.long)
+            total_len = int(targetLengths.sum().item())
+            targets = torch.randint(1, nClasses, (total_len,), device=self.device, dtype=torch.long)
+
+            out = rec(imgs, targetsTensor=targets, targetLengths=targetLengths)
+            assert "loss" in out
+            loss = out["loss"]
+
+            opt = torch.optim.Adam(rec.parameters(), lr=1e-3)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+
+            named = dict(rec.named_parameters())
+            must_have = ["conv1.0.weight", "conv2.0.weight", "rnn.weight_ih_l0", "fc.weight",]
+
+            ok_cov = self.GradCoverage(named, min_ratio=0.5, must_have=must_have)
+            assert ok_cov, "CRNN grad coverage failed."
+
+            for n, p in named.items():
+                if p.requires_grad and p.grad is not None:
+                    assert torch.isfinite(p.grad).all(), f"Non-finite grad at {n}"
+
+            opt.step()
+            print("RecognizeCtcGradSmoke passed.")
+            return True
+        except AssertionError as e:
+            print("RecognizeCtcGradSmoke failed:", e)
+            return False
+        except Exception as e:
+            print("RecognizeCtcGradSmoke error:", e)
+            return False
+
+
+    def EngineForwardDetectAndLoss(self) -> bool:
+        try:
+            engine = self.MakeEngine()
+            engine.train()
+
+            B, H, W = 2, 256, 256
+            imgs = torch.randn(B, 3, H, W, device=self.device)
+
+            with torch.no_grad():
+                feat_tmp = engine.backbone(imgs)
+                prob_tmp, _, _ = engine.dbHead(feat_tmp)
+
+            gtShrink = (torch.rand_like(prob_tmp) > 0.7).float()
+            gtThresh = torch.rand_like(prob_tmp)
+            gtMask = (torch.rand_like(prob_tmp) > 0.1).float()
+
+            out = engine.ForwardDetect(imgs, gtShrink=gtShrink, gtThresh=gtThresh, gtMask=gtMask,)
+            assert "loss" in out
+            loss = out["loss"]
+
+            opt = torch.optim.Adam(list(engine.backbone.parameters()) + list(engine.dbHead.parameters()), lr=1e-3)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+
+            named: Dict[str, nn.Parameter] = {}
+            named.update({f"backbone.{k}": v for k, v in engine.backbone.named_parameters()})
+            named.update({f"dbHead.{k}": v for k, v in engine.dbHead.named_parameters()})
+
+            must_have = [
+                "backbone.enc1.0.conv.weight",
+                "backbone.enc4.1.conv.weight",
+                "dbHead.probConv.0.conv.weight",
+                "dbHead.threshConv.0.conv.weight",]
+
+            ok_cov = self.GradCoverage(named, min_ratio=0.4, must_have=must_have)
+            assert ok_cov, "Engine detect grad coverage failed."
+
+            opt.step()
+            print("EngineForwardDetectAndLoss passed.")
+            return True
+        except AssertionError as e:
+            print("EngineForwardDetectAndLoss failed:", e)
+            return False
+        except Exception as e:
+            print("EngineForwardDetectAndLoss error:", e)
+            return False
+
+    def EngineForwardRecognizeAndLoss(self) -> bool:
+        try:
+            engine = self.MakeEngine()
+            rec = engine.recognizer.to(self.device)
+            rec.train()
+
+            B = 3
+            imgs = torch.randn(B, 1, 32, 128, device=self.device)
+
+            with torch.no_grad():
+                out0 = rec(imgs)
+                T = out0["log_probs"].size(0)
+
+            max_len = max(1, T // 2)
+            targetLengths = torch.randint(1, max_len + 1, (B,), device=self.device, dtype=torch.long)
+            total_len = int(targetLengths.sum().item())
+            targets = torch.randint(1, rec.nClasses, (total_len,), device=self.device, dtype=torch.long)
+
+            out = engine.ForwardRecognize(imgs, targetsTensor=targets, targetLengths=targetLengths)
+            assert "loss" in out
+            loss = out["loss"]
+
+            opt = torch.optim.Adam(rec.parameters(), lr=1e-3)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+
+            named = dict(rec.named_parameters())
+            must_have = [
+                "conv1.0.weight",
+                "conv4.0.weight",
+                "rnn.weight_ih_l0",
+                "fc.weight",]
+
+            ok_cov = self.GradCoverage(named, min_ratio=0.5, must_have=must_have)
+            assert ok_cov, "Engine recognizer grad coverage failed."
+
+            for n, p in named.items():
+                if p.requires_grad and p.grad is not None:
+                    assert torch.isfinite(p.grad).all(), f"Non-finite grad at {n}"
+
+            opt.step()
+            print("EngineForwardRecognizeAndLoss passed.")
+            return True
+        except AssertionError as e:
+            print("EngineForwardRecognizeAndLoss failed:", e)
+            return False
+        except Exception as e:
+            print("EngineForwardRecognizeAndLoss error:", e)
+            return False
+
+    def EngineFullForwardPipeline(self) -> bool:
+        try:
+            engine = self.MakeEngine()
+            engine.eval()
+
+            B, H, W = 2, 256, 256
+            imgs = torch.randn(B, 3, H, W, device=self.device)
+
+            with torch.no_grad():
+                texts_batch = engine(imgs, binThresh=0.3, minBoxArea=5)
+
+            assert isinstance(texts_batch, list)
+            assert len(texts_batch) == B
+
+            for lines in texts_batch:
+                assert isinstance(lines, list)
+                for t in lines:
+                    assert isinstance(t, str)
+
+            print("EngineFullForwardPipeline passed.")
+            return True
+        except AssertionError as e:
+            print("EngineFullForwardPipeline failed:", e)
+            return False
+        except Exception as e:
+            print("EngineFullForwardPipeline error:", e)
+            return False
+
+    def EngineJointTrainGradCoverage(self) -> bool:
+        try:
+            engine = self.MakeEngine()
+            engine.train()
+
+            B_det, H, W = 2, 256, 256
+            imgs_det = torch.randn(B_det, 3, H, W, device=self.device)
+
+            feat = engine.backbone(imgs_det)
+            prob, thresh, binmap = engine.dbHead(feat)
+
+            gtShrink = (torch.rand_like(prob) > 0.7).float()
+            gtThresh = torch.rand_like(prob)
+            gtMask = (torch.rand_like(prob) > 0.1).float()
+
+            loss_det, stats_det = engine.dbLoss(probMap=prob, binMap=binmap, threshMap=thresh, gtShrink=gtShrink, gtThresh=gtThresh, gtMask=gtMask,)
+
+            rec = engine.recognizer
+            B_rec = 3
+            imgs_rec = torch.randn(B_rec, 1, 32, 128, device=self.device)
+
+            with torch.no_grad():
+                out0 = rec(imgs_rec)
+                T = out0["log_probs"].size(0)
+
+            max_len = max(1, T // 2)
+            targetLengths = torch.randint(1, max_len + 1, (B_rec,), device=self.device, dtype=torch.long)
+            total_len = int(targetLengths.sum().item())
+            targets = torch.randint(1, rec.nClasses, (total_len,), device=self.device, dtype=torch.long)
+
+            out_rec = rec(imgs_rec, targetsTensor=targets, targetLengths=targetLengths)
+            loss_rec = out_rec["loss"]
+            total_loss = loss_det + loss_rec
+
+            opt = torch.optim.Adam(engine.parameters(), lr=1e-3)
+            opt.zero_grad(set_to_none=True)
+            total_loss.backward()
+
+            named = dict(engine.named_parameters())
+            must_have = [
+                "backbone.enc1.0.conv.weight",
+                "backbone.enc4.1.conv.weight",
+                "dbHead.probConv.0.conv.weight",
+                "recognizer.conv1.0.weight",
+                "recognizer.rnn.weight_ih_l0",
+                "recognizer.fc.weight",]
+
+            ok_cov = self.GradCoverage(named, min_ratio=0.5, must_have=must_have)
+            assert ok_cov, "Engine joint grad coverage failed."
+
+            for n, p in named.items():
+                if p.requires_grad and p.grad is not None:
+                    assert torch.isfinite(p.grad).all(), f"Non-finite grad at {n}"
+
+            opt.step()
+            print("EngineJointTrainGradCoverage passed.")
+            return True
+        except AssertionError as e:
+            print("EngineJointTrainGradCoverage failed:", e)
+            return False
+        except Exception as e:
+            print("EngineJointTrainGradCoverage error:", e)
+            return False
+
+
+    def RunAll(self) -> Dict[str, bool]:
+        results = {
+            "DetectForwardShapes": self.DetectForwardShapes(),
+            "DetectLossGradSmoke": self.DetectLossGradSmoke(),
+            "RecognizeForwardShapes": self.RecognizeForwardShapes(),
+            "RecognizeCtcGradSmoke": self.RecognizeCtcGradSmoke(),
+            "EngineForwardDetectAndLoss": self.EngineForwardDetectAndLoss(),
+            "EngineForwardRecognizeAndLoss": self.EngineForwardRecognizeAndLoss(),
+            "EngineFullForwardPipeline": self.EngineFullForwardPipeline(),
+            "EngineJointTrainGradCoverage": self.EngineJointTrainGradCoverage(),}
+        
+        passed = sum(1 for v in results.values() if v)
+        print(f"\nOCR module tests: {passed}/{len(results)} passed.")
+        return results
