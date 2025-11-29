@@ -962,6 +962,18 @@ class MemoryExtractor(nn.Module):
         self.ResetInternalLoss()
 
         B, device = x.size(0), x.device
+
+        emotion_eff = emotion
+        if emotion is None:
+            emotion_eff = torch.zeros(B, self.emotion_dim, device=device)
+
+        tdError_eff = tdError
+        reward_eff = reward
+        if tdError_eff is None:
+            tdError_eff = torch.zeros(B, device=device)
+        if reward_eff is None:
+            reward_eff = torch.zeros(B, device=device)
+
         if reset:
             self.ResetAll()
         elif softReset:
@@ -983,22 +995,24 @@ class MemoryExtractor(nn.Module):
         h_new = self.h_state @ self.A_full.t() + self.B_mat(x)
 
         gb = 0.1 + 0.8 * torch.sigmoid(self.grad_bridge) 
-
         h_mix = gb * h_new + (1.0 - gb) * h_prev
 
         y_ssm = self.C_mat(h_mix) + self.D_mat(x)
 
         key, val = self.EncodeKV(h_mix)
 
-        emo_emb = self.emo_write_proj(emotion)  
+        emo_emb = self.emo_write_proj(emotion_eff)  
         emo_emb = F.normalize(emo_emb, dim=-1)
 
-        mod = self.emo_val_mod(emotion) 
+        mod = self.emo_val_mod(emotion_eff) 
         gamma, beta = mod.chunk(2, dim=-1)
         gamma = torch.tanh(gamma)
         beta  = torch.tanh(beta)
 
-        val = F.normalize((1 + gamma) * val + beta, dim=-1)
+        val_mod = (1 + gamma) * val + beta
+
+        alpha = 0.25 * torch.tanh(self.emo_write_alpha)
+        val = F.normalize(val_mod + alpha * emo_emb, dim=-1)
 
         self.h_state = h_mix.detach()
 
@@ -1009,7 +1023,7 @@ class MemoryExtractor(nn.Module):
         self.UpdateMemoryUtilization()
         self.AutoCompress()
 
-        td_feat = tdError.view(-1, 1) if tdError is not None else torch.zeros(B, 1, device=device)
+        td_feat = tdError_eff.view(-1, 1)
         kv_feat = self.KvStats(key) 
         phi = torch.cat([self.ctrl_norm(h_mix), key, kv_feat, importance, gate_local, td_feat], dim=-1)
 
@@ -1017,11 +1031,8 @@ class MemoryExtractor(nn.Module):
         a_raw, b_raw, f_raw, bias_raw = ctrl.split(1, dim=-1)
 
         a = (0.7 + 0.6 * torch.sigmoid(a_raw)).squeeze(-1)
-
         b = (0.97 + 0.03 * torch.sigmoid(b_raw)).squeeze(-1)
-
         fusion_gate = torch.sigmoid(f_raw).squeeze(-1)
-
         gate_bias = 0.5 * torch.tanh(bias_raw).squeeze(-1)
 
         reg = (a - 1.0).abs().mean() + (b - 1.0).abs().mean() + (fusion_gate - 0.5).abs().mean() + gate_bias.abs().mean()
@@ -1037,18 +1048,19 @@ class MemoryExtractor(nn.Module):
         else:
             rule_pre = torch.zeros([], device=h_new.device)
 
-        self.LtmOnlineStore(key, val, importance, tdError=tdError, reward=reward, emotion=emotion,)
+        self.LtmOnlineStore(key, val, importance, tdError=tdError_eff, reward=reward_eff, emotion=emotion_eff,)
        
-        fw_local = self.BuildFastWeights(key, gate_local, neuromod, a, b) if self.enable_hebb_update else None
+        fw_local = self.BuildFastWeights(key, gateLocal=gate_local, neuromod=neuromod, a=a, b=b) if self.enable_hebb_update else None
 
-        mem_recall = self.Retrieve(key,fusion_gate,importance=importance,localGate=gate_local, fwOverride=fw_local,emotion=emotion,tdError=tdError)
+        mem_recall = self.Retrieve(key,fusion_gate, importance=importance, localGate=gate_local, fwOverride=fw_local, emotion=emotion_eff, tdError=tdError_eff,)
 
         self.HebbianUpdate(key, gate_local, neuromod, a, b)
-        self.KvWrite(key, val, importance, emotion=emotion)
+        self.KvWrite(key, val, importance, emotion=emotion_eff)
 
-        ltm_recall, sem_vecs, sem_w, epi_vecs, epi_w = self.ltm.Retrieve(key, topkSem=self.ltm_topk_sem, topkEpi=self.ltm_topk_epi)
+        ltm_recall, sem_vecs, sem_w, epi_vecs, epi_w = self.ltm.Retrieve(
+            key, topkSem=self.ltm_topk_sem, topkEpi=self.ltm_topk_epi)
 
-        msg = torch.cat([h_new, y_ssm, mem_recall, emotion], dim=-1)
+        msg = torch.cat([h_new, y_ssm, mem_recall, emotion_eff], dim=-1)
         ws_val = F.normalize(self.gws_summary(msg), dim=-1)
 
         mem_recall_base = mem_recall.detach() 
@@ -1056,11 +1068,11 @@ class MemoryExtractor(nn.Module):
             loss_gws_align = self.gws_align_weight * (1 - F.cosine_similarity(ws_val, mem_recall_base, dim=-1)).mean()
             self.AddInternalLoss(loss_gws_align)
 
-        affect_mag = tdError.view(-1).abs()
+        affect_mag = tdError_eff.view(-1).abs()
         prio = importance.view(-1) * (1.0 + 0.5 * affect_mag).clamp(0.5, 2.0)
 
         for i in range(B):
-            self.gws.Write(key[i],ws_val[i],priority=float(prio[i].item()),ttl=6,tagId=1,ownerId=self.owner_id,)
+            self.gws.Write(key[i], ws_val[i], priority=float(prio[i].item()), ttl=6, tagId=1, ownerId=self.owner_id,)
 
         gws_read, _ = self.gws.Attend(key, topk=4)
         fuse_gate = self.gws_gate(torch.cat([gws_read, mem_recall], dim=-1))
@@ -1093,7 +1105,7 @@ class MemoryExtractor(nn.Module):
         mem_recall = (1.0 - g_sym) * mem_recall + g_sym * sym_vec
 
         if tdError is not None:
-            mem_recall = self.ApplyOutputGate(mem_recall, tdError, gate_bias)
+            mem_recall = self.ApplyOutputGate(mem_recall, tdError_eff, gate_bias)
 
         fused = self.fusion(torch.cat([y_ssm, mem_recall], dim=-1))
         output = self.norm(fused)
@@ -1113,7 +1125,7 @@ class MemoryExtractor(nn.Module):
             self.RehearseFromLTM(batch=min(8, self.memory_filled if self.memory_filled > 0 else 1))
 
         return output.float(), mem_recall.float()
-
+    
     def GetNeuromod(self, tdError: Optional[torch.Tensor]) -> torch.Tensor:
         if tdError is None:
             return torch.ones(1, 1, 1, device=self.h_state.device)
@@ -1770,6 +1782,9 @@ class TestMemoryMTool:
     def StatePath(self, name: str = "memory_state.pth") -> Path:
         return (self.root / name).absolute()
 
+    def MakeEmotion(self, B: int, mem: MemoryExtractor) -> torch.Tensor:
+        return torch.randn(B, mem.emotion_dim, device=self.device)
+
     def TestGlobalWorkspace(self):
         try:
             dim, slots = 16, 4
@@ -1835,9 +1850,11 @@ class TestMemoryMTool:
             mem = MemoryExtractor(**cfg).to(self.device)
             B = 4
             x = torch.randn(B, cfg["inputDim"], device=self.device)
-            out, memrec = mem(x)
+            emotion = self.MakeEmotion(B, mem)
 
-            assert out.shape == (B, cfg["outputDim"] )
+            out, memrec = mem(x, emotion=emotion)
+
+            assert out.shape == (B, cfg["outputDim"])
             assert memrec.shape == (B, cfg["memoryDim"])
             print("MemoryExtractor forward test passed.")
             return True
@@ -1857,12 +1874,18 @@ class TestMemoryMTool:
             mem.SaveState(str(path))
 
             torch.manual_seed(123)
-            x = torch.randn(3, cfg["inputDim"], device=self.device)
-            out1, _ = mem(x)
-            _ = mem(x)
+            B = 3
+            x = torch.randn(B, cfg["inputDim"], device=self.device)
+            emotion = self.MakeEmotion(B, mem)
+            out1, _ = mem(x, emotion=emotion)
+
+            _ = mem(x, emotion=emotion)
 
             mem.LoadState(str(path))
-            out2, _ = mem(x)
+            torch.manual_seed(123)
+            x = torch.randn(B, cfg["inputDim"], device=self.device)
+            emotion = self.MakeEmotion(B, mem)
+            out2, _ = mem(x, emotion=emotion)
 
             try:
                 path.unlink()
@@ -1885,7 +1908,8 @@ class TestMemoryMTool:
             mem = MemoryExtractor(**cfg).to(self.device)
             for _ in range(5):
                 x = torch.randn(2, cfg["inputDim"], device=self.device)
-                mem(x)
+                emotion = self.MakeEmotion(2, mem)
+                mem(x, emotion=emotion)
 
             goal = torch.randn(cfg["memoryDim"], device=self.device)
             hyp = mem.Reason(goal=goal, steps=3)
@@ -1908,8 +1932,10 @@ class TestMemoryMTool:
         try:
             cfg = dict(inputDim=32, ssmStateDim=32, memoryDim=48, memorySize=32,outputDim=48, useAmp=True, gwsSlots=8, gwsTtl=6)
             mem = MemoryExtractor(**cfg).to(self.device)
-            x = torch.randn(4, cfg["inputDim"], device=self.device)
-            mem(x)
+            B = 4
+            x = torch.randn(B, cfg["inputDim"], device=self.device)
+            emotion = self.MakeEmotion(B, mem)
+            mem(x, emotion=emotion)
 
             fw_before = mem.fast_weights.detach().clone()
             imp_before = mem.memory_importance.detach().clone()
@@ -1936,10 +1962,11 @@ class TestMemoryMTool:
             print(f"MemoryExtractor Reset/SoftReset test error: {e}")
             return False
 
-    def TestMemoryTrain(self, steps: int = 120, batch_size: int = 16):
+    def TestMemoryTrain(self, steps: int = 120, batchSize: int = 16):
         try:
             torch.manual_seed(2025)
             cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64,outputDim=64, useAmp=True, gwsSlots=8, gwsTtl=6,consolidateEvery=10_000, rehearseEvery=10_000)
+            
             device = self.device
             mem = MemoryExtractor(**cfg).to(device)
             mem.train()
@@ -1947,8 +1974,8 @@ class TestMemoryMTool:
             teacher = nn.Sequential(
                 nn.Linear(cfg["inputDim"], 128, bias=False),
                 nn.GELU(),
-                nn.Linear(128, cfg["outputDim"], bias=False),
-            ).to(device)
+                nn.Linear(128, cfg["outputDim"], bias=False),).to(device)
+            
             for p in teacher.parameters():
                 p.requires_grad_(False)
 
@@ -1980,13 +2007,15 @@ class TestMemoryMTool:
 
             in_dim = cfg["inputDim"]
             for t in range(steps):
-                x = torch.randn(batch_size, in_dim, device=device)
-                td = torch.randn(batch_size, device=device)
-                rwd = torch.randn(batch_size, device=device)
+                x = torch.randn(batchSize, in_dim, device=device)
+                td = torch.randn(batchSize, device=device)
+                rwd = torch.randn(batchSize, device=device)
+                emotion = self.MakeEmotion(batchSize, mem)
+
                 with torch.no_grad():
                     target = teacher(x)
 
-                out, _ = mem(x, tdError=td, reward=rwd)
+                out, _ = mem(x, tdError=td, reward=rwd, emotion=emotion)
                 base = F.mse_loss(out, target)
                 total = self.AttachAllInternalLosses(mem, base)
 
@@ -2032,10 +2061,12 @@ class TestMemoryMTool:
                 assert delta_sum > 0.0, f"{must} parameters did not change (Δ=0)"
                 print(f"[trainable] {must}: grad_seen={grads_seen[must]}, Δ_sum={delta_sum:.3e}")
 
-            soft_expect = ["fusion_gate_net", "fusion", "A_full", "B_mat", "C_mat", "D_mat",
-                           "kv_mlp", "kv_head_proj", "k_bias", "v_bias",
-                           "gws_summary", "gws_gate",
-                           "ctrl_head", "ctrl_norm", "grad_bridge", "sym_query", "sym_embed"]
+            soft_expect = [
+                "fusion_gate_net", "fusion", "A_full", "B_mat", "C_mat", "D_mat",
+                "kv_mlp", "kv_head_proj", "k_bias", "v_bias",
+                "gws_summary", "gws_gate",
+                "ctrl_head", "ctrl_norm", "grad_bridge", "sym_query", "sym_embed"]
+            
             for pref in soft_expect:
                 assert grads_seen[pref], f"{pref} saw no gradients (check if in loss path)"
 
@@ -2083,7 +2114,8 @@ class TestMemoryMTool:
         in_dim = mem.B_mat.in_features
         for _ in range(warmup):
             xw = torch.randn(batch, in_dim, generator=rng, device=device)
-            mem(xw)
+            emotion = self.MakeEmotion(batch, mem)
+            mem(xw, emotion=emotion)
 
         mem2 = MemoryExtractor(
             inputDim=mem.B_mat.in_features,
@@ -2113,8 +2145,11 @@ class TestMemoryMTool:
             else:
                 x2 = x if t > 0 else (x + eps * self.RandnLikeGen(x, generator=rng))
 
-            y1, _ = mem(x)
-            y2, _ = mem2(x2)
+            emotion1 = self.MakeEmotion(batch, mem)
+            emotion2 = self.MakeEmotion(batch, mem2)
+
+            y1, _ = mem(x, emotion=emotion1)
+            y2, _ = mem2(x2, emotion=emotion2)
 
             c = F.cosine_similarity(y1, y2, dim=-1).mean().item()
             cos_hist.append(c)
@@ -2173,8 +2208,11 @@ class TestMemoryMTool:
             B = 8
             x = torch.randn(B, cfg["inputDim"], device=self.device)
             target = torch.randn(B, cfg["outputDim"], device=self.device)
+            emotion = self.MakeEmotion(B, mem)
 
-            out, _ = mem(x, tdError=torch.randn(B, device=self.device), reward=torch.randn(B, device=self.device))
+            out, _ = mem(x, tdError=torch.randn(B, device=self.device),
+                         reward=torch.randn(B, device=self.device),
+                         emotion=emotion)
             base = F.mse_loss(out, target)
 
             total = self.AttachAllInternalLosses(mem, base)
@@ -2185,6 +2223,7 @@ class TestMemoryMTool:
                 (("ns_coder_pre" in n or "ns_coder_post" in n or "sym_rules" in n) and
                  (p.grad is not None) and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0)
                 for n, p in mem.named_parameters())
+            
             assert nesy_grad_ok, "NeSy stack (ns_coder_* / sym_rules) did not receive gradients."
 
             for n, p in mem.named_parameters():
@@ -2203,7 +2242,7 @@ class TestMemoryMTool:
 
     def TrainNeSyOnlySanity(self, steps: int = 30):
         try:
-            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32, outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6)
+            cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32,outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6)
             mem = MemoryExtractor(**cfg).to(self.device)
             mem.ns_enable = True
             mem.ns_lambda = 0.5
@@ -2216,7 +2255,8 @@ class TestMemoryMTool:
             in_dim = cfg["inputDim"]
             for _ in range(steps):
                 x = torch.randn(8, in_dim, device=self.device)
-                _ = mem(x)
+                emotion = self.MakeEmotion(8, mem)
+                _ = mem(x, emotion=emotion)
                 base = torch.zeros([], device=self.device)
                 total = self.AttachAllInternalLosses(mem, base)
 
@@ -2240,7 +2280,7 @@ class TestMemoryMTool:
             print(f"TestMemoryMTool.TrainNeSyOnlySanity error: {e}")
             return False
 
-    def TestAllTrainablesTouched(self, steps: int = 10, batch_size: int = 12):
+    def TestAllTrainablesTouched(self, steps: int = 10, batchSize: int = 12):
         try:
             cfg = dict(inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=64,outputDim=96, useAmp=True, gwsSlots=8, gwsTtl=6,consolidateEvery=10_000, rehearseEvery=10_000)
             device = self.device
@@ -2248,15 +2288,17 @@ class TestMemoryMTool:
             mem.train()
 
             opt = torch.optim.Adam(mem.parameters(), lr=1e-3)
-            seen = {n: False for n, p in mem.named_parameters() if p.requires_grad and p.data.numel() > 0}
+            seen = {n: False for n, p in mem.named_parameters()
+                    if p.requires_grad and p.data.numel() > 0}
 
             for t in range(steps):
-                x = torch.randn(batch_size, cfg["inputDim"], device=device)
-                y = torch.randn(batch_size, cfg["outputDim"], device=device)
-                td = torch.randn(batch_size, device=device)
-                rwd = torch.randn(batch_size, device=device)
+                x = torch.randn(batchSize, cfg["inputDim"], device=device)
+                y = torch.randn(batchSize, cfg["outputDim"], device=device)
+                td = torch.randn(batchSize, device=device)
+                rwd = torch.randn(batchSize, device=device)
+                emotion = self.MakeEmotion(batchSize, mem)
 
-                out, _ = mem(x, tdError=td, reward=rwd)
+                out, _ = mem(x, tdError=td, reward=rwd, emotion=emotion)
                 base = F.mse_loss(out, y)
                 total = self.AttachAllInternalLosses(mem, base)
 
@@ -2298,7 +2340,8 @@ class TestMemoryMTool:
             with torch.no_grad():
                 for _ in range(3):
                     xw = torch.randn(B, cfg["inputDim"], device=device)
-                    mem_on(xw)
+                    emotion = self.MakeEmotion(B, mem_on)
+                    mem_on(xw, emotion=emotion)
 
             tmp_path = self.StatePath("memory_state_nesy_effect.pth")
             mem_on.SaveState(str(tmp_path))
@@ -2315,8 +2358,10 @@ class TestMemoryMTool:
 
             with torch.no_grad():
                 xq = torch.randn(B, cfg["inputDim"], device=device)
-                _, recall_on = mem_on(xq)
-                _, recall_off = mem_off(xq)
+                emotion_on = self.MakeEmotion(B, mem_on)
+                emotion_off = self.MakeEmotion(B, mem_off)
+                _, recall_on = mem_on(xq, emotion=emotion_on)
+                _, recall_off = mem_off(xq, emotion=emotion_off)
 
             diff = (recall_on - recall_off).abs().mean().item()
             assert diff > 1e-6, f"NeSy on/off has little effect on mem_recall, diff={diff:.3e}"
@@ -2332,11 +2377,12 @@ class TestMemoryMTool:
 
     def CheckAttachCollector(self):
         try:
-            mem = MemoryExtractor(inputDim=32, ssmStateDim=32, memoryDim=48,
-                                  memorySize=16, outputDim=48, useAmp=True).to(self.device)
+            mem = MemoryExtractor(inputDim=32, ssmStateDim=32, memoryDim=48,memorySize=16, outputDim=48, useAmp=True).to(self.device)
             mem.train()
-            x = torch.randn(4, 32, device=self.device)
-            out, _ = mem(x)
+            B = 4
+            x = torch.randn(B, 32, device=self.device)
+            emotion = self.MakeEmotion(B, mem)
+            out, _ = mem(x, emotion=emotion)
             base = F.mse_loss(out, torch.zeros_like(out))
 
             manual = mem.GetInternalLoss().to(dtype=base.dtype, device=base.device)
@@ -2364,9 +2410,14 @@ class TestMemoryMTool:
             opt = torch.optim.Adam(mem.parameters(), lr=1e-3)
 
             for t in range(steps):
-                x = torch.randn(8, cfg["inputDim"], device=self.device)
-                y = torch.randn(8, cfg["outputDim"], device=self.device)
-                out, _ = mem(x, tdError=torch.randn(8, device=self.device),reward=torch.randn(8, device=self.device))
+                B = 8
+                x = torch.randn(B, cfg["inputDim"], device=self.device)
+                y = torch.randn(B, cfg["outputDim"], device=self.device)
+                td = torch.randn(B, device=self.device)
+                rwd = torch.randn(B, device=self.device)
+                emotion = self.MakeEmotion(B, mem)
+
+                out, _ = mem(x, tdError=td, reward=rwd, emotion=emotion)
                 base = F.mse_loss(out, y)
                 total = self.AttachAllInternalLosses(mem, base)
 
@@ -2406,4 +2457,5 @@ class TestMemoryMTool:
         passed = sum(1 for v in results.values() if v)
         print(f"\nMemory module tests: {passed}/{len(results)} passed.")
         return results
+
 
