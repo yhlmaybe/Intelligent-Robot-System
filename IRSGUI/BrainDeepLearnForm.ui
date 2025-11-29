@@ -24,6 +24,20 @@
      </property>
     </widget>
    </item>
+   <item row="0" column="0">
+    <layout class="QHBoxLayout" name="horizontalLayout">
+     <item>
+      <widget class="QTextBrowser" name="message_textBrowser"/>
+     </item>
+    </layout>
+   </item>
+   <item row="2" column="0">
+    <widget class="QPushButton" name="clear_pushButton">
+     <property name="text">
+      <string>Clear</string>
+     </property>
+    </widget>
+   </item>
    <item row="0" column="1" colspan="2">
     <widget class="QTabWidget" name="tabWidget">
      <property name="sizePolicy">
@@ -129,113 +143,89 @@
       <attribute name="title">
        <string>Test</string>
       </attribute>
-      <layout class="QVBoxLayout" name="verticalLayout_4">
-       <item>
-        <layout class="QVBoxLayout" name="verticalLayout">
-         <property name="spacing">
-          <number>6</number>
+      <layout class="QGridLayout" name="gridLayout_2">
+       <item row="0" column="0">
+        <widget class="QPushButton" name="testPerceptionModule_pushButton">
+         <property name="text">
+          <string>Test Perception Module</string>
          </property>
-         <property name="sizeConstraint">
-          <enum>QLayout::SetDefaultConstraint</enum>
+        </widget>
+       </item>
+       <item row="1" column="0">
+        <widget class="QPushButton" name="testAttentionModulel_pushButton">
+         <property name="text">
+          <string>Test Attention Module</string>
          </property>
-         <item>
-          <widget class="QPushButton" name="testPerceptionModule_pushButton">
-           <property name="text">
-            <string>Test Perception Module</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="testAttentionModulel_pushButton">
-           <property name="text">
-            <string>Test Attention Module</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="testMemoryModule_pushButton">
-           <property name="text">
-            <string>Test Memory Module</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="testDecisionModule_pushButton">
-           <property name="text">
-            <string>Test Decision Module</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="testWorldModule_pushButton">
-           <property name="text">
-            <string>Test World Module</string>
-           </property>
-           <property name="shortcut">
-            <string>Ctrl+S</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="testValueEstimationModule_pushButton">
-           <property name="text">
-            <string>Test Value Estimation Module</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="testConsciousnessModule_pushButton">
-           <property name="text">
-            <string>Test Consciousness Module</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="testOCRModule_pushButton">
-           <property name="text">
-            <string>Test OCR Module</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="testIntentionModule_pushButton">
-           <property name="text">
-            <string>Test Intention Module</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="testTrainModule_pushButton">
-           <property name="text">
-            <string>Test Train Module</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="testTrainOCRModule_pushButton">
-           <property name="text">
-            <string>Test Train OCR Module</string>
-           </property>
-          </widget>
-         </item>
-        </layout>
+        </widget>
+       </item>
+       <item row="2" column="0">
+        <widget class="QPushButton" name="testMemoryModule_pushButton">
+         <property name="text">
+          <string>Test Memory Module</string>
+         </property>
+        </widget>
+       </item>
+       <item row="3" column="0">
+        <widget class="QPushButton" name="testDecisionModule_pushButton">
+         <property name="text">
+          <string>Test Decision Module</string>
+         </property>
+        </widget>
+       </item>
+       <item row="4" column="0">
+        <widget class="QPushButton" name="testWorldModule_pushButton">
+         <property name="text">
+          <string>Test World Module</string>
+         </property>
+         <property name="shortcut">
+          <string>Ctrl+S</string>
+         </property>
+        </widget>
+       </item>
+       <item row="5" column="0">
+        <widget class="QPushButton" name="testValueEstimationModule_pushButton">
+         <property name="text">
+          <string>Test Value Estimation Module</string>
+         </property>
+        </widget>
+       </item>
+       <item row="6" column="0">
+        <widget class="QPushButton" name="testConsciousnessModule_pushButton">
+         <property name="text">
+          <string>Test Consciousness Module</string>
+         </property>
+        </widget>
+       </item>
+       <item row="7" column="0">
+        <widget class="QPushButton" name="testOCRModule_pushButton">
+         <property name="text">
+          <string>Test OCR Module</string>
+         </property>
+        </widget>
+       </item>
+       <item row="8" column="0">
+        <widget class="QPushButton" name="testIntentionModule_pushButton">
+         <property name="text">
+          <string>Test Intention Module</string>
+         </property>
+        </widget>
+       </item>
+       <item row="9" column="0">
+        <widget class="QPushButton" name="testTrainModule_pushButton">
+         <property name="text">
+          <string>Test Train Module</string>
+         </property>
+        </widget>
+       </item>
+       <item row="10" column="0">
+        <widget class="QPushButton" name="testTrainOCRModule_pushButton">
+         <property name="text">
+          <string>Test Train OCR Module</string>
+         </property>
+        </widget>
        </item>
       </layout>
      </widget>
-    </widget>
-   </item>
-   <item row="0" column="0">
-    <layout class="QHBoxLayout" name="horizontalLayout">
-     <item>
-      <widget class="QTextBrowser" name="message_textBrowser"/>
-     </item>
-    </layout>
-   </item>
-   <item row="2" column="0">
-    <widget class="QPushButton" name="clear_pushButton">
-     <property name="text">
-      <string>Clear</string>
-     </property>
     </widget>
    </item>
   </layout>
