@@ -1226,14 +1226,19 @@ class TestIntentionMTool:
         try:
             base = IntentionExtractor().to(self.device)
             base.eval()
-            wrapper = IntentionOnlineWrapper(base=base, initRankEach=4).to(self.device)
+
+            wrapper = IntentionOnlineWrapper(base=base, initRankEach=0).to(self.device)
             wrapper.train()
+
+            wrapper.Update("grow", growFactor=1.0, addEach=4)
 
             consState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(base, batch_size=6)
 
             opt = torch.optim.Adam(list(wrapper.CandParameters()), lr=3e-3)
 
-            intentSem, symProbs, extras = wrapper(consState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=False)
+            dummy_td = torch.ones(consState.size(0), 1, device=self.device)
+
+            intentSem, symProbs, extras = wrapper(consState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=False, tdError=dummy_td)
             loss = F.binary_cross_entropy(symProbs, targetSym)
 
             opt.zero_grad(set_to_none=True)
@@ -1253,23 +1258,25 @@ class TestIntentionMTool:
         except Exception as e:
             print("WrapperCandGradSmoke error:", e)
             return False
-
+        
     def WrapperManualGrowTrainAndCommit(self) -> bool:
         try:
             base = IntentionExtractor().to(self.device)
             base.eval()
 
-            wrapper = IntentionOnlineWrapper(base=base, initRankEach=4).to(self.device)
+            wrapper = IntentionOnlineWrapper(base=base, initRankEach=0).to(self.device)
             wrapper.train()
 
-            _ = wrapper.Update("grow", growFactor=2.0, addEach=0)
+            wrapper.Update("grow", growFactor=1.0, addEach=4)
 
             consState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(base, batch_size=8)
             opt = torch.optim.Adam(list(wrapper.CandParameters()), lr=3e-3)
 
             steps = 10
+
+            dummy_td = torch.ones(consState.size(0), 1, device=self.device)
             for _ in range(steps):
-                intentSem, symProbs, extras = wrapper(consState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=False)
+                intentSem, symProbs, extras = wrapper(consState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=False,tdError=dummy_td)
                 loss = F.binary_cross_entropy(symProbs, targetSym)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()

@@ -79,8 +79,9 @@ class HebbianLinearFW(nn.Module):
         lam: Optional[torch.Tensor] = None,
         betaMix: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
-        scale = 0.0 if betaMix is None else betaMix.detach().mean()
-        W_eff = self.weight + scale * self.H
+        scale = 0.0 if betaMix is None else betaMix.mean()
+        H_eff = self.H.detach().clone()
+        W_eff = self.weight + scale * H_eff
         y = F.linear(x, W_eff, self.bias)
         with torch.no_grad():
             pre, post = x, y
@@ -967,6 +968,8 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         uncert_pred = F.softplus(uncert_raw)
         uncert_pred_fallback = uncert_pred.detach()
 
+        emotion = base.emotion_core(memoryPrev=memory,attnPrev=attn,stateCurr=state,)
+
         irg_out = base.rgen(
             memoryPrev=memory,
             attnPrev=attn,
@@ -1096,6 +1099,7 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
             loss=total_loss,
             eT=eT,
             rInt=r_int,
+            emotion=emotion,
             rComps={k: v.detach() for k, v in comps.items()},
             uncertainty=uncert_pred,
             extras=extras,)
@@ -1284,7 +1288,9 @@ class TestValueEstimationMTool:
             mem, attn, state = self.RandBatch(B)
             done = torch.zeros(B, device=self.device)
 
-            est = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim,useLayerNorm=True, useHebb=True,irgKwargs={"teacherDropoutProb": 0.0}).to(self.device)
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, 
+                                           stateDim=self.state_dim, useLayerNorm=True,useHebb=True,
+                                           irgKwargs={"teacherDropoutProb": 0.0},).to(self.device)
             est.train()
 
             for ad in [est.fc1_adapter, est.fc2_adapter, est.value_adapter, est.uncert_adapter]:
@@ -1293,21 +1299,25 @@ class TestValueEstimationMTool:
             opt = torch.optim.Adam(est.parameters(), lr=1e-3)
 
             with torch.no_grad():
-                before = {n: p.detach().clone()
-                          for n, p in est.named_parameters()
-                          if p.requires_grad and p.data.numel() > 0}
+                before = {
+                    n: p.detach().clone()
+                    for n, p in est.named_parameters()
+                    if p.requires_grad and p.data.numel() > 0}
 
             reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
             entropy_prev = torch.rand(B, device=self.device)
             uncert_teacher = F.softplus(torch.randn(B, device=self.device))
 
-            out = est(memory=mem, attn=attn, state=state,
-                      rewardExt=reward_ext, policyEntropyPrev=entropy_prev,
-                      uncertaintyTeacher=uncert_teacher, tdErrorPrev=None,
-                      done=done)
+            out = est(memory=mem, attn=attn, state=state, rewardExt=reward_ext, policyEntropyPrev=entropy_prev,
+                      uncertaintyTeacher=uncert_teacher,tdErrorPrev=None,done=done,)
+
+            loss = out.loss
+            if out.emotion is not None:
+                emo_loss = (out.emotion ** 2).mean()
+                loss = loss + 0.01 * emo_loss
 
             opt.zero_grad(set_to_none=True)
-            out.loss.backward()
+            loss.backward()
 
             missing = []
             for n, p in est.named_parameters():
@@ -1317,29 +1327,122 @@ class TestValueEstimationMTool:
 
             if missing:
                 print("[AllTrainable] missing/non-finite grads:")
-                for n in missing: print("  -", n)
+                for n in missing:
+                    print("  -", n)
                 return False
 
             torch.nn.utils.clip_grad_norm_(est.parameters(), 1.0)
             opt.step()
 
+            IGNORE_UNCHANGED = {
+                "emotion_core.beta_fast_param",
+                "emotion_core.beta_slow_param",
+                "emotion_core.slow_cell.weight_hh",
+                "emotion_core.gate_net.0.weight",
+                "emotion_core.gate_net.0.bias",}
+
             unchanged = []
+            unchanged_non_ign = []
+
             with torch.no_grad():
                 for n, p in est.named_parameters():
-                    if p.requires_grad and p.data.numel() > 0 and n in before and p.data.shape == before[n].shape:
-                        if torch.allclose(p.data, before[n], atol=0, rtol=0):
+                    if (p.requires_grad and p.data.numel() > 0 and n in before and p.data.shape == before[n].shape):
+                        if torch.allclose(p.data, before[n], atol=0.0, rtol=0.0):
                             unchanged.append(n)
+                            if n not in IGNORE_UNCHANGED:
+                                unchanged_non_ign.append(n)
 
-            if unchanged:
-                print("[AllTrainable] unchanged after step:")
-                for n in unchanged: print("  -", n)
+            if unchanged_non_ign:
+                print("[AllTrainable] unchanged after step (NOT whitelisted):")
+                for n in unchanged_non_ign:
+                    print("  -", n)
                 return False
+
+            if unchanged and not unchanged_non_ign:
+                print("[AllTrainable] unchanged but whitelisted (expected on first step):")
+                for n in unchanged:
+                    print("  -", n)
 
             print("AllTrainableParamsHaveGradAndStep pass")
             return True
+
         except Exception as e:
             print(f"AllTrainableParamsHaveGradAndStep error: {e}")
             return False
+
+    def TestEmotionSecondStepGrad(self) -> bool:
+        try:
+            torch.manual_seed(999)
+            B = 8
+            mem, attn, state = self.RandBatch(B)
+            done = torch.zeros(B, device=self.device)
+
+            est = self.MakeEstimatorHebb().to(self.device)
+            est.train()
+            est.rgen.teacher_dropout_prob = 0.0
+            opt = torch.optim.Adam(est.parameters(), lr=1e-3)
+
+            entropy_prev = torch.rand(B, device=self.device)
+            uncert_teacher = F.softplus(torch.randn(B, device=self.device))
+            reward_ext = torch.randn(B, device=self.device).clamp(-1, 1)
+
+            out1 = est(memory=mem, attn=attn, state=state,rewardExt=reward_ext,
+                       policyEntropyPrev=entropy_prev, uncertaintyTeacher=uncert_teacher,
+                       tdErrorPrev=None, done=done)
+
+            loss1 = out1.loss
+            if out1.emotion is not None:
+                loss1 = loss1 + 0.01 * (out1.emotion ** 2).mean()
+
+            opt.zero_grad(set_to_none=True)
+            loss1.backward()
+            opt.step()
+
+            mem2, attn2, state2 = self.RandBatch(B)
+            entropy_prev2 = torch.rand(B, device=self.device)
+            uncert_teacher2 = F.softplus(torch.randn(B, device=self.device))
+            reward_ext2 = torch.randn(B, device=self.device).clamp(-1, 1)
+
+            out2 = est(memory=mem2, attn=attn2, state=state2,rewardExt=reward_ext2,
+                       policyEntropyPrev=entropy_prev2,uncertaintyTeacher=uncert_teacher2,
+                       tdErrorPrev=None,done=done)
+
+            loss2 = out2.loss
+            if out2.emotion is not None:
+                loss2 = loss2 + 0.01 * (out2.emotion ** 2).mean()
+
+            opt.zero_grad(set_to_none=True)
+            loss2.backward()
+
+            target_names = {
+                "emotion_core.beta_fast_param",
+                "emotion_core.beta_slow_param",
+                "emotion_core.slow_cell.weight_hh",
+                "emotion_core.gate_net.0.weight",
+                "emotion_core.gate_net.0.bias",}
+
+            bad = []
+            for n, p in est.named_parameters():
+                if n in target_names:
+                    if (p.grad is None) or (not torch.isfinite(p.grad).all()):
+                        bad.append(f"{n}: grad None/NaN")
+                    else:
+                        gmax = p.grad.abs().max().item()
+                        if gmax < 1e-10:
+                            bad.append(f"{n}: grad too small ({gmax:.3e})")
+
+            if bad:
+                print("EmotionSecondStepGrad failed:")
+                for msg in bad:
+                    print("  -", msg)
+                return False
+
+            print("EmotionSecondStepGrad pass")
+            return True
+        except Exception as e:
+            print(f"EmotionSecondStepGrad error: {e}")
+            return False
+
 
     def TestGlue1TriggersOnSecondStep(self) -> bool:
         try:
@@ -1498,6 +1601,10 @@ class TestValueEstimationMTool:
                 done=done)
 
             loss = out.loss
+
+            if out.emotion is not None:
+                emo_loss = (out.emotion ** 2).mean()
+                loss = loss + 0.01 * emo_loss
             assert loss.dim() == 0 and torch.isfinite(loss), "loss not scalar/finite"
 
             opt.zero_grad(set_to_none=True)
@@ -1935,6 +2042,7 @@ class TestValueEstimationMTool:
             "LoRAParamsGrad": self.TestLoRAParamsGrad(),
             "LoRAFreezeOld": self.TestLoRAFreezeOld(),
             "AllTrainableParamsHaveGradAndStep": self.TestAllTrainableParamsHaveGradAndStep(),
+            "EmotionSecondStepGrad": self.TestEmotionSecondStepGrad(),
             "Glue1TriggersOnSecondStep": self.TestGlue1TriggersOnSecondStep(),
             "WrapperAlignmentNoDelta": self.TestWrapperAlignmentNoDelta(),
             "SimThenCommitVHead": self.TestSimThenCommitVHead(),

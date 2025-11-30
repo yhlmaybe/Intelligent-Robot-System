@@ -708,15 +708,13 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         L = len(self.base.transformer_layers)
 
         def alloc_feat(addRank: int, device: torch.device, dtype: torch.dtype):
-            A = nn.Parameter(torch.randn(addRank, C, 1, 1, device=device, dtype=dtype) * 1e-4)
-            B = nn.Parameter(torch.zeros(C, addRank, 1, 1, device=device, dtype=dtype) * 1e-4)
+            A = nn.Parameter(torch.randn(addRank, C, device=device, dtype=dtype) * 1e-4) 
+            B = nn.Parameter(torch.zeros(C, addRank, device=device, dtype=dtype) * 1e-4) 
             s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
             return A, B, s
 
         def compose_feat(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            A2 = a.view(a.size(0), C)
-            B2 = b.view(C, a.size(0))
-            return torch.tanh(s) * GetParameterSScale(s) * (B2 @ A2)
+            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
 
         def alloc_patch(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, C * ksz, device=device, dtype=dtype) * 1e-4)
@@ -737,7 +735,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
 
         return {
-            "feat": SiteSpec("feat", L, C * 1, C * 1, self.maxRankFeat, alloc_feat, compose_feat),
+            "feat": SiteSpec("feat", L, C, C, self.maxRankFeat, alloc_feat, compose_feat),
             "patch": SiteSpec("patch", L, C * ksz, E, self.maxRankPatch, alloc_patch, compose_patch),
             "token": SiteSpec("token", L, D, D, self.maxRankToken, alloc_token, compose_token),}
 
@@ -810,8 +808,14 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         if site == "feat":
             if layerIdx != 0:
                 return False
-            init = {"A": a.detach().clone(), "B": b.detach().clone(), "scale": float(scale)}
-            self.base.cnn_feat_adapter.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
+            r = a.size(0)
+            C = self.base.cnn_feat_adapter.C 
+
+            a2 = a.detach().clone().view(r, C, 1, 1) 
+            b2 = b.detach().clone().view(C, r, 1, 1)
+
+            init = {"A": a2, "B": b2, "scale": float(scale)}
+            self.base.cnn_feat_adapter.Grow(addRank=r, init=init, freezeOld=self.freezeOldPar)
             return True
 
         elif site == "patch":

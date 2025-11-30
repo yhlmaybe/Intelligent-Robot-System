@@ -363,9 +363,14 @@ class BaseOnlineWrapper(nn.Module):
 
     def ComposeLayerDelta(self, layerIdx: int) -> Dict[str, Optional[torch.Tensor]]:
         out = {}
-        for name in self.sites:
+        for name, spec in self.sites.items():
+            slot = self.cand[name][layerIdx]
+            if len(slot["A"]) == 0:
+                out[name] = None
+                continue
+
             dMat = self.ComposeOne(name, layerIdx)
-            out[name] = None if torch.allclose(dMat, torch.zeros_like(dMat)) else dMat
+            out[name] = dMat
         return out
 
     @torch.no_grad()

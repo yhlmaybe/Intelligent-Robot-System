@@ -342,7 +342,7 @@ class OCREngineExtractor(nn.Module):
         self.recognizer = CRNNRecognizer(imgH=32,inCh=1, nClasses=len(self.idx2Char), rnnHidden=256,)
 
 
-    def LoadOcrVocabFromTxt(dictPath: str, *, encoding: str = "utf-8") -> str:
+    def LoadOcrVocabFromTxt(self, dictPath: str, *, encoding: str = "utf-8") -> str:
         chars: List[str] = []
         seen = set()
         with open(dictPath, "r", encoding=encoding) as f:
