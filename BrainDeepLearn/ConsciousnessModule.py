@@ -327,19 +327,25 @@ class ConsciousnessExtractor(nn.Module):
 
         if N == 0:
             summary = torch.zeros(B, 3 * D, device=device, dtype=bank.dtype)
-            stats = {"score_mean": torch.zeros(B, device=device),"n_items": torch.zeros(B, device=device),}
+            stats = {
+                "score_mean": torch.zeros(B, device=device),
+                "n_items": torch.zeros(B, device=device),}
+            
             return summary, stats
 
         scores = score_net(bank).squeeze(-1)
 
-        global_mean = bank.mean(dim=1) 
+        global_mean = bank.mean(dim=1)
 
         k_top = min(top_k, N)
         if k_top > 0:
-            _, top_idx = torch.topk(scores, k=k_top, dim=1)
-            idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, D)
-            top_items = torch.gather(bank, 1, idx_exp)
-            top_mean = top_items.mean(dim=1)
+            top_scores, top_idx = torch.topk(scores, k=k_top, dim=1)
+
+            idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, D) 
+            top_items = torch.gather(bank, 1, idx_exp) 
+
+            top_w = F.softmax(top_scores, dim=-1)  
+            top_mean = torch.einsum("bk,bkd->bd", top_w, top_items) 
         else:
             top_mean = torch.zeros(B, D, device=device, dtype=bank.dtype)
             top_idx = None
@@ -355,14 +361,16 @@ class ConsciousnessExtractor(nn.Module):
 
             _, rand_idx = torch.topk(rand_scores, k=k_rand, dim=1)
             idx_exp2 = rand_idx.unsqueeze(-1).expand(-1, -1, D)
-            rand_items = torch.gather(bank, 1, idx_exp2) 
-            rand_mean = rand_items.mean(dim=1) 
+            rand_items = torch.gather(bank, 1, idx_exp2)
+            rand_mean = rand_items.mean(dim=1)
         else:
             rand_mean = torch.zeros(B, D, device=device, dtype=bank.dtype)
 
         summary = torch.cat([global_mean, top_mean, rand_mean], dim=-1)
 
-        stats = {"score_mean": scores.mean(dim=1),  "n_items": torch.full((B,), float(N), device=device), }
+        stats = {
+            "score_mean": scores.mean(dim=1),
+            "n_items": torch.full((B,), float(N), device=device),}
 
         return summary, stats
 
@@ -481,8 +489,8 @@ class ConsciousnessExtractor(nn.Module):
     
     @torch.no_grad()
     def ResetHebbianMemory(self):
-        for _, m in self.named_children():
-            if hasattr(m, "ResetHebbianMemory"):
+        for m in self.modules():
+            if hasattr(m, "ResetHebbianMemory") and m is not self:
                 m.ResetHebbianMemory()
 
 
