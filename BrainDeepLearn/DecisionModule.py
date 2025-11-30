@@ -462,8 +462,6 @@ class DecisionExtractor(nn.Module):
          return torch.softmax(DecisionExtractor.Safe(logits, 60.0), dim=dim)
     
     def FuseIntent(self, stateFeat: torch.Tensor, intentFeat: torch.Tensor) -> torch.Tensor:
-        intentFeat = intentFeat.to(device=stateFeat.device, dtype=stateFeat.dtype)
-
         gain = torch.tanh(self.intent_gain(intentFeat))  
         bias = self.intent_bias(intentFeat) 
 
@@ -1998,7 +1996,7 @@ class TestDecisionMTool:
                 opt.step()
 
             with torch.no_grad():
-                out1 = model(x_fix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev_fix, returnKeysVec=False)
+                out1 = model(x_fix, intent_fix, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev_fix, returnKeysVec=False)
                 end_loss = self.DecisionOnlyLoss(out1, entCoef=0.0).item()
 
             print(f"[ActionsOnly(decision-only)] loss {start_loss:.4f} -> {end_loss:.4f}")
