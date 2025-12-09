@@ -15,9 +15,11 @@ import traceback
 import os
 import math
 
-import debugpy
+#import debugpy
 
 from torch.utils.data import Dataset, DataLoader
+from dataclasses import dataclass, field
+from collections import deque
 
 from PerceptionModule import PerceiveExtractor, PerceptionOnlineWrapper, TestPerceptionMTool
 from AttentionModule import AttentionExtractor, AttentionOnlineWrapper, TestAttentionMTool
@@ -25,9 +27,10 @@ from MemoryModule import MemoryExtractor, TestMemoryMTool
 from DecisionModule import DecisionExtractor, DecisionOnlineWrapper, KEYBOARD_LAYOUT, TestDecisionMTool, DecisionPlannerExtractor
 from WorldModule import RSSMWorldModel, WorldModelOnlineWrapper, TestWorldMTool
 from ValueEstimationModule import ValueEstimationExtractor,ValueEstimationOnlineWrapper, TestValueEstimationMTool
-from ConsciousnessModule import ConsciousnessExtractor,TestConsciousMTool
+from ConsciousnessModule import ConsciousnessExtractor,TestConsciousMTool, ConsciousnessState
 from IntentionModule import IntentionExtractor, IntentionOnlineWrapper, TestIntentionMTool
 from OCRModule import OCREngineExtractor, TestOCRMTool
+from ModuleDimensionManager import ModuleDim
 
 try:
     import imageio.v3 as iio
@@ -45,6 +48,8 @@ class BasicParameters:
     IMAGE_SEQ_LEN = 16
     IMAGE_RM_LEN = math.ceil(IMAGE_SEQ_LEN * 9 / 10)
 
+    MEMORY_CALLBACK_LEN = 16
+
     MEMORY_MEMORY_PATH = "BrainDeepLearn/Data/MemoryMemory.pt"
     WORLD_MEMORY_PATH = "BrainDeepLearn/Data/WorldMemory.pt"
     MODULEPARAMETER_PATH = "BrainDeepLearn/Data/module_parameter.pth"
@@ -58,6 +63,25 @@ class BasicParameters:
 
 
 
+@dataclass
+class BrainStepTrace:
+    ObsImg: Optional[torch.Tensor] 
+    KeyVec: Optional[torch.Tensor] 
+    MouseDelta: Optional[torch.Tensor]
+    
+    PercFeat: Optional[torch.Tensor]
+    AttnFeat: Optional[torch.Tensor]
+    MemFeat: Optional[torch.Tensor]
+    WorldState: Optional[torch.Tensor]
+    ConsciousnessState: Optional[torch.Tensor]
+    IntentionState: Optional[torch.Tensor]
+    Reward: Optional[torch.Tensor]
+    Done: Optional[torch.Tensor]
+    ValueFeat: Optional[torch.Tensor] 
+
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+
 class BrainCore(nn.Module):
     def __init__(
         self,
@@ -65,18 +89,68 @@ class BrainCore(nn.Module):
         *,
         seqLen: int = BasicParameters.IMAGE_SEQ_LEN,
         plasticHebbian: bool = True,
+        prioritizeExtStr: bool = True,
         plasticOnlineLearning: bool = False,
         usePlanner: bool = True,):
         super().__init__()
         self.SEQ_LEN = seqLen
         self.is_online_learning = plasticOnlineLearning
+        self.prioritize_ext_str = prioritizeExtStr
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.perc = PerceiveExtractor(imgSize=BasicParameters.IMAGE_SIZE,useHebbian=plasticHebbian)
-        self.attn = AttentionExtractor(sequenceLength=seqLen, hebbianRate=(0.01 if plasticHebbian else 0.0), useHebbian=plasticHebbian)
-        self.mem = MemoryExtractor(hebbAlpha=(0.15 if plasticHebbian else 0.0), useHebbian=plasticHebbian)
-        self.actor = DecisionExtractor(stateDim=768, includeNoSkill=True, useHebb=plasticHebbian)
-        self.world = RSSMWorldModel(visionDim=1024, useMemory=True)
-        self.critic = ValueEstimationExtractor(memoryDim=768, attnDim=1024, stateDim=512, useHebb=plasticHebbian)
+
+        self.perc = PerceiveExtractor(
+            imgSize=BasicParameters.IMAGE_SIZE,
+            embedDim=ModuleDim.PerceptionEmbed,
+            useHebbian=plasticHebbian)
+        
+        self.attn = AttentionExtractor(
+            embedDim=ModuleDim.AttentionFeat,
+            sequenceLength=seqLen, 
+            hebbianRate=(0.01 if plasticHebbian else 0.0), 
+            useHebbian=plasticHebbian)
+        
+        self.mem = MemoryExtractor(
+            inputDim=ModuleDim.AttentionFeat,
+            ssmStateDim=ModuleDim.MemoryItem,
+            memoryDim=ModuleDim.MemoryItem,
+            outputDim=ModuleDim.MemoryFeat,
+            hebbAlpha=(0.15 if plasticHebbian else 0.0), 
+            useHebbian=plasticHebbian,
+            emotionDim=ModuleDim.ValueEstimationOutEmotion)
+        
+        self.actor = DecisionExtractor(
+            stateDim=ModuleDim.MemoryFeat, 
+            intentDim=ModuleDim.IntentionFeat,
+            includeNoSkill=True, 
+            useHebb=plasticHebbian)
+        
+        self.world = RSSMWorldModel(
+            visionDim=ModuleDim.AttentionFeat, 
+            deterDim=ModuleDim.WorldOutHState,
+            stochDim=ModuleDim.WorldOutZState,
+            stateDim=ModuleDim.WorldFeat,
+            useMemory=True)
+
+        self.critic = ValueEstimationExtractor(
+            memoryDim=ModuleDim.MemoryFeat, 
+            attnDim=ModuleDim.AttentionFeat, 
+            stateDim=ModuleDim.WorldFeat,
+            emotionDim=ModuleDim.ValueEstimationOutEmotion,
+            useHebb=plasticHebbian)
+        
+        self.conscious = ConsciousnessExtractor(
+            memItemDim=ModuleDim.MemoryItem,
+            worldItemDim=ModuleDim.WorldMemoryItem,
+            intentDim=ModuleDim.ConsciousnessState,
+            useHebb=plasticHebbian)
+
+        self.intention = IntentionExtractor(
+            dimSem=ModuleDim.IntentionFeat,
+            consState=ModuleDim.ConsciousnessState)
+
+        self.OCR = OCREngineExtractor()
+
+        self.history_len = int(BasicParameters.MEMORY_CALLBACK_LEN)
 
         if plasticOnlineLearning:
             self.perc = PerceptionOnlineWrapper(self.perc)
@@ -84,6 +158,7 @@ class BrainCore(nn.Module):
             self.actor = DecisionOnlineWrapper(self.actor)
             self.world = WorldModelOnlineWrapper(self.world)
             self.critic =ValueEstimationOnlineWrapper(self.critic)
+            self.intention = IntentionOnlineWrapper(self.intention)
 
         self.use_planner = usePlanner
 
@@ -113,9 +188,11 @@ class BrainCore(nn.Module):
         def z(*s, dtype=torch.float32):
             return torch.zeros(B, *s, device=device, dtype=dtype)
 
-        self.prev_mem = z(768)
-        self.prev_attn = z(1024)
-        self.prev_state = z(256)
+        self.prev_mem = z(ModuleDim.MemoryFeat)
+        self.prev_attn = z(ModuleDim.AttentionFeat)
+
+        self.prev_world_h = z(ModuleDim.WorldOutHState)
+        self.prev_world_z = z(ModuleDim.WorldOutZState)
 
         self.prev_key_vec = z(self.keyvec_dim) 
         self.prev_mouse = z(2)
@@ -125,13 +202,19 @@ class BrainCore(nn.Module):
         else:
             self.prev_option_onehot = z(self.actor.num_options)
 
-        self.prev_reward = z()
-        self.prev_done = z() 
-        self.prev_entropy = z() 
-        self.prev_unc = z() 
-        self.prev_td = z() 
+        self.prev_reward = z(1)
+        self.prev_done = z(1) 
+        self.prev_entropy = z(1) 
+        self.prev_unc = z(1) 
+        self.prev_td = z(1) 
 
         self._buf_B = B
+
+        self.prev_conscious_state = ConsciousnessState(dev_trace = z(512), step = z(),)
+
+        self.perc_buffer = []
+
+        self.history = deque(maxlen=self.history_len)
 
     @torch.no_grad()
     def EnsureB(self, B: int, isOnlineLearning, device: torch.device):
@@ -144,9 +227,10 @@ class BrainCore(nn.Module):
 
     def Step(
         self,
-        frames: torch.Tensor,  # [B, T=SEQ_LEN, C, H, W]
-        rewardExt: Optional[torch.Tensor] = None, # [B]
-        doneFlag: Optional[torch.Tensor] = None, # [B]
+        frame: torch.Tensor,  # [B, C, H, W]
+        textExt: Optional[List[Optional[str]]] = None,
+        rewardExt: Optional[torch.Tensor] = None, # [B, 1]
+        doneFlag: Optional[torch.Tensor] = None, # [B, 1]
         *,
         isTrain: bool = False,
         sampleActions: bool = True,
@@ -155,19 +239,26 @@ class BrainCore(nn.Module):
         if self.is_online_learning and not isTrain:
             raise RuntimeError(f"Wrappers can only be used during training, but isTrain is {isTrain}, isUseWrappers is {self.is_online_learning}")
 
-        B, T, C, H, W = frames.shape
-        dev = frames.device
-        self.EnsureB(B,self.is_online_learning, dev)
+        B, C, H, W = frame.shape
 
-        if T != self.SEQ_LEN:
-            raise ValueError(f"Expected sequence length {self.SEQ_LEN}, but got {T}. "f"frames.shape={tuple(frames.shape)}")
+        ext_texts = textExt
+        if textExt is None:
+            ext_texts = [None] * B
 
-        # [B,T,C,H,W] -> [B*T,C,H,W]
-        x = frames.view(B * T, C, H, W).contiguous()
+        dev = frame.device
 
-        perc_feats = self.perc(x) # [B*T,D]
+        perc_feats = self.perc(frame) # [B,D]
 
-        percs_seq = perc_feats.view(B, T, -1).contiguous() # [B, T, D]
+        self.perc_buffer.append(perc_feats)
+
+        if len(self.perc_buffer) > self.SEQ_LEN:
+            self.perc_buffer.pop(0)
+        else:
+            return None
+        
+        perc_ocr = self.OCR(frame) 
+
+        percs_seq = torch.stack(self.perc_buffer, dim=1).contiguous()
 
         with torch.no_grad():
             world_vis_in = self.attn(percs_seq)
@@ -177,18 +268,16 @@ class BrainCore(nn.Module):
         else:
             a_enc_prev = self.world.action_encoder(self.prev_key_vec, self.prev_mouse)
 
-        hPrev, zPrev = self.world.ExportState()
-
         if isTrain:
             if self.is_online_learning:
-                wm_kwargs = {"keysVec": self.prev_key_vec,"mouseSeq": self.prev_mouse,"h0": hPrev,"z0": zPrev,"rewardSeq": rewardExt,"doneSeq": doneFlag}
+                wm_kwargs = {"keysVec": self.prev_key_vec,"mouseSeq": self.prev_mouse,"h0": self.prev_world_h,"z0": self.prev_world_z,"rewardSeq": rewardExt,"doneSeq": doneFlag}
                 w_out = self.world(world_vis_in, **wm_kwargs)
             else: 
-                w_out = self.world.ForwardTrainSeq(visionSeq=world_vis_in,keysVec= self.prev_key_vec, mouseSeq=self.prev_mouse, h0=hPrev, z0=zPrev,rewardSeq=rewardExt,doneSeq=doneFlag)
+                w_out = self.world.ForwardTrainSeq(visionSeq=world_vis_in,keysVec= self.prev_key_vec, mouseSeq=self.prev_mouse, h0=self.prev_world_h, z0=self.prev_world_z,rewardSeq=rewardExt,doneSeq=doneFlag)
         else:
-            w_out = self.world.StepPosterior(hPrev, zPrev, visionIn=world_vis_in, actionEnc=a_enc_prev, sample=False)
+            w_out = self.world.StepPosterior(self.prev_world_h, self.prev_world_z, visionIn=world_vis_in, actionEnc=a_enc_prev, sample=False)
 
-        hPrev, zPrev = self.world.ExportState()
+        self.prev_world_h, self.prev_world_z = self.world.ExportState()
 
         s_t = w_out["s_next"] # World State
         r_t = w_out["r_pred"] # Prediction Rewards
@@ -205,19 +294,29 @@ class BrainCore(nn.Module):
         td_sig = critic_out.tdError
         rInt_sig = critic_out.rInt
         unc_sig = critic_out.uncertainty
+        emotion_sig = critic_out.emotion
 
         atten_out = self.attn(percs_seq, tdError=td_sig, uncertainty=unc_sig)
 
-        mem_feat, mem_recall = self.mem(atten_out, tdError=td_sig,reward=rInt_sig)
+        mem_feat, mem_recall = self.mem(atten_out, tdError=td_sig,emotion=emotion_sig,reward=rInt_sig)
 
         mem_extra_loss = self.mem.GetInternalLoss()
 
+        memory_bank = self.mem.ExportMemoryBank(B, dev)
+        world_bank = self.world.ExportWorldMemoryBank(B, dev)
+
+        conscious_out = self.conscious(memoryBank=memory_bank, worldBank=world_bank, prevState=self.prev_conscious_state)
+
+        conscious_state = conscious_out.intent_sem
+
+        intent_sem, sym_probs, intention_extras = self.intention(conscious_state, ocrTexts=perc_ocr, extTexts=ext_texts,prioritizeExt=self.prioritize_ext_str)
+
         with torch.no_grad():
             if self.is_online_learning:
-                actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionOnehot": self.prev_option_onehot}
+                actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionOnehot": self.prev_option_onehot, "intentFeat":intent_sem}
                 act_out = self.actor(x=mem_feat,**actor_kwargs)
             else:    
-                act_out = self.actor(stateFeat=mem_feat,sample=sampleActions,deterministic=deterministicActor,prevOptionOnehot=self.prev_option_onehot)
+                act_out = self.actor(stateFeat=mem_feat,intentFeat=intent_sem,sample=sampleActions,deterministic=deterministicActor,prevOptionOnehot=self.prev_option_onehot)
 
         mouseMu = act_out["mouse"]["mu"].detach()
         mouseLogstd = act_out["mouse"]["logstd"].detach() 
@@ -230,13 +329,15 @@ class BrainCore(nn.Module):
         if self.use_planner:
             with torch.no_grad():
                 prior = self.planner.Plan(mouseMu=mouseMu,mouseLogstd=mouseLogstd,skillLogits=skillLogits,
-                                          baseLogits=baseLogits,extraLogits=extraLogits,clickLogits=clickLogits,h0=hPrev.detach(),z0=zPrev.detach())
+                                          baseLogits=baseLogits,extraLogits=extraLogits,clickLogits=clickLogits,
+                                          h0=self.prev_world_h.detach(),z0=self.prev_world_z.detach())
         
         if self.is_online_learning:
             actor_kwargs["prior"] = prior
-            act_out = self.actor(x=mem_feat,kwargs=actor_kwargs)
+            actor_kwargs["intentFeat"] = intent_sem
+            act_out = self.actor(x=mem_feat,**actor_kwargs)
         else:
-            act_out = self.actor(stateFeat=mem_feat,sample=sampleActions,deterministic=deterministicActor,prevOptionOnehot=self.prev_option_onehot,prior=prior)
+            act_out = self.actor(stateFeat=mem_feat,intentFeat=intent_sem,sample=sampleActions,deterministic=deterministicActor,prevOptionOnehot=self.prev_option_onehot,prior=prior)
 
         key_vec = act_out["key_vec"] # [B,106]
         mouse_a = act_out["mouse"]["a"]  # [B,2]
@@ -252,7 +353,6 @@ class BrainCore(nn.Module):
 
         self.prev_mem = mem_feat.detach()
         self.prev_attn = atten_out.detach()
-        self.prev_state = s_t.detach()
         self.prev_key_vec = key_vec.detach()
         self.prev_mouse = mouse_a.detach()
 
@@ -261,6 +361,24 @@ class BrainCore(nn.Module):
         self.prev_entropy = entropy_scalar.detach()
         self.prev_unc = unc_sig.detach()
         self.prev_td = td_sig.detach()
+
+        self.prev_conscious_state = conscious_out.new_state
+
+        trace = BrainStepTrace(
+            ObsImg=perc_ocr.detach(),
+            KeyVec=key_vec.detach(),
+            MouseDelta=mouse_a.detach(),
+
+            PercFeat=perc_feats.detach(),
+            AttnFeat=atten_out.detach(),
+            MemFeat=mem_feat.detach(),
+            WorldState=s_t.detach(),
+            ConsciousnessState=conscious_state.detach(),
+            IntentionState=intent_sem.detach(),
+            Reward=r_t.detach(),
+            Done=d_t.detach(),
+
+            extras= {},)
 
         losses = {}
 
@@ -311,7 +429,6 @@ class BrainCore(nn.Module):
         return {
             "prev_mem": self.prev_mem,
             "prev_attn": self.prev_attn,
-            "prev_state": self.prev_state,
             "prev_key_vec": self.prev_key_vec,
             "prev_mouse": self.prev_mouse,
             "prev_option_onehot": self.prev_option_onehot,
@@ -321,17 +438,36 @@ class BrainCore(nn.Module):
             "prev_unc": self.prev_unc,
             "prev_td": self.prev_td,
             "world_h": h, 
-            "world_z": z,}
+            "world_z": z,
+            "prev_conscious_state": self.prev_conscious_state,
+            "perc_buffer": self.perc_buffer,
+            "_buf_B": self.prev_mem.size(0)}
 
     @torch.no_grad()
     def ImportBuffers(self, state: Dict[str, Any]):
         device = next(self.parameters()).device
+
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
                 state[k] = v.to(device)
+
+        pcs = state.get("prev_conscious_state", None)
+        if pcs is not None:
+            state["prev_conscious_state"] = ConsciousnessState(
+                dev_trace=pcs.dev_trace.to(device),
+                step=pcs.step.to(device),)
+
+        if "perc_buffer" in state:
+            buf = state["perc_buffer"]
+            if isinstance(buf, list):
+                new_buf = []
+                for t in buf:
+                    if isinstance(t, torch.Tensor):
+                        new_buf.append(t.to(device))
+                state["perc_buffer"] = new_buf
+
         self.prev_mem = state["prev_mem"]
         self.prev_attn = state["prev_attn"]
-        self.prev_state = state["prev_state"]
         self.prev_key_vec = state["prev_key_vec"]
         self.prev_mouse = state["prev_mouse"]
         self.prev_option_onehot = state["prev_option_onehot"]
@@ -341,6 +477,9 @@ class BrainCore(nn.Module):
         self.prev_unc = state["prev_unc"]
         self.prev_td = state["prev_td"]
         self.world.ImportState(state["world_h"], state["world_z"])
+        self.prev_conscious_state = state["prev_conscious_state"]
+        self.perc_buffer = state["perc_buffer"]
+        self._buf_B = self.prev_mem.size(0)
 
 
 
@@ -413,27 +552,25 @@ class Agent:
 
     def Act(
         self,
-        frames: torch.Tensor, # [B,T,C,H,W]
+        frame: torch.Tensor, # [B,C,H,W]
         *,
+        textExt: Optional[List[Optional[str]]] = None,
         reward: Optional[torch.Tensor] = None,
         done: Optional[torch.Tensor] = None,
         sampleActions: bool = True,
         deterministicActor: bool = False,):
 
-        frames = frames.to(self.device)
-        B, T, C, H, W = frames.shape
-        if T != self.brain.SEQ_LEN:
-                raise ValueError(f"Expected frames with sequence length {self.brain.SEQ_LEN}, but got {T}. " f"Shape received: {tuple(frames.shape)}.")
+        frame = frame.to(self.device)
 
         if self.is_train:
-            out = self.brain.Step(frames,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
+            out = self.brain.Step(frame,textExt,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
             key_vec = out["decision"]["key_vec"] # [B, 106]
             mouse = out["decision"]["mouse"]["a"] # [B, 2]
             total_loss = out["losses"]["total_loss"]
             return key_vec, mouse, total_loss
         else:  
-            with torch.no_grad:  
-                out = self.brain.Step(frames,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
+            with torch.no_grad():  
+                out = self.brain.Step(frame,textExt,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
                 key_vec = out["decision"]["key_vec"] # [B, 106]
                 mouse = out["decision"]["mouse"]["a"] # [B, 2]
                 return key_vec, mouse 
@@ -489,11 +626,13 @@ class Agent:
             self.brain.attn.base.ResetHebbianMemory()
             self.brain.actor.base.ResetHebbianMemory()
             self.brain.critic.base.ResetHebbianMemory()
+            self.brain.conscious.base.ResetHebbianMemory()
         else:
             self.brain.perc.ResetHebbianMemory()
             self.brain.attn.ResetHebbianMemory()
             self.brain.actor.ResetHebbianMemory()
             self.brain.critic.ResetHebbianMemory()
+            self.brain.conscious.ResetHebbianMemory()
 
         self.brain.mem.ResetHebbianMemory()
 
@@ -586,7 +725,7 @@ class Agent:
         return results
     
     def UpdateAllWrappers(self, action: str, **kwargs):
-        wrappers = [self.brain.perc, self.brain.attn, self.brain.actor, self.brain.world, self.brain.critic]
+        wrappers = [self.brain.perc, self.brain.attn, self.brain.actor, self.brain.world, self.brain.critic, self.brain.intention]
         results = []
         for w in wrappers:
             out = w.Update(action, **kwargs)
@@ -621,6 +760,72 @@ class Agent:
         print("----------------------------------")
         print(f"TOTAL {kind} params: {total:,}")
         return total
+    
+    def SmoothCorrection(
+        wmSeq: List[torch.Tensor], # [B,1]
+        extLast: torch.Tensor, # [B,1]
+        *,
+        q: float = 0.05,  
+        rWm: float = 0.5, 
+        rExt: float = 0.05, 
+        initVar: float = 1.0,) -> torch.Tensor:
+
+        first = wmSeq[0]
+        B = first.size(0)
+        n = len(wmSeq)
+        device = first.device
+        dtype = first.dtype
+
+        # [B,n]
+        wm_mat = torch.cat(wmSeq, dim=1) 
+        ext_vec = extLast.view(B) 
+
+        q_t = torch.tensor(float(q), device=device, dtype=dtype)
+        r_wm_t = torch.tensor(float(rWm), device=device, dtype=dtype)
+        r_ext_t = torch.tensor(float(rExt), device=device, dtype=dtype)
+
+        x_filt = wm_mat.new_zeros(B, n)  
+        P_filt = wm_mat.new_zeros(B, n) 
+
+        x_filt[:, 0] = wm_mat[:, 0]
+        P_filt[:, 0] = wm_mat.new_full((B,), float(initVar))
+
+        for t in range(1, n):
+            x_prior = x_filt[:, t - 1]
+            P_prior = P_filt[:, t - 1] + q_t
+
+            z_t = wm_mat[:, t] 
+
+            K_t = P_prior / (P_prior + r_wm_t + 1e-8)
+
+            x_post = x_prior + K_t * (z_t - x_prior)
+            P_post = (1.0 - K_t) * P_prior
+
+            x_filt[:, t] = x_post
+            P_filt[:, t] = P_post
+
+        x_T = x_filt[:, -1]
+        P_T = P_filt[:, -1]
+
+        K_ext = P_T / (P_T + r_ext_t + 1e-8)
+        x_T_corr = x_T + K_ext * (ext_vec - x_T)
+        P_T_corr = (1.0 - K_ext) * P_T
+
+        x_filt[:, -1] = x_T_corr
+        P_filt[:, -1] = P_T_corr
+
+        x_smooth = x_filt.clone()
+        P_smooth = P_filt.clone()
+
+        for t in range(n - 2, -1, -1):
+            P_t  = P_filt[:, t]
+            P_tp = P_t + q_t  
+            C_t  = P_t / (P_tp + 1e-8)
+
+            x_smooth[:, t] = x_filt[:, t] + C_t * (x_smooth[:, t + 1] - x_filt[:, t])
+            P_smooth[:, t] = P_t + C_t * C_t * (P_smooth[:, t + 1] - P_tp)
+
+        return x_smooth  # [B,n]
 
 
 
