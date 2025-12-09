@@ -522,15 +522,16 @@ class HebbianFusion(nn.Module):
 
 
 class AttentionExtractor(nn.Module):
-    def __init__(self,
-                 embedDim: int = 1024,
-                 sequenceLength: int = 16,
-                 numHeads: int = 8,
-                 temporalLayers: int = 3,
-                 routingIterations: int = 3,
-                 hebbianRate: float = 0.01,
-                 useHebbian: bool = True,
-                 gradientClipVal: float = 1.0,):
+    def __init__(
+        self,
+        embedDim: int = 1024,
+        sequenceLength: int = 16,
+        numHeads: int = 8,
+        temporalLayers: int = 3,
+        routingIterations: int = 3,
+        hebbianRate: float = 0.01,
+        useHebbian: bool = True,
+        gradientClipVal: float = 1.0,):
         super().__init__()
 
         self.num_caps = sequenceLength
