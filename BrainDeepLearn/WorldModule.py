@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import os
 import torch
 import torch.nn as nn
@@ -63,6 +63,7 @@ class ActionEncoder(nn.Module):
         c = self.cont_net(mouseDelta.float())
         d = (1.0 + torch.tanh(self.to_gamma(c))) * d + self.to_beta(c)
         return self.fuse(torch.cat([d, c], dim=-1))
+
 
 
 class GrowableLoRALinear(nn.Module):
@@ -546,7 +547,7 @@ class RSSMWorldModel(nn.Module):
         stateDim: int = 512,
         useDecoder: bool = True,
         useMemory: bool = True,
-        memoryCapacity: int = 4096,
+        memoryCapacity: int = 16384,
         memoryPath: Optional[str] = None,
         memoryAutosaveEvery: int = 0,
         nsEnabled: bool = True,
@@ -554,7 +555,8 @@ class RSSMWorldModel(nn.Module):
         nsLambdaAtLeastOne: float = 1e-2,
         nsLambdaImplication: float = 1e-2,
         nsBiasPrior: bool = True,
-        metaDim: int = 32,):
+        memTopK = 4,
+        memTemp: float = 1.0,):
         super().__init__()
 
         self.vision_dim = visionDim
@@ -563,6 +565,9 @@ class RSSMWorldModel(nn.Module):
         self.stoch_dim = stochDim
         self.state_dim = stateDim
         self.use_decoder = useDecoder
+
+        self._mem_topk: int = int(memTopK)
+        self._mem_temp: float = float(memTemp)
 
         self._A_prev = None
 
@@ -603,7 +608,7 @@ class RSSMWorldModel(nn.Module):
         
         nn.init.zeros_(self.rew_head[-1].target.bias)
         nn.init.zeros_(self.done_head[-1].target.bias)
-
+        
         self.obs_dec = nn.Sequential(
             GrowableLoRALinear(nn.Linear(stateDim, stateDim, bias=True)),
             nn.GELU(),
@@ -638,17 +643,8 @@ class RSSMWorldModel(nn.Module):
         self.ns_lambda_alo = float(nsLambdaAtLeastOne)
         self.ns_lambda_impl = float(nsLambdaImplication)
 
-        self._meta_dim = int(metaDim)
-        self.meta_to_e = nn.Linear(self._meta_dim, stochDim, bias=False)
-        self.meta_to_mu = nn.Linear(self._meta_dim, stochDim, bias=False)
-        self.meta_gate_e = nn.Linear(deterDim + stochDim, stochDim)
-        self.meta_gate_mu = nn.Linear(deterDim + stochDim, stochDim)
-        self.meta_ctx = nn.Parameter(torch.randn(self._meta_dim) * 1e-2)
-
-        nn.init.xavier_uniform_(self.meta_to_e.weight)
-        nn.init.xavier_uniform_(self.meta_to_mu.weight)
-        nn.init.constant_(self.meta_gate_e.bias, -1.0)
-        nn.init.constant_(self.meta_gate_mu.bias, -1.0)
+        self.mem_gate_e = nn.Linear(deterDim + stochDim, stochDim)
+        nn.init.constant_(self.mem_gate_e.bias, -1.0)
 
         self.ResetHidden(batchSize=batchSize)
 
@@ -656,7 +652,6 @@ class RSSMWorldModel(nn.Module):
             self.LoadMemory(self._mem_path, mapLocation=None, strict=False)
 
         self.mem_val_to_e = nn.Sequential(nn.Linear(deterDim, stochDim), nn.LayerNorm(stochDim))
-
 
         self.conn = ConnNet(stateDim=stateDim,actDim=stochDim,wrapLinear=GrowableLoRALinear)
 
@@ -778,16 +773,30 @@ class RSSMWorldModel(nn.Module):
     def MemRetrieve(self, queryE: torch.Tensor) -> Optional[torch.Tensor]:
         if (not self._use_memory) or (self._mem_size == 0):
             return None
+
         single = queryE.dim() == 1
         if single:
             queryE = queryE.unsqueeze(0)
-        keys = self._mem_keys[: self._mem_size] # [N, stochDim]
-        q = F.normalize(queryE, dim=-1, eps=1e-6)
-        k = F.normalize(keys, dim=-1, eps=1e-6)
-        sims = torch.matmul(q, k.t()) # [B, N]
-        idx = sims.argmax(dim=-1)
-        vals = self._mem_vals[idx] # [B, deterDim]
-        return vals[0] if single else vals
+
+        keys = self._mem_keys[: self._mem_size]
+
+        q = F.normalize(queryE, dim=-1, eps=1e-6) 
+        k = F.normalize(keys, dim=-1, eps=1e-6) 
+
+        sims = torch.matmul(q, k.t()) 
+
+        K = min(max(self._mem_topk, 1), self._mem_size)
+        top_vals, top_idx = torch.topk(sims, k=K, dim=-1) 
+
+        temp = max(self._mem_temp, 1e-6)
+        logits = top_vals / temp
+        weights = F.softmax(logits, dim=-1)
+
+        selected_vals = self._mem_vals[top_idx]
+
+        mem_h = (weights.unsqueeze(-1) * selected_vals).sum(dim=1) 
+
+        return mem_h[0] if single else mem_h
 
     def ResetHidden(self, batchSize: int = 1):
         device = next(self.parameters()).device
@@ -873,8 +882,10 @@ class RSSMWorldModel(nn.Module):
         w = F.softmax(logits, dim=-1)
         s_next = (w[:,0:1]*s_base + w[:,1:2]*s_transport + w[:,2:3]*s_phys + w[:,3:4]*s_ode)
 
-        r_pred = self.rew_head(s_next).squeeze(-1)
-        d_prob = torch.sigmoid(self.done_head(s_next)).squeeze(-1)
+        r_pred = self.rew_head(s_next)
+        d_logit = self.done_head(s_next)
+        d_prob = torch.sigmoid(d_logit)
+
         return h_next, z_next, s_next, r_pred, d_prob # s_next is world state
 
     def StepPosterior(
@@ -900,17 +911,8 @@ class RSSMWorldModel(nn.Module):
                 mem_h = self.MemRetrieve(raw_e)
             if mem_h is not None:
                 mem_e = self.mem_val_to_e(mem_h)
-                gate_m = torch.sigmoid(self.meta_gate_e(torch.cat([h_next, raw_e], dim=-1)))
+                gate_m = torch.sigmoid(self.mem_gate_e(torch.cat([h_next, raw_e], dim=-1)))
                 e_in = raw_e + gate_m * mem_e
-
-        if self._meta_dim > 0:
-            ctx = self.meta_ctx.view(1, -1).expand_as(h_next[:, : self._meta_dim])
-            de_meta = self.meta_to_e(ctx)
-            dmu_meta = self.meta_to_mu(ctx)
-            gate_e = torch.sigmoid(self.meta_gate_e(torch.cat([h_next, e_in], dim=-1)))
-            gate_mu = torch.sigmoid(self.meta_gate_mu(torch.cat([h_next, mu_p], dim=-1)))
-            e_in = e_in + gate_e * de_meta
-            mu_p = mu_p + gate_mu * dmu_meta
 
         if self._ns_enabled:
             ns_logits = self.ns_head_post(torch.cat([h_next, e_in], dim=-1))
@@ -946,8 +948,9 @@ class RSSMWorldModel(nn.Module):
         w = F.softmax(logits, dim=-1)
         s_next = (w[:,0:1]*s_base + w[:,1:2]*s_transport + w[:,2:3]*s_phys + w[:,3:4]*s_ode)
 
-        r_pred = self.rew_head(s_next).squeeze(-1)
-        d_prob = torch.sigmoid(self.done_head(s_next)).squeeze(-1)
+        r_pred = self.rew_head(s_next)
+        d_logit = self.done_head(s_next)
+        d_prob = torch.sigmoid(d_logit)
 
         out = {
             "h_next": h_next,
@@ -1014,17 +1017,8 @@ class RSSMWorldModel(nn.Module):
                 mem_h = self.MemRetrieve(raw_e)
             if mem_h is not None:
                 mem_e = self.mem_val_to_e(mem_h)
-                gate_m = torch.sigmoid(self.meta_gate_e(torch.cat([h_next, raw_e], dim=-1)))
+                gate_m = torch.sigmoid(self.mem_gate_e(torch.cat([h_next, raw_e], dim=-1)))
                 e_in = raw_e + gate_m * mem_e
-
-        if self._meta_dim > 0:
-            ctx = self.meta_ctx.view(1, -1).expand(B, -1)
-            de_meta = self.meta_to_e(ctx)
-            dmu_meta = self.meta_to_mu(ctx)
-            gate_e_meta = torch.sigmoid(self.meta_gate_e(torch.cat([h_next, e_in], dim=-1)))
-            gate_mu_meta = torch.sigmoid(self.meta_gate_mu(torch.cat([h_next, mu_p], dim=-1)))
-            e_in = e_in + gate_e_meta * de_meta
-            mu_p = mu_p + gate_mu_meta * dmu_meta
 
         ns_prior_logic = visionSeq.new_tensor(0.0)
         if self._ns_enabled:
@@ -1086,9 +1080,8 @@ class RSSMWorldModel(nn.Module):
         w = F.softmax(logits, dim=-1)
         s1 = (w[:,0:1]*s_base + w[:,1:2]*s_transport + w[:,2:3]*s_phys + w[:,3:4]*s_ode)
 
-        r1 = self.rew_head(s1).squeeze(-1)
-        d_logit = self.done_head(s1).squeeze(-1)
-        d_prob = torch.sigmoid(d_logit)
+        r1 = self.rew_head(s1)
+        d_logit = self.done_head(s1)
 
         loss_recon = visionSeq.new_tensor(0.0)
         if self.use_decoder:
@@ -1123,6 +1116,8 @@ class RSSMWorldModel(nn.Module):
             with torch.no_grad():
                 self.MemAdd(raw_e.detach(), h_next.detach())
 
+        d_prob = torch.sigmoid(d_logit)
+
         return {
             "loss": loss,
             "loss_recon": loss_recon,
@@ -1137,44 +1132,6 @@ class RSSMWorldModel(nn.Module):
             "z_next": z1,
             "r_pred": r1,
             "d_prob": d_prob,}
-
-    def MetaReset(self):
-        with torch.no_grad():
-            self.meta_ctx.zero_()
-
-    def MetaInnerStep(
-        self,
-        vision: torch.Tensor,
-        keys: torch.Tensor,
-        mouse: torch.Tensor,
-        reward: Optional[torch.Tensor] = None,
-        done: Optional[torch.Tensor] = None,
-        lr: float = 0.1,):
-
-        self.train()
-        for p in self.parameters():
-            p.requires_grad_(False)
-        self.meta_ctx.requires_grad_(True)
-        self.meta_to_e.weight.requires_grad_(True)
-        self.meta_to_mu.weight.requires_grad_(True)
-
-        out = self.ForwardTrainSeq(vision, keys, mouse, rewardSeq=reward, doneSeq=done)
-        loss = out["loss"]
-        loss.backward()
-        with torch.no_grad():
-            if self.meta_ctx.grad is not None:
-                self.meta_ctx -= lr * self.meta_ctx.grad
-                self.meta_ctx.grad.zero_()
-            if self.meta_to_e.weight.grad is not None:
-                self.meta_to_e.weight -= lr * self.meta_to_e.weight.grad
-                self.meta_to_e.weight.grad.zero_()
-            if self.meta_to_mu.weight.grad is not None:
-                self.meta_to_mu.weight -= lr * self.meta_to_mu.weight.grad
-                self.meta_to_mu.weight.grad.zero_()
-
-        for p in self.parameters():
-            p.requires_grad_(True)
-        return float(loss.detach().item())
 
     def ExportWorldMemoryBank(
         self,
@@ -1199,6 +1156,7 @@ class RSSMWorldModel(nn.Module):
         memoryBank = bank1.unsqueeze(0).expand(batchSize, N, -1).contiguous()
 
         return memoryBank
+    
 
 class WorldModelOnlineWrapper(BaseOnlineWrapper):
     def __init__(
@@ -1456,17 +1414,8 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
                 mem_h = wm.MemRetrieve(raw_e)
             if mem_h is not None:
                 mem_e = wm.mem_val_to_e(mem_h)
-                gate_m = torch.sigmoid(wm.meta_gate_e(torch.cat([h_next, raw_e], dim=-1)))
+                gate_m = torch.sigmoid(wm.mem_gate_e(torch.cat([h_next, raw_e], dim=-1)))
                 e_in = raw_e + gate_m * mem_e
-
-        if wm._meta_dim > 0:
-            ctx = wm.meta_ctx.view(1, -1).expand(B, -1)
-            de_meta = wm.meta_to_e(ctx)
-            dmu_meta = wm.meta_to_mu(ctx)
-            gate_e = torch.sigmoid(wm.meta_gate_e(torch.cat([h_next, e_in], dim=-1)))
-            gate_mu = torch.sigmoid(wm.meta_gate_mu(torch.cat([h_next, mu_p], dim=-1)))
-            e_in = e_in + gate_e * de_meta
-            mu_p = mu_p + gate_mu * dmu_meta
 
         ns_prior_logic = vision.new_tensor(0.0)
         logits_pr = None
@@ -1652,13 +1601,13 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         r_mid = F.linear(s_next, W_rw1, b_rw1)
         r_mid = wm.rew_head[1](r_mid)
         W_rw2, b_rw2 = eff_linear(wm.rew_head[2], deltas.get("rew2", None))
-        r_pred = F.linear(r_mid, W_rw2, b_rw2).squeeze(-1)
+        r_pred = F.linear(r_mid, W_rw2, b_rw2)
 
         W_dn1, b_dn1 = eff_linear(wm.done_head[0], deltas.get("done1", None))
         d_mid = F.linear(s_next, W_dn1, b_dn1)
         d_mid = wm.done_head[1](d_mid)
         W_dn2, b_dn2 = eff_linear(wm.done_head[2], deltas.get("done2", None))
-        d_logit = F.linear(d_mid, W_dn2, b_dn2).squeeze(-1)
+        d_logit = F.linear(d_mid, W_dn2, b_dn2)
         d_prob = torch.sigmoid(d_logit)
 
         loss_recon = vision.new_tensor(0.0)
@@ -1954,13 +1903,13 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         r_mid = F.linear(s_next, W_rw1, b_rw1)
         r_mid = wm.rew_head[1](r_mid)
         W_rw2, b_rw2 = eff_linear(wm.rew_head[2], deltas.get("rew2", None))
-        r_pred = F.linear(r_mid, W_rw2, b_rw2).squeeze(-1)
+        r_pred = F.linear(r_mid, W_rw2, b_rw2)
 
         W_dn1, b_dn1 = eff_linear(wm.done_head[0], deltas.get("done1", None))
         d_mid = F.linear(s_next, W_dn1, b_dn1)
         d_mid = wm.done_head[1](d_mid)
         W_dn2, b_dn2 = eff_linear(wm.done_head[2], deltas.get("done2", None))
-        d_logit = F.linear(d_mid, W_dn2, b_dn2).squeeze(-1)
+        d_logit = F.linear(d_mid, W_dn2, b_dn2)
         d_prob = torch.sigmoid(d_logit)
 
         return h_next, z_next, s_next, r_pred, d_prob
