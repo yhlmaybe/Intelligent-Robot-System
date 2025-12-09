@@ -239,6 +239,9 @@ class BrainCore(nn.Module):
         if self.is_online_learning and not isTrain:
             raise RuntimeError(f"Wrappers can only be used during training, but isTrain is {isTrain}, isUseWrappers is {self.is_online_learning}")
 
+        #if not isTrain and rewardExt is not None and self.history:
+
+
         B, C, H, W = frame.shape
 
         ext_texts = textExt
@@ -379,6 +382,8 @@ class BrainCore(nn.Module):
             Done=d_t.detach(),
 
             extras= {},)
+        
+        self.history.append(trace)
 
         losses = {}
 
@@ -481,6 +486,72 @@ class BrainCore(nn.Module):
         self.perc_buffer = state["perc_buffer"]
         self._buf_B = self.prev_mem.size(0)
 
+
+    def SmoothCorrection(
+        wmSeq: List[torch.Tensor], # [B,1]
+        extLast: torch.Tensor, # [B,1]
+        *,
+        q: float = 0.05,  
+        rWm: float = 0.5, 
+        rExt: float = 0.05, 
+        initVar: float = 1.0,) -> torch.Tensor:
+
+        first = wmSeq[0]
+        B = first.size(0)
+        n = len(wmSeq)
+        device = first.device
+        dtype = first.dtype
+
+        # [B,n]
+        wm_mat = torch.cat(wmSeq, dim=1) 
+        ext_vec = extLast.view(B) 
+
+        q_t = torch.tensor(float(q), device=device, dtype=dtype)
+        r_wm_t = torch.tensor(float(rWm), device=device, dtype=dtype)
+        r_ext_t = torch.tensor(float(rExt), device=device, dtype=dtype)
+
+        x_filt = wm_mat.new_zeros(B, n)  
+        P_filt = wm_mat.new_zeros(B, n) 
+
+        x_filt[:, 0] = wm_mat[:, 0]
+        P_filt[:, 0] = wm_mat.new_full((B,), float(initVar))
+
+        for t in range(1, n):
+            x_prior = x_filt[:, t - 1]
+            P_prior = P_filt[:, t - 1] + q_t
+
+            z_t = wm_mat[:, t] 
+
+            K_t = P_prior / (P_prior + r_wm_t + 1e-8)
+
+            x_post = x_prior + K_t * (z_t - x_prior)
+            P_post = (1.0 - K_t) * P_prior
+
+            x_filt[:, t] = x_post
+            P_filt[:, t] = P_post
+
+        x_T = x_filt[:, -1]
+        P_T = P_filt[:, -1]
+
+        K_ext = P_T / (P_T + r_ext_t + 1e-8)
+        x_T_corr = x_T + K_ext * (ext_vec - x_T)
+        P_T_corr = (1.0 - K_ext) * P_T
+
+        x_filt[:, -1] = x_T_corr
+        P_filt[:, -1] = P_T_corr
+
+        x_smooth = x_filt.clone()
+        P_smooth = P_filt.clone()
+
+        for t in range(n - 2, -1, -1):
+            P_t  = P_filt[:, t]
+            P_tp = P_t + q_t  
+            C_t  = P_t / (P_tp + 1e-8)
+
+            x_smooth[:, t] = x_filt[:, t] + C_t * (x_smooth[:, t + 1] - x_filt[:, t])
+            P_smooth[:, t] = P_t + C_t * C_t * (P_smooth[:, t + 1] - P_tp)
+
+        return x_smooth  # [B,n]
 
 
 class Agent:
@@ -761,71 +832,7 @@ class Agent:
         print(f"TOTAL {kind} params: {total:,}")
         return total
     
-    def SmoothCorrection(
-        wmSeq: List[torch.Tensor], # [B,1]
-        extLast: torch.Tensor, # [B,1]
-        *,
-        q: float = 0.05,  
-        rWm: float = 0.5, 
-        rExt: float = 0.05, 
-        initVar: float = 1.0,) -> torch.Tensor:
 
-        first = wmSeq[0]
-        B = first.size(0)
-        n = len(wmSeq)
-        device = first.device
-        dtype = first.dtype
-
-        # [B,n]
-        wm_mat = torch.cat(wmSeq, dim=1) 
-        ext_vec = extLast.view(B) 
-
-        q_t = torch.tensor(float(q), device=device, dtype=dtype)
-        r_wm_t = torch.tensor(float(rWm), device=device, dtype=dtype)
-        r_ext_t = torch.tensor(float(rExt), device=device, dtype=dtype)
-
-        x_filt = wm_mat.new_zeros(B, n)  
-        P_filt = wm_mat.new_zeros(B, n) 
-
-        x_filt[:, 0] = wm_mat[:, 0]
-        P_filt[:, 0] = wm_mat.new_full((B,), float(initVar))
-
-        for t in range(1, n):
-            x_prior = x_filt[:, t - 1]
-            P_prior = P_filt[:, t - 1] + q_t
-
-            z_t = wm_mat[:, t] 
-
-            K_t = P_prior / (P_prior + r_wm_t + 1e-8)
-
-            x_post = x_prior + K_t * (z_t - x_prior)
-            P_post = (1.0 - K_t) * P_prior
-
-            x_filt[:, t] = x_post
-            P_filt[:, t] = P_post
-
-        x_T = x_filt[:, -1]
-        P_T = P_filt[:, -1]
-
-        K_ext = P_T / (P_T + r_ext_t + 1e-8)
-        x_T_corr = x_T + K_ext * (ext_vec - x_T)
-        P_T_corr = (1.0 - K_ext) * P_T
-
-        x_filt[:, -1] = x_T_corr
-        P_filt[:, -1] = P_T_corr
-
-        x_smooth = x_filt.clone()
-        P_smooth = P_filt.clone()
-
-        for t in range(n - 2, -1, -1):
-            P_t  = P_filt[:, t]
-            P_tp = P_t + q_t  
-            C_t  = P_t / (P_tp + 1e-8)
-
-            x_smooth[:, t] = x_filt[:, t] + C_t * (x_smooth[:, t + 1] - x_filt[:, t])
-            P_smooth[:, t] = P_t + C_t * C_t * (P_smooth[:, t + 1] - P_tp)
-
-        return x_smooth  # [B,n]
 
 
 

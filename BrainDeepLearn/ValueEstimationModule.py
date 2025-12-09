@@ -780,6 +780,7 @@ class ValueEstimationExtractor(nn.Module):
             hebb_extras = {"H_norm": torch.tensor(0.0, device=device)}
             mix = torch.zeros(B, device=device) 
 
+        
         if rewardExt is None: r_used = self.wInt * r_int
         else: r_used = self.wExt * rewardExt.to(device) + self.wInt * r_int
 
@@ -792,6 +793,19 @@ class ValueEstimationExtractor(nn.Module):
 
         v_next_hat, transp_extras = self.transport(h, value)
         delta = r_used + gamma * v_next_hat - value
+
+        if not self.training:
+            return GeoTropicalOut(
+            value=value, 
+            tdError=delta, 
+            loss=None, 
+            eT=eT, 
+            rInt=r_int,
+            emotion=emotion, 
+            rComps=None, 
+            uncertainty=uncert_pred,  
+            extras=None,)
+
         loss_td = (delta ** 2).mean() * self.wTD
 
         edges = self.micro.PreviewEdges(zNow=h.detach().mean(dim=0) if B>1 else h.detach().squeeze(0),
@@ -855,10 +869,15 @@ class ValueEstimationExtractor(nn.Module):
             "mix_gt_half": (mix > 0.5).float().mean().detach(),}
 
         return GeoTropicalOut(
-            value=value, tdError=delta, loss=total_loss, eT=eT, rInt=r_int,
+            value=value, 
+            tdError=delta, 
+            loss=total_loss, 
+            eT=eT, 
+            rInt=r_int,
             emotion=emotion,
             rComps={k: v.detach() for k, v in comps.items()},
-            uncertainty=uncert_pred, extras=extras)
+            uncertainty=uncert_pred,
+            extras=extras)
 
     @torch.no_grad()
     def ResetHebbianMemory(self): 
@@ -1549,7 +1568,9 @@ class TestValueEstimationMTool:
             mem, attn, state = self.RandBatch(B)
             done = torch.randint(0, 2, (B,), device=self.device).float()
 
-            est = ValueEstimationExtractor(memoryDim=self.mem_dim, attnDim=self.attn_dim, stateDim=self.state_dim, useLayerNorm=False, wExt=1.0, wInt=1.0).to(self.device)
+            est = ValueEstimationExtractor(memoryDim=self.mem_dim,attnDim=self.attn_dim,stateDim=self.state_dim,
+                                           useLayerNorm=False,wExt=1.0,wInt=1.0).to(self.device)
+            
             est.eval()
             est.rgen.teacher_dropout_prob = 0.0
 
@@ -1557,20 +1578,22 @@ class TestValueEstimationMTool:
             entropy_prev = torch.rand(B, device=self.device)
             uncert_teacher = F.softplus(torch.randn(B, device=self.device))
 
-            out = est(memory=mem, attn=attn, state=state,
-                      rewardExt=reward_ext, policyEntropyPrev=entropy_prev,
-                      uncertaintyTeacher=uncert_teacher, tdErrorPrev=None,
-                      done=done)
+            out = est(memory=mem, attn=attn, state=state,rewardExt=reward_ext,policyEntropyPrev=entropy_prev,
+                      uncertaintyTeacher=uncert_teacher, tdErrorPrev=None,done=done)
 
             ok = True
             ok &= (out.value.shape == (B,))
             ok &= (out.uncertainty.shape == (B,))
-            ok &= (out.eT.shape == (B,3))
+            ok &= (out.eT.shape == (B, 3))
 
             with torch.no_grad():
                 r_used = est.wExt * reward_ext + est.wInt * out.rInt
-                gamma = out.eT[...,2] * (1.0 - done)
-                vhat = out.extras["v_next_hat"]
+                gamma = out.eT[..., 2] * (1.0 - done)
+
+                x = torch.cat([mem, attn, state], dim=-1)
+                h = est.Trunk(x)
+                vhat, _ = est.transport(h, out.value)
+
                 td_expected = r_used + gamma * vhat - out.value
                 ok &= torch.allclose(out.tdError, td_expected, atol=1e-6, rtol=1e-5)
 
@@ -1850,10 +1873,8 @@ class TestValueEstimationMTool:
             ok = (
                 torch.allclose(out_wr.value, out_ref.value, atol=atol, rtol=rtol) and
                 torch.allclose(out_wr.tdError, out_ref.tdError, atol=atol, rtol=rtol) and
-                torch.allclose(out_wr.loss, out_ref.loss, atol=atol, rtol=rtol) and
                 torch.allclose(out_wr.eT, out_ref.eT, atol=atol, rtol=rtol) and
-                torch.allclose(out_wr.uncertainty, out_ref.uncertainty, atol=atol, rtol=rtol) and
-                torch.allclose(out_wr.extras["v_next_hat"], out_ref.extras["v_next_hat"], atol=atol, rtol=rtol))
+                torch.allclose(out_wr.uncertainty, out_ref.uncertainty, atol=atol, rtol=rtol))
             
             print(f"WrapperAlignment_NoDelta {'pass' if ok else 'fail'}")
             return ok

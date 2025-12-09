@@ -2076,8 +2076,8 @@ class TestWorldMTool:
                 out["h_next"].shape == (B, self.wm.deter_dim)
                 and out["z_next"].shape == (B, self.wm.stoch_dim)
                 and out["s_next"].shape == (B, self.wm.state_dim)
-                and out["r_pred"].shape == (B,)
-                and out["d_prob"].shape == (B,))
+                and out["r_pred"].shape == (B,1)
+                and out["d_prob"].shape == (B,1))
             
             changed = (not torch.allclose(h_before, h_after)) or (not torch.allclose(z_before, z_after))
             in_range = (out["d_prob"].min().item() >= 0.0) and (out["d_prob"].max().item() <= 1.0)
@@ -2112,8 +2112,8 @@ class TestWorldMTool:
                 h1.shape == (B, self.wm.deter_dim)
                 and z1.shape == (B, self.wm.stoch_dim)
                 and s1.shape == (B, self.wm.state_dim)
-                and r.shape == (B,)
-                and d.shape == (B,))
+                and r.shape == (B,1)
+                and d.shape == (B,1))
             
             h_after, z_after = self.wm.ExportState()
             not_written = torch.allclose(h_prev, h_after) and torch.allclose(z_prev, z_after)
@@ -2502,7 +2502,12 @@ class TestWorldMTool:
 
             h1, z1, s1, r1, d1 = wm.StepPriorOnly(h0, z0, a_enc, sample=False)
 
-            ok_shapes = (h1.shape == (B, wm.deter_dim) and z1.shape == (B, wm.stoch_dim) and s1.shape == (B, wm.state_dim) and r1.shape == (B,) and d1.shape == (B,))
+            ok_shapes = (
+                h1.shape == (B, wm.deter_dim) 
+                and z1.shape == (B, wm.stoch_dim) 
+                and s1.shape == (B, wm.state_dim) 
+                and r1.shape == (B,1) 
+                and d1.shape == (B,1))
 
             vision = torch.randn(B, wm.vision_dim, device=self.device)
             _ = wrapper.ForwardWithDeltas(vision, None, None, None, [{}], keysVec=keys, mouseSeq=mouse, sample=False, hPrev=h0, zPrev=z0,)
