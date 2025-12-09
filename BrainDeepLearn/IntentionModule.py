@@ -747,19 +747,20 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
 
     def ForwardWithDeltas(
         self,
-        consState: Optional[torch.Tensor],
+        x: Optional[torch.Tensor],
         keyPaddingMask: Optional[torch.Tensor] = None,
         tdError: Optional[torch.Tensor] = None,
         uncertainty: Optional[torch.Tensor] = None,
         deltasPerLayer: Optional[List[Dict[str, Optional[torch.Tensor]]]] = None,
-        *,
-        ocrTexts: Optional[List[List[str]]] = None,
-        extTexts: Optional[List[Optional[str]]] = None,
-        prioritizeExt: bool = False,
-        **kwargs) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        **kwargs,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, torch.Tensor]]:
 
         base: "IntentionExtractor" = self.base 
         device = base.conceptEmb.device
+
+        consState: Optional[torch.Tensor] = x
+        ocrTexts: Optional[List[List[str]]] = kwargs.get("ocrTexts", None)
+        extTexts: Optional[List[Optional[str]]] = kwargs.get("extTexts", None)
+        prioritizeExt: bool = bool(kwargs.get("prioritizeExt", False))
 
         row = deltasPerLayer[0] if (deltasPerLayer is not None and len(deltasPerLayer) > 0) else {}
         delta_sem = row.get("sem", None)
