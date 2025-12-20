@@ -14,6 +14,7 @@ import shutil
 import traceback
 import os
 import math
+import copy
 
 #import debugpy
 
@@ -69,6 +70,7 @@ class BrainStepTrace:
     KeyVec: Optional[torch.Tensor] 
     MouseDelta: Optional[torch.Tensor]
     
+    PercBuffer: Optional[torch.Tensor]
     PercFeat: Optional[torch.Tensor]
     AttnFeat: Optional[torch.Tensor]
     MemFeat: Optional[torch.Tensor]
@@ -77,7 +79,13 @@ class BrainStepTrace:
     IntentionState: Optional[torch.Tensor]
     Reward: Optional[torch.Tensor]
     Done: Optional[torch.Tensor]
-    ValueFeat: Optional[torch.Tensor] 
+    ValueFeat: Optional[torch.Tensor]
+    ActionEntropy: Optional[torch.Tensor]
+
+    EntropyPrev: Optional[torch.Tensor] 
+    UncertaintyPrev: Optional[torch.Tensor]
+    TdErrorPrev: Optional[torch.Tensor]
+
 
     extras: Dict[str, Any] = field(default_factory=dict)
 
@@ -177,7 +185,12 @@ class BrainCore(nn.Module):
         self.max_code = max(all_codes)
         self.keyvec_dim = (self.max_code + 1) + 2  # 106
 
-        self._buf_B = 0
+        self.buf_B = 0
+
+        self.extra_mem = None
+        self.thread_end = True
+        self.ex_thread: Optional[threading.Thread] = None
+
         self.ResetBuffers(B=1, isOnlineLearning=self.is_online_learning,device=self.device)
         self.to(self.device)
 
@@ -205,10 +218,8 @@ class BrainCore(nn.Module):
         self.prev_reward = z(1)
         self.prev_done = z(1) 
         self.prev_entropy = z(1) 
-        self.prev_unc = z(1) 
-        self.prev_td = z(1) 
 
-        self._buf_B = B
+        self.buf_B = B
 
         self.prev_conscious_state = ConsciousnessState(dev_trace = z(512), step = z(),)
 
@@ -218,7 +229,7 @@ class BrainCore(nn.Module):
 
     @torch.no_grad()
     def EnsureB(self, B: int, isOnlineLearning, device: torch.device):
-        if (self._buf_B != B) or (self.prev_mem.device != device):
+        if (self.buf_B != B) or (self.prev_mem.device != device):
             self.ResetBuffers(B, isOnlineLearning, device)
             if isOnlineLearning:
                 self.world.base.ResetHidden(batchSize=B)
@@ -239,8 +250,23 @@ class BrainCore(nn.Module):
         if self.is_online_learning and not isTrain:
             raise RuntimeError(f"Wrappers can only be used during training, but isTrain is {isTrain}, isUseWrappers is {self.is_online_learning}")
 
-        #if not isTrain and rewardExt is not None and self.history:
+        if self.extra_mem and self.thread_end:
+            self.mem.MergeMemoryState(self.extra_mem)
+            self.extra_mem =None
 
+        if not isTrain and rewardExt is not None and self.history and self.thread_end:
+            self.thread_end = False
+
+            historyRef_copy = copy.deepcopy(self.history)
+            mem_copy = copy.deepcopy(self.mem)
+            critic_copy = copy.deepcopy(self.critic)
+            atten_copy = copy.deepcopy(self.attn)
+            
+            ex_thread = threading.Thread(
+                target=self.SmoothWork,
+                args=(historyRef_copy, rewardExt, "Reward", atten_copy, mem_copy, critic_copy),
+                daemon=True)
+            ex_thread.start()
 
         B, C, H, W = frame.shape
 
@@ -289,10 +315,10 @@ class BrainCore(nn.Module):
         if self.is_online_learning:
             value_kwargs = {"rewardExt": r_t, "policyEntropyPrev": self.prev_entropy, "done": d_t}
             value_x = {"memory": self.prev_mem,"attn": self.prev_attn, "state": s_t}
-            critic_out = self.critic(x=value_x, tdError=self.prev_td, uncertainty= self.prev_unc, **value_kwargs)
+            critic_out = self.critic(x=value_x, **value_kwargs)
         else:
-            critic_out = self.critic(memory=self.prev_mem,attn=self.prev_attn,state=s_t,rewardExt=r_t,policyEntropyPrev=self.prev_entropy,
-                                    uncertaintyTeacher=self.prev_unc,tdErrorPrev=self.prev_td,done=d_t,)
+            critic_out = self.critic(memory=self.prev_mem,attn=self.prev_attn,state=s_t,rewardExt=r_t,
+                                     policyEntropyPrev=self.prev_entropy,done=d_t,)
 
         td_sig = critic_out.tdError
         rInt_sig = critic_out.rInt
@@ -359,27 +385,27 @@ class BrainCore(nn.Module):
         self.prev_key_vec = key_vec.detach()
         self.prev_mouse = mouse_a.detach()
 
-        self.prev_reward = r_t.detach().view(B)
-        self.prev_done = (doneFlag.detach() if doneFlag is not None else d_t.detach()).view(B)
+        self.prev_reward = r_t.detach()
+        self.prev_done = (doneFlag.detach() if doneFlag is not None else d_t.detach())
         self.prev_entropy = entropy_scalar.detach()
-        self.prev_unc = unc_sig.detach()
-        self.prev_td = td_sig.detach()
 
         self.prev_conscious_state = conscious_out.new_state
 
         trace = BrainStepTrace(
-            ObsImg=perc_ocr.detach(),
-            KeyVec=key_vec.detach(),
-            MouseDelta=mouse_a.detach(),
+            PercBuffer=copy.deepcopy(self.perc_buffer),
+            ObsImg=perc_ocr,
+            KeyVec=key_vec,
+            MouseDelta=mouse_a,
 
-            PercFeat=perc_feats.detach(),
-            AttnFeat=atten_out.detach(),
-            MemFeat=mem_feat.detach(),
-            WorldState=s_t.detach(),
-            ConsciousnessState=conscious_state.detach(),
-            IntentionState=intent_sem.detach(),
-            Reward=r_t.detach(),
-            Done=d_t.detach(),
+            PercFeat=perc_feats,
+            AttnFeat=atten_out,
+            MemFeat=mem_feat,
+            WorldState=s_t,
+            ConsciousnessState=conscious_state,
+            IntentionState=intent_sem,
+            Reward=r_t,
+            Done=d_t,
+            ActionEntropy=entropy_scalar,
 
             extras= {},)
         
@@ -440,13 +466,11 @@ class BrainCore(nn.Module):
             "prev_reward": self.prev_reward,
             "prev_done": self.prev_done,
             "prev_entropy": self.prev_entropy,
-            "prev_unc": self.prev_unc,
-            "prev_td": self.prev_td,
             "world_h": h, 
             "world_z": z,
             "prev_conscious_state": self.prev_conscious_state,
             "perc_buffer": self.perc_buffer,
-            "_buf_B": self.prev_mem.size(0)}
+            "buf_B": self.prev_mem.size(0)}
 
     @torch.no_grad()
     def ImportBuffers(self, state: Dict[str, Any]):
@@ -479,79 +503,138 @@ class BrainCore(nn.Module):
         self.prev_reward = state["prev_reward"]
         self.prev_done = state["prev_done"]
         self.prev_entropy = state["prev_entropy"]
-        self.prev_unc = state["prev_unc"]
-        self.prev_td = state["prev_td"]
         self.world.ImportState(state["world_h"], state["world_z"])
         self.prev_conscious_state = state["prev_conscious_state"]
         self.perc_buffer = state["perc_buffer"]
-        self._buf_B = self.prev_mem.size(0)
+        self.buf_B = self.prev_mem.size(0)
 
 
     def SmoothCorrection(
-        wmSeq: List[torch.Tensor], # [B,1]
-        extLast: torch.Tensor, # [B,1]
+        self,
+        wmSeq: torch.Tensor,
+        extLast: torch.Tensor,
         *,
-        q: float = 0.05,  
-        rWm: float = 0.5, 
-        rExt: float = 0.05, 
+        q: float = 0.05,
+        rWm: float = 0.5,
+        rExt: float = 0.05,
         initVar: float = 1.0,) -> torch.Tensor:
 
-        first = wmSeq[0]
-        B = first.size(0)
-        n = len(wmSeq)
-        device = first.device
-        dtype = first.dtype
+        B, T = wmSeq.shape
 
-        # [B,n]
-        wm_mat = torch.cat(wmSeq, dim=1) 
-        ext_vec = extLast.view(B) 
+        device = wmSeq.device
+        dtype = wmSeq.dtype
 
-        q_t = torch.tensor(float(q), device=device, dtype=dtype)
-        r_wm_t = torch.tensor(float(rWm), device=device, dtype=dtype)
-        r_ext_t = torch.tensor(float(rExt), device=device, dtype=dtype)
+        q_t = torch.as_tensor(float(q), device=device, dtype=dtype)
+        r_wm_t = torch.as_tensor(float(rWm), device=device, dtype=dtype)
+        r_ext_t = torch.as_tensor(float(rExt), device=device, dtype=dtype)
 
-        x_filt = wm_mat.new_zeros(B, n)  
-        P_filt = wm_mat.new_zeros(B, n) 
+        x_filt = wmSeq.new_zeros(B, T, 1) 
+        P_filt = wmSeq.new_zeros(B, T, 1) 
 
-        x_filt[:, 0] = wm_mat[:, 0]
-        P_filt[:, 0] = wm_mat.new_full((B,), float(initVar))
+        x_filt[:, 0, :] = wmSeq[:, 0:1] 
+        P_filt[:, 0, :] = wmSeq.new_full((B, 1), float(initVar))
 
-        for t in range(1, n):
-            x_prior = x_filt[:, t - 1]
-            P_prior = P_filt[:, t - 1] + q_t
+        for t in range(1, T):
+            x_prior = x_filt[:, t - 1, :] 
+            P_prior = P_filt[:, t - 1, :] + q_t 
 
-            z_t = wm_mat[:, t] 
+            z_t = wmSeq[:, t:t+1]
 
-            K_t = P_prior / (P_prior + r_wm_t + 1e-8)
+            K_t = P_prior / (P_prior + r_wm_t + 1e-8) 
 
-            x_post = x_prior + K_t * (z_t - x_prior)
-            P_post = (1.0 - K_t) * P_prior
+            x_post = x_prior + K_t * (z_t - x_prior) 
+            P_post = (1.0 - K_t) * P_prior 
 
-            x_filt[:, t] = x_post
-            P_filt[:, t] = P_post
+            x_filt[:, t, :] = x_post
+            P_filt[:, t, :] = P_post
 
-        x_T = x_filt[:, -1]
-        P_T = P_filt[:, -1]
+        x_T = x_filt[:, -1, :]
+        P_T = P_filt[:, -1, :]
 
-        K_ext = P_T / (P_T + r_ext_t + 1e-8)
-        x_T_corr = x_T + K_ext * (ext_vec - x_T)
-        P_T_corr = (1.0 - K_ext) * P_T
+        ext_vec = extLast.to(device=device, dtype=dtype)
 
-        x_filt[:, -1] = x_T_corr
-        P_filt[:, -1] = P_T_corr
+        K_ext = P_T / (P_T + r_ext_t + 1e-8)  
+        x_T_corr = x_T + K_ext * (ext_vec - x_T) 
+        P_T_corr = (1.0 - K_ext) * P_T 
+
+        x_filt[:, -1, :] = x_T_corr
+        P_filt[:, -1, :] = P_T_corr
 
         x_smooth = x_filt.clone()
         P_smooth = P_filt.clone()
 
-        for t in range(n - 2, -1, -1):
-            P_t  = P_filt[:, t]
-            P_tp = P_t + q_t  
-            C_t  = P_t / (P_tp + 1e-8)
+        for t in range(T - 2, -1, -1):
+            P_t = P_filt[:, t, :] 
+            P_tp = P_t + q_t 
+            C_t = P_t / (P_tp + 1e-8) 
 
-            x_smooth[:, t] = x_filt[:, t] + C_t * (x_smooth[:, t + 1] - x_filt[:, t])
-            P_smooth[:, t] = P_t + C_t * C_t * (P_smooth[:, t + 1] - P_tp)
+            x_smooth[:, t, :] = x_filt[:, t, :] + C_t * (x_smooth[:, t + 1, :] - x_filt[:, t, :])
+            P_smooth[:, t, :] = P_t + C_t * C_t * (P_smooth[:, t + 1, :] - P_tp)
 
-        return x_smooth  # [B,n]
+        return x_smooth.squeeze(-1)  # [B,T]
+
+    def SmoothWork(self, historyRef, lastRef, signal: str, 
+                   attenModule: torch.Module, memModule: torch.Module, criticModule: torch.Module):
+        try:
+            per_buffer_list = []
+            atten_list = []
+            mem_list = []
+            world_state_list = []
+            reward_list = []
+            done_list = []
+            entropy_list = []
+
+            for tr in historyRef:
+                per_buffer_list.append(tr.PerBuffer)
+                atten_list.append(tr.AttnFeat)
+                mem_list.append(tr.MemFeat)
+                world_state_list.append(tr.WorldState)
+                reward_list.append(tr.Reward) 
+                done_list.append(tr.Done)  
+                entropy_list.append(tr.ActionEntropy)
+
+            if signal == "Reward":
+                seq_list = reward_list
+            elif signal == "Done":
+                seq_list = done_list
+            else:
+                return
+            
+            wm_seq = torch.cat(seq_list, dim=1)  # [B, T]
+            
+            smoothed = self.SmoothCorrection(wmSeq=wm_seq, extLast=lastRef)
+
+            smoothed_list = list(smoothed.split(1, dim=1))
+
+            start = int(memModule.time_step)
+
+            for i in range(len(smoothed_list)):
+                if i == 0: 
+                    continue
+                if signal == "Reward":
+                    value = criticModule(memory=mem_list[i-1],attn=atten_list[i-1],state=world_state_list[i],
+                                        rewardExt=smoothed_list[i],policyEntropyPrev=entropy_list[i-1],done=done_list[i],)
+                else: # Done
+                    value = criticModule(memory=mem_list[i-1],attn=atten_list[i-1],state=world_state_list[i],
+                                        rewardExt=reward_list[i],policyEntropyPrev=entropy_list[i-1],done=smoothed_list[i],)
+
+
+                td_sig = value.tdError
+                rInt_sig = value.rInt
+                unc_sig = value.uncertainty
+                emotion_sig = value.emotion
+
+                atten_out = attenModule(per_buffer_list[i], tdError=td_sig, uncertainty=unc_sig)
+
+                _, _ = memModule(atten_out, tdError=td_sig,emotion=emotion_sig,reward=rInt_sig)
+            
+            self.extra_mem = memModule.ExportMemoryState(step=start)
+
+            self.thread_end = True
+
+        except Exception as e:
+            print("[SmoothWork] error:", repr(e))
+            
 
 
 class Agent:

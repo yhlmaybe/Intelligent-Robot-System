@@ -72,22 +72,31 @@ class SimpleSSM(nn.Module):
         self.out_norm = nn.LayerNorm(E)
         self.dw_conv = nn.Conv1d(E, E, convKernel, groups=E, padding=convKernel//2)
 
-    def forward(self, x, keyPaddingMask: Optional[torch.Tensor]=None, tdError: Optional[torch.Tensor]=None, uncertainty: Optional[torch.Tensor]=None):
+    def forward(
+        self, 
+        x, 
+        keyPaddingMask: Optional[torch.Tensor]=None,
+        tdError: Optional[torch.Tensor]=None, 
+        uncertainty: Optional[torch.Tensor]=None):
         B, S, E = x.shape
         dev = x.device
 
-        def z_(t):
-            if t is None: return torch.zeros(B, device=dev)
-            t = t.detach().to(dev).float().view(B)
-            return torch.tanh((t - t.mean()) / (t.std(unbiased=False).clamp_min(1e-6)))
-        
-        td_z = z_(tdError)
-        unc_z = z_(uncertainty)
+        def z_(t: Optional[torch.Tensor]) -> torch.Tensor:
+            if t is None:
+                return torch.zeros(B, 1, device=dev, dtype=torch.float32)
+            t = t.detach().float().reshape(B, 1) 
+            mu = t.mean(dim=0, keepdim=True)
+            sd = t.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+            return torch.tanh((t - mu) / sd) 
 
-        gate_bias = (0.5 * td_z + 0.5 * (-unc_z)).view(B,1,1)
-        alpha = torch.sigmoid(self.alpha_log)
-        alpha_scale = torch.sigmoid(0.5*td_z.unsqueeze(-1) - 0.5*unc_z.unsqueeze(-1))
-        alpha_eff = (alpha.unsqueeze(0) * (0.75 + 0.25*alpha_scale))
+        td_z = z_(tdError)
+        unc_z = z_(uncertainty)  
+
+        gate_bias = (0.5 * td_z - 0.5 * unc_z).unsqueeze(-1)
+
+        alpha = torch.sigmoid(self.alpha_log) 
+        alpha_scale = torch.sigmoid(0.5 * td_z - 0.5 * unc_z) 
+        alpha_eff = alpha.unsqueeze(0) * (0.75 + 0.25 * alpha_scale) 
 
         u_and_g = self.in_proj(x)
         u, g = torch.chunk(u_and_g, 2, dim=-1)
@@ -96,7 +105,7 @@ class SimpleSSM(nn.Module):
         keep3 = None
         if keyPaddingMask is not None:
             keep3 = (~keyPaddingMask).to(u.dtype).unsqueeze(-1) 
-            u = u * keep3  
+            u = u * keep3
 
         u_conv = self.dw_conv(u.transpose(1,2)).transpose(1,2)
         u = u + 0.5 * u_conv
@@ -107,15 +116,25 @@ class SimpleSSM(nn.Module):
         u = u + 0.5 * u_conv
 
         y = torch.empty_like(x)
-        state = torch.zeros(B, E, device=dev)
+        state = torch.zeros(B, E, device=dev, dtype=x.dtype)
 
-        has_mask = keyPaddingMask is not None
+        has_mask = (keyPaddingMask is not None)
+        keep_const = None
+        if not has_mask:
+            keep_const = torch.ones(B, 1, device=dev, dtype=x.dtype) 
+
+        beta_sig = torch.sigmoid(self.beta).unsqueeze(0) 
+        gamma0 = self.gamma.unsqueeze(0)
+        delta0 = self.delta.unsqueeze(0)
+
         for t in range(S):
-            keep = (1.0 if not has_mask else (~keyPaddingMask[:, t]).float().unsqueeze(-1))  # (B,1)
-            upd = torch.sigmoid(self.beta).unsqueeze(0) * u[:, t, :]
+            keep = keep_const if keep_const is not None else (~keyPaddingMask[:, t]).to(x.dtype).unsqueeze(-1) 
+
+            upd = beta_sig * u[:, t, :]
             new_state = alpha_eff * state + (1 - alpha_eff) * upd
-            state = keep * new_state + (1 - keep) * state 
-            out_t = self.gamma.unsqueeze(0) * state + self.delta.unsqueeze(0) * u[:, t, :]
+            state = keep * new_state + (1 - keep) * state
+
+            out_t = gamma0 * state + delta0 * u[:, t, :]
             y[:, t, :] = (out_t * g[:, t, :]) * keep
 
         return self.out_norm(y)
@@ -166,22 +185,21 @@ class MultiHeadAttention(nn.Module):
         self.ResetParameters()
 
     def ModulateTauBias(self, tdError, uncertainty, B):
-        dev = self.hebbian_weights.device
-        def z_(t):
+        dev = self.temp_w_td.device
+
+        def z_(t: Optional[torch.Tensor]) -> torch.Tensor:
             if t is None:
-                return torch.zeros(B, device=dev)
-            t = t.detach().to(dev).float().view(-1)  
-            if t.numel() == 1:
-                t = t.expand(B)                       
-            elif t.numel() != B:
-                raise ValueError(f"Expected size {B}, got {t.numel()}")
-            return torch.tanh((t - t.mean()) / (t.std(unbiased=False).clamp_min(1e-6)))
-        
-        td_z = z_(tdError)
+                return torch.zeros(B, 1, device=dev, dtype=torch.float32)
+            t = t.detach().float().reshape(B, 1) 
+            mu = t.mean(dim=0, keepdim=True)
+            sd = t.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+            return torch.tanh((t - mu) / sd) 
+
+        td_z = z_(tdError) 
         unc_z = z_(uncertainty)
 
-        tau = 1.0 + 0.5*torch.tanh(self.temp_w_td*td_z + self.temp_w_unc*unc_z)
-        bias = 0.5*torch.tanh(self.bias_w_td*td_z + self.bias_w_unc*unc_z)
+        tau  = 1.0 + 0.5 * torch.tanh(self.temp_w_td * td_z + self.temp_w_unc * unc_z)  
+        bias = 0.5 * torch.tanh(self.bias_w_td * td_z + self.bias_w_unc * unc_z) 
         return tau.view(B,1,1,1), bias.view(B,1,1,1)
 
 
@@ -226,26 +244,20 @@ class MultiHeadAttention(nn.Module):
 
 
     def ComputeNeuromodulation(self, tdError: Optional[torch.Tensor], B: int) -> torch.Tensor:
-        device = self.hebbian_weights.device
+        dev = self.hebbian_weights.device
         if tdError is None:
-            return torch.ones(B, 1, 1, 1, device=device)
+            return torch.ones(B, 1, 1, 1, device=dev, dtype=torch.float32)
 
-        td = tdError.detach().to(device)
-        if td.dim() == 0:
-            td = td.view(1)
-        if td.size(0) == 1 and B > 1:
-            td = td.expand(B)
-        if td.size(0) != B:
-            raise ValueError(f"tdError size {td.size(0)} != batch size {B}")
+        td = tdError.detach().float().reshape(B, 1)  
 
         if B == 1:
             td_scaled = (td / self.td_scale).clamp(-10, 10)
-            neuromod = 1.0 + 0.5 * torch.tanh(td_scaled)
+            neuromod = 1.0 + 0.5 * torch.tanh(td_scaled) 
         else:
-            td_mean = td.mean()
-            td_std = td.std(unbiased=False).clamp_min(1e-8)
+            td_mean = td.mean(dim=0, keepdim=True)
+            td_std = td.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
             td_norm = (td - td_mean) / td_std
-            neuromod = 1.0 + 0.5 * torch.tanh(td_norm / self.td_scale)
+            neuromod = 1.0 + 0.5 * torch.tanh(td_norm / self.td_scale) 
 
         return neuromod.view(B, 1, 1, 1)
 
@@ -926,7 +938,7 @@ class TestAttentionMTool:
             x = torch.randn(self.B, self.S, self.E, device=self.device)
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
             kpm[:, -3:] = True
-            y = ssm(x, keyPaddingMask=kpm, tdError=torch.randn(self.B, device=self.device))
+            y = ssm(x, keyPaddingMask=kpm, tdError=torch.randn(self.B, 1, device=self.device))
             assert y.shape == (self.B, self.S, self.E), f"Output shape mismatch: {y.shape}"
             print("SimpleSSM test passed.")
             return True
@@ -964,7 +976,7 @@ class TestAttentionMTool:
             x = torch.randn(self.B, self.S, self.E, device=self.device)
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
             ta = TemporalAttention(self.E, self.H, layerIdx=0, useHebbian=True).to(self.device)
-            y = ta(x, keyPaddingMask=kpm, tdError=torch.randn(self.B, device=self.device))
+            y = ta(x, keyPaddingMask=kpm, tdError=torch.randn(self.B, 1, device=self.device))
             assert y.shape == (self.B, self.S, self.E)
             print("TemporalAttention test passed.")
             return True
@@ -1011,7 +1023,7 @@ class TestAttentionMTool:
             model = AttentionExtractor(embedDim=self.E, sequenceLength=self.S, numHeads=self.H,temporalLayers=2, routingIterations=3, hebbianRate=0.01,useHebbian=True, gradientClipVal=0.5).to(self.device)
             x = torch.randn(self.B, self.S, self.E, device=self.device)
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device); kpm[:, -2:] = True
-            td = torch.randn(self.B, device=self.device)
+            td = torch.randn(self.B, 1, device=self.device)
             y = model(x, keyPaddingMask=kpm, tdError=td)
             assert y.shape == (self.B, self.E)
 
@@ -1036,7 +1048,7 @@ class TestAttentionMTool:
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
 
             x = torch.randn(8, 16, 64, device=self.device)
-            td = torch.randn(8, device=self.device)
+            td = torch.randn(8, 1, device=self.device)
             y = torch.randn(8, 12, device=self.device)
 
             out = model(x, keyPaddingMask=None, tdError=td)
@@ -1071,7 +1083,7 @@ class TestAttentionMTool:
 
             for t in range(steps):
                 x = torch.randn(8, 16, 64, device=self.device)
-                td = torch.randn(8, device=self.device)
+                td = torch.randn(8, 1, device=self.device)
                 y = torch.randn(8, 12, device=self.device)
 
                 pred = head(model(x, tdError=td))
@@ -1110,7 +1122,7 @@ class TestAttentionMTool:
 
             for _ in range(steps):
                 x = torch.randn(8, 16, 64, device=self.device)
-                td = torch.randn(8, device=self.device)
+                td = torch.randn(8, 1, device=self.device)
                 y = torch.randn(8, 12, device=self.device)
                 pred = head(model(x, tdError=td))
                 loss = F.mse_loss(pred, y)
@@ -1143,7 +1155,7 @@ class TestAttentionMTool:
             B = 16
             data_x = torch.randn(B, 16, 64, device=self.device)
             data_y = torch.randn(B, 12, device=self.device)
-            data_td = torch.randn(B, device=self.device)
+            data_td = torch.randn(B, 1, device=self.device)
 
             with torch.no_grad():
                 start = F.mse_loss(head(model(data_x, tdError=data_td)), data_y).item()
@@ -1244,7 +1256,7 @@ class TestAttentionMTool:
 
             for _ in range(6):
                 x = torch.randn(8, 16, 64, device=self.device)
-                td = torch.randn(8, device=self.device)
+                td = torch.randn(8, 1, device=self.device)
                 y = torch.randn(8, 12, device=self.device)
 
                 pred = head(wrapper(x, tdError=td))
@@ -1324,7 +1336,7 @@ class TestAttentionMTool:
 
             for _ in range(8):
                 x = torch.randn(16, 16, 64, device=self.device)
-                td = torch.randn(16, device=self.device)
+                td = torch.randn(16, 1, device=self.device)
                 y = torch.randn(16, 12, device=self.device)
 
                 pred = head(wrapper(x, tdError=td))
@@ -1383,7 +1395,7 @@ class TestAttentionMTool:
             opt = torch.optim.Adam(list(head.parameters()) + list(wrapper.CandParameters()), lr=1e-3)
 
             x  = torch.randn(6, 16, 64, device=self.device)
-            td = torch.randn(6, device=self.device)
+            td = torch.randn(6, 1, device=self.device)
             y  = torch.randn(6, 10, device=self.device)
 
             pred = head(wrapper(x, tdError=td))
@@ -1415,7 +1427,7 @@ class TestAttentionMTool:
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
 
             x  = torch.randn(8, 16, 64, device=self.device)
-            td = torch.randn(8, device=self.device)
+            td = torch.randn(8, 1, device=self.device)
             y  = torch.randn(8, 12, device=self.device)
 
             pred = head(model(x, tdError=td))
@@ -1521,7 +1533,7 @@ class TestAttentionMTool:
 
             U0 = attn.U.norm().item(); V0 = attn.V.norm().item()
             for _ in range(3):
-                _ = attn(x, x, x, tdError=torch.randn(B, device=self.device))
+                _ = attn(x, x, x, tdError=torch.randn(B, 1, device=self.device))
             U1 = attn.U.norm().item(); V1 = attn.V.norm().item()
             assert U1 > U0 + 1e-8 and V1 > V0 + 1e-8, "MHSA Hebbian(U/V) not growing"
 
@@ -1568,7 +1580,7 @@ class TestAttentionMTool:
             head = nn.Linear(64, 12).to(self.device)
             model.eval(); head.train()
             x = torch.randn(1, 16, 64, device=self.device)
-            td = torch.randn(1, device=self.device)
+            td = torch.randn(1, 1, device=self.device)
             y = torch.randn(1, 12, device=self.device)
 
             pred = head(model(x, tdError=td))

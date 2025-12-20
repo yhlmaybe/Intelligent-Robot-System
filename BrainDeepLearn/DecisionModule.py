@@ -71,11 +71,12 @@ def ClampLogstd(logstd: torch.Tensor, low: float = -5.0, high: float = 2.0) -> t
     return torch.clamp(logstd, low, high)
 
 def StableLogProbBernoulli(logits: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-    return (actions * (-F.softplus(-logits)) + (1.0 - actions) * (-F.softplus(logits))).sum(-1)
+    return (actions * (-F.softplus(-logits)) + (1.0 - actions) * (-F.softplus(logits))).sum(-1, keepdim=True)
+
 
 def EntropyBernoulliFromLogits(logits: torch.Tensor) -> torch.Tensor:
     p = torch.sigmoid(logits).clamp(1e-6, 1.0 - 1e-6)
-    return -(p * p.log() + (1 - p) * (1 - p).log()).sum(-1)
+    return -(p * p.log() + (1 - p) * (1 - p).log()).sum(-1, keepdim=True)
 
 def MixLogits(base: torch.Tensor, prior: Optional[torch.Tensor], w: float) -> torch.Tensor:
     if prior is None:
@@ -479,7 +480,7 @@ class DecisionExtractor(nn.Module):
     def ToKeysVec(self, baseAct: torch.Tensor, extraAct: torch.Tensor, skillIdx: torch.Tensor, clicks: torch.Tensor) -> torch.Tensor:
         B = baseAct.size(0)
         device = baseAct.device
-        vec = torch.zeros(B, self.max_code + 1 + 2, device=device)
+        vec = baseAct.new_zeros(B, self.max_code + 1 + 2)
 
         for i, code in enumerate(self.base_codes):
             vec[:, code] = baseAct[:, i]
@@ -524,7 +525,7 @@ class DecisionExtractor(nn.Module):
             x2 = torch.cat([pressed * mask, x2[:, max_scan:]], dim=1)
         return x2
 
-    def EntropyComponents(self,baseLogits: torch.Tensor,extraLogits: torch.Tensor,skillLogits: torch.Tensor,logstd: torch.Tensor,) -> Dict[str, torch.Tensor]:
+    def EntropyComponents(self, baseLogits, extraLogits, skillLogits, logstd):
 
         def clean_logits(x):
             x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -538,20 +539,22 @@ class DecisionExtractor(nn.Module):
         ent_extra = EntropyBernoulliFromLogits(extraLogits)
 
         s = skillLogits - skillLogits.logsumexp(dim=-1, keepdim=True)
-        p = s.exp().clamp(1e-12, 1.0) 
-        ent_skill = -(p * s).sum(dim=-1)
+        p = s.exp().clamp(1e-12, 1.0)
 
-        ent_mouse = (0.5 * (1.0 + math.log(2 * math.pi)) + logstd).sum(-1)
+        ent_skill = -(p * s).sum(dim=-1, keepdim=True)
+
+        ent_mouse = (0.5 * (1.0 + math.log(2 * math.pi)) + logstd).sum(-1, keepdim=True)
 
         n_base = max(1, baseLogits.size(-1))
         n_extra = max(1, extraLogits.size(-1))
         n_skill = max(2, skillLogits.size(-1))
-        base_norm = ent_base / n_base
-        extra_norm = ent_extra / n_extra
-        skill_norm = ent_skill / math.log(n_skill)
+
+        base_norm = ent_base / float(n_base)
+        extra_norm = ent_extra / float(n_extra)
+        skill_norm = ent_skill / float(math.log(n_skill))
 
         l, h = self.logstd_low, self.logstd_high
-        mouse_norm = ((logstd.clamp(l, h) - l) / (h - l)).mean(-1)
+        mouse_norm = ((logstd.clamp(l, h) - l) / (h - l)).mean(-1, keepdim=True)
 
         return {
             "ent_base": ent_base, "ent_extra": ent_extra,
@@ -689,10 +692,10 @@ class DecisionExtractor(nn.Module):
 
                 logp_base = StableLogProbBernoulli(base_logits_s,  base_act)
                 logp_extra = StableLogProbBernoulli(extra_logits_s, extra_act)
-                logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx)
-                
+                logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx).unsqueeze(-1) 
+
                 LOG_TWO_PI = math.log(2.0 * math.pi)
-                logp_mouse = -0.5 * (2.0 * logstd + LOG_TWO_PI).sum(-1)
+                logp_mouse = -0.5 * (2.0 * logstd + LOG_TWO_PI).sum(-1, keepdim=True)
             else:
                 base_prob  = torch.sigmoid(base_logits_s).clamp(1e-6, 1.0 - 1e-6)
                 extra_prob = torch.sigmoid(extra_logits_s).clamp(1e-6, 1.0 - 1e-6)
@@ -711,13 +714,15 @@ class DecisionExtractor(nn.Module):
 
                 logp_base = StableLogProbBernoulli(base_logits_s,  base_act)
                 logp_extra = StableLogProbBernoulli(extra_logits_s, extra_act)
-                logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx)
+                logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx).unsqueeze(-1)
+
                 dist_mouse = torch.distributions.Normal(mu, std)
-                logp_mouse = dist_mouse.log_prob(mouse_a.detach()).sum(-1)
+                logp_mouse = dist_mouse.log_prob(mouse_a.detach()).sum(-1, keepdim=True)
 
             out["keyboard"].update({
                 "base_act": base_act, "extra_act": extra_act, "skill_idx": skill_idx,
                 "logp_base": logp_base, "logp_extra": logp_extra, "logp_skill": logp_skill,})
+            
             out["mouse"].update({"a": mouse_a, "logp": logp_mouse, "click_sample": clicks})
 
             device = z.device
@@ -736,12 +741,10 @@ class DecisionExtractor(nn.Module):
             psi = psi_all[torch.arange(B, device=device), opt_idx]
 
             dist_opt = torch.distributions.Categorical(logits=option_logits_s)
-            logp_new = dist_opt.log_prob(new_idx)
-            logp_opt = torch.where(term_mask, logp_new, torch.zeros_like(logp_new))
+            logp_new = dist_opt.log_prob(new_idx).unsqueeze(-1)
+            logp_opt = torch.where(term_mask.unsqueeze(-1), logp_new, torch.zeros_like(logp_new))
 
-            b = beta_s.squeeze(-1)
-            t = terminate.squeeze(-1)
-            log_beta = t * b.log() + (1 - t) * (1 - b).log()
+            log_beta = terminate * beta_s.log() + (1 - terminate) * (1 - beta_s).log()
 
             out["option"].update({
                 "opt_idx": opt_idx,
@@ -1121,10 +1124,10 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
 
                 logp_base = StableLogProbBernoulli(base_logits_s, base_act)
                 logp_extra = StableLogProbBernoulli(extra_logits_s, extra_act)
-                logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx)
+                logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx).unsqueeze(-1) 
 
                 LOG_TWO_PI = math.log(2.0 * math.pi)
-                logp_mouse = -0.5 * (2.0 * logstd + LOG_TWO_PI).sum(-1)
+                logp_mouse = -0.5 * (2.0 * logstd + LOG_TWO_PI).sum(-1, keepdim=True)
             else:
                 base_prob = torch.sigmoid(base_logits_s).clamp(1e-6, 1.0 - 1e-6)
                 extra_prob = torch.sigmoid(extra_logits_s).clamp(1e-6, 1.0 - 1e-6)
@@ -1142,9 +1145,10 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
 
                 logp_base = StableLogProbBernoulli(base_logits_s, base_act)
                 logp_extra = StableLogProbBernoulli(extra_logits_s, extra_act)
-                logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx)
+                logp_skill = torch.distributions.Categorical(logits=skill_logits_s).log_prob(skill_idx).unsqueeze(-1) 
+
                 dist_mouse = torch.distributions.Normal(mu, std)
-                logp_mouse = dist_mouse.log_prob(mouse_a.detach()).sum(-1)
+                logp_mouse = dist_mouse.log_prob(mouse_a.detach()).sum(-1, keepdim=True)
 
             out["keyboard"].update({
                     "base_act": base_act,
@@ -1174,12 +1178,10 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
             psi = psi_all[torch.arange(B, device=device), opt_idx]
 
             dist_opt = torch.distributions.Categorical(logits=option_logits_s)
-            logp_new = dist_opt.log_prob(new_idx)
-            logp_opt = torch.where(term_mask, logp_new, torch.zeros_like(logp_new))
+            logp_new = dist_opt.log_prob(new_idx).unsqueeze(-1)
+            logp_opt = torch.where(term_mask.unsqueeze(-1), logp_new, torch.zeros_like(logp_new))
 
-            b = beta_s.squeeze(-1)
-            t = terminate.squeeze(-1)
-            log_beta = t * b.log() + (1 - t) * (1 - b).log()
+            log_beta = terminate * beta_s.log() + (1 - terminate) * (1 - beta_s).log()
 
             out["option"].update({
                     "opt_idx": opt_idx,
@@ -1188,7 +1190,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
                     "logp_option": logp_opt,
                     "logp_beta": log_beta,})
 
-            opt_onehot = torch.nn.functional.one_hot(opt_idx, num_classes=K).float().to(device)
+            opt_onehot = torch.nn.functional.one_hot(opt_idx, num_classes=K).float()
             out["option"]["opt_onehot"] = opt_onehot.detach()
 
             if returnKeysVec:
@@ -1321,16 +1323,18 @@ class CEMPlanner(nn.Module):
         return key_vec
 
     @torch.no_grad()
-    def Plan(self,
-             mouseMu: Optional[torch.Tensor] = None,         
-             mouseLogstd: Optional[torch.Tensor] = None,     
-             skillLogits: Optional[torch.Tensor] = None,     
-             baseLogits: Optional[torch.Tensor] = None,       
-             extraLogits: Optional[torch.Tensor] = None,    
-             clickLogits: Optional[torch.Tensor] = None,     
-             h0: Optional[torch.Tensor] = None, # Deterministic hidden states of the world model
-             z0: Optional[torch.Tensor] = None, # Random hidden states of the world model
-             returnTrajectories: bool = False) -> Dict[str, Dict[str, torch.Tensor]]:
+    def Plan(
+        self,
+        mouseMu: Optional[torch.Tensor] = None,         
+        mouseLogstd: Optional[torch.Tensor] = None,     
+        skillLogits: Optional[torch.Tensor] = None,     
+        baseLogits: Optional[torch.Tensor] = None,       
+        extraLogits: Optional[torch.Tensor] = None,    
+        clickLogits: Optional[torch.Tensor] = None,     
+        h0: Optional[torch.Tensor] = None, # Deterministic hidden states of the world model
+        z0: Optional[torch.Tensor] = None, # Random hidden states of the world model
+        x0: Optional[torch.Tensor] = None, # ssm x
+        returnTrajectories: bool = False) -> Dict[str, Dict[str, torch.Tensor]]:
 
         if mouseMu is not None:
             B = mouseMu.size(0)
@@ -1341,7 +1345,7 @@ class CEMPlanner(nn.Module):
         elif baseLogits is not None:
             B = baseLogits.size(0); device = baseLogits.device
         else:
-            h_cur, z_cur = self.wm.ExportState()
+            h_cur, _, _ = self.wm.ExportState()
             if h_cur is None:
                 raise ValueError("batch size/device cannot be inferred; Please provide at least one distributed parameter or (h0,z0)")
             B = h_cur.size(0); device = h_cur.device
@@ -1367,14 +1371,9 @@ class CEMPlanner(nn.Module):
         logits_e = extraLogits.unsqueeze(0).repeat(H, 1, 1)
         logits_c = clickLogits.unsqueeze(0).repeat(H, 1, 1)
 
-        h_prev, z_prev = (h0, z0)
-        if h_prev is None or z_prev is None:
-            h_prev, z_prev = self.wm.ExportState()
-            if h_prev is None or h_prev.size(0) != B or h_prev.device != device:
-                d_dim = self.wm.base.deter_dim if self.wm_is_online_wrapper else self.wm.deter_dim
-                s_dim = self.wm.base.stoch_dim if self.wm_is_online_wrapper else self.wm.stoch_dim
-                h_prev = torch.zeros(B, d_dim, device=device)
-                z_prev = torch.zeros(B, s_dim, device=device)
+        h_prev, z_prev, x_prev = (h0, z0, x0)
+        if h_prev is None or z_prev is None or x_prev is None:
+            h_prev, z_prev, x_prev = self.wm.ExportState()
 
         for _ in range(self.iters):
             eps = torch.randn(H, B, N, 2, device=device)
@@ -1397,6 +1396,7 @@ class CEMPlanner(nn.Module):
 
             h = h_prev.unsqueeze(1).expand(B, N, -1).reshape(B * N, -1).contiguous()
             z = z_prev.unsqueeze(1).expand(B, N, -1).reshape(B * N, -1).contiguous()
+            x = x_prev.unsqueeze(1).expand(B, N, -1).reshape(B * N, -1).contiguous()
 
             score = torch.zeros(B, N, device=device)
             cont = torch.ones(B, N, device=device)
@@ -1415,10 +1415,10 @@ class CEMPlanner(nn.Module):
 
                 if self.wm_is_online_wrapper:
                     a_enc = self.wm.base.action_encoder(key_vec, a_mouse_t)
-                    h, z, s_next, r_t, d_t = self.wm.StepPriorWithDeltas(h, z, a_enc, sample=False)
+                    h, z, s_next, x, r_t, d_t = self.wm.StepPriorWithDeltas(h, z, x, a_enc, sample=False)
                 else:
                     a_enc = self.wm.action_encoder(key_vec, a_mouse_t)
-                    h, z, s_next, r_t, d_t = self.wm.StepPriorOnly(h, z, a_enc, sample=False)
+                    h, z, s_next, x, r_t, d_t = self.wm.StepPriorOnly(h, z, x, a_enc, sample=False)
 
                 r_t = r_t.view(B, N)
                 d_t = d_t.view(B, N)
@@ -1547,6 +1547,7 @@ class TestDecisionMTool:
             super().__init__()
             self.deter_dim = deterDim
             self.stoch_dim = stochDim
+            self.ssm_dim = 256
             self.state_dim = stateDim
             self.action_dim = actionDim
 
@@ -1559,29 +1560,33 @@ class TestDecisionMTool:
             self.rew_head = nn.Linear(stateDim, 1)
             self.done_head = nn.Linear(stateDim, 1)
 
-            self.register_buffer("_h", torch.zeros(1, deterDim))
-            self.register_buffer("_z", torch.zeros(1, stochDim))
+            self.register_buffer("_h", torch.zeros(1, self.deter_dim))
+            self.register_buffer("_z", torch.zeros(1, self.stoch_dim))
+            self.register_buffer("_x", torch.zeros(1, self.ssm_dim))
 
         def ResetHidden(self, B: int = 1, device: torch.device | None = None):
             if device is None:
                 device = self._h.device
             self._h = torch.zeros(B, self.deter_dim, device=device)
             self._z = torch.zeros(B, self.stoch_dim, device=device)
+            self._x = torch.zeros(B, self.ssm_dim, device=device)
 
         def ExportState(self):
-            return self._h, self._z
+            return self._h, self._z, self._x
 
         @torch.no_grad()
-        def StepPriorOnly(self, hPrev, zPrev, aEnc, sample: bool = False):
+        def StepPriorOnly(self, hPrev, zPrev, xPrev, aEnc, sample: bool = False):
             a = self.act_proj(aEnc)
             h_next = self.gru(torch.cat([zPrev, a], dim=-1), hPrev)
+
             mu_p, logstd_p = self.prior_head(h_next).chunk(2, dim=-1)
             logstd_p = torch.clamp(logstd_p, -6.0, 2.0)
-            z_next = mu_p
-            s_next = self.state_proj(torch.cat([h_next, z_next], dim=-1))
-            r_pred = self.rew_head(s_next).squeeze(-1)
-            d_prob = torch.sigmoid(self.done_head(s_next)).squeeze(-1)
-            return h_next, z_next, s_next, r_pred, d_prob
+
+            s_next = self.state_proj(torch.cat([h_next, mu_p], dim=-1))
+            r_pred = self.rew_head(s_next)
+            d_prob = torch.sigmoid(self.done_head(s_next))
+
+            return h_next, mu_p, s_next, mu_p, r_pred, d_prob
 
     def BuildPlanner(self, horizon=3, N=16, elite=4, iters=2):
         try:
@@ -1618,29 +1623,29 @@ class TestDecisionMTool:
         terms: Dict[str, torch.Tensor] = {}
 
         if "logp_base" in kb:
-            t = -(adv_("base", (B,)) * kb["logp_base"]).mean()
+            t = -(adv_("base", (B,1)) * kb["logp_base"]).mean()
             terms["base"] = t; loss_core = loss_core + t
         if "logp_extra" in kb:
-            t = -(adv_("extra", (B,)) * kb["logp_extra"]).mean()
+            t = -(adv_("extra", (B,1)) * kb["logp_extra"]).mean()
             terms["extra"] = t; loss_core = loss_core + t
         if "logp_skill" in kb:
-            t = -(adv_("skill", (B,)) * kb["logp_skill"]).mean()
+            t = -(adv_("skill", (B,1)) * kb["logp_skill"]).mean()
             terms["skill"] = t; loss_core = loss_core + t
 
         if "logp" in ms:
-            t = -(adv_("mouse", (B,)) * ms["logp"]).mean()
+            t = -(adv_("mouse", (B,1)) * ms["logp"]).mean()
             terms["mouse"] = t; loss_core = loss_core + t
 
         if ("click_logits" in ms) and ("click_sample" in ms):
             logp_click = StableLogProbBernoulli(ms["click_logits"], ms["click_sample"])
-            t = -(adv_("click", (B,)) * logp_click).mean()
+            t = -(adv_("click", (B,1)) * logp_click).mean()
             terms["click"] = t; loss_core = loss_core + t
 
         if "logp_option" in op:
-            t = -(adv_("option", (B,)) * op["logp_option"]).mean()
+            t = -(adv_("option", (B,1)) * op["logp_option"]).mean()
             terms["option"] = t; loss_core = loss_core + t
         if "logp_beta" in op:
-            t = -(adv_("beta", (B,)) * op["logp_beta"]).mean()
+            t = -(adv_("beta", (B,1)) * op["logp_beta"]).mean()
             terms["beta"] = t; loss_core = loss_core + t
 
         ent_term = torch.tensor(0.0, device=device)
@@ -1928,13 +1933,13 @@ class TestDecisionMTool:
                 out = model(x, intent, sample=True, deterministic=False,prior=None, prevOptionOnehot=prev, returnKeysVec=False)
                
                 adv = {
-                    "option": torch.full((B,), 1.5, device=self.device),
-                    "beta": torch.full((B,), 0.5, device=self.device),
-                    "skill": torch.ones(B, device=self.device),
-                    "base": torch.ones(B, device=self.device),
-                    "extra": torch.ones(B, device=self.device),
-                    "mouse": torch.ones(B, device=self.device),
-                    "click": torch.ones(B, device=self.device),}
+                    "option": torch.full((B,1), 1.5, device=self.device),
+                    "beta": torch.full((B,1), 0.5, device=self.device),
+                    "skill": torch.ones(B, 1, device=self.device),
+                    "base": torch.ones(B, 1, device=self.device),
+                    "extra": torch.ones(B, 1, device=self.device),
+                    "mouse": torch.ones(B, 1, device=self.device),
+                    "click": torch.ones(B, 1, device=self.device),}
                 
                 loss = self.DecisionOnlyLoss(out, adv=adv, entCoef=0.0)
 
@@ -2324,13 +2329,13 @@ class TestDecisionMTool:
             self.ZeroAllGrads(model)
             out = model(x, intent, sample=True, deterministic=False, prior=None, prevOptionOnehot=prev_onehot, returnKeysVec=False)
             adv = {
-                "option": torch.full((B,), 1.5, device=self.device),
-                "beta": torch.full((B,), 0.7, device=self.device),
-                "skill": torch.ones(B, device=self.device),
-                "base": torch.ones(B, device=self.device),
-                "extra": torch.ones(B, device=self.device),
-                "mouse": torch.ones(B, device=self.device),
-                "click": torch.ones(B, device=self.device),}
+                "option": torch.full((B,1), 1.5, device=self.device),
+                "beta": torch.full((B,1), 0.7, device=self.device),
+                "skill": torch.ones(B, 1, device=self.device),
+                "base": torch.ones(B, 1, device=self.device),
+                "extra": torch.ones(B, 1, device=self.device),
+                "mouse": torch.ones(B, 1, device=self.device),
+                "click": torch.ones(B, 1, device=self.device),}
 
             loss = self.DecisionOnlyLoss(out, adv=adv, entCoef=0.0)
 

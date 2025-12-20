@@ -163,16 +163,7 @@ class S4DCell(nn.Module):
         g = torch.sigmoid(self.gate(u))
         Bu = self.B(u) * g
 
-        B = u.size(0)
-        if (self.x.dim() != 2
-            or self.x.size(0) != B
-            or self.x.size(1) != self.N
-            or self.x.device != u.device
-            or self.x.dtype != u.dtype):
-            self.x = torch.zeros(B, self.N, device=u.device, dtype=u.dtype)
-        x_use = self.x 
-
-        x_next = self.CayleyStep(self.theta, x_use, Bu, self.dt)
+        x_next = self.CayleyStep(self.theta, self.x, Bu, self.dt)
         y_lin = self.C(x_next) + self.D0(u)
         y_glu = y_lin * torch.sigmoid(self.out_gate(x_next))
         y = self.ln_y(y_glu)
@@ -181,6 +172,19 @@ class S4DCell(nn.Module):
         if updateState:
             self.x = x_next.detach()
         return y
+
+    def StepWithX(self, zPrev: torch.Tensor, aT: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        u = torch.cat([zPrev, aT], dim=-1)
+        g = torch.sigmoid(self.gate(u))
+        Bu = self.B(u) * g
+
+        x_next = self.CayleyStep(self.theta, x, Bu, self.dt)
+        y_lin = self.C(x_next) + self.D0(u)
+        y_glu = y_lin * torch.sigmoid(self.out_gate(x_next))
+        y = self.ln_y(y_glu)
+        y = y + self.ffn(self.ln_ffn(y))
+
+        return y, x_next.detach()
     
 class HNNPhysHead(nn.Module):
     def __init__(self, deterDim: int, projDim: int = 256):
@@ -545,6 +549,7 @@ class RSSMWorldModel(nn.Module):
         deterDim: int = 512,
         stochDim: int = 64,
         stateDim: int = 512,
+        ssmDim: int = 512,
         useDecoder: bool = True,
         useMemory: bool = True,
         memoryCapacity: int = 16384,
@@ -565,6 +570,7 @@ class RSSMWorldModel(nn.Module):
         self.stoch_dim = stochDim
         self.state_dim = stateDim
         self.use_decoder = useDecoder
+        self.ssm_dim = ssmDim
 
         self._mem_topk: int = int(memTopK)
         self._mem_temp: float = float(memTemp)
@@ -585,7 +591,7 @@ class RSSMWorldModel(nn.Module):
             nn.LayerNorm(stochDim),
             nn.Tanh(),)
         
-        self.s4 = S4DCell(inDim=stochDim + stochDim, deterDim=deterDim, ssmDim=512, dt=1.0)
+        self.s4 = S4DCell(inDim=stochDim + stochDim, deterDim=deterDim, ssmDim=self.ssm_dim, dt=1.0)
 
         self.prior_net = nn.Sequential(GrowableLoRALinear(nn.Linear(deterDim, 2 * stochDim, bias=True)))
         
@@ -731,8 +737,8 @@ class RSSMWorldModel(nn.Module):
             return
         device = self._mem_keys.device
         N = min(size, self._mem_capacity, keys.size(0), vals.size(0))
-        self._mem_keys[:N] = keys[:N].to(device)
-        self._mem_vals[:N] = vals[:N].to(device)
+        self._mem_keys[:N] = keys[:N]
+        self._mem_vals[:N] = vals[:N]
         self._mem_size = N
         self._mem_ptr = min(max(ptr, 0), self._mem_capacity - 1)
         self._mem_path = path
@@ -805,12 +811,13 @@ class RSSMWorldModel(nn.Module):
         self.s4.ResetState(batchSize, device=device)
         self._A_prev = None
 
-    def ExportState(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._h, self._z
+    def ExportState(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._h, self._z, self.s4.x
 
-    def ImportState(self, h: torch.Tensor, z: torch.Tensor):
+    def ImportState(self, h: torch.Tensor, z: torch.Tensor, s4x: torch.Tensor):
         self._h = h.detach().clone()
         self._z = z.detach().clone()
+        self.s4.x = s4x.detach().clone()
 
     def NsProjectProbs(self, logits: torch.Tensor, temp: float = 1.0) -> torch.Tensor:
         return self.ns_struct.ProjectTrain(logits, temp=temp)
@@ -842,11 +849,12 @@ class RSSMWorldModel(nn.Module):
         self,
         hPrev: torch.Tensor, # deterministic state
         zPrev: torch.Tensor, # stochastic state
+        s4xPrev: torch.Tensor,
         actionEnc: torch.Tensor,
-        sample: bool = False,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        sample: bool = False,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
         a_t = self.act_proj(actionEnc)
-        h_next = self.s4.Step(zPrev, a_t, updateState=False)
+        h_next, s4x_next = self.s4.StepWithX(zPrev, a_t, s4xPrev)
 
         mu_p, logstd_p = self.prior_net(h_next).chunk(2, dim=-1)
         logstd_p = ClampLogStd(logstd_p)
@@ -886,7 +894,7 @@ class RSSMWorldModel(nn.Module):
         d_logit = self.done_head(s_next)
         d_prob = torch.sigmoid(d_logit)
 
-        return h_next, z_next, s_next, r_pred, d_prob # s_next is world state
+        return h_next, z_next, s_next, s4x_next, r_pred, d_prob # s_next is world state
 
     def StepPosterior(
         self,
@@ -985,8 +993,8 @@ class RSSMWorldModel(nn.Module):
         mouseSeq: torch.Tensor,  
         h0: Optional[torch.Tensor] = None,
         z0: Optional[torch.Tensor] = None,
-        rewardSeq: Optional[torch.Tensor] = None, # [B]
-        doneSeq: Optional[torch.Tensor] = None, # [B]
+        rewardSeq: Optional[torch.Tensor] = None, # [B, 1]
+        doneSeq: Optional[torch.Tensor] = None, # [B, 1]
         alphaKl: float = 0.8,
         freeNats: float = 1.0,
         reconCoef: float = 1.0,
@@ -1005,7 +1013,7 @@ class RSSMWorldModel(nn.Module):
 
         a_enc = self.action_encoder(keysVec, mouseSeq)
         a_enc = self.act_proj(a_enc)
-        h_next = self.s4.Step(z0, a_enc, updateState=False)
+        h_next = self.s4.Step(z0, a_enc, updateState=True)
 
         mu_p, logstd_p = self.prior_net(h_next).chunk(2, dim=-1)
         logstd_p = ClampLogStd(logstd_p)
@@ -1137,13 +1145,13 @@ class RSSMWorldModel(nn.Module):
         self,
         batchSize: int,
         device: torch.device,
-        maxItems: Optional[int] = None,) -> Tuple[torch.Tensor, torch.Tensor]:
+        maxItems: Optional[int] = None,) -> torch.Tensor:
 
         if (not self._use_memory) or (self._mem_size == 0):
             N = 1
             bank1 = torch.zeros(N, self.deter_dim, device=device)
         else:
-            vals = self._mem_vals[: self._mem_size].to(device) 
+            vals = self._mem_vals[: self._mem_size]
             N = vals.size(0)
 
             if (maxItems is not None) and (N > maxItems):
@@ -1365,7 +1373,7 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
 
         has_s4_delta = any(deltas.get(k, None) is not None for k in ("s4_B", "s4_C", "s4_D0", "s4_gate", "s4_out_gate"))
         if not has_s4_delta:
-            h_next = wm.s4.Step(z0, a_t, updateState=False)
+            h_next = wm.s4.Step(z0, a_t, updateState=True)
         else:
             u = torch.cat([z0, a_t], dim=-1)
 
@@ -1377,16 +1385,7 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
             g = torch.sigmoid(F.linear(u, W_gate, b_gate))
             Bu = F.linear(u, W_B, b_B) * g
 
-            x_prev = wm.s4.x
-            if (
-                x_prev.dim() != 2
-                or x_prev.size(0) != B
-                or x_prev.size(1) != wm.s4.N
-                or x_prev.device != device
-                or x_prev.dtype != dtype):
-                x_prev = torch.zeros(B, wm.s4.N, device=device, dtype=dtype)
-
-            x_next = wm.s4.CayleyStep(wm.s4.theta, x_prev, Bu, wm.s4.dt)
+            x_next = wm.s4.CayleyStep(wm.s4.theta, wm.s4.x, Bu, wm.s4.dt)
 
             W_outg, b_outg = eff_linear(wm.s4.out_gate, deltas.get("s4_out_gate", None))
             y_lin = F.linear(x_next, W_C, b_C) + F.linear(u, W_D0, b_D0)
@@ -1394,6 +1393,8 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
             y = wm.s4.ln_y(y_glu)
             y = y + wm.s4.ffn(wm.s4.ln_ffn(y))
             h_next = y  
+
+            wm.s4.x = x_next.detach()
 
         W_prior, b_prior = eff_linear(wm.prior_net[0], deltas.get("prior", None))
         prior_out = F.linear(h_next, W_prior, b_prior)
@@ -1694,8 +1695,9 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         self,
         hPrev: torch.Tensor,
         zPrev: torch.Tensor,
+        s4xPrev: torch.Tensor,
         actionEnc: torch.Tensor,
-        sample: bool = False,) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        sample: bool = False,) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         wm = self.base
 
         deltas_list = self.GetCurrentSimDeltas(detach=True, clone=True, skipZeros=True)
@@ -1721,7 +1723,7 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
 
         s4_has_delta = any(deltas.get(k) is not None for k in ("s4_B", "s4_C", "s4_D0", "s4_gate", "s4_out_gate"))
         if not s4_has_delta:
-            h_next = wm.s4.Step(zPrev, a_t, updateState=False)
+            h_next, x_next = wm.s4.StepWithX(zPrev, a_t, s4xPrev)
         else:
             u = torch.cat([zPrev, a_t], dim=-1)
 
@@ -1734,16 +1736,7 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
             g  = torch.sigmoid(F.linear(u, W_gate, b_gate))
             Bu = F.linear(u, W_B, b_B) * g
 
-            x_prev = wm.s4.x
-            if (
-                x_prev.dim() != 2
-                or x_prev.size(0) != B
-                or x_prev.size(1) != wm.s4.N
-                or x_prev.device != device
-                or x_prev.dtype != dtype):
-                x_prev = torch.zeros(B, wm.s4.N, device=device, dtype=dtype)
-
-            x_next = wm.s4.CayleyStep(wm.s4.theta, x_prev, Bu, wm.s4.dt)
+            x_next = wm.s4.CayleyStep(wm.s4.theta, s4xPrev, Bu, wm.s4.dt)
             y_lin = F.linear(x_next, W_C, b_C) + F.linear(u, W_D0, b_D0)
             y_glu = y_lin * torch.sigmoid(F.linear(x_next, W_outg, b_outg))
             y = wm.s4.ln_y(y_glu)
@@ -1912,7 +1905,7 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         d_logit = F.linear(d_mid, W_dn2, b_dn2)
         d_prob = torch.sigmoid(d_logit)
 
-        return h_next, z_next, s_next, r_pred, d_prob
+        return h_next, z_next, s_next, x_next, r_pred, d_prob
     
 
     @torch.no_grad()
@@ -2068,9 +2061,9 @@ class TestWorldMTool:
             h0 = torch.zeros(B, self.wm.deter_dim, device=self.device)
             z0 = torch.zeros(B, self.wm.stoch_dim, device=self.device)
 
-            h_before, z_before = self.wm.ExportState()
+            h_before, z_before, x_before = self.wm.ExportState()
             out = self.wm.StepPosterior(h0, z0, vision, a_enc, sample=False)
-            h_after, z_after = self.wm.ExportState()
+            h_after, z_after, x_after = self.wm.ExportState()
 
             ok_shapes = (
                 out["h_next"].shape == (B, self.wm.deter_dim)
@@ -2079,7 +2072,7 @@ class TestWorldMTool:
                 and out["r_pred"].shape == (B,1)
                 and out["d_prob"].shape == (B,1))
             
-            changed = (not torch.allclose(h_before, h_after)) or (not torch.allclose(z_before, z_after))
+            changed = (not torch.allclose(h_before, h_after)) or (not torch.allclose(z_before, z_after)) or (not torch.allclose(x_before, x_after))
             in_range = (out["d_prob"].min().item() >= 0.0) and (out["d_prob"].max().item() <= 1.0)
 
             with torch.no_grad():
@@ -2104,19 +2097,21 @@ class TestWorldMTool:
             a_enc = self.wm.action_encoder(keys, mouse)
             h0 = torch.zeros(B, self.wm.deter_dim, device=self.device)
             z0 = torch.zeros(B, self.wm.stoch_dim, device=self.device)
+            x0 = torch.zeros(B, self.wm.ssm_dim, device=self.device)
 
-            h_prev, z_prev = self.wm.ExportState()
-            h1, z1, s1, r, d = self.wm.StepPriorOnly(h0, z0, a_enc, sample=False)
+            h_prev, z_prev, x_prev = self.wm.ExportState()
+            h1, z1, s1, x1, r, d = self.wm.StepPriorOnly(h0, z0, x0, a_enc, sample=False)
 
             ok_shapes = (
                 h1.shape == (B, self.wm.deter_dim)
                 and z1.shape == (B, self.wm.stoch_dim)
                 and s1.shape == (B, self.wm.state_dim)
+                and x1.shape == (B, self.wm.ssm_dim)
                 and r.shape == (B,1)
                 and d.shape == (B,1))
             
-            h_after, z_after = self.wm.ExportState()
-            not_written = torch.allclose(h_prev, h_after) and torch.allclose(z_prev, z_after)
+            h_after, z_after, x_after = self.wm.ExportState()
+            not_written = torch.allclose(h_prev, h_after) and torch.allclose(z_prev, z_after) and torch.allclose(x_prev, x_after)
             ok = ok_shapes and not_written
             print("RSSM StepPriorOnly test " + ("passed." if ok else "failed."))
             return ok
@@ -2498,14 +2493,16 @@ class TestWorldMTool:
 
             h0 = torch.zeros(B, wm.deter_dim, device=self.device)
             z0 = torch.zeros(B, wm.stoch_dim, device=self.device)
+            x0 = torch.zeros(B, wm.ssm_dim, device=self.device)
             a_enc = wm.action_encoder(keys, mouse)
 
-            h1, z1, s1, r1, d1 = wm.StepPriorOnly(h0, z0, a_enc, sample=False)
+            h1, z1, s1, x1, r1, d1 = wm.StepPriorOnly(h0, z0, x0, a_enc, sample=False)
 
             ok_shapes = (
                 h1.shape == (B, wm.deter_dim) 
                 and z1.shape == (B, wm.stoch_dim) 
                 and s1.shape == (B, wm.state_dim) 
+                and x1.shape == (B, wm.ssm_dim) 
                 and r1.shape == (B,1) 
                 and d1.shape == (B,1))
 

@@ -42,7 +42,6 @@ class ConsciousnessHyperNet(nn.Module):
         nIntentBlocks: int,
         selfHiddenDim: int,
         intentHiddenDim: int,
-        gateDim: int = 3,
         hiddenDim: int = 512,):
         super().__init__()
         self.ctx_dim = int(ctxDim)
@@ -50,13 +49,11 @@ class ConsciousnessHyperNet(nn.Module):
         self.n_intent_blocks = int(nIntentBlocks)
         self.self_hidden_dim = int(selfHiddenDim)
         self.intent_hidden_dim = int(intentHiddenDim)
-        self.gate_dim = int(gateDim)
 
         self.total_self_params = self.n_self_blocks * 2 * self.self_hidden_dim
         self.total_intent_params = self.n_intent_blocks * 2 * self.intent_hidden_dim
-        self.total_gate_params = self.gate_dim
 
-        out_dim = self.total_self_params + self.total_intent_params + self.total_gate_params
+        out_dim = self.total_self_params + self.total_intent_params
 
         self.mlp = nn.Sequential(
             nn.Linear(self.ctx_dim, hiddenDim),
@@ -74,11 +71,9 @@ class ConsciousnessHyperNet(nn.Module):
         cur = 0
         hs = self.total_self_params
         hi = self.total_intent_params
-        hg = self.total_gate_params
 
         self_flat = h[:, cur:cur + hs]; cur += hs
         intent_flat = h[:, cur:cur + hi]; cur += hi
-        gates = h[:, cur:cur + hg]
 
         self_flat = self_flat.view(B, self.n_self_blocks, 2, self.self_hidden_dim)
 
@@ -90,22 +85,16 @@ class ConsciousnessHyperNet(nn.Module):
         gamma_intent = intent_flat[:, :, 0, :]
         beta_intent = intent_flat[:, :, 1, :]
 
-        gates = torch.sigmoid(gates)
-
         return {
             "gamma_self": gamma_self,
             "beta_self": beta_self,
             "gamma_intent": gamma_intent,
-            "beta_intent": beta_intent,
-            "gates": gates, }
+            "beta_intent": beta_intent,}
 
 
 class ConsciousnessOutput(NamedTuple):
     self_sem: torch.Tensor 
     intent_sem: torch.Tensor  
-    gate_lang: torch.Tensor  
-    gate_world: torch.Tensor 
-    gate_memory: torch.Tensor 
     new_state: ConsciousnessState
     extras: Dict[str, torch.Tensor]
 
@@ -233,7 +222,6 @@ class ConsciousnessExtractor(nn.Module):
             nIntentBlocks=self.n_intent_blocks,
             selfHiddenDim=self.self_dim,
             intentHiddenDim=self.intent_dim,
-            gateDim=3,
             hiddenDim=hyperHiddenDim,)
 
         in_self = self.world_item_dim + self.mem_item_dim + self.dev_dim
@@ -304,7 +292,7 @@ class ConsciousnessExtractor(nn.Module):
 
     def InitialState(self, batchSize: int, device: torch.device) -> ConsciousnessState:
         dev_trace = torch.zeros(batchSize, self.dev_dim, device=device)
-        step = torch.zeros(batchSize, device=device)
+        step = torch.zeros(batchSize, 1, device=device)
         return ConsciousnessState(dev_trace=dev_trace, step=step)
 
     def AggregateBank(
@@ -328,8 +316,8 @@ class ConsciousnessExtractor(nn.Module):
         if N == 0:
             summary = torch.zeros(B, 3 * D, device=device, dtype=bank.dtype)
             stats = {
-                "score_mean": torch.zeros(B, device=device),
-                "n_items": torch.zeros(B, device=device),}
+                "score_mean": torch.zeros(B, 1, device=device),
+                "n_items": torch.zeros(B, 1, device=device),}
             
             return summary, stats
 
@@ -369,8 +357,8 @@ class ConsciousnessExtractor(nn.Module):
         summary = torch.cat([global_mean, top_mean, rand_mean], dim=-1)
 
         stats = {
-            "score_mean": scores.mean(dim=1),
-            "n_items": torch.full((B,), float(N), device=device),}
+            "score_mean": scores.mean(dim=1, keepdim=True),
+            "n_items": torch.full((B,1), float(N), device=device),}
 
         return summary, stats
 
@@ -423,11 +411,6 @@ class ConsciousnessExtractor(nn.Module):
         beta_self = hyper_out["beta_self"]
         gamma_intent = hyper_out["gamma_intent"]
         beta_intent = hyper_out["beta_intent"]
-        gates = hyper_out["gates"] 
-
-        gate_lang = gates[:, 0]
-        gate_world = gates[:, 1]
-        gate_memory = gates[:, 2]
 
         self_in_vec = torch.cat([world_ctx, mem_ctx, dev_ctx], dim=-1) 
         h_self = self.self_in(self_in_vec) 
@@ -467,23 +450,17 @@ class ConsciousnessExtractor(nn.Module):
         new_state = ConsciousnessState(dev_trace=new_dev, step=new_step)
 
         extras: Dict[str, torch.Tensor] = {
-            "gate_lang_raw": gate_lang.detach(),
-            "gate_world_raw": gate_world.detach(),
-            "gate_memory_raw": gate_memory.detach(),
-            "dev_trace_norm": new_dev.norm(dim=-1).detach(),
+            "dev_trace_norm": new_dev.norm(dim=-1, keepdim=True).detach(),
             "mem_score_mean": mem_stats["score_mean"].detach(),
             "world_score_mean": world_stats["score_mean"].detach(),
             "mem_n_items": mem_stats["n_items"].detach(),
             "world_n_items": world_stats["n_items"].detach(),
-            "mem_focus_norm": mem_focus.norm(dim=-1).detach(),
-            "world_focus_norm": world_focus.norm(dim=-1).detach(),}
+            "mem_focus_norm": mem_focus.norm(dim=-1, keepdim=True).detach(),
+            "world_focus_norm": world_focus.norm(dim=-1, keepdim=True).detach(),}
 
         return ConsciousnessOutput(
             self_sem=self_sem,
             intent_sem=intent_sem,
-            gate_lang=gate_lang,
-            gate_world=gate_world,
-            gate_memory=gate_memory,
             new_state=new_state,
             extras=extras,)
     
@@ -544,14 +521,10 @@ class TestConsciousMTool:
 
             assert out.self_sem.shape == (4, self.self_dim), f"self_sem shape wrong: {out.self_sem.shape}"
             assert out.intent_sem.shape == (4, self.intent_dim), f"intent_sem shape wrong: {out.intent_sem.shape}"
-            assert out.gate_lang.shape == (4,), f"gate_lang shape wrong: {out.gate_lang.shape}"
-            assert out.gate_world.shape == (4,), f"gate_world shape wrong: {out.gate_world.shape}"
-            assert out.gate_memory.shape == (4,), f"gate_memory shape wrong: {out.gate_memory.shape}"
             assert out.new_state.dev_trace.shape == (4, self.dev_dim), f"dev_trace shape wrong: {out.new_state.dev_trace.shape}"
-            assert out.new_state.step.shape == (4,), f"step shape wrong: {out.new_state.step.shape}"
+            assert out.new_state.step.shape == (4,1), f"step shape wrong: {out.new_state.step.shape}"
 
             for k in [
-                "gate_lang_raw", "gate_world_raw", "gate_memory_raw",
                 "dev_trace_norm", "mem_score_mean", "world_score_mean",
                 "mem_n_items", "world_n_items",
                 "mem_focus_norm", "world_focus_norm",]:
@@ -676,10 +649,8 @@ class TestConsciousMTool:
             base_loss = F.mse_loss(pred, target)
 
             dev_loss = out.new_state.dev_trace.pow(2).mean()
-            gates = torch.stack([out.gate_lang, out.gate_world, out.gate_memory], dim=-1)
-            gate_loss = gates.pow(2).mean()
 
-            loss = base_loss + 0.1 * (dev_loss + gate_loss)
+            loss = base_loss + 0.1 * dev_loss
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -731,10 +702,8 @@ class TestConsciousMTool:
                 base0 = F.mse_loss(pred0, target)
 
                 dev0 = out0.new_state.dev_trace.pow(2).mean()
-                gates0 = torch.stack([out0.gate_lang, out0.gate_world, out0.gate_memory], dim=-1)
-                gate0 = gates0.pow(2).mean()
 
-                start = (base0 + 0.1 * (dev0 + gate0)).item()
+                start = (base0 + 0.1 * dev0).item()
 
             last_loss = start
             for t in range(1, steps + 1):
@@ -744,10 +713,8 @@ class TestConsciousMTool:
                 base_loss = F.mse_loss(pred, target)
 
                 dev_loss = out.new_state.dev_trace.pow(2).mean()
-                gates = torch.stack([out.gate_lang, out.gate_world, out.gate_memory], dim=-1)
-                gate_loss = gates.pow(2).mean()
 
-                loss = base_loss + 0.1 * (dev_loss + gate_loss)
+                loss = base_loss + 0.1 * dev_loss
 
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -764,10 +731,8 @@ class TestConsciousMTool:
                 base1 = F.mse_loss(pred1, target)
 
                 dev1 = out1.new_state.dev_trace.pow(2).mean()
-                gates1 = torch.stack([out1.gate_lang, out1.gate_world, out1.gate_memory], dim=-1)
-                gate1 = gates1.pow(2).mean()
 
-                end = (base1 + 0.1 * (dev1 + gate1)).item()
+                end = (base1 + 0.1 * dev1).item()
 
             print(f"\n[ConsciousTrain] loss start={start:.6f} -> end={end:.6f}")
             assert end <= 0.8 * start, "Training did not show sufficient convergence (<20% decline)."
@@ -798,10 +763,8 @@ class TestConsciousMTool:
             base_loss = F.mse_loss(pred, target)
 
             dev_loss = out.new_state.dev_trace.pow(2).mean()
-            gates = torch.stack([out.gate_lang, out.gate_world, out.gate_memory], dim=-1)
-            gate_loss = gates.pow(2).mean()
 
-            loss = base_loss + 0.1 * (dev_loss + gate_loss)
+            loss = base_loss + 0.1 * dev_loss
 
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
             opt.zero_grad(set_to_none=True)

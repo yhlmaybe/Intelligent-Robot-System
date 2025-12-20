@@ -409,30 +409,13 @@ class IntentionExtractor(nn.Module):
 
         return tokens
 
-    def EncodeStrings(
-        self,
-        texts: List[str],
-        device: torch.device,) -> torch.Tensor:
-        batch_size = len(texts)
-        _ = batch_size
+    def EncodeStrings(self, texts: List[Optional[str]], device: torch.device) -> torch.Tensor:
+        token_ids = self.TokenizeBatch(texts, device=device) 
+        mask_valid = token_ids.ne(self.pad_idx).any(dim=1) 
 
-        valid = []
-        normed = []
-        for s in texts:
-            if s is None:
-                normed.append("")
-                valid.append(False)
-            else:
-                s2 = str(s).strip()
-                normed.append(s2)
-                valid.append(len(s2) > 0)
-
-        token_ids = self.TokenizeBatch(normed, device=device)
         text_repr = self.encoder(token_ids)
         lang_sem = self.semProj(text_repr)
-
-        mask_valid = torch.tensor(valid, dtype=torch.bool, device=device)
-        lang_sem = lang_sem * mask_valid.unsqueeze(-1)
+        lang_sem = lang_sem * mask_valid.unsqueeze(-1) 
 
         return lang_sem
 
@@ -459,7 +442,6 @@ class IntentionExtractor(nn.Module):
 
         batch_size: Optional[int] = None
         if consState is not None:
-            consState = consState.to(device)
             batch_size = consState.size(0)
 
         if ocrTexts is not None:
@@ -586,8 +568,8 @@ class IntentionExtractor(nn.Module):
 
             intentSem = intentSem + self.beta_trans * fused
 
-            extras["intent_trans_norm"] = fused.norm(dim=-1).detach()
-            extras["intent_trans_mask_sum"] = mask_float.sum(dim=1).squeeze(-1).detach()
+            extras["intent_trans_norm"] = fused.norm(dim=-1, keepdim=True).detach()
+            extras["intent_trans_mask_sum"] = mask_float.sum(dim=1).detach()
 
         symbol_logits = F.linear(intentSem, self.conceptEmb, self.conceptBias)
         symProbs = self.reasoner(symbol_logits, self.conceptEmb)
@@ -708,18 +690,18 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         texts: List[str],
         device: torch.device,
         delta_sem: Optional[torch.Tensor],) -> torch.Tensor:
-        valid = []
-        normed = []
+
+        normed: List[str] = []
         for s in texts:
             if s is None:
                 normed.append("")
-                valid.append(False)
             else:
-                s2 = str(s).strip()
-                normed.append(s2)
-                valid.append(len(s2) > 0)
+                normed.append(str(s))
 
         token_ids = base.TokenizeBatch(normed, device=device)
+
+        mask_valid = token_ids.ne(base.pad_idx).any(dim=1) 
+
         text_repr = base.encoder(token_ids) 
 
         sem_lora: "IntentionLoRALinear" = base.semProj[0]
@@ -727,7 +709,6 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         h = base.semProj[1](h)
         h = base.semProj[2](h)
 
-        mask_valid = torch.tensor(valid, dtype=torch.bool, device=device)
         h = h * mask_valid.unsqueeze(-1)
         return h
 
@@ -771,7 +752,6 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         batch_size: Optional[int] = None
 
         if consState is not None:
-            consState = consState.to(device)
             batch_size = consState.size(0)
 
         if ocrTexts is not None:
@@ -900,8 +880,8 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
 
             intentSem = intentSem + base.beta_trans * fused
 
-            extras["intent_trans_norm"] = fused.norm(dim=-1).detach()
-            extras["intent_trans_mask_sum"] = mask_float.sum(dim=1).squeeze(-1).detach()
+            extras["intent_trans_norm"] = fused.norm(dim=-1, keepdim=True).detach() 
+            extras["intent_trans_mask_sum"] = mask_float.sum(dim=1).detach()
 
         symbol_logits = F.linear(intentSem, base.conceptEmb, base.conceptBias)
         symProbs = base.reasoner(symbol_logits, base.conceptEmb)

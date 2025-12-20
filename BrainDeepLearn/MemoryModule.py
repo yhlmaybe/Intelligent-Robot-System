@@ -195,15 +195,13 @@ class SymbolicMemory(nn.Module):
 
         filled = int(self.filled)
 
-        P = self.Pstore[:filled].to(qSym.device, dtype=qSym.dtype).clone()
+        P = self.Pstore[:filled].to(dtype=qSym.dtype).clone()
 
         sim = qSym @ P.t()
 
         age = (self.global_step - self.step[:filled]).clamp(min=0)
-        age = age.to(device=qSym.device, dtype=sim.dtype).clone() 
 
-        prio = self.prio[:filled].to(device=qSym.device, dtype=sim.dtype)
-        prio = prio.clone() 
+        prio = self.prio[:filled].to(dtype=sim.dtype).clone() 
 
         decay = torch.exp(-recentBias * age).unsqueeze(0)  
         prio_w = prio.unsqueeze(0) 
@@ -318,9 +316,8 @@ class GlobalWorkspace(nn.Module):
         ownerId: int = 0,
         replacePolicy: str = "soft"):
         
-        device = self.keys.device
-        key = F.normalize(key.detach().to(device=device, dtype=self.keys.dtype), dim=-1)
-        val = F.normalize(val.detach().to(device=device, dtype=self.vals.dtype), dim=-1)
+        key = F.normalize(key.detach().to(dtype=self.keys.dtype), dim=-1)
+        val = F.normalize(val.detach().to(dtype=self.vals.dtype), dim=-1)
         ttl = int(ttl) if ttl is not None else self.default_ttl
         pr_t = torch.as_tensor(priority, dtype=self.priority.dtype, device=self.priority.device)
 
@@ -370,10 +367,10 @@ class GlobalWorkspace(nn.Module):
             return (out, None)
 
         idx_alive = torch.nonzero(alive, as_tuple=False).flatten()
-        keys_a = keys[idx_alive].to(device)
-        vals_a = vals[idx_alive].to(device)
-        pr_a = pr[idx_alive].to(device)
-        last_a = last[idx_alive].to(device)
+        keys_a = keys[idx_alive]
+        vals_a = vals[idx_alive]
+        pr_a = pr[idx_alive]
+        last_a = last[idx_alive]
 
         if tagMask is not None:
             tag_a = self.tag_id[idx_alive]
@@ -384,10 +381,10 @@ class GlobalWorkspace(nn.Module):
                 out = torch.zeros(query.size(0), self.dim, device=device, dtype=query.dtype)
                 return (out, None)
             idx_alive = idx_alive[allowed]
-            keys_a = keys[idx_alive].to(device)
-            vals_a = vals[idx_alive].to(device)
-            pr_a = pr[idx_alive].to(device)
-            last_a = last[idx_alive].to(device)
+            keys_a = keys[idx_alive]
+            vals_a = vals[idx_alive]
+            pr_a = pr[idx_alive]
+            last_a = last[idx_alive]
 
         sim = F.normalize(query, dim=-1) @ F.normalize(keys_a, dim=-1).t()
         age = (self.global_step - last_a).clamp(min=0).float()
@@ -460,11 +457,11 @@ class SemanticLTM(nn.Module):
                 return out, None, None, None
             return out
 
-        E = self.emb[:self.filled].to(query.device).float()
+        E = self.emb[:self.filled].float()
         sim = F.normalize(query, dim=-1) @ F.normalize(E, dim=-1).t()
 
-        age = (self.global_step - self.step[:self.filled]).clamp(min=0).float().to(query.device)
-        src = self.source[:self.filled].to(query.device)
+        age = (self.global_step - self.step[:self.filled]).clamp(min=0).float()
+        src = self.source[:self.filled]
         is_imag = (src == MemoryType.SRC_IMAGINE).float()
 
         beta_real = 0.005
@@ -534,11 +531,11 @@ class EpisodicLTM(nn.Module):
                 return out, None, None, None
             return out
 
-        E = self.emb[:self.filled].to(query.device).float()
+        E = self.emb[:self.filled].float()
         sim = F.normalize(query, dim=-1) @ F.normalize(E, dim=-1).t()
 
-        age = (self.global_step - self.step[:self.filled]).clamp(min=0).float().to(query.device)
-        src = self.source[:self.filled].to(query.device)
+        age = (self.global_step - self.step[:self.filled]).clamp(min=0).float()
+        src = self.source[:self.filled]
         is_imag = (src == MemoryType.SRC_IMAGINE).float()
 
         freshness = torch.exp(-recentBias * age)
@@ -912,7 +909,7 @@ class MemoryExtractor(nn.Module):
         if self.memory_filled == 0:
             return torch.zeros(B, 3, device=key.device)
 
-        K = self.memory_keys[:self.memory_filled].float().to(key.device)
+        K = self.memory_keys[:self.memory_filled].float()
         sim = key @ K.t()
         attn = F.softmax(sim, dim=-1)
 
@@ -921,7 +918,7 @@ class MemoryExtractor(nn.Module):
         m = topk_vals.mean(dim=1, keepdim=True) 
         s = topk_vals.std(dim=1, keepdim=True, unbiased=False)
 
-        age = (self.time_step - self.memory_steps[:self.memory_filled]).float().to(key.device) 
+        age = (self.time_step - self.memory_steps[:self.memory_filled]).float()
         age_w = (attn * age.unsqueeze(0)).sum(dim=1, keepdim=True) 
 
         age_w = torch.tanh(age_w / 100.0)
@@ -978,12 +975,12 @@ class MemoryExtractor(nn.Module):
 
         B, device = PPre.size(0), PPre.device
 
-        imp = importance.view(-1).to(device=device)
+        imp = importance.view(-1)
 
         if sourceLabel is None:
             src_all = torch.full((B,), MemoryType.SRC_REAL, dtype=torch.int8, device=device)
         else:
-            src_all = sourceLabel.view(-1).to(device=device).to(torch.int8)
+            src_all = sourceLabel.view(-1).to(torch.int8)
 
         for i in range(B):
             self.sym_mem.Store(PPre[i],score=float(imp[i].item()),source=int(src_all[i].item()),)
@@ -1030,10 +1027,9 @@ class MemoryExtractor(nn.Module):
 
         B, device = x.size(0), x.device
 
+        src_all = sourceLabel
         if sourceLabel is None:
-            src_all = torch.full((B,), MemoryType.SRC_REAL, dtype=torch.int8, device=device)
-        else:
-            src_all = sourceLabel.view(-1).to(device=device).to(torch.int8)
+            src_all = torch.full((B,1), MemoryType.SRC_REAL, dtype=torch.int8, device=device)
 
         emotion_eff = emotion
         if emotion is None:
@@ -1042,17 +1038,15 @@ class MemoryExtractor(nn.Module):
         tdError_eff = tdError
         reward_eff = reward
         if tdError_eff is None:
-            tdError_eff = torch.zeros(B, device=device)
+            tdError_eff = torch.zeros((B, 1), device=device)
         if reward_eff is None:
-            reward_eff = torch.zeros(B, device=device)
+            reward_eff = torch.zeros((B, 1), device=device)
 
         if reset:
             self.ResetAll()
         elif softReset:
             self.SoftReset()
 
-        if self.h_state.device != device:
-            self.h_state = self.h_state.to(device)
         if self.h_state.size(0) != B:
             self.h_state.resize_(B, self.ssm_state_dim).zero_()
 
@@ -1091,21 +1085,20 @@ class MemoryExtractor(nn.Module):
         importance = self.importance_net(h_mix)
         gate_local = self.local_gate(h_mix)
 
-        neuromod = self.GetNeuromod(tdError)
+        neuromod = self.GetNeuromod(tdError_eff)
         self.UpdateMemoryUtilization()
         self.AutoCompress()
 
-        td_feat = tdError_eff.view(-1, 1)
         kv_feat = self.KvStats(key) 
-        phi = torch.cat([self.ctrl_norm(h_mix), key, kv_feat, importance, gate_local, td_feat], dim=-1)
+        phi = torch.cat([self.ctrl_norm(h_mix), key, kv_feat, importance, gate_local, tdError_eff], dim=-1)
 
         ctrl = self.ctrl_head(phi) 
         a_raw, b_raw, f_raw, bias_raw = ctrl.split(1, dim=-1)
 
-        a = (0.7 + 0.6 * torch.sigmoid(a_raw)).squeeze(-1)
-        b = (0.97 + 0.03 * torch.sigmoid(b_raw)).squeeze(-1)
-        fusion_gate = torch.sigmoid(f_raw).squeeze(-1)
-        gate_bias = 0.5 * torch.tanh(bias_raw).squeeze(-1)
+        a = (0.7 + 0.6 * torch.sigmoid(a_raw))
+        b = (0.97 + 0.03 * torch.sigmoid(b_raw))
+        fusion_gate = torch.sigmoid(f_raw)
+        gate_bias = 0.5 * torch.tanh(bias_raw)
 
         reg = (a - 1.0).abs().mean() + (b - 1.0).abs().mean() + (fusion_gate - 0.5).abs().mean() + gate_bias.abs().mean()
         self.AddInternalLoss(1e-4 * reg)
@@ -1148,8 +1141,8 @@ class MemoryExtractor(nn.Module):
             loss_gws_align = self.gws_align_weight * (1 - F.cosine_similarity(ws_val, mem_recall_base, dim=-1)).mean()
             self.AddInternalLoss(loss_gws_align)
 
-        affect_mag = tdError_eff.view(-1).abs()
-        prio = importance.view(-1) * (1.0 + 0.5 * affect_mag).clamp(0.5, 2.0)
+        affect_mag = tdError_eff.abs()
+        prio = importance * (1.0 + 0.5 * affect_mag).clamp(0.5, 2.0)
 
         for i in range(B):
             src_i = int(src_all[i].item())
@@ -1331,7 +1324,7 @@ class MemoryExtractor(nn.Module):
         if source is None:
             src = torch.full((n,), MemoryType.SRC_REAL, dtype=torch.int8, device=device)
         else:
-            src = source.view(-1)[:n].to(device=device).to(torch.int8)
+            src = source.view(-1)[:n].to(torch.int8)
 
         if self.memory_filled > 0:
             mask = torch.ones(self.memory_filled, dtype=torch.bool, device=device)
@@ -1363,7 +1356,7 @@ class MemoryExtractor(nn.Module):
         if sourceLabel is None:
             src_all = torch.full((B,), MemoryType.SRC_REAL, dtype=torch.int8, device=device)
         else:
-            src_all = sourceLabel.view(-1).to(device=device).to(torch.int8)
+            src_all = sourceLabel.view(-1).to(torch.int8)
 
         mask_base = (imp > self.ltm_online_imp_thresh) | (td > self.ltm_online_td_thresh)
 
@@ -1377,7 +1370,7 @@ class MemoryExtractor(nn.Module):
         if idx.numel() == 0:
             return
 
-        emo_vec_all = self.emo_read_proj(emotion.to(device)) 
+        emo_vec_all = self.emo_read_proj(emotion) 
         emo_vec_all = F.normalize(emo_vec_all, dim=-1)
 
         for i in idx.tolist():
@@ -1423,7 +1416,7 @@ class MemoryExtractor(nn.Module):
             imp_kv = self.memory_importance[:self.memory_filled].detach().clone()
             corr = self.memory_corr[:self.memory_filled].detach().clone()
             steps = self.memory_steps[:self.memory_filled].detach().clone()
-            src_all = self.memory_source[:self.memory_filled].to(query.device)
+            src_all = self.memory_source[:self.memory_filled]
 
             sim = query @ keys.t()
             sim = sim * imp_kv.unsqueeze(0) * corr.unsqueeze(0)
@@ -1446,7 +1439,7 @@ class MemoryExtractor(nn.Module):
             th = torch.clamp(th, min=th_min, max=th_max)
 
             if self.ns_enable and self.ns_retrieve_boost > 0.0 and (self._ns_penalty_vec is not None):
-                th = th + self.ns_retrieve_boost * self._ns_penalty_vec.to(th.device)
+                th = th + self.ns_retrieve_boost * self._ns_penalty_vec
 
             mask = top_sim > th
             masked_top = top_sim.masked_fill(~mask, -1e9)
@@ -1456,7 +1449,7 @@ class MemoryExtractor(nn.Module):
 
             vals = values[top_idx] 
 
-            src_all = self.memory_source[:self.memory_filled].to(query.device) 
+            src_all = self.memory_source[:self.memory_filled]
             src_sel = src_all[top_idx]
 
             mask_real = (src_sel == MemoryType.SRC_REAL)
@@ -1490,7 +1483,7 @@ class MemoryExtractor(nn.Module):
 
             emo_vals = self.memory_emotion[:self.memory_filled].float() 
             emo_sel = emo_vals[top_idx] 
-            emo_q = emotion.to(emo_sel.device).unsqueeze(1) 
+            emo_q = emotion.unsqueeze(1) 
 
             emo_sim = F.cosine_similarity(emo_sel,emo_q.expand_as(emo_sel),dim=-1,)
 
@@ -1512,7 +1505,7 @@ class MemoryExtractor(nn.Module):
             else:
                 td_abs = torch.zeros(B, 1, device=query.device)
 
-            gate_feat = torch.cat([td_abs, emotion.to(query.device)], dim=-1)  
+            gate_feat = torch.cat([td_abs, emotion], dim=-1)  
             gamma = self.td_affect_gate(gate_feat) 
 
             kv_part = gamma * mem_task + (1.0 - gamma) * mem_affect
@@ -1553,7 +1546,7 @@ class MemoryExtractor(nn.Module):
             self.memory_importance[:self.memory_filled] *= decay_factor
 
         importances = self.memory_importance[:self.memory_filled]
-        src = self.memory_source[:self.memory_filled].to(importances.device)
+        src = self.memory_source[:self.memory_filled]
         is_imag = (src == MemoryType.SRC_IMAGINE).float()
 
         bias = 1.0 - 0.3 * is_imag
@@ -1585,8 +1578,8 @@ class MemoryExtractor(nn.Module):
             return
         idx = torch.nonzero(alive, as_tuple=False).flatten()
         for i in idx.tolist():
-            v = vals[i].to(self.ltm.semantic.emb.device).float()
-            k = keys[i].to(v.device).float()
+            v = vals[i].float()
+            k = keys[i].float()
             score = float(pr[i].item())
 
             tag = int(snap["tag_id"][i].item())
@@ -1626,12 +1619,12 @@ class MemoryExtractor(nn.Module):
                     self.HebbianUpdate(diff, gate, neu, a, b)
             return
 
-        keys = F.normalize(torch.cat(cand, dim=0).to(device), dim=-1)    # [N,D]
-        w = torch.cat(w, dim=0).to(device) if w else torch.full((keys.size(0),), 0.5, device=device)
+        keys = F.normalize(torch.cat(cand, dim=0), dim=-1)    # [N,D]
+        w = torch.cat(w, dim=0) if w else torch.full((keys.size(0),), 0.5, device=device)
 
         def novelty_vs_kv(cand):
             if self.memory_filled == 0: return torch.ones(cand.size(0), device=cand.device)
-            kv = self.memory_keys[:self.memory_filled].float().to(cand.device)
+            kv = self.memory_keys[:self.memory_filled].float()
             sim = F.normalize(cand,dim=-1) @ F.normalize(kv,dim=-1).t()
             return 1.0 - sim.abs().max(dim=1).values.clamp(0,1)
         novelty = novelty_vs_kv(keys)
@@ -1919,7 +1912,7 @@ class MemoryExtractor(nn.Module):
         h = self.h_state.mean(dim=0, keepdim=True)
         q, _ = self.EncodeKV(h)
         if goal is not None:
-            goal = F.normalize(goal.to(device).view(1, -1), dim=-1)
+            goal = F.normalize(goal.view(1, -1), dim=-1)
             q = F.normalize(q + goal, dim=-1)
         hyp = torch.zeros(1, self.memory_dim, device=device)
         for _ in range(max(1, steps)):
@@ -1941,7 +1934,7 @@ class MemoryExtractor(nn.Module):
         chunks = []
 
         if self.memory_filled > 0:
-            short_vals = self.memory_values[:self.memory_filled].float().to(device)
+            short_vals = self.memory_values[:self.memory_filled].float()
             chunks.append(short_vals) 
 
         gws_snap = self.gws.Inspect()
@@ -1950,17 +1943,17 @@ class MemoryExtractor(nn.Module):
         gws_ttl = gws_snap["ttl"]
         alive = (gws_ttl > 0) & (gws_prio > 0)
         if alive.any():
-            gws_alive = gws_vals[alive].float().to(device)  
+            gws_alive = gws_vals[alive].float()
             chunks.append(gws_alive)
 
         sem = self.ltm.semantic
         if sem.filled > 0:
-            sem_emb = sem.emb[:sem.filled].float().to(device) 
+            sem_emb = sem.emb[:sem.filled].float()
             chunks.append(sem_emb)
 
         epi = self.ltm.episodic
         if epi.filled > 0:
-            epi_emb = epi.emb[:epi.filled].float().to(device) 
+            epi_emb = epi.emb[:epi.filled].float()
             chunks.append(epi_emb)
 
         if not chunks:
@@ -2637,8 +2630,8 @@ class TestMemoryMTool:
             in_dim = cfg["inputDim"]
             for t in range(steps):
                 x = torch.randn(batchSize, in_dim, device=device)
-                td = torch.randn(batchSize, device=device)
-                rwd = torch.randn(batchSize, device=device)
+                td = torch.randn(batchSize, 1, device=device)
+                rwd = torch.randn(batchSize, 1, device=device)
                 emotion = self.MakeEmotion(batchSize, mem)
 
                 with torch.no_grad():
@@ -2848,7 +2841,7 @@ class TestMemoryMTool:
             target = torch.randn(B, cfg["outputDim"], device=self.device)
             emotion = self.MakeEmotion(B, mem)
 
-            out, _ = mem(x,tdError=torch.randn(B, device=self.device),reward=torch.randn(B, device=self.device),emotion=emotion,)
+            out, _ = mem(x,tdError=torch.randn(B, 1, device=self.device),reward=torch.randn(B, 1, device=self.device),emotion=emotion,)
             base = F.mse_loss(out, target)
 
             total = self.AttachAllInternalLosses(mem, base)
@@ -2928,7 +2921,6 @@ class TestMemoryMTool:
 
             opt = torch.optim.Adam(mem.parameters(), lr=1e-3)
 
-
             seen = {
                 n: False
                 for n, p in mem.named_parameters()
@@ -2937,8 +2929,8 @@ class TestMemoryMTool:
             for t in range(steps):
                 x = torch.randn(batchSize, cfg["inputDim"], device=device)
                 y = torch.randn(batchSize, cfg["outputDim"], device=device)
-                td = torch.randn(batchSize, device=device)
-                rwd = torch.randn(batchSize, device=device)
+                td = torch.randn(batchSize, 1, device=device)
+                rwd = torch.randn(batchSize, 1, device=device)
                 emotion = self.MakeEmotion(batchSize, mem)
 
                 out, _ = mem(x, tdError=td, reward=rwd, emotion=emotion)
@@ -3058,8 +3050,8 @@ class TestMemoryMTool:
                 B = 8
                 x = torch.randn(B, cfg["inputDim"], device=self.device)
                 y = torch.randn(B, cfg["outputDim"], device=self.device)
-                td = torch.randn(B, device=self.device)
-                rwd = torch.randn(B, device=self.device)
+                td = torch.randn(B, 1, device=self.device)
+                rwd = torch.randn(B, 1, device=self.device)
                 emotion = self.MakeEmotion(B, mem)
 
                 out, _ = mem(x, tdError=td, reward=rwd, emotion=emotion)
