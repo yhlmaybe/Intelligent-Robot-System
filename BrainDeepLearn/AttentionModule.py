@@ -60,84 +60,132 @@ class GrowableLoRALinear(nn.Module):
         return F.linear(x, W, self.target.bias)
 
 
-class SimpleSSM(nn.Module):
-    def __init__(self, embedDim: int, convKernel: int = 3):
+class SelectiveSSM(nn.Module):
+    def __init__(
+        self,
+        embedDim: int,
+        stateDim: int = 4, 
+        convKernel: int = 4, 
+        useCausalConv: bool = True,):
         super().__init__()
         E = embedDim
-        self.alpha_log = nn.Parameter(torch.zeros(E))
-        self.beta = nn.Parameter(torch.randn(E)*0.05)
-        self.gamma  = nn.Parameter(torch.randn(E)*0.05)
-        self.delta = nn.Parameter(torch.zeros(E))
-        self.in_proj = nn.Linear(E, 2*E)
+        N = stateDim
+        self.E = E
+        self.N = N
+        self.use_causal_conv = bool(useCausalConv)
+
+        self.A_log = nn.Parameter(torch.zeros(E, N)) 
+
+        self.D = nn.Parameter(torch.zeros(E))
+
+        self.in_proj = nn.Linear(E, 2 * E)
+
+        self.param_proj = nn.Linear(E, E + 2 * E * N)
+
+        self.dt_bias = nn.Parameter(torch.full((E,), -3.0))
+
+        self.dw_conv = nn.Conv1d(E, E, convKernel, groups=E, bias=True)
+
         self.out_norm = nn.LayerNorm(E)
-        self.dw_conv = nn.Conv1d(E, E, convKernel, groups=E, padding=convKernel//2)
+
+        nn.init.xavier_uniform_(self.in_proj.weight, gain=0.5)
+        nn.init.zeros_(self.in_proj.bias)
+        nn.init.xavier_uniform_(self.param_proj.weight, gain=0.5)
+        nn.init.zeros_(self.param_proj.bias)
+
+    def ZscoreTanh(self, t: Optional[torch.Tensor], B: int, dev, dtype=torch.float32) -> torch.Tensor:
+        if t is None:
+            return torch.zeros(B, 1, device=dev, dtype=dtype)
+        t = t.detach().float().reshape(B, 1)
+        if B == 1:
+            return torch.tanh(t)
+        mu = t.mean(dim=0, keepdim=True)
+        sd = t.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+        return torch.tanh((t - mu) / sd)
+
+    def CausalDwconv(self, u: torch.Tensor) -> torch.Tensor:
+        B, S, E = u.shape
+        x = u.transpose(1, 2) 
+        if self.use_causal_conv:
+            k = self.dw_conv.kernel_size[0]
+            x = F.pad(x, (k - 1, 0)) 
+        y = self.dw_conv(x)
+        y = y.transpose(1, 2)  
+        return y
 
     def forward(
-        self, 
-        x, 
-        keyPaddingMask: Optional[torch.Tensor]=None,
-        tdError: Optional[torch.Tensor]=None, 
-        uncertainty: Optional[torch.Tensor]=None):
+        self,
+        x: torch.Tensor,                          # (B,S,E)
+        keyPaddingMask: Optional[torch.Tensor] = None,  # (B,S) bool，True=padding
+        tdError: Optional[torch.Tensor] = None,   # (B,1) or (B,)
+        uncertainty: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, S, E = x.shape
         dev = x.device
+        N = self.N
 
-        def z_(t: Optional[torch.Tensor]) -> torch.Tensor:
-            if t is None:
-                return torch.zeros(B, 1, device=dev, dtype=torch.float32)
-            t = t.detach().float().reshape(B, 1) 
-            mu = t.mean(dim=0, keepdim=True)
-            sd = t.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
-            return torch.tanh((t - mu) / sd) 
+        td_z  = self.ZscoreTanh(tdError, B, dev)
+        unc_z = self.ZscoreTanh(uncertainty, B, dev)
 
-        td_z = z_(tdError)
-        unc_z = z_(uncertainty)  
-
-        gate_bias = (0.5 * td_z - 0.5 * unc_z).unsqueeze(-1)
-
-        alpha = torch.sigmoid(self.alpha_log) 
-        alpha_scale = torch.sigmoid(0.5 * td_z - 0.5 * unc_z) 
-        alpha_eff = alpha.unsqueeze(0) * (0.75 + 0.25 * alpha_scale) 
+        mod = torch.sigmoid(0.75 * td_z - 0.75 * unc_z) 
 
         u_and_g = self.in_proj(x)
         u, g = torch.chunk(u_and_g, 2, dim=-1)
         u = F.silu(u)
 
-        keep3 = None
-        if keyPaddingMask is not None:
-            keep3 = (~keyPaddingMask).to(u.dtype).unsqueeze(-1) 
-            u = u * keep3
+        u = u + 0.5 * self.CausalDwconv(u)
 
-        u_conv = self.dw_conv(u.transpose(1,2)).transpose(1,2)
-        u = u + 0.5 * u_conv
+        gate_bias = (0.5 * td_z - 0.5 * unc_z).unsqueeze(-1) 
+        g = torch.sigmoid(g + gate_bias) 
 
-        g = torch.sigmoid(g + gate_bias)
+        p = self.param_proj(x) 
+        dt_raw = p[..., :E]  
+        bc = p[..., E:]  
+        B_raw, C_raw = bc.split(E * N, dim=-1)
 
-        u_conv = self.dw_conv(u.transpose(1,2)).transpose(1,2)
-        u = u + 0.5 * u_conv
+        B_t = torch.tanh(B_raw).view(B, S, E, N)  
+        C_t = torch.tanh(C_raw).view(B, S, E, N)
 
-        y = torch.empty_like(x)
-        state = torch.zeros(B, E, device=dev, dtype=x.dtype)
+        dt = F.softplus(dt_raw + self.dt_bias.view(1, 1, E))
+
+        dt = dt * (0.75 + 0.50 * mod.view(B, 1, 1)) 
+
+        A_pos = F.softplus(self.A_log) + 1e-4
+
+        y = torch.empty((B, S, E), device=dev, dtype=x.dtype)
+        state = torch.zeros((B, E, N), device=dev, dtype=torch.float32)
 
         has_mask = (keyPaddingMask is not None)
-        keep_const = None
-        if not has_mask:
-            keep_const = torch.ones(B, 1, device=dev, dtype=x.dtype) 
-
-        beta_sig = torch.sigmoid(self.beta).unsqueeze(0) 
-        gamma0 = self.gamma.unsqueeze(0)
-        delta0 = self.delta.unsqueeze(0)
 
         for t in range(S):
-            keep = keep_const if keep_const is not None else (~keyPaddingMask[:, t]).to(x.dtype).unsqueeze(-1) 
+            if has_mask:
+                keep = (~keyPaddingMask[:, t]).to(torch.float32).view(B, 1, 1)  
+            else:
+                keep = None
 
-            upd = beta_sig * u[:, t, :]
-            new_state = alpha_eff * state + (1 - alpha_eff) * upd
-            state = keep * new_state + (1 - keep) * state
+            u_t = u[:, t, :].to(torch.float32) 
+            dt_t = dt[:, t, :].to(torch.float32) 
 
-            out_t = gamma0 * state + delta0 * u[:, t, :]
-            y[:, t, :] = (out_t * g[:, t, :]) * keep
+            decay = torch.exp(-dt_t.unsqueeze(-1) * A_pos.unsqueeze(0))
+
+            inj = B_t[:, t, :, :].to(torch.float32) * u_t.unsqueeze(-1)
+
+            new_state = decay * state + (1.0 - decay) * inj
+
+            if keep is not None:
+                state = keep * new_state + (1.0 - keep) * state
+            else:
+                state = new_state
+
+            out_t = (C_t[:, t, :, :].to(torch.float32) * state).sum(dim=-1) + self.D.to(torch.float32).unsqueeze(0) * u_t
+            out_t = out_t * g[:, t, :].to(torch.float32)
+
+            if keep is not None:
+                out_t = out_t * keep.squeeze(-1) 
+
+            y[:, t, :] = out_t.to(dtype=x.dtype)
 
         return self.out_norm(y)
+
 
 
 class MultiHeadAttention(nn.Module):
@@ -370,7 +418,7 @@ class TemporalAttention(nn.Module):
 
         td_scale = 5.0 / (layerIdx + 1)
         self.mhsa = MultiHeadAttention(embedDim, numHeads, tdScale=td_scale, useHebbian=useHebbian)
-        self.ssm = SimpleSSM(embedDim)
+        self.ssm = SelectiveSSM(embedDim, stateDim=4, convKernel=4, useCausalConv=True)
 
         self.mix_gate = nn.Sequential(
             nn.Linear(embedDim, embedDim),
@@ -665,6 +713,35 @@ class AttentionExtractor(nn.Module):
     def AttenFullrankToLowrank(self, residual: bool = True):
         for blk in self.temporal_blocks:
             blk.mhsa.FullrankToLowrank(residual)
+            
+
+    @torch.no_grad()
+    def ExportState(self) -> dict:
+        st = {
+            "fusion_hebb": self.fusion.hebbian_memory.detach().clone(),
+            "mhsa": []}
+        
+        for blk in self.temporal_blocks:
+            mhsa = blk.mhsa
+            st["mhsa"].append({
+                "U": mhsa.U.detach().clone(),
+                "V": mhsa.V.detach().clone(),
+                "hebbW": mhsa.hebbian_weights.detach().clone(),
+                "hebb_step": mhsa.hebb_step.detach().clone(),
+                "use_low_rank": bool(mhsa.use_low_rank),})
+            
+        return st
+
+    @torch.no_grad()
+    def ImportState(self, st: dict):
+        self.fusion.hebbian_memory.copy_(st["fusion_hebb"])
+        for blk, s in zip(self.temporal_blocks, st["mhsa"]):
+            mhsa = blk.mhsa
+            mhsa.U.copy_(s["U"])
+            mhsa.V.copy_(s["V"])
+            mhsa.hebbian_weights.copy_(s["hebbW"])
+            mhsa.hebb_step.copy_(s["hebb_step"])
+            mhsa.use_low_rank = bool(s["use_low_rank"])
 
 
 class AttentionOnlineWrapper(BaseOnlineWrapper):
@@ -934,7 +1011,7 @@ class TestAttentionMTool:
 
     def TestSimpleSSM(self):
         try:
-            ssm = SimpleSSM(self.E).to(self.device)
+            ssm = SelectiveSSM(self.E, stateDim=4, convKernel=4, useCausalConv=True).to(self.device)
             x = torch.randn(self.B, self.S, self.E, device=self.device)
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
             kpm[:, -3:] = True

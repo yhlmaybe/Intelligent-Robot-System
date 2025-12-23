@@ -9,6 +9,7 @@ class ModuleDim:
     WorldFeat: int = 512
     WorldOutHState: int = 512
     WorldOutZState: int = 64
+    WorldOutXState: int = 64
 
     MemoryFeat=AttentionFeat
 

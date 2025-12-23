@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Optional, Dict, NamedTuple, Tuple, List
+from typing import Optional, Dict, NamedTuple, Tuple, List, Any
 import math
 import copy
 import torch
@@ -543,11 +543,11 @@ class TemporalMicroGraph(nn.Module):
         self._step = 0
 
     @torch.no_grad()
-    def Reset(self, device=None):
+    def Reset(self, batchSize=1, device=None):
             dev = device if device is not None else self.prefix_G.device
             dt = self.prefix_G.dtype
-            self.prefix_G.data = torch.ones(1, device=dev, dtype=dt)
-            self.prefix_C.data = torch.zeros(1, device=dev, dtype=dt)
+            self.prefix_G.data = torch.ones(batchSize, device=dev, dtype=dt)
+            self.prefix_C.data = torch.zeros(batchSize, device=dev, dtype=dt)
             self.anchors.clear()
             self._step = 0
 
@@ -961,7 +961,6 @@ class ValueEstimationExtractor(nn.Module):
         self._prev_unc = unc_total.detach()
 
         if not self.training:
-            self._prev_vhat = v_next_hat.mean().detach()
             return GeoTropicalOut(
                 value=value,
                 tdError=delta,
@@ -972,7 +971,9 @@ class ValueEstimationExtractor(nn.Module):
                 rComps=None,
                 uncertainty=unc_total,
                 extras=None,)
-
+        
+        self._prev_vhat = v_next_hat.mean().detach()
+        
         loss_td = (delta ** 2).mean() * self.wTD
 
         edges = self.micro.PreviewEdges(
@@ -1065,6 +1066,11 @@ class ValueEstimationExtractor(nn.Module):
     def ResetHebbianMemory(self):
         self.hebb_value.ResetHebbianMemory()
         self.emotion_core.ResetHebbianMemory()
+
+    @torch.no_grad()
+    def ResetState(self, batchSize):
+        self.micro.Reset(batchSize=batchSize, device=None)
+        self.emotion_core.ResetState(batchSize=batchSize)
         self._prev_vhat = None
         self._prev_td = None
         self._prev_r = None
@@ -1072,14 +1078,194 @@ class ValueEstimationExtractor(nn.Module):
         self._prev_unc = None
 
     @torch.no_grad()
-    def ResetState(self):
-        self.micro.Reset(device=None)
-        self.emotion_core.ResetState()
-        self._prev_vhat = None
-        self._prev_td = None
-        self._prev_r = None
-        self._prev_done = None
-        self._prev_unc = None
+    def ExportState(self) -> Dict[str, Any]:
+        state: Dict[str, Any] = {}
+
+        state["ve_is_training"] = bool(self.training)
+
+        state["ve_prev_vhat"] = (None if self._prev_vhat is None else self._prev_vhat.detach().clone())
+        state["ve_prev_td"] = (None if self._prev_td is None else self._prev_td.detach().clone())
+        state["ve_prev_r"] = (None if self._prev_r is None else self._prev_r.detach().clone())
+        state["ve_prev_done"] = (None if self._prev_done is None else self._prev_done.detach().clone())
+        state["ve_prev_unc"] = (None if self._prev_unc is None else self._prev_unc.detach().clone())
+
+        if hasattr(self, "hebb_value") and hasattr(self.hebb_value, "H"):
+            state["hebb_H"] = self.hebb_value.H.detach().clone()
+
+        if hasattr(self, "emotion_core"):
+            ec = self.emotion_core
+            if hasattr(ec, "h") and ec.h is not None:
+                state["emo_h"] = ec.h.detach().clone()
+            if hasattr(ec, "c") and ec.c is not None:
+                state["emo_c"] = ec.c.detach().clone()
+            if hasattr(ec, "mood") and ec.mood is not None:
+                state["emo_mood"] = ec.mood.detach().clone()
+
+        if hasattr(self, "unc_core"):
+            uc = self.unc_core
+            for name in ["td_ema", "r_ema", "ent_ema"]:
+                if hasattr(uc, name):
+                    ema = getattr(uc, name)
+                    if hasattr(ema, "mean"): state[f"unc_{name}_mean"] = ema.mean.detach().clone()
+                    if hasattr(ema, "var"): state[f"unc_{name}_var"] = ema.var.detach().clone()
+
+        if hasattr(self, "rgen"):
+            rg = self.rgen
+
+            if hasattr(rg, "state_ema"):
+                state["rgen_state_ema"] = rg.state_ema.detach().clone()
+
+            for name in ["nov_ema", "prog_ema", "ent_ema", "unc_ema"]:
+                if hasattr(rg, name):
+                    ema = getattr(rg, name)
+                    if hasattr(ema, "mean"): state[f"rgen_{name}_mean"] = ema.mean.detach().clone()
+                    if hasattr(ema, "var"): state[f"rgen_{name}_var"] = ema.var.detach().clone()
+
+        if hasattr(self, "micro"):
+            mg = self.micro
+            if hasattr(mg, "prefix_G"): state["micro_prefix_G"] = mg.prefix_G.detach().clone()
+            if hasattr(mg, "prefix_C"): state["micro_prefix_C"] = mg.prefix_C.detach().clone()
+
+            state["micro_step"] = int(getattr(mg, "_step", 0))
+
+            anchors: List[Dict[str, torch.Tensor]] = getattr(mg, "anchors", [])
+            n = len(anchors)
+
+            state["micro_anchors_n"] = int(n)
+            if n > 0:
+                z_list = [a["z"].detach() for a in anchors]
+                v_list = [a["v"].detach() for a in anchors] 
+                G_list = [a["G"].detach() for a in anchors]
+                C_list = [a["C"].detach() for a in anchors]
+
+                state["micro_anchors_z"] = torch.stack(z_list, dim=0).clone()
+                state["micro_anchors_v"] = torch.stack(v_list, dim=0).clone()
+                state["micro_anchors_G"] = torch.stack(G_list, dim=0).clone()
+                state["micro_anchors_C"] = torch.stack(C_list, dim=0).clone()
+
+        return state
+
+    @torch.no_grad()
+    def ImportState(self, state: Dict[str, Any],):
+        def need_(key: str) -> Any:
+            if key in state:
+                return state[key]
+            return None
+
+        if "ve_prev_vhat" in state: self._prev_vhat = state["ve_prev_vhat"]
+        if "ve_prev_td" in state: self._prev_td = state["ve_prev_td"]
+        if "ve_prev_r" in state: self._prev_r = state["ve_prev_r"]
+        if "ve_prev_done" in state: self._prev_done = state["ve_prev_done"]
+        if "ve_prev_unc" in state: self._prev_unc = state["ve_prev_unc"]
+
+        if hasattr(self, "hebb_value") and hasattr(self.hebb_value, "H"):
+            H = need_("hebb_H")
+            if H is not None:
+                H = H.to(device=self.hebb_value.H.device, dtype=self.hebb_value.H.dtype)
+                if self.hebb_value.H.shape != H.shape:
+                    self.hebb_value.H.resize_(H.shape).copy_(H)
+                else:
+                    self.hebb_value.H.copy_(H)
+
+        if hasattr(self, "emotion_core"):
+            ec = self.emotion_core
+            if "emo_h" in state and state["emo_h"] is not None:
+                h = state["emo_h"].to(device=ec.h.device, dtype=ec.h.dtype)
+                ec.h = h.clone()
+            if "emo_c" in state and state["emo_c"] is not None:
+                c = state["emo_c"].to(device=ec.c.device, dtype=ec.c.dtype)
+                ec.c = c.clone()
+            if "emo_mood" in state and state["emo_mood"] is not None:
+                m = state["emo_mood"].to(device=ec.mood.device, dtype=ec.mood.dtype)
+                ec.mood = m.clone()
+
+        if hasattr(self, "unc_core"):
+            uc = self.unc_core
+            for name in ["td_ema", "r_ema", "ent_ema"]:
+                if hasattr(uc, name):
+                    ema = getattr(uc, name)
+                    k_mean = f"unc_{name}_mean"
+                    k_var  = f"unc_{name}_var"
+                    if k_mean in state and state[k_mean] is not None:
+                        mean = state[k_mean].to(device=ema.mean.device, dtype=ema.mean.dtype)
+                        if ema.mean.shape != mean.shape:
+                            ema.mean.resize_(mean.shape).copy_(mean)
+                        else:
+                            ema.mean.copy_(mean)
+                    if k_var in state and state[k_var] is not None:
+                        var = state[k_var].to(device=ema.var.device, dtype=ema.var.dtype)
+                        if ema.var.shape != var.shape:
+                            ema.var.resize_(var.shape).copy_(var)
+                        else:
+                            ema.var.copy_(var)
+
+        if hasattr(self, "rgen"):
+            rg = self.rgen
+            if "rgen_state_ema" in state and state["rgen_state_ema"] is not None and hasattr(rg, "state_ema"):
+                s = state["rgen_state_ema"].to(device=rg.state_ema.device, dtype=rg.state_ema.dtype)
+                if rg.state_ema.shape != s.shape:
+                    rg.state_ema.resize_(s.shape).copy_(s)
+                else:
+                    rg.state_ema.copy_(s)
+
+            for name in ["nov_ema", "prog_ema", "ent_ema", "unc_ema"]:
+                if hasattr(rg, name):
+                    ema = getattr(rg, name)
+                    k_mean = f"rgen_{name}_mean"
+                    k_var  = f"rgen_{name}_var"
+                    if k_mean in state and state[k_mean] is not None:
+                        mean = state[k_mean].to(device=ema.mean.device, dtype=ema.mean.dtype)
+                        if ema.mean.shape != mean.shape:
+                            ema.mean.resize_(mean.shape).copy_(mean)
+                        else:
+                            ema.mean.copy_(mean)
+                    if k_var in state and state[k_var] is not None:
+                        var = state[k_var].to(device=ema.var.device, dtype=ema.var.dtype)
+                        if ema.var.shape != var.shape:
+                            ema.var.resize_(var.shape).copy_(var)
+                        else:
+                            ema.var.copy_(var)
+
+        if hasattr(self, "micro"):
+            mg = self.micro
+
+            if "micro_prefix_G" in state and state["micro_prefix_G"] is not None and hasattr(mg, "prefix_G"):
+                G = state["micro_prefix_G"].to(device=mg.prefix_G.device, dtype=mg.prefix_G.dtype)
+                if mg.prefix_G.shape != G.shape:
+                    mg.prefix_G.resize_(G.shape).copy_(G)
+                else:
+                    mg.prefix_G.copy_(G)
+
+            if "micro_prefix_C" in state and state["micro_prefix_C"] is not None and hasattr(mg, "prefix_C"):
+                C = state["micro_prefix_C"].to(device=mg.prefix_C.device, dtype=mg.prefix_C.dtype)
+                if mg.prefix_C.shape != C.shape:
+                    mg.prefix_C.resize_(C.shape).copy_(C)
+                else:
+                    mg.prefix_C.copy_(C)
+
+            if "micro_step" in state:
+                mg._step = int(state["micro_step"])
+
+            n = int(state.get("micro_anchors_n", 0))
+            mg.anchors.clear()
+            if n > 0:
+                zA = need_("micro_anchors_z")
+                vA = need_("micro_anchors_v")
+                GA = need_("micro_anchors_G")
+                CA = need_("micro_anchors_C")
+
+                dev = mg.prefix_G.device if hasattr(mg, "prefix_G") else zA.device
+                zA = zA.to(dev).detach()
+                vA = vA.to(dev).detach()
+                GA = GA.to(dev).detach()
+                CA = CA.to(dev).detach()
+
+                for i in range(n):
+                    mg.anchors.append({
+                        "z": zA[i].clone(),
+                        "v": vA[i].clone(),
+                        "G": GA[i].clone(),
+                        "C": CA[i].clone(),})
 
 
 class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
@@ -1261,7 +1447,6 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         base._prev_unc = unc_total.detach()
 
         if not base.training:
-            base._prev_vhat = v_next_hat.mean().detach()
             return GeoTropicalOut(
                 value=value,
                 tdError=delta,
@@ -1272,6 +1457,8 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
                 rComps=None,
                 uncertainty=unc_total,
                 extras=None,)
+        
+        base._prev_vhat = v_next_hat.mean().detach()
 
         loss_td = (delta ** 2).mean() * base.wTD
 
@@ -2072,7 +2259,7 @@ class TestValueEstimationMTool:
                 hidden=self.hidden, useLayerNorm=True).to(self.device).eval()
             
             est_ref.rgen.teacher_dropout_prob = 0.0
-            est_ref.ResetState()
+            est_ref.ResetState(batchSize=B)
             est_ref.ResetHebbianMemory()
 
             est_wrapped = copy.deepcopy(est_ref).to(self.device).eval()
@@ -2152,7 +2339,7 @@ class TestValueEstimationMTool:
             new_param_count = len(after_ids - before_ids)
             assert new_param_count > 0, "No new trainable parameters after CommitOne"
 
-            est.ResetState()
+            est.ResetState(batchSize=B)
             out_after = wrapper.ForwardWithDeltas(
                 x=(mem, attn, state),
                 keyPaddingMask=None,

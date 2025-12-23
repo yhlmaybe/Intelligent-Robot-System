@@ -1,10 +1,67 @@
 from __future__ import annotations
 from typing import List, Tuple, Dict, Optional
+from dataclasses import dataclass
+from collections import deque, defaultdict
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import re
+import math
+
+
+def NormText(s: str) -> str:
+    s = str(s).strip().lower()
+    s = re.sub(r"\s+", "", s)
+    return s
+
+def CharNgrams(s: str, n: int = 2) -> set:
+    s = NormText(s)
+    if not s:
+        return set()
+    if len(s) <= n:
+        return {s}
+    return {s[i:i+n] for i in range(len(s) - n + 1)}
+
+def Jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / max(1, len(a | b))
+
+def TextSim(a: str, b: str) -> float:
+    return Jaccard(CharNgrams(a, 2), CharNgrams(b, 2))
+
+def IouXyxy(a, b) -> float:
+    ax1, ay1, ax2, ay2 = [float(x) for x in a]
+    bx1, by1, bx2, by2 = [float(x) for x in b]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / max(1e-6, union)
+
+@dataclass
+class OcrLineObs:  
+    box: tuple[int, int, int, int]  
+    text: str
+    det_score: float
+    rec_conf: float
+    step: int
+
+    @property
+    def weight(self) -> float:
+        return max(0.0, self.det_score) * max(0.0, self.rec_conf)
+
+@dataclass
+class OcrTrack:
+    obs: deque 
+    age: int 
 
 
 class ConvBNReLU(nn.Module):
@@ -320,15 +377,29 @@ class CRNNRecognizer(nn.Module):
 
 
 
-
-
-
 class OCREngineExtractor(nn.Module):
     def __init__(
         self,
         vocabCharsPath: str = "/home/yhl/Documents/Intelligent-Robot-System/BrainDeepLearn/ModuleSetting/OCRKeys.txt",
-        dbK: float = 50.0,):
+        dbK: float = 50.0,
+        *,
+        temporalSteps: int = 0, 
+        fuseTopK: int = 8,
+        fuseMinHits: int = 2,
+        fuseIouThr: float = 0.30,
+        fuseSimThr: float = 0.75,
+        fuseDecay: float = 0.85,):
         super().__init__()
+
+        self.temporalSteps = int(temporalSteps)
+        self.fuseTopK = int(fuseTopK)
+        self.fuseMinHits = int(fuseMinHits)
+        self.fuseIouThr = float(fuseIouThr)
+        self.fuseSimThr = float(fuseSimThr)
+        self.fuseDecay = float(fuseDecay)
+
+        self._temporal_step = 0
+        self._tracks_by_bi: dict[int, list[OcrTrack]] = {}
 
         self.backbone = DBBackbone(inCh=3, baseCh=64)
         self.dbHead = DBHead(inCh=256, kValue=dbK)
@@ -358,30 +429,6 @@ class OCREngineExtractor(nn.Module):
         if not chars:
             raise RuntimeError(f"OCR vocab file {dictPath} is empty or invalid")
         return "".join(chars)
-
-    def CtcGreedyDecode(self,
-        logProbs: torch.Tensor,
-        idx2Char: List[str],
-        blankIndex: int = 0,) -> List[str]:
-
-        t, b, c = logProbs.shape
-        preds = logProbs.argmax(dim=-1) 
-
-        results: List[str] = []
-        for bi in range(b):
-            seq = preds[:, bi].tolist()
-            prev = None
-            chars: List[str] = []
-            for idx in seq:
-                if idx == blankIndex:
-                    prev = None
-                    continue
-                if prev == idx:
-                    continue
-                chars.append(idx2Char[idx])
-                prev = idx
-            results.append("".join(chars))
-        return results
 
     def ForwardDetect(
         self,
@@ -525,7 +572,7 @@ class OCREngineExtractor(nn.Module):
         self,
         imagesTensor: torch.Tensor,
         binThresh: float = 0.3,
-        minBoxArea: int = 10,) -> List[List[Tuple[np.ndarray, str, float]]]:
+        minBoxArea: int = 10,) -> List[List[str]]:
 
         feat = self.backbone(imagesTensor)
         prob_map, thresh_map, bin_map = self.dbHead(feat)
@@ -533,45 +580,57 @@ class OCREngineExtractor(nn.Module):
         bsz = imagesTensor.size(0)
         results_batch: List[List[Tuple[np.ndarray, str, float]]] = []
 
+        if self.temporalSteps > 0 and self._tracks_by_bi:
+            for k in list(self._tracks_by_bi.keys()):
+                if k < 0 or k >= bsz:
+                    del self._tracks_by_bi[k]
+
         for bi in range(bsz):
-            pm = prob_map[bi]
-            bm = bin_map[bi] 
-            img = imagesTensor[bi] 
-
-            boxes = self.BitmapToBoxes(bm, threshValue=binThresh, minArea=minBoxArea)
-            if len(boxes) == 0:
-                results_batch.append([])
-                continue
-
-            line_imgs = self.CropAndResizeLines(img, boxes, targetH=32, maxW=256)
-            if line_imgs.size(0) == 0:
-                results_batch.append([])
-                continue
-
-            rec_out = self.recognizer(line_imgs)
-            texts = self.CtcGreedyDecode(
-                rec_out["log_probs"],
-                idx2Char=self.idx2Char,
-                blankIndex=self.blankIndex,)
-
-            h_map, w_map = pm.shape[-2], pm.shape[-1]
-            pm_np = pm.detach().cpu().squeeze(0).numpy()
+            pm = prob_map[bi] 
+            bm = bin_map[bi]  
+            img = imagesTensor[bi]  
 
             triplets: List[Tuple[np.ndarray, str, float]] = []
-            for box, text in zip(boxes, texts):
-                x1, y1, x2, y2 = box.tolist()
-                x1 = max(0, x1)
-                y1 = max(0, y1)
-                x2 = min(w_map, x2)
-                y2 = min(h_map, y2)
-                region = pm_np[y1:y2, x1:x2]
-                if region.size == 0:
-                    score = 0.0
-                else:
-                    score = float(region.mean())
-                triplets.append((box, text, score))
+            frame_obs: List[OcrLineObs] = []  
+
+            boxes = self.BitmapToBoxes(bm, threshValue=binThresh, minArea=minBoxArea)
+
+            if len(boxes) != 0:
+                line_imgs = self.CropAndResizeLines(img, boxes, targetH=32, maxW=256)
+
+                if line_imgs.size(0) != 0:
+                    rec_out = self.recognizer(line_imgs)
+                    pairs = self.CtcGreedyDecodeWithConf(
+                        rec_out["log_probs"],
+                        idx2Char=self.idx2Char,
+                        blankIndex=self.blankIndex)
+
+                    h_map, w_map = pm.shape[-2], pm.shape[-1]
+                    pm_np = pm.detach().cpu().squeeze(0).numpy() 
+
+                    for box, (text, rec_conf) in zip(boxes, pairs):
+                        x1, y1, x2, y2 = box.tolist()
+                        x1 = max(0, x1); y1 = max(0, y1)
+                        x2 = min(w_map, x2); y2 = min(h_map, y2)
+
+                        region = pm_np[y1:y2, x1:x2]
+                        det_score = float(region.mean()) if region.size != 0 else 0.0
+
+                        triplets.append((box, text, det_score))
+                        frame_obs.append(OcrLineObs(
+                            box=(int(x1), int(y1), int(x2), int(y2)),
+                            text=text,
+                            det_score=det_score,
+                            rec_conf=float(rec_conf),
+                            step=self._temporal_step))
 
             results_batch.append(triplets)
+
+            if self.temporalSteps > 0:
+                self.UpdateTemporalTracks(bi, frame_obs)
+
+        if self.temporalSteps > 0:
+            self._temporal_step += 1
 
         return self.OcrResultsToOcrTexts(results_batch)
 
@@ -596,7 +655,128 @@ class OCREngineExtractor(nn.Module):
         return ocr_texts
 
 
+    def ResetTemporal(self):
+        self._temporal_step = 0
+        self._tracks_by_bi.clear()
 
+
+    def CtcGreedyDecodeWithConf(
+        self,
+        logProbs: torch.Tensor, 
+        idx2Char: List[str],
+        blankIndex: int = 0,) -> List[tuple[str, float]]:
+        preds = logProbs.argmax(dim=-1) 
+        chosen_lp = logProbs.gather(dim=-1, index=preds.unsqueeze(-1)).squeeze(-1) 
+        chosen_p = torch.exp(chosen_lp).clamp(0.0, 1.0)  
+
+        t, b = preds.shape
+        out: List[tuple[str, float]] = []
+        for li in range(b):
+            seq = preds[:, li].tolist()
+            pseq = chosen_p[:, li].detach().cpu().tolist()
+            prev = None
+            chars: List[str] = []
+            confs: List[float] = []
+            for idx, p in zip(seq, pseq):
+                if idx == blankIndex:
+                    prev = None
+                    continue
+                if prev == idx:
+                    continue
+                chars.append(idx2Char[idx])
+                confs.append(float(p))
+                prev = idx
+            text = "".join(chars)
+            conf = float(sum(confs) / max(1, len(confs))) if confs else 0.0
+            out.append((text, conf))
+        return out
+
+
+    def UpdateTemporalTracks(self, bi: int, frameObs: List[OcrLineObs]):
+        tracks = self._tracks_by_bi.get(bi, [])
+        for tr in tracks:
+            tr.age += 1
+
+        def match_track(obs: OcrLineObs) -> int:
+            best_i = -1
+            best_s = -1e9
+            for i, tr in enumerate(tracks):
+                last = tr.obs[-1]
+                iou = IouXyxy(last.box, obs.box)
+                sim = TextSim(last.text, obs.text)
+                if (iou >= self.fuseIouThr) or (iou >= self.fuseIouThr * 0.5 and sim >= self.fuseSimThr):
+                    s = 2.0 * iou + 1.0 * sim + 0.2 * obs.weight
+                    if s > best_s:
+                        best_s = s
+                        best_i = i
+            return best_i
+
+        for obs in frameObs:
+            ti = match_track(obs)
+            if ti < 0:
+                dq = deque([obs], maxlen=self.temporalSteps)
+                tracks.append(OcrTrack(obs=dq, age=0))
+            else:
+                tracks[ti].obs.append(obs)
+                tracks[ti].age = 0
+
+        ttl = self.temporalSteps
+        tracks = [tr for tr in tracks if tr.age <= ttl and len(tr.obs) > 0]
+        self._tracks_by_bi[bi] = tracks
+
+
+
+    def ExportFusedTexts(self, bi: int = 0) -> List[str]:
+        if self.temporalSteps <= 0:
+            return []
+
+        tracks = self._tracks_by_bi.get(bi, [])
+        if not tracks:
+            return []
+
+        cands: List[tuple[float, int, str]] = [] 
+
+        for tr in tracks:
+            votes = defaultdict(float)
+            best_raw_for_norm = {}
+            best_w_for_norm = defaultdict(float)
+
+            for ob in tr.obs:
+                nt = NormText(ob.text)
+                if not nt:
+                    continue
+                age = (self._temporal_step - 1) - ob.step
+                recency = self.fuseDecay ** max(0, age)
+                w = ob.weight * recency
+                votes[nt] += w
+                if w > best_w_for_norm[nt]:
+                    best_w_for_norm[nt] = w
+                    best_raw_for_norm[nt] = ob.text
+
+            if not votes:
+                continue
+
+            hits = len(tr.obs)
+            if hits < self.fuseMinHits:
+                continue
+
+            best_nt = max(votes.items(), key=lambda kv: kv[1])[0]
+            rep_text = best_raw_for_norm.get(best_nt, "")
+            score = votes[best_nt] * math.sqrt(hits)
+            if NormText(rep_text):
+                cands.append((score, hits, rep_text))
+
+        cands.sort(key=lambda x: (x[0], x[1], len(x[2])), reverse=True)
+
+        out: List[str] = []
+        for score, hits, text in cands:
+            if len(out) >= self.fuseTopK:
+                break
+            if any(TextSim(text, p) >= max(self.fuseSimThr, 0.80) for p in out):
+                continue
+            out.append(text)
+
+        return out
 
 
 

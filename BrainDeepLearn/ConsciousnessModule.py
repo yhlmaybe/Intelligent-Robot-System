@@ -6,11 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ConsciousnessState(NamedTuple):
-    dev_trace: torch.Tensor 
-    step: torch.Tensor  
-
-
 class FiLMBlock(nn.Module):
     def __init__(self, inDim: int, outDim: int):
         super().__init__()
@@ -95,7 +90,6 @@ class ConsciousnessHyperNet(nn.Module):
 class ConsciousnessOutput(NamedTuple):
     self_sem: torch.Tensor 
     intent_sem: torch.Tensor  
-    new_state: ConsciousnessState
     extras: Dict[str, torch.Tensor]
 
 class ConsciousHebbianLinear(nn.Module):
@@ -253,6 +247,45 @@ class ConsciousnessExtractor(nn.Module):
         self.world_query_net = nn.Sequential(
             nn.LayerNorm(self.self_dim),
             nn.Linear(self.self_dim, self.world_item_dim),)
+        
+        self.arousal_net = nn.Sequential(
+            nn.LayerNorm(self.dev_dim),
+            nn.Linear(self.dev_dim, 1),
+            nn.Sigmoid(),)
+        self.update_base = 0.05
+
+        self.mem_gain_net = nn.Sequential(
+            nn.LayerNorm(self.self_dim),
+            nn.Linear(self.self_dim, 1),
+            nn.Sigmoid(),)
+        
+        self.world_gain_net = nn.Sequential(
+            nn.LayerNorm(self.self_dim),
+            nn.Linear(self.self_dim, 1),
+            nn.Sigmoid(),)
+        self.gain_min = 0.05
+        self.gain_max = 0.35
+
+        self.dev_to_ctx = nn.Sequential(
+            nn.LayerNorm(self.dev_dim),
+            nn.Linear(self.dev_dim, hyperHiddenDim),)
+        
+        self._dev_trace = None
+        self._last_self_intent = None
+        self._last_sem = None
+        self._step: int = 0
+
+    @torch.no_grad()
+    def ResetState(self):
+        self._dev_trace = None
+        self._last_self_intent = None
+        self._last_sem = None
+        self._step = 0
+
+    def GetState(self):
+        if self._dev_trace is None or self._last_self_intent is None or self._last_sem is None:
+            return None, None, None, self._step
+        return self._dev_trace.detach(), self._last_self_intent.detach(), self._last_sem.detach(), self._step
 
     def QueryTopK(
         self,
@@ -289,11 +322,6 @@ class ConsciousnessExtractor(nn.Module):
 
         return focus, top_idx, top_w
 
-
-    def InitialState(self, batchSize: int, device: torch.device) -> ConsciousnessState:
-        dev_trace = torch.zeros(batchSize, self.dev_dim, device=device)
-        step = torch.zeros(batchSize, 1, device=device)
-        return ConsciousnessState(dev_trace=dev_trace, step=step)
 
     def AggregateBank(
         self,
@@ -365,42 +393,35 @@ class ConsciousnessExtractor(nn.Module):
     def forward(
         self,
         memoryBank: torch.Tensor,
-        worldBank: torch.Tensor,
-        prevState: Optional[ConsciousnessState] = None,
-        *,
-        detachBase: bool = True,) -> ConsciousnessOutput:
+        worldBank: torch.Tensor,) -> ConsciousnessOutput:
 
         memory_bank = memoryBank
         world_bank = worldBank
-        prev_state = prevState
-        detach_base = detachBase
 
         B, Nm, Dm = memory_bank.shape
         Bw, Nw, Dw = world_bank.shape
         if B != Bw:
             raise ValueError("The batch dimension of memory_bank and world_bank must be the same")
 
-        device = memory_bank.device
+        if self._dev_trace is None or self._last_self_intent is None or self._last_sem is None:
+            device = memory_bank.device
+            dtype = memory_bank.dtype
 
-        if prev_state is None:
-            prev_state = self.InitialState(B, device=device)
-        dev_trace, step = prev_state.dev_trace, prev_state.step
+            self._dev_trace = torch.zeros(B, self.dev_dim, device=device, dtype=dtype)
+            dev_ctx = torch.zeros(B, self.dev_dim, device=device, dtype=dtype)
+        else:
+            arousal = self.arousal_net(self._dev_trace)
+            alpha = self.update_base * (0.5 + arousal)
+            delta = self.dev_update(torch.cat([self._dev_trace, self._last_sem, self._last_self_intent], dim=-1))
+
+            dev_ctx = self._dev_trace + alpha * delta
 
         mem_summary_raw, mem_stats = self.AggregateBank(memory_bank,self.mem_score_net,topK=self.top_k_mem,randK=self.rand_k_mem,)
 
         world_summary_raw, world_stats = self.AggregateBank(world_bank,self.world_score_net,topK=self.top_k_world,randK=self.rand_k_world,)
 
-        mem_summary = self.mem_agg_proj(mem_summary_raw)
-        world_summary = self.world_agg_proj(world_summary_raw)
-
-        if detach_base:
-            mem_ctx = mem_summary.detach()
-            world_ctx = world_summary.detach()
-            dev_ctx = dev_trace.detach()
-        else:
-            mem_ctx = mem_summary
-            world_ctx = world_summary
-            dev_ctx = dev_trace
+        mem_ctx = self.mem_agg_proj(mem_summary_raw)
+        world_ctx = self.world_agg_proj(world_summary_raw)
 
         ctx_raw = torch.cat([world_ctx, mem_ctx, dev_ctx], dim=-1)
         ctx_norm = self.ctx_norm(ctx_raw)
@@ -429,10 +450,15 @@ class ConsciousnessExtractor(nn.Module):
         world_focus, world_idx, world_w = self.QueryTopK(world_bank, q_world, self.top_k_world) 
 
         mem_delta = F.pad(mem_focus,(0, max(0, self.self_dim - mem_focus.size(-1))),)
-
         world_delta = F.pad(world_focus,(0, max(0, self.self_dim - world_focus.size(-1))),)
 
-        self_sem = self_sem + 0.2 * mem_delta + 0.2 * world_delta
+        g_m = self.mem_gain_net(self_sem) 
+        g_w = self.world_gain_net(self_sem)
+
+        g_m = self.gain_min + (self.gain_max - self.gain_min) * g_m
+        g_w = self.gain_min + (self.gain_max - self.gain_min) * g_w
+
+        self_sem = self_sem + g_m * mem_delta + g_w * world_delta
 
         intent_in_vec = torch.cat([self_sem, mem_ctx, dev_ctx], dim=-1)
         h_intent = self.intent_in(intent_in_vec)
@@ -440,17 +466,24 @@ class ConsciousnessExtractor(nn.Module):
             g = gamma_intent[:, i, :]
             b = beta_intent[:, i, :]
             h_intent = block(h_intent, gamma=g, beta=b)
-        intent_sem = h_intent
 
-        dev_in = torch.cat([dev_ctx, self_sem, intent_sem], dim=-1) 
-        dev_update = self.dev_update(dev_in) 
-        new_dev = dev_trace + 0.05 * dev_update
-        new_step = step + 1.0
+        if self.training:
+            ctx_hat = self.dev_to_ctx(dev_ctx) 
+            ctx_align_loss = F.mse_loss(ctx_hat, ctx_vec.detach(), reduction="none").mean(dim=1, keepdim=True)
+            slow_loss = (dev_ctx - self._dev_trace).pow(2).mean(dim=1, keepdim=True)
 
-        new_state = ConsciousnessState(dev_trace=new_dev, step=new_step)
+            loss = 0.1 * ctx_align_loss.mean() + 1e-3 * slow_loss.mean()
+        else:
+            loss = None
+
+        self._dev_trace = dev_ctx.detach()
+        self._last_self_intent = h_intent.detach()
+        self._last_sem = self_sem.detach()
+        self._step += 1
 
         extras: Dict[str, torch.Tensor] = {
-            "dev_trace_norm": new_dev.norm(dim=-1, keepdim=True).detach(),
+            "loss": loss,
+            "dev_trace_norm": dev_ctx.norm(dim=-1, keepdim=True).detach(),
             "mem_score_mean": mem_stats["score_mean"].detach(),
             "world_score_mean": world_stats["score_mean"].detach(),
             "mem_n_items": mem_stats["n_items"].detach(),
@@ -460,8 +493,7 @@ class ConsciousnessExtractor(nn.Module):
 
         return ConsciousnessOutput(
             self_sem=self_sem,
-            intent_sem=intent_sem,
-            new_state=new_state,
+            intent_sem=h_intent,
             extras=extras,)
     
     @torch.no_grad()
@@ -486,7 +518,6 @@ class TestConsciousMTool:
         self.n_intent_blocks = 3
         self.hyper_hidden = 256
 
-
     def BuildModel(self, useHebb: bool = True) -> "ConsciousnessExtractor":
         model = ConsciousnessExtractor(
             memItemDim=self.mem_dim,
@@ -502,7 +533,6 @@ class TestConsciousMTool:
             topKWorld=4,
             randKWorld=2,
             useHebb=useHebb,).to(self.device)
-        
         model.train()
         return model
 
@@ -511,24 +541,31 @@ class TestConsciousMTool:
         world = torch.randn(B, Nw, self.world_dim, device=self.device)
         return mem, world
 
-
     def TestForwardShapes(self) -> bool:
         try:
             model = self.BuildModel(useHebb=True)
+            model.ResetState()
             mem, world = self.DummyBanks(B=4, Nm=9, Nw=6)
 
-            out = model(mem, world, prevState=None, detachBase=True)
+            out = model(mem, world)
 
             assert out.self_sem.shape == (4, self.self_dim), f"self_sem shape wrong: {out.self_sem.shape}"
             assert out.intent_sem.shape == (4, self.intent_dim), f"intent_sem shape wrong: {out.intent_sem.shape}"
-            assert out.new_state.dev_trace.shape == (4, self.dev_dim), f"dev_trace shape wrong: {out.new_state.dev_trace.shape}"
-            assert out.new_state.step.shape == (4,1), f"step shape wrong: {out.new_state.step.shape}"
+
+            dev_trace, last_intent, last_sem, step = model.GetState()
+            assert dev_trace is not None, "dev_trace should not be None after first forward."
+            assert last_intent is not None and last_sem is not None, "cached last_intent/last_sem should not be None."
+
+            assert dev_trace.shape == (4, self.dev_dim), f"dev_trace shape wrong: {dev_trace.shape}"
+            assert last_intent.shape == (4, self.intent_dim), f"last_intent shape wrong: {last_intent.shape}"
+            assert last_sem.shape == (4, self.self_dim), f"last_sem shape wrong: {last_sem.shape}"
+            assert isinstance(step, int) and step == 1, f"step should be int==1 after first forward, got {step}"
 
             for k in [
+                "loss",
                 "dev_trace_norm", "mem_score_mean", "world_score_mean",
                 "mem_n_items", "world_n_items",
                 "mem_focus_norm", "world_focus_norm",]:
-
                 assert k in out.extras, f"extras missing key: {k}"
 
             print("TestForwardShapes passed.")
@@ -543,23 +580,25 @@ class TestConsciousMTool:
     def TestStateFlow(self) -> bool:
         try:
             model = self.BuildModel(useHebb=True)
+            model.ResetState()
+
             B = 3
             mem, world = self.DummyBanks(B=B, Nm=8, Nw=5)
-            state = model.InitialState(batchSize=B, device=self.device)
 
             steps = []
-            norms = []
-            for _ in range(5):
-                out = model(mem, world, prevState=state, detachBase=True)
-                state = out.new_state
-                steps.append(state.step.detach().cpu())
-                norms.append(state.dev_trace.norm(dim=-1).detach().cpu())
+            dev_list = []
 
-            steps = torch.stack(steps, dim=0)  
-            assert torch.all(steps[1:] > steps[:-1]), f"step not strictly increasing:\n{steps}"
+            for _ in range(6):
+                _ = model(mem, world)
+                dev_trace, last_intent, last_sem, step = model.GetState()
+                assert dev_trace is not None, "dev_trace became None unexpectedly."
+                steps.append(step)
+                dev_list.append(dev_trace.cpu())
 
-            diff = (norms[-1] - norms[0]).abs().sum().item()
-            assert diff > 1e-6, "dev_trace norm did not change across steps; dynamics may be stuck."
+            assert all(steps[i] < steps[i + 1] for i in range(len(steps) - 1)), f"step not strictly increasing: {steps}"
+
+            diff = (dev_list[-1] - dev_list[0]).abs().mean().item()
+            assert diff > 1e-7, f"dev_trace did not change across steps; diff={diff:.3e}"
 
             print("TestStateFlow passed.")
             return True
@@ -572,7 +611,7 @@ class TestConsciousMTool:
 
     def TestConsciousHebbianLinearLifecycle(self) -> bool:
         try:
-            lin = ConsciousHebbianLinear(inFeatures=16, outFeatures=12, hebbAlpha=0.1, useHebb=True,).to(self.device)
+            lin = ConsciousHebbianLinear(inFeatures=16, outFeatures=12, hebbAlpha=0.1, useHebb=True).to(self.device)
 
             x = torch.randn(5, 16, device=self.device)
             with torch.no_grad():
@@ -601,8 +640,9 @@ class TestConsciousMTool:
             mem, world = self.DummyBanks(B=4, Nm=9, Nw=6)
 
             with torch.no_grad():
+                model.ResetState()
                 for _ in range(3):
-                    _ = model(mem, world, prevState=None, detachBase=True)
+                    _ = model(mem, world)
 
             hebb_norm_before = []
             for m in model.modules():
@@ -640,32 +680,33 @@ class TestConsciousMTool:
             mem, world = self.DummyBanks(B=B, Nm=7, Nw=5)
             target = torch.randn(B, 32, device=self.device)
 
-            prev = model.InitialState(batchSize=B, device=self.device)
-            prev = ConsciousnessState(dev_trace=prev.dev_trace.detach(),step=prev.step.detach())
+            model.ResetState()
+            model.ResetHebbianMemory()
 
-            out = model(mem, world, prevState=prev, detachBase=False)
+            _ = model(mem, world) 
+            out = model(mem, world) 
+
             rep = torch.cat([out.self_sem, out.intent_sem], dim=-1)
             pred = head(rep)
-            base_loss = F.mse_loss(pred, target)
-
-            dev_loss = out.new_state.dev_trace.pow(2).mean()
-
-            loss = base_loss + 0.1 * dev_loss
+            main_loss = F.mse_loss(pred, target)
+            aux_loss = out.extras["loss"] if ("loss" in out.extras) else torch.zeros((), device=self.device)
+            total_loss = main_loss + aux_loss
 
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            total_loss.backward()
 
             grads_ok = True
             for n, p in model.named_parameters():
-                if p.requires_grad:
-                    if p.grad is None:
-                        print("Missing grad at:", n)
-                        grads_ok = False
-                        break
-                    if not torch.isfinite(p.grad).all():
-                        print("Non-finite grad at:", n)
-                        grads_ok = False
-                        break
+                if not p.requires_grad:
+                    continue
+                if p.grad is None:
+                    print("Missing grad at:", n)
+                    grads_ok = False
+                    break
+                if not torch.isfinite(p.grad).all():
+                    print("Non-finite grad at:", n)
+                    grads_ok = False
+                    break
 
             if head.weight.grad is None or not torch.isfinite(head.weight.grad).all():
                 grads_ok = False
@@ -696,43 +737,44 @@ class TestConsciousMTool:
             target = torch.randn(B, 32, device=self.device)
 
             with torch.no_grad():
-                out0 = model(mem, world, prevState=None, detachBase=False)
+                model.ResetState()
+                model.ResetHebbianMemory()
+                _ = model(mem, world)
+                out0 = model(mem, world)
                 rep0 = torch.cat([out0.self_sem, out0.intent_sem], dim=-1)
                 pred0 = head(rep0)
-                base0 = F.mse_loss(pred0, target)
-
-                dev0 = out0.new_state.dev_trace.pow(2).mean()
-
-                start = (base0 + 0.1 * dev0).item()
+                start = F.mse_loss(pred0, target).item()
 
             last_loss = start
             for t in range(1, steps + 1):
-                out = model(mem, world, prevState=None, detachBase=False)
+                model.ResetState()
+                model.ResetHebbianMemory()
+
+                _ = model(mem, world)
+                out = model(mem, world)
+
                 rep = torch.cat([out.self_sem, out.intent_sem], dim=-1)
                 pred = head(rep)
-                base_loss = F.mse_loss(pred, target)
-
-                dev_loss = out.new_state.dev_trace.pow(2).mean()
-
-                loss = base_loss + 0.1 * dev_loss
+                main_loss = F.mse_loss(pred, target)
+                aux_loss = out.extras["loss"] if ("loss" in out.extras) else 0.0
+                total_loss = main_loss + aux_loss
 
                 opt.zero_grad(set_to_none=True)
-                loss.backward()
+                total_loss.backward()
                 opt.step()
 
-                last_loss = loss.item()
+                last_loss = float(total_loss.item())
                 if (t % logEvery) == 0 or t == 1:
                     print(f"[ConsciousTrain] step {t}/{steps} | total_loss={last_loss:.6f}")
 
             with torch.no_grad():
-                out1 = model(mem, world, prevState=None, detachBase=False)
+                model.ResetState()
+                model.ResetHebbianMemory()
+                _ = model(mem, world)
+                out1 = model(mem, world)
                 rep1 = torch.cat([out1.self_sem, out1.intent_sem], dim=-1)
                 pred1 = head(rep1)
-                base1 = F.mse_loss(pred1, target)
-
-                dev1 = out1.new_state.dev_trace.pow(2).mean()
-
-                end = (base1 + 0.1 * dev1).item()
+                end = F.mse_loss(pred1, target).item()
 
             print(f"\n[ConsciousTrain] loss start={start:.6f} -> end={end:.6f}")
             assert end <= 0.8 * start, "Training did not show sufficient convergence (<20% decline)."
@@ -757,83 +799,37 @@ class TestConsciousMTool:
             mem, world = self.DummyBanks(B=B, Nm=9, Nw=6)
             target = torch.randn(B, 32, device=self.device)
 
-            out = model(mem, world, prevState=None, detachBase=False)
+            model.ResetState()
+            model.ResetHebbianMemory()
+
+            _ = model(mem, world)
+            out = model(mem, world)
+
             rep = torch.cat([out.self_sem, out.intent_sem], dim=-1)
             pred = head(rep)
-            base_loss = F.mse_loss(pred, target)
-
-            dev_loss = out.new_state.dev_trace.pow(2).mean()
-
-            loss = base_loss + 0.1 * dev_loss
+            main_loss = F.mse_loss(pred, target)
+            aux_loss = out.extras["loss"] if ("loss" in out.extras) else 0.0
+            total_loss = main_loss + aux_loss
 
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            total_loss.backward()
 
-            named: Dict[str, torch.nn.Parameter] = {}
+            missing_any = []
             for n, p in model.named_parameters():
-                named[n] = p
-            for k, v in head.named_parameters():
-                named["head." + k] = v
+                if not p.requires_grad:
+                    continue
+                if p.grad is None:
+                    missing_any.append(n)
 
-            total_trainable = sum(1 for p in named.values() if p.requires_grad)
-            total_with_grad = sum(
-                1 for p in named.values()
-                if p.requires_grad and (p.grad is not None))
-            ratio = total_with_grad / max(1, total_trainable)
-
-            missing_any = [n for n, p in named.items() if p.requires_grad and (p.grad is None)]
             assert len(missing_any) == 0, f"Some trainable params have no grad: {missing_any}"
-
-            print(f"GradCoverageReport passed. grad_ratio={ratio:.2%}")
+            print("GradCoverageReport passed.")
             return True
         except AssertionError as e:
             print("GradCoverageReport failed:", e)
             return False
         except Exception as e:
             print("GradCoverageReport error:", e)
-            return False
-
-    def DetachBaseSwitchEffect(self) -> bool:
-        try:
-            model = self.BuildModel(useHebb=False)
-            B = 4
-            mem, world = self.DummyBanks(B=B, Nm=8, Nw=5)
-
-            base_params = []
-            for n, p in model.named_parameters():
-                if (n.startswith("mem_score_net.")
-                    or n.startswith("world_score_net.")
-                    or n.startswith("mem_agg_proj.")
-                    or n.startswith("world_agg_proj.")):
-                    base_params.append(p)
-            assert len(base_params) > 0, "No base scoring params found."
-
-            model.zero_grad(set_to_none=True)
-            out1 = model(mem, world, prevState=None, detachBase=True)
-            loss1 = out1.self_sem.mean() + out1.intent_sem.mean()
-            loss1.backward()
-
-            has_grad_detached = any(p.grad is not None for p in base_params)
-            assert not has_grad_detached, "Base scoring modules should have NO grad when detachBase=True"
-
-            model.zero_grad(set_to_none=True)
-            out2 = model(mem, world, prevState=None, detachBase=False)
-            loss2 = out2.self_sem.mean() + out2.intent_sem.mean()
-            loss2.backward()
-
-            has_grad_attached = any(
-                (p.grad is not None) and torch.isfinite(p.grad).all()
-                for p in base_params)
-            assert has_grad_attached, "Base scoring modules should GET grad when detachBase=False"
-
-            print("DetachBaseSwitchEffect passed.")
-            return True
-        except AssertionError as e:
-            print("DetachBaseSwitchEffect failed:", e)
-            return False
-        except Exception as e:
-            print("DetachBaseSwitchEffect error:", e)
             return False
 
     def QueryTopKEdgeCases(self) -> bool:
@@ -864,7 +860,6 @@ class TestConsciousMTool:
             print("QueryTopKEdgeCases error:", e)
             return False
 
-
     def RunAll(self) -> Dict[str, bool]:
         results = {
             "ForwardShapes": self.TestForwardShapes(),
@@ -874,10 +869,10 @@ class TestConsciousMTool:
             "TrainStepSmoke": self.TrainStepSmoke(),
             "NormalTrainingConvergence": self.NormalTrainingConvergence(),
             "GradCoverageReport": self.GradCoverageReport(),
-            "DetachBaseSwitchEffect": self.DetachBaseSwitchEffect(),
             "QueryTopKEdgeCases": self.QueryTopKEdgeCases(),}
-        
+
         passed = sum(1 for v in results.values() if v)
         print(f"\nConsciousness module tests: {passed}/{len(results)} passed.")
         return results
+
 

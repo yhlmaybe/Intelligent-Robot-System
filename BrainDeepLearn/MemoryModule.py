@@ -222,6 +222,16 @@ class SymbolicMemory(nn.Module):
         if returnDetails:
             return out, vecs, w, idx
         return out
+    
+    @torch.no_grad()
+    def Reset(self):
+        self.Pstore.zero_()
+        self.prio.zero_()
+        self.step.zero_()
+        self.touch.zero_()
+        self.source.zero_()
+        self.filled = 0
+        self.global_step = 0
 
 
 class SymbolicEmbed(nn.Module):
@@ -766,7 +776,6 @@ class MemoryExtractor(nn.Module):
 
         self.emo_write_alpha = nn.Parameter(torch.tensor(0.3))
 
-
         self.mem_ptr = 0
         self.time_step = 0
         self.memory_filled = 0
@@ -1011,8 +1020,6 @@ class MemoryExtractor(nn.Module):
         rule_loss_post = per_sample_post.mean()
         return P_post, per_sample_post, rule_loss_post, damp, adj_mem
 
-
-
     def forward(self,
         x: torch.Tensor,
         *,
@@ -1213,25 +1220,6 @@ class MemoryExtractor(nn.Module):
     def ApplyOutputGate(self, memRecall: torch.Tensor, tdError: torch.Tensor, gateBias: torch.Tensor) -> torch.Tensor:
         gate_out = (1.0 + torch.tanh(tdError.detach() / self.td_scale + gateBias)) / 2.0
         return gate_out.view(-1, 1) * memRecall
-
-    @torch.no_grad()
-    def SoftReset(self):
-        self.h_state.zero_()
-        self.fast_weights.zero_()
-
-        self._steps_since_svd = 0
-        self.last_compress_step = 0
-        self.memory_usage = 0.0
-        self.fro_norm_history = []
-
-        self._ns_prev_P_pre = None
-        self._ns_prev_P_post = None
-        self._ns_penalty_vec = None
-        self.ns_last = {}
-
-        self._ltm_cache = None
-
-        self.ResetInternalLoss()
 
     @torch.no_grad()
     def HebbianUpdate(self, key: torch.Tensor, gateLocal: torch.Tensor, neuromod: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
@@ -1636,6 +1624,26 @@ class MemoryExtractor(nn.Module):
 
         self.HebbianUpdate(keys, gate, neu, a, b)
 
+    @torch.no_grad()
+    def SoftReset(self):
+        self.h_state.zero_()
+        self.fast_weights.zero_()
+
+        self._steps_since_svd = 0
+        self.last_compress_step = 0
+        self.memory_usage = 0.0
+        self.fro_norm_history = []
+
+        self._ns_prev_P_pre = None
+        self._ns_prev_P_post = None
+        self._ns_penalty_vec = None
+        self.ns_last = {}
+
+        self._ltm_cache = None
+
+        self.ResetInternalLoss()
+
+
     def ResetAll(self):
         self.fast_weights.zero_()
         self.memory_keys.zero_()
@@ -1663,7 +1671,7 @@ class MemoryExtractor(nn.Module):
         self.ns_last = {}
         self.ResetInternalLoss()
 
-        self.sym_mem = SymbolicMemory(k=self.ns_K, capacity=self.sym_capacity)
+        self.sym_mem.Reset()
 
     def GetLastNS(self):
         return self.ns_last
@@ -1974,50 +1982,75 @@ class MemoryExtractor(nn.Module):
     
 
     @torch.no_grad()
-    def ExportMemoryState(self, step: Optional[int] = None) -> Dict[str, torch.Tensor]:
+    def ExportState(self, step: Optional[int] = None) -> Dict[str, torch.Tensor]:
         gws_snap = self.gws.Inspect()
         sem = self.ltm.semantic
         epi = self.ltm.episodic
         sym = self.sym_mem
 
         state: Dict[str, torch.Tensor] = {
+            "time_step": torch.tensor(int(self.time_step)),
+            "gws_global_step": torch.tensor(int(self.gws.global_step)),
+            "ltm_sem_global_step": torch.tensor(int(sem.global_step)),
+            "ltm_epi_global_step": torch.tensor(int(epi.global_step)),
+            "sym_mem_global_step": torch.tensor(int(sym.global_step)),
+
+            "h_state": self.h_state.clone(),
+            "fast_weights": self.fast_weights.clone(),
+
+            "mem_ptr": torch.tensor(int(self.mem_ptr)),
+            "memory_filled": torch.tensor(int(self.memory_filled)),
+            "memory_usage": torch.tensor(float(self.memory_usage), dtype=torch.float32),
+
+            "_steps_since_svd": torch.tensor(int(self._steps_since_svd)),
+            "last_compress_step": torch.tensor(int(self.last_compress_step)),
+            "svd_threshold": torch.tensor(float(self.svd_threshold), dtype=torch.float32),
+            "fro_norm_history": torch.tensor(self.fro_norm_history, dtype=torch.float32),
+
+            "ns_prev_P_pre": (self._ns_prev_P_pre.clone() if (self._ns_prev_P_pre is not None) else None),
+            "ns_prev_P_post": (self._ns_prev_P_post.clone() if (self._ns_prev_P_post is not None) else None),
+            "ns_penalty_vec": (self._ns_penalty_vec.clone() if (self._ns_penalty_vec is not None) else None),}
+
+        state.update({
             "memory_keys": self.memory_keys.clone(),
             "memory_values": self.memory_values.clone(),
             "memory_importance": self.memory_importance.clone(),
             "memory_corr": self.memory_corr.clone(),
             "memory_steps": self.memory_steps.clone(),
             "memory_emotion": self.memory_emotion.clone(),
-            "memory_filled": torch.tensor(self.memory_filled),
-            "memory_source": self.memory_source.clone(),
+            "memory_source": self.memory_source.clone(),})
 
+        state.update({
             "gws_keys": gws_snap["keys"].clone(),
             "gws_vals": gws_snap["vals"].clone(),
             "gws_priority": gws_snap["priority"].clone(),
             "gws_ttl": gws_snap["ttl"].clone(),
             "gws_last_step": gws_snap["last_step"].clone(),
             "gws_tag_id": gws_snap["tag_id"].clone(),
-            "gws_owner_id": gws_snap["owner_id"].clone(),
+            "gws_owner_id": gws_snap["owner_id"].clone(),})
 
+        state.update({
             "ltm_sem_emb": sem.emb.clone(),
             "ltm_sem_prio": sem.prio.clone(),
             "ltm_sem_touch": sem.touch.clone(),
             "ltm_sem_step": sem.step.clone(),
-            "ltm_sem_filled": torch.tensor(sem.filled),
+            "ltm_sem_filled": torch.tensor(int(sem.filled)),
             "ltm_sem_source": sem.source.clone(),
 
             "ltm_epi_emb": epi.emb.clone(),
             "ltm_epi_prio": epi.prio.clone(),
             "ltm_epi_rew": epi.rew.clone(),
             "ltm_epi_step": epi.step.clone(),
-            "ltm_epi_filled": torch.tensor(epi.filled),
-            "ltm_epi_source": epi.source.clone(),
+            "ltm_epi_filled": torch.tensor(int(epi.filled)),
+            "ltm_epi_source": epi.source.clone(),})
 
+        state.update({
             "sym_mem_Pstore": sym.Pstore.clone(),
             "sym_mem_prio": sym.prio.clone(),
             "sym_mem_step": sym.step.clone(),
             "sym_mem_touch": sym.touch.clone(),
-            "sym_mem_filled": torch.tensor(sym.filled),
-            "sym_mem_source": sym.source.clone(),}
+            "sym_mem_filled": torch.tensor(int(sym.filled)),
+            "sym_mem_source": sym.source.clone(),})
 
         if step is None:
             return state
@@ -2036,23 +2069,20 @@ class MemoryExtractor(nn.Module):
                 state["memory_corr"] = self.memory_corr[idx].clone()
                 state["memory_steps"] = self.memory_steps[idx].clone()
                 state["memory_emotion"] = self.memory_emotion[idx].clone()
-                state["memory_filled"] = torch.tensor(idx.numel())
                 state["memory_source"] = self.memory_source[idx].clone()
+                state["memory_filled"] = torch.tensor(int(idx.numel()))
             else:
-                for k in (
-                    "memory_keys", "memory_values", "memory_importance",
-                    "memory_corr", "memory_steps", "memory_emotion",
-                    "memory_filled","memory_source"):
+                for k in ("memory_keys","memory_values","memory_importance","memory_corr","memory_steps","memory_emotion","memory_source"):
                     state.pop(k, None)
+                state["memory_filled"] = torch.tensor(0)
         else:
-            for k in (
-                "memory_keys", "memory_values", "memory_importance",
-                "memory_corr", "memory_steps", "memory_emotion",
-                "memory_filled","memory_source"):
+            for k in ("memory_keys","memory_values","memory_importance","memory_corr","memory_steps","memory_emotion","memory_source"):
                 state.pop(k, None)
+            state["memory_filled"] = torch.tensor(0)
 
-        if sem.filled > 0:
-            sem_steps = sem.step[:sem.filled]
+        sem_filled = int(sem.filled)
+        if sem_filled > 0:
+            sem_steps = sem.step[:sem_filled]
             mask_sem = (sem_steps > s)
             if mask_sem.any():
                 idx = torch.nonzero(mask_sem, as_tuple=False).flatten()
@@ -2060,21 +2090,20 @@ class MemoryExtractor(nn.Module):
                 state["ltm_sem_prio"] = sem.prio[idx].clone()
                 state["ltm_sem_touch"] = sem.touch[idx].clone()
                 state["ltm_sem_step"] = sem.step[idx].clone()
-                state["ltm_sem_filled"] = torch.tensor(idx.numel())
                 state["ltm_sem_source"] = sem.source[idx].clone()
+                state["ltm_sem_filled"] = torch.tensor(int(idx.numel()))
             else:
-                for k in (
-                    "ltm_sem_emb", "ltm_sem_prio", "ltm_sem_touch",
-                    "ltm_sem_step", "ltm_sem_filled","ltm_sem_source"):
+                for k in ("ltm_sem_emb","ltm_sem_prio","ltm_sem_touch","ltm_sem_step","ltm_sem_source"):
                     state.pop(k, None)
+                state["ltm_sem_filled"] = torch.tensor(0)
         else:
-            for k in (
-                "ltm_sem_emb", "ltm_sem_prio", "ltm_sem_touch",
-                "ltm_sem_step", "ltm_sem_filled","ltm_sem_source"):
+            for k in ("ltm_sem_emb","ltm_sem_prio","ltm_sem_touch","ltm_sem_step","ltm_sem_source"):
                 state.pop(k, None)
+            state["ltm_sem_filled"] = torch.tensor(0)
 
-        if epi.filled > 0:
-            epi_steps = epi.step[:epi.filled]
+        epi_filled = int(epi.filled)
+        if epi_filled > 0:
+            epi_steps = epi.step[:epi_filled]
             mask_epi = (epi_steps > s)
             if mask_epi.any():
                 idx = torch.nonzero(mask_epi, as_tuple=False).flatten()
@@ -2082,21 +2111,20 @@ class MemoryExtractor(nn.Module):
                 state["ltm_epi_prio"] = epi.prio[idx].clone()
                 state["ltm_epi_rew"] = epi.rew[idx].clone()
                 state["ltm_epi_step"] = epi.step[idx].clone()
-                state["ltm_epi_filled"] = torch.tensor(idx.numel())
                 state["ltm_epi_source"] = epi.source[idx].clone()
+                state["ltm_epi_filled"] = torch.tensor(int(idx.numel()))
             else:
-                for k in (
-                    "ltm_epi_emb", "ltm_epi_prio", "ltm_epi_rew",
-                    "ltm_epi_step", "ltm_epi_filled","ltm_epi_source"):
+                for k in ("ltm_epi_emb","ltm_epi_prio","ltm_epi_rew","ltm_epi_step","ltm_epi_source"):
                     state.pop(k, None)
+                state["ltm_epi_filled"] = torch.tensor(0)
         else:
-            for k in (
-                "ltm_epi_emb", "ltm_epi_prio", "ltm_epi_rew",
-                "ltm_epi_step", "ltm_epi_filled","ltm_epi_source"):
+            for k in ("ltm_epi_emb","ltm_epi_prio","ltm_epi_rew","ltm_epi_step","ltm_epi_source"):
                 state.pop(k, None)
+            state["ltm_epi_filled"] = torch.tensor(0)
 
-        if sym.filled > 0:
-            sym_steps = sym.step[:sym.filled]
+        sym_filled = int(sym.filled)
+        if sym_filled > 0:
+            sym_steps = sym.step[:sym_filled]
             mask_sym = (sym_steps > s)
             if mask_sym.any():
                 idx = torch.nonzero(mask_sym, as_tuple=False).flatten()
@@ -2104,23 +2132,19 @@ class MemoryExtractor(nn.Module):
                 state["sym_mem_prio"] = sym.prio[idx].clone()
                 state["sym_mem_step"] = sym.step[idx].clone()
                 state["sym_mem_touch"] = sym.touch[idx].clone()
-                state["sym_mem_filled"] = torch.tensor(idx.numel())
                 state["sym_mem_source"] = sym.source[idx].clone()
+                state["sym_mem_filled"] = torch.tensor(int(idx.numel()))
             else:
-                for k in (
-                    "sym_mem_Pstore", "sym_mem_prio",
-                    "sym_mem_step", "sym_mem_touch",
-                    "sym_mem_filled","sym_mem_source"):
+                for k in ("sym_mem_Pstore","sym_mem_prio","sym_mem_step","sym_mem_touch","sym_mem_source"):
                     state.pop(k, None)
+                state["sym_mem_filled"] = torch.tensor(0)
         else:
-            for k in (
-                "sym_mem_Pstore", "sym_mem_prio",
-                "sym_mem_step", "sym_mem_touch",
-                "sym_mem_filled","sym_mem_source"):
+            for k in ("sym_mem_Pstore","sym_mem_prio","sym_mem_step","sym_mem_touch","sym_mem_source"):
                 state.pop(k, None)
+            state["sym_mem_filled"] = torch.tensor(0)
 
         return state
-    
+
     @torch.no_grad()
     def MergeMemoryState(self, state: Dict[str, torch.Tensor]):
         if ("memory_keys" in state) and ("memory_values" in state):
@@ -2130,41 +2154,54 @@ class MemoryExtractor(nn.Module):
             keys = state["memory_keys"].to(dev_kv).float()
             vals = state["memory_values"].to(dev_kv).float()
 
-            imp = state.get("memory_importance",torch.ones(keys.size(0), device=dev_kv),).to(self.memory_importance.device)
+            imp = state.get("memory_importance", None)
+            if imp is None:
+                imp = torch.ones(keys.size(0), device=dev_kv, dtype=torch.float32)
+            else:
+                imp = imp.to(self.memory_importance.device).float().view(-1)
 
             emo = state.get("memory_emotion", None)
-
-            if "memory_filled" in state:
-                n = int(state["memory_filled"].item())
-            else:
-                n = keys.size(0)
-
-            keys = keys[:n]
-            vals = vals[:n]
-            imp  = imp[:n].view(n, 1)
-
             if emo is not None:
-                emo = emo.to(dev_emo)[:n].float()
+                emo = emo.to(dev_emo).float()
             else:
-                emo = torch.zeros(n, self.emotion_dim, device=dev_emo)
-
-            keys = F.normalize(keys, dim=-1)
-            vals = F.normalize(vals, dim=-1)
+                emo = torch.zeros(keys.size(0), self.emotion_dim, device=dev_emo, dtype=torch.float32)
 
             src = state.get("memory_source", None)
             if src is not None:
-                src = src.to(dev_kv).to(torch.int8)
-                src = src[:n]
+                src = src.to(dev_kv).to(torch.int8).view(-1)
+
+            steps = state.get("memory_steps", None)
+            if steps is not None:
+                steps = steps.to(self.memory_steps.device).long().view(-1)
+
+            n = int(state.get("memory_filled", torch.tensor(keys.size(0))).item())
+            n = max(0, min(n, keys.size(0), vals.size(0), imp.size(0), emo.size(0)))
+
+            keys = F.normalize(keys[:n], dim=-1)
+            vals = F.normalize(vals[:n], dim=-1)
+            imp = imp[:n].view(n, 1)
+            emo = emo[:n]
+
+            src = (src[:n] if src is not None else None)
+            steps = (steps[:n] if steps is not None else None)
+
+            old_ts = int(self.time_step)
+            if steps is not None and steps.numel() > 0:
+                self.time_step = max(old_ts, int(steps.max().item()))
 
             for i in range(n):
-                src_i = None
-                if src is not None:
-                    src_i = src[i:i+1]
-                self.KvWrite(key=keys[i:i+1], val=vals[i:i+1], importance=imp[i:i+1], emotion=emo[i:i+1],source=src_i)
+                src_i = (src[i:i+1] if src is not None else None)
+                self.KvWrite(
+                    key=keys[i:i+1],
+                    val=vals[i:i+1],
+                    importance=imp[i:i+1],
+                    emotion=emo[i:i+1],
+                    source=src_i)
+
+            self.time_step = old_ts
 
         if "gws_keys" in state:
             gws_dev = self.gws.keys.device
-
             gk = state["gws_keys"].to(gws_dev).float()
             gv = state["gws_vals"].to(gws_dev).float()
             gpr = state["gws_priority"].to(self.gws.priority.device).float()
@@ -2176,8 +2213,13 @@ class MemoryExtractor(nn.Module):
             if alive.any():
                 idx = torch.nonzero(alive, as_tuple=False).flatten()
                 for i in idx.tolist():
-                    self.gws.Write(key=gk[i], val=gv[i], priority=float(gpr[i].item()), ttl=int(gttl[i].item()), tagId=int(gtag[i].item()),ownerId=int(gown[i].item()),)
-
+                    self.gws.Write(
+                        key=gk[i],
+                        val=gv[i],
+                        priority=float(gpr[i].item()),
+                        ttl=int(gttl[i].item()),
+                        tagId=int(gtag[i].item()),
+                        ownerId=int(gown[i].item()),)
 
         if "ltm_sem_emb" in state:
             sem = self.ltm.semantic
@@ -2185,25 +2227,20 @@ class MemoryExtractor(nn.Module):
 
             emb = state["ltm_sem_emb"].to(dev_sem).float()
             prio = state.get("ltm_sem_prio", None)
-            filled_t = state.get("ltm_sem_filled", None)
             src = state.get("ltm_sem_source", None)
 
-            if filled_t is not None:
-                n_sem = int(filled_t.item())
-            else:
-                n_sem = emb.size(0)
-
-            emb = emb[:n_sem]
             if prio is not None:
-                prio = prio.to(dev_sem).float()[:n_sem]
+                prio = prio.to(sem.prio.device).float().view(-1)
             if src is not None:
-                src = src.to(dev_sem).to(torch.int8)[:n_sem]
+                src = src.to(dev_sem).to(torch.int8).view(-1)
+
+            n_sem = int(state.get("ltm_sem_filled", torch.tensor(emb.size(0))).item())
+            n_sem = max(0, min(n_sem, emb.size(0)))
 
             for i in range(n_sem):
-                score = float(prio[i].item()) if prio is not None else 1.0
-                src_i = int(src[i].item()) if src is not None else MemoryType.SRC_REAL
+                score = float(prio[i].item()) if prio is not None and i < prio.numel() else 1.0
+                src_i = int(src[i].item()) if src is not None and i < src.numel() else MemoryType.SRC_REAL
                 sem.Store(emb[i], score=score, source=src_i)
-
 
         if "ltm_epi_emb" in state:
             epi = self.ltm.episodic
@@ -2212,28 +2249,23 @@ class MemoryExtractor(nn.Module):
             emb = state["ltm_epi_emb"].to(dev_epi).float()
             prio = state.get("ltm_epi_prio", None)
             rew = state.get("ltm_epi_rew", None)
-            filled_t = state.get("ltm_epi_filled", None)
             src = state.get("ltm_epi_source", None)
 
-            if filled_t is not None:
-                n_epi = int(filled_t.item())
-            else:
-                n_epi = emb.size(0)
-
-            emb = emb[:n_epi]
             if prio is not None:
-                prio = prio.to(dev_epi).float()[:n_epi]
+                prio = prio.to(epi.prio.device).float().view(-1)
             if rew is not None:
-                rew = rew.to(dev_epi).float()[:n_epi]
+                rew = rew.to(epi.rew.device).float().view(-1)
             if src is not None:
-                src = src.to(dev_epi).to(torch.int8)[:n_epi]
+                src = src.to(dev_epi).to(torch.int8).view(-1)
+
+            n_epi = int(state.get("ltm_epi_filled", torch.tensor(emb.size(0))).item())
+            n_epi = max(0, min(n_epi, emb.size(0)))
 
             for i in range(n_epi):
-                score = float(prio[i].item()) if prio is not None else 1.0
-                r = float(rew[i].item()) if rew is not None else 0.0
-                src_i = int(src[i].item()) if src is not None else MemoryType.SRC_REAL
+                score = float(prio[i].item()) if prio is not None and i < prio.numel() else 1.0
+                r = float(rew[i].item()) if rew is not None and i < rew.numel() else 0.0
+                src_i = int(src[i].item()) if src is not None and i < src.numel() else MemoryType.SRC_REAL
                 epi.Store(emb[i], reward=r, score=score, source=src_i)
-
 
         if "sym_mem_Pstore" in state:
             sym = self.sym_mem
@@ -2241,106 +2273,141 @@ class MemoryExtractor(nn.Module):
 
             P = state["sym_mem_Pstore"].to(dev_sym).float()
             prio = state.get("sym_mem_prio", None)
-            filled_t = state.get("sym_mem_filled", None)
             src = state.get("sym_mem_source", None)
 
-            if filled_t is not None:
-                n_sym = int(filled_t.item())
-            else:
-                n_sym = P.size(0)
-
-            P = P[:n_sym]
             if prio is not None:
-                prio = prio.to(dev_sym).float()[:n_sym]
+                prio = prio.to(sym.prio.device).float().view(-1)
             if src is not None:
-                src = src.to(dev_sym).to(torch.int8)[:n_sym]
+                src = src.to(dev_sym).to(torch.int8).view(-1)
+
+            n_sym = int(state.get("sym_mem_filled", torch.tensor(P.size(0))).item())
+            n_sym = max(0, min(n_sym, P.size(0)))
 
             for i in range(n_sym):
-                score = float(prio[i].item()) if prio is not None else 1.0
-                src_i = int(src[i].item()) if src is not None else MemoryType.SRC_REAL
+                score = float(prio[i].item()) if prio is not None and i < prio.numel() else 1.0
+                src_i = int(src[i].item()) if src is not None and i < src.numel() else MemoryType.SRC_REAL
                 sym.Store(P[i], score=score, source=src_i)
 
+
     @torch.no_grad()
-    def ImportMemoryState(self, state: Dict[str, torch.Tensor]):
+    def ImportState(self, state: Dict[str, torch.Tensor]):
         dev = self.h_state.device
 
-        hs = state["h_state"].to(dev)
-        if self.h_state.shape != hs.shape:
-            self.h_state.resize_(hs.shape).copy_(hs)
-        else:
-            self.h_state.copy_(hs)
+        if "time_step" in state:
+            self.time_step = int(state["time_step"].item())
+        if "gws_global_step" in state:
+            self.gws.global_step = int(state["gws_global_step"].item())
+        if "ltm_sem_global_step" in state:
+            self.ltm.semantic.global_step = int(state["ltm_sem_global_step"].item())
+        if "ltm_epi_global_step" in state:
+            self.ltm.episodic.global_step = int(state["ltm_epi_global_step"].item())
+        if "sym_mem_global_step" in state:
+            self.sym_mem.global_step = int(state["sym_mem_global_step"].item())
 
-        self.fast_weights.copy_(state["fast_weights"].to(self.fast_weights.device))
-        self.memory_keys.copy_(state["memory_keys"].to(self.memory_keys.device))
-        self.memory_values.copy_(state["memory_values"].to(self.memory_values.device))
-        self.memory_importance.copy_(state["memory_importance"].to(self.memory_importance.device))
-        self.memory_corr.copy_(state["memory_corr"].to(self.memory_corr.device))
-        self.memory_steps.copy_(state["memory_steps"].to(self.memory_steps.device))
-        self.memory_emotion.copy_(state["memory_emotion"].to(self.memory_emotion.device))
-        self.memory_source.copy_(state["memory_source"].to(self.memory_source.device))
+        if "h_state" in state:
+            hs = state["h_state"].to(dev)
+            if self.h_state.shape != hs.shape:
+                self.h_state.resize_(hs.shape).copy_(hs)
+            else:
+                self.h_state.copy_(hs)
 
-        self.mem_ptr = int(state["mem_ptr"].item())
-        self.time_step = int(state["time_step"].item())
-        self.memory_filled = int(state["memory_filled"].item())
+        if "fast_weights" in state:
+            self.fast_weights.copy_(state["fast_weights"].to(self.fast_weights.device))
+
+        if "mem_ptr" in state:
+            self.mem_ptr = int(state["mem_ptr"].item())
+        if "memory_filled" in state:
+            self.memory_filled = int(state["memory_filled"].item())
+        if "memory_usage" in state:
+            self.memory_usage = float(state["memory_usage"].item())
 
         if "_steps_since_svd" in state:
             self._steps_since_svd = int(state["_steps_since_svd"].item())
         if "last_compress_step" in state:
             self.last_compress_step = int(state["last_compress_step"].item())
-        if "memory_usage" in state:
-            self.memory_usage = float(state["memory_usage"].item())
         if "svd_threshold" in state:
             self.svd_threshold = float(state["svd_threshold"].item())
         if "fro_norm_history" in state:
             self.fro_norm_history = state["fro_norm_history"].flatten().tolist()
 
+        if "memory_keys" in state:
+            self.memory_keys.copy_(state["memory_keys"].to(self.memory_keys.device))
+        if "memory_values" in state:
+            self.memory_values.copy_(state["memory_values"].to(self.memory_values.device))
+        if "memory_importance" in state:
+            self.memory_importance.copy_(state["memory_importance"].to(self.memory_importance.device))
+        if "memory_corr" in state:
+            self.memory_corr.copy_(state["memory_corr"].to(self.memory_corr.device))
+        if "memory_steps" in state:
+            self.memory_steps.copy_(state["memory_steps"].to(self.memory_steps.device))
+        if "memory_emotion" in state:
+            self.memory_emotion.copy_(state["memory_emotion"].to(self.memory_emotion.device))
+        if "memory_source" in state:
+            self.memory_source.copy_(state["memory_source"].to(self.memory_source.device))
+
         if "gws_keys" in state:
             self.gws.keys.copy_(state["gws_keys"].to(self.gws.keys.device))
+        if "gws_vals" in state:
             self.gws.vals.copy_(state["gws_vals"].to(self.gws.vals.device))
+        if "gws_priority" in state:
             self.gws.priority.copy_(state["gws_priority"].to(self.gws.priority.device))
+        if "gws_ttl" in state:
             self.gws.ttl.copy_(state["gws_ttl"].to(self.gws.ttl.device))
+        if "gws_last_step" in state:
             self.gws.last_step.copy_(state["gws_last_step"].to(self.gws.last_step.device))
+        if "gws_tag_id" in state:
             self.gws.tag_id.copy_(state["gws_tag_id"].to(self.gws.tag_id.device))
+        if "gws_owner_id" in state:
             self.gws.owner_id.copy_(state["gws_owner_id"].to(self.gws.owner_id.device))
-            self.gws.global_step = int(state["gws_global_step"].item())
+
+        sem = self.ltm.semantic
+        epi = self.ltm.episodic
 
         if "ltm_sem_emb" in state:
-            sem = self.ltm.semantic
             sem.emb.copy_(state["ltm_sem_emb"].to(sem.emb.device))
+        if "ltm_sem_prio" in state:
             sem.prio.copy_(state["ltm_sem_prio"].to(sem.prio.device))
+        if "ltm_sem_touch" in state:
             sem.touch.copy_(state["ltm_sem_touch"].to(sem.touch.device))
+        if "ltm_sem_step" in state:
             sem.step.copy_(state["ltm_sem_step"].to(sem.step.device))
+        if "ltm_sem_filled" in state:
             sem.filled = int(state["ltm_sem_filled"].item())
-            sem.global_step = int(state["ltm_sem_global_step"].item())
+        if "ltm_sem_source" in state:
             sem.source.copy_(state["ltm_sem_source"].to(sem.source.device))
 
         if "ltm_epi_emb" in state:
-            epi = self.ltm.episodic
             epi.emb.copy_(state["ltm_epi_emb"].to(epi.emb.device))
+        if "ltm_epi_prio" in state:
             epi.prio.copy_(state["ltm_epi_prio"].to(epi.prio.device))
+        if "ltm_epi_rew" in state:
             epi.rew.copy_(state["ltm_epi_rew"].to(epi.rew.device))
+        if "ltm_epi_step" in state:
             epi.step.copy_(state["ltm_epi_step"].to(epi.step.device))
+        if "ltm_epi_filled" in state:
             epi.filled = int(state["ltm_epi_filled"].item())
-            epi.global_step = int(state["ltm_epi_global_step"].item())
+        if "ltm_epi_source" in state:
             epi.source.copy_(state["ltm_epi_source"].to(epi.source.device))
-
-        if "ns_prev_P_pre" in state:
-            self._ns_prev_P_pre = (state["ns_prev_P_pre"].to(dev) if state["ns_prev_P_pre"] is not None else None)
-
-        if "ns_prev_P_post" in state:
-            self._ns_prev_P_post = (state["ns_prev_P_post"].to(dev) if state["ns_prev_P_post"] is not None else None)
 
         if "sym_mem_Pstore" in state:
             self.sym_mem.Pstore.copy_(state["sym_mem_Pstore"].to(self.sym_mem.Pstore.device))
+        if "sym_mem_prio" in state:
             self.sym_mem.prio.copy_(state["sym_mem_prio"].to(self.sym_mem.prio.device))
+        if "sym_mem_step" in state:
             self.sym_mem.step.copy_(state["sym_mem_step"].to(self.sym_mem.step.device))
+        if "sym_mem_touch" in state:
             self.sym_mem.touch.copy_(state["sym_mem_touch"].to(self.sym_mem.touch.device))
+        if "sym_mem_filled" in state:
             self.sym_mem.filled = int(state["sym_mem_filled"].item())
-            self.sym_mem.global_step = int(state["sym_mem_global_step"].item())
+        if "sym_mem_source" in state:
             self.sym_mem.source.copy_(state["sym_mem_source"].to(self.sym_mem.source.device))
 
+        if "ns_prev_P_pre" in state:
+            self._ns_prev_P_pre = (state["ns_prev_P_pre"].to(dev) if state["ns_prev_P_pre"] is not None else None)
+        if "ns_prev_P_post" in state:
+            self._ns_prev_P_post = (state["ns_prev_P_post"].to(dev) if state["ns_prev_P_post"] is not None else None)
         if "ns_penalty_vec" in state:
-            self._ns_penalty_vec = (None if state["ns_penalty_vec"] is None else state["ns_penalty_vec"].to(dev))
+            self._ns_penalty_vec = (state["ns_penalty_vec"].to(dev) if state["ns_penalty_vec"] is not None else None)
 
         self.ResetInternalLoss()
 

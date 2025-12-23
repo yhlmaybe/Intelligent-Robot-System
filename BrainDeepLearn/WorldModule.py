@@ -544,7 +544,6 @@ class RSSMWorldModel(nn.Module):
     def __init__(
         self,
         visionDim: int = 1024,
-        batchSize: int = 1,
         actionDim: int = 256,
         deterDim: int = 512,
         stochDim: int = 64,
@@ -652,7 +651,7 @@ class RSSMWorldModel(nn.Module):
         self.mem_gate_e = nn.Linear(deterDim + stochDim, stochDim)
         nn.init.constant_(self.mem_gate_e.bias, -1.0)
 
-        self.ResetHidden(batchSize=batchSize)
+        self.ResetState(batchSize=1)
 
         if self._use_memory and self._mem_path:
             self.LoadMemory(self._mem_path, mapLocation=None, strict=False)
@@ -804,7 +803,7 @@ class RSSMWorldModel(nn.Module):
 
         return mem_h[0] if single else mem_h
 
-    def ResetHidden(self, batchSize: int = 1):
+    def ResetState(self, batchSize: int = 1):
         device = next(self.parameters()).device
         self._h = torch.zeros(batchSize, self.deter_dim, device=device)
         self._z = torch.zeros(batchSize, self.stoch_dim, device=device)
@@ -853,6 +852,13 @@ class RSSMWorldModel(nn.Module):
         actionEnc: torch.Tensor,
         sample: bool = False,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
+        if hPrev is None or zPrev is None or s4xPrev is None:
+            B = actionEnc.size(0)
+            device = actionEnc.device
+            hPrev = torch.zeros(B, self.deter_dim, device=device)
+            zPrev = torch.zeros(B, self.stoch_dim, device=device)
+            s4xPrev = torch.zeros(B, self.ssm_dim, device=device)
+
         a_t = self.act_proj(actionEnc)
         h_next, s4x_next = self.s4.StepWithX(zPrev, a_t, s4xPrev)
 
@@ -873,8 +879,7 @@ class RSSMWorldModel(nn.Module):
             mu_p = mu_p + gate * dmu
 
         if sample:
-            eps = torch.randn_like(mu_p)
-            z_next = mu_p + torch.exp(logstd_p) * eps
+            z_next = mu_p + torch.exp(logstd_p) * torch.randn_like(mu_p)
         else:
             z_next = mu_p
 
@@ -904,6 +909,13 @@ class RSSMWorldModel(nn.Module):
         actionEnc: torch.Tensor,
         sample: bool = False, # False: Deterministic Forward, True: Reparameterized sampling with noise(More exploratory)
         ) -> Dict[str, torch.Tensor]:
+
+        if hPrev is None or zPrev is None:
+            B = visionIn.size(0)
+            device = visionIn.device
+            hPrev = torch.zeros(B, self.deter_dim, device=device)
+            zPrev = torch.zeros(B, self.stoch_dim, device=device)
+            self.s4.ResetState(batch=B,device=device)
 
         raw_e = self.obs_enc(visionIn)
 
@@ -942,7 +954,11 @@ class RSSMWorldModel(nn.Module):
 
         mu_q, logstd_q = self.post_net(torch.cat([h_next, e_t], dim=-1)).chunk(2, dim=-1)
         logstd_q = ClampLogStd(logstd_q)
-        z_next = mu_q + torch.exp(logstd_q) * torch.randn_like(mu_q) if sample else mu_q
+
+        if sample:
+            z_next = mu_q + torch.exp(logstd_q) * torch.randn_like(mu_q)
+        else: 
+            z_next = mu_q
 
         s_base = self.state_proj(torch.cat([h_next, z_next], dim=-1))
         s_prev_base = self.state_proj(torch.cat([hPrev, zPrev], dim=-1))
@@ -963,6 +979,7 @@ class RSSMWorldModel(nn.Module):
         out = {
             "h_next": h_next,
             "z_next": z_next,
+            "x_next": self.s4.x,
             "s_next": s_next,
             "r_pred": r_pred, # Prediction Rewards
             "d_prob": d_prob, # Predicted termination probability
@@ -1004,12 +1021,12 @@ class RSSMWorldModel(nn.Module):
         nsDistillCoef: float = 1e-2,
         nsPriorLogicCoef: float = 1e-3,) -> Dict[str, torch.Tensor]:
 
-        B = visionSeq.size(0)
-        device = visionSeq.device
-        if h0 is None:
+        if h0 is None or z0 is None:
+            B = visionSeq.size(0)
+            device = visionSeq.device
             h0 = torch.zeros(B, self.deter_dim, device=device)
-        if z0 is None:
             z0 = torch.zeros(B, self.stoch_dim, device=device)
+            self.s4.ResetState(batch=B,device=device)
 
         a_enc = self.action_encoder(keysVec, mouseSeq)
         a_enc = self.act_proj(a_enc)
@@ -1076,7 +1093,7 @@ class RSSMWorldModel(nn.Module):
         A_t = self.conn(s_prev_base, a_enc)
         s_transport = self.conn.TransportApply(A_t, s_prev_base)
 
-        prevA = (self._A_prev if (self._A_prev is not None  and self._A_prev.shape == A_t.shape) else None)
+        prevA = (self._A_prev if (self._A_prev is not None and self._A_prev.shape == A_t.shape) else None)
         reg_A = self.conn.ComputeGeomReg(A_t, prevA)
         self._A_prev = A_t.detach()
         
@@ -1137,6 +1154,7 @@ class RSSMWorldModel(nn.Module):
             "loss_ns_prior_logic": ns_prior_logic,
             "s_next": s1,
             "h_next": h_next,
+            "x_next": self.s4.x,
             "z_next": z1,
             "r_pred": r1,
             "d_prob": d_prob,}
@@ -1347,12 +1365,11 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
 
         B = vision.size(0)
         device = vision.device
-        dtype = vision.dtype
 
-        if h0 is None:
-            h0 = torch.zeros(B, wm.deter_dim, device=device, dtype=dtype)
-        if z0 is None:
-            z0 = torch.zeros(B, wm.stoch_dim, device=device, dtype=dtype)
+        if h0 is None or z0 is None:
+            h0 = torch.zeros(B, wm.deter_dim, device=device)
+            z0 = torch.zeros(B, wm.stoch_dim, device=device)
+            wm.s4.ResetState(batch=B, device=device)
 
         deltas: Dict[str, Optional[torch.Tensor]] = (deltasPerLayer[0] if (deltasPerLayer and len(deltasPerLayer) > 0) else {})
 
@@ -1374,6 +1391,7 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         has_s4_delta = any(deltas.get(k, None) is not None for k in ("s4_B", "s4_C", "s4_D0", "s4_gate", "s4_out_gate"))
         if not has_s4_delta:
             h_next = wm.s4.Step(z0, a_t, updateState=True)
+            x_next = wm.s4.x 
         else:
             u = torch.cat([z0, a_t], dim=-1)
 
@@ -1467,7 +1485,7 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         hz = torch.cat([h_next, z1], dim=-1)
         s_pre = wm.state_proj[0](hz)
         W_state, b_state = eff_linear(wm.state_proj[1], deltas.get("state", None))
-        s_mid  = F.linear(s_pre, W_state, b_state)
+        s_mid = F.linear(s_pre, W_state, b_state)
         s_base = wm.state_proj[2](s_mid)
 
         hz_prev = torch.cat([h0, z0], dim=-1)
@@ -1517,7 +1535,7 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
             A_list.append(A_full)
 
         if len(A_list) == 0:
-            A_t_conn = torch.zeros(B, wm.conn.S, wm.conn.S, device=device, dtype=dtype)
+            A_t_conn = torch.zeros(B, wm.conn.S, wm.conn.S, device=device)
         elif len(A_list) == 1:
             A_t_conn = A_list[0]
         else:
@@ -1673,6 +1691,7 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
             "s_next": s_next,
             "h_next": h_next,
             "z_next": z1,
+            "x_next": x_next,
             "r_pred": r_pred,
             "d_prob": d_prob,
             "mu_p": mu_p,
@@ -1703,9 +1722,12 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
         deltas_list = self.GetCurrentSimDeltas(detach=True, clone=True, skipZeros=True)
         deltas = deltas_list[0] if (deltas_list and len(deltas_list) > 0) else {}
 
-        B = hPrev.size(0)
-        device = hPrev.device
-        dtype = hPrev.dtype
+        if hPrev is None or zPrev is None or s4xPrev is None:
+            B = actionEnc.size(0)
+            device = actionEnc.device
+            hPrev = torch.zeros(B, self.deter_dim, device=device)
+            zPrev = torch.zeros(B, self.stoch_dim, device=device)
+            s4xPrev = torch.zeros(B, self.ssm_dim, device=device)
 
         def eff_linear(lo: "GrowableLoRALinear", delta_extra: torch.Tensor | None):
             W = lo.target.weight
@@ -1820,7 +1842,7 @@ class WorldModelOnlineWrapper(BaseOnlineWrapper):
             A_list.append(A_full)
 
         if len(A_list) == 0:
-            A_t_conn = torch.zeros(B, wm.conn.S, wm.conn.S, device=device, dtype=dtype)
+            A_t_conn = torch.zeros(B, wm.conn.S, wm.conn.S, device=device)
         elif len(A_list) == 1:
             A_t_conn = A_list[0]
         else:
@@ -2014,7 +2036,7 @@ class TestWorldMTool:
         self.wm = RSSMWorldModel(
             visionDim=1024, actionDim=256, deterDim=256, stochDim=32, stateDim=256,
             useDecoder=True, useMemory=False, nsEnabled=True).to(self.device)
-        self.wm.ResetHidden(batchSize=4)
+        self.wm.ResetState(batchSize=4)
 
     def Batch(self, B, keyIdx=(17,)):
         vision = torch.randn(B, 1024, device=self.device)
@@ -2055,7 +2077,7 @@ class TestWorldMTool:
         try:
             B = 4
             vision, keys, mouse = self.Batch(B, keyIdx=(17,57))
-            self.wm.ResetHidden(batchSize=B)
+            self.wm.ResetState(batchSize=B)
 
             a_enc = self.wm.action_encoder(keys, mouse)
             h0 = torch.zeros(B, self.wm.deter_dim, device=self.device)
@@ -2092,7 +2114,7 @@ class TestWorldMTool:
         try:
             B = 4
             _, keys, mouse = self.Batch(B, keyIdx=(30,))
-            self.wm.ResetHidden(batchSize=B)
+            self.wm.ResetState(batchSize=B)
 
             a_enc = self.wm.action_encoder(keys, mouse)
             h0 = torch.zeros(B, self.wm.deter_dim, device=self.device)
@@ -2126,7 +2148,7 @@ class TestWorldMTool:
             self.wm.train()
             for p in self.wm.parameters():
                 p.requires_grad_(True)
-            self.wm.ResetHidden(batchSize=B)
+            self.wm.ResetState(batchSize=B)
 
             out = self.wm.ForwardTrainSeq(
                 visionSeq=vision, keysVec=keys, mouseSeq=mouse,
@@ -2151,10 +2173,10 @@ class TestWorldMTool:
         try:
             B = 2
             vision, keys, mouse = self.Batch(B, keyIdx=(18,))
-            self.wm.ResetHidden(batchSize=B)
+            self.wm.ResetState(batchSize=B)
             _ = self.wm.ForwardTrainSeq(vision, keys, mouse)
             has_prev = (self.wm._A_prev is not None) and (self.wm._A_prev.shape == (B, self.wm.state_dim, self.wm.state_dim))
-            self.wm.ResetHidden(batchSize=B)
+            self.wm.ResetState(batchSize=B)
             cleared = (self.wm._A_prev is None)
             ok = has_prev and cleared
             print("Conn regularization cache reset " + ("passed." if ok else "failed."))
@@ -2169,7 +2191,7 @@ class TestWorldMTool:
             wrapper.train()
             B = 4
             vision, keys, mouse = self.Batch(B, keyIdx=(17, 57))
-            self.wm.ResetHidden(batchSize=B)
+            self.wm.ResetState(batchSize=B)
 
             out = wrapper(vision,keysVec=keys,mouseSeq=mouse,sample=False,)
 
@@ -2186,15 +2208,21 @@ class TestWorldMTool:
         try:
             wrapper = WorldModelOnlineWrapper(self.wm, initRankEach=0, autoRank=False).to(self.device)
             wrapper.eval()
+            self.wm.eval()
+
             B = 3
             vision, keys, mouse = self.Batch(B, keyIdx=(31,))
-            self.wm.ResetHidden(batchSize=B)
 
-            out0 = wrapper.ForwardWithDeltas(vision, None, None, None, [{}], keysVec=keys, mouseSeq=mouse, sample=False,)
+            torch.manual_seed(123)
+            self.wm.ResetState(batchSize=B)
+            out0 = wrapper.ForwardWithDeltas(vision, None, None, None, [{}],keysVec=keys, mouseSeq=mouse, sample=False,)
 
             Z = self.wm.stoch_dim
             A = torch.randn(Z, self.wm.action_dim, device=self.device) * 1e-3
-            out1 = wrapper.ForwardWithDeltas(vision,None, None, None,[{"act": A}],keysVec=keys,mouseSeq=mouse,sample=False,)
+
+            torch.manual_seed(123)
+            self.wm.ResetState(batchSize=B)
+            out1 = wrapper.ForwardWithDeltas(vision, None, None, None, [{"act": A}],keysVec=keys, mouseSeq=mouse, sample=False,)
 
             diff = (out0["s_next"] - out1["s_next"]).abs().mean().item()
             ok = diff > 1e-7
@@ -2208,6 +2236,7 @@ class TestWorldMTool:
         try:
             wrapper = WorldModelOnlineWrapper(self.wm, initRankEach=0, autoRank=False).to(self.device)
             wrapper.train()
+
             lo = self.wm.act_proj[0]
             n0 = len(lo.A_list)
 
@@ -2215,22 +2244,27 @@ class TestWorldMTool:
             A = torch.randn(r, self.wm.action_dim, device=self.device) * 1e-2
             Bm = torch.randn(self.wm.stoch_dim, r, device=self.device) * 1e-2
             ok_commit = wrapper.CommitOne("act", 0, A, Bm, 1.0)
+
             n1 = len(lo.A_list)
             grew = ok_commit and (n1 == n0 + 1)
 
             Bsz = 4
             vision, keys, mouse = self.Batch(Bsz, keyIdx=(33,))
-            self.wm.ResetHidden(batchSize=Bsz)
 
             with torch.no_grad():
                 last_alpha = lo.alpha[-1].clone()
+
                 lo.alpha[-1].zero_()
-                out_before = wrapper(vision,keysVec=keys,mouseSeq=mouse,sample=False,)
+                torch.manual_seed(456)
+                self.wm.ResetState(batchSize=Bsz)
+                out_before = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False)
+
                 lo.alpha[-1].copy_(last_alpha)
+                torch.manual_seed(456)
+                self.wm.ResetState(batchSize=Bsz)
+                out_after = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False)
 
-            out_after = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False,)
             change = (out_after["s_next"] - out_before["s_next"]).abs().mean().item()
-
             ok = grew and (change > 1e-7)
             print(f"CommitOne grow & effect {'passed' if ok else 'failed'} (rank {n0}->{n1}, |Δ|={change:.3e})")
             return ok
@@ -2246,7 +2280,7 @@ class TestWorldMTool:
 
             B = 6
             vision, keys, mouse = self.Batch(B, keyIdx=(45,))
-            self.wm.ResetHidden(batchSize=B)
+            self.wm.ResetState(batchSize=B)
 
             out = wrapper(vision,keysVec=keys,mouseSeq=mouse, sample=False,)
 
@@ -2286,7 +2320,7 @@ class TestWorldMTool:
 
             B = 8
             vision, keys, mouse = self.Batch(B, keyIdx=(31, 49))
-            self.wm.ResetHidden(batchSize=B)
+            self.wm.ResetState(batchSize=B)
 
             watch = None
             for p in wrapper.CandParameters():
@@ -2401,7 +2435,7 @@ class TestWorldMTool:
 
             B = 5
             vision, keys, mouse = self.Batch(B, keyIdx=(31,))
-            self.wm.ResetHidden(batchSize=B)
+            self.wm.ResetState(batchSize=B)
 
             out1 = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False,)
 
@@ -2449,20 +2483,18 @@ class TestWorldMTool:
 
             B = 3
             vision, keys, mouse = self.Batch(B, keyIdx=(31, 57))
-            wm.ResetHidden(batchSize=B)
 
             h0 = torch.zeros(B, wm.deter_dim, device=self.device)
             z0 = torch.zeros(B, wm.stoch_dim, device=self.device)
+            wm.ResetState(batchSize=B)
 
             a_enc = wm.action_encoder(keys, mouse)
             out_base = wm.StepPosterior(h0, z0, vision, a_enc, sample=False)
 
-            out_wrap = wrapper.ForwardWithDeltas(vision, None, None, None, [{}], keysVec=keys, mouseSeq=mouse, sample=False, hPrev=h0, zPrev=z0,)
+            wm.ResetState(batchSize=B)
+            out_wrap = wrapper.ForwardWithDeltas(vision, None, None, None, [{}],keysVec=keys, mouseSeq=mouse, sample=False,h0=h0, z0=z0,)
 
-            must_keys = ["h_next", "z_next", "s_next",
-                "r_pred", "d_prob",
-                "mu_p", "logstd_p", "mu_q", "logstd_q",]
-
+            must_keys = ["h_next", "z_next", "s_next", "r_pred", "d_prob", "mu_p", "logstd_p", "mu_q", "logstd_q"]
             ok = True
             for k in must_keys:
                 ok = ok and (k in out_base) and (k in out_wrap)
@@ -2489,25 +2521,27 @@ class TestWorldMTool:
 
             B = 3
             _, keys, mouse = self.Batch(B, keyIdx=(33,))
-            wm.ResetHidden(batchSize=B)
 
             h0 = torch.zeros(B, wm.deter_dim, device=self.device)
             z0 = torch.zeros(B, wm.stoch_dim, device=self.device)
             x0 = torch.zeros(B, wm.ssm_dim, device=self.device)
-            a_enc = wm.action_encoder(keys, mouse)
 
+            wm.ResetState(batchSize=B)
+            a_enc = wm.action_encoder(keys, mouse)
             h1, z1, s1, x1, r1, d1 = wm.StepPriorOnly(h0, z0, x0, a_enc, sample=False)
 
             ok_shapes = (
-                h1.shape == (B, wm.deter_dim) 
-                and z1.shape == (B, wm.stoch_dim) 
-                and s1.shape == (B, wm.state_dim) 
-                and x1.shape == (B, wm.ssm_dim) 
-                and r1.shape == (B,1) 
-                and d1.shape == (B,1))
+                h1.shape == (B, wm.deter_dim)
+                and z1.shape == (B, wm.stoch_dim)
+                and s1.shape == (B, wm.state_dim)
+                and x1.shape == (B, wm.ssm_dim)
+                and r1.shape == (B, 1)
+                and d1.shape == (B, 1))
 
             vision = torch.randn(B, wm.vision_dim, device=self.device)
-            _ = wrapper.ForwardWithDeltas(vision, None, None, None, [{}], keysVec=keys, mouseSeq=mouse, sample=False, hPrev=h0, zPrev=z0,)
+
+            wm.ResetState(batchSize=B)
+            _ = wrapper.ForwardWithDeltas(vision, None, None, None, [{}],keysVec=keys, mouseSeq=mouse, sample=False,h0=h0, z0=z0, )
 
             print("Parity prior (base StepPriorOnly shape) " + ("passed." if ok_shapes else "failed."))
             return ok_shapes
