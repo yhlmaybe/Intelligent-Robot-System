@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from typing import Dict, List, Optional, Iterable, Tuple, Any
-from FunctionTools import GetParameterSScale, SiteSpec, BaseOnlineWrapper
+from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper
 
 
 
@@ -72,7 +72,7 @@ class GrowableLoRAConv2d(nn.Module):
         ksz = self.kh * self.kw
         delta = self.target.weight.new_zeros(self.cout, self.cin * ksz)
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-            delta = delta + torch.tanh(s) * GetParameterSScale(s) * (B @ A)
+            delta = delta + torch.tanh(s) * GetParametersScale(s) * (B @ A)
         return delta.view(self.cout, self.cin, self.kh, self.kw)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -124,7 +124,7 @@ class GrowableConv1x1Adapter(nn.Module):
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
             z = F.conv2d(x, A, bias=None, stride=1, padding=0)
             z = F.conv2d(z, B, bias=None, stride=1, padding=0)
-            y = y + torch.tanh(s) * GetParameterSScale(s) * z
+            y = y + torch.tanh(s) * GetParametersScale(s) * z
         return y
 
 
@@ -166,7 +166,7 @@ class GrowableTokenAdapter(nn.Module):
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
             z = torch.matmul(x, A.t())
             z = torch.matmul(z, B.t())
-            y = y + torch.tanh(s) * GetParameterSScale(s) * z
+            y = y + torch.tanh(s) * GetParametersScale(s) * z
         return y
 
 class SheafGaugeConv2d(nn.Conv2d):
@@ -714,7 +714,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             return A, B, s
 
         def compose_feat(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
+            return torch.tanh(s) * GetParametersScale(s) * (b @ a)
 
         def alloc_patch(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, C * ksz, device=device, dtype=dtype) * 1e-4)
@@ -723,7 +723,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             return A, B, s
 
         def compose_patch(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
+            return torch.tanh(s) * GetParametersScale(s) * (b @ a)
 
         def alloc_token(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, D, device=device, dtype=dtype) * 1e-4)
@@ -732,11 +732,11 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             return A, B, s
 
         def compose_token(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
+            return torch.tanh(s) * GetParametersScale(s) * (b @ a)
 
         return {
-            "feat": SiteSpec("feat", L, C, C, self.maxRankFeat, alloc_feat, compose_feat),
-            "patch": SiteSpec("patch", L, C * ksz, E, self.maxRankPatch, alloc_patch, compose_patch),
+            "feat": SiteSpec("feat", 1, C, C, self.maxRankFeat, alloc_feat, compose_feat),
+            "patch": SiteSpec("patch", 1, C * ksz, E, self.maxRankPatch, alloc_patch, compose_patch),
             "token": SiteSpec("token", L, D, D, self.maxRankToken, alloc_token, compose_token),}
 
     def ForwardWithDeltas(
@@ -868,7 +868,7 @@ class TestPerceptionMTool:
         for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
             A2 = A.view(A.size(0), C) 
             B2 = B.view(C, A.size(0)) 
-            scale = torch.tanh(s.detach()) * GetParameterSScale(s.detach())
+            scale = torch.tanh(s.detach()) * GetParametersScale(s.detach())
             delta = delta + scale * (B2 @ A2) 
         return delta
 
@@ -879,7 +879,7 @@ class TestPerceptionMTool:
         D = adapter.D
         delta = torch.zeros(D, D, device=adapter.A_list[0].device, dtype=adapter.A_list[0].dtype)
         for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
-            scale = torch.tanh(s.detach()) * GetParameterSScale(s.detach())
+            scale = torch.tanh(s.detach()) * GetParametersScale(s.detach())
             delta = delta + scale * (B @ A)
         return delta
 

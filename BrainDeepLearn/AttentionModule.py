@@ -7,6 +7,20 @@ from typing import Optional, Tuple, List, Dict
 from FunctionTools import GetParameterSScale, SiteSpec, BaseOnlineWrapper
 
 
+def SquashNoBatch(
+    t: Optional[torch.Tensor],
+    B: int,
+    device,
+    scale: float,
+    clip: float = 10.0,
+    dtype=torch.float32) -> torch.Tensor:
+
+    if t is None:
+        return torch.zeros(B, 1, device=device, dtype=dtype)
+    t = t.detach().to(device=device, dtype=dtype).reshape(B, 1)
+    t = (t / float(scale)).clamp(-clip, clip)
+    return torch.tanh(t)
+
 class GrowableLoRALinear(nn.Module):
     def __init__(self, targetLinear: nn.Linear):
         super().__init__()
@@ -115,16 +129,16 @@ class SelectiveSSM(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                          # (B,S,E)
+        x: torch.Tensor, # (B,S,E)
         keyPaddingMask: Optional[torch.Tensor] = None,  # (B,S) bool，True=padding
-        tdError: Optional[torch.Tensor] = None,   # (B,1) or (B,)
+        tdError: Optional[torch.Tensor] = None, 
         uncertainty: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, S, E = x.shape
         dev = x.device
         N = self.N
 
-        td_z  = self.ZscoreTanh(tdError, B, dev)
-        unc_z = self.ZscoreTanh(uncertainty, B, dev)
+        td_z = SquashNoBatch(tdError,B, dev, scale=5.0, dtype=torch.float32)
+        unc_z = SquashNoBatch(uncertainty, B, dev, scale=5.0, dtype=torch.float32)
 
         mod = torch.sigmoid(0.75 * td_z - 0.75 * unc_z) 
 
@@ -158,29 +172,28 @@ class SelectiveSSM(nn.Module):
 
         for t in range(S):
             if has_mask:
-                keep = (~keyPaddingMask[:, t]).to(torch.float32).view(B, 1, 1)  
+                keep = (~keyPaddingMask[:, t]).view(B, 1, 1) 
             else:
                 keep = None
 
-            u_t = u[:, t, :].to(torch.float32) 
-            dt_t = dt[:, t, :].to(torch.float32) 
+            u_t = u[:, t, :]
+            dt_t = dt[:, t, :]
 
             decay = torch.exp(-dt_t.unsqueeze(-1) * A_pos.unsqueeze(0))
-
-            inj = B_t[:, t, :, :].to(torch.float32) * u_t.unsqueeze(-1)
+            inj = B_t[:, t, :, :] * u_t.unsqueeze(-1)
 
             new_state = decay * state + (1.0 - decay) * inj
 
             if keep is not None:
-                state = keep * new_state + (1.0 - keep) * state
+                state = torch.where(keep, new_state, state) 
             else:
                 state = new_state
 
-            out_t = (C_t[:, t, :, :].to(torch.float32) * state).sum(dim=-1) + self.D.to(torch.float32).unsqueeze(0) * u_t
-            out_t = out_t * g[:, t, :].to(torch.float32)
+            out_t = (C_t[:, t, :, :] * state).sum(dim=-1) + self.D.unsqueeze(0) * u_t
+            out_t = out_t * g[:, t, :]
 
             if keep is not None:
-                out_t = out_t * keep.squeeze(-1) 
+                out_t = out_t * keep.squeeze(-1).to(out_t.dtype) 
 
             y[:, t, :] = out_t.to(dtype=x.dtype)
 
@@ -203,10 +216,11 @@ class MultiHeadAttention(nn.Module):
         self.rank = rank
         self.hebb_period = max(1, hebbPeriod)
         self.update_hebbian_flag = useHebbian
+        self.uv_decay = 1e-2 
+        self.uv_max_norm = 1.5  
+        self.hebb_eps = 1e-6     
 
         self.use_low_rank = bool(lowRank)
-
-        self.register_buffer("hebb_step", torch.tensor(0, dtype=torch.long), persistent=False)
 
         self.temp_w_td = nn.Parameter(torch.tensor(0.8))
         self.temp_w_unc = nn.Parameter(torch.tensor(0.5))
@@ -223,30 +237,28 @@ class MultiHeadAttention(nn.Module):
         self.v_adapter = GrowableLoRALinear(self.v_proj)
         self.o_adapter = GrowableLoRALinear(self.out_proj)
 
-        eye = torch.eye(self.head_dim)
-        hebb_shape = (numHeads, self.head_dim, self.head_dim)
-        self.register_buffer("hebbian_weights", eye.unsqueeze(0).repeat(hebb_shape[0], 1, 1),persistent=False)
-
-        self.register_buffer("U", torch.zeros(numHeads, self.head_dim, rank), persistent=False)
-        self.register_buffer("V", torch.zeros(numHeads, self.head_dim, rank), persistent=False)
+        self.register_buffer("hebb_step", torch.zeros(1, dtype=torch.long), persistent=False) 
+        self.register_buffer("hebbian_weights", torch.zeros(1, self.num_heads, self.head_dim, self.head_dim), persistent=False)  # (B,H,D,D)
+        self.register_buffer("U", torch.zeros(1, self.num_heads, self.head_dim, self.rank), persistent=False) 
+        self.register_buffer("V", torch.zeros(1, self.num_heads, self.head_dim, self.rank), persistent=False)
 
         self.ResetParameters()
 
+    @torch.no_grad()
+    def EnsureHebbState(self, B: int, device: torch.device, dtype: torch.dtype):
+        if (self.hebb_step.numel() != B) or (self.U.size(0) != B):
+            self.hebb_step = torch.zeros(B, device=device, dtype=torch.long)
+            eye = torch.eye(self.head_dim, device=device, dtype=dtype).view(1, 1, self.head_dim, self.head_dim)
+            self.hebbian_weights = eye.repeat(B, self.num_heads, 1, 1).contiguous()
+            self.U = torch.zeros(B, self.num_heads, self.head_dim, self.rank, device=device, dtype=dtype)
+            self.V = torch.zeros(B, self.num_heads, self.head_dim, self.rank, device=device, dtype=dtype)
+
     def ModulateTauBias(self, tdError, uncertainty, B):
         dev = self.temp_w_td.device
+        td_z = SquashNoBatch(tdError, B, dev, scale=self.td_scale, dtype=torch.float32)  
+        unc_z = SquashNoBatch(uncertainty, B, dev, scale=self.td_scale, dtype=torch.float32) 
 
-        def z_(t: Optional[torch.Tensor]) -> torch.Tensor:
-            if t is None:
-                return torch.zeros(B, 1, device=dev, dtype=torch.float32)
-            t = t.detach().float().reshape(B, 1) 
-            mu = t.mean(dim=0, keepdim=True)
-            sd = t.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
-            return torch.tanh((t - mu) / sd) 
-
-        td_z = z_(tdError) 
-        unc_z = z_(uncertainty)
-
-        tau  = 1.0 + 0.5 * torch.tanh(self.temp_w_td * td_z + self.temp_w_unc * unc_z)  
+        tau = 1.0 + 0.5 * torch.tanh(self.temp_w_td * td_z + self.temp_w_unc * unc_z) 
         bias = 0.5 * torch.tanh(self.bias_w_td * td_z + self.bias_w_unc * unc_z) 
         return tau.view(B,1,1,1), bias.view(B,1,1,1)
 
@@ -293,44 +305,68 @@ class MultiHeadAttention(nn.Module):
 
     def ComputeNeuromodulation(self, tdError: Optional[torch.Tensor], B: int) -> torch.Tensor:
         dev = self.hebbian_weights.device
-        if tdError is None:
-            return torch.ones(B, 1, 1, 1, device=dev, dtype=torch.float32)
-
-        td = tdError.detach().float().reshape(B, 1)  
-
-        if B == 1:
-            td_scaled = (td / self.td_scale).clamp(-10, 10)
-            neuromod = 1.0 + 0.5 * torch.tanh(td_scaled) 
-        else:
-            td_mean = td.mean(dim=0, keepdim=True)
-            td_std = td.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
-            td_norm = (td - td_mean) / td_std
-            neuromod = 1.0 + 0.5 * torch.tanh(td_norm / self.td_scale) 
-
+        td_z = SquashNoBatch(tdError, B, dev, scale=self.td_scale, dtype=torch.float32) 
+        neuromod = 1.0 + 0.5 * td_z  
         return neuromod.view(B, 1, 1, 1)
 
 
     @torch.no_grad()
-    def UpdateHebbianWeights(self, v: torch.Tensor, q: torch.Tensor, alpha: float):
-        if not self.update_hebbian_flag or alpha <= 0:
+    def UpdateHebbianWeights(self, v: torch.Tensor, q: torch.Tensor, alpha: float, keep4: Optional[torch.Tensor] = None):
+        if (not self.update_hebbian_flag) or (alpha <= 0):
             return
 
         v = v.detach()
         q = q.detach()
 
-        norm_factor = v.size(0) * v.size(2)  # B * S
-        hebb = torch.einsum("bhse,bhsd->hde", v, q) / (norm_factor + 1e-8)
+        if keep4 is not None:
+            k = keep4.detach()
+            v = v * k
+            q = q * k
+            denom = k.sum().clamp_min(1.0)
+        else:
+            denom = torch.tensor(v.size(0) * v.size(2), device=v.device, dtype=torch.float32).clamp_min(1.0)
+
+        eps = getattr(self, "hebb_eps", 1e-6)
+        v = F.normalize(v, dim=-1, eps=eps)
+        q = F.normalize(q, dim=-1, eps=eps)
+
+        hebb = torch.einsum("bhse,bhsd->hde", v, q) / (denom + 1e-8)
+        hebb = torch.tanh(hebb) 
+
+        def clamp_fro(x: torch.Tensor, max_norm: float):
+            n = torch.linalg.vector_norm(x, ord=2, dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+            scale = torch.clamp(max_norm / n, max=1.0)
+            return x * scale
 
         if self.use_low_rank:
-            U_grad = torch.einsum('hde,her->hdr', hebb, self.V)
-            V_grad = torch.einsum('hde,hdr->her', hebb, self.U)
-            U_new = torch.clamp(self.U + alpha * U_grad, -1.5, 1.5)
-            V_new = torch.clamp(self.V + alpha * V_grad, -1.5, 1.5)
-            self.U.copy_(U_new)
-            self.V.copy_(V_new)
+            decay = float(getattr(self, "uv_decay", 1e-2))
+            maxn = float(getattr(self, "uv_max_norm", 1.5))
+            r = int(self.U.size(-1))
+
+            M0 = torch.einsum("hdr,her->hde", self.U, self.V) 
+
+            M1 = (1.0 - decay) * M0 + float(alpha) * hebb
+
+            U_s, S, Vh = torch.linalg.svd(M1, full_matrices=False)
+            Sr = S[:, :r].clamp_min(0.0)
+            sqrtSr = Sr.sqrt().unsqueeze(1) 
+
+            Ur = U_s[:, :, :r] * sqrtSr  
+            Vr = Vh.transpose(-2, -1)[:, :, :r] * sqrtSr  
+
+            def clamp_fro(x: torch.Tensor, max_norm: float):
+                n = torch.linalg.vector_norm(x, ord=2, dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+                scale = torch.clamp(max_norm / n, max=1.0)
+                return x * scale
+
+            Ur = clamp_fro(Ur, maxn)
+            Vr = clamp_fro(Vr, maxn)
+
+            self.U.copy_(Ur.to(dtype=self.U.dtype))
+            self.V.copy_(Vr.to(dtype=self.V.dtype))
         else:
-            W_new = (1.0 - alpha) * self.hebbian_weights + alpha * torch.tanh(hebb)
-            self.hebbian_weights.copy_(W_new)
+            W_new = (1.0 - alpha) * self.hebbian_weights + alpha * hebb
+            self.hebbian_weights.copy_(W_new.to(dtype=self.hebbian_weights.dtype))
 
 
     def forward(self, query, key, value, keyPaddingMask: Optional[torch.Tensor]=None, tdError: Optional[torch.Tensor]=None, uncertainty: Optional[torch.Tensor]=None):
@@ -350,11 +386,10 @@ class MultiHeadAttention(nn.Module):
             if int(self.hebb_step.item()) % self.hebb_period == 0:
                 alpha = float(self.base_hebbian_rate * neuromod.mean())
                 if keyPaddingMask is not None:
-                    keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, L, 1)  # (B,1,L,1)
-                    v_upd, q_upd = v * keep4, q * keep4
+                    keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, L, 1)
+                    self.UpdateHebbianWeights(v, q, alpha, keep4=keep4)
                 else:
-                    v_upd, q_upd = v, q
-                self.UpdateHebbianWeights(v_upd, q_upd, alpha)
+                    self.UpdateHebbianWeights(v, q, alpha, keep4=None)
 
         q = q * neuromod
 
@@ -471,45 +506,38 @@ class DynamicRouting(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor, # (B,I,D)
-        mask: Optional[torch.Tensor] = None, # (B,I) bool
-        ) -> torch.Tensor: # (B,O,out_dim)
-        
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None, ) -> torch.Tensor: 
+
         B, I, D = x.shape
-        assert I == self.I and D == self.in_dim, "AttentionModule capsule input dim mismatch"
 
-        u_hat = torch.einsum("bid,iodc->bioc", x, self.transformation) # (B,I,O,C)
+        u_hat = torch.einsum("bid,iodc->bioc", x, self.transformation)
 
-        logits = self.routing_logits.expand(B, -1, -1) # (B,I,O)
-        
+        logits = self.routing_logits.expand(B, -1, -1).clone()
+
         if mask is not None:
             logits = logits.masked_fill(mask.unsqueeze(-1), -1e4)
 
-        cumulative_weights = torch.zeros_like(logits)
-        
         for r in range(self.iterations):
-            # Stable softmax calculation
-            weights = F.log_softmax(logits + cumulative_weights, dim=-1).exp() # (B,I,O)
-            
+            weights = F.log_softmax(logits, dim=-1).exp()
+
             if mask is not None:
                 weights = weights.masked_fill(mask.unsqueeze(-1), 0.0)
-            
-            # Normalize weights
-            weight_sum = weights.sum(dim=1, keepdim=True) + 1e-8
-            weights = weights / weight_sum
-            
-            s = torch.einsum("bioc,bio->boc", u_hat, weights) # (B,O,C)
-            v = self.Squash(s)
-            
+
+            s = torch.einsum("bioc,bio->boc", u_hat, weights) 
+            v = self.Squash(s) 
+
             if r < self.iterations - 1:
-                agreement = torch.einsum("bioc,boc->bio", u_hat, v)
-                # Clip agreement values for stability
+                agreement = torch.einsum("bioc,boc->bio", u_hat, v)  
                 agreement = torch.clamp(agreement, -5.0, 5.0)
-                cumulative_weights = cumulative_weights + agreement
-        
-        self.last_weights = weights.detach().mean(0, keepdim=True)
-            
-        return v # (B,O,C)
+
+                logits = logits + agreement
+
+                if mask is not None:
+                    logits = logits.masked_fill(mask.unsqueeze(-1), -1e4)
+
+        self.last_weights = weights.detach().mean(0, keepdim=True) 
+        return v
 
 
 class HebbianFusion(nn.Module):

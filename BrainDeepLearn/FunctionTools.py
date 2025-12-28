@@ -23,18 +23,40 @@ class SiteSpec:
     composeFn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
+
+class AGICoreModule(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.register_buffer("anchor_", torch.empty(0), persistent=False)
+
+    @property
+    def device(self):
+        return self.anchor_.device
+
+    @property
+    def dtype(self):
+        return self.anchor_.dtype
+
+    def NewZeros(self, *shape, dtype=None):
+        return torch.zeros(*shape, device=self.device, dtype=(dtype or self.dtype))
+    
+    def NewOnes(self, *shape, dtype=None):
+        return torch.ones(*shape, device=self.device, dtype=(dtype or self.dtype))
+
+    def NewTensor(self, data, *, dtype=None):
+        return torch.as_tensor(data, device=self.device, dtype=(dtype or self.dtype))
+    
+
 class BaseOnlineWrapper(nn.Module):
     def __init__(
         self,
-        base: nn.Module,
+        base: AGICoreModule,
         initRankEach: int = 0,
         autoRank: bool = True,
         evThreshold: float = 0.90,
         gradEma: float = 0.9,):
         super().__init__()
         self.base = base
-        self.deviceRef = next(self.base.parameters()).device
-        self.dtypeRef = next(self.base.parameters()).dtype
 
         self.autoRank = bool(autoRank)
         self.evThreshold = float(evThreshold)
@@ -42,9 +64,8 @@ class BaseOnlineWrapper(nn.Module):
 
         self.sites: Dict[str, SiteSpec] = self.BuildSiteSpecs()
         assert len(self.sites) > 0, "No site specs provided."
-        nLayersSet = {spec.nLayers for spec in self.sites.values()}
-        assert len(nLayersSet) == 1, "All sites must share same nLayers."
-        self.layerCount = nLayersSet.pop()
+
+        self.layerCount = max(spec.nLayers for spec in self.sites.values())
 
         for p in self.base.parameters():
             p.requires_grad_(False)
@@ -56,12 +77,19 @@ class BaseOnlineWrapper(nn.Module):
 
         self.freezeOldPar = True
 
+    @property
+    def deviceRef(self):
+        return self.base.device
+
+    @property
+    def dtypeRef(self):
+        return self.base.dtype
+
     def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
         raise NotImplementedError
 
 
     def GetCurrentSimDeltas(self, *, detach: bool = True, clone: bool = True, skipZeros: bool = True) -> List[Dict[str, Optional[torch.Tensor]]]:
-
         deltas: List[Dict[str, Optional[torch.Tensor]]] = []
         Z0_cache: Dict[Tuple[int,int,torch.device,torch.dtype], torch.Tensor] = {}
 
@@ -76,7 +104,7 @@ class BaseOnlineWrapper(nn.Module):
                         k = (spec.outDim, spec.inDim, self.deviceRef, self.dtypeRef)
                         if k not in Z0_cache:
                             Z0_cache[k] = torch.zeros(spec.outDim, spec.inDim,device=self.deviceRef, dtype=self.dtypeRef)
-                        row[name] = Z0_cache[k]
+                        row[name] = Z0_cache[k].clone()
                     continue
 
                 delta = torch.zeros(spec.outDim, spec.inDim,device=self.deviceRef, dtype=self.dtypeRef)
@@ -185,12 +213,21 @@ class BaseOnlineWrapper(nn.Module):
         return {"A": nn.ParameterList(), "B": nn.ParameterList(), "s": nn.ParameterList()}
 
     def InitCandidates(self, initRankEach: int):
-        dev, dt = self.deviceRef, self.dtypeRef
-        self.cand = {name: [self.EmptyLayerSlot() for _ in range(self.layerCount)] for name in self.sites}
+        self.cand = {} 
+
+        for name in self.sites:  
+            layer_slots = [] 
+
+            for _ in range(self.layerCount):
+                slot = self.EmptyLayerSlot()  
+                layer_slots.append(slot)
+
+            self.cand[name] = layer_slots
+            
         if initRankEach > 0:
             for name, spec in self.sites.items():
                 for layerIdx in range(spec.nLayers):
-                    a, b, s = spec.allocFn(initRankEach, dev, dt)
+                    a, b, s = spec.allocFn(initRankEach, self.deviceRef, self.dtypeRef)
                     self.cand[name][layerIdx]["A"].append(a)
                     self.cand[name][layerIdx]["B"].append(b)
                     self.cand[name][layerIdx]["s"].append(s)
@@ -381,14 +418,14 @@ class BaseOnlineWrapper(nn.Module):
         self.eval()
         self.base.eval()
 
-        for name in self.sites:
-            for layerIdx in range(self.layerCount):
+        for name, spec in self.sites.items():
+            for layerIdx in range(spec.nLayers):
                 slot = self.cand[name][layerIdx]
                 for aParam, bParam, sParam in zip(slot["A"], slot["B"], slot["s"]):
                     s_val = float(sParam.detach().item()) if torch.is_tensor(sParam) else float(sParam)
                     if aParam.numel() == 0 or bParam.numel() == 0 or abs(s_val) < 1e-12:
                         continue
-                    did_commit = self.CommitOne(name, layerIdx,aParam.detach().clone(),bParam.detach().clone(), s_val,)
+                    did_commit = self.CommitOne(name, layerIdx, aParam.detach().clone(), bParam.detach().clone(), s_val,)
                     if did_commit:
                         committed_rank += int(aParam.size(0))
                         committed_triples += 1

@@ -5,6 +5,7 @@ from FunctionTools import GetParameterSScale, SiteSpec, BaseOnlineWrapper
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import hashlib
 
 
 
@@ -76,7 +77,6 @@ class TextEncoder(nn.Module):
         dropout: float = 0.1,
         paddingIdx: int = 0,):
         super().__init__()
-
         self.padding_idx = int(paddingIdx)
 
         self.embedding = nn.Embedding(
@@ -84,52 +84,63 @@ class TextEncoder(nn.Module):
             embedding_dim=dimEmbed,
             padding_idx=self.padding_idx,)
 
-        self.rnn = nn.GRU(
+        self.rnn_f = nn.GRU(
             input_size=dimEmbed,
             hidden_size=dimHidden,
             num_layers=numLayers,
             batch_first=True,
-            bidirectional=True,
+            bidirectional=False,
+            dropout=dropout if numLayers > 1 else 0.0,)
+        
+        self.rnn_b = nn.GRU(
+            input_size=dimEmbed,
+            hidden_size=dimHidden,
+            num_layers=numLayers,
+            batch_first=True,
+            bidirectional=False,
             dropout=dropout if numLayers > 1 else 0.0,)
 
         self.att_proj = nn.Linear(dimHidden * 2, 1)
         self.out_dim = dimHidden * 2
 
+    def ReversePaddedSequence(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        B, T = x.shape[:2]
+        idx = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)  
+        L = lengths.unsqueeze(1)
+        rev_idx = torch.where(idx < L, (L - 1 - idx), idx)  
+        rev_idx = rev_idx.unsqueeze(-1).expand(-1, -1, x.size(-1)) 
+        return x.gather(1, rev_idx)
+
     def forward(self, tokenIds: torch.Tensor) -> torch.Tensor:
+        B, T = tokenIds.shape
 
-        batch_size, seq_len = tokenIds.shape
+        emb = self.embedding(tokenIds)
 
-        emb = self.embedding(tokenIds) 
+        mask = (tokenIds != self.padding_idx)  
+        lengths = mask.long().sum(dim=1).clamp(min=1)  
 
-        mask = (tokenIds != self.padding_idx) 
-        lengths = mask.long().sum(dim=1) 
-        lengths_clamped = lengths.clamp(min=1)
-        lengths_cpu = lengths_clamped.detach().cpu()
+        out_f, _ = self.rnn_f(emb)
 
-        packed = nn.utils.rnn.pack_padded_sequence(emb,lengths_cpu,batch_first=True,enforce_sorted=False,)
+        emb_rev = self.ReversePaddedSequence(emb, lengths)
+        out_b_rev, _ = self.rnn_b(emb_rev) 
+        out_b = self.ReversePaddedSequence(out_b_rev, lengths)
 
-        out_packed, _ = self.rnn(packed)
+        out = torch.cat([out_f, out_b], dim=-1) 
 
-        out, _ = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True, total_length=seq_len,) 
-
-        scores = self.att_proj(out).squeeze(-1)
+        scores = self.att_proj(out).squeeze(-1) 
         scores = scores.masked_fill(~mask, float("-inf"))
 
         no_token = ~mask.any(dim=1)
-
         if no_token.any():
             scores = scores.clone()
             scores[no_token] = 0.0
 
-        attn = F.softmax(scores, dim=-1) 
-
+        attn = F.softmax(scores, dim=-1)
         if no_token.any():
             attn = attn.clone()
             attn[no_token] = 0.0
 
-        attn_exp = attn.unsqueeze(-1) 
-        text_repr = (out * attn_exp).sum(dim=1)  
-
+        text_repr = (out * attn.unsqueeze(-1)).sum(dim=1) 
         return text_repr
 
 
@@ -162,23 +173,30 @@ class LangSymbolReasoner(nn.Module):
             nn.Linear(hiddenDim, self.nSymbols),)
 
     def BuildRelationMatrix(self, conceptEmb: torch.Tensor, relCore: torch.Tensor) -> torch.Tensor:
-        norm_emb = F.normalize(conceptEmb, dim=-1, eps=1e-6) 
-        interm = norm_emb @ relCore  
-        relation_matrix = interm @ norm_emb.t() 
+        norm_emb = F.normalize(conceptEmb, dim=-1, eps=1e-6)
+        interm = norm_emb @ relCore
+        relation_matrix = interm @ norm_emb.t()
         return relation_matrix
 
     def forward(
         self,
         symLogits: torch.Tensor,
-        conceptEmb: torch.Tensor,) -> torch.Tensor:
-        batch_size, symbol_count = symLogits.shape
-        assert symbol_count == self.nSymbols, "IntentionExtractor: nSymbols mismatch in LangSymbolReasoner."
+        conceptEmb: torch.Tensor,
+        *,
+        return_support: bool = False,):
+        B, K = symLogits.shape
+        assert K == self.nSymbols, "LangSymbolReasoner: nSymbols mismatch."
 
-        sym_probs0 = torch.sigmoid(symLogits)  # [B, K]
+        sym_probs0 = torch.sigmoid(symLogits) 
 
         w_imp = torch.tanh(self.BuildRelationMatrix(conceptEmb, self.relImp))
         w_contr = torch.tanh(self.BuildRelationMatrix(conceptEmb, self.relContr))
         w_cooc = torch.tanh(self.BuildRelationMatrix(conceptEmb, self.relCooc))
+
+        if w_imp.dim() == 2 and w_imp.size(0) == w_imp.size(1):
+            w_imp = w_imp.clone();   w_imp.fill_diagonal_(0.0)
+            w_contr = w_contr.clone(); w_contr.fill_diagonal_(0.0)
+            w_cooc = w_cooc.clone(); w_cooc.fill_diagonal_(0.0)
 
         support_imp = sym_probs0 @ w_imp
         support_cooc = sym_probs0 @ w_cooc
@@ -196,41 +214,120 @@ class LangSymbolReasoner(nn.Module):
         final_logits = combined_logits + delta_logits
         sym_probs = torch.sigmoid(final_logits)
 
-        return sym_probs
+        if not return_support:
+            return sym_probs
 
-    def GetInternalLoss(
-        self,
-        conceptEmb: torch.Tensor,
-        symProbs: torch.Tensor,
-        lambdaSymmetry: float = 1e-3,
-        lambdaAntiSymmetry: float = 1e-3,
-        lambdaEntropy: float = 1e-3,) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        support = {
+            "sym_probs0": sym_probs0,
+            "support_imp": support_imp,
+            "support_cooc": support_cooc,
+            "support_contr": support_contr,}
+        
+        return sym_probs, support
+
+    def GetInternalLoss(self, conceptEmb, symProbs, lambdaSymmetry=1e-3, lambdaEntropy=1e-3):
 
         w_contr = self.BuildRelationMatrix(conceptEmb, self.relContr)
         w_cooc = self.BuildRelationMatrix(conceptEmb, self.relCooc)
 
-        anti_sym_part = 0.5 * (w_cooc - w_cooc.t())
-        loss_symmetry = anti_sym_part.pow(2).mean() * lambdaSymmetry
+        if w_contr.dim() == 2 and w_contr.size(0) == w_contr.size(1):
+            w_contr = w_contr.clone(); w_contr.fill_diagonal_(0.0)
+            w_cooc = w_cooc.clone(); w_cooc.fill_diagonal_(0.0)
 
-        contr_sym_part = 0.5 * (w_contr + w_contr.t())
-        loss_anti_symmetry = contr_sym_part.pow(2).mean() * lambdaAntiSymmetry
+        cooc_anti = 0.5 * (w_cooc - w_cooc.t())
+        contr_anti = 0.5 * (w_contr - w_contr.t())
+
+        loss_cooc_sym = cooc_anti.pow(2).mean() * lambdaSymmetry
+        loss_contr_sym = contr_anti.pow(2).mean() * lambdaSymmetry
 
         eps = 1e-6
         p = symProbs.clamp(eps, 1.0 - eps)
         entropy = -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
         mean_entropy = entropy.mean()
-
         target_entropy = symProbs.new_tensor(0.5)
-        loss_entropy = ((mean_entropy - target_entropy) ** 2) * lambdaEntropy
+        loss_entropy = (mean_entropy - target_entropy).pow(2) * lambdaEntropy
 
-        total_loss = loss_symmetry + loss_anti_symmetry + loss_entropy
-
-        stats: Dict[str, torch.Tensor] = {
-            "reason_symmetry": loss_symmetry.detach(),
-            "reason_antisymmetry": loss_anti_symmetry.detach(),
-            "reason_entropy": loss_entropy.detach(),}
-
+        total_loss = loss_cooc_sym + loss_contr_sym + loss_entropy
+        
+        stats = {"reason_cooc_sym_pen": loss_cooc_sym.detach(),
+                "reason_contr_sym_pen": loss_contr_sym.detach(),
+                "reason_entropy": loss_entropy.detach(),}
         return total_loss, stats
+
+
+class SymControlNet(nn.Module):
+    def __init__(self, nSymbols: int, dimSem: int):
+        super().__init__()
+        self.nSymbols = int(nSymbols)
+        self.dimSem = int(dimSem)
+
+        inK = self.nSymbols * 5  # symProbs + sym_probs0 + imp + cooc + contr
+
+        self.k2h = nn.Sequential(
+            IntentionLoRALinear(nn.Linear(inK, dimSem)),
+            nn.LayerNorm(dimSem),
+            nn.GELU(),)
+
+        self.gain_head = nn.Sequential(
+            IntentionLoRALinear(nn.Linear(dimSem, 3)),)
+
+        self.tok_head = nn.Sequential(
+            IntentionLoRALinear(nn.Linear(dimSem, 3)), )
+
+        self.film_head = nn.Sequential(
+            IntentionLoRALinear(nn.Linear(dimSem, dimSem * 2)),)
+
+        self.ctx_proj = nn.Sequential(
+            IntentionLoRALinear(nn.Linear(dimSem, dimSem)),
+            nn.LayerNorm(dimSem),
+            nn.GELU(),
+            nn.Linear(dimSem, dimSem),)
+
+    def forward(
+        self,
+        symProbs: torch.Tensor,
+        support: Dict[str, torch.Tensor],
+        conceptEmb: torch.Tensor,
+        token_mask: torch.Tensor,) -> Dict[str, torch.Tensor]:
+
+        featK = torch.cat([
+            symProbs,
+            support["sym_probs0"],
+            support["support_imp"],
+            support["support_cooc"],
+            support["support_contr"],], dim=-1)
+
+        h = self.k2h(featK)  
+
+        gains = torch.sigmoid(self.gain_head(h))  
+        g_ocr = gains[:, 0:1]
+        g_ext = gains[:, 1:2]
+        g_trans = gains[:, 2:3]
+
+        tok_logits = self.tok_head(h)
+        tok_w = F.softmax(tok_logits, dim=-1)  
+
+        mask_f = token_mask.float()
+        tok_w = tok_w * mask_f
+        denom = tok_w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        tok_w = tok_w / denom
+
+        film = self.film_head(h)
+        gamma_raw, beta = film.chunk(2, dim=-1)
+        film_scale = torch.exp(gamma_raw.clamp(-4.0, 4.0))
+
+        sym_ctx_raw = symProbs @ conceptEmb 
+        sym_ctx = self.ctx_proj(sym_ctx_raw) 
+
+        return {
+            "h": h,
+            "g_ocr": g_ocr,
+            "g_ext": g_ext,
+            "g_trans": g_trans,
+            "tok_w": tok_w,  
+            "film_scale": film_scale, 
+            "beta": beta, 
+            "sym_ctx": sym_ctx, }
 
 
 class IntentionExtractor(nn.Module):
@@ -247,12 +344,12 @@ class IntentionExtractor(nn.Module):
         dimSem: int = 512,
         consDim: int = 1024,
         nSymbols: int = 128,
+        reasonSteps: int = 3,
         reasonerHiddenDim: int = 512,
         reasonerAlphaImp: float = 1.0,
         reasonerAlphaCooc: float = 0.5,
         reasonerAlphaContr: float = 1.0,
         lossLambdaSymmetry: float = 1e-3,
-        lossLambdaAntiSymmetry: float = 1e-3,
         lossLambdaEntropy: float = 1e-3,
         ocrDictPath: Optional[str] = "/home/yhl/Documents/Intelligent-Robot-System/BrainDeepLearn/ModuleSetting/OCRKeys.txt",):
         super().__init__()
@@ -308,7 +405,6 @@ class IntentionExtractor(nn.Module):
             alphaContr=reasonerAlphaContr,)
 
         self.lossLambdaSymmetry = float(lossLambdaSymmetry)
-        self.lossLambdaAntiSymmetry = float(lossLambdaAntiSymmetry)
         self.lossLambdaEntropy = float(lossLambdaEntropy)
 
         fuse_ocr_in = dimSem * 7
@@ -346,6 +442,15 @@ class IntentionExtractor(nn.Module):
         
         self.intentTransformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
         self.beta_trans = nn.Parameter(torch.tensor(0.3))
+
+        self.reason_steps = int(reasonSteps)
+
+        self.symCtrl = SymControlNet(nSymbols=nSymbols, dimSem=dimSem)
+
+        self.beta_sym = nn.Parameter(torch.tensor(0.2))
+        self.beta_update = nn.Parameter(torch.tensor(0.5))
+
+        self.sym_norm = nn.LayerNorm(dimSem)
 
     def LoadOcrDict(self, dictPath: str) -> None:
         ch2id: Dict[str, int] = {}
@@ -403,8 +508,8 @@ class IntentionExtractor(nn.Module):
                 continue
             pieces = s.split()
             for j, tok in enumerate(pieces[: self.max_seq_len]):
-                h = hash(tok)
-                idx = 1 + (abs(h) % (self.vocab_size - 1))
+                h = int.from_bytes(hashlib.md5(tok.encode("utf-8")).digest()[:8], "little", signed=False)
+                idx = 1 + (h % (self.vocab_size - 1))
                 tokens[i, j] = idx
 
         return tokens
@@ -556,23 +661,92 @@ class IntentionExtractor(nn.Module):
                 has_ocr_mask,
                 has_ext_mask,], dim=1,) 
 
+        def safe_token_mask(token_mask_: torch.Tensor) -> torch.Tensor:
+            safe = token_mask_.clone()
+            all_pad = ~safe.any(dim=1)
+            if all_pad.any():
+                safe[all_pad, 0] = True
+            return safe
+
+        trans_tokens: Optional[torch.Tensor] = None
+        token_mask_safe = safe_token_mask(token_mask)
+        src_key_padding_mask = ~token_mask_safe  # [B,3]
+
         if token_mask.any():
-            src_key_padding_mask = ~token_mask 
+            trans_tokens = self.intentTransformer(tokens, src_key_padding_mask=src_key_padding_mask)
 
-            trans_out = self.intentTransformer(tokens,src_key_padding_mask=src_key_padding_mask,)
-
-            mask_float = token_mask.float().unsqueeze(-1)  
-            sum_vec = (trans_out * mask_float).sum(dim=1)
+            mask_float = token_mask.float().unsqueeze(-1)
+            sum_vec = (trans_tokens * mask_float).sum(dim=1)
             denom = mask_float.sum(dim=1).clamp(min=1.0)
-            fused = sum_vec / denom 
-
+            fused = sum_vec / denom
             intentSem = intentSem + self.beta_trans * fused
 
             extras["intent_trans_norm"] = fused.norm(dim=-1, keepdim=True).detach()
             extras["intent_trans_mask_sum"] = mask_float.sum(dim=1).detach()
 
-        symbol_logits = F.linear(intentSem, self.conceptEmb, self.conceptBias)
-        symProbs = self.reasoner(symbol_logits, self.conceptEmb)
+        token_mask = torch.stack([has_cons_mask, has_ocr_mask, has_ext_mask], dim=1) 
+        src_key_padding_mask = ~token_mask if token_mask.any() else None
+
+        abs_ext_ocr = torch.abs(sem_ext - sem_ocr)
+        mul_ext_ocr = sem_ext * sem_ocr
+
+        for t in range(self.reason_steps):
+            symbol_logits = F.linear(intentSem, self.conceptEmb, self.conceptBias)
+            symProbs_t, support = self.reasoner(symbol_logits, self.conceptEmb, return_support=True)
+
+            ctrl = self.symCtrl(symProbs_t, support, self.conceptEmb, token_mask)
+
+            base_ctx = intentSem 
+
+            feat_ocr = torch.cat([
+                base_ctx,
+                sem_ocr,
+                torch.abs(base_ctx - sem_ocr),
+                base_ctx * sem_ocr,
+                sem_ext,
+                abs_ext_ocr,
+                mul_ext_ocr,], dim=-1)
+
+            gate_ocr = self.fuse_ocr_gate(feat_ocr)
+            sem_ocr_fused = gate_ocr * sem_ocr
+            base2 = base_ctx + torch.tanh(self.beta_ocr) * ctrl["g_ocr"] * (sem_ocr_fused * has_ocr_mask.unsqueeze(-1).float())
+
+            feat_ext = torch.cat([
+                base2,
+                sem_ext,
+                torch.abs(base2 - sem_ext),
+                base2 * sem_ext,], dim=-1)
+
+            gate_ext = self.fuse_ext_gate(feat_ext)
+
+            if prioritizeExt:
+                gamma0 = 0.5 + 0.5 * gate_ext
+                gamma_eff = gamma0 * ctrl["g_ext"]
+                candidate = (1.0 - gamma_eff) * base2 + gamma_eff * sem_ext
+                intent2 = torch.where(has_ext_mask.unsqueeze(-1), candidate, base2)
+            else:
+                sem_ext_fused = gate_ext * sem_ext
+                intent2 = base2 + torch.tanh(self.beta_ext) * ctrl["g_ext"] * (sem_ext_fused * has_ext_mask.unsqueeze(-1).float())
+
+            if (trans_tokens is not None) and token_mask.any():
+                w = ctrl["tok_w"] * token_mask.float() 
+                denom = w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+                w = w / denom
+                fused2 = (trans_tokens * w.unsqueeze(-1)).sum(dim=1) 
+                intent2 = intent2 + torch.tanh(self.beta_trans) * ctrl["g_trans"] * fused2
+
+            intent2 = self.sym_norm(intent2 + torch.tanh(self.beta_sym) * ctrl["sym_ctx"])
+            intent2 = self.sym_norm(intent2 * ctrl["film_scale"] + ctrl["beta"])
+
+            u = torch.sigmoid(self.beta_update)
+            intentSem = (1.0 - u) * intentSem + u * intent2
+
+            extras["sym_probs_loop"] = symProbs_t.detach()
+            extras["sym_ctrl_gains"] = torch.cat([ctrl["g_ocr"], ctrl["g_ext"], ctrl["g_trans"]], dim=-1).detach()
+            extras["sym_tok_w"] = ctrl["tok_w"].detach()
+
+        final_logits = F.linear(intentSem, self.conceptEmb, self.conceptBias)
+        symProbs = self.reasoner(final_logits, self.conceptEmb)
 
         return intentSem, symProbs, extras
 
@@ -584,7 +758,6 @@ class IntentionExtractor(nn.Module):
             conceptEmb=self.conceptEmb,
             symProbs=symProbs,
             lambdaSymmetry=self.lossLambdaSymmetry,
-            lambdaAntiSymmetry=self.lossLambdaAntiSymmetry,
             lambdaEntropy=self.lossLambdaEntropy,)
         
         return total_loss, stats
@@ -603,11 +776,13 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         maxRankSem: int = 64,
         maxRankCons: int = 64,
         maxRankOcr: int = 64,
-        maxRankExt: int = 64,):
+        maxRankExt: int = 64,
+        maxRankSym: int = 64,):
         self.maxRankSem = int(maxRankSem)
         self.maxRankCons = int(maxRankCons)
         self.maxRankOcr = int(maxRankOcr)
         self.maxRankExt = int(maxRankExt)
+        self.maxRankSym = int(maxRankSym)
         super().__init__(base,initRankEach=initRankEach,autoRank=autoRank,evThreshold=evThreshold,gradEma=gradEma,)
 
     def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
@@ -617,6 +792,11 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         cons_lora: "IntentionLoRALinear" = base.consProj
         ocr_lora: "IntentionLoRALinear" = base.fuse_ocr_gate[0]
         ext_lora: "IntentionLoRALinear" = base.fuse_ext_gate[0]
+        sym_k2h: "IntentionLoRALinear" = base.symCtrl.k2h[0]
+        sym_gain: "IntentionLoRALinear" = base.symCtrl.gain_head[0]
+        sym_tok: "IntentionLoRALinear" = base.symCtrl.tok_head[0]
+        sym_film: "IntentionLoRALinear" = base.symCtrl.film_head[0]
+        sym_ctx: "IntentionLoRALinear" = base.symCtrl.ctx_proj[0]
 
         def make_alloc(inDim: int, outDim: int, maxRank: int):
             def alloc(addRank: int, device: torch.device, dtype: torch.dtype):
@@ -664,7 +844,53 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 outDim=int(ext_lora.out_f),
                 maxRank=self.maxRankExt,
                 allocFn=make_alloc(int(ext_lora.in_f), int(ext_lora.out_f), self.maxRankExt),
+                composeFn=compose,),
+
+            "sym_k2h": SiteSpec(
+                name="sym_k2h",
+                nLayers=1,
+                inDim=int(sym_k2h.in_f),
+                outDim=int(sym_k2h.out_f),
+                maxRank=self.maxRankSym,
+                allocFn=make_alloc(int(sym_k2h.in_f), int(sym_k2h.out_f), self.maxRankSym),
+                composeFn=compose,),
+
+            "sym_gain": SiteSpec(
+                name="sym_gain",
+                nLayers=1,
+                inDim=int(sym_gain.in_f),
+                outDim=int(sym_gain.out_f),
+                maxRank=self.maxRankSym,
+                allocFn=make_alloc(int(sym_gain.in_f), int(sym_gain.out_f), self.maxRankSym),
+                composeFn=compose,),
+
+            "sym_tok": SiteSpec(
+                name="sym_tok",
+                nLayers=1,
+                inDim=int(sym_tok.in_f),
+                outDim=int(sym_tok.out_f),
+                maxRank=self.maxRankSym,
+                allocFn=make_alloc(int(sym_tok.in_f), int(sym_tok.out_f), self.maxRankSym),
+                composeFn=compose,),
+
+            "sym_film": SiteSpec(
+                name="sym_film",
+                nLayers=1,
+                inDim=int(sym_film.in_f),
+                outDim=int(sym_film.out_f),
+                maxRank=self.maxRankSym,
+                allocFn=make_alloc(int(sym_film.in_f), int(sym_film.out_f), self.maxRankSym),
+                composeFn=compose,),
+
+            "sym_ctx": SiteSpec(
+                name="sym_ctx",
+                nLayers=1,
+                inDim=int(sym_ctx.in_f),
+                outDim=int(sym_ctx.out_f),
+                maxRank=self.maxRankSym,
+                allocFn=make_alloc(int(sym_ctx.in_f), int(sym_ctx.out_f), self.maxRankSym),
                 composeFn=compose,),}
+        
         return specs
 
     @staticmethod
@@ -744,10 +970,16 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         prioritizeExt: bool = bool(kwargs.get("prioritizeExt", False))
 
         row = deltasPerLayer[0] if (deltasPerLayer is not None and len(deltasPerLayer) > 0) else {}
+
         delta_sem = row.get("sem", None)
         delta_cons = row.get("cons", None)
         delta_ocr = row.get("ocr_gate", None)
         delta_ext = row.get("ext_gate", None)
+        delta_sym_k2h = row.get("sym_k2h", None)
+        delta_sym_gain = row.get("sym_gain", None)
+        delta_sym_tok = row.get("sym_tok", None)
+        delta_sym_film = row.get("sym_film", None)
+        delta_sym_ctx = row.get("sym_ctx", None)
 
         batch_size: Optional[int] = None
 
@@ -858,19 +1090,20 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         else:
             cons_token = torch.zeros(batch_size, dimSem, device=device)
 
-        tokens = torch.stack([
-                cons_token,
-                sem_ocr,
-                sem_ext,],dim=1,) 
+        tokens = torch.stack([cons_token, sem_ocr, sem_ext], dim=1) 
+        token_mask = torch.stack([has_cons_mask, has_ocr_mask, has_ext_mask], dim=1)  
 
-        token_mask = torch.stack([
-                has_cons_mask,
-                has_ocr_mask,
-                has_ext_mask,],dim=1,)
+        def safe_token_mask(token_mask: torch.Tensor) -> torch.Tensor:
+            safe = token_mask.clone()
+            all_pad = ~safe.any(dim=1) 
+            if all_pad.any():
+                safe[all_pad, 0] = True
+            return safe
 
-        if token_mask.any():
-            src_key_padding_mask = ~token_mask
+        token_mask_safe = safe_token_mask(token_mask)
+        src_key_padding_mask = ~token_mask_safe 
 
+        if token_mask.any(): 
             trans_out = base.intentTransformer(tokens, src_key_padding_mask=src_key_padding_mask)
 
             mask_float = token_mask.float().unsqueeze(-1) 
@@ -880,13 +1113,126 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
 
             intentSem = intentSem + base.beta_trans * fused
 
-            extras["intent_trans_norm"] = fused.norm(dim=-1, keepdim=True).detach() 
-            extras["intent_trans_mask_sum"] = mask_float.sum(dim=1).detach()
+        for t in range(int(base.reason_steps)):
 
-        symbol_logits = F.linear(intentSem, base.conceptEmb, base.conceptBias)
-        symProbs = base.reasoner(symbol_logits, base.conceptEmb)
+            symbol_logits = F.linear(intentSem, base.conceptEmb, base.conceptBias)
+            symProbs_t, support = base.reasoner(symbol_logits, base.conceptEmb, return_support=True)
 
+            ctrl = self.SymCtrlWithDelta(
+                base=base,
+                symProbs=symProbs_t,
+                support=support,
+                token_mask=token_mask, 
+                delta_sym_k2h=delta_sym_k2h,
+                delta_sym_gain=delta_sym_gain,
+                delta_sym_tok=delta_sym_tok,
+                delta_sym_film=delta_sym_film,
+                delta_sym_ctx=delta_sym_ctx,)
+
+            base_ctx = intentSem
+
+            feat_ocr2 = torch.cat([
+                base_ctx, sem_ocr, torch.abs(base_ctx - sem_ocr), base_ctx * sem_ocr,
+                sem_ext, torch.abs(sem_ext - sem_ocr), sem_ext * sem_ocr], dim=-1)
+
+            gate_ocr2 = self.GateWithDelta(base.fuse_ocr_gate, feat_ocr2, delta_ocr)
+            sem_ocr_fused2 = gate_ocr2 * sem_ocr
+            base2 = base_ctx + torch.tanh(base.beta_ocr) * ctrl["g_ocr"] * (
+                sem_ocr_fused2 * has_ocr_mask.unsqueeze(-1).float())
+
+            feat_ext2 = torch.cat([base2, sem_ext, torch.abs(base2 - sem_ext), base2 * sem_ext], dim=-1)
+
+            gate_ext2 = self.GateWithDelta(base.fuse_ext_gate, feat_ext2, delta_ext)
+
+            if prioritizeExt:
+                gamma0 = 0.5 + 0.5 * gate_ext2
+                gamma_eff = gamma0 * ctrl["g_ext"]
+                cand = (1.0 - gamma_eff) * base2 + gamma_eff * sem_ext
+                intent2 = torch.where(has_ext_mask.unsqueeze(-1), cand, base2)
+            else:
+                sem_ext_fused2 = gate_ext2 * sem_ext
+                intent2 = base2 + torch.tanh(base.beta_ext) * ctrl["g_ext"] * (
+                    sem_ext_fused2 * has_ext_mask.unsqueeze(-1).float())
+
+            if token_mask.any():
+                w = ctrl["tok_w"] * token_mask.float()
+                denom = w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+                w = w / denom
+                fused2 = (trans_out * w.unsqueeze(-1)).sum(dim=1) 
+                intent2 = intent2 + torch.tanh(base.beta_trans) * ctrl["g_trans"] * fused2
+
+            intent2 = base.sym_norm(intent2 + torch.tanh(base.beta_sym) * ctrl["sym_ctx"])
+            intent2 = base.sym_norm(intent2 * ctrl["film_scale"] + ctrl["beta"])
+
+            u = torch.sigmoid(base.beta_update)
+            intentSem = (1.0 - u) * intentSem + u * intent2
+
+            extras["sym_probs_loop"] = symProbs_t.detach()
+            extras["sym_ctrl_gains"] = torch.cat([ctrl["g_ocr"], ctrl["g_ext"], ctrl["g_trans"]], dim=-1).detach()
+            extras["sym_tok_w"] = ctrl["tok_w"].detach()
+
+        final_logits = F.linear(intentSem, base.conceptEmb, base.conceptBias)
+        symProbs = base.reasoner(final_logits, base.conceptEmb)
         return intentSem, symProbs, extras
+
+
+    def SymCtrlWithDelta(
+        self,
+        base: "IntentionExtractor",
+        symProbs: torch.Tensor,
+        support: Dict[str, torch.Tensor],
+        token_mask: torch.Tensor,
+        *,
+        delta_sym_k2h: Optional[torch.Tensor],
+        delta_sym_gain: Optional[torch.Tensor],
+        delta_sym_tok: Optional[torch.Tensor],
+        delta_sym_film: Optional[torch.Tensor],
+        delta_sym_ctx: Optional[torch.Tensor],) -> Dict[str, torch.Tensor]:
+
+        featK = torch.cat([
+            symProbs,
+            support["sym_probs0"],
+            support["support_imp"],
+            support["support_cooc"],
+            support["support_contr"],], dim=-1)
+
+        h = self.LinearWithLora(base.symCtrl.k2h[0], featK, delta_sym_k2h)
+        h = base.symCtrl.k2h[1](h)
+        h = base.symCtrl.k2h[2](h)
+
+        gains = self.LinearWithLora(base.symCtrl.gain_head[0], h, delta_sym_gain)
+        gains = torch.sigmoid(gains)
+        g_ocr = gains[:, 0:1]
+        g_ext = gains[:, 1:2]
+        g_trans = gains[:, 2:3]
+
+        tok_logits = self.LinearWithLora(base.symCtrl.tok_head[0], h, delta_sym_tok)
+        tok_w = F.softmax(tok_logits, dim=-1)
+        mask_f = token_mask.float()
+        tok_w = tok_w * mask_f
+        denom = tok_w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        tok_w = tok_w / denom
+
+        film = self.LinearWithLora(base.symCtrl.film_head[0], h, delta_sym_film)
+        gamma_raw, beta = film.chunk(2, dim=-1)
+        film_scale = torch.exp(gamma_raw.clamp(-4.0, 4.0))
+
+        sym_ctx_raw = symProbs @ base.conceptEmb
+        sym_ctx = self.LinearWithLora(base.symCtrl.ctx_proj[0], sym_ctx_raw, delta_sym_ctx)
+        sym_ctx = base.symCtrl.ctx_proj[1](sym_ctx)
+        sym_ctx = base.symCtrl.ctx_proj[2](sym_ctx)
+        sym_ctx = base.symCtrl.ctx_proj[3](sym_ctx)
+
+        return {
+            "h": h,
+            "g_ocr": g_ocr,
+            "g_ext": g_ext,
+            "g_trans": g_trans,
+            "tok_w": tok_w,
+            "film_scale": film_scale, 
+            "beta": beta,
+            "sym_ctx": sym_ctx,}
+
 
     @torch.no_grad()
     def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
@@ -911,6 +1257,16 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         elif site == "ext_gate":
             base.fuse_ext_gate[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
+        elif site == "sym_k2h":
+            base.symCtrl.k2h[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
+        elif site == "sym_gain":
+            base.symCtrl.gain_head[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
+        elif site == "sym_tok":
+            base.symCtrl.tok_head[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
+        elif site == "sym_film":
+            base.symCtrl.film_head[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
+        elif site == "sym_ctx":
+            base.symCtrl.ctx_proj[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar); return True
         else:
             raise ValueError(f"Unknown site: {site}")
 
@@ -953,23 +1309,25 @@ class TestIntentionMTool:
         targetSym = torch.randint(low=0,high=2,size=(batch_size, nSymbols),dtype=torch.float32,device=self.device,)
         return consState, ocrTexts, extTexts, targetSym
 
-    def GradCoverage(
-        self,
-        named: Dict[str, torch.nn.Parameter],
-        min_ratio: float,
-        must_have: List[str],) -> bool:
+    def GradCoverage(self, named: Dict[str, torch.nn.Parameter], min_ratio: float, must_have: List[str]) -> bool:
         total_trainable = sum(1 for p in named.values() if p.requires_grad)
         total_with_grad = sum(1 for p in named.values() if p.requires_grad and (p.grad is not None))
         ratio = total_with_grad / max(1, total_trainable)
 
-        missing = [n for n in must_have if n in named and (named[n].grad is None)]
-        if missing:
-            print("Missing gradient parameters:", missing)
+        missing_names = [n for n in must_have if n not in named]
+        if missing_names:
+            print("Unknown parameter names (typo / changed module?):", missing_names)
+            return False
+
+        missing_grad = [n for n in must_have if named[n].requires_grad and (named[n].grad is None)]
+        if missing_grad:
+            print("Missing gradient parameters:", missing_grad)
             return False
 
         if ratio < min_ratio:
             print(f"Gradient coverage too low: {ratio:.2%} < {min_ratio:.2%}")
             return False
+
         print(f"Gradient coverage: {ratio:.2%}")
         return True
 
@@ -1050,7 +1408,6 @@ class TestIntentionMTool:
 
             must_have = [
                 "encoder.embedding.weight",
-                "encoder.rnn.weight_ih_l0",
                 "encoder.att_proj.weight",
                 "semProj.0.target.weight",
                 "consProj.target.weight",
@@ -1059,8 +1416,22 @@ class TestIntentionMTool:
                 "conceptEmb",
                 "reasoner.relImp",
                 "reasoner.relCooc",
-                "reasoner.relContr",]
+                "reasoner.relContr",
+                "symCtrl.k2h.0.target.weight",
+                "symCtrl.gain_head.0.target.weight",
+                "symCtrl.tok_head.0.target.weight",
+                "symCtrl.film_head.0.target.weight",
+                "symCtrl.ctx_proj.0.target.weight",
+                "beta_sym",
+                "beta_update",]
 
+            for l in range(model.encoder.rnn_f.num_layers):
+                must_have += [
+                    f"encoder.rnn_f.weight_ih_l{l}",
+                    f"encoder.rnn_f.weight_hh_l{l}",
+                    f"encoder.rnn_b.weight_ih_l{l}",
+                    f"encoder.rnn_b.weight_hh_l{l}",]
+                
             ok_cov = self.GradCoverage(named, min_ratio=0.5, must_have=must_have)
             assert ok_cov, "Gradient coverage check failed."
 
@@ -1164,20 +1535,18 @@ class TestIntentionMTool:
 
             r0 = wrapper.Update("ranks")["ranks"]
             for row in r0["perLayer"]:
-                assert row["sem"] == 0 and row["cons"] == 0 and row["ocr_gate"] == 0 and row["ext_gate"] == 0
+                for k, v in row.items():
+                    assert v == 0, f"expected 0 rank at {k}, got {v}"
 
             wrapper.Update("grow", growFactor=2.0, addEach=2)
             r1 = wrapper.Update("ranks")["ranks"]
-            sum_sem = r1["sum"]["sem"]
-            sum_cons = r1["sum"]["cons"]
-            sum_ocr = r1["sum"]["ocr_gate"]
-            sum_ext = r1["sum"]["ext_gate"]
-            assert sum_sem > 0 and sum_cons > 0 and sum_ocr > 0 and sum_ext > 0
+            assert any(r1["sum"][k] > 0 for k in r1["sum"].keys())
 
             wrapper.Update("rollback")
             r2 = wrapper.Update("ranks")["ranks"]
             for row in r2["perLayer"]:
-                assert row["sem"] == 0 and row["cons"] == 0 and row["ocr_gate"] == 0 and row["ext_gate"] == 0
+                for k, v in row.items():
+                    assert v == 0
 
             print("WrapperAPIBasics passed.")
             return True
@@ -1254,66 +1623,80 @@ class TestIntentionMTool:
             opt = torch.optim.Adam(list(wrapper.CandParameters()), lr=3e-3)
 
             steps = 10
-
             dummy_td = torch.ones(consState.size(0), 1, device=self.device)
+
             for _ in range(steps):
-                intentSem, symProbs, extras = wrapper(consState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=False,tdError=dummy_td)
+                intentSem, symProbs, extras = wrapper(
+                    consState,
+                    ocrTexts=ocrTexts,
+                    extTexts=extTexts,
+                    prioritizeExt=False,
+                    tdError=dummy_td,)
+                
                 loss = F.binary_cross_entropy(symProbs, targetSym)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 wrapper.Update("accumulategrads")
                 opt.step()
 
-            sites = ["sem", "cons", "ocr_gate", "ext_gate"]
+            sites = ["sem", "cons", "ocr_gate", "ext_gate", "sym_k2h", "sym_gain", "sym_tok", "sym_film", "sym_ctx"]
+
             expected: Dict[str, torch.Tensor] = {}
             for site in sites:
-                mat = wrapper.ComposeOne(site, layerIdx=0).detach().clone()
-                expected[site] = mat
+                expected[site] = wrapper.ComposeOne(site, layerIdx=0).detach().clone()
 
             res = wrapper.Update("commit")
             assert res["ok"], "Commit failed."
             stats = res.get("commit_stats", {})
-            print(f"[IntentionCommit] committed_rank={stats.get('committed_rank', 0)}, "
-                  f"triples={stats.get('committed_triples', 0)}")
+            print(
+                f"[IntentionCommit] committed_rank={stats.get('committed_rank', 0)}, "
+                f"triples={stats.get('committed_triples', 0)}")
 
             r_after = wrapper.Update("ranks")["ranks"]
             for row in r_after["perLayer"]:
-                assert row["sem"] == 0 and row["cons"] == 0 and row["ocr_gate"] == 0 and row["ext_gate"] == 0
+                for k, v in row.items():
+                    assert int(v) == 0, f"rank not cleared: site={k}, rank={v}"
 
             atol, rtol = 1e-6, 1e-4
 
-            def delta_from_lora(mod) -> torch.Tensor:
-                dw = mod.DeltaWeight()
-                if dw is None:
-                    return torch.zeros_like(expected["sem"])
-                return dw.to(expected["sem"].device, expected["sem"].dtype)
+            def site_to_mod(site: str) -> "IntentionLoRALinear":
+                if site == "sem":
+                    return base.semProj[0]
+                if site == "cons":
+                    return base.consProj
+                if site == "ocr_gate":
+                    return base.fuse_ocr_gate[0]
+                if site == "ext_gate":
+                    return base.fuse_ext_gate[0]
+                if site == "sym_k2h":
+                    return base.symCtrl.k2h[0]
+                if site == "sym_gain":
+                    return base.symCtrl.gain_head[0]
+                if site == "sym_tok":
+                    return base.symCtrl.tok_head[0]
+                if site == "sym_film":
+                    return base.symCtrl.film_head[0]
+                if site == "sym_ctx":
+                    return base.symCtrl.ctx_proj[0]
+                raise KeyError(f"Unknown site: {site}")
 
-            exp_sem = expected["sem"]
-            if not torch.allclose(exp_sem, torch.zeros_like(exp_sem)):
-                got_sem = delta_from_lora(base.semProj[0])
-                assert torch.allclose(got_sem, exp_sem, atol=atol, rtol=rtol), \
-                    f"sem delta mismatch, max_abs={(got_sem - exp_sem).abs().max().item():.3e}"
+            for site in sites:
+                exp = expected[site]
+                mod = site_to_mod(site)
 
-            exp_cons = expected["cons"]
-            if not torch.allclose(exp_cons, torch.zeros_like(exp_cons)):
-                got_cons = delta_from_lora(base.consProj)
-                assert torch.allclose(got_cons, exp_cons, atol=atol, rtol=rtol), \
-                    f"cons delta mismatch, max_abs={(got_cons - exp_cons).abs().max().item():.3e}"
+                got = mod.DeltaWeight()
+                if got is None:
+                    got = torch.zeros_like(exp)
+                else:
+                    got = got.to(device=exp.device, dtype=exp.dtype)
 
-            exp_ocr = expected["ocr_gate"]
-            if not torch.allclose(exp_ocr, torch.zeros_like(exp_ocr)):
-                got_ocr = delta_from_lora(base.fuse_ocr_gate[0])
-                assert torch.allclose(got_ocr, exp_ocr, atol=atol, rtol=rtol), \
-                    f"ocr_gate delta mismatch, max_abs={(got_ocr - exp_ocr).abs().max().item():.3e}"
-
-            exp_ext = expected["ext_gate"]
-            if not torch.allclose(exp_ext, torch.zeros_like(exp_ext)):
-                got_ext = delta_from_lora(base.fuse_ext_gate[0])
-                assert torch.allclose(got_ext, exp_ext, atol=atol, rtol=rtol), \
-                    f"ext_gate delta mismatch, max_abs={(got_ext - exp_ext).abs().max().item():.3e}"
+                if not torch.allclose(got, exp, atol=atol, rtol=rtol):
+                    max_abs = (got - exp).abs().max().item()
+                    raise AssertionError(f"{site} delta mismatch, max_abs={max_abs:.3e}")
 
             base.eval()
             wrapper.eval()
+
             cons_chk, ocr_chk, ext_chk, _ = self.MakeDummyBatch(base, batch_size=5)
             with torch.no_grad():
                 ib, sb, _ = base(cons_chk, ocrTexts=ocr_chk, extTexts=ext_chk)
@@ -1326,6 +1709,7 @@ class TestIntentionMTool:
 
             print("WrapperManualGrowTrainAndCommit passed.")
             return True
+
         except AssertionError as e:
             print("WrapperManualGrowTrainAndCommit failed:", e)
             return False

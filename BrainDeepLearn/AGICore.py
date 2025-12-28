@@ -144,7 +144,7 @@ class BrainCore(nn.Module):
 
         self.intention = IntentionExtractor(
             dimSem=ModuleDim.IntentionFeat,
-            consState=ModuleDim.ConsciousnessState)
+            consDim=ModuleDim.ConsciousnessState)
 
         self.OCR = OCREngineExtractor()
 
@@ -237,6 +237,10 @@ class BrainCore(nn.Module):
         if self.is_online_learning and not isTrain:
             raise RuntimeError(f"Wrappers can only be used during training, but isTrain is {isTrain}, isUseWrappers is {self.is_online_learning}")
 
+        B, dev = frame.size[0], frame.device
+        if (self.buf_B != B) or (self.prev_mem.device != dev):
+            self.ResetBuffers(B=B, isOnlineLearning=self.is_online_learning, device=dev)
+        
         if self.extra_mem and self.thread_end:
             self.mem.MergeMemoryState(self.extra_mem)
             self.extra_mem =None
@@ -827,85 +831,39 @@ class Agent:
         self.brain.mem.ResetHebbianMemory()
         self.brain.conscious.ResetHebbianMemory()
 
-    def StackNpImagesKeysMouses(
+    def ConvertNpImagesKeysMouses(
         self,
-        imgs: List[np.ndarray],
-        keys: Optional[List[Union[np.ndarray, torch.Tensor, float, int]]] = None,
-        mouse: Optional[List[Union[np.ndarray, torch.Tensor, float, int]]] = None,
-        reward: Optional[List[Union[np.ndarray, torch.Tensor, float, int]]] = None,
-        done: Optional[List[Union[np.ndarray, torch.Tensor, float, int]]] = None,
+        imgs: np.ndarray,
+        keys: np.ndarray,
+        mouse: np.ndarray,
+        reward: np.ndarray,
+        done: np.ndarray,
         *,
-        B: int,
-        T: int,
         size: Optional[Tuple[int, int]] = (BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE),
         device: Optional[torch.device] = None,) -> Dict[str, List]:
-        assert len(imgs) == B * T, f"got {len(imgs)} images, but B*T = {B*T}"
 
-        img_tensors: List[torch.Tensor] = []
-        for i, im in enumerate(imgs):
-            if not isinstance(im, np.ndarray):
-                raise TypeError(f"image {i} is {type(im)}, expected np.ndarray")
-            if im.ndim != 3 or im.shape[2] != 3:
-                raise ValueError(f"image {i} has shape {im.shape}, expected [H,W,3]")
-            t = torch.from_numpy(im).permute(2, 0, 1).contiguous().float() / 255.0  # [3,H,W]
-            img_tensors.append(t)
+        if imgs is not None:
+            img_tensor = torch.from_numpy(imgs).permute(0, 3, 1, 2).contiguous().float() / 255.0  # [B,3,H,W]
+            if size is not None:
+                out_h, out_w = size
+                img_tensor = F.interpolate(img_tensor,size=(out_h, out_w),mode="bilinear",align_corners=False,antialias=True,)
+            if device is not None: img_tensor = img_tensor.to(device)
+        else: img_tensor = None
 
-        x = torch.stack(img_tensors, dim=0)  # [B*T, 3, H, W]
+        def convert_tensor(x):
+            if x is not None:
+                x_tensor = torch.from_numpy(x).float()
+                if device is not None:
+                    x_tensor = x_tensor.to(device)
+            else: x_tensor = None
+            return x_tensor
 
-        if size is not None:
-            out_h, out_w = size
-            x = F.interpolate(x,size=(out_h, out_w),mode="bilinear",align_corners=False,antialias=True,)
+        key_tensor = convert_tensor(keys)
+        mouse_tensor = convert_tensor(mouse)
+        reward_tensor = convert_tensor(reward)
+        done_tensor = convert_tensor(done)
 
-        BxT, C, H, W = x.shape
-        x = x.view(B, T, C, H, W)
-
-
-        def PickLastFromSeq(
-            seq: List[Union[np.ndarray, torch.Tensor, float, int]],
-            *,
-            B: int,
-            T: int,
-            clamp_min: Optional[float] = None,
-            clamp_max: Optional[float] = None,
-            squeeze_scalar: bool = False, ) -> torch.Tensor:
-            assert len(seq) == B * T, f"got {len(seq)} items, but need B*T={B*T}"
-            picked = []
-            for b in range(B):
-                idx = b * T + (T - 1)
-                v = seq[idx]
-                if isinstance(v, np.ndarray):
-                    vt = torch.from_numpy(v).float()
-                elif isinstance(v, torch.Tensor):
-                    vt = v.float()
-                else:
-                    vt = torch.tensor(float(v), dtype=torch.float32)
-
-                if squeeze_scalar:
-                    vt = vt.view(-1)[0]  
-                picked.append(vt)
-
-            out = torch.stack(picked, dim=0) 
-            if (clamp_min is not None) or (clamp_max is not None):
-                out = torch.clamp(out,clamp_min if clamp_min is not None else -float("inf"), clamp_max if clamp_max is not None else float("inf"))
-            return out
-
-        key_tensor = PickLastFromSeq(keys, B=B, T=T) if keys  is not None else None
-        mouse_tensor = PickLastFromSeq(mouse, B=B, T=T) if mouse is not None else None
-        reward_tensor = PickLastFromSeq(reward, B=B, T=T, clamp_min=-10.0, clamp_max=10.0, squeeze_scalar=True) if reward is not None else None
-        done_tensor = PickLastFromSeq(done, B=B, T=T, clamp_min=0.0, clamp_max=1.0, squeeze_scalar=True) if done is not None else None
-
-        if device is not None:
-            x = x.to(device)
-            if key_tensor is not None:
-                key_tensor = key_tensor.to(device)
-            if mouse_tensor is not None:
-                mouse_tensor = mouse_tensor.to(device)
-            if reward_tensor is not None:
-                reward_tensor = reward_tensor.to(device)
-            if done_tensor is not None:
-                done_tensor = done_tensor.to(device)
-
-        return {"frames": x, "keys": key_tensor, "mouses": mouse_tensor, "rewards": reward_tensor, "dones": done_tensor,}
+        return {"frames": img_tensor, "keys": key_tensor, "mouses": mouse_tensor, "rewards": reward_tensor, "dones": done_tensor,}
 
 
     def UpdateWrappers(self, wrappers, action: str, **kwargs):
