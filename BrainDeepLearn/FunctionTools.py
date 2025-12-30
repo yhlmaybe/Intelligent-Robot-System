@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 
-def GetParameterSScale(like: Optional[torch.Tensor] = None):
+def GetParametersScale(like: Optional[torch.Tensor] = None):
     val = 1e-1
     if like is None:
         return val
@@ -160,7 +160,7 @@ class BaseOnlineWrapper(nn.Module):
             return {"ok": True, "ranks": self.CurrentRanks()}
 
         elif act == "ranks":
-            return {"ranks": self.CurrentRanks()}
+            return {"ok": True, "ranks": self.CurrentRanks()}
 
         elif act == "accumulategrads":
             self.AccumulateGrads()
@@ -214,6 +214,7 @@ class BaseOnlineWrapper(nn.Module):
 
     def InitCandidates(self, initRankEach: int):
         self.cand = {} 
+        self.gradEmaBuf = None
 
         for name in self.sites:  
             layer_slots = [] 
@@ -223,7 +224,7 @@ class BaseOnlineWrapper(nn.Module):
                 layer_slots.append(slot)
 
             self.cand[name] = layer_slots
-            
+
         if initRankEach > 0:
             for name, spec in self.sites.items():
                 for layerIdx in range(spec.nLayers):
@@ -235,15 +236,22 @@ class BaseOnlineWrapper(nn.Module):
     def CurrentRanks(self):
         eps = 1e-12
         out = {"perLayer": []}
+
         for layerIdx in range(self.layerCount):
             row = {}
-            for name in self.sites:
-                r = 0
-                for aParam, sParam in zip(self.cand[name][layerIdx]["A"], self.cand[name][layerIdx]["s"]):
-                    sVal = float(torch.tanh(sParam.detach()).item()) * 1e-1
-                    if abs(sVal) > eps: r += int(aParam.size(0))
+            for name, spec in self.sites.items():
+                r = 0  
+                slotA = self.cand[name][layerIdx]["A"]
+                slotS = self.cand[name][layerIdx]["s"]
+
+                for aParam, sParam in zip(slotA, slotS):
+                    sEff = float(torch.tanh(sParam.detach()).item()) * float(GetParametersScale(sParam))
+                    if abs(sEff) > eps:
+                        r += int(aParam.size(0))
+
                 row[name] = r
             out["perLayer"].append(row)
+
         out["sum"] = {name: sum(row[name] for row in out["perLayer"]) for name in self.sites}
         return out
 
@@ -324,7 +332,7 @@ class BaseOnlineWrapper(nn.Module):
             for gA, gB, aParam, bParam, sParam in zip(gradAList, gradBList, aList, bList, sList):
                 if gA is None and gB is None:
                     continue
-                sEff = float(torch.tanh(sParam.detach()).item()) * 1e-1
+                sEff = float(torch.tanh(sParam.detach()).item()) * float(GetParametersScale(sParam))
                 sEff = sEff if abs(sEff) > 1e-12 else 1.0
                 parts = []
                 if gA is not None:
@@ -375,22 +383,25 @@ class BaseOnlineWrapper(nn.Module):
                                 sParam.data.zero_()
                     else:
                         s_set = torch.tensor(1.0, device=self.deviceRef, dtype=self.dtypeRef)
-                        c = torch.tanh(s_set) * 1e-1
-                        sqrtS = torch.sqrt(S[:r] / c).unsqueeze(0) 
-                        bNew = (U[:, :r] * sqrtS).contiguous()
-                        aNew = (sqrtS.t() @ Vh[:r, :]).contiguous()
-                        self.cand[name][layerIdx]["A"].clear()
-                        self.cand[name][layerIdx]["B"].clear()
-                        self.cand[name][layerIdx]["s"].clear()
-                        self.cand[name][layerIdx]["A"].append(nn.Parameter(aNew))
-                        self.cand[name][layerIdx]["B"].append(nn.Parameter(bNew))
-                        self.cand[name][layerIdx]["s"].append(nn.Parameter(s_set))
+                        c = torch.tanh(s_set) * float(GetParametersScale(s_set))
+                        sqrtS = torch.sqrt(S[:r] / c)
+                        bNew = (U[:, :r] * sqrtS.unsqueeze(0)).contiguous() 
+                        aNew = (Vh[:r, :] * sqrtS.unsqueeze(1)).contiguous() 
+                        slot = self.cand[name][layerIdx]
+                        slot["A"] = nn.ParameterList([nn.Parameter(aNew)])
+                        slot["B"] = nn.ParameterList([nn.Parameter(bNew)])
+                        slot["s"] = nn.ParameterList([nn.Parameter(s_set)])
+                        if self.gradEmaBuf is not None:
+                            self.gradEmaBuf[name][layerIdx]["A"] = []
+                            self.gradEmaBuf[name][layerIdx]["B"] = []
 
     def ComposeOne(self, site: str, layerIdx: int) -> torch.Tensor:
         spec = self.sites[site]
-        if len(self.cand[site][layerIdx]["A"]) == 0:
-            return torch.zeros(spec.outDim, spec.inDim, device=self.deviceRef, dtype=self.dtypeRef)
         delta = torch.zeros(spec.outDim, spec.inDim, device=self.deviceRef, dtype=self.dtypeRef)
+
+        if len(self.cand[site][layerIdx]["A"]) == 0:
+            return delta
+            
         for aParam, bParam, sParam in zip(
             self.cand[site][layerIdx]["A"],
             self.cand[site][layerIdx]["B"],
@@ -401,6 +412,9 @@ class BaseOnlineWrapper(nn.Module):
     def ComposeLayerDelta(self, layerIdx: int) -> Dict[str, Optional[torch.Tensor]]:
         out = {}
         for name, spec in self.sites.items():
+            if layerIdx >= spec.nLayers:
+                out[name] = None
+                continue
             slot = self.cand[name][layerIdx]
             if len(slot["A"]) == 0:
                 out[name] = None
