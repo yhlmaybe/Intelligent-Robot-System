@@ -2,11 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from typing import Dict, List, Optional, Iterable, Tuple, Any
-from FunctionTools import GetParameterSScale, SiteSpec, BaseOnlineWrapper
-
-
-
+from typing import Dict, List, Optional, Iterable, Tuple, Union
+from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule
 
 
 def ProjectFroNorm(tensor: torch.Tensor, maxNorm: Optional[float]):
@@ -31,6 +28,17 @@ def Norm2d(C: int, groups: int = 32, desiredCpg: int = 16, mincpg: int = 8) -> n
     return nn.GroupNorm(num_groups=g, num_channels=C, affine=True)
 
 
+def FrobeniusCapPerSample(mem: torch.Tensor, cap: Optional[float]):
+    if cap is None:
+        return
+    with torch.no_grad():
+        B = mem.size(0)
+        flat = mem.reshape(B, -1)
+        n = torch.linalg.vector_norm(flat, ord=2, dim=1)
+        scale = (cap / (n + 1e-12)).clamp(max=1.0) 
+        mem.mul_(scale.view(B, *([1] * (mem.dim() - 1))))
+
+
 class GrowableLoRAConv2d(nn.Module):
     def __init__(self, targetConv: nn.Conv2d):
         super().__init__()
@@ -47,16 +55,15 @@ class GrowableLoRAConv2d(nn.Module):
         ksz = self.kh * self.kw
         if init is None: init = {}
 
-        dev = self.target.weight.device
-        dt = self.target.weight.dtype
+        factory = {"device": self.target.weight.device, "dtype": self.target.weight.dtype}
 
-        A = init.get("A", torch.randn(addRank, self.cin * ksz, device=dev, dtype=dt) * 1e-4)
-        B = init.get("B", torch.randn(self.cout, addRank, device=dev, dtype=dt) * 1e-4)
+        A = init.get("A", torch.randn(addRank, self.cin * ksz, **factory) * 1e-4)
+        B = init.get("B", torch.randn(self.cout, addRank, **factory) * 1e-4)
         s = init.get("scale", 1e-3)
 
-        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
-        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
-        s = nn.Parameter(torch.as_tensor(s, device=A.device, dtype=A.dtype))
+        A = nn.Parameter(A.contiguous().to(**factory))
+        B = nn.Parameter(B.contiguous().to(**factory))
+        s = nn.Parameter(torch.as_tensor(s, **factory))
 
         if freezeOld:
             for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
@@ -72,7 +79,7 @@ class GrowableLoRAConv2d(nn.Module):
         ksz = self.kh * self.kw
         delta = self.target.weight.new_zeros(self.cout, self.cin * ksz)
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-            delta = delta + torch.tanh(s) * GetParameterSScale(s) * (B @ A)
+            delta = delta + torch.tanh(s) * GetParametersScale(s) * (B @ A)
         return delta.view(self.cout, self.cin, self.kh, self.kw)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -84,10 +91,11 @@ class GrowableLoRAConv2d(nn.Module):
         delta = self.DeltaWeight()
         if delta is not None:
             w = w + delta
-        return F.conv2d(x, w, self.target.bias, stride=self.target.stride, padding=self.target.padding, dilation=self.target.dilation, groups=self.target.groups)
+        return F.conv2d(x, w, self.target.bias, stride=self.target.stride,
+                        padding=self.target.padding, dilation=self.target.dilation, groups=self.target.groups)
 
 
-class GrowableConv1x1Adapter(nn.Module):
+class GrowableConv1x1Adapter(AGICoreModule):
     def __init__(self, channels: int):
         super().__init__()
         self.C = channels
@@ -95,19 +103,18 @@ class GrowableConv1x1Adapter(nn.Module):
         self.B_list = nn.ParameterList() 
         self.alpha = nn.ParameterList()
 
-        self.register_buffer("_anchor", torch.empty(0))
-
     @torch.no_grad()
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
         if init is None: init = {}
-        A = init.get("A", torch.randn(addRank, self.C, 1, 1) * 1e-4)
-        B = init.get("B", torch.randn(self.C, addRank, 1, 1) * 1e-4)
+        factory = {"device": self.device, "dtype": self.dtype}
+
+        A = init.get("A", torch.randn(addRank, self.C, 1, 1, **factory) * 1e-4)
+        B = init.get("B", torch.randn(self.C, addRank, 1, 1, **factory) * 1e-4)
         s = init.get("scale", 1e-3)
 
-        dev, dt = self._anchor.device, self._anchor.dtype
-        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
-        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
-        s = nn.Parameter(torch.as_tensor(s, device=dev, dtype=dt))
+        A = nn.Parameter(A.contiguous().to(**factory))
+        B = nn.Parameter(B.contiguous().to(**factory))
+        s = nn.Parameter(torch.as_tensor(s, **factory))
 
         if freezeOld:
             for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
@@ -124,11 +131,11 @@ class GrowableConv1x1Adapter(nn.Module):
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
             z = F.conv2d(x, A, bias=None, stride=1, padding=0)
             z = F.conv2d(z, B, bias=None, stride=1, padding=0)
-            y = y + torch.tanh(s) * GetParameterSScale(s) * z
+            y = y + torch.tanh(s) * GetParametersScale(s) * z
         return y
 
 
-class GrowableTokenAdapter(nn.Module):
+class GrowableTokenAdapter(AGICoreModule):
     def __init__(self, dim: int):
         super().__init__()
         self.D = dim
@@ -136,20 +143,18 @@ class GrowableTokenAdapter(nn.Module):
         self.B_list = nn.ParameterList()
         self.alpha = nn.ParameterList()
 
-        self.register_buffer("_anchor", torch.empty(0))
-
     @torch.no_grad()
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
         if init is None: init = {}
+        factory = {"device": self.device, "dtype": self.dtype}
         
-        A = init.get("A", torch.randn(addRank, self.D) * 1e-4)
-        B = init.get("B", torch.randn(self.D, addRank) * 1e-4)
+        A = init.get("A", torch.randn(addRank, self.D, **factory) * 1e-4)
+        B = init.get("B", torch.randn(self.D, addRank, **factory) * 1e-4)
         s = init.get("scale", 1e-3)
 
-        dev, dt = self._anchor.device, self._anchor.dtype
-        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
-        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
-        s = nn.Parameter(torch.as_tensor(s, device=dev, dtype=dt))
+        A = nn.Parameter(A.contiguous().to(**factory))
+        B = nn.Parameter(B.contiguous().to(**factory))
+        s = nn.Parameter(torch.as_tensor(s, **factory))
 
         if freezeOld:
             for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
@@ -166,7 +171,7 @@ class GrowableTokenAdapter(nn.Module):
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
             z = torch.matmul(x, A.t())
             z = torch.matmul(z, B.t())
-            y = y + torch.tanh(s) * GetParameterSScale(s) * z
+            y = y + torch.tanh(s) * GetParametersScale(s) * z
         return y
 
 class SheafGaugeConv2d(nn.Conv2d):
@@ -211,8 +216,7 @@ class SheafGaugeConv2d(nn.Conv2d):
         self.gauge_scale = float(gauge_scale)
         self.gauge_bias_scale = float(gauge_bias_scale)
 
-    @staticmethod
-    def Shift(x: torch.Tensor, dim: int, step: int) -> torch.Tensor:
+    def Shift(self, x: torch.Tensor, dim: int, step: int) -> torch.Tensor:
         if step == 0:
             return x
         y = torch.roll(x, shifts=step, dims=dim)
@@ -252,7 +256,7 @@ class SheafGaugeConv2d(nn.Conv2d):
         x_norm = (x - mean) / (var + self.eps).sqrt()
 
         gamma = torch.tanh(self.gauge_gamma(x_norm)) * self.gauge_scale
-        beta  = torch.tanh(self.gauge_beta(x_norm))  * self.gauge_bias_scale
+        beta = torch.tanh(self.gauge_beta(x_norm)) * self.gauge_bias_scale
         return (1.0 + gamma) * x + beta
 
     def Preprocess(self, x: torch.Tensor) -> torch.Tensor:
@@ -278,61 +282,122 @@ class HebbianConv2d(nn.Module):
         self,
         inChannels: int,
         outChannels: int,
-        kernelSize: int,
+        kernelSize: Union[int, Tuple[int, int]],
         stride: int = 1,
         padding: int = 0,
+        dilation: int = 1,
+        groups: int = 1,
         hebbRate: float = 1e-3,
         emaMomentum: float = 0.995,
         applyScale: float = 0.25,
         memNormCap: Optional[float] = 1.0,
         bias: bool = False,
-        useHebbian: bool = False,):
+        useHebbian: bool = True,):
         super().__init__()
+        self.kernel_size = kernelSize if isinstance(kernelSize, tuple) else (kernelSize, kernelSize)
+        self.stride = int(stride)
+        self.padding = int(padding)
+        self.dilation = int(dilation)
+        self.groups = int(groups)
 
-        self.conv = nn.Conv2d(inChannels, outChannels, kernel_size=kernelSize, stride=stride, padding=padding, bias=bias)
+        self.conv = nn.Conv2d(
+            inChannels, outChannels,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+            bias=bias,)
+
         self.hebb_rate = float(hebbRate)
         self.ema_alpha = float(emaMomentum)
         self.apply_scale = float(applyScale)
         self.mem_norm_cap = memNormCap
-        self.enable_hebbian_updates = useHebbian
-        self.register_buffer("hebb_memory", torch.zeros_like(self.conv.weight))
+        self.use_hebbian = bool(useHebbian)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.enable_hebbian_updates:
-            weight_eff = self.conv.weight + self.apply_scale * self.hebb_memory.detach()
-        else:
-            weight_eff = self.conv.weight
-
-        out = F.conv2d(
-            x, weight_eff, self.conv.bias,
-            stride=self.conv.stride, padding=self.conv.padding,
-            dilation=self.conv.dilation, groups=self.conv.groups)
-
-        if self.enable_hebbian_updates:
-            with torch.no_grad():
-                kH, kW = self.conv.kernel_size
-
-                x_unfold = F.unfold(x, kernel_size=(kH, kW), padding=self.conv.padding, stride=self.conv.stride)  # [B, Cin*kH*kW, L]
-
-                out_unfold = out.view(out.size(0), out.size(1), -1)  # [B, Cout, L]
-
-                # Hebb: y x^T；Decay: <y^2> * W
-                hebb_term = torch.einsum('bik,bjk->ij', out_unfold, x_unfold)  # [Cout, Cin*kH*kW]
-                weight_flat = self.conv.weight.view(self.conv.weight.size(0), -1)
-
-                y2_sum = out_unfold.square().sum(dim=[0, 2])
-                decay_term = y2_sum.unsqueeze(1) * weight_flat
-
-                delta_w = self.hebb_rate * (hebb_term - decay_term)
-                delta_w = delta_w.view_as(self.hebb_memory)
-
-                self.hebb_memory.mul_(self.ema_alpha).add_(delta_w, alpha=(1.0 - self.ema_alpha))
-                ProjectFroNorm(self.hebb_memory, self.mem_norm_cap)
-        return out
+        self.register_buffer("hebb_memory", torch.empty(0), persistent=True)
 
     def ResetHebbianMemory(self):
         with torch.no_grad():
-            self.hebb_memory.zero_()
+            self.hebb_memory = torch.empty(0, device=self.conv.weight.device, dtype=self.conv.weight.dtype)
+
+    def EnsureB(self, B: int, device, dtype):
+        w = self.conv.weight
+        target_shape = (B, w.size(0), w.size(1), w.size(2), w.size(3)) 
+        if (self.hebb_memory.numel() == 0) or (self.hebb_memory.shape != target_shape) \
+           or (self.hebb_memory.device != device) or (self.hebb_memory.dtype != dtype):
+            self.hebb_memory = torch.zeros(*target_shape, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, inC, H, W = x.shape
+        w = self.conv.weight
+        outC = w.size(0)
+        g = self.groups
+        in_per_g = inC // g
+
+        if self.use_hebbian:
+            self.EnsureB(B, x.device, w.dtype)
+            w_eff = w.unsqueeze(0) + self.apply_scale * self.hebb_memory.detach()
+        else:
+            w_eff = w.unsqueeze(0).expand(B, -1, -1, -1, -1)
+
+        x_big = x.reshape(1, B * inC, H, W)
+
+        w_big = w_eff.reshape(B * outC, w.size(1), w.size(2), w.size(3))
+
+        groups_total = B * g
+
+        if self.conv.bias is None:
+            b_big = None
+        else:
+            b_big = self.conv.bias.repeat(B)
+
+        out_big = F.conv2d(
+            x_big, w_big, b_big,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=groups_total,)
+        
+        Hout, Wout = out_big.shape[-2], out_big.shape[-1]
+        out = out_big.reshape(B, outC, Hout, Wout)
+
+        if self.use_hebbian:
+            with torch.no_grad():
+                x_unfold = F.unfold(
+                    x.detach(),
+                    kernel_size=self.kernel_size,
+                    padding=self.padding,
+                    stride=self.stride,
+                    dilation=self.dilation,)
+
+                out_unfold = out.detach().reshape(B, outC, -1)
+                L = out_unfold.size(-1)
+                N = float(L) if L > 0 else 1.0 
+
+                x_unfold_g = x_unfold.reshape(B, g, in_per_g * (self.kernel_size[0] * self.kernel_size[1]), L)
+                out_unfold_g = out_unfold.reshape(B, g, outC // g, L)
+
+                xu = x_unfold_g.float()
+                yu = out_unfold_g.float()
+
+                hebb_term = torch.einsum("bgol,bgil->bgoi", yu, xu) / N
+
+                y2_mean = yu.square().sum(dim=-1) / N
+
+                mem = self.hebb_memory.reshape(B, g, outC // g, -1).float()
+                decay = y2_mean.unsqueeze(-1) * mem
+
+                delta = self.hebb_rate * (hebb_term - decay) 
+                delta = delta.to(self.hebb_memory.dtype).reshape_as(self.hebb_memory)
+
+                self.hebb_memory.mul_(self.ema_alpha).add_(delta, alpha=(1.0 - self.ema_alpha))
+
+                FrobeniusCapPerSample(self.hebb_memory, self.mem_norm_cap)
+
+        return out
+
+
 
 class HebbianLinear(nn.Module):
     def __init__(
@@ -343,11 +408,13 @@ class HebbianLinear(nn.Module):
         emaMomentum: float = 0.995,
         applyScale: float = 0.2,
         memNormCap: Optional[float] = 1.0,
-        normalize: bool = False,
-        weightConstraint: Optional[str] = None,
+        normalize: bool = False,  
+        weightConstraint: Optional[str] = None, 
         bias: bool = True,
-        useHebbian: bool = False,):
+        useHebbian: bool = True,):
         super().__init__()
+        self.inFeatures = int(inFeatures)
+        self.outFeatures = int(outFeatures)
 
         self.weight = nn.Parameter(torch.randn(outFeatures, inFeatures) * 0.01)
         self.bias = nn.Parameter(torch.zeros(outFeatures)) if bias else None
@@ -356,55 +423,71 @@ class HebbianLinear(nn.Module):
         self.ema_alpha = float(emaMomentum)
         self.apply_scale = float(applyScale)
         self.mem_norm_cap = memNormCap
-        self.normalize = normalize
+        self.normalize = bool(normalize)
         self.weight_constraint = weightConstraint
-        self.enable_hebbian_updates = useHebbian
+        self.use_hebbian = bool(useHebbian)
 
-        self.register_buffer("hebb_memory", torch.zeros(outFeatures, inFeatures))
-        if normalize:
-            self.register_buffer("running_mean", torch.zeros(outFeatures))
-            self.register_buffer("running_var", torch.ones(outFeatures))
-            self.momentum = 0.1
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.enable_hebbian_updates:
-            w_eff = self.weight + self.apply_scale * self.hebb_memory.detach()
-        else:
-            w_eff = self.weight
-        y = F.linear(x, w_eff, self.bias) 
-
-        if self.normalize:
-            if self.training:
-                with torch.no_grad():
-                    mean = y.mean(0)
-                    var = y.var(0, unbiased=False)
-
-                    self.running_mean.mul_(1 - self.momentum).add_(mean, alpha=self.momentum)
-                    self.running_var.mul_(1 - self.momentum).add_(var, alpha=self.momentum)
-            y_hat = (y - self.running_mean) / torch.sqrt(self.running_var + 1e-5)
-        else:
-            y_hat = y
-
-        if self.enable_hebbian_updates:
-            with torch.no_grad():
-                hebb_term = torch.einsum('bi,bj->ij', y_hat, x)
-                y_sq = (y_hat ** 2).sum(dim=0)
-                decay_term = y_sq.unsqueeze(1) * self.weight
-
-                delta_w = self.hebb_rate * (hebb_term - decay_term)
-                self.hebb_memory.mul_(self.ema_alpha).add_(delta_w, alpha=(1.0 - self.ema_alpha))
-
-                if self.weight_constraint == 'clip':
-                    self.hebb_memory.clamp_(-1.0, 1.0)
-                elif self.weight_constraint == 'norm':
-                    self.hebb_memory.copy_(F.normalize(self.hebb_memory, dim=1))
-
-                ProjectFroNorm(self.hebb_memory, self.mem_norm_cap)
-        return y_hat
+        self.register_buffer("hebb_memory", torch.empty(0), persistent=True)
 
     def ResetHebbianMemory(self):
         with torch.no_grad():
-            self.hebb_memory.zero_()
+            self.hebb_memory = torch.empty(0, device=self.weight.device, dtype=self.weight.dtype)
+
+    def EnsureB(self, B: int, device, dtype):
+        if (self.hebb_memory.numel() == 0) or (self.hebb_memory.shape != (B, self.outFeatures, self.inFeatures)) \
+           or (self.hebb_memory.device != device) or (self.hebb_memory.dtype != dtype):
+            self.hebb_memory = torch.zeros(B, self.outFeatures, self.inFeatures, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.size(0)
+
+        if self.use_hebbian:
+            self.EnsureB(B, x.device, self.weight.dtype)
+            w_eff = self.weight.unsqueeze(0) + self.apply_scale * self.hebb_memory.detach() 
+        else:
+            w_eff = self.weight.unsqueeze(0) 
+
+        x2 = x.reshape(B, -1, self.inFeatures)  
+        y2 = torch.einsum("bni,boi->bno", x2, w_eff)
+        if self.bias is not None:
+            y2 = y2 + self.bias.view(1, 1, -1)
+        y = y2.view(*x.shape[:-1], self.outFeatures) 
+
+        if self.normalize:
+            mean = y.mean(dim=-1, keepdim=True)
+            var = y.var(dim=-1, keepdim=True, unbiased=False)
+            y_hat = (y - mean) / torch.sqrt(var + 1e-5)
+        else:
+            y_hat = y
+
+        if self.use_hebbian:
+            with torch.no_grad():
+                yh2 = y_hat.reshape(B, -1, self.outFeatures) 
+                N = float(yh2.size(1)) if yh2.size(1) > 0 else 1.0
+
+                x32 = x2.float()
+                y32 = yh2.float()
+
+                hebb_term = torch.einsum("bno,bni->boi", y32, x32) / N
+
+                y_sq_mean = y32.square().mean(dim=1)
+
+                decay = y_sq_mean.unsqueeze(-1) * self.hebb_memory.float()
+                delta = self.hebb_rate * (hebb_term - decay)
+                delta = delta.to(self.hebb_memory.dtype)
+
+                self.hebb_memory.mul_(self.ema_alpha).add_(delta, alpha=(1.0 - self.ema_alpha))
+
+                if self.weight_constraint == "clip":
+                    self.hebb_memory.clamp_(-1.0, 1.0)
+                elif self.weight_constraint == "norm":
+                    eps = 1e-8
+                    n = self.hebb_memory.norm(dim=-1, keepdim=True).clamp_min(eps)
+                    self.hebb_memory.div_(n)
+
+                FrobeniusCapPerSample(self.hebb_memory, self.mem_norm_cap)
+
+        return y_hat
 
 
 
@@ -491,7 +574,7 @@ class CNNFeatureExtractor(nn.Module):
         return x  # [B, C, H', W']
 
 
-class PerceiveExtractor(nn.Module):
+class PerceiveExtractor(AGICoreModule):
     def __init__(
         self,
         imgSize: int = 512,
@@ -579,6 +662,7 @@ class PerceiveExtractor(nn.Module):
         layers.append(nn.GELU())
         layers.append(HebbianLinear(embedDim, embedDim, hebbRate=hebbRate, useHebbian = useHebbian))
         layers.append(nn.Dropout(p=dropout))
+
         self.mlp = nn.Sequential(*layers)
 
         self.adaptive_gate = nn.Sequential(
@@ -636,15 +720,18 @@ class PerceiveExtractor(nn.Module):
 
         return fuse_out # [B, embed_dim * 2]
 
-
     def InitWeights(self):
-        if isinstance(self.patch_embed, nn.Conv2d):
-            nn.init.kaiming_normal_(self.patch_embed.weight, mode='fan_out', nonlinearity='relu')
-            if self.patch_embed.bias is not None:
-                nn.init.zeros_(self.patch_embed.bias)
+        for name, m in self.named_modules():
+            if isinstance(m, SheafGaugeConv2d):
+                nn.init.zeros_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
+            elif "gauge_" in name:
+                if hasattr(m, "weight"): nn.init.zeros_(m.weight)
+                if hasattr(m, "bias") and m.bias is not None: nn.init.zeros_(m.bias)
+
+            elif isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
@@ -654,7 +741,7 @@ class PerceiveExtractor(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-            elif isinstance(m, (nn.GroupNorm, nn.InstanceNorm2d, nn.LayerNorm, nn.BatchNorm2d)):
+            elif isinstance(m, (nn.GroupNorm, nn.InstanceNorm2d, nn.LayerNorm)):
                 if getattr(m, "affine", True):
                     if hasattr(m, "weight") and m.weight is not None:
                         nn.init.ones_(m.weight)
@@ -677,7 +764,10 @@ class PerceiveExtractor(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def ResetHebbianMemory(self): 
-        for name, m in self.named_children(): 
+        for m in self.modules(): 
+            if m is self:
+                continue
+            
             if hasattr(m, "ResetHebbianMemory"): 
                 m.ResetHebbianMemory()
 
@@ -700,44 +790,48 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         super().__init__(base, initRankEach=initRankEach, autoRank=autoRank, evThreshold=evThreshold, gradEma=gradEma)
 
     def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
-        C = int(self.base.patch_embed.in_channels)
-        E = int(self.base.patch_embed.out_channels)
+        C_feat = self.base.cnn_feat_adapter.C
+        
+        patch_w = self.base.patch_embed.weight
+        E_out = patch_w.size(0) 
+        C_in = patch_w.size(1)   
         kh, kw = self.base.patch_embed.kernel_size
         ksz = kh * kw
-        D = int(self.base.pos_embed.size(-1))
-        L = len(self.base.transformer_layers)
+        
+        D_model = int(self.base.cls_token.size(-1))
+        L_trans = len(self.base.transformer_layers)
 
         def alloc_feat(addRank: int, device: torch.device, dtype: torch.dtype):
-            A = nn.Parameter(torch.randn(addRank, C, device=device, dtype=dtype) * 1e-4) 
-            B = nn.Parameter(torch.zeros(C, addRank, device=device, dtype=dtype) * 1e-4) 
+            A = nn.Parameter(torch.randn(addRank, C_feat, device=device, dtype=dtype) * 1e-4) 
+            B = nn.Parameter(torch.zeros(C_feat, addRank, device=device, dtype=dtype) * 1e-4) 
             s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
             return A, B, s
 
         def compose_feat(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
+            return torch.tanh(s) * GetParametersScale(s) * (b @ a)
 
         def alloc_patch(addRank: int, device: torch.device, dtype: torch.dtype):
-            A = nn.Parameter(torch.randn(addRank, C * ksz, device=device, dtype=dtype) * 1e-4)
-            B = nn.Parameter(torch.zeros(E, addRank, device=device, dtype=dtype) * 1e-4)
+            A = nn.Parameter(torch.randn(addRank, C_in * ksz, device=device, dtype=dtype) * 1e-4)
+            B = nn.Parameter(torch.zeros(E_out, addRank, device=device, dtype=dtype) * 1e-4)
             s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
             return A, B, s
 
         def compose_patch(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
+            return torch.tanh(s) * GetParametersScale(s) * (b @ a)
 
         def alloc_token(addRank: int, device: torch.device, dtype: torch.dtype):
-            A = nn.Parameter(torch.randn(addRank, D, device=device, dtype=dtype) * 1e-4)
-            B = nn.Parameter(torch.zeros(D, addRank, device=device, dtype=dtype) * 1e-4)
+            A = nn.Parameter(torch.randn(addRank, D_model, device=device, dtype=dtype) * 1e-4)
+            B = nn.Parameter(torch.zeros(D_model, addRank, device=device, dtype=dtype) * 1e-4)
             s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
             return A, B, s
 
         def compose_token(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
+            return torch.tanh(s) * GetParametersScale(s) * (b @ a)
 
         return {
-            "feat": SiteSpec("feat", 1, C, C, self.maxRankFeat, alloc_feat, compose_feat),
-            "patch": SiteSpec("patch", 1, C * ksz, E, self.maxRankPatch, alloc_patch, compose_patch),
-            "token": SiteSpec("token", L, D, D, self.maxRankToken, alloc_token, compose_token),}
+            "feat": SiteSpec("feat", 1, C_feat, C_feat, self.maxRankFeat, alloc_feat, compose_feat),
+            "patch": SiteSpec("patch", 1, C_in * ksz, E_out, self.maxRankPatch, alloc_patch, compose_patch),
+            "token": SiteSpec("token", L_trans, D_model, D_model, self.maxRankToken, alloc_token, compose_token),}
 
     def ForwardWithDeltas(
         self,
@@ -748,6 +842,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]] = None,
         **kwargs,) -> torch.Tensor:
         feat = self.base.cnn_extractor(x)
+        
         feat = self.base.cnn_feat_adapter(feat)
 
         deltaFeat2D = deltasPerLayer[0].get("feat", None)
@@ -759,8 +854,9 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         feat_patch = feat
         if hasattr(self.base.patch_embed, "Preprocess"):
             feat_patch = self.base.patch_embed.Preprocess(feat_patch)
-
+        
         W_eff = self.base.patch_embed.weight
+        
         base_delta = self.base.patch_adapter.DeltaWeight()
         if base_delta is not None:
             W_eff = W_eff + base_delta
@@ -772,8 +868,14 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             kh, kw = self.base.patch_embed.kernel_size
             W_eff = W_eff + deltaPatch2D.view(E, C_in, kh, kw).to(device=feat_patch.device, dtype=feat_patch.dtype)
 
-        patches = F.conv2d(feat_patch,W_eff,bias=None,stride=self.base.patch_embed.stride,
-            padding=self.base.patch_embed.padding,dilation=self.base.patch_embed.dilation,groups=self.base.patch_embed.groups,)
+        patches = F.conv2d(
+            feat_patch,
+            W_eff,
+            bias=None, 
+            stride=self.base.patch_embed.stride,
+            padding=self.base.patch_embed.padding,
+            dilation=self.base.patch_embed.dilation,
+            groups=self.base.patch_embed.groups,)
 
         B, C, Ph, Pw = patches.shape
         patches = rearrange(patches, "b c h w -> b (h w) c")
@@ -784,13 +886,16 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
 
         for i, layer in enumerate(self.base.transformer_layers):
             xTok = layer(xTok)
+            
             xTok = self.base.token_adapters[i](xTok)
+            
             deltaTok2D = deltasPerLayer[i].get("token", None)
             if deltaTok2D is not None:
                 xTok = xTok + (xTok @ deltaTok2D.t())
 
         xTok = self.base.encoder_norm(xTok)
         cls_rep = xTok[:, 0, :]
+        
         mlp_out = self.base.mlp(cls_rep)
         gate = self.base.adaptive_gate(mlp_out)
         out = gate * mlp_out + (1 - gate) * cls_rep
@@ -810,7 +915,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
                 return False
             r = a.size(0)
             C = self.base.cnn_feat_adapter.C 
-
+            
             a2 = a.detach().clone().view(r, C, 1, 1) 
             b2 = b.detach().clone().view(C, r, 1, 1)
 
@@ -868,7 +973,7 @@ class TestPerceptionMTool:
         for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
             A2 = A.view(A.size(0), C) 
             B2 = B.view(C, A.size(0)) 
-            scale = torch.tanh(s.detach()) * GetParameterSScale(s.detach())
+            scale = torch.tanh(s.detach()) * GetParametersScale(s.detach())
             delta = delta + scale * (B2 @ A2) 
         return delta
 
@@ -879,7 +984,7 @@ class TestPerceptionMTool:
         D = adapter.D
         delta = torch.zeros(D, D, device=adapter.A_list[0].device, dtype=adapter.A_list[0].dtype)
         for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
-            scale = torch.tanh(s.detach()) * GetParameterSScale(s.detach())
+            scale = torch.tanh(s.detach()) * GetParametersScale(s.detach())
             delta = delta + scale * (B @ A)
         return delta
 
