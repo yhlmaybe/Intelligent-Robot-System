@@ -58,7 +58,7 @@ class GrowableLoRAConv2d(nn.Module):
         factory = {"device": self.target.weight.device, "dtype": self.target.weight.dtype}
 
         A = init.get("A", torch.randn(addRank, self.cin * ksz, **factory) * 1e-4)
-        B = init.get("B", torch.randn(self.cout, addRank, **factory) * 1e-4)
+        B = init.get("B", torch.zeros(self.cout, addRank, **factory))
         s = init.get("scale", 1e-3)
 
         A = nn.Parameter(A.contiguous().to(**factory))
@@ -109,7 +109,7 @@ class GrowableConv1x1Adapter(AGICoreModule):
         factory = {"device": self.device, "dtype": self.dtype}
 
         A = init.get("A", torch.randn(addRank, self.C, 1, 1, **factory) * 1e-4)
-        B = init.get("B", torch.randn(self.C, addRank, 1, 1, **factory) * 1e-4)
+        B = init.get("B", torch.zeros(self.C, addRank, 1, 1, **factory))
         s = init.get("scale", 1e-3)
 
         A = nn.Parameter(A.contiguous().to(**factory))
@@ -149,7 +149,7 @@ class GrowableTokenAdapter(AGICoreModule):
         factory = {"device": self.device, "dtype": self.dtype}
         
         A = init.get("A", torch.randn(addRank, self.D, **factory) * 1e-4)
-        B = init.get("B", torch.randn(self.D, addRank, **factory) * 1e-4)
+        B = init.get("B", torch.zeros(self.D, addRank, **factory))
         s = init.get("scale", 1e-3)
 
         A = nn.Parameter(A.contiguous().to(**factory))
@@ -277,7 +277,7 @@ class SheafGaugeConv2d(nn.Conv2d):
 
 
 
-class HebbianConv2d(nn.Module):
+class HebbianConv2d(AGICoreModule):
     def __init__(
         self,
         inChannels: int,
@@ -319,7 +319,7 @@ class HebbianConv2d(nn.Module):
 
     def ResetHebbianMemory(self):
         with torch.no_grad():
-            self.hebb_memory = torch.empty(0, device=self.conv.weight.device, dtype=self.conv.weight.dtype)
+            self.hebb_memory = torch.empty(0, device=self.device, dtype=self.dtype)
 
     def EnsureB(self, B: int, device, dtype):
         w = self.conv.weight
@@ -336,7 +336,7 @@ class HebbianConv2d(nn.Module):
         in_per_g = inC // g
 
         if self.use_hebbian:
-            self.EnsureB(B, x.device, w.dtype)
+            self.EnsureB(B, self.device, self.dtype)
             w_eff = w.unsqueeze(0) + self.apply_scale * self.hebb_memory.detach()
         else:
             w_eff = w.unsqueeze(0).expand(B, -1, -1, -1, -1)
@@ -399,7 +399,7 @@ class HebbianConv2d(nn.Module):
 
 
 
-class HebbianLinear(nn.Module):
+class HebbianLinear(AGICoreModule):
     def __init__(
         self,
         inFeatures: int,
@@ -431,7 +431,7 @@ class HebbianLinear(nn.Module):
 
     def ResetHebbianMemory(self):
         with torch.no_grad():
-            self.hebb_memory = torch.empty(0, device=self.weight.device, dtype=self.weight.dtype)
+            self.hebb_memory = torch.empty(0, device=self.device, dtype=self.dtype)
 
     def EnsureB(self, B: int, device, dtype):
         if (self.hebb_memory.numel() == 0) or (self.hebb_memory.shape != (B, self.outFeatures, self.inFeatures)) \
@@ -442,7 +442,7 @@ class HebbianLinear(nn.Module):
         B = x.size(0)
 
         if self.use_hebbian:
-            self.EnsureB(B, x.device, self.weight.dtype)
+            self.EnsureB(B, self.device, self.dtype)
             w_eff = self.weight.unsqueeze(0) + self.apply_scale * self.hebb_memory.detach() 
         else:
             w_eff = self.weight.unsqueeze(0) 
@@ -491,7 +491,7 @@ class HebbianLinear(nn.Module):
 
 
 
-class TransformerEncode(nn.Module):
+class TransformerEncode(AGICoreModule):
     def __init__(self, modelDim: int, headNum: int, dimFeedforward: int = 2048, dropout: float = 0.1):
         super().__init__()
         self.self_atten = nn.MultiheadAttention(modelDim, headNum, dropout=dropout, batch_first=True)
@@ -520,7 +520,7 @@ class TransformerEncode(nn.Module):
         return src
     
 
-class ResidualBlock(nn.Module):
+class ResidualBlock(AGICoreModule):
     def __init__(self, inChannels: int, outChannels: int, stride: int = 1, useHebbian: bool = False):
         super().__init__()
         self.downsample = None
@@ -543,7 +543,7 @@ class ResidualBlock(nn.Module):
         out = self.relu(out)
         return out
 
-class CNNFeatureExtractor(nn.Module):
+class CNNFeatureExtractor(AGICoreModule):
     def __init__(self, inChannels: int = 3, baseChannels: int = 64, useHebbian: bool = True):
         super().__init__()
         self.conv1 = HebbianConv2d(inChannels, baseChannels, 7, stride=2, padding=3,bias=False, useHebbian=useHebbian)
@@ -623,6 +623,8 @@ class PerceiveExtractor(AGICoreModule):
             kernel_size=patchSize,
             stride=patchSize,
             bias=False,
+            device=self.device,
+            dtype=self.dtype,
             sheaf_alpha=0.1,
             sheaf_iters=1,
             gauge_groups=1, 
@@ -634,7 +636,6 @@ class PerceiveExtractor(AGICoreModule):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embedDim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         self.pos_drop = nn.Dropout(p=posDrop)
-
 
         self.cnn_feat_adapter = GrowableConv1x1Adapter(channels=cnn_feat_dim)
         self.patch_adapter = GrowableLoRAConv2d(self.patch_embed)
@@ -803,7 +804,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
 
         def alloc_feat(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, C_feat, device=device, dtype=dtype) * 1e-4) 
-            B = nn.Parameter(torch.zeros(C_feat, addRank, device=device, dtype=dtype) * 1e-4) 
+            B = nn.Parameter(torch.zeros(C_feat, addRank, device=device, dtype=dtype)) 
             s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
             return A, B, s
 
@@ -812,7 +813,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
 
         def alloc_patch(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, C_in * ksz, device=device, dtype=dtype) * 1e-4)
-            B = nn.Parameter(torch.zeros(E_out, addRank, device=device, dtype=dtype) * 1e-4)
+            B = nn.Parameter(torch.zeros(E_out, addRank, device=device, dtype=dtype))
             s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
             return A, B, s
 
@@ -821,7 +822,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
 
         def alloc_token(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, D_model, device=device, dtype=dtype) * 1e-4)
-            B = nn.Parameter(torch.zeros(D_model, addRank, device=device, dtype=dtype) * 1e-4)
+            B = nn.Parameter(torch.zeros(D_model, addRank, device=device, dtype=dtype))
             s = nn.Parameter(torch.tensor(1e-3, device=device, dtype=dtype))
             return A, B, s
 
