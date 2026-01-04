@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict
-from FunctionTools import GetParameterSScale, SiteSpec, BaseOnlineWrapper
+from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule
 
 
 def SquashNoBatch(
@@ -38,16 +38,15 @@ class GrowableLoRALinear(nn.Module):
             return
         if init is None: init = {}
 
-        dev = self.target.weight.device
-        dt = self.target.weight.dtype
+        factory = {"device": self.target.weight.device, "dtype": self.target.weight.dtype}
 
-        A = init.get("A", torch.randn(addRank, self.in_f, device=dev, dtype=dt) * 1e-4)
-        B = init.get("B", torch.randn(self.out_f, addRank, device=dev, dtype=dt) * 1e-4)
+        A = init.get("A", torch.randn(addRank, self.in_f, **factory) * 1e-4)
+        B = init.get("B", torch.zeros(self.out_f, addRank, **factory))
         s = init.get("scale", 1e-3)
 
-        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
-        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
-        s = nn.Parameter(torch.as_tensor(s, device=A.device, dtype=A.dtype))
+        A = nn.Parameter(A.contiguous().to(**factory))
+        B = nn.Parameter(B.contiguous().to(**factory))
+        s = nn.Parameter(torch.as_tensor(s, **factory))
 
         if freezeOld:
             for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
@@ -62,7 +61,7 @@ class GrowableLoRALinear(nn.Module):
             return None
         delta = self.target.weight.new_zeros(self.out_f, self.in_f)
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-            s_eff = torch.tanh(s) * GetParameterSScale(s) 
+            s_eff = torch.tanh(s) * GetParametersScale(s) 
             delta = delta + s_eff * (B @ A)
         return delta
 
@@ -74,7 +73,7 @@ class GrowableLoRALinear(nn.Module):
         return F.linear(x, W, self.target.bias)
 
 
-class SelectiveSSM(nn.Module):
+class SelectiveSSM(AGICoreModule):
     def __init__(
         self,
         embedDim: int,
@@ -88,7 +87,7 @@ class SelectiveSSM(nn.Module):
         self.N = N
         self.use_causal_conv = bool(useCausalConv)
 
-        self.A_log = nn.Parameter(torch.zeros(E, N)) 
+        self.A_log = nn.Parameter(torch.randn(E, N))
 
         self.D = nn.Parameter(torch.zeros(E))
 
@@ -134,11 +133,10 @@ class SelectiveSSM(nn.Module):
         tdError: Optional[torch.Tensor] = None, 
         uncertainty: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, S, E = x.shape
-        dev = x.device
         N = self.N
 
-        td_z = SquashNoBatch(tdError,B, dev, scale=5.0, dtype=torch.float32)
-        unc_z = SquashNoBatch(uncertainty, B, dev, scale=5.0, dtype=torch.float32)
+        td_z = SquashNoBatch(tdError,B, self.device, scale=5.0, dtype=self.dtype)
+        unc_z = SquashNoBatch(uncertainty, B, self.device, scale=5.0, dtype=self.dtype)
 
         mod = torch.sigmoid(0.75 * td_z - 0.75 * unc_z) 
 
@@ -151,7 +149,7 @@ class SelectiveSSM(nn.Module):
         gate_bias = (0.5 * td_z - 0.5 * unc_z).unsqueeze(-1) 
         g = torch.sigmoid(g + gate_bias) 
 
-        p = self.param_proj(x) 
+        p = self.param_proj(u) 
         dt_raw = p[..., :E]  
         bc = p[..., E:]  
         B_raw, C_raw = bc.split(E * N, dim=-1)
@@ -165,8 +163,8 @@ class SelectiveSSM(nn.Module):
 
         A_pos = F.softplus(self.A_log) + 1e-4
 
-        y = torch.empty((B, S, E), device=dev, dtype=x.dtype)
-        state = torch.zeros((B, E, N), device=dev, dtype=torch.float32)
+        y = torch.empty((B, S, E), device=self.device, dtype=self.dtype)
+        state = torch.zeros((B, E, N), device=self.device, dtype=self.dtype)
 
         has_mask = (keyPaddingMask is not None)
 
@@ -193,18 +191,25 @@ class SelectiveSSM(nn.Module):
             out_t = out_t * g[:, t, :]
 
             if keep is not None:
-                out_t = out_t * keep.squeeze(-1).to(out_t.dtype) 
+                out_t = out_t * keep.squeeze(-1).to(self.dtype) 
 
-            y[:, t, :] = out_t.to(dtype=x.dtype)
+            y[:, t, :] = out_t.to(dtype=self.dtype)
 
         return self.out_norm(y)
 
 
 
-class MultiHeadAttention(nn.Module):
-    def __init__(self, embedDim: int, numHeads: int, hebbianRate: float = 0.01,
-                 attnDropout: float = 0.1, tdScale: float = 5.0, lowRank: bool = True,
-                 rank: int = 8, hebbPeriod: int = 4, useHebbian: bool = True,):
+class MultiHeadAttention(AGICoreModule):
+    def __init__(
+        self, 
+        embedDim: int, 
+        numHeads: int, 
+        hebbianRate: float = 0.01,
+        attnDropout: float = 0.1, 
+        tdScale: float = 5.0, 
+        lowRank: bool = True,
+        rank: int = 8, 
+        useHebbian: bool = True,):
         super().__init__()
         assert embedDim % numHeads == 0, "AttentionModule embed_dim must be divisible by num_heads"
         self.embed_dim = embedDim
@@ -213,9 +218,8 @@ class MultiHeadAttention(nn.Module):
         self.base_hebbian_rate = hebbianRate
         self.attn_dropout_p = attnDropout
         self.td_scale = tdScale
-        self.rank = rank
-        self.hebb_period = max(1, hebbPeriod)
-        self.update_hebbian_flag = useHebbian
+        self.rank = min(int(rank), self.head_dim)
+        self.use_hebbian = useHebbian
         self.uv_decay = 1e-2 
         self.uv_max_norm = 1.5  
         self.hebb_eps = 1e-6     
@@ -237,7 +241,6 @@ class MultiHeadAttention(nn.Module):
         self.v_adapter = GrowableLoRALinear(self.v_proj)
         self.o_adapter = GrowableLoRALinear(self.out_proj)
 
-        self.register_buffer("hebb_step", torch.zeros(1, dtype=torch.long), persistent=False) 
         self.register_buffer("hebbian_weights", torch.zeros(1, self.num_heads, self.head_dim, self.head_dim), persistent=False)  # (B,H,D,D)
         self.register_buffer("U", torch.zeros(1, self.num_heads, self.head_dim, self.rank), persistent=False) 
         self.register_buffer("V", torch.zeros(1, self.num_heads, self.head_dim, self.rank), persistent=False)
@@ -245,18 +248,20 @@ class MultiHeadAttention(nn.Module):
         self.ResetParameters()
 
     @torch.no_grad()
-    def EnsureHebbState(self, B: int, device: torch.device, dtype: torch.dtype):
-        if (self.hebb_step.numel() != B) or (self.U.size(0) != B):
-            self.hebb_step = torch.zeros(B, device=device, dtype=torch.long)
-            eye = torch.eye(self.head_dim, device=device, dtype=dtype).view(1, 1, self.head_dim, self.head_dim)
-            self.hebbian_weights = eye.repeat(B, self.num_heads, 1, 1).contiguous()
+    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
+        if self.U.size(0) != B:
+            self.hebbian_weights = torch.zeros(B, self.num_heads, self.head_dim, self.head_dim, device=device, dtype=dtype)
+            
             self.U = torch.zeros(B, self.num_heads, self.head_dim, self.rank, device=device, dtype=dtype)
             self.V = torch.zeros(B, self.num_heads, self.head_dim, self.rank, device=device, dtype=dtype)
+            
+            if self.use_low_rank:
+                 self.U.normal_(0.0, 1e-3)
+                 self.V.normal_(0.0, 1e-3)
 
     def ModulateTauBias(self, tdError, uncertainty, B):
-        dev = self.temp_w_td.device
-        td_z = SquashNoBatch(tdError, B, dev, scale=self.td_scale, dtype=torch.float32)  
-        unc_z = SquashNoBatch(uncertainty, B, dev, scale=self.td_scale, dtype=torch.float32) 
+        td_z = SquashNoBatch(tdError, B, self.device, scale=self.td_scale, dtype=self.dtype)  
+        unc_z = SquashNoBatch(uncertainty, B, self.device, scale=self.td_scale, dtype=self.dtype) 
 
         tau = 1.0 + 0.5 * torch.tanh(self.temp_w_td * td_z + self.temp_w_unc * unc_z) 
         bias = 0.5 * torch.tanh(self.bias_w_td * td_z + self.bias_w_unc * unc_z) 
@@ -276,10 +281,10 @@ class MultiHeadAttention(nn.Module):
                 self.V.normal_(0.0, 1e-3)
 
     def ResetHebbianMemory(self):
-        device = self.hebbian_weights.device
-        eye = torch.eye(self.head_dim, device=device)
-        self.hebbian_weights.copy_(eye.unsqueeze(0).repeat(self.num_heads, 1, 1))
-        with torch.no_grad():
+        if self.hebbian_weights.numel() > 0:
+            self.hebbian_weights.zero_()
+            
+        if self.U.numel() > 0:
             self.U.zero_()
             self.V.zero_()
 
@@ -304,33 +309,33 @@ class MultiHeadAttention(nn.Module):
 
 
     def ComputeNeuromodulation(self, tdError: Optional[torch.Tensor], B: int) -> torch.Tensor:
-        dev = self.hebbian_weights.device
-        td_z = SquashNoBatch(tdError, B, dev, scale=self.td_scale, dtype=torch.float32) 
+        td_z = SquashNoBatch(tdError, B, self.device, scale=self.td_scale, dtype=self.dtype) 
         neuromod = 1.0 + 0.5 * td_z  
         return neuromod.view(B, 1, 1, 1)
 
 
     @torch.no_grad()
-    def UpdateHebbianWeights(self, v: torch.Tensor, q: torch.Tensor, alpha: float, keep4: Optional[torch.Tensor] = None):
-        if (not self.update_hebbian_flag) or (alpha <= 0):
+    def UpdateHebbianWeights(self, v: torch.Tensor, q: torch.Tensor, alpha_tensor: torch.Tensor, keep4: Optional[torch.Tensor] = None):
+        if (not self.use_hebbian):
             return
 
         v = v.detach()
         q = q.detach()
 
         if keep4 is not None:
-            k = keep4.detach()
+            k = keep4.detach() 
             v = v * k
             q = q * k
-            denom = k.sum().clamp_min(1.0)
+            denom = k.sum(dim=-2, keepdim=True).clamp_min(1.0) 
         else:
-            denom = torch.tensor(v.size(0) * v.size(2), device=v.device, dtype=torch.float32).clamp_min(1.0)
+            S_len = v.size(2)
+            denom = torch.tensor(S_len, device=v.device, dtype=v.dtype)
 
         eps = getattr(self, "hebb_eps", 1e-6)
         v = F.normalize(v, dim=-1, eps=eps)
         q = F.normalize(q, dim=-1, eps=eps)
 
-        hebb = torch.einsum("bhse,bhsd->hde", v, q) / (denom + 1e-8)
+        hebb = torch.einsum("bhse,bhsd->bhde", v, q) / (denom + 1e-8)
         hebb = torch.tanh(hebb) 
 
         def clamp_fro(x: torch.Tensor, max_norm: float):
@@ -343,34 +348,33 @@ class MultiHeadAttention(nn.Module):
             maxn = float(getattr(self, "uv_max_norm", 1.5))
             r = int(self.U.size(-1))
 
-            M0 = torch.einsum("hdr,her->hde", self.U, self.V) 
+            M0 = torch.einsum("bhdr,bher->bhde", self.U, self.V) 
 
-            M1 = (1.0 - decay) * M0 + float(alpha) * hebb
+            M1 = (1.0 - decay) * M0 + alpha_tensor * hebb
 
-            U_s, S, Vh = torch.linalg.svd(M1, full_matrices=False)
-            Sr = S[:, :r].clamp_min(0.0)
-            sqrtSr = Sr.sqrt().unsqueeze(1) 
+            M1_f = M1.float()
+            U_s, S, Vh = torch.linalg.svd(M1_f, full_matrices=False)
 
-            Ur = U_s[:, :, :r] * sqrtSr  
-            Vr = Vh.transpose(-2, -1)[:, :, :r] * sqrtSr  
+            Sr = S[..., :r].clamp_min(0.0) 
+            sqrtSr = Sr.sqrt().unsqueeze(-2) 
 
-            def clamp_fro(x: torch.Tensor, max_norm: float):
-                n = torch.linalg.vector_norm(x, ord=2, dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-                scale = torch.clamp(max_norm / n, max=1.0)
-                return x * scale
+            Ur = U_s[..., :r] * sqrtSr 
+            Vr = Vh.transpose(-2, -1)[..., :r] * sqrtSr
 
             Ur = clamp_fro(Ur, maxn)
             Vr = clamp_fro(Vr, maxn)
 
-            self.U.copy_(Ur.to(dtype=self.U.dtype))
-            self.V.copy_(Vr.to(dtype=self.V.dtype))
+            self.U.copy_(Ur.to(self.dtype))
+            self.V.copy_(Vr.to(self.dtype))
         else:
-            W_new = (1.0 - alpha) * self.hebbian_weights + alpha * hebb
-            self.hebbian_weights.copy_(W_new.to(dtype=self.hebbian_weights.dtype))
+            W_new = (1.0 - alpha_tensor) * self.hebbian_weights + alpha_tensor * hebb
+            self.hebbian_weights.copy_(W_new)
 
 
     def forward(self, query, key, value, keyPaddingMask: Optional[torch.Tensor]=None, tdError: Optional[torch.Tensor]=None, uncertainty: Optional[torch.Tensor]=None):
         B, L, _ = query.shape
+        self.EnsureB(B, device=self.device, dtype=self.dtype)
+
         neuromod = self.ComputeNeuromodulation(tdError, B)
 
         q_lin = self.q_adapter(query) 
@@ -381,24 +385,23 @@ class MultiHeadAttention(nn.Module):
         k = k_lin.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = v_lin.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if self.training and self.update_hebbian_flag and self.base_hebbian_rate > 0:
-            self.hebb_step.add_(1)
-            if int(self.hebb_step.item()) % self.hebb_period == 0:
-                alpha = float(self.base_hebbian_rate * neuromod.mean())
-                if keyPaddingMask is not None:
-                    keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, L, 1)
-                    self.UpdateHebbianWeights(v, q, alpha, keep4=keep4)
-                else:
-                    self.UpdateHebbianWeights(v, q, alpha, keep4=None)
+        if self.use_hebbian and self.base_hebbian_rate > 0:
+            alpha = self.base_hebbian_rate * neuromod
+            if keyPaddingMask is not None:
+                keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, L, 1)
+                self.UpdateHebbianWeights(v, q, alpha, keep4=keep4)
+            else:
+                self.UpdateHebbianWeights(v, q, alpha, keep4=None)
 
         q = q * neuromod
 
         if self.use_low_rank:
-            vU = torch.einsum("bhse,her->bhsr", v, self.U)
-            delt = torch.einsum("bhsr,hdr->bhsd", vU, self.V)
-            v_fast = v + delt
+            vV = torch.matmul(v, self.V)
+            delt = torch.matmul(vV, self.U.transpose(-2, -1))  
         else:
-            v_fast = torch.einsum("bhse,hde->bhsd", v, self.hebbian_weights)
+            delt = torch.einsum("bhse,bhde->bhsd", v, self.hebbian_weights)
+
+        v_fast = v + delt
 
         tau, bias = self.ModulateTauBias(tdError, uncertainty, B)
         q = q / tau
@@ -422,65 +425,88 @@ class MultiHeadAttention(nn.Module):
 
 
     @torch.no_grad()
-    def LowrankToFullrank(self, residual: bool = True):
-        W = torch.einsum('hdr,her->hde', self.U, self.V) # (H,D,D)
-        if residual:
-            eye = torch.eye(W.size(1), device=W.device).unsqueeze(0).expand(W.size(0), -1, -1)
-            W = W + eye
+    def LowrankToFullrank(self):
+        W = torch.einsum('bhdr,bher->bhde', self.U, self.V) # (B,H,D,D)
+        
+        if self.hebbian_weights.shape != W.shape:
+             self.hebbian_weights = torch.empty_like(W)
         self.hebbian_weights.copy_(W)
-        self.use_low_rank = False 
+        self.use_low_rank = False
         
     @torch.no_grad()
-    def FullrankToLowrank(self, residual: bool = True):
-        M = self.hebbian_weights.clone() # (H,D,D)
-        if residual:
-            eye = torch.eye(M.size(1), device=M.device).unsqueeze(0).expand(M.size(0), -1, -1)
-            M = M - eye  
+    def FullrankToLowrank(self):
+        M = self.hebbian_weights.clone() # (B,H,D,D)
 
-        U_s, S, Vh = torch.linalg.svd(M, full_matrices=False) # (H,D,D), (H,D), (H,D,D)
+        U_s, S, Vh = torch.linalg.svd(M, full_matrices=False) 
         r = self.U.size(-1)
-        Ur = U_s[:, :, :r] * S[:, None, :r].clamp_min(0).sqrt()
-        Vr = Vh.transpose(-2, -1)[:, :, :r] * S[:, None, :r].clamp_min(0).sqrt()
+        
+        Sr = S[..., :r].clamp_min(0.0)
+        sqrtSr = Sr.sqrt().unsqueeze(-2)
+
+        Ur = U_s[..., :r] * sqrtSr
+        Vr = Vh.transpose(-2, -1)[..., :r] * sqrtSr
 
         self.U.copy_(Ur)
         self.V.copy_(Vr)
         self.use_low_rank = True
 
 
-class TemporalAttention(nn.Module):
+class TemporalAttention(AGICoreModule):
     def __init__(self, embedDim: int, numHeads: int, layerIdx: int = 0, useHebbian: bool = True):
         super().__init__()
 
         td_scale = 5.0 / (layerIdx + 1)
         self.mhsa = MultiHeadAttention(embedDim, numHeads, tdScale=td_scale, useHebbian=useHebbian)
-        self.ssm = SelectiveSSM(embedDim, stateDim=4, convKernel=4, useCausalConv=True)
+        self.ssm = SelectiveSSM(embedDim, stateDim=16, convKernel=4, useCausalConv=True)
+
+        self.gamma = nn.Parameter(1e-1 * torch.ones(embedDim), requires_grad=True)
 
         self.mix_gate = nn.Sequential(
             nn.Linear(embedDim, embedDim),
             nn.SiLU(),
             nn.Linear(embedDim, 1))
         
+        nn.init.constant_(self.mix_gate[-1].bias, -1.0)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(embedDim, 4 * embedDim),
+            nn.GELU(),
+            nn.Linear(4 * embedDim, embedDim))
+        
+        self.gamma_ffn = nn.Parameter(1e-1 * torch.ones(embedDim), requires_grad=True)
+        
         self.dropout = nn.Dropout(0.1)
         self.norm = nn.LayerNorm(embedDim)
+        self.norm_ffn = nn.LayerNorm(embedDim)
 
     def forward(self, x, keyPaddingMask: Optional[torch.Tensor]=None, tdError: Optional[torch.Tensor]=None, uncertainty: Optional[torch.Tensor]=None):
+        residual = x
+        x_norm = self.norm(x)
         
-        mhsa_out = self.mhsa(x, x, x, keyPaddingMask=keyPaddingMask,tdError=tdError, uncertainty=uncertainty)
+        mhsa_out = self.mhsa(x_norm, x_norm, x_norm, keyPaddingMask=keyPaddingMask,tdError=tdError, uncertainty=uncertainty)
 
-        ssm_out  = self.ssm(x, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty)
+        ssm_out = self.ssm(x_norm, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty)
 
-        w = torch.sigmoid(self.mix_gate(x)) # (B,S,1)
+        w = torch.sigmoid(self.mix_gate(x_norm)) # (B,S,1)
 
         y = w * mhsa_out + (1 - w) * ssm_out # (B,S,E)
 
-        out = self.norm(x + self.dropout(y))
+        x = residual + self.dropout(y) * self.gamma
+
+        residual = x
+        x_norm = self.norm_ffn(x)
+
+        ffn_out = self.ffn(x_norm)
+
+        out = residual + self.dropout(ffn_out) * self.gamma_ffn
+
         if keyPaddingMask is not None:
             keep = (~keyPaddingMask).unsqueeze(-1).to(out.dtype)  # (B,S,1)
             out = out * keep
         return out
 
 
-class DynamicRouting(nn.Module):
+class DynamicRouting(AGICoreModule):
     def __init__(self, inCaps: int, inDim: int, outCaps: int, outDim: int, iterations: int = 3):
         super().__init__()
         self.I = inCaps
@@ -492,14 +518,11 @@ class DynamicRouting(nn.Module):
         self.transformation = nn.Parameter(torch.empty(inCaps, outCaps, inDim, outDim))
         self.routing_logits = nn.Parameter(torch.randn(1, inCaps, outCaps) * 0.01)
         self.ResetParameters()
-        
-        self.register_buffer("last_weights", torch.zeros(1, inCaps, outCaps), persistent=False)
 
     def ResetParameters(self):
         nn.init.kaiming_uniform_(self.transformation, a=math.sqrt(5))
 
-    @staticmethod
-    def Squash(vectors: torch.Tensor) -> torch.Tensor:
+    def Squash(self, vectors: torch.Tensor) -> torch.Tensor:
         squared_norm = vectors.pow(2).sum(dim=-1, keepdim=True)
         scale = squared_norm / (1.0 + squared_norm) / (torch.sqrt(squared_norm + 1e-8))
         return scale * vectors
@@ -516,31 +539,31 @@ class DynamicRouting(nn.Module):
         logits = self.routing_logits.expand(B, -1, -1).clone()
 
         if mask is not None:
-            logits = logits.masked_fill(mask.unsqueeze(-1), -1e4)
+            logits = logits.masked_fill(mask.unsqueeze(-1), -1e9)
 
         for r in range(self.iterations):
-            weights = F.log_softmax(logits, dim=-1).exp()
+            weights = torch.softmax(logits, dim=-1)  # (B,I,O)
 
             if mask is not None:
                 weights = weights.masked_fill(mask.unsqueeze(-1), 0.0)
+                denom = weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                weights = weights / denom
 
-            s = torch.einsum("bioc,bio->boc", u_hat, weights) 
-            v = self.Squash(s) 
+            s = torch.einsum("bioc,bio->boc", u_hat, weights)
+            v = self.Squash(s)
 
             if r < self.iterations - 1:
-                agreement = torch.einsum("bioc,boc->bio", u_hat, v)  
-                agreement = torch.clamp(agreement, -5.0, 5.0)
-
-                logits = logits + agreement
-
+                agreement = torch.einsum("bioc,boc->bio", u_hat, v).clamp(-5.0, 5.0)
                 if mask is not None:
-                    logits = logits.masked_fill(mask.unsqueeze(-1), -1e4)
+                    agreement = agreement.masked_fill(mask.unsqueeze(-1), 0.0)
+                logits = logits + agreement
+                if mask is not None:
+                    logits = logits.masked_fill(mask.unsqueeze(-1), -1e9)
 
-        self.last_weights = weights.detach().mean(0, keepdim=True) 
         return v
 
 
-class HebbianFusion(nn.Module):
+class HebbianFusion(AGICoreModule):
     def __init__(self, numModes: int, embedDim: int, hebbianRate: float = 0.01, useHebbian: bool = True, momentum: float = 0.9):
         super().__init__()
         self.num_modes = numModes
@@ -552,7 +575,7 @@ class HebbianFusion(nn.Module):
         self.ctx_q = nn.Linear(self.embed_dim, 1, bias=False)
 
         self.base_weights = nn.Parameter(torch.empty(numModes, embedDim, embedDim))
-        self.register_buffer("hebbian_memory", torch.zeros(numModes, embedDim, embedDim))
+        self.register_buffer("hebbian_memory", torch.zeros(1, numModes, embedDim, embedDim))
 
         self.ResetParameters()
 
@@ -575,19 +598,22 @@ class HebbianFusion(nn.Module):
     def ResetHebbianMemory(self):
         self.hebbian_memory.zero_()
 
-    def EffectiveWeights(self) -> torch.Tensor:
-        if not self.use_hebbian:
-            return self.base_weights
-        eff = self.momentum * self.base_weights + (1.0 - self.momentum) * self.hebbian_memory
-        return torch.clamp(eff, -3.0, 3.0)
+    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
+        if self.hebbian_memory.shape[0] != B:
+            self.hebbian_memory = torch.zeros(B, self.num_modes, self.embed_dim, self.embed_dim, device=device, dtype=dtype)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor: # inputs:(B,M,E)
         B, M, E = inputs.shape
 
-        assert M == self.num_modes and E == self.embed_dim, "AttentionModule HebbianFusion shape mismatch"
+        self.EnsureB(B, self.device, self.dtype)
 
-        effW = self.EffectiveWeights()  # (M,E,E)
-        weighted = torch.einsum("bme,mef->bmf", inputs, effW) # (B,M,E)
+        if self.use_hebbian:
+            effW = self.momentum * self.base_weights.unsqueeze(0) + (1.0 - self.momentum) * self.hebbian_memory
+            effW = torch.clamp(effW, -3.0, 3.0)
+        else:
+            effW = self.base_weights.unsqueeze(0)
+
+        weighted = torch.einsum("bme,bmef->bmf", inputs, effW) # (B,M,E)
 
         alpha = torch.softmax(self.ctx_q(inputs).squeeze(-1) / math.sqrt(self.embed_dim), dim=1) # (B,M)
         context = torch.einsum("bme,bm->be", inputs, alpha).unsqueeze(1).expand(-1, M, -1)   
@@ -600,8 +626,8 @@ class HebbianFusion(nn.Module):
 
         if self.use_hebbian and self.hebbian_rate > 0:
             with torch.no_grad():
-                norm = max(1, B) * math.sqrt(E)
-                hebb_term = torch.einsum("bme,bf->mef", inputs.float(), fused.float()) / (norm + 1e-8)
+                norm = math.sqrt(E)
+                hebb_term = torch.einsum("bme,bf->bmef", inputs.float(), fused.float()) / (norm + 1e-8)
                 mem_new = (1.0 - self.hebbian_rate) * self.hebbian_memory + self.hebbian_rate * hebb_term
                 self.hebbian_memory.copy_(mem_new)
 
@@ -609,14 +635,15 @@ class HebbianFusion(nn.Module):
 
 
 
-class AttentionExtractor(nn.Module):
+class AttentionExtractor(AGICoreModule):
     def __init__(
         self,
         embedDim: int = 1024,
-        sequenceLength: int = 16,
-        numHeads: int = 8,
-        temporalLayers: int = 3,
-        routingIterations: int = 3,
+        sequenceLength: int = 32,
+        numHeads: int = 16,
+        temporalLayers: int = 12,
+        capsDim: int = 256,
+        routingIterations: int = 6,
         hebbianRate: float = 0.01,
         useHebbian: bool = True,
         gradientClipVal: float = 1.0,):
@@ -627,12 +654,18 @@ class AttentionExtractor(nn.Module):
         self.output_dim = embedDim
         self.use_hebbian = useHebbian
         self.num_heads = numHeads
+        self.caps_dim = capsDim
 
         self.temporal_blocks: nn.ModuleList = nn.ModuleList([
             TemporalAttention(embedDim, numHeads, idx, useHebbian=useHebbian)
             for idx in range(temporalLayers)])
 
-        self.routing = DynamicRouting(sequenceLength, embedDim, 4, embedDim, iterations=routingIterations)
+        self.caps_in_proj = nn.Sequential(
+            nn.Linear(embedDim, self.caps_dim), 
+            nn.LayerNorm(self.caps_dim), 
+            nn.SiLU())
+        self.routing = DynamicRouting(sequenceLength, self.caps_dim, 32, self.caps_dim, iterations=routingIterations)
+        self.caps_out_proj = nn.Linear(self.caps_dim, embedDim)
 
         self.fusion = HebbianFusion(numModes=3, embedDim=embedDim, hebbianRate=hebbianRate, useHebbian=useHebbian)
 
@@ -698,7 +731,9 @@ class AttentionExtractor(nn.Module):
         caps = (h_seg * valid.unsqueeze(-1)).sum(dim=2) / valid_cnt_safe # (B,I,E) masked mean
         caps_mask = (valid_cnt.squeeze(-1) == 0)                      
 
-        routed = self.routing(caps, caps_mask) # (B,4,E)
+        cap_in = self.caps_in_proj(caps)
+        routed = self.routing(cap_in, caps_mask) # (B,4,E)
+        routed = self.caps_out_proj(routed)
         routed = F.layer_norm(routed, (E,))
 
         # Fusion of different representations
@@ -734,13 +769,13 @@ class AttentionExtractor(nn.Module):
             blk.mhsa.ResetHebbianMemory()
         self.fusion.ResetHebbianMemory()
 
-    def AttenLowrankToFullrank(self, residual: bool = True):
+    def AttenLowrankToFullrank(self):
         for blk in self.temporal_blocks:
-            blk.mhsa.LowrankToFullrank(residual)
+            blk.mhsa.LowrankToFullrank()
         
-    def AttenFullrankToLowrank(self, residual: bool = True):
+    def AttenFullrankToLowrank(self):
         for blk in self.temporal_blocks:
-            blk.mhsa.FullrankToLowrank(residual)
+            blk.mhsa.FullrankToLowrank()
             
 
     @torch.no_grad()
@@ -755,21 +790,33 @@ class AttentionExtractor(nn.Module):
                 "U": mhsa.U.detach().clone(),
                 "V": mhsa.V.detach().clone(),
                 "hebbW": mhsa.hebbian_weights.detach().clone(),
-                "hebb_step": mhsa.hebb_step.detach().clone(),
                 "use_low_rank": bool(mhsa.use_low_rank),})
             
         return st
 
     @torch.no_grad()
     def ImportState(self, st: dict):
-        self.fusion.hebbian_memory.copy_(st["fusion_hebb"])
-        for blk, s in zip(self.temporal_blocks, st["mhsa"]):
-            mhsa = blk.mhsa
-            mhsa.U.copy_(s["U"])
-            mhsa.V.copy_(s["V"])
-            mhsa.hebbian_weights.copy_(s["hebbW"])
-            mhsa.hebb_step.copy_(s["hebb_step"])
-            mhsa.use_low_rank = bool(s["use_low_rank"])
+        fusion_state = st.get("fusion_hebb")
+        if fusion_state is not None:
+            if self.fusion.hebbian_memory is None:
+                self.fusion.hebbian_memory = fusion_state.clone()
+            elif self.fusion.hebbian_memory.shape != fusion_state.shape:
+                self.fusion.hebbian_memory = fusion_state.clone()
+            else:
+                self.fusion.hebbian_memory.copy_(fusion_state)
+        
+        if "mhsa" in st:
+            for blk, s in zip(self.temporal_blocks, st["mhsa"]):
+                mhsa = blk.mhsa
+                
+                target_B = s["U"].size(0)
+                if mhsa.U.size(0) != target_B:
+                    mhsa.EnsureB(target_B, mhsa.U.device, mhsa.U.dtype)
+
+                mhsa.U.copy_(s["U"])
+                mhsa.V.copy_(s["V"])
+                mhsa.hebbian_weights.copy_(s["hebbW"])
+                mhsa.use_low_rank = bool(s["use_low_rank"])
 
 
 class AttentionOnlineWrapper(BaseOnlineWrapper):
@@ -807,7 +854,7 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
             return A, B, s
 
         def compose_linear(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            s_eff = torch.tanh(s) * GetParameterSScale(s) 
+            s_eff = torch.tanh(s) * GetParametersScale(s) 
             return s_eff * (b @ a)
 
         return {
@@ -855,7 +902,9 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         caps = (h_seg * valid.unsqueeze(-1)).sum(dim=2) / valid_cnt
         caps_mask = (valid_cnt.squeeze(-1) == 0)
 
-        routed = self.base.routing(caps, caps_mask)  # (B,4,E)
+        cap_in = self.base.caps_in_proj(caps) 
+        routed = self.base.routing(cap_in, caps_mask)
+        routed = self.base.caps_out_proj(routed) 
         routed = F.layer_norm(routed, (E,))
 
         routed_mean = routed.mean(dim=1)
@@ -910,8 +959,14 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         tdError: Optional[torch.Tensor],
         uncertainty: Optional[torch.Tensor],
         delta: Dict[str, Optional[torch.Tensor]],) -> torch.Tensor:
+
         mhsa = blk.mhsa
-        B, S, _ = x.shape
+        B, S, E = x.shape
+
+        residual0 = x
+        x_norm = blk.norm(x)
+
+        mhsa.EnsureB(B, device=x_norm.device, dtype=x_norm.dtype)
 
         def eff_linear(weight: torch.Tensor, adapter, d2: Optional[torch.Tensor]):
             W = weight
@@ -927,63 +982,69 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         Wv = eff_linear(mhsa.v_proj.weight, mhsa.v_adapter, delta.get("v"))
         Wo = eff_linear(mhsa.out_proj.weight, mhsa.o_adapter, delta.get("o"))
 
-        neuromod = mhsa.ComputeNeuromodulation(tdError, B)
+        neuromod = mhsa.ComputeNeuromodulation(tdError, B) 
+        tau, bias = mhsa.ModulateTauBias(tdError, uncertainty, B) 
 
-        q_lin = F.linear(x, Wq, mhsa.q_proj.bias)
-        k_lin = F.linear(x, Wk, mhsa.k_proj.bias)
-        v_lin = F.linear(x, Wv, mhsa.v_proj.bias)
+        q_lin = F.linear(x_norm, Wq, mhsa.q_proj.bias)
+        k_lin = F.linear(x_norm, Wk, mhsa.k_proj.bias)
+        v_lin = F.linear(x_norm, Wv, mhsa.v_proj.bias)
 
-        q = q_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
+        q = q_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2) 
         k = k_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
         v = v_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
 
-        if mhsa.training and mhsa.update_hebbian_flag and mhsa.base_hebbian_rate > 0:
-            mhsa.hebb_step.add_(1)
-            if int(mhsa.hebb_step.item()) % mhsa.hebb_period == 0:
-                alpha = float(mhsa.base_hebbian_rate * neuromod.mean())
-                if keyPaddingMask is not None:
-                    keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, S, 1)  # (B,1,S,1)
-                    v_upd, q_upd = v * keep4, q * keep4
-                else:
-                    v_upd, q_upd = v, q
-                mhsa.UpdateHebbianWeights(v_upd, q_upd, alpha)
+        if mhsa.training and mhsa.use_hebbian and mhsa.base_hebbian_rate > 0:
+            alpha = mhsa.base_hebbian_rate * neuromod  
+            if keyPaddingMask is not None:
+                keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, S, 1)
+                mhsa.UpdateHebbianWeights(v, q, alpha, keep4=keep4)
+            else:
+                mhsa.UpdateHebbianWeights(v, q, alpha, keep4=None)
 
         q = q * neuromod
-        if mhsa.use_low_rank:
-            vU = torch.einsum("bhse,her->bhsr", v, mhsa.U)
-            delt = torch.einsum("bhsr,hdr->bhsd", vU, mhsa.V)
-            v_fast = v + delt
-        else:
-            v_fast = torch.einsum("bhse,hde->bhsd", v, mhsa.hebbian_weights)
-
-        tau, bias = mhsa.ModulateTauBias(tdError, uncertainty, B)
         q = q / tau
+
+        if mhsa.use_low_rank:
+            v_proj = torch.einsum("bhsd,bhdr->bhsr", v, mhsa.V) 
+            delt = torch.einsum("bhsr,bhrd->bhsd", v_proj, mhsa.U.transpose(-2, -1)) 
+        else:
+            delt = torch.einsum("bhsd,bhde->bhse", v, mhsa.hebbian_weights) 
+
+        v_fast = v + delt
 
         d = q.size(-1)
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
         scores = scores + bias
+
         if keyPaddingMask is not None:
-            mask = keyPaddingMask[:, None, None, :]
-            mask_val = torch.tensor(-1e9 if q.dtype != torch.float16 else -1e4, dtype=q.dtype, device=q.device)
+            mask = keyPaddingMask[:, None, None, :] 
+            mask_val = torch.tensor(-1e9 if q.dtype != torch.float16 else -1e4,dtype=q.dtype, device=q.device)
             scores = scores.masked_fill(mask, mask_val)
 
         weights = F.softmax(scores, dim=-1)
-        weights = F.dropout(weights, p=mhsa.attn_dropout_p if mhsa.training else 0.0, training=mhsa.training)
-        context = torch.matmul(weights, v_fast)
-        out = context.transpose(1, 2).reshape(B, S, mhsa.embed_dim)
+        weights = F.dropout(weights, p=mhsa.attn_dropout_p if mhsa.training else 0.0,training=mhsa.training)
+        context = torch.matmul(weights, v_fast) 
+        out = context.transpose(1, 2).reshape(B, S, mhsa.embed_dim) 
 
         mhsa_out = F.linear(out, Wo, mhsa.out_proj.bias)
 
-        ssm_out = blk.ssm(x, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty)
-        w = torch.sigmoid(blk.mix_gate(x))
-        y = w * mhsa_out + (1 - w) * ssm_out
+        ssm_out = blk.ssm(x_norm, keyPaddingMask=keyPaddingMask,tdError=tdError, uncertainty=uncertainty)
 
-        out = blk.norm(x + blk.dropout(y))
+        w = torch.sigmoid(blk.mix_gate(x_norm))
+        y = w * mhsa_out + (1.0 - w) * ssm_out
+
+        x1 = residual0 + blk.dropout(y) * blk.gamma
+
+        residual1 = x1
+        x1_norm = blk.norm_ffn(x1)
+        ffn_out = blk.ffn(x1_norm)
+        out2 = residual1 + blk.dropout(ffn_out) * blk.gamma_ffn
+
         if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).unsqueeze(-1).to(out.dtype) 
-            out = out * keep
-        return out
+            keep = (~keyPaddingMask).unsqueeze(-1).to(out2.dtype)
+            out2 = out2 * keep
 
+        return out2
 
 
 class TestAttentionMTool:
@@ -1033,7 +1094,7 @@ class TestAttentionMTool:
         in_f = adapter.in_f
         delta = torch.zeros(out_f, in_f, device=adapter.A_list[0].device, dtype=adapter.A_list[0].dtype)
         for A, B, s in zip(adapter.A_list, adapter.B_list, adapter.alpha):
-            s_eff = torch.tanh(s.detach()) * GetParameterSScale(s.detach())
+            s_eff = torch.tanh(s.detach()) * GetParametersScale(s.detach())
             delta = delta + s_eff * (B @ A)
         return delta
 
@@ -1061,10 +1122,10 @@ class TestAttentionMTool:
             attn = MultiHeadAttention(embedDim=self.E, numHeads=self.H, lowRank=True, rank=self.R).to(self.device)
             y1 = attn(x, x, x, keyPaddingMask=kpm, tdError=None)
             assert y1.shape == (self.B, self.S, self.E)
-            attn.LowrankToFullrank(residual=True)
+            attn.LowrankToFullrank()
             y2 = attn(x, x, x, keyPaddingMask=kpm, tdError=None)
             assert y2.shape == (self.B, self.S, self.E)
-            attn.FullrankToLowrank(residual=True)
+            attn.FullrankToLowrank()
             y3 = attn(x, x, x, keyPaddingMask=kpm, tdError=None)
             assert y3.shape == (self.B, self.S, self.E)
             print("MultiHeadAttention test passed.")
@@ -1603,25 +1664,70 @@ class TestAttentionMTool:
     def LowrankFullrankConsistency(self):
         try:
             torch.manual_seed(9)
+
             attn = MultiHeadAttention(embedDim=64, numHeads=4, lowRank=True, rank=4, useHebbian=True).to(self.device)
             attn.eval()
-            B,S,E = 2, 12, 64
+
+            B, S, E = 2, 12, 64
             x = torch.randn(B, S, E, device=self.device)
-            with torch.no_grad():
-                y_low = attn(x, x, x, keyPaddingMask=None, tdError=None)
-                attn.LowrankToFullrank(residual=True)
-                y_full = attn(x, x, x, keyPaddingMask=None, tdError=None)
-            max_abs = (y_low - y_full).abs().max().item()
-            assert max_abs < 1e-5, f"Low rank->full rank values are inconsistent, max_abs={max_abs:.3e}"
 
             with torch.no_grad():
-                attn.FullrankToLowrank(residual=True)
-                y_low2 = attn(x, x, x, keyPaddingMask=None, tdError=None)
-            max_abs2 = (y_full - y_low2).abs().max().item()
-            assert max_abs2 < 1e-5, f"Full rank-> low rank values are inconsistent, max_abs={max_abs2:.3e}"
+                for _ in range(2):
+                    _ = attn(x, x, x, keyPaddingMask=None, tdError=torch.randn(B, 1, device=self.device))
+
+            with torch.no_grad():
+                U0 = attn.U.detach().clone()
+                V0 = attn.V.detach().clone()
+                W0 = attn.hebbian_weights.detach().clone()
+                use_lr0 = bool(attn.use_low_rank)
+                use_hebb0 = bool(attn.use_hebbian)
+                rate0 = float(attn.base_hebbian_rate)
+
+            def restore_state(use_low_rank: bool):
+                attn.EnsureB(B, device=x.device, dtype=x.dtype)
+                attn.U.copy_(U0)
+                attn.V.copy_(V0)
+                attn.hebbian_weights.copy_(W0)
+                attn.use_low_rank = bool(use_low_rank)
+
+            def forward_freeze_hebbian_update():
+                old_use = attn.use_hebbian
+                old_rate = attn.base_hebbian_rate
+                attn.use_hebbian = False 
+                try:
+                    return attn(x, x, x, keyPaddingMask=None, tdError=None)
+                finally:
+                    attn.use_hebbian = old_use
+                    attn.base_hebbian_rate = old_rate
+
+            with torch.no_grad():
+                restore_state(use_low_rank=True)
+                y_low = forward_freeze_hebbian_update()
+
+                restore_state(use_low_rank=True)
+                attn.LowrankToFullrank()
+                y_full = forward_freeze_hebbian_update()
+
+                max_abs = (y_low - y_full).abs().max().item()
+                assert max_abs < 1e-5, (
+                    f"[TestAttentionMTool.LowrankFullrankConsistency] "
+                    f"Low rank->full rank values inconsistent, max_abs={max_abs:.3e}")
+
+                restore_state(use_low_rank=True)
+                attn.LowrankToFullrank()
+                y_full2 = forward_freeze_hebbian_update()
+
+                attn.FullrankToLowrank()
+                y_low2 = forward_freeze_hebbian_update()
+
+                max_abs2 = (y_full2 - y_low2).abs().max().item()
+                assert max_abs2 < 1e-5, (
+                    f"[TestAttentionMTool.LowrankFullrankConsistency] "
+                    f"Full rank->low rank values inconsistent, max_abs={max_abs2:.3e}")
 
             print("LowrankFullrankConsistency passed.")
             return True
+
         except AssertionError as e:
             print(f"LowrankFullrankConsistency failed: {e}")
             return False
@@ -1631,7 +1737,7 @@ class TestAttentionMTool:
 
     def HebbianMemoryLifecycleAttention(self):
         try:
-            attn = MultiHeadAttention(embedDim=64, numHeads=4, lowRank=True, rank=4,useHebbian=True, hebbianRate=0.05, hebbPeriod=1).to(self.device)
+            attn = MultiHeadAttention(embedDim=64, numHeads=4, lowRank=True, rank=4,useHebbian=True, hebbianRate=0.05).to(self.device)
             attn.train()
             B,S,E = 2, 10, 64
             x = torch.randn(B, S, E, device=self.device)
