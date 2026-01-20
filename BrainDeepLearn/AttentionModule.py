@@ -7,20 +7,6 @@ from typing import Optional, Tuple, List, Dict
 from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule
 
 
-def SquashNoBatch(
-    t: Optional[torch.Tensor],
-    B: int,
-    device,
-    scale: float,
-    clip: float = 10.0,
-    dtype=torch.float32) -> torch.Tensor:
-
-    if t is None:
-        return torch.zeros(B, 1, device=device, dtype=dtype)
-    t = t.detach().to(device=device, dtype=dtype).reshape(B, 1)
-    t = (t / float(scale)).clamp(-clip, clip)
-    return torch.tanh(t)
-
 class GrowableLoRALinear(nn.Module):
     def __init__(self, targetLinear: nn.Linear):
         super().__init__()
@@ -106,16 +92,6 @@ class SelectiveSSM(AGICoreModule):
         nn.init.xavier_uniform_(self.param_proj.weight, gain=0.5)
         nn.init.zeros_(self.param_proj.bias)
 
-    def ZscoreTanh(self, t: Optional[torch.Tensor], B: int, dev, dtype=torch.float32) -> torch.Tensor:
-        if t is None:
-            return torch.zeros(B, 1, device=dev, dtype=dtype)
-        t = t.detach().float().reshape(B, 1)
-        if B == 1:
-            return torch.tanh(t)
-        mu = t.mean(dim=0, keepdim=True)
-        sd = t.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
-        return torch.tanh((t - mu) / sd)
-
     def CausalDwconv(self, u: torch.Tensor) -> torch.Tensor:
         B, S, E = u.shape
         x = u.transpose(1, 2) 
@@ -128,17 +104,15 @@ class SelectiveSSM(AGICoreModule):
 
     def forward(
         self,
-        x: torch.Tensor, # (B,S,E)
-        keyPaddingMask: Optional[torch.Tensor] = None,  # (B,S) bool，True=padding
-        tdError: Optional[torch.Tensor] = None, 
-        uncertainty: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x: torch.Tensor, # [B,S,E]
+        tdError: torch.Tensor, # [B]
+        uncertainty: torch.Tensor,# [B]
+        keyPaddingMask: Optional[torch.Tensor] = None,  # [B,S] bool，True=padding
+        ) -> torch.Tensor:
         B, S, E = x.shape
         N = self.N
 
-        td_z = SquashNoBatch(tdError,B, self.device, scale=5.0, dtype=self.dtype)
-        unc_z = SquashNoBatch(uncertainty, B, self.device, scale=5.0, dtype=self.dtype)
-
-        mod = torch.sigmoid(0.75 * td_z - 0.75 * unc_z) 
+        mod = torch.sigmoid(0.75 * tdError - 0.75 * uncertainty) 
 
         u_and_g = self.in_proj(x)
         u, g = torch.chunk(u_and_g, 2, dim=-1)
@@ -146,7 +120,7 @@ class SelectiveSSM(AGICoreModule):
 
         u = u + 0.5 * self.CausalDwconv(u)
 
-        gate_bias = (0.5 * td_z - 0.5 * unc_z).unsqueeze(-1) 
+        gate_bias = (0.5 * tdError - 0.5 * uncertainty).view(B, 1, 1)
         g = torch.sigmoid(g + gate_bias) 
 
         p = self.param_proj(u) 
@@ -206,7 +180,7 @@ class MultiHeadAttention(AGICoreModule):
         numHeads: int, 
         hebbianRate: float = 0.01,
         attnDropout: float = 0.1, 
-        tdScale: float = 5.0, 
+        tdUncScale: float = 1.0, 
         lowRank: bool = True,
         rank: int = 8, 
         useHebbian: bool = True,):
@@ -217,7 +191,7 @@ class MultiHeadAttention(AGICoreModule):
         self.head_dim = embedDim // numHeads
         self.base_hebbian_rate = hebbianRate
         self.attn_dropout_p = attnDropout
-        self.td_scale = tdScale
+        self.td_unc_scale = tdUncScale
         self.rank = min(int(rank), self.head_dim)
         self.use_hebbian = useHebbian
         self.uv_decay = 1e-2 
@@ -259,13 +233,9 @@ class MultiHeadAttention(AGICoreModule):
                  self.U.normal_(0.0, 1e-3)
                  self.V.normal_(0.0, 1e-3)
 
-    def ModulateTauBias(self, tdError, uncertainty, B):
-        td_z = SquashNoBatch(tdError, B, self.device, scale=self.td_scale, dtype=self.dtype)  
-        unc_z = SquashNoBatch(uncertainty, B, self.device, scale=self.td_scale, dtype=self.dtype) 
-
-        tau = 1.0 + 0.5 * torch.tanh(self.temp_w_td * td_z + self.temp_w_unc * unc_z) 
-        bias = 0.5 * torch.tanh(self.bias_w_td * td_z + self.bias_w_unc * unc_z) 
-        return tau.view(B,1,1,1), bias.view(B,1,1,1)
+    def ModulateTau(self, tdError, uncertainty, B):
+        tau = 1.0 + 0.5 * torch.tanh(self.temp_w_td * tdError + self.temp_w_unc * uncertainty) 
+        return tau.view(B,1,1,1)
 
 
     def ResetParameters(self) -> None:
@@ -291,10 +261,10 @@ class MultiHeadAttention(AGICoreModule):
 
     def ScaledDotAttn(
         self,
-        q: torch.Tensor, # (B, H, Lq, D)
-        k: torch.Tensor, # (B, H, Lk, D)
-        v: torch.Tensor, # (B, H, Lk, D)
-        mask: Optional[torch.Tensor], # (B, 1, 1, Lk)
+        q: torch.Tensor, # [B, H, Lq, D]
+        k: torch.Tensor, # [B, H, Lk, D]
+        v: torch.Tensor, # [B, H, Lk, D]
+        mask: Optional[torch.Tensor], # [B, 1, 1, Lk]
         dropoutP: float,) -> Tuple[torch.Tensor, torch.Tensor]:
 
         d = q.size(-1)
@@ -308,9 +278,8 @@ class MultiHeadAttention(AGICoreModule):
         return context, weights
 
 
-    def ComputeNeuromodulation(self, tdError: Optional[torch.Tensor], B: int) -> torch.Tensor:
-        td_z = SquashNoBatch(tdError, B, self.device, scale=self.td_scale, dtype=self.dtype) 
-        neuromod = 1.0 + 0.5 * td_z  
+    def ComputeNeuromodulation(self, tdError: torch.Tensor, B: int) -> torch.Tensor:
+        neuromod = 1.0 + 0.5 * tdError
         return neuromod.view(B, 1, 1, 1)
 
 
@@ -352,7 +321,7 @@ class MultiHeadAttention(AGICoreModule):
 
             M1 = (1.0 - decay) * M0 + alpha_tensor * hebb
 
-            M1_f = M1.float()
+            M1_f = M1
             U_s, S, Vh = torch.linalg.svd(M1_f, full_matrices=False)
 
             Sr = S[..., :r].clamp_min(0.0) 
@@ -371,11 +340,11 @@ class MultiHeadAttention(AGICoreModule):
             self.hebbian_weights.copy_(W_new)
 
 
-    def forward(self, query, key, value, keyPaddingMask: Optional[torch.Tensor]=None, tdError: Optional[torch.Tensor]=None, uncertainty: Optional[torch.Tensor]=None):
+    def forward(self, query, key, value, tdError: torch.Tensor, uncertainty: torch.Tensor, keyPaddingMask: Optional[torch.Tensor] = None):
         B, L, _ = query.shape
         self.EnsureB(B, device=self.device, dtype=self.dtype)
 
-        neuromod = self.ComputeNeuromodulation(tdError, B)
+        neuromod = self.ComputeNeuromodulation(tdError * self.td_unc_scale , B)
 
         q_lin = self.q_adapter(query) 
         k_lin = self.k_adapter(key)
@@ -403,14 +372,13 @@ class MultiHeadAttention(AGICoreModule):
 
         v_fast = v + delt
 
-        tau, bias = self.ModulateTauBias(tdError, uncertainty, B)
+        tau = self.ModulateTau(tdError * self.td_unc_scale , uncertainty * self.td_unc_scale , B)
         q = q / tau
 
         d = q.size(-1)
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
-        scores = scores + bias
         if keyPaddingMask is not None:
-            mask = keyPaddingMask[:, None, None, :]  # bool (B,1,1,L)
+            mask = keyPaddingMask[:, None, None, :]  # bool [B,1,1,L]
             mask_val = torch.tensor(-1e9 if q.dtype != torch.float16 else -1e4, dtype=q.dtype, device=q.device)
             scores = scores.masked_fill(mask, mask_val)
 
@@ -426,7 +394,7 @@ class MultiHeadAttention(AGICoreModule):
 
     @torch.no_grad()
     def LowrankToFullrank(self):
-        W = torch.einsum('bhdr,bher->bhde', self.U, self.V) # (B,H,D,D)
+        W = torch.einsum('bhdr,bher->bhde', self.U, self.V) # [B,H,D,D]
         
         if self.hebbian_weights.shape != W.shape:
              self.hebbian_weights = torch.empty_like(W)
@@ -435,7 +403,7 @@ class MultiHeadAttention(AGICoreModule):
         
     @torch.no_grad()
     def FullrankToLowrank(self):
-        M = self.hebbian_weights.clone() # (B,H,D,D)
+        M = self.hebbian_weights.clone() # [B,H,D,D]
 
         U_s, S, Vh = torch.linalg.svd(M, full_matrices=False) 
         r = self.U.size(-1)
@@ -455,8 +423,8 @@ class TemporalAttention(AGICoreModule):
     def __init__(self, embedDim: int, numHeads: int, layerIdx: int = 0, useHebbian: bool = True):
         super().__init__()
 
-        td_scale = 5.0 / (layerIdx + 1)
-        self.mhsa = MultiHeadAttention(embedDim, numHeads, tdScale=td_scale, useHebbian=useHebbian)
+        td_unc_scale = 1.0 / (layerIdx + 1)
+        self.mhsa = MultiHeadAttention(embedDim, numHeads, tdUncScale=td_unc_scale, useHebbian=useHebbian)
         self.ssm = SelectiveSSM(embedDim, stateDim=16, convKernel=4, useCausalConv=True)
 
         self.gamma = nn.Parameter(1e-1 * torch.ones(embedDim), requires_grad=True)
@@ -479,7 +447,7 @@ class TemporalAttention(AGICoreModule):
         self.norm = nn.LayerNorm(embedDim)
         self.norm_ffn = nn.LayerNorm(embedDim)
 
-    def forward(self, x, keyPaddingMask: Optional[torch.Tensor]=None, tdError: Optional[torch.Tensor]=None, uncertainty: Optional[torch.Tensor]=None):
+    def forward(self, x, tdError: torch.Tensor, uncertainty: torch.Tensor, keyPaddingMask: Optional[torch.Tensor]=None,):
         residual = x
         x_norm = self.norm(x)
         
@@ -487,9 +455,9 @@ class TemporalAttention(AGICoreModule):
 
         ssm_out = self.ssm(x_norm, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty)
 
-        w = torch.sigmoid(self.mix_gate(x_norm)) # (B,S,1)
+        w = torch.sigmoid(self.mix_gate(x_norm)) # [B,S,1]
 
-        y = w * mhsa_out + (1 - w) * ssm_out # (B,S,E)
+        y = w * mhsa_out + (1 - w) * ssm_out # [B,S,E]
 
         x = residual + self.dropout(y) * self.gamma
 
@@ -501,7 +469,7 @@ class TemporalAttention(AGICoreModule):
         out = residual + self.dropout(ffn_out) * self.gamma_ffn
 
         if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).unsqueeze(-1).to(out.dtype)  # (B,S,1)
+            keep = (~keyPaddingMask).unsqueeze(-1).to(out.dtype)  # [B,S,1]
             out = out * keep
         return out
 
@@ -542,7 +510,7 @@ class DynamicRouting(AGICoreModule):
             logits = logits.masked_fill(mask.unsqueeze(-1), -1e9)
 
         for r in range(self.iterations):
-            weights = torch.softmax(logits, dim=-1)  # (B,I,O)
+            weights = torch.softmax(logits, dim=-1)  # [B,I,O]
 
             if mask is not None:
                 weights = weights.masked_fill(mask.unsqueeze(-1), 0.0)
@@ -602,7 +570,7 @@ class HebbianFusion(AGICoreModule):
         if self.hebbian_memory.shape[0] != B:
             self.hebbian_memory = torch.zeros(B, self.num_modes, self.embed_dim, self.embed_dim, device=device, dtype=dtype)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor: # inputs:(B,M,E)
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor: # inputs:[B,M,E]
         B, M, E = inputs.shape
 
         self.EnsureB(B, self.device, self.dtype)
@@ -613,21 +581,21 @@ class HebbianFusion(AGICoreModule):
         else:
             effW = self.base_weights.unsqueeze(0)
 
-        weighted = torch.einsum("bme,bmef->bmf", inputs, effW) # (B,M,E)
+        weighted = torch.einsum("bme,bmef->bmf", inputs, effW) # [B,M,E]
 
-        alpha = torch.softmax(self.ctx_q(inputs).squeeze(-1) / math.sqrt(self.embed_dim), dim=1) # (B,M)
+        alpha = torch.softmax(self.ctx_q(inputs).squeeze(-1) / math.sqrt(self.embed_dim), dim=1) # [B,M]
         context = torch.einsum("bme,bm->be", inputs, alpha).unsqueeze(1).expand(-1, M, -1)   
 
-        gate_in = torch.cat([inputs, context, inputs - context, inputs * context], dim=-1) # (B,M,4E)
-        gate_logits = self.gate_head(gate_in).squeeze(-1) # (B,M)
-        gate_w = torch.softmax(gate_logits, dim=-1) # (B,M)
+        gate_in = torch.cat([inputs, context, inputs - context, inputs * context], dim=-1) # [B,M,4E]
+        gate_logits = self.gate_head(gate_in).squeeze(-1) # [B,M]
+        gate_w = torch.softmax(gate_logits, dim=-1) # [B,M]
 
-        fused = torch.einsum("bmf,bm->bf", weighted, gate_w) # (B,E)
+        fused = torch.einsum("bmf,bm->bf", weighted, gate_w) # [B,E]
 
         if self.use_hebbian and self.hebbian_rate > 0:
             with torch.no_grad():
                 norm = math.sqrt(E)
-                hebb_term = torch.einsum("bme,bf->bmef", inputs.float(), fused.float()) / (norm + 1e-8)
+                hebb_term = torch.einsum("bme,bf->bmef", inputs, fused) / (norm + 1e-8)
                 mem_new = (1.0 - self.hebbian_rate) * self.hebbian_memory + self.hebbian_rate * hebb_term
                 self.hebbian_memory.copy_(mem_new)
 
@@ -691,12 +659,19 @@ class AttentionExtractor(AGICoreModule):
 
     def forward(
         self,
-        x: torch.Tensor, # (B,S,E)
+        x: torch.Tensor, # [B,S,E]
         keyPaddingMask: Optional[torch.Tensor] = None,
-        tdError: Optional[torch.Tensor] = None,
-        uncertainty: Optional[torch.Tensor]=None,) -> torch.Tensor: # (B,) or scalar
+        tdError: Optional[torch.Tensor] = None, # [-1 ,1] [B]
+        uncertainty: Optional[torch.Tensor]=None, # [0 ,1] [B]
+        ) -> torch.Tensor: # [B] or scalar
         
         B, S, E = x.shape
+
+        if tdError is None:
+            tdError = x.new_zeros(B, device=self.device, dtype=self.dtype) 
+
+        if uncertainty is None:
+            uncertainty = x.new_zeros(B, device=self.device, dtype=self.dtype) 
 
         # Handle sequence padding
         if S % self.num_caps != 0:
@@ -707,41 +682,41 @@ class AttentionExtractor(AGICoreModule):
             S = x.size(1)
 
         if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).unsqueeze(-1).to(x.dtype)
+            keep = (~keyPaddingMask).unsqueeze(-1)
             x = x * keep
         
         # Use detached version of tdError for checkpointing
-        #td_error_detached = tdError.detach() if tdError is not None else None
+        # td_error_detached = tdError.detach() if tdError is not None else None
         for blk in self.temporal_blocks:
-            x = blk(x, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty= uncertainty)
+            x = blk(x, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty)
 
         # Create capsule mask
         chunk = S // self.num_caps
 
         if keyPaddingMask is not None:
-            seg_mask = keyPaddingMask.reshape(B, self.num_caps, chunk) # (B,I,chunk)
+            seg_mask = keyPaddingMask.reshape(B, self.num_caps, chunk) # [B,I,chunk]
         else:
             seg_mask = x.new_zeros(B, self.num_caps, chunk, dtype=torch.bool)
 
-        valid = (~seg_mask).float()                                  
-        valid_cnt = valid.sum(dim=2, keepdim=True) # (B,I,1)
+        valid = (~seg_mask)                                  
+        valid_cnt = valid.sum(dim=2, keepdim=True) # [B,I,1]
         valid_cnt_safe = valid_cnt.clamp_min(1.0)
 
-        h_seg = x.reshape(B, self.num_caps, chunk, E) # (B,I,chunk,E)
-        caps = (h_seg * valid.unsqueeze(-1)).sum(dim=2) / valid_cnt_safe # (B,I,E) masked mean
+        h_seg = x.reshape(B, self.num_caps, chunk, E) # [B,I,chunk,E]
+        caps = (h_seg * valid.unsqueeze(-1)).sum(dim=2) / valid_cnt_safe # [B,I,E] masked mean
         caps_mask = (valid_cnt.squeeze(-1) == 0)                      
 
         cap_in = self.caps_in_proj(caps)
-        routed = self.routing(cap_in, caps_mask) # (B,4,E)
+        routed = self.routing(cap_in, caps_mask) # [B,4,E]
         routed = self.caps_out_proj(routed)
         routed = F.layer_norm(routed, (E,))
 
         # Fusion of different representations
-        routed_mean = routed.mean(dim=1) # (B,E)
+        routed_mean = routed.mean(dim=1) # [B,E]
         
         if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).to(x.dtype).unsqueeze(-1)  # (B,S,1)
-            denom = keep.sum(dim=1, keepdim=True).clamp_min(1.0) # (B,1,1)
+            keep = (~keyPaddingMask).to(x.dtype).unsqueeze(-1)  # [B,S,1]
+            denom = keep.sum(dim=1, keepdim=True).clamp_min(1.0) # [B,1,1]
             temp_mean = (x * keep).sum(dim=1) / denom.squeeze(-1)  
         else:
             temp_mean = x.mean(dim=1)
@@ -749,18 +724,18 @@ class AttentionExtractor(AGICoreModule):
         fusion_in = torch.stack([
             temp_mean, 
             routed_mean, 
-            temp_mean + routed_mean], dim=1)  # (B,3,E)
+            temp_mean + routed_mean], dim=1)  # [B,3,E]
         
-        fused = self.fusion(fusion_in)  # (B,E)
+        fused = self.fusion(fusion_in)  # [B,E]
 
-        context = self.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))  # (B,E)
+        context = self.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))  # [B,E]
 
         logits = self.static_mixer(context).view(B, self.num_heads, 3)
-        strat_w = torch.softmax(logits, dim=-1)  # (B,H,3)
+        strat_w = torch.softmax(logits, dim=-1)  #[B,H,3]
 
-        feats = torch.stack([temp_mean, routed_mean, fused], dim=1)  # (B,3,E)
-        mixed_per_head = torch.einsum("bhs,bse->bhe", strat_w, feats)  # (B,H,E)
-        out = mixed_per_head.mean(dim=1)  # (B,E)
+        feats = torch.stack([temp_mean, routed_mean, fused], dim=1)  # [B,3,E]
+        mixed_per_head = torch.einsum("bhs,bse->bhe", strat_w, feats)  # [B,H,E]
+        out = mixed_per_head.mean(dim=1)  # [B,E]
 
         return self.output_proj(out)
 
@@ -848,8 +823,8 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         E = int(self.base.temporal_blocks[0].mhsa.embed_dim)
 
         def alloc_linear(addRank: int, device: torch.device, dtype: torch.dtype):
-            A = nn.Parameter(torch.randn(addRank, E, device=device, dtype=dtype) * 1e-4) # (r, inDim)
-            B = nn.Parameter(torch.zeros(E, addRank, device=device, dtype=dtype) * 1e-4) # (outDim, r)
+            A = nn.Parameter(torch.randn(addRank, E, device=device, dtype=dtype) * 1e-4) # [r, inDim]
+            B = nn.Parameter(torch.zeros(E, addRank, device=device, dtype=dtype) * 1e-4) # [outDim, r]
             s = nn.Parameter(torch.tensor(1e-2, device=device, dtype=dtype))
             return A, B, s
 
@@ -865,13 +840,20 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
 
     def ForwardWithDeltas(
         self,
-        x: torch.Tensor,  # (B,S,E)
+        x: torch.Tensor,  # [B,S,E]
         keyPaddingMask: Optional[torch.Tensor] = None,
         tdError: Optional[torch.Tensor] = None,
         uncertainty: Optional[torch.Tensor] = None,
         deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]] = None,
         **kwargs,) -> torch.Tensor:
         B, S, E = x.shape
+
+        if tdError is None:
+            tdError = x.new_zeros(B, device=self.base.device, dtype=self.base.dtype) 
+
+        if uncertainty is None:
+            uncertainty = x.new_zeros(B, device=self.base.device, dtype=self.base.dtype)  
+
         num_caps = int(self.base.num_caps)
 
         if S % num_caps != 0:
@@ -896,7 +878,7 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         else:
             seg_mask = h.new_zeros(B, num_caps, chunk, dtype=torch.bool)
 
-        valid = (~seg_mask).float()
+        valid = (~seg_mask)
         valid_cnt = valid.sum(dim=2, keepdim=True).clamp_min(1.0)
         h_seg = h.reshape(B, num_caps, chunk, E)
         caps = (h_seg * valid.unsqueeze(-1)).sum(dim=2) / valid_cnt
@@ -915,15 +897,15 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         else:
             temp_mean = h.mean(dim=1)
 
-        fusion_in = torch.stack([temp_mean, routed_mean, temp_mean + routed_mean], dim=1)  # (B,3,E)
+        fusion_in = torch.stack([temp_mean, routed_mean, temp_mean + routed_mean], dim=1)  # [B,3,E]
         fused = self.base.fusion(fusion_in)
 
-        context = self.base.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))  # (B,E)
+        context = self.base.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))  # [B,E]
 
         logits = self.base.static_mixer(context).view(B, self.base.num_heads, 3)
         strat_w = torch.softmax(logits, dim=-1)
 
-        feats = torch.stack([temp_mean, routed_mean, fused], dim=1)  # (B,3,E)
+        feats = torch.stack([temp_mean, routed_mean, fused], dim=1)  # [B,3,E]
         mixed_per_head = torch.einsum("bhs,bse->bhe", strat_w, feats)
         out = mixed_per_head.mean(dim=1)
 
@@ -955,9 +937,9 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         self,
         blk,
         x: torch.Tensor,
-        keyPaddingMask: Optional[torch.Tensor],
-        tdError: Optional[torch.Tensor],
-        uncertainty: Optional[torch.Tensor],
+        keyPaddingMask: torch.Tensor,
+        tdError: torch.Tensor,
+        uncertainty: torch.Tensor,
         delta: Dict[str, Optional[torch.Tensor]],) -> torch.Tensor:
 
         mhsa = blk.mhsa
@@ -982,8 +964,11 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         Wv = eff_linear(mhsa.v_proj.weight, mhsa.v_adapter, delta.get("v"))
         Wo = eff_linear(mhsa.out_proj.weight, mhsa.o_adapter, delta.get("o"))
 
-        neuromod = mhsa.ComputeNeuromodulation(tdError, B) 
-        tau, bias = mhsa.ModulateTauBias(tdError, uncertainty, B) 
+        td_eff  = tdError * mhsa.td_unc_scale
+        unc_eff = uncertainty * mhsa.td_unc_scale
+
+        neuromod = mhsa.ComputeNeuromodulation(td_eff, B) 
+        tau = mhsa.ModulateTau(td_eff, unc_eff, B) 
 
         q_lin = F.linear(x_norm, Wq, mhsa.q_proj.bias)
         k_lin = F.linear(x_norm, Wk, mhsa.k_proj.bias)
@@ -993,7 +978,7 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         k = k_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
         v = v_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
 
-        if mhsa.training and mhsa.use_hebbian and mhsa.base_hebbian_rate > 0:
+        if mhsa.use_hebbian and mhsa.base_hebbian_rate > 0:
             alpha = mhsa.base_hebbian_rate * neuromod  
             if keyPaddingMask is not None:
                 keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, S, 1)
@@ -1008,13 +993,12 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
             v_proj = torch.einsum("bhsd,bhdr->bhsr", v, mhsa.V) 
             delt = torch.einsum("bhsr,bhrd->bhsd", v_proj, mhsa.U.transpose(-2, -1)) 
         else:
-            delt = torch.einsum("bhsd,bhde->bhse", v, mhsa.hebbian_weights) 
+            delt = torch.einsum("bhse,bhde->bhsd", v, mhsa.hebbian_weights) 
 
         v_fast = v + delt
 
         d = q.size(-1)
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
-        scores = scores + bias
 
         if keyPaddingMask is not None:
             mask = keyPaddingMask[:, None, None, :] 
@@ -1104,7 +1088,8 @@ class TestAttentionMTool:
             x = torch.randn(self.B, self.S, self.E, device=self.device)
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
             kpm[:, -3:] = True
-            y = ssm(x, keyPaddingMask=kpm, tdError=torch.randn(self.B, 1, device=self.device))
+            unc = torch.randn(self.B, device=self.device)
+            y = ssm(x, keyPaddingMask=kpm, tdError=torch.randn(self.B, device=self.device), uncertainty = unc)
             assert y.shape == (self.B, self.S, self.E), f"Output shape mismatch: {y.shape}"
             print("SimpleSSM test passed.")
             return True
@@ -1119,14 +1104,15 @@ class TestAttentionMTool:
         try:
             x = torch.randn(self.B, self.S, self.E, device=self.device)
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device); kpm[:, -3:] = True
+            td_unc = torch.randn(self.B, device=self.device)
             attn = MultiHeadAttention(embedDim=self.E, numHeads=self.H, lowRank=True, rank=self.R).to(self.device)
-            y1 = attn(x, x, x, keyPaddingMask=kpm, tdError=None)
+            y1 = attn(x, x, x, keyPaddingMask=kpm, tdError=td_unc, uncertainty=td_unc)
             assert y1.shape == (self.B, self.S, self.E)
             attn.LowrankToFullrank()
-            y2 = attn(x, x, x, keyPaddingMask=kpm, tdError=None)
+            y2 = attn(x, x, x, keyPaddingMask=kpm, tdError=td_unc, uncertainty=td_unc)
             assert y2.shape == (self.B, self.S, self.E)
             attn.FullrankToLowrank()
-            y3 = attn(x, x, x, keyPaddingMask=kpm, tdError=None)
+            y3 = attn(x, x, x, keyPaddingMask=kpm, tdError=td_unc, uncertainty=td_unc)
             assert y3.shape == (self.B, self.S, self.E)
             print("MultiHeadAttention test passed.")
             return True
@@ -1142,7 +1128,7 @@ class TestAttentionMTool:
             x = torch.randn(self.B, self.S, self.E, device=self.device)
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
             ta = TemporalAttention(self.E, self.H, layerIdx=0, useHebbian=True).to(self.device)
-            y = ta(x, keyPaddingMask=kpm, tdError=torch.randn(self.B, 1, device=self.device))
+            y = ta(x, keyPaddingMask=kpm, tdError=torch.randn(self.B, device=self.device), uncertainty=torch.randn(self.B, device=self.device))
             assert y.shape == (self.B, self.S, self.E)
             print("TemporalAttention test passed.")
             return True
@@ -1189,7 +1175,7 @@ class TestAttentionMTool:
             model = AttentionExtractor(embedDim=self.E, sequenceLength=self.S, numHeads=self.H,temporalLayers=2, routingIterations=3, hebbianRate=0.01,useHebbian=True, gradientClipVal=0.5).to(self.device)
             x = torch.randn(self.B, self.S, self.E, device=self.device)
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device); kpm[:, -2:] = True
-            td = torch.randn(self.B, 1, device=self.device)
+            td = torch.randn(self.B, device=self.device)
             y = model(x, keyPaddingMask=kpm, tdError=td)
             assert y.shape == (self.B, self.E)
 
@@ -1214,7 +1200,7 @@ class TestAttentionMTool:
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
 
             x = torch.randn(8, 16, 64, device=self.device)
-            td = torch.randn(8, 1, device=self.device)
+            td = torch.randn(8, device=self.device)
             y = torch.randn(8, 12, device=self.device)
 
             out = model(x, keyPaddingMask=None, tdError=td)
@@ -1249,7 +1235,7 @@ class TestAttentionMTool:
 
             for t in range(steps):
                 x = torch.randn(8, 16, 64, device=self.device)
-                td = torch.randn(8, 1, device=self.device)
+                td = torch.randn(8, device=self.device)
                 y = torch.randn(8, 12, device=self.device)
 
                 pred = head(model(x, tdError=td))
@@ -1288,7 +1274,7 @@ class TestAttentionMTool:
 
             for _ in range(steps):
                 x = torch.randn(8, 16, 64, device=self.device)
-                td = torch.randn(8, 1, device=self.device)
+                td = torch.randn(8, device=self.device)
                 y = torch.randn(8, 12, device=self.device)
                 pred = head(model(x, tdError=td))
                 loss = F.mse_loss(pred, y)
@@ -1321,7 +1307,7 @@ class TestAttentionMTool:
             B = 16
             data_x = torch.randn(B, 16, 64, device=self.device)
             data_y = torch.randn(B, 12, device=self.device)
-            data_td = torch.randn(B, 1, device=self.device)
+            data_td = torch.randn(B, device=self.device)
 
             with torch.no_grad():
                 start = F.mse_loss(head(model(data_x, tdError=data_td)), data_y).item()
@@ -1422,7 +1408,7 @@ class TestAttentionMTool:
 
             for _ in range(6):
                 x = torch.randn(8, 16, 64, device=self.device)
-                td = torch.randn(8, 1, device=self.device)
+                td = torch.randn(8, device=self.device)
                 y = torch.randn(8, 12, device=self.device)
 
                 pred = head(wrapper(x, tdError=td))
@@ -1502,7 +1488,7 @@ class TestAttentionMTool:
 
             for _ in range(8):
                 x = torch.randn(16, 16, 64, device=self.device)
-                td = torch.randn(16, 1, device=self.device)
+                td = torch.randn(16, device=self.device)
                 y = torch.randn(16, 12, device=self.device)
 
                 pred = head(wrapper(x, tdError=td))
@@ -1561,7 +1547,7 @@ class TestAttentionMTool:
             opt = torch.optim.Adam(list(head.parameters()) + list(wrapper.CandParameters()), lr=1e-3)
 
             x  = torch.randn(6, 16, 64, device=self.device)
-            td = torch.randn(6, 1, device=self.device)
+            td = torch.randn(6, device=self.device)
             y  = torch.randn(6, 10, device=self.device)
 
             pred = head(wrapper(x, tdError=td))
@@ -1593,7 +1579,7 @@ class TestAttentionMTool:
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
 
             x  = torch.randn(8, 16, 64, device=self.device)
-            td = torch.randn(8, 1, device=self.device)
+            td = torch.randn(8, device=self.device)
             y  = torch.randn(8, 12, device=self.device)
 
             pred = head(model(x, tdError=td))
@@ -1673,7 +1659,7 @@ class TestAttentionMTool:
 
             with torch.no_grad():
                 for _ in range(2):
-                    _ = attn(x, x, x, keyPaddingMask=None, tdError=torch.randn(B, 1, device=self.device))
+                    _ = attn(x, x, x, keyPaddingMask=None, tdError=torch.zeros(B, device=self.device), uncertainty=torch.zeros(B, device=self.device))
 
             with torch.no_grad():
                 U0 = attn.U.detach().clone()
@@ -1695,7 +1681,7 @@ class TestAttentionMTool:
                 old_rate = attn.base_hebbian_rate
                 attn.use_hebbian = False 
                 try:
-                    return attn(x, x, x, keyPaddingMask=None, tdError=None)
+                    return attn(x, x, x, keyPaddingMask=None, tdError=torch.zeros(B, device=self.device), uncertainty=torch.zeros(B, device=self.device))
                 finally:
                     attn.use_hebbian = old_use
                     attn.base_hebbian_rate = old_rate
@@ -1744,7 +1730,7 @@ class TestAttentionMTool:
 
             U0 = attn.U.norm().item(); V0 = attn.V.norm().item()
             for _ in range(3):
-                _ = attn(x, x, x, tdError=torch.randn(B, 1, device=self.device))
+                _ = attn(x, x, x, tdError=torch.randn(B, device=self.device), uncertainty=torch.randn(B, device=self.device))
             U1 = attn.U.norm().item(); V1 = attn.V.norm().item()
             assert U1 > U0 + 1e-8 and V1 > V0 + 1e-8, "MHSA Hebbian(U/V) not growing"
 
@@ -1791,7 +1777,7 @@ class TestAttentionMTool:
             head = nn.Linear(64, 12).to(self.device)
             model.eval(); head.train()
             x = torch.randn(1, 16, 64, device=self.device)
-            td = torch.randn(1, 1, device=self.device)
+            td = torch.randn(1, device=self.device)
             y = torch.randn(1, 12, device=self.device)
 
             pred = head(model(x, tdError=td))

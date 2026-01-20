@@ -47,7 +47,7 @@ class GrowableLoRAConv2d(nn.Module):
         self.B_list = nn.ParameterList() 
         self.alpha = nn.ParameterList()
 
-        w = self.target.weight
+        w = self.target.weight # [cout, cin, kh, kw]
         self.cout, self.cin, self.kh, self.kw = w.shape
 
     @torch.no_grad()
@@ -57,7 +57,7 @@ class GrowableLoRAConv2d(nn.Module):
 
         factory = {"device": self.target.weight.device, "dtype": self.target.weight.dtype}
 
-        A = init.get("A", torch.randn(addRank, self.cin * ksz, **factory) * 1e-4)
+        A = init.get("A", torch.randn(addRank, self.cin * ksz, **factory) * 1e-4) 
         B = init.get("B", torch.zeros(self.cout, addRank, **factory))
         s = init.get("scale", 1e-3)
 
@@ -324,8 +324,7 @@ class HebbianConv2d(AGICoreModule):
     def EnsureB(self, B: int, device, dtype):
         w = self.conv.weight
         target_shape = (B, w.size(0), w.size(1), w.size(2), w.size(3)) 
-        if (self.hebb_memory.numel() == 0) or (self.hebb_memory.shape != target_shape) \
-           or (self.hebb_memory.device != device) or (self.hebb_memory.dtype != dtype):
+        if (self.hebb_memory.numel() == 0) or (self.hebb_memory.shape != target_shape):
             self.hebb_memory = torch.zeros(*target_shape, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -378,14 +377,14 @@ class HebbianConv2d(AGICoreModule):
                 x_unfold_g = x_unfold.reshape(B, g, in_per_g * (self.kernel_size[0] * self.kernel_size[1]), L)
                 out_unfold_g = out_unfold.reshape(B, g, outC // g, L)
 
-                xu = x_unfold_g.float()
-                yu = out_unfold_g.float()
+                xu = x_unfold_g
+                yu = out_unfold_g
 
                 hebb_term = torch.einsum("bgol,bgil->bgoi", yu, xu) / N
 
                 y2_mean = yu.square().sum(dim=-1) / N
 
-                mem = self.hebb_memory.reshape(B, g, outC // g, -1).float()
+                mem = self.hebb_memory.reshape(B, g, outC // g, -1)
                 decay = y2_mean.unsqueeze(-1) * mem
 
                 delta = self.hebb_rate * (hebb_term - decay) 
@@ -434,8 +433,7 @@ class HebbianLinear(AGICoreModule):
             self.hebb_memory = torch.empty(0, device=self.device, dtype=self.dtype)
 
     def EnsureB(self, B: int, device, dtype):
-        if (self.hebb_memory.numel() == 0) or (self.hebb_memory.shape != (B, self.outFeatures, self.inFeatures)) \
-           or (self.hebb_memory.device != device) or (self.hebb_memory.dtype != dtype):
+        if (self.hebb_memory.numel() == 0) or (self.hebb_memory.shape != (B, self.outFeatures, self.inFeatures)):
             self.hebb_memory = torch.zeros(B, self.outFeatures, self.inFeatures, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -465,14 +463,14 @@ class HebbianLinear(AGICoreModule):
                 yh2 = y_hat.reshape(B, -1, self.outFeatures) 
                 N = float(yh2.size(1)) if yh2.size(1) > 0 else 1.0
 
-                x32 = x2.float()
-                y32 = yh2.float()
+                x32 = x2
+                y32 = yh2
 
                 hebb_term = torch.einsum("bno,bni->boi", y32, x32) / N
 
                 y_sq_mean = y32.square().mean(dim=1)
 
-                decay = y_sq_mean.unsqueeze(-1) * self.hebb_memory.float()
+                decay = y_sq_mean.unsqueeze(-1) * self.hebb_memory
                 delta = self.hebb_rate * (hebb_term - decay)
                 delta = delta.to(self.hebb_memory.dtype)
 
@@ -602,16 +600,16 @@ class PerceiveExtractor(AGICoreModule):
             useHebbian=useHebbian)
 
         with torch.no_grad():
-            mods = [m for m in self.cnn_extractor.modules() if hasattr(m, "enable_hebbian_updates")]
-            old = [bool(m.enable_hebbian_updates) for m in mods]
-            for m in mods: m.enable_hebbian_updates = False
+            mods = [m for m in self.cnn_extractor.modules() if hasattr(m, "use_hebbian")]
+            old = [bool(m.use_hebbian) for m in mods]
+            for m in mods: m.use_hebbian = False
 
             dummy = torch.zeros(1, 3, imgSize, imgSize)
             fmap = self.cnn_extractor(dummy)
             Hf, Wf = fmap.shape[-2], fmap.shape[-1]
 
             for m, v in zip(mods, old):
-                m.enable_hebbian_updates = v
+                m.use_hebbian = v
 
         num_patches = (Hf // patchSize) ** 2
 

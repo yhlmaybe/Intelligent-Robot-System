@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import List, Tuple, Dict, Optional
-from FunctionTools import GetParameterSScale, SiteSpec, BaseOnlineWrapper
+from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper
 
 import torch
 import torch.nn as nn
@@ -55,7 +55,7 @@ class IntentionLoRALinear(nn.Module):
 
         delta = self.target.weight.new_zeros(self.out_f, self.in_f)
         for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-            delta = delta + torch.tanh(s) * GetParameterSScale(s) * (B @ A)
+            delta = delta + torch.tanh(s) * GetParametersScale(s) * (B @ A)
         return delta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -807,7 +807,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
             return alloc
 
         def compose(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
+            return torch.tanh(s) * GetParametersScale(s) * (b @ a)
 
         specs = {
             "sem": SiteSpec(

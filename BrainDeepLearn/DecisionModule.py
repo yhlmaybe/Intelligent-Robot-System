@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional, List, Any
-from FunctionTools import GetParameterSScale, SiteSpec, BaseOnlineWrapper
+from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper
 
 
 KEYBOARD_LAYOUT = {
@@ -131,7 +131,7 @@ class LoRALinearAdapter(nn.Module):
         if len(self.A_list) > 0:
             dW = W.new_zeros(self.out_f, self.in_f)
             for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-                s_eff = torch.tanh(s) * GetParameterSScale(s) 
+                s_eff = torch.tanh(s) * GetParametersScale(s) 
                 dW = dW + s_eff * (B @ A)
             W = W + dW
         return F.linear(x, W, self.target.bias)
@@ -173,7 +173,7 @@ class MatLoRAAdapter(nn.Module):
         if len(self.A_list) > 0:
             d = baseMatrix.new_zeros(self.M, self.N)
             for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-                s_eff = torch.tanh(s) * GetParameterSScale(s)
+                s_eff = torch.tanh(s) * GetParametersScale(s)
                 d = d + s_eff * (B @ A)
             M_eff = M_eff + d
         return M_eff
@@ -819,7 +819,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
             return A, B, s
 
         def compose_lin(a, b, s):
-            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
+            return torch.tanh(s) * GetParametersScale(s) * (b @ a)
 
         def alloc_mat(addRank, device, dtype, N, M):
             A = nn.Parameter(torch.randn(addRank, N, device=device, dtype=dtype) * 1e-4)
@@ -828,7 +828,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
             return A, B, s
 
         def compose_mat(a, b, s):
-            return torch.tanh(s) * GetParameterSScale(s) * (b @ a)
+            return torch.tanh(s) * GetParametersScale(s) * (b @ a)
 
         L = 1
 
@@ -1697,7 +1697,7 @@ class TestDecisionMTool:
             adap.Grow(addRank=3)
             y_aug = adap(x)
             A, B, s = adap.A_list[0], adap.B_list[0], adap.alpha[0]
-            s_eff = torch.tanh(s) * GetParameterSScale(s)
+            s_eff = torch.tanh(s) * GetParametersScale(s)
             delta = F.linear(x, s_eff * (B @ A), bias=None)
             diff = (y_aug - y_base - delta).abs().max().item()
             if diff >= 1e-5:
@@ -1724,8 +1724,8 @@ class TestDecisionMTool:
 
             A0, B0, s0 = adap.A_list[0], adap.B_list[0], adap.alpha[0]
             A1, B1, s1 = adap.A_list[1], adap.B_list[1], adap.alpha[1]
-            s0_eff = torch.tanh(s0) * GetParameterSScale(s0)
-            s1_eff = torch.tanh(s1) * GetParameterSScale(s1)
+            s0_eff = torch.tanh(s0) * GetParametersScale(s0)
+            s1_eff = torch.tanh(s1) * GetParametersScale(s1)
             expect = base + s0_eff * (B0 @ A0) + s1_eff * (B1 @ A1)
 
             err = (out1 - expect).abs().max().item()
@@ -1891,7 +1891,7 @@ class TestDecisionMTool:
 
             A_new, B_new, s_new = tgt.A_list[-1], tgt.B_list[-1], tgt.alpha[-1]
 
-            s_eff = torch.tanh(s_new) * GetParameterSScale(s_new)
+            s_eff = torch.tanh(s_new) * GetParametersScale(s_new)
             expect_delta = F.linear(h, s_eff * (B_new @ A_new), bias=None)
 
             err = (y_after - y_base - expect_delta).abs().max().item()
