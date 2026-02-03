@@ -281,6 +281,10 @@ class MultiHeadAttention(AGICoreModule):
     def ComputeNeuromodulation(self, tdError: torch.Tensor, B: int) -> torch.Tensor:
         neuromod = 1.0 + 0.5 * tdError
         return neuromod.view(B, 1, 1, 1)
+    
+    def ComputeHebbMod(self, tdError: torch.Tensor, uncertainty: torch.Tensor, B: int) -> torch.Tensor:
+        mod = ((tdError + 1.0) * 0.5) * (1.0 - uncertainty) # [B]
+        return mod.view(B, 1, 1, 1)
 
 
     @torch.no_grad()
@@ -345,6 +349,7 @@ class MultiHeadAttention(AGICoreModule):
         self.EnsureB(B, device=self.device, dtype=self.dtype)
 
         neuromod = self.ComputeNeuromodulation(tdError * self.td_unc_scale , B)
+        hebb_mod = self.ComputeHebbMod(tdError * self.td_unc_scale, uncertainty * self.td_unc_scale, B).to(self.dtype)
 
         q_lin = self.q_adapter(query) 
         k_lin = self.k_adapter(key)
@@ -355,7 +360,7 @@ class MultiHeadAttention(AGICoreModule):
         v = v_lin.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.use_hebbian and self.base_hebbian_rate > 0:
-            alpha = self.base_hebbian_rate * neuromod
+            alpha = self.base_hebbian_rate * hebb_mod
             if keyPaddingMask is not None:
                 keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, L, 1)
                 self.UpdateHebbianWeights(v, q, alpha, keep4=keep4)
@@ -370,6 +375,7 @@ class MultiHeadAttention(AGICoreModule):
         else:
             delt = torch.einsum("bhse,bhde->bhsd", v, self.hebbian_weights)
 
+        delt = delt * hebb_mod
         v_fast = v + delt
 
         tau = self.ModulateTau(tdError * self.td_unc_scale , uncertainty * self.td_unc_scale , B)
@@ -969,6 +975,7 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
 
         neuromod = mhsa.ComputeNeuromodulation(td_eff, B) 
         tau = mhsa.ModulateTau(td_eff, unc_eff, B) 
+        hebb_mod = mhsa.ComputeHebbMod(td_eff, unc_eff, B)
 
         q_lin = F.linear(x_norm, Wq, mhsa.q_proj.bias)
         k_lin = F.linear(x_norm, Wk, mhsa.k_proj.bias)
@@ -979,7 +986,7 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         v = v_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
 
         if mhsa.use_hebbian and mhsa.base_hebbian_rate > 0:
-            alpha = mhsa.base_hebbian_rate * neuromod  
+            alpha = mhsa.base_hebbian_rate * hebb_mod  
             if keyPaddingMask is not None:
                 keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, S, 1)
                 mhsa.UpdateHebbianWeights(v, q, alpha, keep4=keep4)
@@ -995,6 +1002,7 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         else:
             delt = torch.einsum("bhse,bhde->bhsd", v, mhsa.hebbian_weights) 
 
+        delt = delt * hebb_mod
         v_fast = v + delt
 
         d = q.size(-1)

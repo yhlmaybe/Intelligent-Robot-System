@@ -18,7 +18,7 @@ from torch.utils.data import Dataset, DataLoader
 from PerceptionModule import TestPerceptionMTool
 from AttentionModule import  TestAttentionMTool
 from MemoryModule import  TestMemoryMTool
-from DecisionModule import KEYBOARD_LAYOUT, TestDecisionMTool
+from DecisionModule import RAW_KEYBOARD_LAYOUT, TestDecisionMTool
 from WorldModule import  TestWorldMTool
 from ValueEstimationModule import  TestValueEstimationMTool
 from ConsciousnessModule import TestConsciousMTool
@@ -245,7 +245,7 @@ class ManagerFunction:
             mse = nn.MSELoss()
 
             all_codes = []
-            for grp in KEYBOARD_LAYOUT.values():
+            for grp in RAW_KEYBOARD_LAYOUT.values():
                 all_codes += list(grp.values())
 
             max_code = max(all_codes)
@@ -546,7 +546,7 @@ class ManagerFunction:
 
             code_to_name: dict[int, str] = {}
             all_codes = []
-            for grp, mp in KEYBOARD_LAYOUT.items():
+            for grp, mp in RAW_KEYBOARD_LAYOUT.items():
                 for name, code in mp.items():
                     code_to_name.setdefault(code, name)
                     all_codes.append(code)
@@ -720,16 +720,16 @@ class ManagerFunction:
             (root / "texts").mkdir(parents=True, exist_ok=True)
 
             all_codes = []
-            for grp in KEYBOARD_LAYOUT.values():
+            for grp in RAW_KEYBOARD_LAYOUT.values():
                 all_codes += list(grp.values())
             max_code = max(all_codes)
             keys_dim = max_code + 1 + 2
 
-            base_codes = [KEYBOARD_LAYOUT["base_keys"][k] for k in KEYBOARD_LAYOUT["base_keys"]]
+            base_codes = [RAW_KEYBOARD_LAYOUT["base_keys"][k] for k in RAW_KEYBOARD_LAYOUT["base_keys"]]
             extra_codes = []
             for grp in ["menu_keys", "system_keys", "alpha_keys"]:
-                extra_codes += [KEYBOARD_LAYOUT[grp][k] for k in KEYBOARD_LAYOUT[grp]]
-            skill_codes = [KEYBOARD_LAYOUT["skill_keys"][k] for k in KEYBOARD_LAYOUT["skill_keys"]]
+                extra_codes += [RAW_KEYBOARD_LAYOUT[grp][k] for k in RAW_KEYBOARD_LAYOUT[grp]]
+            skill_codes = [RAW_KEYBOARD_LAYOUT["skill_keys"][k] for k in RAW_KEYBOARD_LAYOUT["skill_keys"]]
 
             H, W = BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE
 

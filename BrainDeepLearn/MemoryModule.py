@@ -55,7 +55,6 @@ class SoftSymbolicRules(AGICoreModule):
         massWeight: float = 1e-2,
         initStd: float = 0.5,
         seedDisjoint: bool = True,
-        impTopk: int = 0,
         temporalL2: float = 0.1,
         temporalMonotonic: bool = False,):
         super().__init__()
@@ -73,8 +72,6 @@ class SoftSymbolicRules(AGICoreModule):
         self.mass_imp_row = float(massImpRow)
         self.mass_weight = float(massWeight)
 
-        self.imp_topk = int(impTopk)
-
         self.temporal_l2 = float(temporalL2)
         self.temporal_monotonic = bool(temporalMonotonic)
 
@@ -84,10 +81,8 @@ class SoftSymbolicRules(AGICoreModule):
 
         self.register_buffer("no_self_mask", ~torch.eye(self.K, dtype=torch.bool), persistent=True)
 
-        if self.excl_logits is not None:
-            nn.init.normal_(self.excl_logits, mean=0.0, std=float(initStd))
-        if self.or_logits is not None:
-            nn.init.normal_(self.or_logits, mean=0.0, std=float(initStd))
+        nn.init.normal_(self.excl_logits, mean=0.0, std=float(initStd))
+        nn.init.normal_(self.or_logits, mean=0.0, std=float(initStd))
 
         if seedDisjoint:
             self.SeedDisjointInit()
@@ -120,20 +115,12 @@ class SoftSymbolicRules(AGICoreModule):
                 self.or_logits[g, idx] = 2.0
                 cursor = (cursor + m) % self.K
 
-    def Weights(self, dtype: torch.dtype, device: torch.device):
-        W_excl = torch.sigmoid(self.excl_logits).to(device=device, dtype=dtype) if self.excl_logits is not None else None #[G_excl, K]
-        W_or = torch.sigmoid(self.or_logits).to(device=device, dtype=dtype) if self.or_logits is not None else None #[G_excl, K]
+    def Weights(self):
+        W_excl = torch.sigmoid(self.excl_logits) if self.excl_logits is not None else None #[G_excl, K]
+        W_or = torch.sigmoid(self.or_logits) if self.or_logits is not None else None #[G_excl, K]
 
-        A_imp = torch.sigmoid(self.imp_logits).to(device=device, dtype=dtype) #[K, K]
-        A_imp = A_imp.masked_fill(~self.no_self_mask.to(device=device), 0.0) 
-
-        if self.imp_topk and self.imp_topk > 0:
-            k_top = min(self.imp_topk, self.K - 1)
-            if k_top > 0:
-                vals, idx = torch.topk(A_imp, k_top, dim=1, largest=True, sorted=False)# [K, k_top], [K, k_top]
-                topk_mask = torch.zeros_like(A_imp, dtype=torch.bool) #[K, K]
-                topk_mask.scatter_(1, idx, True)
-                A_imp = A_imp.masked_fill(~topk_mask, 0.0) #[K, K]
+        A_imp = torch.sigmoid(self.imp_logits) #[K, K]
+        A_imp = A_imp.masked_fill(~self.no_self_mask, 0.0) 
 
         return W_excl, W_or, A_imp
 
@@ -144,7 +131,7 @@ class SoftSymbolicRules(AGICoreModule):
         total_penalty = p_f.new_zeros(B)
         aux_reg = p_f.new_zeros(())
 
-        W_excl, W_or, A_imp = self.Weights(dtype=p_f.dtype, device=p_f.device)#[G_excl, K] , [G_or, K] , [K, K]
+        W_excl, W_or, A_imp = self.Weights()#[G_excl, K] , [G_or, K] , [K, K]
 
         if W_excl is not None and W_excl.numel() > 0:
             s = torch.matmul(p_f, W_excl.t()) #[B, G_excl]
@@ -220,8 +207,6 @@ class SymbolicCoder(AGICoreModule):
 
         self.proto_scale_log = nn.Parameter(torch.tensor(2.3)) 
 
-        self.bias = nn.Parameter(torch.zeros(k))
-
         self.proto_mix_log = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x: torch.Tensor):  # x: [B, inDim]
@@ -243,11 +228,11 @@ class SymbolicCoder(AGICoreModule):
         proto_logits = cosine_sim * scale
 
         alpha = torch.sigmoid(self.proto_mix_log)
-        total_logits = moe_logits + alpha * proto_logits + self.bias
+        total_logits = moe_logits + alpha * proto_logits
 
         P = torch.sigmoid(total_logits) #[B, k]
 
-        return P
+        return P #[B, k]
 
 
 class QueryToSymbol(AGICoreModule):
@@ -981,7 +966,7 @@ class MemoryExtractor(AGICoreModule):
         memorySize: int = 16384,
         symSize: int = 16384,
         ltmSize: int = 16384,
-        nsK: int = 128,
+        nsK: int = 256,
         outputDim: int = 1024,
         hebbAlpha: float = 0.15,
         decayFactor: float = 0.95,
@@ -1152,8 +1137,7 @@ class MemoryExtractor(AGICoreModule):
             massImpRow=1.5,
             massWeight=1e-2, 
             initStd=0.5, 
-            seedDisjoint=True, 
-            impTopk=0)
+            seedDisjoint=True,)
 
         self.sym_query = QueryToSymbol(inDim=self.memory_dim, k=self.ns_K, hidden=512) 
         self.sym_mem = SymbolicMemory(k=self.ns_K, capacity=self.sym_capacity)
@@ -1331,9 +1315,9 @@ class MemoryExtractor(AGICoreModule):
 
     def forward(self,
         x: torch.Tensor, # [B, inputDim]
-        tdError: torch.Tensor, # [B]
+        tdError: torch.Tensor, # [B] [-1, 1]
         emotion: torch.Tensor, # [B, emotionDim]
-        reward: torch.Tensor, # [B]
+        reward: torch.Tensor, # [B] 
         reset: bool = False,
         softReset: bool = False,
         sourceLabel: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -1573,7 +1557,7 @@ class MemoryExtractor(AGICoreModule):
         valEpi: torch.Tensor, # [B, memory_dim]
         importance: torch.Tensor, # [B]
         tdError: torch.Tensor, # [B]
-        reward: torch.Tensor, # [B]
+        reward: torch.Tensor, # [B] [-10, 10]
         sourceLabel: torch.Tensor):
         mask_base = (importance > self.ltm_online_imp_thresh) | (tdError.abs() > self.ltm_online_td_thresh)
         is_imag = (sourceLabel == MemoryType.SRC_IMAGINE)
@@ -1983,7 +1967,7 @@ class MemoryExtractor(AGICoreModule):
     @torch.no_grad()
     def ExportMemoryBank(self, topk: int = 1024,) -> Optional[Dict[str, torch.Tensor]]:
         device = self.device
-        B = int(self.memory_filled.size(0))   # [B]
+        B = int(self.memory_filled.size(0)) # [B]
         K = int(topk)
         D = int(self.memory_dim)
 

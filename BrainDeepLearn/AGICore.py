@@ -20,8 +20,8 @@ from collections import deque
 from PerceptionModule import PerceiveExtractor, PerceptionOnlineWrapper
 from AttentionModule import AttentionExtractor, AttentionOnlineWrapper
 from MemoryModule import MemoryExtractor
-from DecisionModule import DecisionExtractor, DecisionOnlineWrapper, KEYBOARD_LAYOUT, DecisionPlannerExtractor, StableLogProbBernoulli
-from WorldModule import RSSMWorldModel, WorldModelOnlineWrapper
+from DecisionModule import DecisionExtractor, DecisionOnlineWrapper, RAW_KEYBOARD_LAYOUT, DecisionPlannerExtractor, StableLogProbBernoulli
+from WorldModule import RSSMWorldModel, WorldOnlineWrapper
 from ValueEstimationModule import ValueEstimationExtractor,ValueEstimationOnlineWrapper
 from ConsciousnessModule import ConsciousnessExtractor
 from IntentionModule import IntentionExtractor, IntentionOnlineWrapper
@@ -154,7 +154,7 @@ class BrainCore(nn.Module):
             self.perc = PerceptionOnlineWrapper(self.perc)
             self.attn = AttentionOnlineWrapper(self.attn)
             self.actor = DecisionOnlineWrapper(self.actor)
-            self.world = WorldModelOnlineWrapper(self.world)
+            self.world = WorldOnlineWrapper(self.world)
             self.critic =ValueEstimationOnlineWrapper(self.critic)
             self.intention = IntentionOnlineWrapper(self.intention)
 
@@ -163,14 +163,14 @@ class BrainCore(nn.Module):
         self.planner = DecisionPlannerExtractor().BuildPlanner(
             worldModel=self.world,
             wmIsOnlineWrapper=plasticOnlineLearning,
-            KEYBOARD_LAYOUT=KEYBOARD_LAYOUT,
+            RAW_KEYBOARD_LAYOUT=RAW_KEYBOARD_LAYOUT,
             includeNoSkill=True,
             horizon=5, N=64, elite=8, iters=3,
             gamma=0.99, temperature=1.0, momentum=0.15,
             laplace=1.0, minVar=1e-4, epsBern=1e-4)
 
         all_codes = []
-        for grp in KEYBOARD_LAYOUT.values():
+        for grp in RAW_KEYBOARD_LAYOUT.values():
             all_codes += list(grp.values())
         self.max_code = max(all_codes)
         self.keyvec_dim = (self.max_code + 1) + 2  # 106
