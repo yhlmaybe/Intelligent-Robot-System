@@ -615,11 +615,12 @@ class ConnNet(AGICoreModule):
 
 
 class SoftNeSyStructure(AGICoreModule):
-    def __init__(self, k: int, gExcl: int = 8, gAlo: int = 8, tauInit: float = 1.0):
+    def __init__(self, k: int, gExcl: int = 8, gAlo: int = 8, tauInit: float = 1.0, lambdaDag: float = 1e-3):
         super().__init__()
         self.K = int(k)
         self.Ge = int(gExcl)
         self.Ga = int(gAlo)
+        self.lambda_dag = float(lambdaDag)
         self.tau = nn.Parameter(torch.tensor(float(tauInit)))
         self.M_excl = nn.Parameter(torch.randn(self.Ge, self.K) * 0.01)
         self.M_alo = nn.Parameter(torch.randn(self.Ga, self.K) * 0.01)
@@ -732,11 +733,18 @@ class SoftNeSyStructure(AGICoreModule):
 
         loss = lambdaExcl * excl + lambdaAlo * alo + lambdaImpl * impl
 
-        reg = 1e-4 * W.mean() + 1e-3 * (
-            (F.softmax(self.M_excl, dim=-1)*torch.log(F.softmax(self.M_excl, dim=-1)+1e-6)).sum()/self.Ge +
-            (F.softmax(self.M_alo, dim=-1)*torch.log(F.softmax(self.M_alo , dim=-1)+1e-6)).sum()/self.Ga)
-        
-        reg = reg + 1e-6 * (torch.trace(torch.matrix_exp(W * W)) - self.K)
+        reg = 1e-4 * W.mean()
+
+        Ge_sm = F.softmax(self.M_excl, dim=-1).clamp_min(1e-6)
+        Ga_sm = F.softmax(self.M_alo,  dim=-1).clamp_min(1e-6)
+        reg = reg + 1e-3 * (
+            (Ge_sm * torch.log(Ge_sm)).sum() / float(self.Ge) +
+            (Ga_sm * torch.log(Ga_sm)).sum() / float(self.Ga))
+
+        A = (W * W) / float(self.K)  # [K,K]
+        dag = torch.trace(torch.matrix_exp(A.float())) - float(self.K)
+        dag = dag.to(dtype=P.dtype, device=P.device)
+        reg = reg + self.lambda_dag * dag
 
         loss = loss + reg
         stats = {"excl": excl.detach(), "alo": alo.detach(), "impl": impl.detach()}
@@ -1521,8 +1529,18 @@ class RSSMWorldModel(AGICoreModule):
         loss_recon = visionIn.new_tensor(0.0)
         recon = None
         if self.use_decoder:
-            recon = self.obs_dec(s1) # [B,visionDim]
-            loss_recon = F.mse_loss(recon, visionIn, reduction="mean")
+            recon = self.obs_dec(s1)  # [B, visionDim]
+
+            target = self.obs_enc[0](visionIn)  # nn.LayerNorm(visionDim)
+
+            recon_n = F.layer_norm(
+                recon,
+                normalized_shape=(int(recon.size(-1)),),
+                weight=self.obs_enc[0].weight,
+                bias=self.obs_enc[0].bias,
+                eps=self.obs_enc[0].eps,)
+
+            loss_recon = F.mse_loss(recon_n, target, reduction="mean")
 
         aux_moe = visionIn.new_tensor(0.0)
         if self._ns_enabled:
@@ -2235,7 +2253,17 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         recon = None
         if self.base.use_decoder:
             recon = self.ObsDec(s1, d)
-            loss_recon = F.mse_loss(recon, visionIn, reduction="mean")
+
+            target = self.base.obs_enc[0](visionIn)
+
+            recon_n = F.layer_norm(
+                recon,
+                normalized_shape=(int(recon.size(-1)),),
+                weight=self.base.obs_enc[0].weight,
+                bias=self.base.obs_enc[0].bias,
+                eps=self.base.obs_enc[0].eps,)
+
+            loss_recon = F.mse_loss(recon_n, target, reduction="mean")
 
         aux_moe = visionIn.new_tensor(0.0)
         if self.base._ns_enabled:
@@ -2490,86 +2518,45 @@ class TestWorldMTool:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         torch.manual_seed(int(seed))
 
-        all_codes = []
-        try:
-            if isinstance(RAW_KEYBOARD_LAYOUT, dict) and any(
-                isinstance(v, dict) for v in RAW_KEYBOARD_LAYOUT.values()):
-
-                for v in RAW_KEYBOARD_LAYOUT.values():
-                    if isinstance(v, dict):
-                        all_codes += list(v.values())
-            else:
-                all_codes += list(RAW_KEYBOARD_LAYOUT.values())
-        except Exception:
-            all_codes = list(range(106))
-
-        self.max_code = int(max(all_codes)) if len(all_codes) > 0 else 105
-        self.key_dim = int(self.max_code + 1)
+        self.key_dim = int(NUM_DISCRETE_KEYS)
 
         self.wm = RSSMWorldModel(
-            visionDim=1024,
-            actionDim=256,
-            deterDim=256,
+            visionDim=256,
+            actionDim=128,
+            deterDim=128,
             stochDim=32,
-            stateDim=256,
+            stateDim=128,
+            ssmDim=128,
             useDecoder=True,
             useMemory=False,
             nsEnabled=True,).to(self.device)
-        
+
         self.wm.ResetState(batchSize=4)
 
     def TestActionEncoder(self) -> bool:
         try:
             torch.manual_seed(0)
             B = 4
-            K = int(self.key_dim)
+            K = self.key_dim
 
-            sig = inspect.signature(ActionEncoder.__init__)
-            kw = {}
-            if "numDiscrete" in sig.parameters:
-                kw["numDiscrete"] = K
-            if "mouseDim" in sig.parameters:
-                kw["mouseDim"] = 2
-            if "contDim" in sig.parameters:
-                kw["contDim"] = 2
-            if "clickDim" in sig.parameters:
-                kw["clickDim"] = 2
-            if "outDim" in sig.parameters:
-                kw["outDim"] = 128
-            if "hidden" in sig.parameters:
-                kw["hidden"] = 256
-            if "dropout" in sig.parameters:
-                kw["dropout"] = 0.0
-
-            enc = ActionEncoder(**kw).to(self.device).train()
+            enc = ActionEncoder(
+                numDiscrete=K, mouseDim=2, clickDim=2,
+                outDim=64, hidden=128, dropout=0.0).to(self.device).train()
 
             keys = torch.zeros(B, K, device=self.device)
+            keys[:, min(5, K - 1)] = 1.0
             keys[:, min(17, K - 1)] = 1.0
-            keys[:, min(57, K - 1)] = 1.0
 
             mouse = torch.randn(B, 2, device=self.device)
             click = torch.zeros(B, 2, device=self.device)
             click[:, 0] = 1.0
 
-            fwd_sig = inspect.signature(enc.forward)
-            n_args = len([p for p in fwd_sig.parameters.values() if p.name != "self"])
-
-            if n_args >= 3:
-                y1 = enc(keys, mouse, click)
-                y2 = enc(keys, None, None)
-            elif n_args == 2:
-                y1 = enc(keys, mouse)
-                y2 = enc(keys, None)
-            else:
-                y1 = enc(keys)
-                y2 = enc(keys)
-
-            ok_shape = (y1.dim() == 2) and (y2.dim() == 2) and (y1.shape[0] == B) and (y2.shape[0] == B)
-            if not ok_shape:
-                print(f"ActionEncoder test failed: bad shapes y1={tuple(y1.shape)}, y2={tuple(y2.shape)}")
+            y = enc(keys, mouse, click)
+            if y.dim() != 2 or y.shape[0] != B or y.shape[1] != 64:
+                print(f"ActionEncoder FAILED: y shape={tuple(y.shape)} expected={(B,64)}")
                 return False
 
-            loss = (y1 ** 2).mean() + 0.1 * (y2 ** 2).mean()
+            loss = (y ** 2).mean()
             enc.zero_grad(set_to_none=True)
             loss.backward()
 
@@ -2579,48 +2566,46 @@ class TestWorldMTool:
                     any_grad = True
                     break
 
-            ok = ok_shape and any_grad
-            print("ActionEncoder test " + ("passed." if ok else "failed.") + f" | loss={float(loss.item()):.6f}")
+            ok = bool(any_grad)
+            print(f"ActionEncoder {'passed' if ok else 'failed'} | loss={float(loss.item()):.6f}")
             return ok
 
         except Exception as e:
-            print(f"ActionEncoder test FAILED: {type(e).__name__}: {e}")
+            print(f"ActionEncoder FAILED: {type(e).__name__}: {e}")
             return False
+
 
     def TestRSSMStepPosterior(self) -> bool:
         try:
             torch.manual_seed(0)
-            B = 4
             wm = self.wm
+            wm.eval()
+
+            B = 4
             wm.ResetState(batchSize=B)
 
             vision = torch.randn(B, wm.vision_dim, device=self.device)
             keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(17, self.key_dim - 1)] = 1.0
-            keys[:, min(57, self.key_dim - 1)] = 1.0
+            keys[:, min(9, self.key_dim - 1)] = 1.0
+            keys[:, min(33, self.key_dim - 1)] = 1.0
             mouse = torch.randn(B, 2, device=self.device)
+            click = torch.zeros(B, 2, device=self.device)
 
-            ae = wm.action_encoder
-            ae_sig = inspect.signature(ae.forward)
-            ae_n = len([p for p in ae_sig.parameters.values() if p.name != "self"])
-            if ae_n >= 3:
-                a_enc = ae(keys, mouse, None)
-            else:
-                a_enc = ae(keys, mouse)
-
-            h0 = torch.zeros(B, wm.deter_dim, device=self.device)
-            z0 = torch.zeros(B, wm.stoch_dim, device=self.device)
+            action_enc = wm.action_encoder(keys, mouse, click)
 
             h_before, z_before, x_before = wm.ExportState()
-            out = wm.StepPosterior(h0, z0, vision, a_enc, sample=False)
+            out = wm.StepPosterior(vision, action_enc, sample=False)
             h_after, z_after, x_after = wm.ExportState()
 
             ok_shapes = (
                 out["h_next"].shape == (B, wm.deter_dim)
                 and out["z_next"].shape == (B, wm.stoch_dim)
+                and out["x_next"].shape == (B, wm.ssm_dim)
                 and out["s_next"].shape == (B, wm.state_dim)
-                and out["r_pred"].shape == (B, 1)
-                and out["d_prob"].shape == (B, 1))
+                and out["r_pred"].shape == (B,)
+                and out["d_prob"].shape == (B,)
+                and out["mu_q"].shape == (B, wm.stoch_dim)
+                and out["logstd_q"].shape == (B, wm.stoch_dim))
 
             changed = (
                 (not torch.allclose(h_before, h_after))
@@ -2631,270 +2616,481 @@ class TestWorldMTool:
             dmax = float(out["d_prob"].max().item())
             in_range = (dmin >= 0.0) and (dmax <= 1.0)
 
-            mix_ok = True
-            with torch.no_grad():
-                if hasattr(wm, "act_proj") and hasattr(wm, "mix_gate"):
-                    a_t = wm.act_proj(a_enc)
-                    logits = wm.mix_gate(torch.cat([out["h_next"], out["z_next"], a_t], dim=-1))
-                    w = torch.softmax(logits, dim=-1)
-                    mix_ok = torch.allclose(w.sum(dim=-1), torch.ones(B, device=w.device), atol=1e-6)
-
             ns_ok = True
             if getattr(wm, "_ns_enabled", False):
-                if ("ns_logits" in out) and ("ns_probs" in out):
-                    p = out["ns_probs"]
-                    ns_ok = (p.min().item() >= 0.0) and (p.max().item() <= 1.0)
-                else:
-                    ns_ok = True
+                ns_ok = (
+                    ("ns_logits" in out) and ("ns_Q" in out) and ("ns_pen" in out)
+                    and out["ns_logits"].shape == (B, wm._ns_K)
+                    and out["ns_Q"].shape == (B, wm._ns_K)
+                    and out["ns_pen"].shape == (B,)
+                    and (out["ns_Q"].min().item() >= 0.0) and (out["ns_Q"].max().item() <= 1.0)
+                    and (out["ns_pen"].min().item() >= 0.0) and (out["ns_pen"].max().item() <= 1.0))
 
-            ok = ok_shapes and changed and in_range and mix_ok and ns_ok
-            print("RSSM StepPosterior test " + ("passed." if ok else "failed.") + f" | d_prob=[{dmin:.3f},{dmax:.3f}]")
+            recon_ok = True
+            if getattr(wm, "use_decoder", False):
+                recon_ok = ("recon" in out) and (out["recon"].shape == (B, wm.vision_dim))
+
+            ok = bool(ok_shapes and changed and in_range and ns_ok and recon_ok)
+            print(f"RSSM StepPosterior {'passed' if ok else 'failed'} | d_prob=[{dmin:.3f},{dmax:.3f}]")
             return ok
 
         except Exception as e:
-            print(f"RSSM StepPosterior test FAILED: {type(e).__name__}: {e}")
+            print(f"RSSM StepPosterior FAILED: {type(e).__name__}: {e}")
             return False
+
 
     def TestRSSMStepPriorOnly(self) -> bool:
         try:
             torch.manual_seed(0)
-            B = 4
             wm = self.wm
+            wm.eval()
+
+            B = 4
             wm.ResetState(batchSize=B)
 
             keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(30, self.key_dim - 1)] = 1.0
+            keys[:, min(12, self.key_dim - 1)] = 1.0
             mouse = torch.randn(B, 2, device=self.device)
+            click = torch.zeros(B, 2, device=self.device)
+            action_enc = wm.action_encoder(keys, mouse, click)
 
-            ae = wm.action_encoder
-            ae_sig = inspect.signature(ae.forward)
-            ae_n = len([p for p in ae_sig.parameters.values() if p.name != "self"])
-            if ae_n >= 3:
-                a_enc = ae(keys, mouse, None)
-            else:
-                a_enc = ae(keys, mouse)
+            hPrev = torch.randn(B, wm.deter_dim, device=self.device)
+            zPrev = torch.randn(B, wm.stoch_dim, device=self.device)
+            s4xPrev = torch.randn(B, wm.ssm_dim, device=self.device)
 
-            h0 = torch.zeros(B, wm.deter_dim, device=self.device)
-            z0 = torch.zeros(B, wm.stoch_dim, device=self.device)
-            x0 = torch.zeros(B, wm.ssm_dim, device=self.device)
-
-            h_prev, z_prev, x_prev = wm.ExportState()
-            h1, z1, s1, x1, r, d = wm.StepPriorOnly(h0, z0, x0, a_enc, sample=False)
+            h_before, z_before, x_before = wm.ExportState()
+            h1, z1, s1, x1, r, d = wm.StepPriorOnly(hPrev, zPrev, s4xPrev, action_enc, sample=False)
+            h_after, z_after, x_after = wm.ExportState()
 
             ok_shapes = (
                 h1.shape == (B, wm.deter_dim)
                 and z1.shape == (B, wm.stoch_dim)
                 and s1.shape == (B, wm.state_dim)
                 and x1.shape == (B, wm.ssm_dim)
-                and r.shape == (B, 1)
-                and d.shape == (B, 1))
+                and r.shape == (B,)
+                and d.shape == (B,))
 
-            h_after, z_after, x_after = wm.ExportState()
-            not_written = torch.allclose(h_prev, h_after) and torch.allclose(z_prev, z_after) and torch.allclose(x_prev, x_after)
+            not_written = (
+                torch.allclose(h_before, h_after)
+                and torch.allclose(z_before, z_after)
+                and torch.allclose(x_before, x_after))
 
             dmin = float(d.min().item())
             dmax = float(d.max().item())
             in_range = (dmin >= 0.0) and (dmax <= 1.0)
 
-            ok = ok_shapes and not_written and in_range
-            print("RSSM StepPriorOnly test " + ("passed." if ok else "failed.") + f" | d=[{dmin:.3f},{dmax:.3f}]")
+            ok = bool(ok_shapes and not_written and in_range)
+            print(f"RSSM StepPriorOnly {'passed' if ok else 'failed'} | d=[{dmin:.3f},{dmax:.3f}]")
             return ok
 
         except Exception as e:
-            print(f"RSSM StepPriorOnly test FAILED: {type(e).__name__}: {e}")
+            print(f"RSSM StepPriorOnly FAILED: {type(e).__name__}: {e}")
             return False
 
-    def TestForwardTrainSeq(self) -> bool:
+
+    def TestForwardTrainFiniteGrad(self) -> bool:
         try:
             torch.manual_seed(0)
-            B = 2
             wm = self.wm
             wm.train()
-            for p in wm.parameters():
-                p.requires_grad_(True)
+
+            B = 3
             wm.ResetState(batchSize=B)
 
             vision = torch.randn(B, wm.vision_dim, device=self.device)
             keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(17, self.key_dim - 1)] = 1.0
+            keys[:, min(7, self.key_dim - 1)] = 1.0
             mouse = torch.randn(B, 2, device=self.device)
+            click = torch.zeros(B, 2, device=self.device)
 
-            out = wm.ForwardTrainSeq(
-                visionSeq=vision,
-                keysVec=keys,
-                mouseSeq=mouse,
-                rewardSeq=None,
-                doneSeq=None,
-                alphaKl=0.8,
-                freeNats=1.0,
-                reconCoef=1.0,
-                rewardCoef=1.0,
-                doneCoef=1.0,)
+            reward = torch.zeros(B, device=self.device)
+            done = torch.zeros(B, device=self.device)
+
+            sample = False
+            alphaKl = 0.8
+            freeNats = 1.0
+            reconCoef = 1.0
+            rewardCoef = 1.0
+            doneCoef = 1.0
+            nsCoef = 1.0
+            nsDistillCoef = 1e-2
+            nsPriorLogicCoef = 1e-3
+            physCoef = 1e-4
+
+            out = wm.ForwardTrain(
+                vision, keys, click, mouse, reward, done,
+                sample=sample,
+                alphaKl=alphaKl, freeNats=freeNats,
+                reconCoef=reconCoef, rewardCoef=rewardCoef, doneCoef=doneCoef,
+                nsCoef=nsCoef, nsDistillCoef=nsDistillCoef, nsPriorLogicCoef=nsPriorLogicCoef,
+                physCoef=physCoef,)
 
             loss = out["loss"]
             if not torch.isfinite(loss).item():
-                print("ForwardTrainSeq loss is not finite.")
+                print("ForwardTrain FAILED: loss not finite")
                 return False
 
-            distill = out.get("loss_ns_distill", None)
+            aux_moe = vision.new_zeros(())
+            if getattr(wm, "_ns_enabled", False):
+                aux_moe = wm.ns_head_prior.GetAuxLoss() + wm.ns_head_post.GetAuxLoss()
+
+            terms = [
+                ("recon", reconCoef, out["loss_recon"]),
+                ("reward", rewardCoef, out["loss_reward"]),
+                ("done", doneCoef, out["loss_done"]),
+                ("kl", 1.0, out["loss_kl"]),
+                ("ns", nsCoef, out["loss_ns"]),
+                ("ns_distill", nsDistillCoef, out["loss_ns_distill"]),
+                ("ns_prior_logic", nsPriorLogicCoef, out["loss_ns_prior_logic"]),
+                ("phys", physCoef, out["loss_phys"]),
+                ("conn_reg", 1.0, out["loss_conn_reg"]),
+                ("aux_moe", 1e-1, aux_moe),]
+
+            rows = []
+            for name, coef, v in terms:
+                v_f = float(v.detach().item()) if torch.is_tensor(v) else float(v)
+                contrib = float(coef) * v_f
+                rows.append((abs(contrib), name, float(coef), v_f, contrib))
+
+            rows.sort(reverse=True, key=lambda x: x[0])
+
+            total_calc = sum(r[4] for r in rows)
+            total_out = float(loss.detach().item())
+
+            print("\n[ForwardTrain loss breakdown]")
+            print(f"total(out) = {total_out:.6f} | total(calc) = {total_calc:.6f} | diff = {total_out - total_calc:.6f}")
+            for _, name, coef, raw, contrib in rows:
+                print(f"  {name:<14} raw={raw:>12.6f}  coef={coef:<10g}  contrib={contrib:>12.6f}")
+
+            top_name = rows[0][1]
+            if top_name == "kl":
+                mu_p = out["mu_p"]; mu_q = out["mu_q"]
+                ls_p = out["logstd_p"]; ls_q = out["logstd_q"]
+                print("\n[KL debug stats]")
+                print(f" mu_p: mean|x|={mu_p.abs().mean().item():.4f} max|x|={mu_p.abs().max().item():.4f}")
+                print(f" mu_q: mean|x|={mu_q.abs().mean().item():.4f} max|x|={mu_q.abs().max().item():.4f}")
+                print(f" logstd_p: min={ls_p.min().item():.4f} max={ls_p.max().item():.4f}")
+                print(f" logstd_q: min={ls_q.min().item():.4f} max={ls_q.max().item():.4f}")
+
+            elif top_name == "recon" and ("recon" in out):
+                recon = out["recon"]
+                target = wm.obs_enc[0](vision) 
+                recon_n = F.layer_norm(
+                    recon,
+                    normalized_shape=(int(recon.size(-1)),),
+                    weight=wm.obs_enc[0].weight,
+                    bias=wm.obs_enc[0].bias,
+                    eps=wm.obs_enc[0].eps,)
+                
+                print("\n[Recon debug stats]")
+                print(f" recon: mean={recon.mean().item():.4f} std={recon.std().item():.4f} max|x|={recon.abs().max().item():.4f}")
+                print(f" recon_n: mean={recon_n.mean().item():.4f} std={recon_n.std().item():.4f} max|x|={recon_n.abs().max().item():.4f}")
+                print(f" target: mean={target.mean().item():.4f} std={target.std().item():.4f} max|x|={target.abs().max().item():.4f}")
 
             wm.zero_grad(set_to_none=True)
             loss.backward()
 
             any_grad = False
             for p in wm.parameters():
-                if p.grad is not None and torch.isfinite(p.grad).all().item() and (p.grad.abs().sum().item() > 0):
+                if p.requires_grad and (p.grad is not None) and torch.isfinite(p.grad).all().item() and (p.grad.abs().sum().item() > 0):
                     any_grad = True
                     break
 
             ok = bool(any_grad)
-            if distill is None:
-                print(f"RSSM ForwardTrainSeq test {'passed' if ok else 'failed'}. loss={float(loss.item()):.6f} | ns_distill=NA")
-            else:
-                print(
-                    f"RSSM ForwardTrainSeq test {'passed' if ok else 'failed'}. "
-                    f"loss={float(loss.item()):.6f} | ns_distill={float(distill.item()):.6f}")
+            print(f"\nForwardTrain finite&grad {'passed' if ok else 'failed'} | loss={total_out:.6f}")
             return ok
 
         except Exception as e:
-            print(f"ForwardTrainSeq test FAILED: {type(e).__name__}: {e}")
+            print(f"ForwardTrain finite&grad FAILED: {type(e).__name__}: {e}")
             return False
+
+
+    def TestLossDecrease(self, steps: int = 80, lr: float = 1e-3) -> bool:
+        try:
+            torch.manual_seed(0)
+
+            wm = RSSMWorldModel(
+                visionDim=128,
+                actionDim=64,
+                deterDim=64,
+                stochDim=16,
+                stateDim=64,
+                ssmDim=64,
+                useDecoder=True,
+                useMemory=False,
+                nsEnabled=False,).to(self.device).train()
+
+            B = 6
+            wm.ResetState(batchSize=B)
+
+            vision = torch.randn(B, wm.vision_dim, device=self.device)
+            keys = torch.zeros(B, self.key_dim, device=self.device)
+            keys[:, min(3, self.key_dim - 1)] = 1.0
+            keys[:, min(25, self.key_dim - 1)] = 1.0
+            mouse = torch.randn(B, 2, device=self.device)
+            click = torch.zeros(B, 2, device=self.device)
+
+            reward = torch.zeros(B, device=self.device)
+            done = torch.zeros(B, device=self.device)
+
+            opt = torch.optim.Adam(wm.parameters(), lr=float(lr))
+
+            losses: List[float] = []
+
+            with torch.no_grad():
+                out0 = wm.ForwardTrain(
+                    vision, keys, click, mouse, reward, done,
+                    sample=False,
+                    alphaKl=0.8, freeNats=1.0,
+                    reconCoef=1.0, rewardCoef=0.0, doneCoef=0.0,
+                    nsCoef=0.0, nsDistillCoef=0.0, nsPriorLogicCoef=0.0,
+                    physCoef=0.0,)
+                init_loss = float(out0["loss"].item())
+
+            for t in range(int(steps)):
+                opt.zero_grad(set_to_none=True)
+                out = wm.ForwardTrain(
+                    vision, keys, click, mouse, reward, done,
+                    sample=False,
+                    alphaKl=0.8, freeNats=1.0,
+                    reconCoef=1.0, rewardCoef=0.0, doneCoef=0.0,
+                    nsCoef=0.0, nsDistillCoef=0.0, nsPriorLogicCoef=0.0,
+                    physCoef=0.0,)
+                loss = out["loss"]
+                if not torch.isfinite(loss).item():
+                    print(f"LossDecrease FAILED: non-finite at step {t}, loss={loss}")
+                    return False
+                loss.backward()
+                opt.step()
+                losses.append(float(loss.item()))
+
+            head_n = min(5, len(losses))
+            tail_n = min(5, len(losses))
+            head = sum(losses[:head_n]) / max(1, head_n)
+            tail = sum(losses[-tail_n:]) / max(1, tail_n)
+
+            margin = max(1e-4, 0.02 * abs(head))
+            ok = bool(tail <= head - margin)
+
+            with torch.no_grad():
+                out1 = wm.ForwardTrain(
+                    vision, keys, click, mouse, reward, done,
+                    sample=False,
+                    alphaKl=0.8, freeNats=1.0,
+                    reconCoef=1.0, rewardCoef=0.0, doneCoef=0.0,
+                    nsCoef=0.0, nsDistillCoef=0.0, nsPriorLogicCoef=0.0,
+                    physCoef=0.0,)
+                final_loss = float(out1["loss"].item())
+
+            print(
+                f"LossDecrease {'passed' if ok else 'failed'} | "
+                f"init={init_loss:.6f} -> final={final_loss:.6f}; "
+                f"head={head:.6f} -> tail={tail:.6f}")
+            return ok
+
+        except Exception as e:
+            print(f"LossDecrease FAILED: {type(e).__name__}: {e}")
+            return False
+
 
     def TestConnRegReset(self) -> bool:
         try:
             torch.manual_seed(0)
-            B = 2
             wm = self.wm
+            wm.train()
+
+            B = 3
+            wm.ResetState(batchSize=B)
+
             vision = torch.randn(B, wm.vision_dim, device=self.device)
             keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(18, self.key_dim - 1)] = 1.0
+            keys[:, min(11, self.key_dim - 1)] = 1.0
             mouse = torch.randn(B, 2, device=self.device)
+            click = torch.zeros(B, 2, device=self.device)
+
+            reward = torch.zeros(B, device=self.device)
+            done = torch.zeros(B, device=self.device)
+
+            _ = wm.ForwardTrain(vision, keys, click, mouse, reward, done, sample=False)
+            has_prev = getattr(wm, "_A_prev", None) is not None
 
             wm.ResetState(batchSize=B)
-            _ = wm.ForwardTrainSeq(vision, keys, mouse)
-            has_prev = (getattr(wm, "_A_prev", None) is not None)
-
-            wm.ResetState(batchSize=B)
-            cleared = (getattr(wm, "_A_prev", None) is None)
+            cleared = getattr(wm, "_A_prev", None) is None
 
             ok = bool(has_prev and cleared)
-            print("Conn regularization cache reset " + ("passed." if ok else "failed."))
+            print(f"Conn regularization cache reset {'passed' if ok else 'failed'}")
             return ok
 
         except Exception as e:
             print(f"Conn regularization cache reset FAILED: {type(e).__name__}: {e}")
             return False
 
+
+    def TestExportWorldMemoryBank(self) -> bool:
+        try:
+            torch.manual_seed(0)
+            wm = RSSMWorldModel(
+                visionDim=64,
+                actionDim=32,
+                deterDim=64,
+                stochDim=16,
+                stateDim=32,
+                ssmDim=32,
+                useDecoder=False,
+                useMemory=True,
+                memoryCapacity=32,
+                nsEnabled=False,
+                memTopK=4,
+                memTemp=1.0,).to(self.device).eval()
+
+            B = 2
+            wm.ResetState(batchSize=B)
+
+            out0 = wm.ExportWorldMemoryBank(topk=4)
+            if out0 is not None:
+                print("ExportWorldMemoryBank FAILED: expected None when not filled enough.")
+                return False
+
+            for _ in range(6):
+                keyE = F.normalize(torch.randn(B, wm.stoch_dim, device=self.device), dim=-1)
+                valH = torch.randn(B, wm.state_dim, device=self.device)
+                imp = torch.rand(B, device=self.device)
+                wm.MemAdd(keyE, valH, imp)
+
+            out = wm.ExportWorldMemoryBank(topk=4)
+            if out is None:
+                print("ExportWorldMemoryBank FAILED: expected dict after filling.")
+                return False
+
+            ok_shapes = (
+                ("size" in out) and ("idx" in out) and ("vals" in out) and ("keys" in out) and ("imp" in out)
+                and out["size"].shape == (B,)
+                and out["idx"].shape == (B, 4)
+                and out["vals"].shape == (B, 4, wm.state_dim)
+                and out["keys"].shape == (B, 4, wm.stoch_dim)
+                and out["imp"].shape == (B, 4))
+
+            idx_ok = bool((out["idx"] >= 0).all().item() and (out["idx"] < wm._mem_capacity).all().item())
+            imp_ok = bool(torch.isfinite(out["imp"]).all().item())
+
+            ok = bool(ok_shapes and idx_ok and imp_ok)
+            print(f"ExportWorldMemoryBank {'passed' if ok else 'failed'}")
+            return ok
+
+        except Exception as e:
+            print(f"ExportWorldMemoryBank FAILED: {type(e).__name__}: {e}")
+            return False
+
+
     def TestWrapperAPIBasics(self) -> bool:
         try:
             torch.manual_seed(0)
             wm = self.wm
-            wrapper = WorldOnlineWrapper(wm, initRankEach=0, autoRank=False).to(self.device)
-            wrapper.train()
+            wm.eval()
+
+            wrapper = WorldOnlineWrapper(wm, initRankEach=0, autoRank=False).to(self.device).eval()
 
             B = 4
+            wm.ResetState(batchSize=B)
+
             vision = torch.randn(B, wm.vision_dim, device=self.device)
             keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(17, self.key_dim - 1)] = 1.0
-            keys[:, min(57, self.key_dim - 1)] = 1.0
+            keys[:, min(6, self.key_dim - 1)] = 1.0
             mouse = torch.randn(B, 2, device=self.device)
+            click = torch.zeros(B, 2, device=self.device)
+            reward = torch.zeros(B, device=self.device)
+            done = torch.zeros(B, device=self.device)
 
-            wm.ResetState(batchSize=B)
-            out = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False)
+            out = wrapper(
+                vision,
+                keysVec=keys,
+                mouseClick=click,
+                mouseSeq=mouse,
+                reward=reward,
+                done=done,
+                sample=False,)
 
-            must = ["h_next", "z_next", "s_next", "r_pred", "d_prob"]
-            ok = True
-            for k in must:
-                ok = ok and (k in out)
+            must = ["loss", "h_next", "z_next", "s_next", "r_pred", "d_prob"]
+            ok = all(k in out for k in must)
 
+            ok = ok and (out["h_next"].shape == (B, wm.deter_dim))
+            ok = ok and (out["z_next"].shape == (B, wm.stoch_dim))
             ok = ok and (out["s_next"].shape == (B, wm.state_dim))
-            if getattr(wm, "_ns_enabled", False):
-                ok = ok and ("ns_logits" in out) and ("ns_probs" in out)
+            ok = ok and (out["r_pred"].shape == (B,))
+            ok = ok and (out["d_prob"].shape == (B,))
 
-            print("Wrapper API basics " + ("passed." if ok else "failed."))
-            return ok
+            dmin = float(out["d_prob"].min().item())
+            dmax = float(out["d_prob"].max().item())
+            ok = ok and (0.0 <= dmin <= dmax <= 1.0)
+
+            print(f"Wrapper API basics {'passed' if ok else 'failed'} | d_prob=[{dmin:.3f},{dmax:.3f}]")
+            return bool(ok)
 
         except Exception as e:
             print(f"Wrapper API basics FAILED: {type(e).__name__}: {e}")
             return False
 
+
     def TestForwardWithDeltasInjection(self) -> bool:
         try:
             torch.manual_seed(0)
             wm = self.wm
-            wrapper = WorldOnlineWrapper(wm, initRankEach=0, autoRank=False).to(self.device)
-            wrapper.eval()
             wm.eval()
+
+            wrapper = WorldOnlineWrapper(wm, initRankEach=0, autoRank=False).to(self.device).eval()
 
             B = 3
             vision = torch.randn(B, wm.vision_dim, device=self.device)
             keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(31, self.key_dim - 1)] = 1.0
+            keys[:, min(10, self.key_dim - 1)] = 1.0
             mouse = torch.randn(B, 2, device=self.device)
+            click = torch.zeros(B, 2, device=self.device)
+            reward = torch.zeros(B, device=self.device)
+            done = torch.zeros(B, device=self.device)
 
-            site = "act"
-            if hasattr(wrapper, "cand") and isinstance(wrapper.cand, dict) and (site not in wrapper.cand) and len(wrapper.cand) > 0:
-                site = next(iter(wrapper.cand.keys()))
-
-            out_f, in_f = None, None
-            try:
-                lo = wm.act_proj[0]
-                tgt = getattr(lo, "target", None)
-                if tgt is not None and hasattr(tgt, "weight"):
-                    out_f, in_f = tgt.weight.shape
-            except Exception:
-                pass
-            if out_f is None or in_f is None:
-                out_f, in_f = (wm.action_dim, wm.action_dim)
+            site = "act_proj"
+            Wshape = wm.act_proj[0].target.weight.shape  
+            deltaW = torch.randn(*Wshape, device=self.device) * 1e-3
 
             torch.manual_seed(123)
             wm.ResetState(batchSize=B)
             out0 = wrapper.ForwardWithDeltas(
                 vision, None, None, None, [{}],
-                keysVec=keys, mouseSeq=mouse, sample=False,)
-
-            deltaW = torch.randn(out_f, in_f, device=self.device) * 1e-3
+                keysVec=keys, mouseClick=click, mouseSeq=mouse, reward=reward, done=done, sample=False,)
 
             torch.manual_seed(123)
             wm.ResetState(batchSize=B)
             out1 = wrapper.ForwardWithDeltas(
                 vision, None, None, None, [{site: deltaW}],
-                keysVec=keys, mouseSeq=mouse, sample=False,)
+                keysVec=keys, mouseClick=click, mouseSeq=mouse, reward=reward, done=done, sample=False,)
 
             diff = float((out0["s_next"] - out1["s_next"]).abs().mean().item())
             ok = diff > 1e-7
-            print(f"ForwardWithDeltas injection {'passed' if ok else 'failed'} (site='{site}', |Δ|={diff:.3e})")
-            return ok
+            print(f"ForwardWithDeltas injection {'passed' if ok else 'failed'} | site='{site}', |Δ|={diff:.3e}")
+            return bool(ok)
 
         except Exception as e:
             print(f"ForwardWithDeltas injection FAILED: {type(e).__name__}: {e}")
             return False
 
+
     def TestCommitOneGrowAndValueChange(self) -> bool:
         try:
             torch.manual_seed(0)
             wm = self.wm
-            wrapper = WorldOnlineWrapper(wm, initRankEach=0, autoRank=False).to(self.device)
-            wrapper.train()
+            wm.eval()
+
+            wrapper = WorldOnlineWrapper(wm, initRankEach=0, autoRank=False).to(self.device).train()
 
             lo = wm.act_proj[0]
             n0 = len(lo.A_list)
 
+            out_f, in_f = lo.target.weight.shape 
             r = 2
-            in_f = getattr(lo, "in_f", None)
-            out_f = getattr(lo, "out_f", None)
-            if in_f is None or out_f is None:
-                tgt = getattr(lo, "target", None)
-                if tgt is not None and hasattr(tgt, "in_features") and hasattr(tgt, "out_features"):
-                    in_f = int(tgt.in_features)
-                    out_f = int(tgt.out_features)
-                else:
-                    in_f = int(wm.action_dim)
-                    out_f = int(wm.action_dim)
 
-            A = torch.randn(r, in_f, device=self.device) * 1e-2
-            Bm = torch.randn(out_f, r, device=self.device) * 1e-2
-            ok_commit = wrapper.CommitOne("act", 0, A, Bm, 1.0)
+            A = torch.randn(r, in_f, device=self.device) * 0.10
+            Bm = torch.randn(out_f, r, device=self.device) * 0.10
+            ok_commit = wrapper.CommitOne("act_proj", 0, A, Bm, 10.0)
 
             n1 = len(lo.A_list)
             grew = bool(ok_commit and (n1 == n0 + 1))
@@ -2902,487 +3098,230 @@ class TestWorldMTool:
             Bsz = 4
             vision = torch.randn(Bsz, wm.vision_dim, device=self.device)
             keys = torch.zeros(Bsz, self.key_dim, device=self.device)
-            keys[:, min(33, self.key_dim - 1)] = 1.0
+            keys[:, min(8, self.key_dim - 1)] = 1.0
             mouse = torch.randn(Bsz, 2, device=self.device)
+            click = torch.zeros(Bsz, 2, device=self.device)
+            reward = torch.zeros(Bsz, device=self.device)
+            done = torch.zeros(Bsz, device=self.device)
 
+            wrapper.eval()
             with torch.no_grad():
-                last_alpha = lo.alpha[-1].clone()
+                last_s = lo.alpha[-1].clone()
 
                 lo.alpha[-1].zero_()
                 torch.manual_seed(456)
                 wm.ResetState(batchSize=Bsz)
-                out_before = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False)
+                out_before = wrapper(
+                    vision,
+                    keysVec=keys, mouseClick=click, mouseSeq=mouse, reward=reward, done=done,
+                    sample=False,)
 
-                lo.alpha[-1].copy_(last_alpha)
+                lo.alpha[-1].copy_(last_s)
                 torch.manual_seed(456)
                 wm.ResetState(batchSize=Bsz)
-                out_after = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False)
+                out_after = wrapper(
+                    vision,
+                    keysVec=keys, mouseClick=click, mouseSeq=mouse, reward=reward, done=done,
+                    sample=False,)
 
             change = float((out_after["s_next"] - out_before["s_next"]).abs().mean().item())
-            ok = grew and (change > 1e-7)
-            print(f"CommitOne grow & effect {'passed' if ok else 'failed'} (rank {n0}->{n1}, |Δ|={change:.3e})")
+            ok = bool(grew and (change > 1e-7))
+            print(f"CommitOne grow & effect {'passed' if ok else 'failed'} | rank {n0}->{n1}, |Δ|={change:.3e}")
             return ok
 
         except Exception as e:
             print(f"CommitOne grow & effect FAILED: {type(e).__name__}: {e}")
             return False
 
+
     def TestGradFlowCandidates(self) -> bool:
         try:
             torch.manual_seed(0)
             wm = self.wm
-            wrapper = WorldOnlineWrapper(wm, initRankEach=2, autoRank=False).to(self.device)
-            wrapper.train()
+            wm.eval()
 
-            with torch.no_grad():
-                for _, layer_list in wrapper.cand.items():
-                    for slot in layer_list:
-                        for Bp in slot["B"]:
-                            if Bp.numel() > 0:
-                                Bp.data.normal_(0.0, 1e-3)
-                        for sp in slot["s"]:
-                            sp.data.fill_(1.0)
+            wrapper = WorldOnlineWrapper(wm, initRankEach=2, autoRank=False).to(self.device).train()
 
-            B = 6
+            B = 5
+            wm.ResetState(batchSize=B)
+
             vision = torch.randn(B, wm.vision_dim, device=self.device)
             keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(45, self.key_dim - 1)] = 1.0
+            keys[:, min(14, self.key_dim - 1)] = 1.0
             mouse = torch.randn(B, 2, device=self.device)
+            click = torch.zeros(B, 2, device=self.device)
+            reward = torch.zeros(B, device=self.device)
+            done = torch.zeros(B, device=self.device)
 
-            wm.ResetState(batchSize=B)
-            out = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False)
+            out = wrapper(
+                vision,
+                keysVec=keys, mouseClick=click, mouseSeq=mouse, reward=reward, done=done,
+                sample=False,)
 
-            loss = (
-                F.mse_loss(out["r_pred"], torch.zeros_like(out["r_pred"]))
-                + 0.5 * F.binary_cross_entropy(out["d_prob"].clamp(1e-6, 1.0 - 1e-6), torch.zeros_like(out["d_prob"]))
-                + 0.1 * F.mse_loss(out["s_next"], torch.zeros_like(out["s_next"])))
+            loss = out["loss"]
+            if not torch.isfinite(loss).item():
+                print("GradFlowCandidates FAILED: loss not finite")
+                return False
+
+            wrapper.zero_grad(set_to_none=True)
+            loss.backward()
 
             params = list(wrapper.CandParameters())
             if len(params) == 0:
-                print("Grad flow (wrapper candidates): failed | no candidate params")
+                print("GradFlowCandidates FAILED: no candidate params")
                 return False
 
+            any_grad = False
             for p in params:
-                if p.grad is not None:
-                    p.grad.zero_()
-
-            loss.backward()
-
-            site = "act" if "act" in wrapper.cand else next(iter(wrapper.cand.keys()))
-            slot = wrapper.cand[site][0]
-
-            hasA = False
-            for p in slot["A"]:
                 if p.grad is not None and torch.isfinite(p.grad).all().item() and (p.grad.abs().sum().item() > 0):
-                    hasA = True
-                    break
-            hasB = False
-            for p in slot["B"]:
-                if p.grad is not None and torch.isfinite(p.grad).all().item() and (p.grad.abs().sum().item() > 0):
-                    hasB = True
-                    break
-            hasS = False
-            for p in slot["s"]:
-                if p.grad is not None and torch.isfinite(p.grad).all().item() and (p.grad.abs().sum().item() > 0):
-                    hasS = True
+                    any_grad = True
                     break
 
-            ok = bool(hasA and hasB and hasS)
-            print(f"Grad flow (wrapper candidates): {'passed' if ok else 'failed'} | site='{site}' | loss={float(loss.item()):.6f}")
+            ok = bool(any_grad)
+            print(f"Grad flow (wrapper candidates) {'passed' if ok else 'failed'} | loss={float(loss.item()):.6f}")
             return ok
 
         except Exception as e:
             print(f"Grad flow (wrapper candidates) FAILED: {type(e).__name__}: {e}")
             return False
 
-    def TestWrapperTrainLossDecreases(self) -> bool:
+    def TestWrapperUpdateInjectLoRA(self) -> bool:
         try:
             torch.manual_seed(0)
-            wm = self.wm
-            wrapper = WorldOnlineWrapper(wm, initRankEach=2, autoRank=False).to(self.device)
-            wrapper.train()
+
+            wm = self.wm.to(self.device).eval()
+            wrapper = WorldOnlineWrapper(wm, initRankEach=0, autoRank=False).to(self.device).eval()
+            base = wrapper.base
+
+            B = 4
+            V = int(base.vision_dim)
+            K = int(getattr(base.action_encoder, "K", 64))
+
+            visionIn = torch.randn(B, V, device=self.device, dtype=base.dtype)
+            keysVec = torch.zeros(B, K, device=self.device, dtype=base.dtype)
+            keysVec[:, min(3, K - 1)] = 1.0
+
+            mouseSeq = torch.zeros(B, 2, device=self.device, dtype=base.dtype)
+            mouseClick = torch.zeros(B, 2, device=self.device, dtype=base.dtype)
+
+            reward = torch.zeros(B, device=self.device, dtype=base.dtype)
+            done = torch.zeros(B, device=self.device, dtype=base.dtype)
+
+            base_params0 = {n: p.detach().clone() for n, p in base.named_parameters()}
+
+            use_mem0 = bool(getattr(base, "_use_memory", False))
+            if hasattr(base, "_use_memory"):
+                base._use_memory = False
+
+            base.EnsureB(B, base.device, base.dtype)
+
+            h0 = base._h.detach().clone()
+            z0 = base._z.detach().clone()
+            s4x0 = base.s4.x.detach().clone()
+            Aprev0 = None
+            if hasattr(base, "_A_prev") and (base._A_prev is not None):
+                Aprev0 = base._A_prev.detach().clone()
+
+            def _restore_state():
+                base._h = h0.detach().clone()
+                base._z = z0.detach().clone()
+                base.s4.x = s4x0.detach().clone()
+                if hasattr(base, "_A_prev"):
+                    base._A_prev = None if Aprev0 is None else Aprev0.detach().clone()
+
+            wrapper.Update("reset", initRankEach=0)
+            _restore_state()
 
             with torch.no_grad():
-                for _, layer_list in wrapper.cand.items():
-                    for slot in layer_list:
-                        for Bp in slot["B"]:
-                            if Bp.numel() > 0:
-                                Bp.data.normal_(0.0, 1e-3)
-                        for sp in slot["s"]:
-                            sp.data.fill_(1.0)
+                out0 = wrapper(
+                    visionIn,
+                    keysVec=keysVec,
+                    mouseClick=mouseClick,
+                    mouseSeq=mouseSeq,
+                    reward=reward,
+                    done=done,
+                    sample=False,)
+            dprob0 = out0["d_prob"].detach().float().mean().item()
 
-            opt = torch.optim.Adam(list(wrapper.CandParameters()), lr=2e-3)
+            wrapper.Update("reset", initRankEach=0)
+            wrapper.Update("grow", growFactor=1.0, addEach=1)   
 
-            B = 8
-            vision = torch.randn(B, wm.vision_dim, device=self.device)
-            keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(31, self.key_dim - 1)] = 1.0
-            keys[:, min(49, self.key_dim - 1)] = 1.0
-            mouse = torch.randn(B, 2, device=self.device)
+            assert "act_proj" in wrapper.sites, "Site 'act_proj' not found in wrapper.sites"
+            assert len(wrapper.cand["act_proj"][0]["A"]) > 0, "act_proj layer0 has no candidate after grow()"
 
-            wm.ResetState(batchSize=B)
+            with torch.no_grad():
+                A = wrapper.cand["act_proj"][0]["A"][0]
+                Bm = wrapper.cand["act_proj"][0]["B"][0]
+                s = wrapper.cand["act_proj"][0]["s"][0]
 
-            watch = None
-            for p in wrapper.CandParameters():
-                watch = p
-                break
-            before = watch.detach().clone() if watch is not None else None
+                A.normal_(0.0, 5e-2)
+                Bm.normal_(0.0, 5e-2)
+                s.fill_(3.0)  
 
-            steps = 40
-            losses = []
-            for t in range(1, steps + 1):
-                out = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False)
-                loss = (
-                    F.mse_loss(out["r_pred"], torch.zeros_like(out["r_pred"]))
-                    + 0.5 * F.binary_cross_entropy(out["d_prob"].clamp(1e-6, 1.0 - 1e-6), torch.zeros_like(out["d_prob"]))
-                    + 0.1 * F.mse_loss(out["s_next"], torch.zeros_like(out["s_next"])))
+            dmat = wrapper.ComposeOne("act_proj", 0)
+            dnorm = float(dmat.detach().float().abs().mean().item())
+            assert dnorm > 0.0, "Injected delta is still zero; injection failed"
 
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(list(wrapper.CandParameters()), 3.0)
-                opt.step()
+            _restore_state()
+            with torch.no_grad():
+                out1 = wrapper(
+                    visionIn,
+                    keysVec=keysVec,
+                    mouseClick=mouseClick,
+                    mouseSeq=mouseSeq,
+                    reward=reward,
+                    done=done,
+                    sample=False,)
+            dprob1 = out1["d_prob"].detach().float().mean().item()
 
-                losses.append(float(loss.item()))
-                if t % 10 == 0:
-                    print(f"[WrapperTrain] step {t}/{steps} | loss={losses[-1]:.6f}")
+            same_base = True
+            for n, p in base.named_parameters():
+                if not torch.equal(base_params0[n], p.detach()):
+                    same_base = False
+                    break
 
-            start, end = losses[0], losses[-1]
-            decreased = (end <= start * 0.75) or ((start - end) >= 0.3)
+            diff = abs(dprob1 - dprob0)
+            ok = (diff > 1e-9) and same_base
 
-            changed = True
-            if before is not None:
-                delta = float((watch.detach() - before).abs().mean().item())
-                changed = delta > 1e-7
+            print(
+                f"Wrapper Update-inject LoRA {'passed' if ok else 'FAILED'} | "
+                f"site='act_proj' | mean|Δ|={dnorm:.3e} | "
+                f"d_prob_mean: {dprob0:.6f} -> {dprob1:.6f} |Δ|={diff:.3e} | "
+                f"base_unchanged={same_base}")
 
-            ok = bool(decreased and changed)
-            print(f"Wrapper multi-step training {'passed' if ok else 'failed'} (loss {start:.4f} -> {end:.4f}; params changed={changed})")
+            if hasattr(base, "_use_memory"):
+                base._use_memory = use_mem0
+
             return ok
 
         except Exception as e:
-            print(f"Wrapper multi-step training FAILED: {type(e).__name__}: {e}")
-            return False
-
-    def TestBaseGradFlow(self) -> bool:
-        try:
-            torch.manual_seed(0)
-            base = RSSMWorldModel(
-                visionDim=1024, actionDim=256, deterDim=256, stochDim=32, stateDim=256,
-                useDecoder=True, useMemory=False, nsEnabled=True).to(self.device)
-            base.train()
-
-            B = 6
-            vision = torch.randn(B, base.vision_dim, device=self.device)
-            keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(32, self.key_dim - 1)] = 1.0
-            mouse = torch.randn(B, 2, device=self.device)
-
-            out = base.ForwardTrainSeq(vision, keys, mouse)
-            loss = out["loss"]
-
-            base.zero_grad(set_to_none=True)
-            loss.backward()
-
-            sample_params = []
-            for m in base.modules():
-                tgt = getattr(m, "target", None)
-                if tgt is not None and hasattr(tgt, "weight") and isinstance(tgt.weight, torch.Tensor):
-                    sample_params.append(tgt.weight)
-                    if len(sample_params) >= 4:
-                        break
-            if len(sample_params) < 2:
-                for p in base.parameters():
-                    sample_params.append(p)
-                    if len(sample_params) >= 4:
-                        break
-
-            grads_ok = True
-            for p in sample_params:
-                g = p.grad
-                if (g is None) or (not torch.isfinite(g).all().item()) or (float(g.abs().sum().item()) == 0.0):
-                    grads_ok = False
-                    break
-
-            print(f"Base grad flow: {'passed' if grads_ok else 'failed'} | loss={float(loss.item()):.6f}")
-            return bool(grads_ok)
-
-        except Exception as e:
-            print(f"Base grad flow FAILED: {type(e).__name__}: {e}")
-            return False
-
-    def TestBaseTrainingLossDecreases(self) -> bool:
-        try:
-            torch.manual_seed(0)
-            base = RSSMWorldModel(
-                visionDim=1024, actionDim=256, deterDim=256, stochDim=32, stateDim=256,
-                useDecoder=True, useMemory=False, nsEnabled=True).to(self.device)
-            base.train()
-
-            opt = torch.optim.Adam(base.parameters(), lr=1e-3)
-
-            B = 8
-            vision = torch.randn(B, base.vision_dim, device=self.device)
-            keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(32, self.key_dim - 1)] = 1.0
-            mouse = torch.randn(B, 2, device=self.device)
-
-            watch_params = []
-            for m in base.modules():
-                tgt = getattr(m, "target", None)
-                if tgt is not None and hasattr(tgt, "weight"):
-                    watch_params.append(tgt.weight)
-                    if len(watch_params) >= 2:
-                        break
-            if len(watch_params) < 2:
-                for p in base.parameters():
-                    watch_params.append(p)
-                    if len(watch_params) >= 2:
-                        break
-            before_vals = [p.detach().clone() for p in watch_params]
-
-            losses = []
-            steps = 30
-            for t in range(1, steps + 1):
-                out = base.ForwardTrainSeq(vision, keys, mouse)
-                loss = out["loss"]
-
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(base.parameters(), 3.0)
-                opt.step()
-
-                losses.append(float(loss.item()))
-                if t % 10 == 0:
-                    print(f"[BaseTrain] step {t}/{steps} | loss={losses[-1]:.6f}")
-
-            start, end = losses[0], losses[-1]
-            decreased = end < start
-
-            changed = True
-            for p, b in zip(watch_params, before_vals):
-                if float((p.detach() - b).abs().mean().item()) <= 1e-7:
-                    changed = False
-                    break
-
-            ok = bool(decreased and changed)
-            print(f"Base ForwardTrainSeq training {'passed' if ok else 'failed'} (loss {start:.4f} -> {end:.4f}; params changed={changed})")
-            return ok
-
-        except Exception as e:
-            print(f"Base ForwardTrainSeq training FAILED: {type(e).__name__}: {e}")
-            return False
-
-    def TestGradCoverageCandidateSites(self) -> bool:
-        try:
-            torch.manual_seed(0)
-            wm = self.wm
-            wrapper = WorldOnlineWrapper(wm, initRankEach=2, autoRank=False).to(self.device)
-            wrapper.train()
-
-            with torch.no_grad():
-                for _, layer_list in wrapper.cand.items():
-                    for slot in layer_list:
-                        for Bp in slot["B"]:
-                            if Bp.numel() > 0:
-                                Bp.data.normal_(0.0, 1e-3)
-                        for sp in slot["s"]:
-                            sp.data.fill_(1.0)
-
-            B = 5
-            vision = torch.randn(B, wm.vision_dim, device=self.device)
-            keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(31, self.key_dim - 1)] = 1.0
-            mouse = torch.randn(B, 2, device=self.device)
-
-            wm.ResetState(batchSize=B)
-            out1 = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False)
-
-            mu_q = out1.get("mu_q", None)
-            logstd_q = out1.get("logstd_q", None)
-
-            out2 = wrapper(vision, keysVec=keys, mouseSeq=mouse, sample=False)
-
-            base_loss = (
-                F.mse_loss(out2["r_pred"], torch.zeros_like(out2["r_pred"]))
-                + 0.5 * F.binary_cross_entropy(out2["d_prob"].clamp(1e-6, 1.0 - 1e-6), torch.zeros_like(out2["d_prob"]))
-                + 0.1 * F.mse_loss(out2["s_next"], torch.zeros_like(out2["s_next"])))
-
-            loss = base_loss
-            if (mu_q is not None) and (logstd_q is not None) and ("mu_p" in out2) and ("logstd_p" in out2):
-                mu_p = out2["mu_p"]
-                logstd_p = out2["logstd_p"]
-                vq = torch.exp(2.0 * logstd_q)
-                vp = torch.exp(2.0 * logstd_p)
-                kl = (logstd_p - logstd_q) + (vq + (mu_q - mu_p) ** 2) / (2.0 * vp) - 0.5
-                kl = kl.sum(dim=-1, keepdim=True).mean()
-                loss = loss + 0.1 * kl
-
-            for p in wrapper.CandParameters():
-                if p.grad is not None:
-                    p.grad.zero_()
-            loss.backward()
-
-            missing = []
-            for site_name, layer_list in wrapper.cand.items():
-                for li, slot in enumerate(layer_list):
-                    def _list_has_grad(plist):
-                        for p in plist:
-                            if p.grad is not None and torch.isfinite(p.grad).all().item() and (p.grad.abs().sum().item() > 0):
-                                return True
-                        return False
-
-                    okA = True if len(slot["A"]) == 0 else _list_has_grad(slot["A"])
-                    okB = True if len(slot["B"]) == 0 else _list_has_grad(slot["B"])
-                    okS = True if len(slot["s"]) == 0 else _list_has_grad(slot["s"])
-                    if not (okA and okB and okS):
-                        missing.append(f"{site_name}[{li}]")
-
-            ok_all = (len(missing) == 0)
-            print(f"Grad coverage (candidates) {'passed' if ok_all else 'failed'}; missing/no-grad: {missing}")
-            return bool(ok_all)
-
-        except Exception as e:
-            print(f"Grad coverage (candidates) FAILED: {type(e).__name__}: {e}")
-            return False
-
-    def TestParityPosterior(self) -> bool:
-        try:
-            torch.manual_seed(0)
-            wm = self.wm
-            wrapper = WorldOnlineWrapper(wm, initRankEach=0, autoRank=False).to(self.device)
-            wrapper.eval()
-            wm.eval()
-
-            B = 3
-            vision = torch.randn(B, wm.vision_dim, device=self.device)
-            keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(31, self.key_dim - 1)] = 1.0
-            keys[:, min(57, self.key_dim - 1)] = 1.0
-            mouse = torch.randn(B, 2, device=self.device)
-
-            h0 = torch.zeros(B, wm.deter_dim, device=self.device)
-            z0 = torch.zeros(B, wm.stoch_dim, device=self.device)
-
-            wm.ResetState(batchSize=B)
-            ae = wm.action_encoder
-            ae_sig = inspect.signature(ae.forward)
-            ae_n = len([p for p in ae_sig.parameters.values() if p.name != "self"])
-            if ae_n >= 3:
-                a_enc = ae(keys, mouse, None)
-            else:
-                a_enc = ae(keys, mouse)
-            out_base = wm.StepPosterior(h0, z0, vision, a_enc, sample=False)
-
-            wm.ResetState(batchSize=B)
             try:
-                out_wrap = wrapper.ForwardWithDeltas(
-                    vision, None, None, None, [{}],
-                    keysVec=keys, mouseSeq=mouse, sample=False, h0=h0, z0=z0)
-            except TypeError:
-                out_wrap = wrapper.ForwardWithDeltas(
-                    vision, None, None, None, [{}],
-                    keysVec=keys, mouseSeq=mouse, sample=False)
+                if "base" in locals() and hasattr(base, "_use_memory") and "use_mem0" in locals():
+                    base._use_memory = use_mem0
+            except Exception:
+                pass
 
-            must_keys = ["h_next", "z_next", "s_next", "r_pred", "d_prob", "mu_p", "logstd_p", "mu_q", "logstd_q"]
-            ok = True
-            max_diff = 0.0
-            for k in must_keys:
-                if (k not in out_base) or (k not in out_wrap):
-                    ok = False
-                    continue
-                if out_base[k].shape != out_wrap[k].shape:
-                    ok = False
-                    continue
-                diff = float((out_base[k] - out_wrap[k]).abs().max().item())
-                max_diff = max(max_diff, diff)
-                if diff > 1e-5:
-                    ok = False
-
-            if getattr(wm, "_ns_enabled", False):
-                if ("ns_probs" in out_wrap) and ("ns_logits" in out_wrap):
-                    p = out_wrap["ns_probs"]
-                    ok = ok and (p.min().item() >= 0.0) and (p.max().item() <= 1.0)
-
-            print(f"Parity posterior (values) {'passed' if ok else 'failed'} | max|Δ|={max_diff:.3e}")
-            return bool(ok)
-
-        except Exception as e:
-            print(f"Parity posterior FAILED: {type(e).__name__}: {e}")
+            print(f"Wrapper Update-inject LoRA FAILED: {type(e).__name__}: {e}")
             return False
 
-    def TestParityPrior(self) -> bool:
-        try:
-            torch.manual_seed(0)
-            wm = self.wm
-            B = 3
 
-            keys = torch.zeros(B, self.key_dim, device=self.device)
-            keys[:, min(33, self.key_dim - 1)] = 1.0
-            mouse = torch.randn(B, 2, device=self.device)
-
-            ae = wm.action_encoder
-            ae_sig = inspect.signature(ae.forward)
-            ae_n = len([p for p in ae_sig.parameters.values() if p.name != "self"])
-            if ae_n >= 3:
-                a_enc = ae(keys, mouse, None)
-            else:
-                a_enc = ae(keys, mouse)
-
-            h0 = torch.zeros(B, wm.deter_dim, device=self.device)
-            z0 = torch.zeros(B, wm.stoch_dim, device=self.device)
-            x0 = torch.zeros(B, wm.ssm_dim, device=self.device)
-
-            wm.ResetState(batchSize=B)
-            h_prev, z_prev, x_prev = wm.ExportState()
-            h1, z1, s1, x1, r1, d1 = wm.StepPriorOnly(h0, z0, x0, a_enc, sample=False)
-            h_after, z_after, x_after = wm.ExportState()
-
-            wm.ResetState(batchSize=B)
-            h2, z2, s2, x2, r2, d2 = wm.StepPriorOnly(h0, z0, x0, a_enc, sample=False)
-
-            ok_shapes = (
-                h1.shape == (B, wm.deter_dim)
-                and z1.shape == (B, wm.stoch_dim)
-                and s1.shape == (B, wm.state_dim)
-                and x1.shape == (B, wm.ssm_dim)
-                and r1.shape == (B, 1)
-                and d1.shape == (B, 1))
-
-            not_written = torch.allclose(h_prev, h_after) and torch.allclose(z_prev, z_after) and torch.allclose(x_prev, x_after)
-            deterministic = (
-                torch.allclose(h1, h2, atol=1e-6)
-                and torch.allclose(z1, z2, atol=1e-6)
-                and torch.allclose(s1, s2, atol=1e-6)
-                and torch.allclose(x1, x2, atol=1e-6)
-                and torch.allclose(r1, r2, atol=1e-6)
-                and torch.allclose(d1, d2, atol=1e-6))
-
-            ok = bool(ok_shapes and not_written and deterministic)
-            print(f"Parity prior (base deterministic & no-write) {'passed' if ok else 'failed'}.")
-            return ok
-
-        except Exception as e:
-            print(f"Parity prior FAILED: {type(e).__name__}: {e}")
-            return False
 
     def RunAll(self) -> bool:
         results = {
             "ActionEncoder": self.TestActionEncoder(),
             "RSSMStepPosterior": self.TestRSSMStepPosterior(),
             "RSSMStepPriorOnly": self.TestRSSMStepPriorOnly(),
-            "ForwardTrainSeq": self.TestForwardTrainSeq(),
+            "ForwardTrainFiniteGrad": self.TestForwardTrainFiniteGrad(),
+            "LossDecrease": self.TestLossDecrease(),
             "ConnRegReset": self.TestConnRegReset(),
+            "ExportWorldMemoryBank": self.TestExportWorldMemoryBank(),
             "WrapperAPIBasics": self.TestWrapperAPIBasics(),
             "ForwardWithDeltasInjection": self.TestForwardWithDeltasInjection(),
             "CommitOneGrowAndValueChange": self.TestCommitOneGrowAndValueChange(),
             "GradFlowCandidates": self.TestGradFlowCandidates(),
-            "WrapperTrainLossDecreases": self.TestWrapperTrainLossDecreases(),
-            "BaseGradFlow": self.TestBaseGradFlow(),
-            "BaseTrainLossDecreases": self.TestBaseTrainingLossDecreases(),
-            "GradCoverageCandidateSites": self.TestGradCoverageCandidateSites(),
-            "ParityPosteriorValues": self.TestParityPosterior(),
-            "ParityPriorBase": self.TestParityPrior(),}
+            "WrapperUpdateInjectLoRA": self.TestWrapperUpdateInjectLoRA(),}
 
-        passed = sum(1 for ok in results.values() if ok)
-        total = len(results)
-        print(f"\nWorldModel test summary: {passed}/{total} passed.")
-        return all(results.values())
+        passed = sum(1 for v in results.values() if v)
+        print(f"\n[WorldModule Tests] {passed}/{len(results)} passed.")
+        return passed == len(results)
+

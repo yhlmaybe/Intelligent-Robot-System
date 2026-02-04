@@ -527,7 +527,7 @@ class DecisionExtractor(AGICoreModule):
             SwiGLUBlock(dim=psiDim, drop=0.1, layerscale=1e-2),)
 
         self.psi_to = nn.ModuleDict({
-            "keys": nn.Sequential(
+            "kbd_keys": nn.Sequential(
                 nn.LayerNorm(psiDim),
                 nn.Linear(psiDim, 1024),
                 nn.SiLU(),
@@ -657,7 +657,7 @@ class DecisionExtractor(AGICoreModule):
 
         psi_h = self.psi_trunk(psi_mix)  
 
-        keys_psi_logit = self.psi_to["keys"](psi_h) # [B, KEY_DIM]
+        keys_psi_logit = self.psi_to["kbd_keys"](psi_h) # [B, KEY_DIM]
         mu_psi = self.psi_to["mu"](psi_h) # [B, act_dim]
         ls_psi = self.psi_to["logstd"](psi_h) # [B, act_dim]
         click_psi_logit = self.psi_to["click"](psi_h) # [B, 2]
@@ -1051,7 +1051,7 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         if D.get("click2") is not None:
             click_direct_logit = click_direct_logit + F.linear(ct, D["click2"], bias=None)
 
-        keys_psi_logit = self.base.psi_to["keys"](psi_h)
+        keys_psi_logit = self.base.psi_to["kbd_keys"](psi_h)
         mu_psi = self.base.psi_to["mu"](psi_h)
         ls_psi = self.base.psi_to["logstd"](psi_h)
         click_psi_logit = self.base.psi_to["click"](psi_h)
@@ -1792,7 +1792,7 @@ class TestDecisionMTool:
             ok = True
             ok &= prior["mouse"]["mu"].shape == (B, 2)
             ok &= prior["mouse"]["var"].shape == (B, 2)
-            ok &= prior["keyboard"]["keys_logits"].shape == (B, self.key_dim)
+            ok &= prior["keys"]["logits"].shape == (B, self.key_dim)
             ok &= prior["click"]["logits"].shape == (B, 2)
 
             if not ok:
@@ -1823,7 +1823,7 @@ class TestDecisionMTool:
             model.eval()
 
             with torch.no_grad():
-                last_lin = model.psi_to["keys"][-1]
+                last_lin = model.psi_to["kbd_keys"][-1]
                 if isinstance(last_lin, nn.Linear):
                     last_lin.weight.zero_()
                     if last_lin.bias is not None:
@@ -2182,6 +2182,300 @@ class TestDecisionMTool:
             print("Stress test error:", type(e).__name__, e)
             return False
 
+
+    def TestPlannerEffectiveness(self) -> bool:
+        try:
+            class ToyActionEncoder(nn.Module):
+                def __init__(self, keyVecDim: int):
+                    super().__init__()
+                    self.key_vec_dim = int(keyVecDim)
+
+                def forward(self, keyVec: torch.Tensor, mouseDelta: torch.Tensor) -> torch.Tensor:
+                    return torch.cat([keyVec.float(), mouseDelta.float()], dim=-1)
+
+            class ToyRewardWorldModel(nn.Module):
+                def __init__(
+                    self,
+                    keyVecDim: int,
+                    deterDim: int = 8,
+                    stochDim: int = 4,
+                    ssmDim: int = 6,
+                    stateDim: int = 8,
+                    target_xy: Tuple[float, float] = (0.8, -0.4),
+                    space_code: int = 72,):
+                    super().__init__()
+                    self.key_vec_dim = int(keyVecDim)
+                    self.deter_dim = int(deterDim)
+                    self.stoch_dim = int(stochDim)
+                    self.ssm_dim = int(ssmDim)
+                    self.state_dim = int(stateDim)
+
+                    self.action_encoder = ToyActionEncoder(self.key_vec_dim)
+
+                    self.register_buffer("_h", torch.zeros(1, self.deter_dim))
+                    self.register_buffer("_z", torch.zeros(1, self.stoch_dim))
+                    self.register_buffer("_x", torch.zeros(1, self.ssm_dim))
+
+                    self.register_buffer("_target", torch.tensor(target_xy, dtype=torch.float32).view(1, 2))
+                    self.space_code = int(space_code)
+
+                def ResetHidden(self, B: int = 1, device: torch.device | None = None):
+                    device = device or self._h.device
+                    self._h = torch.zeros(B, self.deter_dim, device=device)
+                    self._z = torch.zeros(B, self.stoch_dim, device=device)
+                    self._x = torch.zeros(B, self.ssm_dim, device=device)
+
+                def ExportState(self):
+                    return self._h, self._z, self._x
+
+                @torch.no_grad()
+                def StepPriorOnly(self, hPrev, zPrev, xPrev, aEnc, sample: bool = False):
+                    keyvec = aEnc[:, : self.key_vec_dim] 
+                    mouse = aEnc[:, self.key_vec_dim : ] 
+
+                    target = self._target.to(device=mouse.device, dtype=mouse.dtype)
+                    dist2 = (mouse - target).square().sum(dim=-1, keepdim=True)
+
+                    click0 = keyvec[:, (self.key_vec_dim - 2):(self.key_vec_dim - 1)]
+                    space = keyvec[:, self.space_code:self.space_code + 1]
+
+                    r = (-dist2) + 1.2 * space + 0.4 * click0
+
+                    h_next = hPrev
+                    z_next = zPrev
+                    s_next = torch.zeros(aEnc.size(0), self.state_dim, device=aEnc.device, dtype=aEnc.dtype)
+                    x_next = xPrev
+                    d_prob = torch.zeros(aEnc.size(0), 1, device=aEnc.device, dtype=aEnc.dtype)
+
+                    return h_next, z_next, s_next, x_next, r, d_prob
+
+            B = 4
+            horizon = 4
+            N = 128
+            elite = 16
+            iters = 4
+
+            space_code = int(RAW_KEYBOARD_LAYOUT.get("Space", 72))
+
+            wm = ToyRewardWorldModel(
+                keyVecDim=self.keyvec_dim,
+                deterDim=8,
+                stochDim=4,
+                ssmDim=6,
+                stateDim=8,
+                target_xy=(0.8, -0.4),
+                space_code=space_code,).to(self.device)
+            wm.ResetHidden(B=B, device=self.device)
+            h0, z0, x0 = wm.ExportState()
+
+            planner = CEMPlanner(
+                worldModel=wm,
+                wmIsOnlineWrapper=False,
+                maxCode=self.max_code,
+                horizon=horizon,
+                N=N,
+                elite=elite,
+                iters=iters,
+                gamma=0.99,
+                temperature=1.0,
+                momentum=0.15,
+                minVar=1e-4,
+                epsBern=1e-4,).to(self.device)
+
+            keysLogits0 = torch.zeros(B, self.key_dim, device=self.device)
+            mouseMu0 = torch.zeros(B, 2, device=self.device)
+            mouseLogstd0 = torch.zeros(B, 2, device=self.device)
+            clickLogits0 = torch.zeros(B, 2, device=self.device)
+
+            prior = planner.Plan(keysLogits0, mouseMu0, mouseLogstd0, clickLogits0, h0, z0, x0, returnTrajectories=False)
+
+            target = torch.tensor([0.8, -0.4], device=self.device, dtype=torch.float32).view(1, 2)
+            mu_plan = prior["mouse"]["mu"].to(dtype=torch.float32)
+            dist2_plan = (mu_plan - target).square().sum(dim=-1).mean().item()
+            dist2_base = (mouseMu0.to(dtype=torch.float32) - target).square().sum(dim=-1).mean().item()
+
+            p_space_plan = torch.sigmoid(prior["keys"]["logits"][:, space_code]).mean().item()
+            p_click0_plan = torch.sigmoid(prior["click"]["logits"][:, 0]).mean().item()
+
+            p_space_base = 0.5
+            p_click0_base = 0.5
+
+            ok = True
+            ok &= (dist2_plan < dist2_base * 0.90) 
+            ok &= (p_space_plan > p_space_base + 0.15)
+            ok &= (p_click0_plan > p_click0_base + 0.10)
+
+            if not ok:
+                print(
+                    "Planner effectiveness failed:",
+                    f"dist2 base={dist2_base:.4f} plan={dist2_plan:.4f}, "
+                    f"p(space) base={p_space_base:.3f} plan={p_space_plan:.3f}, "
+                    f"p(click0) base={p_click0_base:.3f} plan={p_click0_plan:.3f}")
+                return False
+
+            print("CEMPlanner effectiveness (toy reward) pass")
+            return True
+        except Exception as e:
+            print("Planner effectiveness error:", type(e).__name__, e)
+            return False
+
+
+    def TestLossDecreaseSupervised(self, steps: int = 160) -> bool:
+        try:
+            model = DecisionExtractor(
+                stateDim=256, intentDim=256,
+                hiddenDim=128, psiDim=64,
+                optionNum=16, useHebb=False).to(self.device)
+
+            model.train()
+            opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+
+            B = 32
+            x = torch.randn(B, 256, device=self.device)
+            intent = torch.randn(B, 256, device=self.device)
+
+            K = model.num_options
+            prev = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
+
+            tgt_keys = torch.zeros(B, self.key_dim, device=self.device)
+            for code in [RAW_KEYBOARD_LAYOUT.get("W", 32), RAW_KEYBOARD_LAYOUT.get("Space", 72), RAW_KEYBOARD_LAYOUT.get("Shift", 57)]:
+                if 0 <= int(code) < self.key_dim:
+                    tgt_keys[:, int(code)] = 1.0
+
+            tgt_click = torch.tensor([1.0, 0.0], device=self.device).view(1, 2).repeat(B, 1)
+            tgt_mouse = torch.tensor([0.35, -0.25], device=self.device).view(1, 2).repeat(B, 1)
+            tgt_opt = torch.full((B,), 3, device=self.device, dtype=torch.long)
+
+            bce = nn.BCEWithLogitsLoss(reduction="mean")
+            mse = nn.MSELoss(reduction="mean")
+            ce = nn.CrossEntropyLoss(reduction="mean")
+
+            losses: List[float] = []
+
+            for t in range(int(steps)):
+                out = model(
+                    x, intent,
+                    sample=False,
+                    prevOptionLogit=prev,
+                    prior=None,
+                    returnKeysVec=False,)
+
+                keys_logits = out["keyboard"]["keys_logits"]
+                click_logits = out["mouse"]["click_logits"]
+                mu = out["mouse"]["mu"]
+                opt_logits = out["option"]["logits"]
+
+                loss_keys = bce(keys_logits, tgt_keys)
+                loss_click = bce(click_logits, tgt_click)
+                loss_mouse = mse(mu, tgt_mouse)
+                loss_opt = ce(opt_logits, tgt_opt)
+
+                loss = loss_keys + 0.5 * loss_click + 2.0 * loss_mouse + 0.5 * loss_opt
+
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
+                losses.append(float(loss.detach().cpu().item()))
+
+            head = sum(losses[:10]) / 10.0
+            tail = sum(losses[-10:]) / 10.0
+
+            if not (tail < head * 0.70):
+                print(f"Supervised loss did not decrease enough: head={head:.6f} tail={tail:.6f}")
+                return False
+
+            print(f"Supervised loss decrease pass. head={head:.6f} -> tail={tail:.6f}")
+            return True
+        except Exception as e:
+            print("Loss decrease test error:", type(e).__name__, e)
+            return False
+
+
+    def TestAllParamsHaveGrad(self) -> bool:
+        try:
+            model = DecisionExtractor(
+                stateDim=256, intentDim=256,
+                hiddenDim=128, psiDim=64,
+                optionNum=16, useHebb=True).to(self.device)
+
+            if not self.PregrowAllLora(model, rank=2, freezeOld=False):
+                return False
+
+            model.train()
+
+            B = 16
+            x = torch.randn(B, 256, device=self.device)
+            intent = torch.randn(B, 256, device=self.device)
+
+            K = model.num_options
+            prev = F.one_hot(torch.randint(0, K, (B,), device=self.device), num_classes=K).float()
+
+            tgt_keys = torch.zeros(B, self.key_dim, device=self.device)
+            for code in [RAW_KEYBOARD_LAYOUT.get("W", 32), RAW_KEYBOARD_LAYOUT.get("Space", 72)]:
+                if 0 <= int(code) < self.key_dim:
+                    tgt_keys[:, int(code)] = 1.0
+
+            tgt_click = torch.tensor([1.0, 1.0], device=self.device).view(1, 2).repeat(B, 1)
+            tgt_mouse = torch.tensor([0.2, -0.1], device=self.device).view(1, 2).repeat(B, 1)
+            tgt_opt = torch.randint(0, K, (B,), device=self.device, dtype=torch.long)
+
+            bce = nn.BCEWithLogitsLoss(reduction="mean")
+            mse = nn.MSELoss(reduction="mean")
+            ce = nn.CrossEntropyLoss(reduction="mean")
+
+            out = model(
+                x, intent,
+                sample=False,
+                prevOptionLogit=prev, 
+                prior=None,
+                returnKeysVec=False,)
+
+            keys_logits = out["keyboard"]["keys_logits"]
+            click_logits = out["mouse"]["click_logits"]
+            mu = out["mouse"]["mu"]
+            logstd = out["mouse"]["logstd"]
+            opt_logits = out["option"]["logits"]
+
+            loss = (
+                bce(keys_logits, tgt_keys)
+                + 0.5 * bce(click_logits, tgt_click)
+                + 2.0 * mse(mu, tgt_mouse)
+                + 0.1 * mse(logstd, torch.full_like(logstd, -1.0))
+                + 0.5 * ce(opt_logits, tgt_opt))
+
+            for p in model.parameters():
+                p.grad = None
+
+            loss.backward()
+
+            missing: List[str] = []
+            nonfinite: List[str] = []
+
+            for name, p in model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if p.grad is None:
+                    missing.append(name)
+                    continue
+                if not torch.isfinite(p.grad).all():
+                    nonfinite.append(name)
+
+            if missing or nonfinite:
+                if missing:
+                    print("Missing grad (first 20):", missing[:20])
+                if nonfinite:
+                    print("Non-finite grad (first 20):", nonfinite[:20])
+                return False
+
+            print("All-params gradient coverage pass (base + LoRA)")
+            return True
+        except Exception as e:
+            print("All-params grad test error:", type(e).__name__, e)
+            return False
+
+
     def RunAll(self):
         results = {
             "HebbianPlasticityLayer": self.TestHebbLayer(),
@@ -2196,7 +2490,10 @@ class TestDecisionMTool:
             "NoNanManySteps": self.TestNoNanManySteps(),
             "ParamsChange": self.TestParamsChange(),
             "GradRoutingAllModes": self.TestGradRoutingAllModes(),
-            "StressTestPlannerAndDecision": self.StressTestPlannerAndDecision(),}
+            "StressTestPlannerAndDecision": self.StressTestPlannerAndDecision(),
+            "PlannerEffectiveness": self.TestPlannerEffectiveness(),
+            "LossDecreaseSupervised": self.TestLossDecreaseSupervised(),
+            "AllParamsHaveGrad": self.TestAllParamsHaveGrad(),}
 
         passed = sum(1 for v in results.values() if v)
         print(f"\n[DecisionModule Tests] {passed}/{len(results)} passed.")
