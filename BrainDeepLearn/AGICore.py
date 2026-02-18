@@ -318,18 +318,26 @@ class BrainCore(nn.Module):
         s_t = w_out["s_next"] # World State
         r_t = w_out["r_pred"].detach() # Prediction Rewards
         d_t = w_out["d_prob"].detach() # Termination Probability
+        d_tr = w_out.get("d_tr", None)
+        d_ph = w_out.get("d_ph", None)
 
         self.prev_world_h = w_out["h_next"].detach()
         self.prev_world_z = w_out["z_next"].detach()
         self.prev_world_x = w_out["x_next"].detach()
 
         if self.is_online_learning:
-            value_kwargs = {"rewardExt": r_t, "policyEntropyPrev": self.prev_entropy, "done": d_t}
+            value_kwargs = {
+                "rewardExt": r_t,
+                "policyEntropyPrev": self.prev_entropy,
+                "done": d_t,
+                "worldDeltaTransport": d_tr,
+                "worldDeltaPhysics": d_ph}
             value_x = {"memory": self.prev_mem,"attn": self.prev_attn, "state": s_t}
             critic_out = self.critic(x=value_x, **value_kwargs)
         else:
             critic_out = self.critic(memory=self.prev_mem,attn=self.prev_attn,state=s_t,rewardExt=r_t,
-                                     policyEntropyPrev=self.prev_entropy,done=d_t,)
+                                     policyEntropyPrev=self.prev_entropy,done=d_t,
+                                     worldDeltaTransport=d_tr,worldDeltaPhysics=d_ph,)
 
         td_sig = critic_out.tdError.detach()
         rInt_sig = critic_out.rInt.detach()

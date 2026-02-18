@@ -4,9 +4,8 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import inspect
 from DecisionModule import RAW_KEYBOARD_LAYOUT
-from FunctionTools import SiteSpec, BaseOnlineWrapper, AGICoreModule, GetParametersScale
+from FunctionTools import SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear, GetParametersScale
 
 NUM_DISCRETE_KEYS = len(RAW_KEYBOARD_LAYOUT)
 
@@ -80,59 +79,6 @@ class ActionEncoder(AGICoreModule):
         g = torch.sigmoid(self.out_gate(out)) # [B, outDim]
 
         return out * (0.5 + 0.5 * g) # [B, outDim]
-
-
-
-class GrowableLoRALinear(nn.Module):
-    def __init__(self, targetLinear: nn.Linear):
-        super().__init__()
-        assert isinstance(targetLinear, nn.Linear)
-        self.target = targetLinear
-        self.in_f = targetLinear.in_features
-        self.out_f = targetLinear.out_features
-
-        self.A_list = nn.ParameterList()
-        self.B_list = nn.ParameterList()
-        self.alpha = nn.ParameterList()
-
-    @torch.no_grad()
-    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
-        if addRank <= 0: 
-            return
-        if init is None: 
-            init = {}
-        factory = {"device": self.target.weight.device, "dtype": self.target.weight.dtype}
-        A = init.get("A", torch.randn(addRank, self.in_f, **factory) * 1e-4)
-        B = init.get("B", torch.randn(self.out_f, addRank, **factory) * 1e-4)
-        s = init.get("scale", 1e-3)
-
-        A = nn.Parameter(A.contiguous().to(**factory))
-        B = nn.Parameter(B.contiguous().to(**factory))
-        s = nn.Parameter(torch.as_tensor(s, **factory))
-
-        if freezeOld:
-            for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
-                p.requires_grad_(False)
-
-        self.A_list.append(A)
-        self.B_list.append(B)
-        self.alpha.append(s)
-
-    def DeltaWeight(self) -> Optional[torch.Tensor]:
-        if len(self.A_list) == 0:
-            return None
-        dW = self.target.weight.new_zeros(self.out_f, self.in_f)
-        for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-            s_eff = torch.tanh(s) * GetParametersScale(s) 
-            dW = dW + s_eff * (B @ A)
-        return dW
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        W = self.target.weight
-        delta = self.DeltaWeight()
-        if delta is not None:
-            W = W + delta
-        return F.linear(x, W, self.target.bias)
 
 
 class S4DCell(AGICoreModule):
@@ -1360,6 +1306,8 @@ class RSSMWorldModel(AGICoreModule):
             "s_next": s_next,
             "r_pred": r_pred,
             "d_prob": d_prob,
+            "d_tr": d_tr,
+            "d_ph": d_ph,
             "mu_q": mu_q,
             "logstd_q": logstd_q,}
 
@@ -1527,6 +1475,7 @@ class RSSMWorldModel(AGICoreModule):
         d_prob = torch.sigmoid(d_logit) # [B]
 
         loss_recon = visionIn.new_tensor(0.0)
+        recon_error = visionIn.new_zeros(B)
         recon = None
         if self.use_decoder:
             recon = self.obs_dec(s1)  # [B, visionDim]
@@ -1540,7 +1489,8 @@ class RSSMWorldModel(AGICoreModule):
                 bias=self.obs_enc[0].bias,
                 eps=self.obs_enc[0].eps,)
 
-            loss_recon = F.mse_loss(recon_n, target, reduction="mean")
+            recon_error = (recon_n - target).pow(2).mean(dim=-1)
+            loss_recon = recon_error.mean()
 
         aux_moe = visionIn.new_tensor(0.0)
         if self._ns_enabled:
@@ -1584,6 +1534,9 @@ class RSSMWorldModel(AGICoreModule):
             "s_next": s1,
             "r_pred": r_pred,
             "d_prob": d_prob,
+            "d_tr": d_tr,
+            "d_ph": d_ph,
+            "recon_error": recon_error,
             "mu_p": mu_p,
             "logstd_p": logstd_p,
             "mu_q": mu_q,
@@ -2250,6 +2203,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         d_prob = torch.sigmoid(d_logit)
 
         loss_recon = visionIn.new_tensor(0.0)
+        recon_error = visionIn.new_zeros(B)
         recon = None
         if self.base.use_decoder:
             recon = self.ObsDec(s1, d)
@@ -2263,7 +2217,8 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
                 bias=self.base.obs_enc[0].bias,
                 eps=self.base.obs_enc[0].eps,)
 
-            loss_recon = F.mse_loss(recon_n, target, reduction="mean")
+            recon_error = (recon_n - target).pow(2).mean(dim=-1)
+            loss_recon = recon_error.mean()
 
         aux_moe = visionIn.new_tensor(0.0)
         if self.base._ns_enabled:
@@ -2304,6 +2259,9 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
             "s_next": s1,
             "r_pred": r_pred,
             "d_prob": d_prob,
+            "d_tr": d_tr,
+            "d_ph": d_ph,
+            "recon_error": recon_error,
             "mu_p": mu_p,
             "logstd_p": logstd_p,
             "mu_q": mu_q,
@@ -3324,4 +3282,3 @@ class TestWorldMTool:
         passed = sum(1 for v in results.values() if v)
         print(f"\n[WorldModule Tests] {passed}/{len(results)} passed.")
         return passed == len(results)
-

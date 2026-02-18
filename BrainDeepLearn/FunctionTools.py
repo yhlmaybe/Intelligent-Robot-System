@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Callable, Tuple
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def GetParametersScale(like: Optional[torch.Tensor] = None):
@@ -10,6 +11,58 @@ def GetParametersScale(like: Optional[torch.Tensor] = None):
     if like is None:
         return val
     return torch.as_tensor(val, device=like.device, dtype=like.dtype)
+
+
+class GrowableLoRALinear(nn.Module):
+    def __init__(self, targetLinear: nn.Linear):
+        super().__init__()
+        assert isinstance(targetLinear, nn.Linear)
+        self.target = targetLinear
+        self.in_f = targetLinear.in_features
+        self.out_f = targetLinear.out_features
+
+        self.A_list = nn.ParameterList()
+        self.B_list = nn.ParameterList()
+        self.alpha = nn.ParameterList()
+
+    @torch.no_grad()
+    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
+        if addRank <= 0: 
+            return
+        if init is None: 
+            init = {}
+        factory = {"device": self.target.weight.device, "dtype": self.target.weight.dtype}
+        A = init.get("A", torch.randn(addRank, self.in_f, **factory) * 1e-4)
+        B = init.get("B", torch.randn(self.out_f, addRank, **factory) * 1e-4)
+        s = init.get("scale", 1e-3)
+
+        A = nn.Parameter(A.contiguous().to(**factory))
+        B = nn.Parameter(B.contiguous().to(**factory))
+        s = nn.Parameter(torch.as_tensor(s, **factory))
+
+        if freezeOld:
+            for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
+                p.requires_grad_(False)
+
+        self.A_list.append(A)
+        self.B_list.append(B)
+        self.alpha.append(s)
+
+    def DeltaWeight(self) -> Optional[torch.Tensor]:
+        if len(self.A_list) == 0:
+            return None
+        dW = self.target.weight.new_zeros(self.out_f, self.in_f)
+        for A, B, s in zip(self.A_list, self.B_list, self.alpha):
+            s_eff = torch.tanh(s) * GetParametersScale(s) 
+            dW = dW + s_eff * (B @ A)
+        return dW
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        W = self.target.weight
+        delta = self.DeltaWeight()
+        if delta is not None:
+            W = W + delta
+        return F.linear(x, W, self.target.bias)
 
 
 @dataclass

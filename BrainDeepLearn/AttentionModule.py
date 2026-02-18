@@ -4,59 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict
-from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule
+from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear
 
 
-class GrowableLoRALinear(nn.Module):
-    def __init__(self, targetLinear: nn.Linear):
-        super().__init__()
-        self.target = targetLinear
-        self.A_list = nn.ParameterList()
-        self.B_list = nn.ParameterList()
-        self.alpha = nn.ParameterList()
-
-        self.out_f = targetLinear.out_features
-        self.in_f = targetLinear.in_features
-
-    @torch.no_grad()
-    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
-        if addRank <= 0:
-            return
-        if init is None: init = {}
-
-        factory = {"device": self.target.weight.device, "dtype": self.target.weight.dtype}
-
-        A = init.get("A", torch.randn(addRank, self.in_f, **factory) * 1e-4)
-        B = init.get("B", torch.zeros(self.out_f, addRank, **factory))
-        s = init.get("scale", 1e-3)
-
-        A = nn.Parameter(A.contiguous().to(**factory))
-        B = nn.Parameter(B.contiguous().to(**factory))
-        s = nn.Parameter(torch.as_tensor(s, **factory))
-
-        if freezeOld:
-            for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
-                p.requires_grad_(False)
-
-        self.A_list.append(A)
-        self.B_list.append(B)
-        self.alpha.append(s)
-
-    def DeltaWeight(self) -> Optional[torch.Tensor]:
-        if len(self.A_list) == 0:
-            return None
-        delta = self.target.weight.new_zeros(self.out_f, self.in_f)
-        for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-            s_eff = torch.tanh(s) * GetParametersScale(s) 
-            delta = delta + s_eff * (B @ A)
-        return delta
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        W = self.target.weight
-        delta = self.DeltaWeight()
-        if delta is not None:
-            W = W + delta
-        return F.linear(x, W, self.target.bias)
 
 
 class SelectiveSSM(AGICoreModule):
