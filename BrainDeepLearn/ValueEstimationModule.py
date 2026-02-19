@@ -703,36 +703,101 @@ class MaxPlusLinear(AGICoreModule):
 
 
 class TropicalAffineTransport(AGICoreModule):
-    def __init__(self, hDim: int, useSoftTrop: bool = True, temp: float = 0.2, epsA: float = 1e-3):
+    def __init__(
+        self,
+        hDim: int,
+        useSoftTrop: bool = True,
+        temp: float = 0.2,
+        epsA: float = 1e-3,
+        numExperts: int = 4,
+        expertTemp: float = 1.0,
+        aDeltaLimit: float = 0.25,
+        bLimit: float = 0.5,
+        driftScale: float = 0.10,):
         super().__init__()
-        self.trop = MaxPlusLinear(inFeatures=hDim+1, outFeatures=1, useSoft=useSoftTrop, temperature=temp)
+        self.k = max(1, int(numExperts))
+        self.epsA = float(epsA)
+        self.expert_temp = float(expertTemp)
+        self.a_delta_limit = float(aDeltaLimit)
+        self.b_limit = float(bLimit)
+        self.drift_scale = float(driftScale)
 
-        self.a_net = nn.Sequential(nn.Linear(hDim, hDim//2), nn.SiLU(), nn.Linear(hDim//2, 1))
-        self.b_net = nn.Sequential(nn.Linear(hDim, hDim//2), nn.SiLU(), nn.Linear(hDim//2, 1))
-        self.g_net = nn.Sequential(nn.Linear(hDim, hDim//2), nn.SiLU(), nn.Linear(hDim//2, 1), nn.Sigmoid())
+        self.field_ctx = nn.Sequential(
+            nn.Linear(hDim, hDim),
+            nn.LayerNorm(hDim),
+            nn.GELU(),
+            nn.Linear(hDim, hDim),
+            nn.GELU(),)
 
-        self.epsA = epsA
+        self.expert_gate = nn.Linear(hDim, self.k)
+        self.trop = MaxPlusLinear(inFeatures=hDim + 1, outFeatures=self.k, useSoft=useSoftTrop, temperature=temp)
+
+        self.affine_core = nn.Sequential(
+            nn.Linear(hDim, hDim),
+            nn.LayerNorm(hDim),
+            nn.GELU(),
+            nn.Linear(hDim, hDim),
+            nn.GELU(),)
+
+        self.a_head = nn.Linear(hDim, self.k)
+        self.b_head = nn.Linear(hDim, self.k)
+        self.g_head = nn.Linear(hDim, self.k)
+
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight); nn.init.zeros_(m.bias)
 
+        nn.init.zeros_(self.expert_gate.weight)
+        nn.init.zeros_(self.expert_gate.bias)
+        nn.init.zeros_(self.a_head.weight)
+        nn.init.zeros_(self.a_head.bias)
+        nn.init.zeros_(self.b_head.weight)
+        nn.init.zeros_(self.b_head.bias)
+        nn.init.zeros_(self.g_head.weight)
+        nn.init.constant_(self.g_head.bias, -2.0)
+
     def forward(self, h: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         v_in = v # [B,1]
-        a = F.softplus(self.a_net(h)) + self.epsA # [B,1]
-        b = self.b_net(h) # [B,1]
-        g = self.g_net(h) # [B,1]
+        ctx = self.field_ctx(h) # [B,H]
 
-        trop_in = torch.cat([h, v_in], dim=-1)
-        trop_out = self.trop(trop_in) # [B,1]
-        aff_out  = a * v + b # [B,1]
-        v_next_hat = g * trop_out + (1.0 - g) * aff_out # [B,1]
+        tau = max(self.expert_temp, 1e-6)
+        w_logits = self.expert_gate(ctx) # [B,K]
+        w = torch.softmax(w_logits / tau, dim=-1) # [B,K]
+
+        z_aff = self.affine_core(ctx) # [B,H]
+        a_raw = self.a_head(z_aff) # [B,K]
+        b_raw = self.b_head(z_aff) # [B,K]
+        g_raw = self.g_head(z_aff) # [B,K]
+
+        a = (1.0 + self.a_delta_limit * torch.tanh(a_raw)).clamp_min(self.epsA) # [B,K]
+        b = self.b_limit * torch.tanh(b_raw) # [B,K]
+        g = torch.sigmoid(g_raw) # [B,K]
+
+        trop_in = torch.cat([ctx, v_in], dim=-1)
+        trop_all = self.trop(trop_in) # [B,K]
+        aff_all = a * v_in + b # [B,K]
+        flow_all = g * trop_all + (1.0 - g) * aff_all # [B,K]
+
+        flow_mix = (w * flow_all).sum(dim=-1, keepdim=True) # [B,1]
+        dv = self.drift_scale * torch.tanh(flow_mix - v_in)
+        v_next_hat = v_in + dv # [B,1]
+
+        gate_trop = (w * g).sum(dim=-1, keepdim=True)
+        a_mix = (w * a).sum(dim=-1, keepdim=True)
+        b_mix = (w * b).sum(dim=-1, keepdim=True)
+        trop_mix = (w * trop_all).sum(dim=-1, keepdim=True)
+        aff_mix = (w * aff_all).sum(dim=-1, keepdim=True)
 
         extras = {
-            "gate_trop": g, 
-            "a": a, 
-            "b": b,
-            "trop_out": trop_out, 
-            "aff_out": aff_out}
+            "gate_trop": gate_trop,
+            "a": a_mix,
+            "b": b_mix,
+            "trop_out": trop_mix,
+            "aff_out": aff_mix,
+            "flow_dv": dv,
+            "expert_w": w,
+            "expert_trop": trop_all,
+            "expert_aff": aff_all,}
         
         return v_next_hat, extras
 
@@ -870,6 +935,15 @@ class TemporalMicroGraph(AGICoreModule):
 
         diff = self.anchor_z - zNow.unsqueeze(1) # [B,M,D]
         dist = (diff * diff).sum(dim=-1).sqrt() # [B,M]
+
+        M = self.max_anchors
+        pos = torch.arange(M, device=device).view(1, M).expand(B, M)  # [B,M]
+
+        age = (self.ptr.view(B, 1) - 1 - pos) % M
+        age = age.to(dist.dtype)
+
+        dist = dist + age * 1e-6
+
         dist = dist.masked_fill(~valid_mask, float("inf"))
 
         _, idx = torch.topk(-dist, k=K, dim=1) # idx: [B,K]
@@ -1082,11 +1156,34 @@ class GeoTropicalOut(NamedTuple):
     extras: Dict[str, torch.Tensor]
 
 
+class ResidualMLPBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hiddenMul: float = 2.0,
+        scaleInit: float = 0.25,):
+        super().__init__()
+        inner = max(int(dim), int(round(float(hiddenMul) * float(dim))))
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, inner)
+        self.fc2 = nn.Linear(inner, dim)
+        self.res_scale = nn.Parameter(torch.tensor(float(scaleInit)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        r = self.norm(x)
+        r = F.gelu(self.fc1(r))
+        r = self.fc2(r)
+        return x + torch.tanh(self.res_scale) * r
+
+
 class ValueEstimationExtractor(AGICoreModule):
     def __init__(self,
         memoryDim: int = 768, attnDim: int = 1024, stateDim: int = 256, *,
         emotionDim: int = 64, 
         hidden: int = 2048, 
+        trunkResBlocks: int = 4,
+        trunkResHiddenMul: float = 2.0,
+        trunkResScaleInit: float = 0.25,
         useSoftTrop: bool = True, tropTemp: float = 0.2, epsA: float = 1e-3,
         microMaxAnchors: int = 256, microTopK: int = 4, microDistTau: float = 0.5, microLenPower: float = 0.5,
         wGITScale: float = 1e-3, wGITShift: float = 1e-3, wGITSign: float = 1e-3,
@@ -1111,6 +1208,9 @@ class ValueEstimationExtractor(AGICoreModule):
         self.fc2 = nn.Linear(H, H)
         self.norm1 = nn.LayerNorm(H)
         self.norm2 = nn.LayerNorm(H)
+        self.trunk_res_blocks = nn.ModuleList([
+            ResidualMLPBlock(dim=H, hiddenMul=trunkResHiddenMul, scaleInit=trunkResScaleInit)
+            for _ in range(max(0, int(trunkResBlocks)))])
 
         self.hebb_value = HebbianLinearFW(H, 1, bias=True,useHebbian=useHebb)
         self.value_head = nn.Linear(H, 1)
@@ -1167,6 +1267,8 @@ class ValueEstimationExtractor(AGICoreModule):
         h = self.norm1(h)
         h = F.gelu(self.fc2_adapter(h))
         h = self.norm2(h)
+        for blk in self.trunk_res_blocks:
+            h = blk(h)
         return h
 
     def forward(self,
@@ -1295,8 +1397,7 @@ class ValueEstimationExtractor(AGICoreModule):
             + 0.10 * loss_micro
             + loss_git
             + loss_mix
-            + loss_hebb_wd
-            + loss_unc)
+            + loss_hebb_wd)
 
         with torch.no_grad():
             self._prev_h = h.detach() # [B, H]
@@ -1607,6 +1708,9 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         h = F.gelu(h)
         if base.norm2 is not None:
             h = base.norm2(h)
+        if hasattr(base, "trunk_res_blocks"):
+            for blk in base.trunk_res_blocks:
+                h = blk(h)
 
         emotion = base.emotion_core(memoryPrev=memory, attnPrev=attn, stateCurr=state)
 
@@ -1736,8 +1840,7 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
             + 0.10 * loss_micro
             + loss_git
             + loss_mix
-            + loss_hebb_wd
-            + loss_unc)
+            + loss_hebb_wd)
 
         with torch.no_grad():
             g_now = (0.99 * (1.0 - done))
@@ -2387,8 +2490,16 @@ class TestValueEstimationMTool:
             mem, attn, state = self.RandBatch(batchSize)
             reward, entropy, done, d_tr, d_ph = self.RandSignals(batchSize, doneProb=0.0)
 
+            with torch.no_grad():
+                for _ in range(8):
+                    _ = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
+
+            snap = est.ExportState()
+
             losses: List[float] = []
             for t in range(int(steps)):
+                est.ImportState(snap)
+
                 out = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
                 loss = out.loss
                 if not torch.isfinite(loss).item():
@@ -2399,6 +2510,7 @@ class TestValueEstimationMTool:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(est.parameters(), 1.0)
                 opt.step()
+
                 losses.append(float(loss.detach().item()))
 
             if len(losses) < 20:
@@ -2439,7 +2551,9 @@ class TestValueEstimationMTool:
                 f"raw start/end: {loss_start:.6f} -> {loss_end:.6f}, "
                 f"first_mean={first_mean:.6f}, last_mean={last_mean:.6f}, "
                 f"first_med={first_med:.6f}, last_med={last_med:.6f})")
+            
             return ok
+
         except Exception as e:
             print(f"LossDecreases error: {e}")
             return False
