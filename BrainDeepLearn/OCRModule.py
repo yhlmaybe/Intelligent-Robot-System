@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Union, TypedDict
 from dataclasses import dataclass
 from collections import deque, defaultdict
 
@@ -64,6 +64,14 @@ class OcrTrack:
     age: int 
 
 
+class OcrItem(TypedDict):
+    box: Tuple[int, int, int, int]
+    text: str
+    det_score: float
+    rec_conf: float
+    score: float
+
+
 class ConvBNReLU(nn.Module):
     def __init__(self, inCh: int, outCh: int, kSize: int = 3, stride: int = 1, padding: int = 1):
         super().__init__()
@@ -71,11 +79,17 @@ class ConvBNReLU(nn.Module):
         self.bn = nn.BatchNorm2d(outCh)
         self.act = nn.ReLU(inplace=True)
 
-    def forward(self, inputTensor: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        inputTensor: torch.Tensor # [B, C, H, W]
+        ) -> torch.Tensor:
         x = self.conv(inputTensor)
         x = self.bn(x)
         x = self.act(x)
-        return x
+
+        # H' ((H + 2*padding - kSize)/stride) + 1
+        # W' ((W + 2*padding - kSize)/stride) + 1
+        return x # [B, outCh, H', W']
 
 
 class DBBackbone(nn.Module):
@@ -150,7 +164,7 @@ class DBBackbone(nn.Module):
         d1 = self.dec1(x1)
 
         out = self.outConv(d1)
-        return out
+        return out # [B, 256, H, W]
 
 
 class DBHead(nn.Module):
@@ -175,11 +189,10 @@ class DBHead(nn.Module):
 
         bin_map = torch.sigmoid(self.k * (prob_map - thresh_map))
 
-        return prob_map, thresh_map, bin_map
+        return prob_map, thresh_map, bin_map # [B, 1, H, W]
 
 
 def BalancedBceLoss(predTensor: torch.Tensor, gtTensor: torch.Tensor, maskTensor: Optional[torch.Tensor] = None) -> torch.Tensor:
-
     eps = 1e-6
     pred = predTensor.clamp(eps, 1.0 - eps)
     gt = gtTensor
@@ -189,8 +202,9 @@ def BalancedBceLoss(predTensor: torch.Tensor, gtTensor: torch.Tensor, maskTensor
     else:
         mask = maskTensor
 
-    pos = (gt > 0.5).float()
-    neg = 1.0 - pos
+    valid = (mask > 0.5).float()
+    pos = (gt > 0.5).float() * valid
+    neg = (1.0 - (gt > 0.5).float()) * valid
 
     n_pos = pos.sum().clamp(min=1.0)
     n_neg = neg.sum().clamp(min=1.0)
@@ -201,12 +215,11 @@ def BalancedBceLoss(predTensor: torch.Tensor, gtTensor: torch.Tensor, maskTensor
     loss_pos = -w_pos * (pos * torch.log(pred)) 
     loss_neg = -w_neg * (neg * torch.log(1.0 - pred))
 
-    loss = (loss_pos + loss_neg) * mask
-    return loss.sum() / mask.sum().clamp(min=1.0)
+    loss = (loss_pos + loss_neg)
+    return loss.sum() / valid.sum().clamp(min=1.0)
 
 
 def DiceLoss(predTensor: torch.Tensor,gtTensor: torch.Tensor, maskTensor: Optional[torch.Tensor] = None) -> torch.Tensor:
-
     if maskTensor is None:
         mask = torch.ones_like(gtTensor)
     else:
@@ -247,7 +260,8 @@ class DBLoss(nn.Module):
         loss_prob = BalancedBceLoss(probMap, gtShrink, gtMask)
         loss_bin = DiceLoss(binMap, gtShrink, gtMask)
 
-        loss_thresh = F.l1_loss(threshMap * gtMask, gtThresh * gtMask)
+        l1 = torch.abs(threshMap - gtThresh) * gtMask
+        loss_thresh = l1.sum() / gtMask.sum().clamp(min=1.0)
 
         total = (self.lambdaProb * loss_prob
             + self.lambdaBin * loss_bin
@@ -393,13 +407,17 @@ class OCREngineExtractor(nn.Module):
 
         self.temporalSteps = int(temporalSteps)
         self.fuseTopK = int(fuseTopK)
-        self.fuseMinHits = int(fuseMinHits)
+        self.fuseMinHits = max(1, int(fuseMinHits))
         self.fuseIouThr = float(fuseIouThr)
         self.fuseSimThr = float(fuseSimThr)
         self.fuseDecay = float(fuseDecay)
+        if self.temporalSteps > 0:
+            self.fuseMinHits = min(self.fuseMinHits, self.temporalSteps)
 
         self._temporal_step = 0
         self._tracks_by_bi: dict[int, list[OcrTrack]] = {}
+        self._last_batch_size: int = 0
+        self._last_ocr_texts_batch: List[List[str]] = []
 
         self.backbone = DBBackbone(inCh=3, baseCh=64)
         self.dbHead = DBHead(inCh=256, kValue=dbK)
@@ -570,15 +588,15 @@ class OCREngineExtractor(nn.Module):
 
     def forward(
         self,
-        imagesTensor: torch.Tensor,
+        imagesTensor: torch.Tensor, # [B,3,H,W]
         binThresh: float = 0.3,
-        minBoxArea: int = 10,) -> List[List[str]]:
+        minBoxArea: int = 10,) -> List[List[OcrItem]]:
 
-        feat = self.backbone(imagesTensor)
-        prob_map, thresh_map, bin_map = self.dbHead(feat)
+        feat = self.backbone(imagesTensor) # [B,256,H,W]
+        prob_map, thresh_map, bin_map = self.dbHead(feat) # [B,1,H,W]
 
         bsz = imagesTensor.size(0)
-        results_batch: List[List[Tuple[np.ndarray, str, float]]] = []
+        results_batch: List[List[Tuple[np.ndarray, str, float, float]]] = []
 
         if self.temporalSteps > 0 and self._tracks_by_bi:
             for k in list(self._tracks_by_bi.keys()):
@@ -590,7 +608,7 @@ class OCREngineExtractor(nn.Module):
             bm = bin_map[bi]  
             img = imagesTensor[bi]  
 
-            triplets: List[Tuple[np.ndarray, str, float]] = []
+            triplets: List[Tuple[np.ndarray, str, float, float]] = []
             frame_obs: List[OcrLineObs] = []  
 
             boxes = self.BitmapToBoxes(bm, threshValue=binThresh, minArea=minBoxArea)
@@ -616,7 +634,7 @@ class OCREngineExtractor(nn.Module):
                         region = pm_np[y1:y2, x1:x2]
                         det_score = float(region.mean()) if region.size != 0 else 0.0
 
-                        triplets.append((box, text, det_score))
+                        triplets.append((box, text, det_score, float(rec_conf)))
                         frame_obs.append(OcrLineObs(
                             box=(int(x1), int(y1), int(x2), int(y2)),
                             text=text,
@@ -632,18 +650,22 @@ class OCREngineExtractor(nn.Module):
         if self.temporalSteps > 0:
             self._temporal_step += 1
 
-        return self.OcrResultsToOcrTexts(results_batch)
+        ocr_items = self.OcrResultsToOcrItems(results_batch) 
+        self._last_batch_size = bsz
+        self._last_ocr_texts_batch = [[it["text"] for it in items] for items in ocr_items]
+        return ocr_items
 
 
     def OcrResultsToOcrTexts(
         self,
-        resultsBatch: List[List[Tuple[np.ndarray, str, float]]],
+        resultsBatch: List[List[Tuple[np.ndarray, str, float, float]]],
         scoreThresh: float = 0.3,) -> List[List[str]]:
         ocr_texts: List[List[str]] = []
 
         for triplets in resultsBatch:
             lines: List[str] = []
-            for box, text, score in triplets:
+            for box, text, det_score, rec_conf in triplets:
+                score = max(0.0, float(det_score)) * max(0.0, float(rec_conf))
                 if score < scoreThresh:
                     continue
                 t = str(text).strip()
@@ -655,9 +677,38 @@ class OCREngineExtractor(nn.Module):
         return ocr_texts
 
 
+    def OcrResultsToOcrItems(
+        self,
+        resultsBatch: List[List[Tuple[np.ndarray, str, float, float]]],
+        scoreThresh: float = 0.3,) -> List[List[OcrItem]]:
+
+        out_batch: List[List[OcrItem]] = []
+        for triplets in resultsBatch:
+            items: List[OcrItem] = []
+            for box, text, det_score, rec_conf in triplets:
+                score = max(0.0, float(det_score)) * max(0.0, float(rec_conf))
+                if score < scoreThresh:
+                    continue
+                t = str(text).strip()
+                if not t:
+                    continue
+
+                x1, y1, x2, y2 = [int(v) for v in box.tolist()]  # xyxy
+                items.append({
+                    "box": (x1, y1, x2, y2),
+                    "text": t,
+                    "det_score": float(det_score),
+                    "rec_conf": float(rec_conf),
+                    "score": float(score),})
+            out_batch.append(items)
+        return out_batch
+
+
     def ResetTemporal(self):
         self._temporal_step = 0
         self._tracks_by_bi.clear()
+        self._last_batch_size = 0
+        self._last_ocr_texts_batch = []
 
 
     def CtcGreedyDecodeWithConf(
@@ -726,9 +777,11 @@ class OCREngineExtractor(nn.Module):
 
 
 
-    def ExportFusedTexts(self, bi: int = 0) -> List[str]:
+    def ExportFusedTextsForBi(self, bi: int) -> List[str]:
         if self.temporalSteps <= 0:
-            return []
+            if bi < 0 or bi >= len(self._last_ocr_texts_batch):
+                return []
+            return list(self._last_ocr_texts_batch[bi])
 
         tracks = self._tracks_by_bi.get(bi, [])
         if not tracks:
@@ -778,6 +831,21 @@ class OCREngineExtractor(nn.Module):
 
         return out
 
+    def ExportFusedTexts(self, bi: Optional[int] = None) -> Union[List[str], List[List[str]]]:
+        if bi is not None:
+            return self.ExportFusedTextsForBi(int(bi))
+
+        bsz = self._last_batch_size
+        if bsz <= 0:
+            if self.temporalSteps > 0 and self._tracks_by_bi:
+                bsz = max(self._tracks_by_bi.keys()) + 1
+            elif self._last_ocr_texts_batch:
+                bsz = len(self._last_ocr_texts_batch)
+            else:
+                return []
+
+        return [self.ExportFusedTextsForBi(i) for i in range(bsz)]
+
 
 
 class TestOCRMTool:
@@ -814,7 +882,9 @@ class TestOCRMTool:
         except (TypeError, FileNotFoundError, RuntimeError) as e:
             print(f"OCREngineExtractor init failed ({e}), patching LoadOcrVocabFromTxt with dummy vocab.")
 
-            OCREngineExtractor.LoadOcrVocabFromTxt = staticmethod("0123456789ABCDEF")
+            OCREngineExtractor.LoadOcrVocabFromTxt = (
+                lambda self, dictPath, *, encoding="utf-8": "0123456789ABCDEF"
+            )
             engine = OCREngineExtractor().to(self.device)
             return engine
 
@@ -1086,15 +1156,22 @@ class TestOCRMTool:
             imgs = torch.randn(B, 3, H, W, device=self.device)
 
             with torch.no_grad():
-                texts_batch = engine(imgs, binThresh=0.3, minBoxArea=5)
+                items_batch = engine(imgs, binThresh=0.3, minBoxArea=5)
 
-            assert isinstance(texts_batch, list)
-            assert len(texts_batch) == B
+            assert isinstance(items_batch, list)
+            assert len(items_batch) == B
 
-            for lines in texts_batch:
-                assert isinstance(lines, list)
-                for t in lines:
-                    assert isinstance(t, str)
+            for items in items_batch:
+                assert isinstance(items, list)
+                for it in items:
+                    assert isinstance(it, dict)
+                    assert isinstance(it.get("text"), str)
+                    box = it.get("box")
+                    assert isinstance(box, tuple) and len(box) == 4
+                    assert all(isinstance(v, int) for v in box)
+                    assert isinstance(it.get("det_score"), float)
+                    assert isinstance(it.get("rec_conf"), float)
+                    assert isinstance(it.get("score"), float)
 
             print("EngineFullForwardPipeline passed.")
             return True

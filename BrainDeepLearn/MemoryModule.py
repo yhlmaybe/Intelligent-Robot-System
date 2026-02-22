@@ -1964,69 +1964,78 @@ class MemoryExtractor(AGICoreModule):
         self.load_state_dict(sd, strict=False)
         self.pending.clear()
 
+
     @torch.no_grad()
     def ExportMemoryBank(self, topk: int = 1024,) -> Optional[Dict[str, torch.Tensor]]:
         device = self.device
         B = int(self.memory_filled.size(0)) # [B]
-        K = int(topk)
         D = int(self.memory_dim)
+        topk = int(topk)
 
-        if K <= 0:
+        if topk <= 0 or self.memory_filled.min().item() <=0:
             return None
 
         out: Dict[str, torch.Tensor] = {}
 
-        out["gws"] = self.gws.vals # [B, S, D]
+        S_gws = int(self.gws.slots)
+        gws_valid = (self.gws.ttl > 0) & (self.gws.priority > 0)  # [B, S_gws]
+        K_gws = min(topk, S_gws, int(gws_valid.sum(dim=1).min().item()))
+        if K_gws > 0:
+            gws_age = (self.gws.global_step.unsqueeze(1) - self.gws.last_step).clamp(min=0).float()
+            gws_fresh = torch.exp(-gws_age * float(self.gws.recency_temp))
+            gws_scores = (self.gws.priority * gws_fresh).masked_fill(~gws_valid, -1e9)
+            _, gws_idx = StableTopk(gws_scores, K_gws)  # [B, K_gws]
+            gws_idx_exp = gws_idx.unsqueeze(-1).expand(B, K_gws, D)  # [B, K_gws, D]
+            out["gws"] = torch.gather(self.gws.vals, 1, gws_idx_exp).contiguous()
 
         M_kv = int(self.memory_size)
         filled_kv = self.memory_filled  # [B]
-        if (K > M_kv) or (not bool((filled_kv >= K).all().item())):
-            return None
+        K_kv = min(topk, M_kv, int(filled_kv.min().item()))
+        if K_kv > 0:
+            ar = torch.arange(M_kv, device=device).view(1, M_kv) # [1, M_kv]
+            valid = ar < filled_kv.view(B, 1) # [B, M_kv]
+            scores = self.memory_importance.masked_fill(~valid, -1e9) # [B, M_kv]
+            _, idx = StableTopk(scores, K_kv) # [B, K_kv]
+            idx_exp = idx.unsqueeze(-1).expand(B, K_kv, D) # [B, K_kv, D]
+            out["kv"] = torch.gather(self.memory_values, 1, idx_exp).contiguous() # [B, K_kv, D]
 
-        ar = torch.arange(M_kv, device=device).view(1, M_kv) # [1, M_kv]
-        valid = ar < filled_kv.view(B, 1) # [B, M_kv]
-        scores = self.memory_importance.masked_fill(~valid, -1e9) # [B, M_kv]
-        _, idx = StableTopk(scores, K) # [B, K]
-        idx_exp = idx.unsqueeze(-1).expand(B, K, D) # [B, K, D]
-        out["kv"] = torch.gather(self.memory_values, 1, idx_exp).contiguous() # [B, K, D]
 
         sem = self.ltm.semantic
         M_sem = int(sem.capacity)
-        filled_sem = sem.filled  # [B]
-        if (K > M_sem) or (not bool((filled_sem >= K).all().item())):
-            return None
+        filled_sem = sem.filled # [B]
+        K_sem = min(topk, M_sem, int(filled_sem.min().item()))
+        if K_sem > 0:
+            ar = torch.arange(M_sem, device=sem.prio.device).view(1, M_sem) # [1, M_sem]
+            valid = ar < filled_sem.view(B, 1) # [B, M_sem]
+            scores = sem.prio.masked_fill(~valid, -1e9) # [B, M_sem]
+            _, idx = StableTopk(scores, K_sem) # [B, K_sem]
+            idx_exp = idx.unsqueeze(-1).expand(B, K_sem, D) # [B, K_sem, D]
+            out["ltm_sem"] = torch.gather(sem.vals, 1, idx_exp).contiguous() # [B, K_sem, D]
 
-        ar = torch.arange(M_sem, device=sem.prio.device).view(1, M_sem) # [1, M_sem]
-        valid = ar < filled_sem.view(B, 1) # [B, M_sem]
-        scores = sem.prio.masked_fill(~valid, -1e9)  # [B, M_sem]
-        _, idx = StableTopk(scores, K) # [B, K]
-        idx_exp = idx.unsqueeze(-1).expand(B, K, D) # [B, K, D]
-        out["ltm_sem"] = torch.gather(sem.vals, 1, idx_exp).contiguous() # [B, K, D]
 
         epi = self.ltm.episodic
         M_epi = int(epi.capacity)
         filled_epi = epi.filled  # [B]
-        if (K > M_epi) or (not bool((filled_epi >= K).all().item())):
-            return None
+        K_epi = min(topk, M_epi, int(filled_epi.min().item()))
+        if K_epi > 0:
+            ar = torch.arange(M_epi, device=epi.prio.device).view(1, M_epi) # [1, M_epi]
+            valid = ar < filled_epi.view(B, 1) # [B, M_epi]
+            scores = epi.prio.masked_fill(~valid, -1e9) # [B, M_epi]
+            _, idx = StableTopk(scores, K_epi) # [B, K_epi]
+            idx_exp = idx.unsqueeze(-1).expand(B, K_epi, D) # [B, K_epi, D]
+            out["ltm_epi"] = torch.gather(epi.vals, 1, idx_exp).contiguous() # [B, K_epi, D]
 
-        ar = torch.arange(M_epi, device=epi.prio.device).view(1, M_epi) # [1, M_epi]
-        valid = ar < filled_epi.view(B, 1)  # [B, M_epi]
-        scores = epi.prio.masked_fill(~valid, -1e9) # [B, M_epi]
-        _, idx = StableTopk(scores, K) # [B, K]
-        idx_exp = idx.unsqueeze(-1).expand(B, K, D) # [B, K, D]
-        out["ltm_epi"] = torch.gather(epi.vals, 1, idx_exp).contiguous() # [B, K, D]
 
         sym = self.sym_mem
-        n_sym = int(sym.filled.item()) 
+        n_sym = int(sym.filled.item())
         nsK = int(sym.K)
 
-        if n_sym < K:
-            return None
-
-        sym_scores = sym.prio[:n_sym] # [n_sym]
-        _, sym_idx = StableTopk(sym_scores, K) # [K]
-        top_vals = sym.P_vals[:n_sym].index_select(0, sym_idx) # [K, nsK]
-        out["sym"] = top_vals.unsqueeze(0).expand(B, K, nsK).contiguous() # [B, K, nsK]
+        K_sym = min(topk, n_sym)
+        if K_sym > 0:
+            sym_scores = sym.prio[:n_sym] # [n_sym]
+            _, sym_idx = StableTopk(sym_scores, K_sym) # [K_sym]
+            top_vals = sym.P_vals[:n_sym].index_select(0, sym_idx) # [K_sym, nsK]
+            out["sym"] = top_vals.unsqueeze(0).expand(B, K_sym, nsK).contiguous() # [B, K_sym, nsK]
 
         return out
     

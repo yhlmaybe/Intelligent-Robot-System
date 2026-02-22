@@ -1544,7 +1544,7 @@ class RSSMWorldModel(AGICoreModule):
             **({"recon": recon, "recon_target": visionIn} if (self.use_decoder and recon is not None) else {}),}
 
 
-    def ExportWorldMemoryBank(self, topk: int = 1024) -> Optional[Dict[str, torch.Tensor]]:
+    def ExportWorldMemoryBank(self, topk: int = 1024, onlyVals: bool = False) -> Optional[Dict[str, torch.Tensor]]:
         if (not getattr(self, "_use_memory", False)):
             return None
 
@@ -1559,7 +1559,9 @@ class RSSMWorldModel(AGICoreModule):
         if (filled <= 0).all():
             return None
 
-        if (K > cap) or (not bool((filled >= K).all().item())):
+        K = min(K, cap)
+        K = min(K, int(filled.min().item()))
+        if K <= 0:
             return None
 
         ar = torch.arange(cap, device=self._mem_vals.device).view(1, cap) # [1,cap]
@@ -1569,11 +1571,15 @@ class RSSMWorldModel(AGICoreModule):
         _, idx = torch.topk(scores, k=K, dim=-1) # [B,K]
 
         out: Dict[str, torch.Tensor] = {} 
-        out["size"] = filled.detach().clone() # [B]
-        out["idx"]  = idx.contiguous() # [B,K]
 
         Dv = int(self._mem_vals.size(-1))
         out["vals"] = torch.gather(self._mem_vals, 1, idx.unsqueeze(-1).expand(B, K, Dv)).contiguous()
+
+        if onlyVals:
+            return out
+
+        out["size"] = filled.detach().clone() # [B]
+        out["idx"]  = idx.contiguous() # [B,K]
 
         Dk = int(self._mem_keys.size(-1))
         out["keys"] = torch.gather(self._mem_keys, 1, idx.unsqueeze(-1).expand(B, K, Dk)).contiguous()
