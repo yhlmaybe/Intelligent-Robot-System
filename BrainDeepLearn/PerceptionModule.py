@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from typing import Dict, List, Optional, Iterable, Tuple, Union
-from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule
+from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, RoPEMultiheadAttention
 
 
 def ProjectFroNorm(tensor: torch.Tensor, maxNorm: Optional[float]):
@@ -388,7 +388,7 @@ class HebbianConv2d(AGICoreModule):
                 decay = y2_mean.unsqueeze(-1) * mem
 
                 delta = self.hebb_rate * (hebb_term - decay) 
-                delta = delta.to(self.hebb_memory.dtype).reshape_as(self.hebb_memory)
+                delta = delta.reshape_as(self.hebb_memory)
 
                 self.hebb_memory.mul_(self.ema_alpha).add_(delta, alpha=(1.0 - self.ema_alpha))
 
@@ -472,7 +472,6 @@ class HebbianLinear(AGICoreModule):
 
                 decay = y_sq_mean.unsqueeze(-1) * self.hebb_memory
                 delta = self.hebb_rate * (hebb_term - decay)
-                delta = delta.to(self.hebb_memory.dtype)
 
                 self.hebb_memory.mul_(self.ema_alpha).add_(delta, alpha=(1.0 - self.ema_alpha))
 
@@ -492,7 +491,10 @@ class HebbianLinear(AGICoreModule):
 class TransformerEncode(AGICoreModule):
     def __init__(self, modelDim: int, headNum: int, dimFeedforward: int = 2048, dropout: float = 0.1):
         super().__init__()
-        self.self_atten = nn.MultiheadAttention(modelDim, headNum, dropout=dropout, batch_first=True)
+        self.self_atten = RoPEMultiheadAttention(
+            embedDim=modelDim,
+            numHeads=headNum,
+            dropout=dropout,)
         self.linear1 = nn.Linear(modelDim, dimFeedforward)
         self.linear2 = nn.Linear(dimFeedforward, modelDim)
         self.norm1 = nn.LayerNorm(modelDim)
@@ -506,9 +508,9 @@ class TransformerEncode(AGICoreModule):
         src_norm1 = self.norm1(src)
         src2, _ = self.self_atten(
             src_norm1, src_norm1, src_norm1,
-            attn_mask=srcMask,
-            key_padding_mask=srcKeyPaddingMask,
-            need_weights=False)
+            attnMask=srcMask,
+            keyPaddingMask=srcKeyPaddingMask,
+            needWeights=False)
         
         src = src + self.dropout1(src2)
 
@@ -611,8 +613,6 @@ class PerceiveExtractor(AGICoreModule):
             for m, v in zip(mods, old):
                 m.use_hebbian = v
 
-        num_patches = (Hf // patchSize) ** 2
-
         cnn_feat_dim = baseChannels * 16
 
         self.patch_embed = SheafGaugeConv2d(
@@ -631,8 +631,6 @@ class PerceiveExtractor(AGICoreModule):
         
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embedDim))
         nn.init.trunc_normal_(self.cls_token, std=0.02)
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embedDim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
         self.pos_drop = nn.Dropout(p=posDrop)
 
         self.cnn_feat_adapter = GrowableConv1x1Adapter(channels=cnn_feat_dim)
@@ -691,7 +689,6 @@ class PerceiveExtractor(AGICoreModule):
 
         cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=B)
         x = torch.cat([cls_tokens, patches], dim=1)  # [B, num_patches+1, embed_dim]
-        x = x + self.pos_embed
         x = self.pos_drop(x)
 
         for i, layer in enumerate(self.transformer_layers):
@@ -747,16 +744,6 @@ class PerceiveExtractor(AGICoreModule):
                     if hasattr(m, "bias") and m.bias is not None:
                         nn.init.zeros_(m.bias)
 
-            elif isinstance(m, nn.MultiheadAttention):
-                if hasattr(m, "in_proj_weight") and m.in_proj_weight is not None:
-                    nn.init.xavier_uniform_(m.in_proj_weight)
-                if hasattr(m, "in_proj_bias") and m.in_proj_bias is not None:
-                    nn.init.zeros_(m.in_proj_bias)
-                if hasattr(m, "out_proj") and isinstance(m.out_proj, nn.Linear):
-                    nn.init.xavier_uniform_(m.out_proj.weight)
-                    if m.out_proj.bias is not None:
-                        nn.init.zeros_(m.out_proj.bias)
-            
             elif isinstance(m, HebbianLinear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
@@ -880,7 +867,6 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         patches = rearrange(patches, "b c h w -> b (h w) c")
         cls_tokens = repeat(self.base.cls_token, "1 1 d -> b 1 d", b=B)
         xTok = torch.cat([cls_tokens, patches], dim=1)
-        xTok = xTok + self.base.pos_embed
         xTok = self.base.pos_drop(xTok)
 
         for i, layer in enumerate(self.base.transformer_layers):
@@ -1652,4 +1638,3 @@ class TestPerceptionMTool:
         passed = sum(1 for v in results.values() if v)
         print(f"\nPerception module tests (with wrapper): {passed}/{len(results)} passed.")
         return results
-

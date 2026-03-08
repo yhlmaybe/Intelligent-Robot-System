@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional, List, Any
-from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule
+from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, RoPEMultiheadAttention
 from collections import OrderedDict
 
 
@@ -415,11 +415,10 @@ class IntentFusion(AGICoreModule):
             nn.Dropout(drop),
             nn.Linear(hidden, self.num_intent_tokens * self.state_dim),)
         
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=self.state_dim,
-            num_heads=numHeads,
-            dropout=drop,
-            batch_first=True,)
+        self.cross_attn = RoPEMultiheadAttention(
+            embedDim=self.state_dim,
+            numHeads=numHeads,
+            dropout=drop,)
 
         self.attn_out = nn.Sequential(
             nn.Linear(self.state_dim, self.state_dim),
@@ -462,7 +461,7 @@ class IntentFusion(AGICoreModule):
 
         tokens = self.intent_to_tokens(i).view(-1, self.num_intent_tokens, self.state_dim)  # [B, T, D]
         q = s.unsqueeze(1)  # [B, 1, D]
-        ctx, _ = self.cross_attn(q, tokens, tokens, need_weights=False)  # [B, 1, D]
+        ctx, _ = self.cross_attn(q, tokens, tokens, needWeights=False)  # [B, 1, D]
         ctx = self.attn_out(ctx.squeeze(1))  # [B, D]
 
         fuse_vec = torch.cat([s, i_proj, film_n, inter_mul, bilin, ctx], dim=-1) # [B, 6D]

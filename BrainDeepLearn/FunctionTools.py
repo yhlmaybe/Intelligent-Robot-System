@@ -98,7 +98,157 @@ class AGICoreModule(nn.Module):
 
     def NewTensor(self, data, *, dtype=None):
         return torch.as_tensor(data, device=self.device, dtype=(dtype or self.dtype))
-    
+
+
+class RotaryEmbedding(AGICoreModule):
+    def __init__(self, dim: int, base: float = 10000.0):
+        super().__init__()
+        rotary_dim = max(0, int(dim))
+        if (rotary_dim % 2) != 0:
+            rotary_dim -= 1
+        self.dim = rotary_dim
+        self.base = float(base)
+
+        if self.dim > 0:
+            inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / float(self.dim)))
+        else:
+            inv_freq = torch.empty(0, dtype=torch.float32)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def BuildCosSin(
+        self,
+        seqLen: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        offset: int = 0,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.dim <= 0:
+            return None, None
+
+        pos = torch.arange(offset, offset + int(seqLen), device=device, dtype=self.dtype)
+        freq = torch.outer(pos, self.inv_freq)
+        freq = torch.repeat_interleave(freq, repeats=2, dim=-1)
+        cos = freq.cos().to(dtype=dtype).unsqueeze(0).unsqueeze(0)
+        sin = freq.sin().to(dtype=dtype).unsqueeze(0).unsqueeze(0)
+        return cos, sin
+
+    @staticmethod
+    def RotateHalf(x: torch.Tensor) -> torch.Tensor:
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        x_rot = torch.stack([-x_odd, x_even], dim=-1)
+        return x_rot.flatten(start_dim=-2)
+
+    def Apply(
+        self,
+        x: torch.Tensor,
+        *,
+        offset: int = 0,) -> torch.Tensor:
+        if self.dim <= 0:
+            return x
+
+        rotary = x[..., :self.dim]
+        passthrough = x[..., self.dim:]
+        cos, sin = self.BuildCosSin(
+            seqLen=int(x.size(-2)),
+            device=x.device,
+            dtype=x.dtype,
+            offset=offset,)
+        rotary = rotary * cos + self.RotateHalf(rotary) * sin
+        if passthrough.numel() == 0:
+            return rotary
+        return torch.cat([rotary, passthrough], dim=-1)
+
+
+class RoPEMultiheadAttention(AGICoreModule):
+    def __init__(
+        self,
+        embedDim: int,
+        numHeads: int,
+        dropout: float = 0.0,
+        ropeBase: float = 10000.0,):
+        super().__init__()
+        if embedDim % numHeads != 0:
+            raise ValueError(f"RoPEMultiheadAttention: embedDim={embedDim} must be divisible by numHeads={numHeads}.")
+
+        self.embed_dim = int(embedDim)
+        self.num_heads = int(numHeads)
+        self.head_dim = self.embed_dim // self.num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+        self.attn_drop = nn.Dropout(dropout)
+        self.rope = RotaryEmbedding(self.head_dim, base=ropeBase)
+
+    def ReshapeHeads(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        x = x.view(B, T, self.num_heads, self.head_dim)
+        return x.transpose(1, 2)
+
+    def MergeHeads(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, T, Dh = x.shape
+        x = x.transpose(1, 2).contiguous().view(B, T, H * Dh)
+        return x
+
+    @staticmethod
+    def PrepareMask(mask: torch.Tensor, B: int, Tq: int, Tk: int) -> torch.Tensor:
+        if mask.dim() == 2:
+            return mask.reshape(1, 1, Tq, Tk)
+        if mask.dim() == 3:
+            return mask.reshape(B, 1, Tq, Tk)
+        if mask.dim() == 4:
+            return mask
+        raise ValueError(f"RoPEMultiheadAttention: unsupported attn_mask dim={int(mask.dim())}.")
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        needWeights: bool = True,
+        attnMask: Optional[torch.Tensor] = None,) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        B, Tq, _ = query.shape
+        Tk = int(key.size(1))
+
+        q = self.ReshapeHeads(self.q_proj(query))
+        k = self.ReshapeHeads(self.k_proj(key))
+        v = self.ReshapeHeads(self.v_proj(value))
+
+        q = self.rope.Apply(q)
+        k = self.rope.Apply(k)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        neg_large = torch.finfo(scores.dtype).min
+
+        if attnMask is not None:
+            attnMaskView = self.PrepareMask(attnMask, B, Tq, Tk)
+            if attnMaskView.dtype == torch.bool:
+                scores = scores.masked_fill(attnMaskView, neg_large)
+            else:
+                scores = scores + attnMaskView
+
+        if keyPaddingMask is not None:
+            padMask = keyPaddingMask.reshape(B, 1, 1, Tk)
+            scores = scores.masked_fill(padMask, neg_large)
+
+        attn = F.softmax(scores, dim=-1)
+        attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
+        attn = self.attn_drop(attn)
+
+        out = torch.matmul(attn, v)
+        out = self.MergeHeads(out)
+        out = self.out_proj(out)
+
+        weights = None
+        if needWeights:
+            weights = attn.mean(dim=1)
+        return out, weights
+
 
 class BaseOnlineWrapper(nn.Module):
     def __init__(

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict
-from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear
+from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear, RotaryEmbedding
 
 
 
@@ -121,8 +121,6 @@ class SelectiveSSM(AGICoreModule):
 
         return self.out_norm(y)
 
-
-
 class MultiHeadAttention(AGICoreModule):
     def __init__(
         self, 
@@ -164,6 +162,7 @@ class MultiHeadAttention(AGICoreModule):
         self.k_adapter = GrowableLoRALinear(self.k_proj)
         self.v_adapter = GrowableLoRALinear(self.v_proj)
         self.o_adapter = GrowableLoRALinear(self.out_proj)
+        self.rope = RotaryEmbedding(self.head_dim)
 
         self.register_buffer("hebbian_weights", torch.zeros(1, self.num_heads, self.head_dim, self.head_dim), persistent=False)  # (B,H,D,D)
         self.register_buffer("U", torch.zeros(1, self.num_heads, self.head_dim, self.rank), persistent=False) 
@@ -217,8 +216,10 @@ class MultiHeadAttention(AGICoreModule):
         mask: Optional[torch.Tensor], # [B, 1, 1, Lk]
         dropoutP: float,) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        d = q.size(-1)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
+        q_attn = self.rope.Apply(q)
+        k_attn = self.rope.Apply(k)
+        d = q_attn.size(-1)
+        scores = torch.matmul(q_attn, k_attn.transpose(-2, -1)) / math.sqrt(d)
         if mask is not None:
             mask_value = -torch.finfo(scores.dtype).max
             scores = scores.masked_fill(mask, mask_value)
@@ -331,8 +332,11 @@ class MultiHeadAttention(AGICoreModule):
         tau = self.ModulateTau(tdError * self.td_unc_scale , uncertainty * self.td_unc_scale , B)
         q = q / tau
 
-        d = q.size(-1)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
+        q_attn = self.rope.Apply(q)
+        k_attn = self.rope.Apply(k)
+
+        d = q_attn.size(-1)
+        scores = torch.matmul(q_attn, k_attn.transpose(-2, -1)) / math.sqrt(d)
         if keyPaddingMask is not None:
             mask = keyPaddingMask[:, None, None, :]  # bool [B,1,1,L]
             mask_val = torch.tensor(-1e9 if q.dtype != torch.float16 else -1e4, dtype=q.dtype, device=q.device)
@@ -955,8 +959,11 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         delt = delt * hebb_mod
         v_fast = v + delt
 
-        d = q.size(-1)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
+        q_attn = mhsa.rope.Apply(q)
+        k_attn = mhsa.rope.Apply(k)
+
+        d = q_attn.size(-1)
+        scores = torch.matmul(q_attn, k_attn.transpose(-2, -1)) / math.sqrt(d)
 
         if keyPaddingMask is not None:
             mask = keyPaddingMask[:, None, None, :] 
@@ -1778,4 +1785,3 @@ class TestAttentionMTool:
         passed = sum(1 for v in results.values() if v)
         print(f"\nAttention module tests (with wrapper): {passed}/{len(results)} passed.")
         return results
-

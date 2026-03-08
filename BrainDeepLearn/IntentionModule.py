@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import List, Tuple, Dict, Optional
-from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear
+from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear, RoPEMultiheadAttention
 
 import copy
 import torch
@@ -298,162 +298,6 @@ class LangSymbolReasoner(AGICoreModule):
         return total_loss, stats
 
 
-class RotaryEmbedding(AGICoreModule):
-    def __init__(self, dim: int, base: float = 10000.0):
-        super().__init__()
-        rotary_dim = max(0, int(dim))
-        if (rotary_dim % 2) != 0:
-            rotary_dim -= 1
-        self.dim = rotary_dim
-        self.base = float(base)
-
-        if self.dim > 0:
-            inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / float(self.dim)))
-        else:
-            inv_freq = torch.empty(0, dtype=torch.float32)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def BuildCosSin(
-        self,
-        seqLen: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        *,
-        offset: int = 0,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if self.dim <= 0:
-            return None, None
-
-        pos = torch.arange(offset, offset + int(seqLen), device=device, dtype=self.dtype)
-        freq = torch.outer(pos, self.inv_freq) # [T, D/2]
-        freq = torch.repeat_interleave(freq, repeats=2, dim=-1) # [T, D]
-        cos = freq.cos().to(dtype=dtype).unsqueeze(0).unsqueeze(0) # [1, 1, T, D]
-        sin = freq.sin().to(dtype=dtype).unsqueeze(0).unsqueeze(0) # [1, 1, T, D]
-        return cos, sin
-
-    @staticmethod
-    def RotateHalf(x: torch.Tensor) -> torch.Tensor:
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
-        x_rot = torch.stack([-x_odd, x_even], dim=-1)
-        return x_rot.flatten(start_dim=-2)
-
-    def Apply(
-        self,
-        x: torch.Tensor,
-        *,
-        offset: int = 0,) -> torch.Tensor:
-        if self.dim <= 0:
-            return x
-
-        rotary = x[..., :self.dim]
-        passthrough = x[..., self.dim:]
-        cos, sin = self.BuildCosSin(
-            seqLen=int(x.size(-2)),
-            device=x.device,
-            dtype=x.dtype,
-            offset=offset,)
-        rotary = rotary * cos + self.RotateHalf(rotary) * sin
-        if passthrough.numel() == 0:
-            return rotary
-        return torch.cat([rotary, passthrough], dim=-1)
-
-
-class RoPEMultiheadAttention(AGICoreModule):
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        dropout: float = 0.0,
-        *,
-        batch_first: bool = True,
-        ropeBase: float = 10000.0,):
-        super().__init__()
-        if not batch_first:
-            raise ValueError("RoPEMultiheadAttention only supports batch_first=True.")
-        if embed_dim % num_heads != 0:
-            raise ValueError(f"RoPEMultiheadAttention: embed_dim={embed_dim} must be divisible by num_heads={num_heads}.")
-
-        self.embed_dim = int(embed_dim)
-        self.num_heads = int(num_heads)
-        self.head_dim = self.embed_dim // self.num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
-
-        self.attn_drop = nn.Dropout(dropout)
-        self.rope = RotaryEmbedding(self.head_dim, base=ropeBase)
-
-    def ReshapeHeads(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D = x.shape
-        x = x.view(B, T, self.num_heads, self.head_dim)
-        return x.transpose(1, 2) # [B, H, T, Dh]
-
-    def MergeHeads(self, x: torch.Tensor) -> torch.Tensor:
-        B, H, T, Dh = x.shape
-        x = x.transpose(1, 2).contiguous().view(B, T, H * Dh)
-        return x
-
-    @staticmethod
-    def PrepareMask(mask: torch.Tensor, B: int, Tq: int, Tk: int) -> torch.Tensor:
-        if mask.dim() == 2:
-            return mask.view(1, 1, Tq, Tk)
-        if mask.dim() == 3:
-            return mask.view(B, 1, Tq, Tk)
-        if mask.dim() == 4:
-            return mask
-        raise ValueError(f"RoPEMultiheadAttention: unsupported attn_mask dim={int(mask.dim())}.")
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        need_weights: bool = True,
-        attn_mask: Optional[torch.Tensor] = None, 
-        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-
-        B, Tq, _ = query.shape
-        Tk = int(key.size(1))
-
-        q = self.ReshapeHeads(self.q_proj(query)) # [B, H, Tq, Dh]
-        k = self.ReshapeHeads(self.k_proj(key)) # [B, H, Tk, Dh]
-        v = self.ReshapeHeads(self.v_proj(value)) # [B, H, Tk, Dh]
-
-        q = self.rope.Apply(q)
-        k = self.rope.Apply(k)
-
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale # [B, H, Tq, Tk]
-        neg_large = torch.finfo(scores.dtype).min
-
-        if attn_mask is not None:
-            attn_mask_view = self.PrepareMask(attn_mask, B, Tq, Tk)
-            if attn_mask_view.dtype == torch.bool:
-                scores = scores.masked_fill(attn_mask_view, neg_large)
-            else:
-                scores = scores + attn_mask_view
-
-        if key_padding_mask is not None:
-            pad_mask = key_padding_mask.view(B, 1, 1, Tk)
-            scores = scores.masked_fill(pad_mask, neg_large)
-
-        attn = F.softmax(scores, dim=-1)
-        attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
-        attn = self.attn_drop(attn)
-
-        out = torch.matmul(attn, v) # [B, H, Tq, Dh]
-        out = self.MergeHeads(out) # [B, Tq, D]
-        out = self.out_proj(out) # [B, Tq, D]
-
-        weights = None
-        if need_weights:
-            weights = attn.mean(dim=1) # [B, Tq, Tk]
-        return out, weights
-
-
 class RoPETransformerEncoderLayer(nn.Module):
     def __init__(
         self,
@@ -465,10 +309,9 @@ class RoPETransformerEncoderLayer(nn.Module):
         activation: str = "gelu",):
         super().__init__()
         self.self_attn = RoPEMultiheadAttention(
-            embed_dim=d_model,
-            num_heads=nhead,
-            dropout=dropout,
-            batch_first=True,)
+            embedDim=d_model,
+            numHeads=nhead,
+            dropout=dropout,)
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -489,8 +332,8 @@ class RoPETransformerEncoderLayer(nn.Module):
             query=attn_in,
             key=attn_in,
             value=attn_in,
-            key_padding_mask=src_key_padding_mask,
-            need_weights=False,)
+            keyPaddingMask=src_key_padding_mask,
+            needWeights=False,)
         x = src + self.dropout1(attn_out)
 
         ff_in = self.norm2(x)
@@ -528,15 +371,13 @@ class RoPETransformerDecoderLayer(nn.Module):
         activation: str = "gelu",):
         super().__init__()
         self.self_attn = RoPEMultiheadAttention(
-            embed_dim=d_model,
-            num_heads=nhead,
-            dropout=dropout,
-            batch_first=True,)
+            embedDim=d_model,
+            numHeads=nhead,
+            dropout=dropout,)
         self.cross_attn = RoPEMultiheadAttention(
-            embed_dim=d_model,
-            num_heads=nhead,
-            dropout=dropout,
-            batch_first=True,)
+            embedDim=d_model,
+            numHeads=nhead,
+            dropout=dropout,)
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -563,9 +404,9 @@ class RoPETransformerDecoderLayer(nn.Module):
             query=self_in,
             key=self_in,
             value=self_in,
-            key_padding_mask=tgt_key_padding_mask,
-            need_weights=False,
-            attn_mask=tgt_mask,)
+            keyPaddingMask=tgt_key_padding_mask,
+            needWeights=False,
+            attnMask=tgt_mask,)
         x = tgt + self.dropout1(self_out)
 
         cross_in = self.norm2(x)
@@ -573,8 +414,8 @@ class RoPETransformerDecoderLayer(nn.Module):
             query=cross_in,
             key=memory,
             value=memory,
-            key_padding_mask=memory_key_padding_mask,
-            need_weights=False,)
+            keyPaddingMask=memory_key_padding_mask,
+            needWeights=False,)
         x = x + self.dropout2(cross_out)
 
         ff_in = self.norm3(x)
@@ -784,10 +625,9 @@ class IntentionExtractor(AGICoreModule):
         attn_heads = pick_heads(dimSem)
 
         self.slotCrossAttn = RoPEMultiheadAttention(
-            embed_dim=dimSem,
-            num_heads=attn_heads,
-            dropout=encoderDropout,
-            batch_first=True,)
+            embedDim=dimSem,
+            numHeads=attn_heads,
+            dropout=encoderDropout,)
         self.slotPost = nn.Sequential(
             nn.Linear(dimSem, dimSem),
             nn.LayerNorm(dimSem),
@@ -1096,8 +936,8 @@ class IntentionExtractor(AGICoreModule):
             query=query,  
             key=contextualChunks,  
             value=contextualChunks,  
-            key_padding_mask=~safe_mask,  
-            need_weights=False,)
+            keyPaddingMask=~safe_mask,  
+            needWeights=False,)
         slots = self.slotPost(slots_attn + query) # [B, K, D]
 
         slot_mask = has_chunk.unsqueeze(1).expand(B, K) # [B, K]

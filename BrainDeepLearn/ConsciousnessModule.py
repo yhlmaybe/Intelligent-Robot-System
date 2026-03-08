@@ -1,6 +1,6 @@
 from __future__ import annotations 
 from typing import Optional, Dict, Tuple, NamedTuple
-from FunctionTools import AGICoreModule
+from FunctionTools import AGICoreModule, RoPEMultiheadAttention
 
 import torch
 import torch.nn as nn
@@ -484,15 +484,13 @@ class ConsciousnessExtractor(AGICoreModule):
             nn.LayerNorm(self.world_item_dim),
             nn.Linear(self.world_item_dim, hyperHiddenDim),)
         
-        self.mem_cross_attn = nn.MultiheadAttention(
-            embed_dim=hyperHiddenDim,
-            num_heads=self.ctx_attn_heads,
-            batch_first=True,)
+        self.mem_cross_attn = RoPEMultiheadAttention(
+            embedDim=hyperHiddenDim,
+            numHeads=self.ctx_attn_heads,)
         
-        self.world_cross_attn = nn.MultiheadAttention(
-            embed_dim=hyperHiddenDim,
-            num_heads=self.ctx_attn_heads,
-            batch_first=True,)
+        self.world_cross_attn = RoPEMultiheadAttention(
+            embedDim=hyperHiddenDim,
+            numHeads=self.ctx_attn_heads,)
         
         self.mem_obs_fuse = nn.Sequential(
             nn.LayerNorm(2 * hyperHiddenDim),
@@ -1092,7 +1090,7 @@ class ConsciousnessExtractor(AGICoreModule):
 
         if memory_bank.size(1) > 0:
             mem_tokens = self.mem_token_proj(memory_bank)
-            mem_attn_out, mem_attn_prob = self.mem_cross_attn(q, mem_tokens, mem_tokens, need_weights=True)
+            mem_attn_out, mem_attn_prob = self.mem_cross_attn(q, mem_tokens, mem_tokens, needWeights=True)
             mem_attn_vec = mem_attn_out.squeeze(1) # [B,H]
             mem_attn_prob = mem_attn_prob.squeeze(1) # [B,Nm]
             mem_attn_entropy = -(mem_attn_prob * mem_attn_prob.clamp_min(1e-8).log()).sum(dim=-1, keepdim=True) # [B,1]
@@ -1104,7 +1102,7 @@ class ConsciousnessExtractor(AGICoreModule):
         world_use_attn = world_bank.size(1) > 1
         if world_use_attn:
             world_tokens = self.world_token_proj(world_bank)
-            world_attn_out, world_attn_prob = self.world_cross_attn(q, world_tokens, world_tokens, need_weights=True)
+            world_attn_out, world_attn_prob = self.world_cross_attn(q, world_tokens, world_tokens, needWeights=True)
             world_attn_vec = world_attn_out.squeeze(1) # [B,H]
             world_attn_prob = world_attn_prob.squeeze(1) # [B,Nw]
             world_attn_entropy = -(world_attn_prob * world_attn_prob.clamp_min(1e-8).log()).sum(dim=-1, keepdim=True)
