@@ -144,7 +144,8 @@ class BrainCore(nn.Module):
 
         self.intention = IntentionExtractor(
             dimSem=ModuleDim.IntentionFeat,
-            consDim=ModuleDim.ConsciousnessState)
+            consSelfDim=int(self.conscious.self_dim),
+            consIntentDim=int(self.conscious.intent_dim))
 
         self.OCR = OCREngineExtractor()
 
@@ -353,12 +354,14 @@ class BrainCore(nn.Module):
 
         conscious_out = self.conscious(memoryBank=memory_bank, worldBank=world_bank)
 
-        conscious_state = conscious_out.intent_sem
-
         fuse_ocr = self.OCR.ExportFusedTexts()
 
-        intent_sem, sym_probs, intention_extras = self.intention(conscious_state, ocrTexts=fuse_ocr, 
-                                                                 extTexts=textExt,prioritizeExt=self.prioritize_ext_str)
+        intent_sem, sym_probs, intention_extras = self.intention(
+            conscious_out.self_sem,
+            conscious_out.intent_sem,
+            ocrTexts=fuse_ocr,
+            extTexts=textExt,
+            prioritizeExt=self.prioritize_ext_str,)
 
         with torch.no_grad():
             if self.is_online_learning:
@@ -422,7 +425,7 @@ class BrainCore(nn.Module):
                 AttnFeat=atten_out,
                 MemFeat=mem_feat,
                 WorldState=s_t,
-                ConsciousnessState=conscious_state,
+                ConsciousnessState=conscious_out.intent_sem,
                 IntentionState=intent_sem,
                 Reward=r_t,
                 Done=d_t,
@@ -485,7 +488,15 @@ class BrainCore(nn.Module):
             conscious_loss = conscious_out.extras["loss"]
             losses["conscious_loss"] = conscious_loss
 
-            intention_loss = self.intention.GetInternalLoss(sym_probs)
+            intention_loss_out = self.intention.GetInternalLoss(sym_probs)
+            if isinstance(intention_loss_out, tuple):
+                intention_loss, intention_stats = intention_loss_out
+                if isinstance(intention_stats, dict):
+                    for k, v in intention_stats.items():
+                        losses[f"intention_{k}"] = v
+            else:
+                intention_loss = intention_loss_out
+
             losses["intention_loss"] = intention_loss
 
             total_loss = world_loss_main + critic_loss + actor_loss + mem_loss + conscious_loss +intention_loss

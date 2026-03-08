@@ -1,73 +1,17 @@
 from __future__ import annotations
 from typing import List, Tuple, Dict, Optional
-from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper
+from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear
 
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import hashlib
+import math
 
 
 
-class IntentionLoRALinear(nn.Module):
-    def __init__(self, targetLinear: nn.Linear):
-        super().__init__()
-        assert isinstance(targetLinear, nn.Linear)
-        self.target = targetLinear
-
-        self.A_list = nn.ParameterList()
-        self.B_list = nn.ParameterList()
-        self.alpha = nn.ParameterList() 
-
-        self.out_f = int(targetLinear.out_features)
-        self.in_f = int(targetLinear.in_features)
-
-    @torch.no_grad()
-    def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
-        if (addRank is None) or (addRank <= 0):
-            return
-
-        if init is None:
-            init = {}
-
-        dev = self.target.weight.device
-        dt  = self.target.weight.dtype
-
-        A = init.get("A", torch.randn(addRank, self.in_f, device=dev, dtype=dt) * 1e-4)
-        B = init.get("B", torch.randn(self.out_f, addRank, device=dev, dtype=dt) * 1e-4)
-        s = init.get("scale", 1e-3)
-
-        A = nn.Parameter(A.contiguous().to(device=dev, dtype=dt))
-        B = nn.Parameter(B.contiguous().to(device=dev, dtype=dt))
-        s = nn.Parameter(torch.as_tensor(s, device=dev, dtype=dt))
-
-        if freezeOld:
-            for p in list(self.A_list) + list(self.B_list) + list(self.alpha):
-                p.requires_grad_(False)
-
-        self.A_list.append(A)
-        self.B_list.append(B)
-        self.alpha.append(s)
-
-    def DeltaWeight(self) -> Optional[torch.Tensor]:
-        if len(self.A_list) == 0:
-            return None
-
-        delta = self.target.weight.new_zeros(self.out_f, self.in_f)
-        for A, B, s in zip(self.A_list, self.B_list, self.alpha):
-            delta = delta + torch.tanh(s) * GetParametersScale(s) * (B @ A)
-        return delta
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        W = self.target.weight
-        delta = self.DeltaWeight()
-        if delta is not None:
-            W = W + delta
-        return F.linear(x, W, self.target.bias)
-
-
-
-class TextEncoder(nn.Module):
+class TextEncoder(AGICoreModule):
     def __init__(
         self,
         vocabSize: int,
@@ -105,29 +49,29 @@ class TextEncoder(nn.Module):
 
     def ReversePaddedSequence(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         B, T = x.shape[:2]
-        idx = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)  
+        idx = torch.arange(T, device=self.device).unsqueeze(0).expand(B, T)  
         L = lengths.unsqueeze(1)
         rev_idx = torch.where(idx < L, (L - 1 - idx), idx)  
         rev_idx = rev_idx.unsqueeze(-1).expand(-1, -1, x.size(-1)) 
-        return x.gather(1, rev_idx)
+        return x.gather(1, rev_idx) # [B, T, D]
 
     def forward(self, tokenIds: torch.Tensor) -> torch.Tensor:
         B, T = tokenIds.shape
 
-        emb = self.embedding(tokenIds)
+        emb = self.embedding(tokenIds) # [B, T, E]
 
         mask = (tokenIds != self.padding_idx)  
         lengths = mask.long().sum(dim=1).clamp(min=1)  
 
-        out_f, _ = self.rnn_f(emb)
+        out_f, _ = self.rnn_f(emb) # [B, T, H]
 
         emb_rev = self.ReversePaddedSequence(emb, lengths)
         out_b_rev, _ = self.rnn_b(emb_rev) 
         out_b = self.ReversePaddedSequence(out_b_rev, lengths)
 
-        out = torch.cat([out_f, out_b], dim=-1) 
+        out = torch.cat([out_f, out_b], dim=-1) # [B, T, 2H]
 
-        scores = self.att_proj(out).squeeze(-1) 
+        scores = self.att_proj(out).squeeze(-1) # [B, T]
         scores = scores.masked_fill(~mask, float("-inf"))
 
         no_token = ~mask.any(dim=1)
@@ -141,11 +85,11 @@ class TextEncoder(nn.Module):
             attn[no_token] = 0.0
 
         text_repr = (out * attn.unsqueeze(-1)).sum(dim=1) 
-        return text_repr
+        return text_repr # [B, 2H]
 
 
 
-class LangSymbolReasoner(nn.Module):
+class LangSymbolReasoner(AGICoreModule):
     def __init__(
         self,
         nSymbols: int,
@@ -153,10 +97,12 @@ class LangSymbolReasoner(nn.Module):
         hiddenDim: int = 512,
         alphaImp: float = 1.0,
         alphaCooc: float = 0.5,
-        alphaContr: float = 1.0,):
+        alphaContr: float = 1.0,
+        dynamicScale: float = 0.25,):
         super().__init__()
         self.nSymbols = int(nSymbols)
         self.dimSem = int(dimSem)
+        self.dynamic_scale = float(dynamicScale)
 
         self.relImp = nn.Parameter(torch.randn(self.dimSem, self.dimSem) * 0.02)
         self.relContr = nn.Parameter(torch.randn(self.dimSem, self.dimSem) * 0.02)
@@ -166,79 +112,174 @@ class LangSymbolReasoner(nn.Module):
         self.alphaCooc = nn.Parameter(torch.tensor(float(alphaCooc)))
         self.alphaContr = nn.Parameter(torch.tensor(float(alphaContr)))
 
+        self.ctxBackbone = nn.Sequential(
+            nn.Linear(self.dimSem, hiddenDim),
+            nn.LayerNorm(hiddenDim),
+            nn.GELU(),
+            nn.Linear(hiddenDim, self.dimSem),
+            nn.LayerNorm(self.dimSem),
+            nn.GELU(),)
+
+        self.alphaHead = nn.Linear(self.dimSem, 3)
+        self.filmImp = nn.Linear(self.dimSem, self.dimSem * 2)
+        self.filmCooc = nn.Linear(self.dimSem, self.dimSem * 2)
+        self.filmContr = nn.Linear(self.dimSem, self.dimSem * 2)
+
         self.postMlp = nn.Sequential(
-            nn.Linear(self.nSymbols * 2, hiddenDim),
+            nn.Linear(self.nSymbols * 2 + self.dimSem, hiddenDim),
             nn.LayerNorm(hiddenDim),
             nn.GELU(),
             nn.Linear(hiddenDim, self.nSymbols),)
 
-    def BuildRelationMatrix(self, conceptEmb: torch.Tensor, relCore: torch.Tensor) -> torch.Tensor:
-        norm_emb = F.normalize(conceptEmb, dim=-1, eps=1e-6)
-        interm = norm_emb @ relCore
-        relation_matrix = interm @ norm_emb.t()
-        return relation_matrix
+    def BuildRelationMatrix(
+        self,
+        conceptEmb: torch.Tensor,
+        relCore: torch.Tensor,
+        gamma: Optional[torch.Tensor] = None,
+        beta: Optional[torch.Tensor] = None,) -> torch.Tensor:
+
+        norm_emb = F.normalize(conceptEmb, dim=-1, eps=1e-6) # [K, D]
+        scale = 1.0 / math.sqrt(float(self.dimSem))
+
+        if (gamma is None) or (beta is None):
+            interm = norm_emb @ relCore # [K, D]
+            relation_matrix = interm @ norm_emb.t() # [K, K]
+            return relation_matrix * scale
+
+        B = gamma.size(0)
+        emb = norm_emb.unsqueeze(0).expand(B, -1, -1) # [B, K, D]
+        emb = emb * gamma.unsqueeze(1) + beta.unsqueeze(1)
+        emb = F.normalize(emb, dim=-1, eps=1e-6) # [B, K, D]
+
+        interm = torch.matmul(emb, relCore) # [B, K, D]
+        relation_matrix = torch.matmul(interm, emb.transpose(1, 2)) # [B, K, K]
+        return relation_matrix * scale
+
+    def BuildFilmParams(self, ctxFeat: torch.Tensor, filmHead: nn.Linear) -> Tuple[torch.Tensor, torch.Tensor]:
+        film = filmHead(ctxFeat) # [B, 2D]
+        gamma_raw, beta_raw = film.chunk(2, dim=-1) # [B, D]
+        gamma = 1.0 + self.dynamic_scale * torch.tanh(gamma_raw)
+        beta = self.dynamic_scale * torch.tanh(beta_raw)
+        return gamma, beta # [B, D]
 
     def forward(
         self,
-        symLogits: torch.Tensor,
-        conceptEmb: torch.Tensor,
+        symLogits: torch.Tensor, # [B, K]
+        conceptEmb: torch.Tensor, # [K, D]
+        ctx: Optional[torch.Tensor] = None, # [B, D]
         *,
-        return_support: bool = False,):
+        returnSupport: bool = False,):
+
         B, K = symLogits.shape
-        assert K == self.nSymbols, "LangSymbolReasoner: nSymbols mismatch."
 
-        sym_probs0 = torch.sigmoid(symLogits) 
+        if ctx is None:
+            ctx = symLogits.new_zeros(B, self.dimSem)
 
-        w_imp = torch.tanh(self.BuildRelationMatrix(conceptEmb, self.relImp))
-        w_contr = torch.tanh(self.BuildRelationMatrix(conceptEmb, self.relContr))
-        w_cooc = torch.tanh(self.BuildRelationMatrix(conceptEmb, self.relCooc))
+        ctx_feat = self.ctxBackbone(ctx) # [B, D]
+        alpha_delta = self.alphaHead(ctx_feat) # [B, 3]
+        alpha_base = torch.stack([self.alphaImp, self.alphaCooc, self.alphaContr], dim=0).unsqueeze(0) # [1, 3]
+        alpha_eff = torch.tanh(alpha_base + alpha_delta) # [B, 3]
 
-        if w_imp.dim() == 2 and w_imp.size(0) == w_imp.size(1):
-            w_imp = w_imp.clone();   w_imp.fill_diagonal_(0.0)
-            w_contr = w_contr.clone(); w_contr.fill_diagonal_(0.0)
-            w_cooc = w_cooc.clone(); w_cooc.fill_diagonal_(0.0)
+        gamma_imp, beta_imp = self.BuildFilmParams(ctx_feat, self.filmImp)
+        gamma_cooc, beta_cooc = self.BuildFilmParams(ctx_feat, self.filmCooc)
+        gamma_contr, beta_contr = self.BuildFilmParams(ctx_feat, self.filmContr)
 
-        support_imp = sym_probs0 @ w_imp
-        support_cooc = sym_probs0 @ w_cooc
-        support_contr = sym_probs0 @ w_contr
+        sym_probs0 = torch.sigmoid(symLogits) # [B, K]
+
+        w_imp = torch.tanh(self.BuildRelationMatrix(conceptEmb, self.relImp, gamma_imp, beta_imp)) # [B, K, K]
+        w_contr = torch.tanh(self.BuildRelationMatrix(conceptEmb, self.relContr, gamma_contr, beta_contr)) # [B, K, K]
+        w_cooc = torch.tanh(self.BuildRelationMatrix(conceptEmb, self.relCooc, gamma_cooc, beta_cooc)) # [B, K, K]
+
+        diag_mask = torch.eye(K, device=self.device, dtype=torch.bool).unsqueeze(0)
+        w_imp = w_imp.masked_fill(diag_mask, 0.0)
+        w_contr = w_contr.masked_fill(diag_mask, 0.0)
+        w_cooc = w_cooc.masked_fill(diag_mask, 0.0)
+
+        support_imp = torch.bmm(sym_probs0.unsqueeze(1), w_imp).squeeze(1)
+        support_cooc = torch.bmm(sym_probs0.unsqueeze(1), w_cooc).squeeze(1)
+        support_contr = torch.bmm(sym_probs0.unsqueeze(1), w_contr).squeeze(1)
 
         combined_logits = (symLogits
-            + torch.tanh(self.alphaImp) * support_imp
-            + torch.tanh(self.alphaCooc) * support_cooc
-            - torch.tanh(self.alphaContr) * support_contr)
+            + alpha_eff[:, 0:1] * support_imp
+            + alpha_eff[:, 1:2] * support_cooc
+            - alpha_eff[:, 2:3] * support_contr)
 
-        combined_probs = torch.sigmoid(combined_logits)
-        mlp_input = torch.cat([sym_probs0, combined_probs], dim=-1)
-        delta_logits = self.postMlp(mlp_input)
+        combined_probs = torch.sigmoid(combined_logits) # [B, K]
+        mlp_input = torch.cat([sym_probs0, combined_probs, ctx_feat], dim=-1) # [B, 2K + D]
+        delta_logits = self.postMlp(mlp_input) # [B, K]
 
-        final_logits = combined_logits + delta_logits
-        sym_probs = torch.sigmoid(final_logits)
+        final_logits = combined_logits + delta_logits # [B, K]
+        sym_probs = torch.sigmoid(final_logits) # [B, K]
 
-        if not return_support:
+        if not returnSupport:
             return sym_probs
 
         support = {
             "sym_probs0": sym_probs0,
             "support_imp": support_imp,
             "support_cooc": support_cooc,
-            "support_contr": support_contr,}
+            "support_contr": support_contr,
+            "w_imp": w_imp,
+            "w_cooc": w_cooc,
+            "w_contr": w_contr,
+            "alpha_eff": alpha_eff,
+            "alpha_delta": alpha_delta,
+            "gamma_imp": gamma_imp,
+            "gamma_cooc": gamma_cooc,
+            "gamma_contr": gamma_contr,
+            "beta_imp": beta_imp,
+            "beta_cooc": beta_cooc,
+            "beta_contr": beta_contr,
+            "ctx_feat": ctx_feat,}
         
-        return sym_probs, support
+        return sym_probs, support # sym_probs: [B, K]
 
-    def GetInternalLoss(self, conceptEmb, symProbs, lambdaSymmetry=1e-3, lambdaEntropy=1e-3):
+    def GetInternalLoss(
+        self,
+        conceptEmb,
+        symProbs,
+        supportCache: Optional[Dict[str, torch.Tensor]] = None,
+        lambdaSymmetry=1e-3,
+        lambdaEntropy=1e-3,
+        lambdaDynamic=5e-4):
 
-        w_contr = self.BuildRelationMatrix(conceptEmb, self.relContr)
-        w_cooc = self.BuildRelationMatrix(conceptEmb, self.relCooc)
+        w_contr = torch.tanh(self.BuildRelationMatrix(conceptEmb, self.relContr)) # [K, K]
+        w_cooc = torch.tanh(self.BuildRelationMatrix(conceptEmb, self.relCooc)) # [K, K]
 
         if w_contr.dim() == 2 and w_contr.size(0) == w_contr.size(1):
-            w_contr = w_contr.clone(); w_contr.fill_diagonal_(0.0)
-            w_cooc = w_cooc.clone(); w_cooc.fill_diagonal_(0.0)
+            w_contr = w_contr.clone()
+            w_cooc = w_cooc.clone()
+            w_contr.fill_diagonal_(0.0)
+            w_cooc.fill_diagonal_(0.0)
 
         cooc_anti = 0.5 * (w_cooc - w_cooc.t())
         contr_anti = 0.5 * (w_contr - w_contr.t())
 
         loss_cooc_sym = cooc_anti.pow(2).mean() * lambdaSymmetry
         loss_contr_sym = contr_anti.pow(2).mean() * lambdaSymmetry
+        loss_dynamic = symProbs.new_zeros(())
+
+        if supportCache is not None:
+            if ("w_cooc" in supportCache) and (supportCache["w_cooc"].dim() == 3):
+                cooc_dyn = supportCache["w_cooc"]
+                cooc_dyn_anti = 0.5 * (cooc_dyn - cooc_dyn.transpose(1, 2))
+                loss_dynamic = loss_dynamic + cooc_dyn_anti.pow(2).mean() * lambdaSymmetry
+
+            if ("w_contr" in supportCache) and (supportCache["w_contr"].dim() == 3):
+                contr_dyn = supportCache["w_contr"]
+                contr_dyn_anti = 0.5 * (contr_dyn - contr_dyn.transpose(1, 2))
+                loss_dynamic = loss_dynamic + contr_dyn_anti.pow(2).mean() * lambdaSymmetry
+
+            for k in ("gamma_imp", "gamma_cooc", "gamma_contr"):
+                if k in supportCache:
+                    loss_dynamic = loss_dynamic + (supportCache[k] - 1.0).pow(2).mean() * lambdaDynamic
+
+            for k in ("beta_imp", "beta_cooc", "beta_contr"):
+                if k in supportCache:
+                    loss_dynamic = loss_dynamic + supportCache[k].pow(2).mean() * lambdaDynamic
+
+            if "alpha_delta" in supportCache:
+                loss_dynamic = loss_dynamic + supportCache["alpha_delta"].pow(2).mean() * lambdaDynamic
 
         eps = 1e-6
         p = symProbs.clamp(eps, 1.0 - eps)
@@ -247,47 +288,361 @@ class LangSymbolReasoner(nn.Module):
         target_entropy = symProbs.new_tensor(0.5)
         loss_entropy = (mean_entropy - target_entropy).pow(2) * lambdaEntropy
 
-        total_loss = loss_cooc_sym + loss_contr_sym + loss_entropy
+        total_loss = loss_cooc_sym + loss_contr_sym + loss_entropy + loss_dynamic
         
         stats = {"reason_cooc_sym_pen": loss_cooc_sym.detach(),
                 "reason_contr_sym_pen": loss_contr_sym.detach(),
+                "reason_dynamic_pen": loss_dynamic.detach(),
                 "reason_entropy": loss_entropy.detach(),}
+        
         return total_loss, stats
 
 
+class RotaryEmbedding(AGICoreModule):
+    def __init__(self, dim: int, base: float = 10000.0):
+        super().__init__()
+        rotary_dim = max(0, int(dim))
+        if (rotary_dim % 2) != 0:
+            rotary_dim -= 1
+        self.dim = rotary_dim
+        self.base = float(base)
+
+        if self.dim > 0:
+            inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / float(self.dim)))
+        else:
+            inv_freq = torch.empty(0, dtype=torch.float32)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def BuildCosSin(
+        self,
+        seqLen: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        *,
+        offset: int = 0,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.dim <= 0:
+            return None, None
+
+        pos = torch.arange(offset, offset + int(seqLen), device=device, dtype=self.dtype)
+        freq = torch.outer(pos, self.inv_freq) # [T, D/2]
+        freq = torch.repeat_interleave(freq, repeats=2, dim=-1) # [T, D]
+        cos = freq.cos().to(dtype=dtype).unsqueeze(0).unsqueeze(0) # [1, 1, T, D]
+        sin = freq.sin().to(dtype=dtype).unsqueeze(0).unsqueeze(0) # [1, 1, T, D]
+        return cos, sin
+
+    @staticmethod
+    def RotateHalf(x: torch.Tensor) -> torch.Tensor:
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        x_rot = torch.stack([-x_odd, x_even], dim=-1)
+        return x_rot.flatten(start_dim=-2)
+
+    def Apply(
+        self,
+        x: torch.Tensor,
+        *,
+        offset: int = 0,) -> torch.Tensor:
+        if self.dim <= 0:
+            return x
+
+        rotary = x[..., :self.dim]
+        passthrough = x[..., self.dim:]
+        cos, sin = self.BuildCosSin(
+            seqLen=int(x.size(-2)),
+            device=x.device,
+            dtype=x.dtype,
+            offset=offset,)
+        rotary = rotary * cos + self.RotateHalf(rotary) * sin
+        if passthrough.numel() == 0:
+            return rotary
+        return torch.cat([rotary, passthrough], dim=-1)
+
+
+class RoPEMultiheadAttention(AGICoreModule):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        *,
+        batch_first: bool = True,
+        ropeBase: float = 10000.0,):
+        super().__init__()
+        if not batch_first:
+            raise ValueError("RoPEMultiheadAttention only supports batch_first=True.")
+        if embed_dim % num_heads != 0:
+            raise ValueError(f"RoPEMultiheadAttention: embed_dim={embed_dim} must be divisible by num_heads={num_heads}.")
+
+        self.embed_dim = int(embed_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.embed_dim // self.num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+        self.attn_drop = nn.Dropout(dropout)
+        self.rope = RotaryEmbedding(self.head_dim, base=ropeBase)
+
+    def ReshapeHeads(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        x = x.view(B, T, self.num_heads, self.head_dim)
+        return x.transpose(1, 2) # [B, H, T, Dh]
+
+    def MergeHeads(self, x: torch.Tensor) -> torch.Tensor:
+        B, H, T, Dh = x.shape
+        x = x.transpose(1, 2).contiguous().view(B, T, H * Dh)
+        return x
+
+    @staticmethod
+    def PrepareMask(mask: torch.Tensor, B: int, Tq: int, Tk: int) -> torch.Tensor:
+        if mask.dim() == 2:
+            return mask.view(1, 1, Tq, Tk)
+        if mask.dim() == 3:
+            return mask.view(B, 1, Tq, Tk)
+        if mask.dim() == 4:
+            return mask
+        raise ValueError(f"RoPEMultiheadAttention: unsupported attn_mask dim={int(mask.dim())}.")
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = True,
+        attn_mask: Optional[torch.Tensor] = None, 
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+
+        B, Tq, _ = query.shape
+        Tk = int(key.size(1))
+
+        q = self.ReshapeHeads(self.q_proj(query)) # [B, H, Tq, Dh]
+        k = self.ReshapeHeads(self.k_proj(key)) # [B, H, Tk, Dh]
+        v = self.ReshapeHeads(self.v_proj(value)) # [B, H, Tk, Dh]
+
+        q = self.rope.Apply(q)
+        k = self.rope.Apply(k)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale # [B, H, Tq, Tk]
+        neg_large = torch.finfo(scores.dtype).min
+
+        if attn_mask is not None:
+            attn_mask_view = self.PrepareMask(attn_mask, B, Tq, Tk)
+            if attn_mask_view.dtype == torch.bool:
+                scores = scores.masked_fill(attn_mask_view, neg_large)
+            else:
+                scores = scores + attn_mask_view
+
+        if key_padding_mask is not None:
+            pad_mask = key_padding_mask.view(B, 1, 1, Tk)
+            scores = scores.masked_fill(pad_mask, neg_large)
+
+        attn = F.softmax(scores, dim=-1)
+        attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
+        attn = self.attn_drop(attn)
+
+        out = torch.matmul(attn, v) # [B, H, Tq, Dh]
+        out = self.MergeHeads(out) # [B, Tq, D]
+        out = self.out_proj(out) # [B, Tq, D]
+
+        weights = None
+        if need_weights:
+            weights = attn.mean(dim=1) # [B, Tq, Tk]
+        return out, weights
+
+
+class RoPETransformerEncoderLayer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float = 0.1,
+        *,
+        activation: str = "gelu",):
+        super().__init__()
+        self.self_attn = RoPEMultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            batch_first=True,)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.ff_drop = nn.Dropout(dropout)
+        self.activation = F.gelu if activation == "gelu" else F.relu
+
+    def forward(
+        self,
+        src: torch.Tensor,
+        src_key_padding_mask: Optional[torch.Tensor] = None,) -> torch.Tensor:
+        attn_in = self.norm1(src)
+        attn_out, _ = self.self_attn(
+            query=attn_in,
+            key=attn_in,
+            value=attn_in,
+            key_padding_mask=src_key_padding_mask,
+            need_weights=False,)
+        x = src + self.dropout1(attn_out)
+
+        ff_in = self.norm2(x)
+        ff = self.linear1(ff_in)
+        ff = self.activation(ff)
+        ff = self.ff_drop(ff)
+        ff = self.linear2(ff)
+        x = x + self.dropout2(ff)
+        return x
+
+
+class RoPETransformerEncoder(nn.Module):
+    def __init__(self, layer: RoPETransformerEncoderLayer, num_layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(int(num_layers))])
+
+    def forward(
+        self,
+        src: torch.Tensor,
+        src_key_padding_mask: Optional[torch.Tensor] = None,) -> torch.Tensor:
+        x = src
+        for layer in self.layers:
+            x = layer(x, src_key_padding_mask=src_key_padding_mask)
+        return x
+
+
+class RoPETransformerDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float = 0.1,
+        *,
+        activation: str = "gelu",):
+        super().__init__()
+        self.self_attn = RoPEMultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            batch_first=True,)
+        self.cross_attn = RoPEMultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            batch_first=True,)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.ff_drop = nn.Dropout(dropout)
+        self.activation = F.gelu if activation == "gelu" else F.relu
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,) -> torch.Tensor:
+        self_in = self.norm1(tgt)
+        self_out, _ = self.self_attn(
+            query=self_in,
+            key=self_in,
+            value=self_in,
+            key_padding_mask=tgt_key_padding_mask,
+            need_weights=False,
+            attn_mask=tgt_mask,)
+        x = tgt + self.dropout1(self_out)
+
+        cross_in = self.norm2(x)
+        cross_out, _ = self.cross_attn(
+            query=cross_in,
+            key=memory,
+            value=memory,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=False,)
+        x = x + self.dropout2(cross_out)
+
+        ff_in = self.norm3(x)
+        ff = self.linear1(ff_in)
+        ff = self.activation(ff)
+        ff = self.ff_drop(ff)
+        ff = self.linear2(ff)
+        x = x + self.dropout3(ff)
+        return x
+
+
+class RoPETransformerDecoder(nn.Module):
+    def __init__(self, layer: RoPETransformerDecoderLayer, num_layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(int(num_layers))])
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,) -> torch.Tensor:
+        x = tgt
+        for layer in self.layers:
+            x = layer(
+                x,
+                memory,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,)
+        return x
+
+
 class SymControlNet(nn.Module):
-    def __init__(self, nSymbols: int, dimSem: int):
+    def __init__(self, nSymbols: int, dimSem: int, nTokenSources: int = 4):
         super().__init__()
         self.nSymbols = int(nSymbols)
         self.dimSem = int(dimSem)
+        self.n_token_sources = int(nTokenSources)
 
         inK = self.nSymbols * 5  # symProbs + sym_probs0 + imp + cooc + contr
 
         self.k2h = nn.Sequential(
-            IntentionLoRALinear(nn.Linear(inK, dimSem)),
+            GrowableLoRALinear(nn.Linear(inK, dimSem)),
             nn.LayerNorm(dimSem),
             nn.GELU(),)
 
         self.gain_head = nn.Sequential(
-            IntentionLoRALinear(nn.Linear(dimSem, 3)),)
+            GrowableLoRALinear(nn.Linear(dimSem, 3)),)
 
         self.tok_head = nn.Sequential(
-            IntentionLoRALinear(nn.Linear(dimSem, 3)), )
+            GrowableLoRALinear(nn.Linear(dimSem, self.n_token_sources)), )
 
         self.film_head = nn.Sequential(
-            IntentionLoRALinear(nn.Linear(dimSem, dimSem * 2)),)
+            GrowableLoRALinear(nn.Linear(dimSem, dimSem * 2)),)
 
         self.ctx_proj = nn.Sequential(
-            IntentionLoRALinear(nn.Linear(dimSem, dimSem)),
+            GrowableLoRALinear(nn.Linear(dimSem, dimSem)),
             nn.LayerNorm(dimSem),
             nn.GELU(),
             nn.Linear(dimSem, dimSem),)
 
     def forward(
         self,
-        symProbs: torch.Tensor,
+        symProbs: torch.Tensor,  # [B, K]
         support: Dict[str, torch.Tensor],
-        conceptEmb: torch.Tensor,
+        conceptEmb: torch.Tensor, # [K, D]
         token_mask: torch.Tensor,) -> Dict[str, torch.Tensor]:
 
         featK = torch.cat([
@@ -297,14 +652,14 @@ class SymControlNet(nn.Module):
             support["support_cooc"],
             support["support_contr"],], dim=-1)
 
-        h = self.k2h(featK)  
+        h = self.k2h(featK) # [B, 5K]
 
-        gains = torch.sigmoid(self.gain_head(h))  
+        gains = torch.sigmoid(self.gain_head(h)) # [B, 3]
         g_ocr = gains[:, 0:1]
         g_ext = gains[:, 1:2]
         g_trans = gains[:, 2:3]
 
-        tok_logits = self.tok_head(h)
+        tok_logits = self.tok_head(h) # [B, S]
         tok_w = F.softmax(tok_logits, dim=-1)  
 
         mask_f = token_mask.float()
@@ -312,7 +667,7 @@ class SymControlNet(nn.Module):
         denom = tok_w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
         tok_w = tok_w / denom
 
-        film = self.film_head(h)
+        film = self.film_head(h) # [B, 2D]
         gamma_raw, beta = film.chunk(2, dim=-1)
         film_scale = torch.exp(gamma_raw.clamp(-4.0, 4.0))
 
@@ -330,32 +685,45 @@ class SymControlNet(nn.Module):
             "sym_ctx": sym_ctx, }
 
 
-class IntentionExtractor(nn.Module):
+class IntentionExtractor(AGICoreModule):
     def __init__(
         self,
         *,
         vocabSize: int = 6624,
         paddingIdx: int = 0,
         maxSeqLen: int = 64,
+        recallSafetyMaxLen: Optional[int] = None,
         dimEmbed: int = 512,
         dimEncoderHidden: int = 512,
         numEncoderLayers: int = 3,
         encoderDropout: float = 0.1,
         dimSem: int = 512,
         consDim: int = 1024,
+        consSelfDim: Optional[int] = None,
+        consIntentDim: Optional[int] = None,
         nSymbols: int = 128,
         reasonSteps: int = 3,
         reasonerHiddenDim: int = 512,
         reasonerAlphaImp: float = 1.0,
         reasonerAlphaCooc: float = 0.5,
         reasonerAlphaContr: float = 1.0,
+        reasonerDynamicScale: float = 0.25,
         lossLambdaSymmetry: float = 1e-3,
         lossLambdaEntropy: float = 1e-3,
+        lossLambdaRecallCE: float = 0.25,
+        lossLambdaRecallAlign: float = 0.05,
+        nTextSlots: int = 4,
+        chunkOverlapRatio: float = 0.5,
         ocrDictPath: Optional[str] = "/home/yhl/Documents/Intelligent-Robot-System/BrainDeepLearn/ModuleSetting/OCRKeys.txt",):
         super().__init__()
 
         self.pad_idx = int(paddingIdx)
         self.max_seq_len = int(maxSeqLen)
+        self.n_text_slots = max(1, int(nTextSlots))
+        overlap = float(chunkOverlapRatio)
+        overlap = min(max(overlap, 0.0), 0.95)
+        self.chunk_overlap_ratio = overlap
+        self.chunk_stride = max(1, int(round(self.max_seq_len * (1.0 - overlap))))
 
         self.ch2id: Dict[str, int] = {}
         self.id2ch: List[str] = []
@@ -368,9 +736,12 @@ class IntentionExtractor(nn.Module):
                 self.id2ch = []
 
         if self.id2ch:
-            self.vocab_size = len(self.id2ch) + 1
+            self.vocab_size = len(self.id2ch) + 2
         else:
-            self.vocab_size = int(vocabSize)
+            self.vocab_size = max(3, int(vocabSize))
+        self.eos_idx = int(self.vocab_size - 1)
+        safety_len = self.max_seq_len * 4 if (recallSafetyMaxLen is None) else int(recallSafetyMaxLen)
+        self.recall_safety_max_len = max(self.max_seq_len, safety_len)
 
         self.encoder = TextEncoder(
             vocabSize=self.vocab_size,
@@ -383,15 +754,87 @@ class IntentionExtractor(nn.Module):
         encoder_out_dim = self.encoder.out_dim
 
         self.semProj = nn.Sequential(
-            IntentionLoRALinear(nn.Linear(encoder_out_dim, dimSem)),
+            GrowableLoRALinear(nn.Linear(encoder_out_dim, dimSem)),
+            nn.LayerNorm(dimSem),
+            nn.GELU(),)
+        self.chunkFuseInNorm = nn.LayerNorm(dimSem)
+        self.chunkFuseFwd = nn.Linear(dimSem, dimSem * 4)
+        self.chunkFuseBwd = nn.Linear(dimSem, dimSem * 4)
+        self.chunkStateProj = nn.Sequential(
+            nn.Linear(dimSem * 2, dimSem),
+            nn.LayerNorm(dimSem),
+            nn.GELU(),)
+        self.slotFuseInNorm = nn.LayerNorm(dimSem)
+        self.slotQuery = nn.Parameter(torch.randn(self.n_text_slots, dimSem) * 0.02)
+        self.slotDynQuery = nn.Sequential(
+            nn.Linear(dimSem, dimSem * 2),
+            nn.LayerNorm(dimSem * 2),
+            nn.GELU(),
+            nn.Linear(dimSem * 2, self.n_text_slots * dimSem),)
+        self.slotMixGate = nn.Sequential(
+            nn.Linear(dimSem, self.n_text_slots),
+            nn.Sigmoid(),)
+
+        def pick_heads(embed_dim: int) -> int:
+            for h in (8, 4, 2, 1):
+                if (embed_dim % h) == 0:
+                    return h
+            return 1
+
+        attn_heads = pick_heads(dimSem)
+
+        self.slotCrossAttn = RoPEMultiheadAttention(
+            embed_dim=dimSem,
+            num_heads=attn_heads,
+            dropout=encoderDropout,
+            batch_first=True,)
+        self.slotPost = nn.Sequential(
+            nn.Linear(dimSem, dimSem),
+            nn.LayerNorm(dimSem),
+            nn.GELU(),)
+        self.chunkFuseOut = nn.Sequential(
+            nn.Linear(dimSem * 2, dimSem),
             nn.LayerNorm(dimSem),
             nn.GELU(),)
 
         self.dimSem = int(dimSem)
+        if consSelfDim is None:
+            consSelfDim = consDim
+        if consIntentDim is None:
+            consIntentDim = consDim
 
-        self.consProj = nn.Linear(consDim, dimSem)
-        self.consProj = IntentionLoRALinear(self.consProj)
-        self.consNorm = nn.LayerNorm(dimSem)
+        self.cons_self_dim = int(consSelfDim)
+        self.cons_intent_dim = int(consIntentDim)
+
+        self.consSelfProj = GrowableLoRALinear(nn.Linear(self.cons_self_dim, dimSem))
+        self.consSelfNorm = nn.LayerNorm(dimSem)
+        self.consIntentProj = GrowableLoRALinear(nn.Linear(self.cons_intent_dim, dimSem))
+        self.consIntentNorm = nn.LayerNorm(dimSem)
+
+        pair_hidden = dimSem * 2
+        self.consPairNet = nn.Sequential(
+            GrowableLoRALinear(nn.Linear(dimSem * 4, pair_hidden)),
+            nn.LayerNorm(pair_hidden),
+            nn.GELU(),
+            nn.Linear(pair_hidden, dimSem),
+            nn.LayerNorm(dimSem),
+            nn.GELU(),)
+
+        cons_encoder_layer = RoPETransformerEncoderLayer(
+            d_model=dimSem,
+            nhead=attn_heads,
+            dim_feedforward=dimSem * 4,
+            dropout=encoderDropout,
+            activation="gelu",)
+        self.consTokenTransformer = RoPETransformerEncoder(cons_encoder_layer, num_layers=2)
+
+        self.consTokenGate = nn.Sequential(
+            GrowableLoRALinear(nn.Linear(dimSem * 3, dimSem)),
+            nn.LayerNorm(dimSem),
+            nn.GELU(),
+            nn.Linear(dimSem, 3),)
+
+        self.consFuseNorm = nn.LayerNorm(dimSem)
 
         self.conceptEmb = nn.Parameter(torch.randn(nSymbols, dimSem) * 0.02)
         self.conceptBias = nn.Parameter(torch.zeros(nSymbols))
@@ -402,10 +845,13 @@ class IntentionExtractor(nn.Module):
             hiddenDim=reasonerHiddenDim,
             alphaImp=reasonerAlphaImp,
             alphaCooc=reasonerAlphaCooc,
-            alphaContr=reasonerAlphaContr,)
+            alphaContr=reasonerAlphaContr,
+            dynamicScale=reasonerDynamicScale,)
 
         self.lossLambdaSymmetry = float(lossLambdaSymmetry)
         self.lossLambdaEntropy = float(lossLambdaEntropy)
+        self.lossLambdaRecallCE = float(lossLambdaRecallCE)
+        self.lossLambdaRecallAlign = float(lossLambdaRecallAlign)
 
         fuse_ocr_in = dimSem * 7
         self.fuse_ocr_gate = nn.Sequential(
@@ -416,7 +862,7 @@ class IntentionExtractor(nn.Module):
             nn.Sigmoid(),)
         
         ocr_fc1 = self.fuse_ocr_gate[0]
-        self.fuse_ocr_gate[0] = IntentionLoRALinear(ocr_fc1)
+        self.fuse_ocr_gate[0] = GrowableLoRALinear(ocr_fc1)
 
         fuse_ext_in = dimSem * 4
         self.fuse_ext_gate = nn.Sequential(
@@ -427,30 +873,64 @@ class IntentionExtractor(nn.Module):
             nn.Sigmoid(),)
         
         ext_fc1 = self.fuse_ext_gate[0]
-        self.fuse_ext_gate[0] = IntentionLoRALinear(ext_fc1)
+        self.fuse_ext_gate[0] = GrowableLoRALinear(ext_fc1)
 
         self.beta_ocr = nn.Parameter(torch.tensor(0.1))
         self.beta_ext = nn.Parameter(torch.tensor(0.1))
 
-        encoder_layer = nn.TransformerEncoderLayer(
+        encoder_layer = RoPETransformerEncoderLayer(
             d_model=dimSem,
-            nhead=8,
+            nhead=attn_heads,
             dim_feedforward=dimSem * 4,
             dropout=encoderDropout,
-            batch_first=True,
             activation="gelu",)
         
-        self.intentTransformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.intentTransformer = RoPETransformerEncoder(encoder_layer, num_layers=2)
         self.beta_trans = nn.Parameter(torch.tensor(0.3))
 
         self.reason_steps = int(reasonSteps)
 
-        self.symCtrl = SymControlNet(nSymbols=nSymbols, dimSem=dimSem)
+        self.n_token_sources = 2 + 2 * self.n_text_slots
+        self.symCtrl = SymControlNet(nSymbols=nSymbols, dimSem=dimSem, nTokenSources=self.n_token_sources)
 
         self.beta_sym = nn.Parameter(torch.tensor(0.2))
         self.beta_update = nn.Parameter(torch.tensor(0.5))
 
         self.sym_norm = nn.LayerNorm(dimSem)
+
+        self.recallStart = nn.Parameter(torch.zeros(dimSem))
+        self.recallTokEmb = nn.Embedding(self.vocab_size, dimSem, padding_idx=self.pad_idx)
+        self.recallCond = nn.Sequential(
+            nn.Linear(dimSem, dimSem * 2),
+            nn.LayerNorm(dimSem * 2),
+            nn.GELU(),
+            nn.Linear(dimSem * 2, dimSem),
+            nn.LayerNorm(dimSem),
+            nn.GELU(),)
+        self.recallMemScore = nn.Sequential(
+            nn.Linear(dimSem, dimSem),
+            nn.LayerNorm(dimSem),
+            nn.GELU(),
+            nn.Linear(dimSem, 1),)
+        self.recallInNorm = nn.LayerNorm(dimSem)
+        self.recallInDrop = nn.Dropout(encoderDropout)
+
+        recall_dec_layer = RoPETransformerDecoderLayer(
+            d_model=dimSem,
+            nhead=attn_heads,
+            dim_feedforward=dimSem * 4,
+            dropout=encoderDropout,
+            activation="gelu",)
+        self.recallDecoder = RoPETransformerDecoder(recall_dec_layer, num_layers=2)
+        self.recallHead = nn.Linear(dimSem, self.vocab_size)
+
+        self._last_reason_support: Optional[Dict[str, torch.Tensor]] = None
+        self._last_recall_logits: Optional[torch.Tensor] = None
+        self._last_recall_hidden: Optional[torch.Tensor] = None
+        self._last_recall_targets: Optional[torch.Tensor] = None
+        self._last_recall_valid: Optional[torch.Tensor] = None
+        self._last_recall_cons_sem: Optional[torch.Tensor] = None
+
 
     def LoadOcrDict(self, dictPath: str) -> None:
         ch2id: Dict[str, int] = {}
@@ -473,56 +953,197 @@ class IntentionExtractor(nn.Module):
         self.ch2id = ch2id
         self.id2ch = id2ch
 
-    def TokenizeBatch(self, texts: List[str], device: torch.device) -> torch.Tensor:
+    def TextToTokenIds(self, text: Optional[str]) -> List[int]:
+        if text is None:
+            return []
+
+        s = str(text).strip()
+        if not s:
+            return []
+
+        ids: List[int] = []
+        if self.ch2id:
+            for ch in s:
+                ch_id = self.ch2id.get(ch, None)
+                if ch_id is not None:
+                    ids.append(int(ch_id))
+            return ids
+
+        pieces = s.lower().split()
+        span = max(1, self.eos_idx - 1) # map words into [1, eos_idx-1], excluding PAD/EOS
+        for tok in pieces:
+            h = int.from_bytes(hashlib.md5(tok.encode("utf-8")).digest()[:8], "little", signed=False)
+            idx = 1 + (h % span)
+            ids.append(int(idx))
+        return ids
+
+    def BuildChunkStartIndices(self, length: int, stride: int) -> List[int]:
+        T = self.max_seq_len
+        if length <= 0:
+            return [0]
+        if length <= T:
+            return [0]
+
+        stride_eff = min(T, max(1, int(stride)))
+        last_start = max(0, length - T)
+        starts = list(range(0, last_start + 1, stride_eff))
+        if len(starts) == 0:
+            starts = [0]
+        if starts[-1] != last_start:
+            starts.append(last_start)
+        return starts
+
+    def TokenizeBatch(
+        self,
+        texts: List[Optional[str]],
+        device: torch.device,
+        *,
+        stride: Optional[int] = None,
+        appendEos: bool = False,) -> torch.Tensor:
         batch_size = len(texts)
+        if batch_size == 0:
+            return torch.full((0, 1, self.max_seq_len), self.pad_idx, dtype=torch.long, device=device)
+
+        stride_eff = self.chunk_stride if (stride is None) else max(1, int(stride))
+        all_ids: List[List[int]] = []
+        for s in texts:
+            ids = self.TextToTokenIds(s)
+            if appendEos:
+                ids = list(ids)
+                if (len(ids) == 0) or (int(ids[-1]) != int(self.eos_idx)):
+                    ids.append(int(self.eos_idx))
+            all_ids.append(ids)
+        all_starts: List[List[int]] = []
+        chunk_counts: List[int] = []
+        for ids in all_ids:
+            starts = self.BuildChunkStartIndices(len(ids), stride_eff)
+            all_starts.append(starts)
+            chunk_counts.append(len(starts))
+
+        n_chunks = max(1, max(chunk_counts))
         tokens = torch.full(
-            (batch_size, self.max_seq_len),
+            (batch_size, n_chunks, self.max_seq_len),
             self.pad_idx,
             dtype=torch.long,
             device=device,)
 
-        if self.ch2id:
-            for i, s in enumerate(texts):
-                if s is None:
-                    continue
-                s = str(s).strip()
-                if not s:
-                    continue
-
-                pos = 0
-                for ch in s:
-                    if pos >= self.max_seq_len:
-                        break
-                    ch_id = self.ch2id.get(ch, None)
-                    if ch_id is None:
-                        continue
-                    tokens[i, pos] = ch_id
-                    pos += 1
-            return tokens
-
-        for i, s in enumerate(texts):
-            if s is None:
+        for i, ids in enumerate(all_ids):
+            if len(ids) == 0:
                 continue
-            s = str(s).strip().lower()
-            if not s:
-                continue
-            pieces = s.split()
-            for j, tok in enumerate(pieces[: self.max_seq_len]):
-                h = int.from_bytes(hashlib.md5(tok.encode("utf-8")).digest()[:8], "little", signed=False)
-                idx = 1 + (h % (self.vocab_size - 1))
-                tokens[i, j] = idx
+            starts = all_starts[i]
+            for c, start in enumerate(starts):
+                end = min(start + self.max_seq_len, len(ids))
+                seg = ids[start:end]
+                if len(seg) == 0:
+                    continue
+                seg_t = torch.as_tensor(seg, dtype=torch.long, device=device)
+                tokens[i, c, : seg_t.numel()] = seg_t
 
-        return tokens
+        return tokens # [B, N, T]
 
-    def EncodeStrings(self, texts: List[Optional[str]], device: torch.device) -> torch.Tensor:
-        token_ids = self.TokenizeBatch(texts, device=device) 
-        mask_valid = token_ids.ne(self.pad_idx).any(dim=1) 
+    def SelectiveScan(
+        self,
+        x: torch.Tensor, # [B, N, D]
+        valid: torch.Tensor, # [B, N]
+        proj: nn.Linear,
+        *,
+        reverse: bool = False,) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        text_repr = self.encoder(token_ids)
-        lang_sem = self.semProj(text_repr)
-        lang_sem = lang_sem * mask_valid.unsqueeze(-1) 
+        B, N, D = x.shape  
+        h = x.new_zeros(B, D) # [B, D]
+        states = x.new_zeros(B, N, D) # [B, N, D]
+        idx_iter = range(N - 1, -1, -1) if reverse else range(N) 
 
-        return lang_sem
+        for idx in idx_iter:
+            xi = x[:, idx, :] # [B, D]
+            gate_in_raw, gate_keep_raw, cand_raw, skip_raw = proj(xi).chunk(4, dim=-1) # [B, D]
+
+            gate_in = torch.sigmoid(gate_in_raw) # [B, D]
+            gate_keep = torch.sigmoid(gate_keep_raw) # [B, D]
+            cand = torch.tanh(cand_raw) # [B, D]
+            skip = torch.tanh(skip_raw) # [B, D]
+
+            h_new = gate_keep * h + gate_in * cand + 0.1 * skip # [B, D]
+            m = valid[:, idx].unsqueeze(-1).float() # [B, 1]
+            h = m * h_new + (1.0 - m) * h # [B, D]
+            states[:, idx, :] = h # [B, N, D]
+
+        return states, h  
+
+    def BuildSemanticSlots(
+        self,
+        contextualChunks: torch.Tensor, # [B, N, D]
+        chunkValid: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, N, D = contextualChunks.shape  
+        K = self.n_text_slots 
+
+        has_chunk = chunkValid.any(dim=1) # [B]
+        valid_f = chunkValid.float().unsqueeze(-1) # [B, N, 1]
+        denom = valid_f.sum(dim=1).clamp(min=1.0) # [B, 1]
+        summary = (contextualChunks * valid_f).sum(dim=1) / denom # [B, D]
+
+        query_base = self.slotQuery.unsqueeze(0).expand(B, -1, -1) # [B, K, D]
+        query_dyn = self.slotDynQuery(summary).view(B, K, D) # [B, K, D]
+        mix_gate = self.slotMixGate(summary).unsqueeze(-1) # [B, K, 1]
+        query = self.slotFuseInNorm(mix_gate * query_base + (1.0 - mix_gate) * query_dyn) # [B, K, D]
+
+        safe_mask = chunkValid.clone() # [B, N]
+        all_pad = ~safe_mask.any(dim=1) # [B]
+        if all_pad.any():
+            safe_mask[all_pad, 0] = True
+
+        slots_attn, _ = self.slotCrossAttn(
+            query=query,  
+            key=contextualChunks,  
+            value=contextualChunks,  
+            key_padding_mask=~safe_mask,  
+            need_weights=False,)
+        slots = self.slotPost(slots_attn + query) # [B, K, D]
+
+        slot_mask = has_chunk.unsqueeze(1).expand(B, K) # [B, K]
+        slots = slots * slot_mask.unsqueeze(-1).float() # [B, K, D]
+        return slots, slot_mask 
+
+    def PoolChunkSemanticsWithSlots(
+        self,
+        chunkSem: torch.Tensor,
+        chunkValid: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        x = self.chunkFuseInNorm(chunkSem) # [B, N, D]
+
+        states_fwd, _ = self.SelectiveScan(x, chunkValid, self.chunkFuseFwd, reverse=False) # [B, N, D]
+        states_bwd, _ = self.SelectiveScan(x, chunkValid, self.chunkFuseBwd, reverse=True) # [B, N, D]
+        contextual = self.chunkStateProj(torch.cat([states_fwd, states_bwd], dim=-1)) # [B, N, D]
+        contextual = contextual * chunkValid.unsqueeze(-1).float() # [B, N, D]
+
+        slots, slot_mask = self.BuildSemanticSlots(contextual, chunkValid) # slots: [B, K, D], slot_mask: [B, K]
+        slots_norm = self.slotFuseInNorm(slots) # [B, K, D]
+        _, slot_fwd = self.SelectiveScan(slots_norm, slot_mask, self.chunkFuseFwd, reverse=False) # [B, D]
+        _, slot_bwd = self.SelectiveScan(slots_norm, slot_mask, self.chunkFuseBwd, reverse=True) # [B, D]
+
+        pooled = self.chunkFuseOut(torch.cat([slot_fwd, slot_bwd], dim=-1)) # [B, D]
+        pooled = pooled * chunkValid.any(dim=1).unsqueeze(-1).float() # [B, D]
+        return pooled, slots, slot_mask # pooled: [B, D] 
+
+
+    def EncodeStringsWithSlots(
+        self,
+        texts: List[Optional[str]],
+        device: torch.device,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        token_ids = self.TokenizeBatch(texts, device=device) # [B, N, T]
+        B, N, T = token_ids.shape # scalars
+        token_flat = token_ids.reshape(B * N, T) # [B*N, T]
+        mask_valid_flat = token_flat.ne(self.pad_idx).any(dim=1) # [B*N]
+
+        text_repr_flat = self.encoder(token_flat) # [B*N, E]
+        lang_sem_flat = self.semProj(text_repr_flat) # [B*N, D]
+        lang_sem_flat = lang_sem_flat * mask_valid_flat.unsqueeze(-1) # [B*N, D]
+
+        chunk_sem = lang_sem_flat.view(B, N, self.dimSem) # [B, N, D]
+        chunk_valid = mask_valid_flat.view(B, N) # [B, N]
+        lang_sem, slot_sem, slot_mask = self.PoolChunkSemanticsWithSlots(chunk_sem, chunk_valid) # [B, D], [B, K, D], [B, K]
+        return lang_sem, slot_sem, slot_mask 
+
 
     @staticmethod
     def MergeOcrTexts(ocrTexts: List[List[str]]) -> List[str]:
@@ -535,66 +1156,587 @@ class IntentionExtractor(nn.Module):
                 merged.append(" ".join(parts))
         return merged
 
-    def forward(
+    def BuildRecallTexts(
         self,
-        consState: Optional[torch.Tensor],
-        ocrTexts: Optional[List[List[str]]] = None,
-        extTexts: Optional[List[Optional[str]]] = None,
+        batchSize: int,
+        ocrTexts: Optional[List[List[str]]],
+        extTexts: Optional[List[Optional[str]]],) -> List[str]:
+        ocr_merged = [""] * batchSize if ocrTexts is None else self.MergeOcrTexts(ocrTexts)
+        ext_norm: List[str] = [""] * batchSize
+        if extTexts is not None:
+            ext_norm = [("" if t is None else str(t).strip()) for t in extTexts]
+
+        merged: List[str] = []
+        for ocr_s, ext_s in zip(ocr_merged, ext_norm):
+            o = ocr_s.strip()
+            e = ext_s.strip()
+            if o and e:
+                merged.append(f"{o} {e}")
+            elif o:
+                merged.append(o)
+            elif e:
+                merged.append(e)
+            else:
+                merged.append("")
+        return merged
+
+    def BuildRecallDecoderInputs(
+        self,
+        recallTargets: Optional[torch.Tensor],
+        batchSize: int,
+        device: torch.device,
+        recallPrefixTokens: Optional[torch.Tensor] = None,) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if recallTargets is None:
+            T = self.max_seq_len
+            start = self.recallStart.view(1, 1, -1).expand(batchSize, T, -1)
+            dec_in = self.recallInNorm(start)
+            dec_in = self.recallInDrop(dec_in) # [B, T, D]
+            return dec_in, None, None
+
+        B, T_target = recallTargets.shape
+        if recallPrefixTokens is not None:
+            prefix_ids = recallPrefixTokens
+        else:
+            prefix_ids = None
+
+        shifted = torch.full_like(recallTargets, self.pad_idx)
+        if T_target > 1:
+            shifted[:, 1:] = recallTargets[:, :-1]
+        if prefix_ids is not None:
+            shifted[:, 0] = prefix_ids
+
+        tok_emb = self.recallTokEmb(shifted) # [B, T_target, D]
+        start = self.recallStart.view(1, 1, -1).expand(B, 1, -1)
+        first = start
+        if prefix_ids is not None:
+            use_prefix = prefix_ids.ne(self.pad_idx).view(B, 1, 1)
+            first = torch.where(use_prefix, tok_emb[:, :1, :], start)
+        if T_target > 1:
+            dec_tokens = torch.cat([first, tok_emb[:, 1:, :]], dim=1)
+        else:
+            dec_tokens = first
+
+        dec_in = self.recallInNorm(dec_tokens)
+        dec_in = self.recallInDrop(dec_in)
+
+        tgt_pad_mask = shifted.eq(self.pad_idx)
+        tgt_pad_mask[:, 0] = False
+        causal_mask = torch.triu(
+            torch.ones((T_target, T_target), device=device, dtype=torch.bool),
+            diagonal=1,)
+
+        return dec_in, tgt_pad_mask, causal_mask
+
+    def DecodeRecallFromConscious(
+        self,
+        recallSem: Optional[torch.Tensor], # [B, D] or [B, M, D]
+        recallSemValid: Optional[torch.Tensor] = None,
+        recallTargets: Optional[torch.Tensor] = None, # [B, T]
+        recallPrefixTokens: Optional[torch.Tensor] = None,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        dtype = self.dtype
+
+        if recallSem is not None:
+            B = recallSem.size(0)
+        elif recallTargets is not None:
+            B = recallTargets.size(0)
+        else:
+            raise ValueError("DecodeRecallFromConscious: recallSem or recallTargets must be provided.")
+
+        mem_tokens, mem_valid, mem_summary = self.NormalizeRecallMemory(
+            recallSem=recallSem,
+            recallSemValid=recallSemValid,
+            batchSize=B,
+            device=self.device,
+            dtype=dtype,)
+        has_sem = mem_valid.any(dim=1) # [B]
+        cond_bias = self.recallCond(mem_summary).unsqueeze(1) # [B, 1, D]
+
+        dec_in, tgt_pad_mask, causal_mask = self.BuildRecallDecoderInputs(
+            recallTargets=recallTargets,
+            batchSize=B,
+            device=self.device,
+            recallPrefixTokens=recallPrefixTokens,)
+        
+        query = dec_in + cond_bias # [B, T, D]
+        mem_key_padding_mask = ~mem_valid # [B, M]
+        all_mem_pad = mem_key_padding_mask.all(dim=1)
+        if all_mem_pad.any():
+            mem_key_padding_mask = mem_key_padding_mask.clone()
+            mem_key_padding_mask[all_mem_pad, 0] = False
+
+        hidden = self.recallDecoder(
+            tgt=query,
+            memory=mem_tokens,
+            tgt_mask=causal_mask,
+            tgt_key_padding_mask=tgt_pad_mask,
+            memory_key_padding_mask=mem_key_padding_mask,)
+        
+        logits = self.recallHead(hidden) # [B, T, V]
+        
+        return logits, hidden, has_sem
+
+    def DecodeRecallChunked(
+        self,
+        recallSem: Optional[torch.Tensor],
+        recallSemValid: Optional[torch.Tensor],
+        recallTargets: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        B, N, T = recallTargets.shape
+        D = self.dimSem
+
+        mem_tokens: Optional[torch.Tensor] = None
+        mem_valid: Optional[torch.Tensor] = None
+        recall_flat: Optional[torch.Tensor] = None
+        valid_flat: Optional[torch.Tensor] = None
+        if recallSem is not None:
+            mem_tokens, mem_valid, _ = self.NormalizeRecallMemory(
+                recallSem=recallSem,
+                recallSemValid=recallSemValid,
+                batchSize=B,
+                device=recallTargets.device,
+                dtype=self.dtype,)
+            M = int(mem_tokens.size(1))
+            recall_flat = mem_tokens.unsqueeze(1).expand(B, N, M, self.dimSem).reshape(B * N, M, self.dimSem)
+            valid_flat = mem_valid.unsqueeze(1).expand(B, N, M).reshape(B * N, M)
+        elif recallSemValid is not None:
+            raise ValueError("DecodeRecallChunked: recallSemValid is set but recallSem is None.")
+
+        chunk_prefix = self.BuildRecallChunkPrefixTokens(recallTargets) # [B, N]
+        prefix_flat = chunk_prefix.reshape(B * N) # [B*N]
+        targets_flat = recallTargets.reshape(B * N, T)
+
+        logits_flat, hidden_flat, has_sem_flat = self.DecodeRecallFromConscious(
+            recallSem=recall_flat,
+            recallSemValid=valid_flat,
+            recallTargets=targets_flat,
+            recallPrefixTokens=prefix_flat,)
+
+        logits = logits_flat.view(B, N, T, -1)
+        hidden = hidden_flat.view(B, N, T, D)
+        has_sem = has_sem_flat.view(B, N)
+        return logits, hidden, has_sem
+
+    def PoolRecallMemory(
+        self,
+        recallMem: torch.Tensor, # [B, M, D]
+        recallMemValid: torch.Tensor,) -> torch.Tensor:
+
+        scores = self.recallMemScore(recallMem).squeeze(-1) # [B, M]
+        safe_valid = recallMemValid.clone()
+        all_pad = ~safe_valid.any(dim=1)
+        if all_pad.any():
+            safe_valid[all_pad, 0] = True
+
+        scores = scores.masked_fill(~safe_valid, float("-inf"))
+        attn = F.softmax(scores, dim=-1)
+        attn = attn * recallMemValid.float()
+        attn = attn / attn.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+        summary = (recallMem * attn.unsqueeze(-1)).sum(dim=1) # [B, D]
+        summary = summary * recallMemValid.any(dim=1).unsqueeze(-1).float()
+        return summary
+
+    def NormalizeRecallMemory(
+        self,
+        recallSem: Optional[torch.Tensor],
+        recallSemValid: Optional[torch.Tensor],
+        batchSize: int,
+        device: torch.device,
+        dtype: torch.dtype,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        if recallSem is None:
+            mem = torch.zeros(batchSize, 1, self.dimSem, device=device, dtype=dtype)
+            valid = torch.zeros(batchSize, 1, dtype=torch.bool, device=device)
+            summary = torch.zeros(batchSize, self.dimSem, device=device, dtype=dtype)
+            return mem, valid, summary
+
+        if recallSem.dim() == 2:
+            mem = recallSem.unsqueeze(1) # [B, 1, D]
+        elif recallSem.dim() == 3:
+            mem = recallSem # [B, M, D]
+        else:
+            raise ValueError("NormalizeRecallMemory: recallSem must be [B, D] or [B, M, D].")
+
+        B, M, _ = mem.shape
+        if recallSemValid is None:
+            valid = torch.ones(B, M, dtype=torch.bool, device=device)
+        else:
+            if recallSemValid.dim() == 1:
+                v = recallSemValid.to(dtype=torch.bool).unsqueeze(1) # [B, 1]
+                valid = v.expand(B, M) 
+            elif recallSemValid.dim() == 2:
+                valid = recallSemValid.to(dtype=torch.bool)
+            else:
+                raise ValueError("NormalizeRecallMemory: recallSemValid must be [B] or [B, M].")
+
+        mem = mem * valid.unsqueeze(-1).float()
+        summary = self.PoolRecallMemory(mem, valid) # [B, D]
+        return mem, valid, summary
+
+    def BuildRecallChunkPrefixTokens(self, recallTargets: torch.Tensor) -> torch.Tensor:
+        B, N, _ = recallTargets.shape
+        prefix = torch.full((B, N), self.pad_idx, dtype=torch.long, device=recallTargets.device)
+        if N <= 1:
+            return prefix
+
+        valid_tok = recallTargets.ne(self.pad_idx) # [B, N, T]
+        chunk_len = valid_tok.long().sum(dim=-1) # [B, N]
+        has_chunk = chunk_len.gt(0) # [B, N]
+        last_pos = (chunk_len - 1).clamp(min=0) # [B, N]
+        last_tok = recallTargets.gather(dim=-1, index=last_pos.unsqueeze(-1)).squeeze(-1) # [B, N]
+
+        prefix[:, 1:] = last_tok[:, :-1]
+        prev_has = torch.zeros((B, N), dtype=torch.bool, device=recallTargets.device)
+        prev_has[:, 1:] = has_chunk[:, :-1]
+        link_mask = has_chunk & prev_has # [B, N]
+        prefix = torch.where(link_mask, prefix, torch.full_like(prefix, self.pad_idx))
+        return prefix
+
+    def BuildRecallTargetsFromGenerated(
+        self,
+        tokenIds: torch.Tensor,
         *,
-        prioritizeExt: bool = False,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        stride: Optional[int] = None,) -> torch.Tensor:
 
-        device = self.conceptEmb.device
+        B, L = tokenIds.shape
+        T = self.max_seq_len
+        if B == 0:
+            return torch.full((0, 1, T), self.pad_idx, dtype=torch.long, device=tokenIds.device)
 
+        stride_eff = T if (stride is None) else max(1, int(stride))
+        starts = self.BuildChunkStartIndices(int(L), stride_eff)
+        N = max(1, len(starts))
+
+        out = torch.full((B, N, T), self.pad_idx, dtype=torch.long, device=tokenIds.device)
+        for n, st in enumerate(starts):
+            ed = min(st + T, int(L))
+            if ed <= st:
+                continue
+            out[:, n, : (ed - st)] = tokenIds[:, st:ed]
+        return out # [B, N, T]
+
+    def CacheRecallState(
+        self,
+        recallLogits: torch.Tensor,
+        recallHidden: torch.Tensor,
+        recallTargets: torch.Tensor,
+        recallValid: torch.Tensor,
+        consSem: Optional[torch.Tensor],) -> None:
+        self._last_recall_logits = recallLogits
+        self._last_recall_hidden = recallHidden
+        self._last_recall_targets = recallTargets
+        self._last_recall_valid = recallValid
+        self._last_recall_cons_sem = None if consSem is None else consSem
+
+    def RunRecallFromSemantic(
+        self,
+        recallSem: Optional[torch.Tensor], # [B, D] or [B, M, D]
+        recallSemValid: Optional[torch.Tensor],
+        batchSize: int,
+        ocrTexts: Optional[List[List[str]]],
+        extTexts: Optional[List[Optional[str]]],
+        device: torch.device,) -> Dict[str, torch.Tensor]:
+
+        self._last_recall_logits = None
+        self._last_recall_hidden = None
+        self._last_recall_targets = None
+        self._last_recall_valid = None
+        self._last_recall_cons_sem = None
+
+        recall_texts = self.BuildRecallTexts(batchSize, ocrTexts=ocrTexts, extTexts=extTexts)
+
+        recall_targets = self.TokenizeBatch(
+            recall_texts,
+            device=device,
+            stride=self.max_seq_len,
+            appendEos=True,) # [B, N, T]
+        
+        recall_target_valid = recall_targets.ne(self.pad_idx).any(dim=-1) # [B, N]
+
+        recall_logits, recall_hidden, recall_has_sem = self.DecodeRecallChunked(
+            recallSem=recallSem,
+            recallSemValid=recallSemValid,
+            recallTargets=recall_targets,)
+        
+        recall_valid = recall_target_valid & recall_has_sem # [B, N]
+        recall_pred_ids = recall_logits.argmax(dim=-1) # [B, N, T]
+
+        recall_cond = None
+        if recallSem is not None:
+            _, _, recall_summary = self.NormalizeRecallMemory(
+                recallSem=recallSem,
+                recallSemValid=recallSemValid,
+                batchSize=batchSize,
+                device=device,
+                dtype=self.dtype,)
+            recall_cond = recall_summary.unsqueeze(1).expand(batchSize, recall_targets.size(1), self.dimSem)
+
+        self.CacheRecallState(
+            recallLogits=recall_logits,
+            recallHidden=recall_hidden,
+            recallTargets=recall_targets,
+            recallValid=recall_valid,
+            consSem=recall_cond,)
+
+        return {
+            "recall_logits": recall_logits.detach(),
+            "recall_targets": recall_targets.detach(),
+            "recall_valid": recall_valid.detach(),
+            "recall_pred_ids": recall_pred_ids.detach(),}
+
+    def BuildRecallSemanticFromTexts(
+        self,
+        semOcr: torch.Tensor,
+        hasOcrMask: torch.Tensor,
+        semExt: torch.Tensor,
+        hasExtMask: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        recall_mem = torch.stack([semOcr, semExt], dim=1) # [B, 2, D]
+        recall_mem_valid = torch.stack([hasOcrMask, hasExtMask], dim=1) # [B, 2]
+        recall_mem = recall_mem * recall_mem_valid.unsqueeze(-1).float()
+        return recall_mem, recall_mem_valid
+
+    @torch.no_grad()
+    def TokenIdsToTexts(
+        self, 
+        tokenIds: torch.Tensor # [B, L]
+        ) -> List[str]:
+
+        use_dict = len(self.id2ch) > 0
+
+        def decode_one_row(row: List[int]) -> Tuple[str, bool]:
+            pieces: List[str] = []
+            hit_eos = False
+            for tid_raw in row:
+                tid = int(tid_raw)
+                if tid == self.eos_idx:
+                    hit_eos = True
+                    break
+                if tid == self.pad_idx:
+                    break
+                if use_dict:
+                    if 1 <= tid <= len(self.id2ch):
+                        pieces.append(self.id2ch[tid - 1])
+                    else:
+                        pieces.append("[UNK]")
+                else:
+                    pieces.append(str(tid))
+            text = "".join(pieces) if use_dict else " ".join(pieces)
+            return text, hit_eos
+
+        rows = tokenIds.detach().to("cpu").tolist()
+        texts: List[str] = []
+        for row in rows:
+            txt, _ = decode_one_row(row)
+            texts.append(txt)
+        return texts
+
+    @torch.no_grad()
+    def RecallGenerateFromSemantic(
+        self,
+        recallSem: torch.Tensor, # [B, D]s
+        *,
+        maxLen: Optional[int] = None,) -> Tuple[torch.Tensor, List[str]]:
+
+        B = int(recallSem.size(0))
+        device = self.device
+        total_len = self.recall_safety_max_len if (maxLen is None) else max(1, int(maxLen))
+
+        pred_ids = torch.full((B, total_len), self.pad_idx, dtype=torch.long, device=device)
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+        offset = 0
+        while offset < total_len:
+            if bool(finished.all()):
+                break
+            chunk_len = min(self.max_seq_len, total_len - offset)
+            chunk_ids = torch.full((B, chunk_len), self.pad_idx, dtype=torch.long, device=device) # [B, chunk_len]
+
+            if offset > 0:
+                bridge = min(offset, self.max_seq_len - 1)
+                prefix = pred_ids[:, offset - bridge:offset] # [B, bridge]
+            else:
+                prefix = pred_ids.new_empty((B, 0))
+
+            for t in range(chunk_len):
+                ctx = torch.cat([prefix, chunk_ids[:, :t]], dim=1) # [B, bridge + t]
+                if int(ctx.size(1)) > (self.max_seq_len - 1):
+                    ctx = ctx[:, -(self.max_seq_len - 1):]
+                local_targets = torch.cat([
+                    ctx,
+                    torch.full((B, 1), self.pad_idx, dtype=torch.long, device=device),], dim=1)
+
+                logits_t, _, _ = self.DecodeRecallFromConscious(
+                    recallSem=recallSem,
+                    recallTargets=local_targets,) #  logits_t: [B, T_local, V]
+                
+                next_id = logits_t[:, -1, :].argmax(dim=-1)
+                next_id = torch.where(finished, torch.full_like(next_id, self.pad_idx), next_id)
+                chunk_ids[:, t] = next_id
+                finished = finished | next_id.eq(self.eos_idx)
+
+            pred_ids[:, offset: offset + chunk_len] = chunk_ids
+            offset += chunk_len
+
+        has_any = pred_ids.ne(self.pad_idx).any(dim=0)
+        if bool(has_any.any()):
+            last_idx = int(torch.nonzero(has_any, as_tuple=False)[-1, 0]) + 1
+            pred_ids = pred_ids[:, :last_idx]
+        else:
+            pred_ids = pred_ids[:, :1]
+
+        texts = self.TokenIdsToTexts(pred_ids) # [B, L]
+        return pred_ids, texts # [B, L(Token)], List[str]
+
+    @torch.no_grad()
+    def RecallGenerateFromConscious(
+        self,
+        selfState: Optional[torch.Tensor],
+        intentState: Optional[torch.Tensor],
+        *,
+        maxLen: Optional[int] = None,) -> Tuple[torch.Tensor, List[str]]:
+        intentSem, _, _ = self(
+            selfState=selfState,
+            intentState=intentState,
+            ocrTexts=None,
+            extTexts=None,
+            prioritizeExt=False,)
+        if intentSem.numel() == 0:
+            empty_ids = torch.full((0, 1), self.pad_idx, dtype=torch.long, device=self.device)
+            return empty_ids, []
+        return self.RecallGenerateFromSemantic(intentSem, maxLen=maxLen)
+
+    def InferBatchSize(
+        self,
+        selfState: Optional[torch.Tensor],
+        intentState: Optional[torch.Tensor],
+        ocrTexts: Optional[List[List[str]]],
+        extTexts: Optional[List[Optional[str]]],) -> Optional[int]:
         batch_size: Optional[int] = None
-        if consState is not None:
-            batch_size = consState.size(0)
+        if selfState is not None:
+            batch_size = int(selfState.size(0))
+        if intentState is not None:
+            if batch_size is None:
+                batch_size = int(intentState.size(0))
+            elif int(intentState.size(0)) != batch_size:
+                raise ValueError(
+                    f"IntentionExtractor: batch mismatch, self_sem={batch_size}, intent_sem={int(intentState.size(0))}")
 
         if ocrTexts is not None:
             if batch_size is None:
                 batch_size = len(ocrTexts)
             elif len(ocrTexts) != batch_size:
-                raise ValueError(f"IntentionExtractor: batch mismatch, consState={batch_size}, ocrTexts={len(ocrTexts)}")
+                raise ValueError(f"IntentionExtractor: batch mismatch, consciousness={batch_size}, ocrTexts={len(ocrTexts)}")
 
         if extTexts is not None:
             if batch_size is None:
                 batch_size = len(extTexts)
             elif len(extTexts) != batch_size:
-                raise ValueError( f"IntentionExtractor: batch mismatch, consState/ocr vs extTexts={len(extTexts)}")
+                raise ValueError(f"IntentionExtractor: batch mismatch, consciousness/ocr={batch_size}, extTexts={len(extTexts)}")
 
-        if batch_size is None:
-            return None, None, {}
+        return batch_size
+
+    def EncodeConsciousStates(
+        self,
+        selfState: Optional[torch.Tensor],
+        intentState: Optional[torch.Tensor],
+        batchSize: int,
+        device: torch.device,) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        dim = self.dimSem
+        self_sem = torch.zeros(batchSize, dim, device=device)
+        intent_sem = torch.zeros(batchSize, dim, device=device)
+        extras: Dict[str, torch.Tensor] = {}
+
+        if selfState is not None:
+            self_in = selfState
+            self_sem = self.consSelfNorm(self.consSelfProj(self_in)) # [B, D]
+            extras["cons_self_sem"] = self_sem.detach()
+
+        if intentState is not None:
+            intent_in = intentState
+            intent_sem = self.consIntentNorm(self.consIntentProj(intent_in)) # [B, D]
+            extras["cons_intent_sem"] = intent_sem.detach()
 
         cons_sem: Optional[torch.Tensor] = None
-        if consState is not None:
-            cons_sem = self.consNorm(self.consProj(consState))
-            has_cons_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
-        else:
-            has_cons_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        if (selfState is not None) and (intentState is not None):
+            pair_feat = torch.cat([
+                self_sem,
+                intent_sem,
+                torch.abs(self_sem - intent_sem),
+                self_sem * intent_sem,], dim=-1)
+            pair_sem = self.consPairNet(pair_feat) # [B, D]
+
+            cons_tokens = torch.stack([self_sem, intent_sem, pair_sem], dim=1) # [B, 3, D]
+            cons_tokens = self.consTokenTransformer(cons_tokens) # [B, 3, D]
+
+            token_logits = self.consTokenGate(cons_tokens.reshape(batchSize, -1))
+            token_weights = F.softmax(token_logits, dim=-1) # [B, 3]
+
+            cons_sem = (cons_tokens * token_weights.unsqueeze(-1)).sum(dim=1) # [B, D]
+            cons_sem = self.consFuseNorm(cons_sem + pair_sem) # [B, D]
+
+            extras["cons_pair_sem"] = pair_sem.detach()
+            extras["cons_token_weights"] = token_weights.detach()
+        elif intentState is not None:
+            cons_sem = intent_sem
+        elif selfState is not None:
+            cons_sem = self_sem
+
+        return cons_sem, self_sem, intent_sem, extras
+
+    def forward(
+        self,
+        selfState: Optional[torch.Tensor],
+        intentState: Optional[torch.Tensor],
+        ocrTexts: Optional[List[List[str]]] = None,
+        extTexts: Optional[List[Optional[str]]] = None,
+        *,
+        prioritizeExt: bool = False,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+
+        device = self.device
+        batch_size = self.InferBatchSize(selfState, intentState, ocrTexts, extTexts)
+        if batch_size is None:
+            intent_zero = torch.zeros(0, self.dimSem, device=device)
+            sym_zero = torch.zeros(0, int(self.conceptEmb.size(0)), device=device)
+            return intent_zero, sym_zero, {}
+
+        cons_sem, self_sem, intent_sem_cons, cons_extras = self.EncodeConsciousStates(
+            selfState=selfState,
+            intentState=intentState,
+            batchSize=batch_size,
+            device=device,) # cons_sem: [B, D]
+        
+        extras: Dict[str, torch.Tensor] = dict(cons_extras)
+        if cons_sem is not None:
+            extras["cons_sem"] = cons_sem.detach()
 
         if ocrTexts is not None:
             merged = self.MergeOcrTexts(ocrTexts)
-            sem_ocr = self.EncodeStrings(merged, device=device)
-            has_ocr_mask = sem_ocr.abs().sum(dim=-1).gt(0)
+            sem_ocr, ocr_slots, ocr_slot_mask = self.EncodeStringsWithSlots(merged, device=device) # [B, D], [B, K, D], [B, K]
+            has_ocr_mask = ocr_slot_mask.any(dim=1)
         else:
             sem_ocr = torch.zeros(batch_size, self.dimSem, device=device)
+            ocr_slots = torch.zeros(batch_size, self.n_text_slots, self.dimSem, device=device)
+            ocr_slot_mask = torch.zeros(batch_size, self.n_text_slots, dtype=torch.bool, device=device)
             has_ocr_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         if extTexts is not None:
             normed = [("" if t is None else str(t)) for t in extTexts]
-            sem_ext = self.EncodeStrings(normed, device=device)
-            has_ext_mask = sem_ext.abs().sum(dim=-1).gt(0)
+            sem_ext, ext_slots, ext_slot_mask = self.EncodeStringsWithSlots(normed, device=device) # [B, D], [B, K, D], [B, K]
+            has_ext_mask = ext_slot_mask.any(dim=1)
         else:
             sem_ext = torch.zeros(batch_size, self.dimSem, device=device)
+            ext_slots = torch.zeros(batch_size, self.n_text_slots, self.dimSem, device=device)
+            ext_slot_mask = torch.zeros(batch_size, self.n_text_slots, dtype=torch.bool, device=device)
             has_ext_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-        extras: Dict[str, torch.Tensor] = {}
 
         if (cons_sem is None) and (not has_ocr_mask.any()) and (not has_ext_mask.any()):
             return None, None, extras
 
         if cons_sem is not None:
-            base = cons_sem
-            extras["cons_sem"] = cons_sem.detach()
+            base = cons_sem # [B, D]
         else:
             base = torch.zeros(batch_size, self.dimSem, device=device)
 
@@ -609,31 +1751,34 @@ class IntentionExtractor(nn.Module):
                 torch.abs(ext_for_ocr - sem_ocr),
                 ext_for_ocr * sem_ocr,],dim=-1,) 
 
-        gate_ocr = self.fuse_ocr_gate(feat_ocr)
-        sem_ocr_fused = gate_ocr * sem_ocr 
+        gate_ocr = self.fuse_ocr_gate(feat_ocr) # [B, 1]
 
-        ocr_mask_float = has_ocr_mask.unsqueeze(-1).float()
-        base = base + self.beta_ocr * (sem_ocr_fused * ocr_mask_float)
+        sem_ocr_fused = gate_ocr * sem_ocr # [B, D]
+
+        ocr_mask_float = has_ocr_mask.unsqueeze(-1).float() # [B, 1]
+        base = base + self.beta_ocr * (sem_ocr_fused * ocr_mask_float) # [B, D]
 
         extras["sem_ocr_raw"] = sem_ocr.detach()
         extras["sem_ocr_fused"] = sem_ocr_fused.detach()
         extras["gate_ocr"] = gate_ocr.detach()
         extras["has_ocr_mask"] = has_ocr_mask.detach()
+        extras["sem_ocr_slots"] = ocr_slots.detach()
+        extras["sem_ocr_slot_mask"] = ocr_slot_mask.detach()
 
         feat_ext = torch.cat([
                 base,
                 sem_ext,
                 torch.abs(base - sem_ext),
-                base * sem_ext,],dim=-1,) 
+                base * sem_ext,],dim=-1,) # [B, 4D]
 
-        gate_ext = self.fuse_ext_gate(feat_ext)
+        gate_ext = self.fuse_ext_gate(feat_ext) # [B, 1]
 
         has_ext_mask_float = has_ext_mask.unsqueeze(-1).float()
         has_ext_mask_exp = has_ext_mask.unsqueeze(-1) 
 
         if prioritizeExt:
-            gamma = 0.5 + 0.5 * gate_ext  
-            candidate = (1.0 - gamma) * base + gamma * sem_ext
+            gamma = 0.5 + 0.5 * gate_ext # [B, 1]
+            candidate = (1.0 - gamma) * base + gamma * sem_ext # [B, D]
             intentSem = torch.where(has_ext_mask_exp, candidate, base)
 
             extras["gamma_ext"] = gamma.detach()
@@ -645,21 +1790,21 @@ class IntentionExtractor(nn.Module):
         extras["sem_ext_raw"] = sem_ext.detach()
         extras["gate_ext"] = gate_ext.detach()
         extras["has_ext_mask"] = has_ext_mask.detach()
+        extras["sem_ext_slots"] = ext_slots.detach()
+        extras["sem_ext_slot_mask"] = ext_slot_mask.detach()
 
-        if cons_sem is not None:
-            cons_token = cons_sem
-        else:
-            cons_token = torch.zeros(batch_size, self.dimSem, device=device)
-
-        tokens = torch.stack([
-                cons_token,
-                sem_ocr,
-                sem_ext,],dim=1,)
-
-        token_mask = torch.stack([
-                has_cons_mask,
-                has_ocr_mask,
-                has_ext_mask,], dim=1,) 
+        self_token_mask = torch.full((batch_size, 1), selfState is not None, dtype=torch.bool, device=device)
+        intent_token_mask = torch.full((batch_size, 1), intentState is not None, dtype=torch.bool, device=device)
+        tokens = torch.cat([
+            self_sem.unsqueeze(1),
+            intent_sem_cons.unsqueeze(1),
+            ocr_slots,
+            ext_slots,], dim=1)
+        token_mask = torch.cat([
+            self_token_mask,
+            intent_token_mask,
+            ocr_slot_mask,
+            ext_slot_mask,], dim=1)
 
         def safe_token_mask(token_mask_: torch.Tensor) -> torch.Tensor:
             safe = token_mask_.clone()
@@ -670,7 +1815,7 @@ class IntentionExtractor(nn.Module):
 
         trans_tokens: Optional[torch.Tensor] = None
         token_mask_safe = safe_token_mask(token_mask)
-        src_key_padding_mask = ~token_mask_safe  # [B,3]
+        src_key_padding_mask = ~token_mask_safe  # [B, S]
 
         if token_mask.any():
             trans_tokens = self.intentTransformer(tokens, src_key_padding_mask=src_key_padding_mask)
@@ -684,15 +1829,17 @@ class IntentionExtractor(nn.Module):
             extras["intent_trans_norm"] = fused.norm(dim=-1, keepdim=True).detach()
             extras["intent_trans_mask_sum"] = mask_float.sum(dim=1).detach()
 
-        token_mask = torch.stack([has_cons_mask, has_ocr_mask, has_ext_mask], dim=1) 
-        src_key_padding_mask = ~token_mask if token_mask.any() else None
-
         abs_ext_ocr = torch.abs(sem_ext - sem_ocr)
         mul_ext_ocr = sem_ext * sem_ocr
 
+        self._last_reason_support = None
         for t in range(self.reason_steps):
             symbol_logits = F.linear(intentSem, self.conceptEmb, self.conceptBias)
-            symProbs_t, support = self.reasoner(symbol_logits, self.conceptEmb, return_support=True)
+            symProbs_t, support = self.reasoner(
+                symbol_logits,
+                self.conceptEmb,
+                ctx=intentSem,
+                returnSupport=True,)
 
             ctrl = self.symCtrl(symProbs_t, support, self.conceptEmb, token_mask)
 
@@ -744,9 +1891,65 @@ class IntentionExtractor(nn.Module):
             extras["sym_probs_loop"] = symProbs_t.detach()
             extras["sym_ctrl_gains"] = torch.cat([ctrl["g_ocr"], ctrl["g_ext"], ctrl["g_trans"]], dim=-1).detach()
             extras["sym_tok_w"] = ctrl["tok_w"].detach()
+            extras["sym_reason_alpha"] = support["alpha_eff"].detach()
 
         final_logits = F.linear(intentSem, self.conceptEmb, self.conceptBias)
-        symProbs = self.reasoner(final_logits, self.conceptEmb)
+
+        symProbs, final_support = self.reasoner(
+            final_logits,
+            self.conceptEmb,
+            ctx=intentSem,
+            returnSupport=True,)
+        
+        self._last_reason_support = final_support
+        extras["reason_alpha_final"] = final_support["alpha_eff"].detach()
+
+        if self.training:
+            recall_sem_train, recall_sem_valid = self.BuildRecallSemanticFromTexts(
+                semOcr=sem_ocr,
+                hasOcrMask=has_ocr_mask,
+                semExt=sem_ext,
+                hasExtMask=has_ext_mask,)
+            
+            extras.update(self.RunRecallFromSemantic(
+                recallSem=recall_sem_train,
+                recallSemValid=recall_sem_valid,
+                batchSize=batch_size,
+                ocrTexts=ocrTexts,
+                extTexts=extTexts,
+                device=device,))
+        else:
+            recall_pred_ids, _ = self.RecallGenerateFromSemantic(
+                intentSem,
+                maxLen=self.recall_safety_max_len,)
+            
+            recall_targets = self.BuildRecallTargetsFromGenerated(
+                recall_pred_ids,
+                stride=self.max_seq_len,) # [B, N, T]
+            
+            recall_target_valid = recall_targets.ne(self.pad_idx).any(dim=-1) # [B, N]
+            recall_mem = intentSem.unsqueeze(1) # [B, 1, D]
+            recall_valid_sem = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+
+            recall_logits, recall_hidden, recall_has_sem = self.DecodeRecallChunked(
+                recallSem=recall_mem,
+                recallSemValid=recall_valid_sem,
+                recallTargets=recall_targets,)
+            
+            recall_valid = recall_target_valid & recall_has_sem
+            recall_cond = intentSem.unsqueeze(1).expand(batch_size, recall_targets.size(1), self.dimSem)
+
+            self.CacheRecallState(
+                recallLogits=recall_logits,
+                recallHidden=recall_hidden,
+                recallTargets=recall_targets,
+                recallValid=recall_valid,
+                consSem=recall_cond,)
+                
+            extras["recall_logits"] = recall_logits.detach()
+            extras["recall_targets"] = recall_targets.detach()
+            extras["recall_valid"] = recall_valid.detach()
+            extras["recall_pred_ids"] = recall_pred_ids.detach()
 
         return intentSem, symProbs, extras
 
@@ -754,13 +1957,71 @@ class IntentionExtractor(nn.Module):
         self,
         symProbs: torch.Tensor,) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
-        total_loss, stats = self.reasoner.GetInternalLoss(
+        reason_loss, stats = self.reasoner.GetInternalLoss(
             conceptEmb=self.conceptEmb,
             symProbs=symProbs,
+            supportCache=self._last_reason_support,
             lambdaSymmetry=self.lossLambdaSymmetry,
             lambdaEntropy=self.lossLambdaEntropy,)
-        
+
+        recall_loss, recall_stats = self.GetRecallLoss()
+        total_loss = reason_loss + recall_loss
+
+        stats.update(recall_stats)
+
         return total_loss, stats
+
+    def GetRecallLoss(self) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        zero = self.conceptEmb.new_zeros(())
+
+        if (self._last_recall_logits is None
+            or self._last_recall_hidden is None
+            or self._last_recall_targets is None
+            or self._last_recall_valid is None):
+            return zero, {
+                "recall_loss_ce": zero.detach(),
+                "recall_loss_align": zero.detach(),
+                "recall_loss_total": zero.detach(),}
+
+        logits = self._last_recall_logits
+        hidden = self._last_recall_hidden
+        targets = self._last_recall_targets
+        valid_seq = self._last_recall_valid
+
+        if logits.numel() == 0 or (not valid_seq.any()):
+            return zero, {
+                "recall_loss_ce": zero.detach(),
+                "recall_loss_align": zero.detach(),
+                "recall_loss_total": zero.detach(),}
+
+        V = logits.size(-1)
+        ce = F.cross_entropy(
+            logits.reshape(-1, V),
+            targets.reshape(-1),
+            reduction="none",).view_as(targets)
+
+        token_valid = targets.ne(self.pad_idx) & valid_seq.unsqueeze(-1)
+        denom = token_valid.float().sum().clamp(min=1.0)
+        loss_ce = (ce * token_valid.float()).sum() / denom
+
+        loss_align = zero
+        if self._last_recall_cons_sem is not None:
+            cons_sem = self._last_recall_cons_sem
+
+            token_f = token_valid.float().unsqueeze(-1)
+            hidden_avg = (hidden * token_f).sum(dim=-2) / token_f.sum(dim=-2).clamp(min=1.0)
+            cos = F.cosine_similarity(hidden_avg, cons_sem, dim=-1)
+            loss_align = (1.0 - cos) * valid_seq.float()
+            loss_align = loss_align.sum() / valid_seq.float().sum().clamp(min=1.0)
+
+        total = self.lossLambdaRecallCE * loss_ce + self.lossLambdaRecallAlign * loss_align
+
+        stats = {
+            "recall_loss_ce": loss_ce.detach(),
+            "recall_loss_align": loss_align.detach(),
+            "recall_loss_total": total.detach(),}
+        
+        return total, stats
 
 
 
@@ -788,15 +2049,18 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
     def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
         base: "IntentionExtractor" = self.base 
 
-        sem_lora: "IntentionLoRALinear" = base.semProj[0]
-        cons_lora: "IntentionLoRALinear" = base.consProj
-        ocr_lora: "IntentionLoRALinear" = base.fuse_ocr_gate[0]
-        ext_lora: "IntentionLoRALinear" = base.fuse_ext_gate[0]
-        sym_k2h: "IntentionLoRALinear" = base.symCtrl.k2h[0]
-        sym_gain: "IntentionLoRALinear" = base.symCtrl.gain_head[0]
-        sym_tok: "IntentionLoRALinear" = base.symCtrl.tok_head[0]
-        sym_film: "IntentionLoRALinear" = base.symCtrl.film_head[0]
-        sym_ctx: "IntentionLoRALinear" = base.symCtrl.ctx_proj[0]
+        sem_lora: "GrowableLoRALinear" = base.semProj[0]
+        cons_self_lora: "GrowableLoRALinear" = base.consSelfProj
+        cons_intent_lora: "GrowableLoRALinear" = base.consIntentProj
+        cons_pair_lora: "GrowableLoRALinear" = base.consPairNet[0]
+        cons_gate_lora: "GrowableLoRALinear" = base.consTokenGate[0]
+        ocr_lora: "GrowableLoRALinear" = base.fuse_ocr_gate[0]
+        ext_lora: "GrowableLoRALinear" = base.fuse_ext_gate[0]
+        sym_k2h: "GrowableLoRALinear" = base.symCtrl.k2h[0]
+        sym_gain: "GrowableLoRALinear" = base.symCtrl.gain_head[0]
+        sym_tok: "GrowableLoRALinear" = base.symCtrl.tok_head[0]
+        sym_film: "GrowableLoRALinear" = base.symCtrl.film_head[0]
+        sym_ctx: "GrowableLoRALinear" = base.symCtrl.ctx_proj[0]
 
         def make_alloc(inDim: int, outDim: int, maxRank: int):
             def alloc(addRank: int, device: torch.device, dtype: torch.dtype):
@@ -819,13 +2083,40 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 allocFn=make_alloc(int(sem_lora.in_f), int(sem_lora.out_f), self.maxRankSem),
                 composeFn=compose,),
 
-            "cons": SiteSpec(
-                name="cons",
+            "cons_self": SiteSpec(
+                name="cons_self",
                 nLayers=1,
-                inDim=int(cons_lora.in_f),
-                outDim=int(cons_lora.out_f),
+                inDim=int(cons_self_lora.in_f),
+                outDim=int(cons_self_lora.out_f),
                 maxRank=self.maxRankCons,
-                allocFn=make_alloc(int(cons_lora.in_f), int(cons_lora.out_f), self.maxRankCons),
+                allocFn=make_alloc(int(cons_self_lora.in_f), int(cons_self_lora.out_f), self.maxRankCons),
+                composeFn=compose,),
+
+            "cons_intent": SiteSpec(
+                name="cons_intent",
+                nLayers=1,
+                inDim=int(cons_intent_lora.in_f),
+                outDim=int(cons_intent_lora.out_f),
+                maxRank=self.maxRankCons,
+                allocFn=make_alloc(int(cons_intent_lora.in_f), int(cons_intent_lora.out_f), self.maxRankCons),
+                composeFn=compose,),
+
+            "cons_pair": SiteSpec(
+                name="cons_pair",
+                nLayers=1,
+                inDim=int(cons_pair_lora.in_f),
+                outDim=int(cons_pair_lora.out_f),
+                maxRank=self.maxRankCons,
+                allocFn=make_alloc(int(cons_pair_lora.in_f), int(cons_pair_lora.out_f), self.maxRankCons),
+                composeFn=compose,),
+
+            "cons_token_gate": SiteSpec(
+                name="cons_token_gate",
+                nLayers=1,
+                inDim=int(cons_gate_lora.in_f),
+                outDim=int(cons_gate_lora.out_f),
+                maxRank=self.maxRankCons,
+                allocFn=make_alloc(int(cons_gate_lora.in_f), int(cons_gate_lora.out_f), self.maxRankCons),
                 composeFn=compose,),
 
             "ocr_gate": SiteSpec(
@@ -893,9 +2184,28 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         
         return specs
 
+    def forward(
+        self,
+        selfState: Optional[torch.Tensor],
+        intentState: Optional[torch.Tensor],
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        tdError: Optional[torch.Tensor] = None,
+        uncertainty: Optional[torch.Tensor] = None,
+        **kwargs,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        deltas = [self.ComposeLayerDelta(layerIdx) for layerIdx in range(self.layerCount)]
+        return self.ForwardWithDeltas(
+            x=None,
+            keyPaddingMask=keyPaddingMask,
+            tdError=tdError,
+            uncertainty=uncertainty,
+            deltasPerLayer=deltas,
+            selfState=selfState,
+            intentState=intentState,
+            **kwargs,)
+
     @staticmethod
     def LinearWithLora(
-        mod: "IntentionLoRALinear",
+        mod: "GrowableLoRALinear",
         x: torch.Tensor,
         deltaW: Optional[torch.Tensor],) -> torch.Tensor:
         W = mod.target.weight
@@ -915,7 +2225,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         base: "IntentionExtractor",
         texts: List[str],
         device: torch.device,
-        delta_sem: Optional[torch.Tensor],) -> torch.Tensor:
+        delta_sem: Optional[torch.Tensor],) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
         normed: List[str] = []
         for s in texts:
@@ -924,26 +2234,30 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
             else:
                 normed.append(str(s))
 
-        token_ids = base.TokenizeBatch(normed, device=device)
+        token_ids = base.TokenizeBatch(normed, device=device) # [B, N, T]
+        B, N, T = token_ids.shape
+        token_flat = token_ids.reshape(B * N, T)
+        mask_valid_flat = token_flat.ne(base.pad_idx).any(dim=1) # [B*N]
 
-        mask_valid = token_ids.ne(base.pad_idx).any(dim=1) 
+        text_repr = base.encoder(token_flat) 
 
-        text_repr = base.encoder(token_ids) 
-
-        sem_lora: "IntentionLoRALinear" = base.semProj[0]
+        sem_lora: "GrowableLoRALinear" = base.semProj[0]
         h = self.LinearWithLora(sem_lora, text_repr, delta_sem)
         h = base.semProj[1](h)
         h = base.semProj[2](h)
 
-        h = h * mask_valid.unsqueeze(-1)
-        return h
+        h = h * mask_valid_flat.unsqueeze(-1)
+        chunk_sem = h.view(B, N, base.dimSem)
+        chunk_valid = mask_valid_flat.view(B, N)
+        pooled, slots, slot_mask = base.PoolChunkSemanticsWithSlots(chunk_sem, chunk_valid)
+        return pooled, slots, slot_mask
 
     def GateWithDelta(
         self,
         gate_seq: nn.Sequential,
         x: torch.Tensor,
         delta_gate: Optional[torch.Tensor],) -> torch.Tensor:
-        gate_lora: "IntentionLoRALinear" = gate_seq[0]
+        gate_lora: "GrowableLoRALinear" = gate_seq[0]
 
         h = self.LinearWithLora(gate_lora, x, delta_gate)
         h = gate_seq[1](h)
@@ -952,9 +2266,100 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         h = gate_seq[4](h)
         return h
 
+    def ConsPairWithDelta(
+        self,
+        pair_seq: nn.Sequential,
+        x: torch.Tensor,
+        delta_pair: Optional[torch.Tensor],) -> torch.Tensor:
+        pair_lora: "GrowableLoRALinear" = pair_seq[0]
+        h = self.LinearWithLora(pair_lora, x, delta_pair)
+        h = pair_seq[1](h)
+        h = pair_seq[2](h)
+        h = pair_seq[3](h)
+        h = pair_seq[4](h)
+        h = pair_seq[5](h)
+        return h
+
+    def ConsTokenGateWithDelta(
+        self,
+        gate_seq: nn.Sequential,
+        x: torch.Tensor,
+        delta_gate: Optional[torch.Tensor],) -> torch.Tensor:
+        gate_lora: "GrowableLoRALinear" = gate_seq[0]
+        h = self.LinearWithLora(gate_lora, x, delta_gate)
+        h = gate_seq[1](h)
+        h = gate_seq[2](h)
+        h = gate_seq[3](h)
+        return h
+
+    def EncodeConsciousStatesWithDelta(
+        self,
+        base: "IntentionExtractor",
+        selfState: Optional[torch.Tensor],
+        intentState: Optional[torch.Tensor],
+        batchSize: int,
+        device: torch.device,
+        *,
+        delta_cons_self: Optional[torch.Tensor],
+        delta_cons_intent: Optional[torch.Tensor],
+        delta_cons_pair: Optional[torch.Tensor],
+        delta_cons_token_gate: Optional[torch.Tensor],) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        dim = base.dimSem
+        self_sem = torch.zeros(batchSize, dim, device=device)
+        intent_sem = torch.zeros(batchSize, dim, device=device)
+        extras: Dict[str, torch.Tensor] = {}
+
+        if selfState is not None:
+            if selfState.size(-1) != base.cons_self_dim:
+                raise ValueError(
+                    f"IntentionOnlineWrapper: self_sem dim mismatch, expected {base.cons_self_dim}, got {int(selfState.size(-1))}.")
+            self_in = selfState.to(device=device)
+            self_lin = self.LinearWithLora(base.consSelfProj, self_in, delta_cons_self)
+            self_sem = base.consSelfNorm(self_lin)
+            extras["cons_self_sem"] = self_sem.detach()
+
+        if intentState is not None:
+            if intentState.size(-1) != base.cons_intent_dim:
+                raise ValueError(
+                    f"IntentionOnlineWrapper: intent_sem dim mismatch, expected {base.cons_intent_dim}, got {int(intentState.size(-1))}.")
+            intent_in = intentState.to(device=device)
+            intent_lin = self.LinearWithLora(base.consIntentProj, intent_in, delta_cons_intent)
+            intent_sem = base.consIntentNorm(intent_lin)
+            extras["cons_intent_sem"] = intent_sem.detach()
+
+        cons_sem: Optional[torch.Tensor] = None
+        if (selfState is not None) and (intentState is not None):
+            pair_feat = torch.cat([
+                self_sem,
+                intent_sem,
+                torch.abs(self_sem - intent_sem),
+                self_sem * intent_sem,], dim=-1)
+
+            pair_sem = self.ConsPairWithDelta(base.consPairNet, pair_feat, delta_cons_pair)
+            cons_tokens = torch.stack([self_sem, intent_sem, pair_sem], dim=1)
+            cons_tokens = base.consTokenTransformer(cons_tokens)
+
+            token_logits = self.ConsTokenGateWithDelta(
+                base.consTokenGate,
+                cons_tokens.reshape(batchSize, -1),
+                delta_cons_token_gate,)
+            token_weights = F.softmax(token_logits, dim=-1)
+
+            cons_sem = (cons_tokens * token_weights.unsqueeze(-1)).sum(dim=1)
+            cons_sem = base.consFuseNorm(cons_sem + pair_sem)
+
+            extras["cons_pair_sem"] = pair_sem.detach()
+            extras["cons_token_weights"] = token_weights.detach()
+        elif intentState is not None:
+            cons_sem = intent_sem
+        elif selfState is not None:
+            cons_sem = self_sem
+
+        return cons_sem, self_sem, intent_sem, extras
+
     def ForwardWithDeltas(
         self,
-        x: Optional[torch.Tensor],
+        x=None,
         keyPaddingMask: Optional[torch.Tensor] = None,
         tdError: Optional[torch.Tensor] = None,
         uncertainty: Optional[torch.Tensor] = None,
@@ -964,7 +2369,8 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         base: "IntentionExtractor" = self.base 
         device = base.conceptEmb.device
 
-        consState: Optional[torch.Tensor] = x
+        self_state: Optional[torch.Tensor] = kwargs.get("selfState", None)
+        intent_state: Optional[torch.Tensor] = kwargs.get("intentState", None)
         ocrTexts: Optional[List[List[str]]] = kwargs.get("ocrTexts", None)
         extTexts: Optional[List[Optional[str]]] = kwargs.get("extTexts", None)
         prioritizeExt: bool = bool(kwargs.get("prioritizeExt", False))
@@ -972,7 +2378,10 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         row = deltasPerLayer[0] if (deltasPerLayer is not None and len(deltasPerLayer) > 0) else {}
 
         delta_sem = row.get("sem", None)
-        delta_cons = row.get("cons", None)
+        delta_cons_self = row.get("cons_self", None)
+        delta_cons_intent = row.get("cons_intent", None)
+        delta_cons_pair = row.get("cons_pair", None)
+        delta_cons_token_gate = row.get("cons_token_gate", None)
         delta_ocr = row.get("ocr_gate", None)
         delta_ext = row.get("ext_gate", None)
         delta_sym_k2h = row.get("sym_k2h", None)
@@ -981,53 +2390,47 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         delta_sym_film = row.get("sym_film", None)
         delta_sym_ctx = row.get("sym_ctx", None)
 
-        batch_size: Optional[int] = None
-
-        if consState is not None:
-            batch_size = consState.size(0)
-
-        if ocrTexts is not None:
-            if batch_size is None:
-                batch_size = len(ocrTexts)
-            elif len(ocrTexts) != batch_size:
-                raise ValueError(f"IntentionOnlineWrapper: batch mismatch, consState={batch_size}, ocrTexts={len(ocrTexts)}")
-
-        if extTexts is not None:
-            if batch_size is None:
-                batch_size = len(extTexts)
-            elif len(extTexts) != batch_size:
-                raise ValueError(f"IntentionOnlineWrapper: batch mismatch, consState/ocr vs extTexts={len(extTexts)}")
-
+        batch_size = base.InferBatchSize(self_state, intent_state, ocrTexts, extTexts)
         if batch_size is None:
-            return None, None, {}
+            intent_zero = torch.zeros(0, base.dimSem, device=device)
+            sym_zero = torch.zeros(0, int(base.conceptEmb.size(0)), device=device)
+            return intent_zero, sym_zero, {}
 
         dimSem = base.dimSem
-        extras: Dict[str, torch.Tensor] = {}
-
-        if consState is not None:
-            cons_lora: "IntentionLoRALinear" = base.consProj
-            cons_lin = self.LinearWithLora(cons_lora, consState, delta_cons)
-            cons_sem = base.consNorm(cons_lin)
-            has_cons_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        cons_sem, self_sem, intent_sem_cons, cons_extras = self.EncodeConsciousStatesWithDelta(
+            base=base,
+            selfState=self_state,
+            intentState=intent_state,
+            batchSize=batch_size,
+            device=device,
+            delta_cons_self=delta_cons_self,
+            delta_cons_intent=delta_cons_intent,
+            delta_cons_pair=delta_cons_pair,
+            delta_cons_token_gate=delta_cons_token_gate,)
+        extras: Dict[str, torch.Tensor] = dict(cons_extras)
+        if cons_sem is not None:
             extras["cons_sem"] = cons_sem.detach()
-        else:
-            cons_sem = None
-            has_cons_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         if ocrTexts is not None:
             merged = base.MergeOcrTexts(ocrTexts)
-            sem_ocr = self.EncodeStringsWithDelta(base, merged, device=device, delta_sem=delta_sem)
-            has_ocr_mask = sem_ocr.abs().sum(dim=-1).gt(0)
+            sem_ocr, ocr_slots, ocr_slot_mask = self.EncodeStringsWithDelta(
+                base, merged, device=device, delta_sem=delta_sem)
+            has_ocr_mask = ocr_slot_mask.any(dim=1)
         else:
             sem_ocr = torch.zeros(batch_size, dimSem, device=device)
+            ocr_slots = torch.zeros(batch_size, base.n_text_slots, dimSem, device=device)
+            ocr_slot_mask = torch.zeros(batch_size, base.n_text_slots, dtype=torch.bool, device=device)
             has_ocr_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         if extTexts is not None:
             normed = [("" if t is None else str(t)) for t in extTexts]
-            sem_ext = self.EncodeStringsWithDelta(base, normed, device=device, delta_sem=delta_sem)
-            has_ext_mask = sem_ext.abs().sum(dim=-1).gt(0)
+            sem_ext, ext_slots, ext_slot_mask = self.EncodeStringsWithDelta(
+                base, normed, device=device, delta_sem=delta_sem)
+            has_ext_mask = ext_slot_mask.any(dim=1)
         else:
             sem_ext = torch.zeros(batch_size, dimSem, device=device)
+            ext_slots = torch.zeros(batch_size, base.n_text_slots, dimSem, device=device)
+            ext_slot_mask = torch.zeros(batch_size, base.n_text_slots, dtype=torch.bool, device=device)
             has_ext_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         if (cons_sem is None) and (not has_ocr_mask.any()) and (not has_ext_mask.any()):
@@ -1059,6 +2462,8 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         extras["sem_ocr_fused"] = sem_ocr_fused.detach()
         extras["gate_ocr"] = gate_ocr.detach()
         extras["has_ocr_mask"] = has_ocr_mask.detach()
+        extras["sem_ocr_slots"] = ocr_slots.detach()
+        extras["sem_ocr_slot_mask"] = ocr_slot_mask.detach()
 
         feat_ext = torch.cat([
                 base_vec,
@@ -1084,14 +2489,21 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         extras["sem_ext_raw"] = sem_ext.detach()
         extras["gate_ext"] = gate_ext.detach()
         extras["has_ext_mask"] = has_ext_mask.detach()
+        extras["sem_ext_slots"] = ext_slots.detach()
+        extras["sem_ext_slot_mask"] = ext_slot_mask.detach()
 
-        if cons_sem is not None:
-            cons_token = cons_sem
-        else:
-            cons_token = torch.zeros(batch_size, dimSem, device=device)
-
-        tokens = torch.stack([cons_token, sem_ocr, sem_ext], dim=1) 
-        token_mask = torch.stack([has_cons_mask, has_ocr_mask, has_ext_mask], dim=1)  
+        self_token_mask = torch.full((batch_size, 1), self_state is not None, dtype=torch.bool, device=device)
+        intent_token_mask = torch.full((batch_size, 1), intent_state is not None, dtype=torch.bool, device=device)
+        tokens = torch.cat([
+            self_sem.unsqueeze(1),
+            intent_sem_cons.unsqueeze(1),
+            ocr_slots,
+            ext_slots,], dim=1)
+        token_mask = torch.cat([
+            self_token_mask,
+            intent_token_mask,
+            ocr_slot_mask,
+            ext_slot_mask,], dim=1)
 
         def safe_token_mask(token_mask: torch.Tensor) -> torch.Tensor:
             safe = token_mask.clone()
@@ -1103,6 +2515,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         token_mask_safe = safe_token_mask(token_mask)
         src_key_padding_mask = ~token_mask_safe 
 
+        trans_out: Optional[torch.Tensor] = None
         if token_mask.any(): 
             trans_out = base.intentTransformer(tokens, src_key_padding_mask=src_key_padding_mask)
 
@@ -1112,11 +2525,18 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
             fused = sum_vec / denom
 
             intentSem = intentSem + base.beta_trans * fused
+            extras["intent_trans_norm"] = fused.norm(dim=-1, keepdim=True).detach()
+            extras["intent_trans_mask_sum"] = mask_float.sum(dim=1).detach()
 
+        base._last_reason_support = None
         for t in range(int(base.reason_steps)):
 
             symbol_logits = F.linear(intentSem, base.conceptEmb, base.conceptBias)
-            symProbs_t, support = base.reasoner(symbol_logits, base.conceptEmb, return_support=True)
+            symProbs_t, support = base.reasoner(
+                symbol_logits,
+                base.conceptEmb,
+                ctx=intentSem,
+                returnSupport=True,)
 
             ctrl = self.SymCtrlWithDelta(
                 base=base,
@@ -1154,7 +2574,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 intent2 = base2 + torch.tanh(base.beta_ext) * ctrl["g_ext"] * (
                     sem_ext_fused2 * has_ext_mask.unsqueeze(-1).float())
 
-            if token_mask.any():
+            if (trans_out is not None) and token_mask.any():
                 w = ctrl["tok_w"] * token_mask.float()
                 denom = w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
                 w = w / denom
@@ -1170,9 +2590,55 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
             extras["sym_probs_loop"] = symProbs_t.detach()
             extras["sym_ctrl_gains"] = torch.cat([ctrl["g_ocr"], ctrl["g_ext"], ctrl["g_trans"]], dim=-1).detach()
             extras["sym_tok_w"] = ctrl["tok_w"].detach()
+            extras["sym_reason_alpha"] = support["alpha_eff"].detach()
 
         final_logits = F.linear(intentSem, base.conceptEmb, base.conceptBias)
-        symProbs = base.reasoner(final_logits, base.conceptEmb)
+        symProbs, final_support = base.reasoner(
+            final_logits,
+            base.conceptEmb,
+            ctx=intentSem,
+            returnSupport=True,)
+        base._last_reason_support = final_support
+        extras["reason_alpha_final"] = final_support["alpha_eff"].detach()
+        if self.training:
+            recall_sem_train, recall_sem_valid = base.BuildRecallSemanticFromTexts(
+                semOcr=sem_ocr,
+                hasOcrMask=has_ocr_mask,
+                semExt=sem_ext,
+                hasExtMask=has_ext_mask,)
+            extras.update(base.RunRecallFromSemantic(
+                recallSem=recall_sem_train,
+                recallSemValid=recall_sem_valid,
+                batchSize=batch_size,
+                ocrTexts=ocrTexts,
+                extTexts=extTexts,
+                device=device,))
+        else:
+            recall_pred_ids, _ = base.RecallGenerateFromSemantic(
+                intentSem,
+                maxLen=base.recall_safety_max_len,)
+            recall_targets = base.BuildRecallTargetsFromGenerated(
+                recall_pred_ids,
+                stride=base.max_seq_len,) # [B, N, T]
+            recall_target_valid = recall_targets.ne(base.pad_idx).any(dim=-1) # [B, N]
+            recall_mem = intentSem.unsqueeze(1) # [B, 1, D]
+            recall_valid_sem = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
+            recall_logits, recall_hidden, recall_has_sem = base.DecodeRecallChunked(
+                recallSem=recall_mem,
+                recallSemValid=recall_valid_sem,
+                recallTargets=recall_targets,)
+            recall_valid = recall_target_valid & recall_has_sem
+            recall_cond = intentSem.unsqueeze(1).expand(batch_size, recall_targets.size(1), base.dimSem)
+            base.CacheRecallState(
+                recallLogits=recall_logits,
+                recallHidden=recall_hidden,
+                recallTargets=recall_targets,
+                recallValid=recall_valid,
+                consSem=recall_cond,)
+            extras["recall_logits"] = recall_logits.detach()
+            extras["recall_targets"] = recall_targets.detach()
+            extras["recall_valid"] = recall_valid.detach()
+            extras["recall_pred_ids"] = recall_pred_ids.detach()
         return intentSem, symProbs, extras
 
 
@@ -1248,8 +2714,17 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         if site == "sem":
             base.semProj[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
-        elif site == "cons":
-            base.consProj.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
+        elif site == "cons_self":
+            base.consSelfProj.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
+            return True
+        elif site == "cons_intent":
+            base.consIntentProj.Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
+            return True
+        elif site == "cons_pair":
+            base.consPairNet[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
+            return True
+        elif site == "cons_token_gate":
+            base.consTokenGate[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
             return True
         elif site == "ocr_gate":
             base.fuse_ocr_gate[0].Grow(addRank=a.size(0), init=init, freezeOld=self.freezeOldPar)
@@ -1284,6 +2759,19 @@ class TestIntentionMTool:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         torch.manual_seed(42)
 
+    def MakeTestModel(self) -> "IntentionExtractor":
+        return IntentionExtractor(
+            maxSeqLen=8,
+            recallSafetyMaxLen=2,
+            dimEmbed=32,
+            dimEncoderHidden=16,
+            numEncoderLayers=2,
+            dimSem=32,
+            consDim=64,
+            nSymbols=12,
+            reasonSteps=1,
+            reasonerHiddenDim=32,
+            nTextSlots=1,).to(self.device)
 
     def MakeDummyBatch(
         self,
@@ -1291,23 +2779,74 @@ class TestIntentionMTool:
         batch_size: int = 8,
         with_ocr: bool = True,
         with_ext: bool = True,
-        with_cons: bool = True,) -> Tuple[Optional[torch.Tensor], Optional[List[List[str]]], Optional[List[Optional[str]]], torch.Tensor]:
+        with_cons: bool = True,
+        compact_text: bool = False,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[List[List[str]]], Optional[List[Optional[str]]], torch.Tensor]:
         nSymbols = int(model.conceptEmb.size(0))
-        consState = None
+        selfState: Optional[torch.Tensor] = None
+        intentState: Optional[torch.Tensor] = None
         ocrTexts: Optional[List[List[str]]] = None
         extTexts: Optional[List[Optional[str]]] = None
 
         if with_cons:
-            consDim = int(model.consProj.in_f)
-            consState = torch.randn(batch_size, consDim, device=self.device)
+            selfState = torch.randn(batch_size, int(model.cons_self_dim), device=self.device)
+            intentState = torch.randn(batch_size, int(model.cons_intent_dim), device=self.device)
 
         if with_ocr:
-            ocrTexts = [[f"ocr text {i} sample"] for i in range(batch_size)]
+            if compact_text:
+                ocrTexts = [["ab"] for _ in range(batch_size)]
+            else:
+                ocrTexts = [[f"ocr text {i} sample"] for i in range(batch_size)]
         if with_ext:
-            extTexts = [f"external hint {i}" for i in range(batch_size)]
+            if compact_text:
+                extTexts = ["cd" for _ in range(batch_size)]
+            else:
+                extTexts = [f"external hint {i}" for i in range(batch_size)]
 
         targetSym = torch.randint(low=0,high=2,size=(batch_size, nSymbols),dtype=torch.float32,device=self.device,)
-        return consState, ocrTexts, extTexts, targetSym
+        return selfState, intentState, ocrTexts, extTexts, targetSym
+
+    def ComputeBaseLossBundle(
+        self,
+        model: "IntentionExtractor",
+        selfState: Optional[torch.Tensor],
+        intentState: Optional[torch.Tensor],
+        ocrTexts: Optional[List[List[str]]],
+        extTexts: Optional[List[Optional[str]]],
+        targetSym: torch.Tensor,
+        *,
+        prioritizeExt: bool = False,) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        intentSem, symProbs, extras = model(
+            selfState,
+            intentState,
+            ocrTexts=ocrTexts,
+            extTexts=extTexts,
+            prioritizeExt=prioritizeExt,)
+
+        if symProbs is None:
+            raise AssertionError("ComputeBaseLossBundle: symProbs is None.")
+
+        loss_main = F.binary_cross_entropy(symProbs, targetSym)
+        internal_loss, stats = model.GetInternalLoss(symProbs)
+        loss_total = loss_main + 0.1 * internal_loss
+        loss_reason_total = (
+            stats["reason_cooc_sym_pen"]
+            + stats["reason_contr_sym_pen"]
+            + stats["reason_dynamic_pen"]
+            + stats["reason_entropy"])
+
+        bundle = {
+            "loss_total": loss_total,
+            "loss_main": loss_main,
+            "loss_internal": internal_loss,
+            "loss_reason_total": loss_reason_total,
+            "loss_recall_total": stats["recall_loss_total"],}
+        return bundle, symProbs, extras
+
+    @staticmethod
+    def BestSeen(history: List[float]) -> float:
+        if len(history) <= 0:
+            raise ValueError("BestSeen: history is empty.")
+        return min(history)
 
     def GradCoverage(self, named: Dict[str, torch.nn.Parameter], min_ratio: float, must_have: List[str]) -> bool:
         total_trainable = sum(1 for p in named.values() if p.requires_grad)
@@ -1339,38 +2878,55 @@ class TestIntentionMTool:
 
             dimSem = int(model.dimSem)
             nSymbols = int(model.conceptEmb.size(0))
-            consDim = int(model.consProj.in_f)
+            selfDim = int(model.cons_self_dim)
+            intentDim = int(model.cons_intent_dim)
 
             B = 4
 
-            cons_only = torch.randn(B, consDim, device=self.device)
-            intentSem, symProbs, extras = model(cons_only, ocrTexts=None, extTexts=None)
+            self_only = torch.randn(B, selfDim, device=self.device)
+            intent_only = torch.randn(B, intentDim, device=self.device)
+            intentSem, symProbs, extras = model(self_only, intent_only, ocrTexts=None, extTexts=None)
             assert intentSem is not None and symProbs is not None
             assert intentSem.shape == (B, dimSem)
             assert symProbs.shape == (B, nSymbols)
+            assert ("recall_logits" in extras) and ("recall_targets" in extras)
+            assert ("recall_pred_ids" in extras)
+
+            cons_self_only = torch.randn(B, selfDim, device=self.device)
+            intentSem0, symProbs0, _ = model(cons_self_only, None, ocrTexts=None, extTexts=None)
+            assert intentSem0 is not None and symProbs0 is not None
+            assert intentSem0.shape == (B, dimSem)
+            assert symProbs0.shape == (B, nSymbols)
+
+            cons_int_only = torch.randn(B, intentDim, device=self.device)
+            intentSem1, symProbs1, _ = model(None, cons_int_only, ocrTexts=None, extTexts=None)
+            assert intentSem1 is not None and symProbs1 is not None
+            assert intentSem1.shape == (B, dimSem)
+            assert symProbs1.shape == (B, nSymbols)
 
             ocrTexts = [[f"hello {i}"] for i in range(B)]
-            intentSem2, symProbs2, extras2 = model(consState=None, ocrTexts=ocrTexts, extTexts=None)
+            intentSem2, symProbs2, extras2 = model(None, None, ocrTexts=ocrTexts, extTexts=None)
             assert intentSem2 is not None and symProbs2 is not None
             assert intentSem2.shape == (B, dimSem)
             assert symProbs2.shape == (B, nSymbols)
 
             extTexts = [f"world {i}" for i in range(B)]
-            intentSem3, symProbs3, extras3 = model(consState=None, ocrTexts=None, extTexts=extTexts)
+            intentSem3, symProbs3, extras3 = model(None, None, ocrTexts=None, extTexts=extTexts)
             assert intentSem3 is not None and symProbs3 is not None
             assert intentSem3.shape == (B, dimSem)
             assert symProbs3.shape == (B, nSymbols)
 
-            cons_full = torch.randn(B, consDim, device=self.device)
+            cons_full_self = torch.randn(B, selfDim, device=self.device)
+            cons_full_intent = torch.randn(B, intentDim, device=self.device)
             ocr_full = [[f"ocr {i} text"] for i in range(B)]
             ext_full = [f"ext {i} text" for i in range(B)]
 
-            intentSem4, symProbs4, extras4 = model(cons_full, ocrTexts=ocr_full, extTexts=ext_full, prioritizeExt=True)
+            intentSem4, symProbs4, extras4 = model(cons_full_self, cons_full_intent, ocrTexts=ocr_full, extTexts=ext_full, prioritizeExt=True)
             assert intentSem4 is not None and symProbs4 is not None
             assert intentSem4.shape == (B, dimSem)
             assert symProbs4.shape == (B, nSymbols)
 
-            for t in (symProbs, symProbs2, symProbs3, symProbs4):
+            for t in (symProbs, symProbs0, symProbs1, symProbs2, symProbs3, symProbs4):
                 assert torch.isfinite(t).all()
                 assert t.min().item() >= -1e-6 and t.max().item() <= 1.0 + 1e-6
 
@@ -1388,9 +2944,9 @@ class TestIntentionMTool:
             model = IntentionExtractor().to(self.device)
             model.train()
 
-            consState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(model, batch_size=8)
+            selfState, intentState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(model, batch_size=8)
 
-            intentSem, symProbs, extras = model(consState, ocrTexts=ocrTexts, extTexts=extTexts)
+            intentSem, symProbs, extras = model(selfState, intentState, ocrTexts=ocrTexts, extTexts=extTexts)
             assert symProbs is not None
             assert torch.isfinite(symProbs).all()
 
@@ -1410,7 +2966,28 @@ class TestIntentionMTool:
                 "encoder.embedding.weight",
                 "encoder.att_proj.weight",
                 "semProj.0.target.weight",
-                "consProj.target.weight",
+                "chunkFuseFwd.weight",
+                "chunkFuseBwd.weight",
+                "chunkStateProj.0.weight",
+                "slotFuseInNorm.weight",
+                "slotQuery",
+                "slotDynQuery.0.weight",
+                "slotMixGate.0.weight",
+                "slotCrossAttn.q_proj.weight",
+                "slotPost.0.weight",
+                "chunkFuseOut.0.weight",
+                "consSelfProj.target.weight",
+                "consIntentProj.target.weight",
+                "consPairNet.0.target.weight",
+                "consTokenTransformer.layers.0.self_attn.q_proj.weight",
+                "consTokenGate.0.target.weight",
+                "recallTokEmb.weight",
+                "recallStart",
+                "recallCond.0.weight",
+                "intentTransformer.layers.0.self_attn.q_proj.weight",
+                "recallDecoder.layers.0.self_attn.q_proj.weight",
+                "recallDecoder.layers.0.cross_attn.q_proj.weight",
+                "recallHead.weight",
                 "fuse_ocr_gate.0.target.weight",
                 "fuse_ext_gate.0.target.weight",
                 "conceptEmb",
@@ -1449,23 +3026,180 @@ class TestIntentionMTool:
             print("TrainStepSmokeBase error:", e)
             return False
 
+    def AllTrainableGradCoverageBase(self) -> bool:
+        try:
+            model = self.MakeTestModel()
+            model.train()
+
+            selfState, intentState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(model, batch_size=2, compact_text=True)
+            losses, symProbs, _ = self.ComputeBaseLossBundle(
+                model,
+                selfState,
+                intentState,
+                ocrTexts,
+                extTexts,
+                targetSym,)
+
+            model.zero_grad(set_to_none=True)
+            losses["loss_total"].backward()
+
+            missing = []
+            non_finite = []
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if param.grad is None:
+                    missing.append(name)
+                    continue
+                if not torch.isfinite(param.grad).all():
+                    non_finite.append(name)
+
+            assert len(missing) == 0, f"Missing grad for trainable params: {missing}"
+            assert len(non_finite) == 0, f"Non-finite grad for params: {non_finite}"
+
+            print(f"AllTrainableGradCoverageBase passed. params={sum(1 for p in model.parameters() if p.requires_grad)}")
+            return True
+        except AssertionError as e:
+            print("AllTrainableGradCoverageBase failed:", e)
+            return False
+        except Exception as e:
+            print("AllTrainableGradCoverageBase error:", e)
+            return False
+
+    def BranchGradientCoverageBase(self) -> bool:
+        try:
+            specs = [
+                {"with_cons": True, "with_ocr": True, "with_ext": True, "prioritizeExt": False},
+                {"with_cons": True, "with_ocr": False, "with_ext": False, "prioritizeExt": False},
+                {"with_cons": False, "with_ocr": True, "with_ext": False, "prioritizeExt": False},
+                {"with_cons": False, "with_ocr": False, "with_ext": True, "prioritizeExt": True},]
+
+            union: set = set()
+            branch_grads: Dict[str, set] = {}
+            ref_model = self.MakeTestModel()
+            all_trainable = {n for n, p in ref_model.named_parameters() if p.requires_grad}
+
+            for spec in specs:
+                model = self.MakeTestModel()
+                model.train()
+                selfState, intentState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(
+                    model,
+                    batch_size=2,
+                    with_cons=spec["with_cons"],
+                    with_ocr=spec["with_ocr"],
+                    with_ext=spec["with_ext"],
+                    compact_text=True,)
+
+                losses, _, _ = self.ComputeBaseLossBundle(
+                    model,
+                    selfState,
+                    intentState,
+                    ocrTexts,
+                    extTexts,
+                    targetSym,
+                    prioritizeExt=bool(spec["prioritizeExt"]),)
+
+                model.zero_grad(set_to_none=True)
+                losses["loss_total"].backward()
+
+                got = {n for n, p in model.named_parameters() if p.requires_grad and (p.grad is not None)}
+                union |= got
+                key = f"cons={int(spec['with_cons'])},ocr={int(spec['with_ocr'])},ext={int(spec['with_ext'])},prio={int(spec['prioritizeExt'])}"
+                branch_grads[key] = got
+
+            missing_union = sorted(all_trainable - union)
+            assert len(missing_union) == 0, f"Union grad coverage missing params: {missing_union}"
+
+            assert "consSelfProj.target.weight" in branch_grads["cons=1,ocr=0,ext=0,prio=0"]
+            assert "consIntentProj.target.weight" in branch_grads["cons=1,ocr=0,ext=0,prio=0"]
+            assert "fuse_ocr_gate.0.target.weight" in branch_grads["cons=0,ocr=1,ext=0,prio=0"]
+            assert "fuse_ext_gate.0.target.weight" in branch_grads["cons=0,ocr=0,ext=1,prio=1"]
+
+            print(f"BranchGradientCoverageBase passed. union={len(union)}/{len(all_trainable)}")
+            return True
+        except AssertionError as e:
+            print("BranchGradientCoverageBase failed:", e)
+            return False
+        except Exception as e:
+            print("BranchGradientCoverageBase error:", e)
+            return False
+
+    def LossComponentsDecreaseBase(self, steps: int = 6) -> bool:
+        try:
+            model = self.MakeTestModel()
+            model.train()
+
+            selfState, intentState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(model, batch_size=2, compact_text=True)
+            opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+
+            with torch.no_grad():
+                start_losses, _, _ = self.ComputeBaseLossBundle(
+                    model,
+                    selfState,
+                    intentState,
+                    ocrTexts,
+                    extTexts,
+                    targetSym,)
+                start_total = float(start_losses["loss_total"].item())
+                start_main = float(start_losses["loss_main"].item())
+                start_recall = float(start_losses["loss_recall_total"].item())
+
+            hist_total: List[float] = []
+            hist_main: List[float] = []
+            hist_recall: List[float] = []
+
+            for _ in range(int(steps)):
+                losses, _, _ = self.ComputeBaseLossBundle(
+                    model,
+                    selfState,
+                    intentState,
+                    ocrTexts,
+                    extTexts,
+                    targetSym,)
+                opt.zero_grad(set_to_none=True)
+                losses["loss_total"].backward()
+                opt.step()
+
+                hist_total.append(float(losses["loss_total"].detach().item()))
+                hist_main.append(float(losses["loss_main"].detach().item()))
+                hist_recall.append(float(losses["loss_recall_total"].detach().item()))
+
+            best_total = self.BestSeen(hist_total)
+            best_main = self.BestSeen(hist_main)
+            best_recall = self.BestSeen(hist_recall)
+
+            assert best_total < start_total, f"total loss did not decrease: start={start_total:.6f}, best={best_total:.6f}"
+            assert best_main < start_main, f"main loss did not decrease: start={start_main:.6f}, best={best_main:.6f}"
+            assert best_recall < start_recall, f"recall loss did not decrease: start={start_recall:.6f}, best={best_recall:.6f}"
+
+            print(
+                f"LossComponentsDecreaseBase passed. total {start_total:.6f}->{best_total:.6f}, "
+                f"main {start_main:.6f}->{best_main:.6f}, recall {start_recall:.6f}->{best_recall:.6f}")
+            return True
+        except AssertionError as e:
+            print("LossComponentsDecreaseBase failed:", e)
+            return False
+        except Exception as e:
+            print("LossComponentsDecreaseBase error:", e)
+            return False
+
     def NormalTrainingConvergenceBase(self, steps: int = 80, logEvery: int = 20) -> bool:
         try:
             model = IntentionExtractor().to(self.device)
             model.train()
 
-            consState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(model, batch_size=12)
+            selfState, intentState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(model, batch_size=12)
             opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
             with torch.no_grad():
-                _, sym0, _ = model(consState, ocrTexts=ocrTexts, extTexts=extTexts)
+                _, sym0, _ = model(selfState, intentState, ocrTexts=ocrTexts, extTexts=extTexts)
                 start_main = F.binary_cross_entropy(sym0, targetSym).item()
                 internal0, _ = model.GetInternalLoss(sym0)
                 start = start_main + 0.1 * internal0.item()
 
             hist = []
             for t in range(1, steps + 1):
-                intentSem, symProbs, extras = model(consState, ocrTexts=ocrTexts, extTexts=extTexts)
+                intentSem, symProbs, extras = model(selfState, intentState, ocrTexts=ocrTexts, extTexts=extTexts)
                 loss_main = F.binary_cross_entropy(symProbs, targetSym)
                 internal_loss, _ = model.GetInternalLoss(symProbs)
                 loss = loss_main + 0.1 * internal_loss
@@ -1500,11 +3234,11 @@ class TestIntentionMTool:
             wrapper = IntentionOnlineWrapper(base=base, initRankEach=0).to(self.device)
             wrapper.eval()
 
-            consState, ocrTexts, extTexts, _ = self.MakeDummyBatch(base, batch_size=5)
+            selfState, intentState, ocrTexts, extTexts, _ = self.MakeDummyBatch(base, batch_size=5)
 
             with torch.no_grad():
-                y_base = base(consState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=True)
-                y_wrap = wrapper(consState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=True)
+                y_base = base(selfState, intentState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=True)
+                y_wrap = wrapper(selfState, intentState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=True)
 
             intent_base, sym_base, _ = y_base
             intent_wrap, sym_wrap, _ = y_wrap
@@ -1582,13 +3316,13 @@ class TestIntentionMTool:
 
             wrapper.Update("grow", growFactor=1.0, addEach=4)
 
-            consState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(base, batch_size=6)
+            selfState, intentState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(base, batch_size=6)
 
             opt = torch.optim.Adam(list(wrapper.CandParameters()), lr=3e-3)
 
-            dummy_td = torch.ones(consState.size(0), 1, device=self.device)
+            dummy_td = torch.ones(targetSym.size(0), 1, device=self.device)
 
-            intentSem, symProbs, extras = wrapper(consState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=False, tdError=dummy_td)
+            intentSem, symProbs, extras = wrapper(selfState, intentState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=False, tdError=dummy_td)
             loss = F.binary_cross_entropy(symProbs, targetSym)
 
             opt.zero_grad(set_to_none=True)
@@ -1608,6 +3342,61 @@ class TestIntentionMTool:
         except Exception as e:
             print("WrapperCandGradSmoke error:", e)
             return False
+
+    def WrapperCandidateConvergence(self, steps: int = 4) -> bool:
+        try:
+            base = self.MakeTestModel()
+            base.eval()
+
+            wrapper = IntentionOnlineWrapper(base=base, initRankEach=0).to(self.device)
+            wrapper.train()
+            wrapper.Update("grow", growFactor=1.0, addEach=2)
+
+            selfState, intentState, _, _, targetSym = self.MakeDummyBatch(
+                base,
+                batch_size=2,
+                with_ocr=False,
+                with_ext=False,
+                with_cons=True,
+                compact_text=True,)
+
+            opt = torch.optim.Adam(list(wrapper.CandParameters()), lr=8e-3)
+
+            with torch.no_grad():
+                _, sym0, _ = wrapper(
+                    selfState,
+                    intentState,
+                    ocrTexts=None,
+                    extTexts=None,
+                    prioritizeExt=False,)
+                start = float(F.binary_cross_entropy(sym0, targetSym).item())
+
+            hist: List[float] = []
+            for _ in range(int(steps)):
+                _, symProbs, _ = wrapper(
+                    selfState,
+                    intentState,
+                    ocrTexts=None,
+                    extTexts=None,
+                    prioritizeExt=False,)
+                loss = F.binary_cross_entropy(symProbs, targetSym)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                wrapper.Update("accumulategrads")
+                opt.step()
+                hist.append(float(loss.detach().item()))
+
+            best = self.BestSeen(hist)
+            assert best < start, f"wrapper candidate loss did not decrease: start={start:.6f}, best={best:.6f}"
+
+            print(f"WrapperCandidateConvergence passed. start={start:.6f}, best={best:.6f}")
+            return True
+        except AssertionError as e:
+            print("WrapperCandidateConvergence failed:", e)
+            return False
+        except Exception as e:
+            print("WrapperCandidateConvergence error:", e)
+            return False
         
     def WrapperManualGrowTrainAndCommit(self) -> bool:
         try:
@@ -1619,15 +3408,16 @@ class TestIntentionMTool:
 
             wrapper.Update("grow", growFactor=1.0, addEach=4)
 
-            consState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(base, batch_size=8)
+            selfState, intentState, ocrTexts, extTexts, targetSym = self.MakeDummyBatch(base, batch_size=8)
             opt = torch.optim.Adam(list(wrapper.CandParameters()), lr=3e-3)
 
             steps = 10
-            dummy_td = torch.ones(consState.size(0), 1, device=self.device)
+            dummy_td = torch.ones(targetSym.size(0), 1, device=self.device)
 
             for _ in range(steps):
                 intentSem, symProbs, extras = wrapper(
-                    consState,
+                    selfState,
+                    intentState,
                     ocrTexts=ocrTexts,
                     extTexts=extTexts,
                     prioritizeExt=False,
@@ -1639,7 +3429,19 @@ class TestIntentionMTool:
                 wrapper.Update("accumulategrads")
                 opt.step()
 
-            sites = ["sem", "cons", "ocr_gate", "ext_gate", "sym_k2h", "sym_gain", "sym_tok", "sym_film", "sym_ctx"]
+            sites = [
+                "sem",
+                "cons_self",
+                "cons_intent",
+                "cons_pair",
+                "cons_token_gate",
+                "ocr_gate",
+                "ext_gate",
+                "sym_k2h",
+                "sym_gain",
+                "sym_tok",
+                "sym_film",
+                "sym_ctx",]
 
             expected: Dict[str, torch.Tensor] = {}
             for site in sites:
@@ -1659,11 +3461,17 @@ class TestIntentionMTool:
 
             atol, rtol = 1e-6, 1e-4
 
-            def site_to_mod(site: str) -> "IntentionLoRALinear":
+            def site_to_mod(site: str) -> "GrowableLoRALinear":
                 if site == "sem":
                     return base.semProj[0]
-                if site == "cons":
-                    return base.consProj
+                if site == "cons_self":
+                    return base.consSelfProj
+                if site == "cons_intent":
+                    return base.consIntentProj
+                if site == "cons_pair":
+                    return base.consPairNet[0]
+                if site == "cons_token_gate":
+                    return base.consTokenGate[0]
                 if site == "ocr_gate":
                     return base.fuse_ocr_gate[0]
                 if site == "ext_gate":
@@ -1697,10 +3505,10 @@ class TestIntentionMTool:
             base.eval()
             wrapper.eval()
 
-            cons_chk, ocr_chk, ext_chk, _ = self.MakeDummyBatch(base, batch_size=5)
+            self_chk, intent_chk, ocr_chk, ext_chk, _ = self.MakeDummyBatch(base, batch_size=5)
             with torch.no_grad():
-                ib, sb, _ = base(cons_chk, ocrTexts=ocr_chk, extTexts=ext_chk)
-                iw, sw, _ = wrapper(cons_chk, ocrTexts=ocr_chk, extTexts=ext_chk)
+                ib, sb, _ = base(self_chk, intent_chk, ocrTexts=ocr_chk, extTexts=ext_chk)
+                iw, sw, _ = wrapper(self_chk, intent_chk, ocrTexts=ocr_chk, extTexts=ext_chk)
 
             max_abs_int = (ib - iw).abs().max().item()
             max_abs_sym = (sb - sw).abs().max().item()
@@ -1722,11 +3530,15 @@ class TestIntentionMTool:
         results = {
             "ForwardVariants": self.ForwardVariants(),
             "TrainStepSmokeBase": self.TrainStepSmokeBase(),
+            "AllTrainableGradCoverageBase": self.AllTrainableGradCoverageBase(),
+            "BranchGradientCoverageBase": self.BranchGradientCoverageBase(),
+            "LossComponentsDecreaseBase": self.LossComponentsDecreaseBase(),
             "NormalTrainingConvergenceBase": self.NormalTrainingConvergenceBase(),
             "WrapperForwardEqualWhenNoInitRank": self.WrapperForwardEqualWhenNoInitRank(),
             "WrapperAPIBasics": self.WrapperAPIBasics(),
             "WrapperKeepsBaseEval": self.WrapperKeepsBaseEval(),
             "WrapperCandGradSmoke": self.WrapperCandGradSmoke(),
+            "WrapperCandidateConvergence": self.WrapperCandidateConvergence(),
             "WrapperManualGrowTrainAndCommit": self.WrapperManualGrowTrainAndCommit(),}
         
         passed = sum(1 for v in results.values() if v)
