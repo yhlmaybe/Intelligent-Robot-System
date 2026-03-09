@@ -882,7 +882,9 @@ class RSSMWorldModel(AGICoreModule):
         self.register_buffer("_mem_keys", torch.zeros(1, self._mem_capacity, stochDim))
         self.register_buffer("_mem_vals", torch.zeros(1, self._mem_capacity, stateDim))
         self.register_buffer("_mem_size", torch.zeros(1, dtype=torch.long))
-        self.register_buffer("_mem_imp", torch.zeros(1, self._mem_capacity)) 
+        self.register_buffer("_mem_imp", torch.zeros(1, self._mem_capacity))
+        self.register_buffer("_mem_steps", torch.zeros(1, self._mem_capacity, dtype=torch.long))
+        self.register_buffer("_mem_global_step", torch.zeros(1, dtype=torch.long))
 
         self._mem_imp_lr = 0.10
 
@@ -927,7 +929,9 @@ class RSSMWorldModel(AGICoreModule):
         self._mem_keys = torch.zeros(B, cap, self.stoch_dim, device=device, dtype=dtype)
         self._mem_vals = torch.zeros(B, cap, self.state_dim, device=device, dtype=dtype)
         self._mem_imp = torch.zeros(B, cap, device=device, dtype=dtype)
+        self._mem_steps = torch.zeros(B, cap, device=device, dtype=torch.long)
         self._mem_size = torch.zeros(B, device=device, dtype=torch.long)
+        self._mem_global_step = torch.zeros(B, device=device, dtype=torch.long)
 
         self._h = torch.zeros(B, self.deter_dim, device=device, dtype=dtype)
         self._z = torch.zeros(B, self.stoch_dim, device=device, dtype=dtype)
@@ -956,7 +960,9 @@ class RSSMWorldModel(AGICoreModule):
             "mem_keys": self._mem_keys[:, :maxN].detach().cpu(), # [B,maxN,Z]
             "mem_vals": self._mem_vals[:, :maxN].detach().cpu(), # [B,maxN,S]
             "mem_imp": self._mem_imp[:,  :maxN].detach().cpu(), # [B,maxN]
-            "mem_size": self._mem_size.detach().cpu(),} # [B] 
+            "mem_steps": self._mem_steps[:, :maxN].detach().cpu(), # [B,maxN]
+            "mem_size": self._mem_size.detach().cpu(), # [B]
+            "mem_global_step": self._mem_global_step.detach().cpu(),} # [B]
 
         torch.save(payload, p)
 
@@ -974,6 +980,8 @@ class RSSMWorldModel(AGICoreModule):
         vals = payload["mem_vals"] # [B, C, stateDim]
         size = payload["mem_size"] # [B]
         imp = payload["mem_imp"] # [B, C]
+        steps = payload["mem_steps"] # [B, C]
+        global_step = payload["mem_global_step"] # [B]
 
         Bf = int(keys.size(0))
         Cf = int(keys.size(1))
@@ -987,17 +995,23 @@ class RSSMWorldModel(AGICoreModule):
         new_keys = torch.zeros(Bf, new_cap, self.stoch_dim, device=dev, dtype=dtyp)
         new_vals = torch.zeros(Bf, new_cap, self.state_dim, device=dev, dtype=dtyp)
         new_imp = torch.zeros(Bf, new_cap, device=dev, dtype=dtyp)
+        new_steps = torch.zeros(Bf, new_cap, device=dev, dtype=torch.long)
         new_size = torch.zeros(Bf, device=dev, dtype=torch.long)
+        new_global_step = torch.zeros(Bf, device=dev, dtype=torch.long)
 
         new_keys[:, :Cf] = keys.to(device=dev, dtype=dtyp).contiguous()
         new_vals[:, :Cf] = vals.to(device=dev, dtype=dtyp).contiguous()
         new_imp[:,  :Cf] = imp.to(device=dev, dtype=dtyp).contiguous()
+        new_steps[:, :Cf] = steps.to(device=dev, dtype=torch.long).contiguous()
         new_size[:] = size.to(device=dev, dtype=torch.long).clamp_(0, Cf)
+        new_global_step[:] = global_step.to(device=dev, dtype=torch.long).view(-1)[:Bf]
 
         self._mem_keys = new_keys
         self._mem_vals = new_vals
         self._mem_imp = new_imp
+        self._mem_steps = new_steps
         self._mem_size = new_size
+        self._mem_global_step = new_global_step
 
     def ResetMemory(self):
         if not self._use_memory:
@@ -1005,7 +1019,45 @@ class RSSMWorldModel(AGICoreModule):
         self._mem_keys.zero_()
         self._mem_vals.zero_()
         self._mem_imp.zero_()
+        self._mem_steps.zero_()
         self._mem_size.zero_()
+        self._mem_global_step.zero_()
+
+    @torch.no_grad()
+    def ReorderMemorySteps(self):
+        if not self._use_memory:
+            return
+
+        B = int(self._mem_size.size(0))
+        cap = int(self._mem_capacity)
+        device = self.device
+
+        if cap <= 0 or B <= 0:
+            self._mem_steps.zero_()
+            self._mem_global_step.zero_()
+            return
+
+        slots = torch.arange(cap, device=device).view(1, cap)
+        valid = slots < self._mem_size.view(B, 1) # [B, cap]
+
+        if not bool(valid.any().item()):
+            self._mem_steps.zero_()
+            self._mem_global_step.zero_()
+            return
+
+        max_step = torch.iinfo(self._mem_steps.dtype).max
+        metric = torch.where(valid, self._mem_steps, torch.full_like(self._mem_steps, max_step))
+        order = torch.argsort(metric, dim=1, descending=False)
+
+        new_steps = torch.zeros_like(self._mem_steps)
+        ranks = torch.arange(1, cap + 1, device=device, dtype=torch.long).view(1, cap).expand(B, cap)
+        rank_valid = ranks <= self._mem_size.view(B, 1)
+        assign = torch.where(rank_valid, ranks, torch.zeros_like(ranks))
+        new_steps.scatter_(1, order, assign)
+        new_steps = torch.where(valid, new_steps, torch.zeros_like(new_steps))
+
+        self._mem_steps.copy_(new_steps)
+        self._mem_global_step.copy_(self._mem_size)
 
     @torch.no_grad()
     def MemAdd(
@@ -1026,6 +1078,7 @@ class RSSMWorldModel(AGICoreModule):
         idx_replace = torch.argmin(self._mem_imp, dim=1) # [B]
         idx = torch.where(has_space, size, idx_replace).long() # [B]
 
+        self._mem_global_step.add_(1)
         self._mem_size = torch.where(has_space, size + 1, size) # [B]
 
         bidx = torch.arange(B, device=self.device)
@@ -1033,6 +1086,7 @@ class RSSMWorldModel(AGICoreModule):
         self._mem_keys[bidx, idx] = keyE # [B,Z]
         self._mem_vals[bidx, idx] = valH # [B,S]
         self._mem_imp[bidx, idx] = imp # [B]
+        self._mem_steps[bidx, idx] = self._mem_global_step
 
         if self._mem_path and self._mem_autosave_every > 0:
             self._mem_add_count += 1
@@ -1569,6 +1623,9 @@ class RSSMWorldModel(AGICoreModule):
         scores = self._mem_imp.masked_fill(~valid, -1e9) # [B,cap]
 
         _, idx = torch.topk(scores, k=K, dim=-1) # [B,K]
+        sel_steps = torch.gather(self._mem_steps, 1, idx) # [B,K]
+        time_order = torch.argsort(sel_steps, dim=-1, descending=True)
+        idx = torch.gather(idx, 1, time_order)
 
         out: Dict[str, torch.Tensor] = {} 
 
@@ -1580,6 +1637,7 @@ class RSSMWorldModel(AGICoreModule):
 
         out["size"] = filled.detach().clone() # [B]
         out["idx"]  = idx.contiguous() # [B,K]
+        out["steps"] = torch.gather(self._mem_steps, 1, idx).contiguous() # [B,K]
 
         Dk = int(self._mem_keys.size(-1))
         out["keys"] = torch.gather(self._mem_keys, 1, idx.unsqueeze(-1).expand(B, K, Dk)).contiguous()
@@ -2927,22 +2985,145 @@ class TestWorldMTool:
                 return False
 
             ok_shapes = (
-                ("size" in out) and ("idx" in out) and ("vals" in out) and ("keys" in out) and ("imp" in out)
+                ("size" in out) and ("idx" in out) and ("vals" in out) and ("keys" in out) and ("imp" in out) and ("steps" in out)
                 and out["size"].shape == (B,)
                 and out["idx"].shape == (B, 4)
                 and out["vals"].shape == (B, 4, wm.state_dim)
                 and out["keys"].shape == (B, 4, wm.stoch_dim)
-                and out["imp"].shape == (B, 4))
+                and out["imp"].shape == (B, 4)
+                and out["steps"].shape == (B, 4))
 
             idx_ok = bool((out["idx"] >= 0).all().item() and (out["idx"] < wm._mem_capacity).all().item())
             imp_ok = bool(torch.isfinite(out["imp"]).all().item())
+            step_ok = bool((out["steps"][:, :-1] >= out["steps"][:, 1:]).all().item())
 
-            ok = bool(ok_shapes and idx_ok and imp_ok)
+            ok = bool(ok_shapes and idx_ok and imp_ok and step_ok)
             print(f"ExportWorldMemoryBank {'passed' if ok else 'failed'}")
             return ok
 
         except Exception as e:
             print(f"ExportWorldMemoryBank FAILED: {type(e).__name__}: {e}")
+            return False
+
+    def TestExportWorldMemoryBankLatestFirst(self) -> bool:
+        try:
+            wm = RSSMWorldModel(
+                visionDim=32,
+                actionDim=16,
+                deterDim=32,
+                stochDim=8,
+                stateDim=12,
+                ssmDim=16,
+                useDecoder=False,
+                useMemory=True,
+                memoryCapacity=8,
+                nsEnabled=False,
+                memTopK=4,
+                memTemp=1.0,).to(self.device).eval()
+
+            B = 1
+            wm.ResetState(batchSize=B)
+            wm.ResetMemory()
+
+            with torch.no_grad():
+                wm._mem_size.fill_(3)
+                wm._mem_imp.zero_()
+                wm._mem_steps.zero_()
+                wm._mem_vals.zero_()
+                wm._mem_keys.zero_()
+                wm._mem_global_step.fill_(30)
+
+                wm._mem_imp[0, :3] = torch.tensor([0.9, 0.8, 0.7], device=self.device, dtype=wm.dtype)
+                wm._mem_steps[0, :3] = torch.tensor([30, 10, 20], device=self.device, dtype=torch.long)
+
+                wm._mem_vals[0, 0, 0] = 30.0
+                wm._mem_vals[0, 1, 0] = 10.0
+                wm._mem_vals[0, 2, 0] = 20.0
+
+                wm._mem_keys[0, 0, 0] = 3.0
+                wm._mem_keys[0, 1, 0] = 1.0
+                wm._mem_keys[0, 2, 0] = 2.0
+
+            out = wm.ExportWorldMemoryBank(topk=3)
+            if out is None:
+                print("ExportWorldMemoryBank latest-first FAILED: expected dict.")
+                return False
+
+            expected_steps = torch.tensor([30, 20, 10], device=self.device, dtype=torch.long)
+            expected_vals = torch.tensor([30.0, 20.0, 10.0], device=self.device, dtype=wm.dtype)
+            expected_keys = torch.tensor([3.0, 2.0, 1.0], device=self.device, dtype=wm.dtype)
+
+            ok = bool(
+                torch.equal(out["steps"][0], expected_steps)
+                and torch.allclose(out["vals"][0, :, 0], expected_vals)
+                and torch.allclose(out["keys"][0, :, 0], expected_keys))
+
+            print(f"ExportWorldMemoryBank latest-first {'passed' if ok else 'failed'}")
+            return ok
+        except Exception as e:
+            print(f"ExportWorldMemoryBank latest-first FAILED: {type(e).__name__}: {e}")
+            return False
+
+    def TestReorderMemorySteps(self) -> bool:
+        try:
+            wm = RSSMWorldModel(
+                visionDim=32,
+                actionDim=16,
+                deterDim=32,
+                stochDim=8,
+                stateDim=12,
+                ssmDim=16,
+                useDecoder=False,
+                useMemory=True,
+                memoryCapacity=8,
+                nsEnabled=False,
+                memTopK=4,
+                memTemp=1.0,).to(self.device).eval()
+
+            B = 1
+            wm.ResetState(batchSize=B)
+            wm.ResetMemory()
+
+            with torch.no_grad():
+                wm._mem_size.fill_(3)
+                wm._mem_imp.zero_()
+                wm._mem_steps.zero_()
+                wm._mem_vals.zero_()
+                wm._mem_global_step.fill_(30)
+
+                wm._mem_imp[0, :3] = torch.tensor([0.9, 0.8, 0.7], device=self.device, dtype=wm.dtype)
+                wm._mem_steps[0, :3] = torch.tensor([30, 10, 20], device=self.device, dtype=torch.long)
+                wm._mem_vals[0, 0, 0] = 30.0
+                wm._mem_vals[0, 1, 0] = 10.0
+                wm._mem_vals[0, 2, 0] = 20.0
+
+            wm.ReorderMemorySteps()
+
+            expect_steps = torch.tensor([3, 1, 2], device=self.device, dtype=torch.long)
+            if not torch.equal(wm._mem_steps[0, :3], expect_steps):
+                print(f"ReorderMemorySteps FAILED: got local steps {wm._mem_steps[0, :3].tolist()}")
+                return False
+
+            if int(wm._mem_global_step[0].item()) != 3:
+                print(f"ReorderMemorySteps FAILED: global step={int(wm._mem_global_step[0].item())}, expected 3")
+                return False
+
+            out = wm.ExportWorldMemoryBank(topk=3)
+            if out is None:
+                print("ReorderMemorySteps FAILED: expected export dict after reset.")
+                return False
+
+            expect_export_steps = torch.tensor([3, 2, 1], device=self.device, dtype=torch.long)
+            expect_export_vals = torch.tensor([30.0, 20.0, 10.0], device=self.device, dtype=wm.dtype)
+
+            ok = bool(
+                torch.equal(out["steps"][0], expect_export_steps)
+                and torch.allclose(out["vals"][0, :, 0], expect_export_vals))
+
+            print(f"ReorderMemorySteps {'passed' if ok else 'failed'}")
+            return ok
+        except Exception as e:
+            print(f"ReorderMemorySteps FAILED: {type(e).__name__}: {e}")
             return False
 
 
@@ -3279,6 +3460,8 @@ class TestWorldMTool:
             "LossDecrease": self.TestLossDecrease(),
             "ConnRegReset": self.TestConnRegReset(),
             "ExportWorldMemoryBank": self.TestExportWorldMemoryBank(),
+            "ExportWorldMemoryBankLatestFirst": self.TestExportWorldMemoryBankLatestFirst(),
+            "ReorderMemorySteps": self.TestReorderMemorySteps(),
             "WrapperAPIBasics": self.TestWrapperAPIBasics(),
             "ForwardWithDeltasInjection": self.TestForwardWithDeltasInjection(),
             "CommitOneGrowAndValueChange": self.TestCommitOneGrowAndValueChange(),

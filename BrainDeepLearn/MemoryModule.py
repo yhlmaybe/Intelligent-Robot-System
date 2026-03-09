@@ -1950,7 +1950,7 @@ class MemoryExtractor(AGICoreModule):
             return
         
         obj = torch.load(path, weights_only=False)
-        sd = obj["state_dict"] if isinstance(obj, dict) and "state_dict" in obj else obj
+        sd = obj["state_dict"]
         
         if "h_state" in sd:
             saved_B = sd["h_state"].size(0)
@@ -1961,7 +1961,7 @@ class MemoryExtractor(AGICoreModule):
                 self.ltm.semantic.EnsureB(saved_B, device=self.device, dtype=self.dtype)
                 self.ltm.episodic.EnsureB(saved_B, device=self.device, dtype=self.dtype)
 
-        self.load_state_dict(sd, strict=False)
+        self.load_state_dict(sd, strict=True)
         self.pending.clear()
 
 
@@ -1969,13 +1969,23 @@ class MemoryExtractor(AGICoreModule):
     def ExportMemoryBank(self, topk: int = 1024,) -> Optional[Dict[str, torch.Tensor]]:
         device = self.device
         B = int(self.memory_filled.size(0)) # [B]
-        D = int(self.memory_dim)
         topk = int(topk)
 
         if topk <= 0 or self.memory_filled.min().item() <=0:
             return None
 
         out: Dict[str, torch.Tensor] = {}
+
+        def GatherTopkLatestFirst(
+            values: torch.Tensor,
+            indices: torch.Tensor,
+            steps: torch.Tensor,) -> torch.Tensor:
+            
+            sel_steps = torch.gather(steps, 1, indices)
+            time_order = torch.argsort(sel_steps, dim=1, descending=True)
+            time_indices = torch.gather(indices, 1, time_order)
+            idx_exp = time_indices.unsqueeze(-1).expand(B, time_indices.size(1), values.size(-1))
+            return torch.gather(values, 1, idx_exp).contiguous()
 
         S_gws = int(self.gws.slots)
         gws_valid = (self.gws.ttl > 0) & (self.gws.priority > 0)  # [B, S_gws]
@@ -1985,8 +1995,7 @@ class MemoryExtractor(AGICoreModule):
             gws_fresh = torch.exp(-gws_age * float(self.gws.recency_temp))
             gws_scores = (self.gws.priority * gws_fresh).masked_fill(~gws_valid, -1e9)
             _, gws_idx = StableTopk(gws_scores, K_gws)  # [B, K_gws]
-            gws_idx_exp = gws_idx.unsqueeze(-1).expand(B, K_gws, D)  # [B, K_gws, D]
-            out["gws"] = torch.gather(self.gws.vals, 1, gws_idx_exp).contiguous()
+            out["gws"] = GatherTopkLatestFirst(self.gws.vals, gws_idx, self.gws.last_step)
 
         M_kv = int(self.memory_size)
         filled_kv = self.memory_filled  # [B]
@@ -1996,8 +2005,7 @@ class MemoryExtractor(AGICoreModule):
             valid = ar < filled_kv.view(B, 1) # [B, M_kv]
             scores = self.memory_importance.masked_fill(~valid, -1e9) # [B, M_kv]
             _, idx = StableTopk(scores, K_kv) # [B, K_kv]
-            idx_exp = idx.unsqueeze(-1).expand(B, K_kv, D) # [B, K_kv, D]
-            out["kv"] = torch.gather(self.memory_values, 1, idx_exp).contiguous() # [B, K_kv, D]
+            out["kv"] = GatherTopkLatestFirst(self.memory_values, idx, self.memory_steps) # [B, K_kv, D]
 
 
         sem = self.ltm.semantic
@@ -2009,8 +2017,7 @@ class MemoryExtractor(AGICoreModule):
             valid = ar < filled_sem.view(B, 1) # [B, M_sem]
             scores = sem.prio.masked_fill(~valid, -1e9) # [B, M_sem]
             _, idx = StableTopk(scores, K_sem) # [B, K_sem]
-            idx_exp = idx.unsqueeze(-1).expand(B, K_sem, D) # [B, K_sem, D]
-            out["ltm_sem"] = torch.gather(sem.vals, 1, idx_exp).contiguous() # [B, K_sem, D]
+            out["ltm_sem"] = GatherTopkLatestFirst(sem.vals, idx, sem.step) # [B, K_sem, D]
 
 
         epi = self.ltm.episodic
@@ -2022,8 +2029,7 @@ class MemoryExtractor(AGICoreModule):
             valid = ar < filled_epi.view(B, 1) # [B, M_epi]
             scores = epi.prio.masked_fill(~valid, -1e9) # [B, M_epi]
             _, idx = StableTopk(scores, K_epi) # [B, K_epi]
-            idx_exp = idx.unsqueeze(-1).expand(B, K_epi, D) # [B, K_epi, D]
-            out["ltm_epi"] = torch.gather(epi.vals, 1, idx_exp).contiguous() # [B, K_epi, D]
+            out["ltm_epi"] = GatherTopkLatestFirst(epi.vals, idx, epi.step) # [B, K_epi, D]
 
 
         sym = self.sym_mem
@@ -2034,6 +2040,9 @@ class MemoryExtractor(AGICoreModule):
         if K_sym > 0:
             sym_scores = sym.prio[:n_sym] # [n_sym]
             _, sym_idx = StableTopk(sym_scores, K_sym) # [K_sym]
+            sel_steps = sym.step[:n_sym].index_select(0, sym_idx)
+            time_order = torch.argsort(sel_steps, dim=0, descending=True)
+            sym_idx = sym_idx.index_select(0, time_order)
             top_vals = sym.P_vals[:n_sym].index_select(0, sym_idx) # [K_sym, nsK]
             out["sym"] = top_vals.unsqueeze(0).expand(B, K_sym, nsK).contiguous() # [B, K_sym, nsK]
 
@@ -2235,11 +2244,11 @@ class MemoryExtractor(AGICoreModule):
         if mergeGws and ("gws_keys" in state) and ("gws_vals" in state):
             gk = state["gws_keys"].to(device=self.gws.keys.device, dtype=self.gws.keys.dtype) # [B, S, D]
             gv = state["gws_vals"].to(device=self.gws.vals.device, dtype=self.gws.vals.dtype) # [B, S, D]
-            gpr = state.get("gws_priority", None)
-            gttl = state.get("gws_ttl", None)
-            gls = state.get("gws_last_step", None)
-            gsrc = state.get("gws_source", None)
-            ggs = state.get("gws_global_step", None)
+            gpr = state["gws_priority"].to(device=self.gws.priority.device, dtype=self.gws.priority.dtype) # [B, S]
+            gttl = state["gws_ttl"].to(device=self.gws.ttl.device, dtype=torch.long) # [B, S]
+            gls = state["gws_last_step"].to(device=self.gws.last_step.device, dtype=torch.long) # [B, S]
+            gsrc = state["gws_source"].to(device=self.gws.source.device, dtype=torch.int8) # [B, S]
+            ggs = state["gws_global_step"].to(device=self.gws.global_step.device, dtype=torch.long) # [B]
 
             B_src = int(gk.size(0))
             S_src = int(gk.size(1))
@@ -2252,22 +2261,11 @@ class MemoryExtractor(AGICoreModule):
             if int(gk.size(-1)) == D_dst and int(gv.size(-1)) == D_dst:
                 self.gws.keys[:B, :S].copy_(gk[:B, :S])
                 self.gws.vals[:B, :S].copy_(gv[:B, :S])
-
-                if gpr is not None:
-                    gpr = gpr.to(device=self.gws.priority.device, dtype=self.gws.priority.dtype) # [B, S]
-                    self.gws.priority[:B, :S].copy_(gpr[:B, :S])
-                if gttl is not None:
-                    gttl = gttl.to(device=self.gws.ttl.device, dtype=torch.long) # [B, S]
-                    self.gws.ttl[:B, :S].copy_(gttl[:B, :S])
-                if gls is not None:
-                    gls = gls.to(device=self.gws.last_step.device, dtype=torch.long) # [B, S]
-                    self.gws.last_step[:B, :S].copy_(gls[:B, :S])
-                if gsrc is not None:
-                    gsrc = gsrc.to(device=self.gws.source.device, dtype=torch.int8) # [B, S]
-                    self.gws.source[:B, :S].copy_(gsrc[:B, :S])
-                if ggs is not None:
-                    ggs = ggs.to(device=self.gws.global_step.device, dtype=torch.long) # [B]
-                    self.gws.global_step[:B].copy_(ggs[:B])
+                self.gws.priority[:B, :S].copy_(gpr[:B, :S])
+                self.gws.ttl[:B, :S].copy_(gttl[:B, :S])
+                self.gws.last_step[:B, :S].copy_(gls[:B, :S])
+                self.gws.source[:B, :S].copy_(gsrc[:B, :S])
+                self.gws.global_step[:B].copy_(ggs[:B])
 
         if ("memory_keys" in state) and ("memory_values" in state):
             k_src = state["memory_keys"].to(device=device, dtype=dtype) # [B, M, D]
@@ -2278,34 +2276,16 @@ class MemoryExtractor(AGICoreModule):
                 B = min(B_dst, B_src)
 
                 if D_src == int(self.memory_dim) and int(v_src.size(2)) == int(self.memory_dim):
-                    filled_src = state.get("memory_filled", None)
-                    if filled_src is None:
-                        filled_src = torch.full((B_src,), M_src, device=device, dtype=torch.long)
-                    else:
-                        filled_src = filled_src.to(device=device, dtype=torch.long)
+                    filled_src = state["memory_filled"].to(device=device, dtype=torch.long)
                     filled_src = filled_src.clamp(min=0, max=M_src)  # [B_src]
 
-                    imp_src = state.get("memory_importance", None)
-                    if imp_src is None:
-                        imp_src = torch.ones(B_src, M_src, device=device, dtype=dtype)
-                    else:
-                        imp_src = imp_src.to(device=device, dtype=dtype)
+                    imp_src = state["memory_importance"].to(device=device, dtype=dtype)
 
-                    emo_src = state.get("memory_emotion", None)
-                    if emo_src is None:
-                        emo_src = torch.zeros(B_src, M_src, self.emotion_dim, device=device, dtype=dtype)
-                    else:
-                        emo_src = emo_src.to(device=device, dtype=dtype)
+                    emo_src = state["memory_emotion"].to(device=device, dtype=dtype)
 
-                    src_src = state.get("memory_source", None)
-                    if src_src is None:
-                        src_src = torch.full((B_src, M_src), MemoryType.SRC_REAL, device=device, dtype=torch.int8)
-                    else:
-                        src_src = src_src.to(device=device, dtype=torch.int8)
+                    src_src = state["memory_source"].to(device=device, dtype=torch.int8)
 
-                    step_src = state.get("memory_steps", None)
-                    if step_src is not None:
-                        step_src = step_src.to(device=device, dtype=torch.long)  # [B, M]
+                    step_src = state["memory_steps"].to(device=device, dtype=torch.long)  # [B, M]
 
                     max_n = int(filled_src[:B].max().item())
                     M_dst = int(self.memory_size)
@@ -2331,10 +2311,7 @@ class MemoryExtractor(AGICoreModule):
                         emo_t = emo_src[:B, t]
                         src_t = src_src[:B, t]
 
-                        if (step_src is not None) and (step_src.dim() == 2):
-                            st_t = step_src[:B, t]
-                        else:
-                            st_t = self.time_step[:B]
+                        st_t = step_src[:B, t]
 
                         self.memory_keys[b_sel, tgt_sel].copy_(k_t[mask])
                         self.memory_values[b_sel, tgt_sel].copy_(v_t[mask])
@@ -2357,24 +2334,12 @@ class MemoryExtractor(AGICoreModule):
                 C_dst = int(sem.capacity)
 
                 if D_src == int(self.memory_dim) and int(v_src.size(2)) == int(self.memory_dim):
-                    filled_src = state.get("ltm_sem_filled", None)
-                    if filled_src is None:
-                        filled_src = torch.full((B_src,), C_src, device=sem.keys.device, dtype=torch.long)
-                    else:
-                        filled_src = filled_src.to(device=sem.keys.device, dtype=torch.long)
+                    filled_src = state["ltm_sem_filled"].to(device=sem.keys.device, dtype=torch.long)
                     filled_src = filled_src.clamp(min=0, max=C_src)
 
-                    pr_src = state.get("ltm_sem_prio", None)
-                    if pr_src is None:
-                        pr_src = torch.ones(B_src, C_src, device=sem.prio.device, dtype=sem.prio.dtype)
-                    else:
-                        pr_src = pr_src.to(device=sem.prio.device, dtype=sem.prio.dtype)
+                    pr_src = state["ltm_sem_prio"].to(device=sem.prio.device, dtype=sem.prio.dtype)
 
-                    src_src = state.get("ltm_sem_source", None)
-                    if src_src is None:
-                        src_src = torch.full((B_src, C_src), MemoryType.SRC_REAL, device=sem.source.device, dtype=torch.int8)
-                    else:
-                        src_src = src_src.to(device=sem.source.device, dtype=torch.int8)
+                    src_src = state["ltm_sem_source"].to(device=sem.source.device, dtype=torch.int8)
 
                     max_n = int(filled_src[:B].max().item())
                     for t in range(max_n):
@@ -2420,30 +2385,14 @@ class MemoryExtractor(AGICoreModule):
                 C_dst = int(epi.capacity)
 
                 if D_src == int(self.memory_dim) and int(v_src.size(2)) == int(self.memory_dim):
-                    filled_src = state.get("ltm_epi_filled", None)
-                    if filled_src is None:
-                        filled_src = torch.full((B_src,), C_src, device=epi.keys.device, dtype=torch.long)
-                    else:
-                        filled_src = filled_src.to(device=epi.keys.device, dtype=torch.long)
+                    filled_src = state["ltm_epi_filled"].to(device=epi.keys.device, dtype=torch.long)
                     filled_src = filled_src.clamp(min=0, max=C_src)
 
-                    pr_src = state.get("ltm_epi_prio", None)
-                    if pr_src is None:
-                        pr_src = torch.ones(B_src, C_src, device=epi.prio.device, dtype=epi.prio.dtype)
-                    else:
-                        pr_src = pr_src.to(device=epi.prio.device, dtype=epi.prio.dtype)
+                    pr_src = state["ltm_epi_prio"].to(device=epi.prio.device, dtype=epi.prio.dtype)
 
-                    rw_src = state.get("ltm_epi_rew", None)
-                    if rw_src is None:
-                        rw_src = torch.zeros(B_src, C_src, device=epi.rew.device, dtype=epi.rew.dtype)
-                    else:
-                        rw_src = rw_src.to(device=epi.rew.device, dtype=epi.rew.dtype)
+                    rw_src = state["ltm_epi_rew"].to(device=epi.rew.device, dtype=epi.rew.dtype)
 
-                    src_src = state.get("ltm_epi_source", None)
-                    if src_src is None:
-                        src_src = torch.full((B_src, C_src), MemoryType.SRC_REAL, device=epi.source.device, dtype=torch.int8)
-                    else:
-                        src_src = src_src.to(device=epi.source.device, dtype=torch.int8)
+                    src_src = state["ltm_epi_source"].to(device=epi.source.device, dtype=torch.int8)
 
                     max_n = int(filled_src[:B].max().item())
                     for t in range(max_n):
@@ -2485,25 +2434,11 @@ class MemoryExtractor(AGICoreModule):
             sym = self.sym_mem
             Pk = state["sym_mem_P_keys"].to(device=sym.P_keys.device, dtype=sym.P_keys.dtype) # [C, K]
             Pv = state["sym_mem_P_vals"].to(device=sym.P_vals.device, dtype=sym.P_vals.dtype) # [C, K]
-
-            pr = state.get("sym_mem_prio", None)
-            if pr is None:
-                pr = torch.ones(Pk.size(0), device=sym.prio.device, dtype=sym.prio.dtype)
-            else:
-                pr = pr.to(device=sym.prio.device, dtype=sym.prio.dtype).view(-1)
-
-            src = state.get("sym_mem_source", None)
-            if src is None:
-                src = torch.full((Pk.size(0),), MemoryType.SRC_REAL, device=sym.source.device, dtype=torch.int8)
-            else:
-                src = src.to(device=sym.source.device, dtype=torch.int8).view(-1)
-
-            filled_sym = state.get("sym_mem_filled", None)
-            if filled_sym is None:
-                n = int(min(Pk.size(0), Pv.size(0), pr.numel(), src.numel()))
-            else:
-                n = int(filled_sym.item())
-                n = max(0, min(n, Pk.size(0), Pv.size(0), pr.numel(), src.numel()))
+            pr = state["sym_mem_prio"].to(device=sym.prio.device, dtype=sym.prio.dtype).view(-1)
+            src = state["sym_mem_source"].to(device=sym.source.device, dtype=torch.int8).view(-1)
+            filled_sym = state["sym_mem_filled"]
+            n = int(filled_sym.item())
+            n = max(0, min(n, Pk.size(0), Pv.size(0), pr.numel(), src.numel()))
 
             for i in range(n):
                 sym.Store(
@@ -2620,8 +2555,6 @@ class MemoryExtractor(AGICoreModule):
 
             if "gws_source" in state:
                 copy_batch(self.gws.source, state["gws_source"].to(torch.int8), float_cast=False)
-            elif "gws_tag_id" in state:
-                copy_batch(self.gws.source, state["gws_tag_id"].to(torch.int8), float_cast=False)
 
         if importLtm:
             sem = self.ltm.semantic
@@ -2756,6 +2689,89 @@ class MemoryExtractor(AGICoreModule):
                 sym.step.zero_() 
             if resetGlobal and hasattr(sym, "global_step") and isinstance(sym.global_step, torch.Tensor):
                 sym.global_step.zero_()
+
+    @torch.no_grad()
+    def ReorderMemorySteps(self) -> None:
+        def RebaseBatchedSteps(steps: torch.Tensor, valid: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            B, N = steps.shape
+            if (B <= 0) or (N <= 0):
+                return torch.zeros_like(steps), torch.zeros(B, device=steps.device, dtype=torch.long)
+
+            if not bool(valid.any().item()):
+                return torch.zeros_like(steps), torch.zeros(B, device=steps.device, dtype=torch.long)
+
+            max_step = torch.iinfo(steps.dtype).max
+            metric = torch.where(valid, steps, torch.full_like(steps, max_step))
+            order = torch.argsort(metric, dim=1, descending=False)
+
+            counts = valid.sum(dim=1).to(dtype=torch.long)
+            ranks = torch.arange(1, N + 1, device=steps.device, dtype=torch.long).view(1, N).expand(B, N)
+            rank_valid = ranks <= counts.view(B, 1)
+            assign = torch.where(rank_valid, ranks, torch.zeros_like(ranks))
+
+            new_steps = torch.zeros_like(steps)
+            new_steps.scatter_(1, order, assign)
+            new_steps = torch.where(valid, new_steps, torch.zeros_like(new_steps))
+            return new_steps, counts
+
+        def RebaseFlatSteps(steps: torch.Tensor, filled: int) -> Tuple[torch.Tensor, int]:
+            n = int(filled)
+            new_steps = torch.zeros_like(steps)
+            if n <= 0:
+                return new_steps, 0
+
+            order = torch.argsort(steps[:n], dim=0, descending=False)
+            ranks = torch.arange(1, n + 1, device=steps.device, dtype=torch.long)
+            new_steps[:n].scatter_(0, order, ranks)
+            return new_steps, n
+
+        if hasattr(self, "memory_steps") and isinstance(self.memory_steps, torch.Tensor) and self.memory_steps.numel() > 0:
+            B, M = self.memory_steps.shape
+            slots = torch.arange(M, device=self.memory_steps.device).view(1, M)
+            valid = slots < self.memory_filled.view(B, 1)
+            new_steps, counts = RebaseBatchedSteps(self.memory_steps, valid)
+            self.memory_steps.copy_(new_steps)
+            self.time_step.copy_(counts)
+            if hasattr(self, "last_compress_step") and isinstance(self.last_compress_step, torch.Tensor):
+                self.last_compress_step.zero_()
+
+        gws = getattr(self, "gws", None)
+        if gws is not None and hasattr(gws, "last_step") and isinstance(gws.last_step, torch.Tensor):
+            valid = (gws.ttl > 0) & (gws.priority > 0)
+            new_steps, counts = RebaseBatchedSteps(gws.last_step, valid)
+            gws.last_step.copy_(new_steps)
+            if hasattr(gws, "global_step") and isinstance(gws.global_step, torch.Tensor):
+                gws.global_step.copy_(counts)
+
+        ltm = getattr(self, "ltm", None)
+        if ltm is not None:
+            sem = ltm.semantic
+            epi = ltm.episodic
+
+            if hasattr(sem, "step") and isinstance(sem.step, torch.Tensor):
+                B, C = sem.step.shape
+                slots = torch.arange(C, device=sem.step.device).view(1, C)
+                valid = slots < sem.filled.view(B, 1)
+                new_steps, counts = RebaseBatchedSteps(sem.step, valid)
+                sem.step.copy_(new_steps)
+                if hasattr(sem, "global_step") and isinstance(sem.global_step, torch.Tensor):
+                    sem.global_step.copy_(counts)
+
+            if hasattr(epi, "step") and isinstance(epi.step, torch.Tensor):
+                B, C = epi.step.shape
+                slots = torch.arange(C, device=epi.step.device).view(1, C)
+                valid = slots < epi.filled.view(B, 1)
+                new_steps, counts = RebaseBatchedSteps(epi.step, valid)
+                epi.step.copy_(new_steps)
+                if hasattr(epi, "global_step") and isinstance(epi.global_step, torch.Tensor):
+                    epi.global_step.copy_(counts)
+
+        sym = getattr(self, "sym_mem", None)
+        if sym is not None and hasattr(sym, "step") and isinstance(sym.step, torch.Tensor):
+            new_steps, count = RebaseFlatSteps(sym.step, int(sym.filled.item()))
+            sym.step.copy_(new_steps)
+            if hasattr(sym, "global_step") and isinstance(sym.global_step, torch.Tensor):
+                sym.global_step.fill_(int(count))
 
 
 
@@ -3039,6 +3055,224 @@ class TestMemoryMTool:
             print(f"EpisodicLTM eviction abs(reward) test error: {e}")
             return False
 
+    def TestExportMemoryBankLatestFirstOrder(self):
+        try:
+            cfg = dict(
+                inputDim=32,
+                ssmStateDim=32,
+                memoryDim=8,
+                memorySize=8,
+                symSize=8,
+                ltmSize=8,
+                nsK=4,
+                outputDim=8,
+                gwsSlots=4,
+                gwsTtl=8,
+                compressEvery=100,
+                emotionDim=4,)
+
+            cfg = self.FilterKwargs(MemoryExtractor, cfg)
+
+            mem = MemoryExtractor(**cfg).to(self.device)
+            mem.ResetAll()
+
+            mark_old, mark_mid, mark_new = 10.0, 20.0, 30.0
+            steps = torch.tensor([30, 10, 20], device=self.device, dtype=torch.long)
+            scores = torch.tensor([3.0, 2.0, 1.0], device=self.device, dtype=mem.dtype)
+            expected = torch.tensor([mark_new, mark_mid, mark_old], device=self.device, dtype=mem.dtype)
+
+            with torch.no_grad():
+                mem.time_step.fill_(30)
+                mem.memory_filled.fill_(3)
+                mem.memory_importance[0, :3] = scores
+                mem.memory_steps[0, :3] = steps
+                mem.memory_values.zero_()
+                mem.memory_values[0, 0, 0] = mark_new
+                mem.memory_values[0, 1, 0] = mark_old
+                mem.memory_values[0, 2, 0] = mark_mid
+
+                mem.gws.global_step.fill_(30)
+                mem.gws.priority.zero_()
+                mem.gws.ttl.zero_()
+                mem.gws.last_step.zero_()
+                mem.gws.vals.zero_()
+                mem.gws.priority[0, :3] = scores
+                mem.gws.ttl[0, :3] = 1
+                mem.gws.last_step[0, :3] = steps
+                mem.gws.vals[0, 0, 0] = mark_new
+                mem.gws.vals[0, 1, 0] = mark_old
+                mem.gws.vals[0, 2, 0] = mark_mid
+
+                sem = mem.ltm.semantic
+                sem.global_step.fill_(30)
+                sem.filled.fill_(3)
+                sem.prio.zero_()
+                sem.step.zero_()
+                sem.vals.zero_()
+                sem.prio[0, :3] = scores
+                sem.step[0, :3] = steps
+                sem.vals[0, 0, 0] = mark_new
+                sem.vals[0, 1, 0] = mark_old
+                sem.vals[0, 2, 0] = mark_mid
+
+                epi = mem.ltm.episodic
+                epi.global_step.fill_(30)
+                epi.filled.fill_(3)
+                epi.prio.zero_()
+                epi.step.zero_()
+                epi.vals.zero_()
+                epi.prio[0, :3] = scores
+                epi.step[0, :3] = steps
+                epi.vals[0, 0, 0] = mark_new
+                epi.vals[0, 1, 0] = mark_old
+                epi.vals[0, 2, 0] = mark_mid
+
+                sym = mem.sym_mem
+                sym.filled.fill_(3)
+                sym.prio.zero_()
+                sym.step.zero_()
+                sym.P_vals.zero_()
+                sym.prio[:3] = scores
+                sym.step[:3] = steps
+                sym.P_vals[0, 0] = mark_new
+                sym.P_vals[1, 0] = mark_old
+                sym.P_vals[2, 0] = mark_mid
+
+            bank = mem.ExportMemoryBank(topk=3)
+            assert bank is not None
+
+            for k in ("gws", "kv", "ltm_sem", "ltm_epi", "sym"):
+                got = bank[k][0, :, 0]
+                assert torch.allclose(got, expected), f"{k} export not latest-first: got {got.tolist()}"
+
+            print("ExportMemoryBank latest-first-order test passed.")
+            return True
+        except AssertionError as e:
+            print(f"ExportMemoryBank latest-first-order test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"ExportMemoryBank latest-first-order test error: {e}")
+            return False
+
+    def TestReorderMemorySteps(self):
+        try:
+            cfg = dict(
+                inputDim=32,
+                ssmStateDim=32,
+                memoryDim=8,
+                memorySize=8,
+                symSize=8,
+                ltmSize=8,
+                nsK=4,
+                outputDim=8,
+                gwsSlots=4,
+                gwsTtl=8,
+                compressEvery=100,
+                emotionDim=4,)
+
+            cfg = self.FilterKwargs(MemoryExtractor, cfg)
+
+            mem = MemoryExtractor(**cfg).to(self.device)
+            mem.ResetAll()
+
+            with torch.no_grad():
+                mem.time_step.fill_(30)
+                mem.memory_filled.fill_(3)
+                mem.memory_steps.zero_()
+                mem.memory_steps[0, :3] = torch.tensor([30, 10, 20], device=self.device, dtype=torch.long)
+
+                mem.gws.priority.zero_()
+                mem.gws.ttl.zero_()
+                mem.gws.last_step.zero_()
+                mem.gws.global_step.fill_(30)
+                mem.gws.priority[0, :3] = torch.tensor([3.0, 2.0, 1.0], device=self.device, dtype=mem.dtype)
+                mem.gws.ttl[0, :3] = 1
+                mem.gws.last_step[0, :3] = torch.tensor([30, 10, 20], device=self.device, dtype=torch.long)
+
+                sem = mem.ltm.semantic
+                sem.filled.fill_(3)
+                sem.step.zero_()
+                sem.global_step.fill_(30)
+                sem.step[0, :3] = torch.tensor([30, 10, 20], device=self.device, dtype=torch.long)
+
+                epi = mem.ltm.episodic
+                epi.filled.fill_(3)
+                epi.step.zero_()
+                epi.global_step.fill_(30)
+                epi.step[0, :3] = torch.tensor([30, 10, 20], device=self.device, dtype=torch.long)
+
+                sym = mem.sym_mem
+                sym.filled.fill_(3)
+                sym.step.zero_()
+                sym.global_step.fill_(30)
+                sym.step[:3] = torch.tensor([30, 10, 20], device=self.device, dtype=torch.long)
+
+                mem.memory_values.zero_()
+                mem.memory_values[0, 0, 0] = 30.0
+                mem.memory_values[0, 1, 0] = 10.0
+                mem.memory_values[0, 2, 0] = 20.0
+
+                mem.gws.vals.zero_()
+                mem.gws.vals[0, 0, 0] = 30.0
+                mem.gws.vals[0, 1, 0] = 10.0
+                mem.gws.vals[0, 2, 0] = 20.0
+
+                sem.vals.zero_()
+                sem.vals[0, 0, 0] = 30.0
+                sem.vals[0, 1, 0] = 10.0
+                sem.vals[0, 2, 0] = 20.0
+
+                epi.vals.zero_()
+                epi.vals[0, 0, 0] = 30.0
+                epi.vals[0, 1, 0] = 10.0
+                epi.vals[0, 2, 0] = 20.0
+
+                sym.P_vals.zero_()
+                sym.P_vals[0, 0] = 30.0
+                sym.P_vals[1, 0] = 10.0
+                sym.P_vals[2, 0] = 20.0
+
+            mem.ReorderMemorySteps()
+
+            expect_local = torch.tensor([3, 1, 2], device=self.device, dtype=torch.long)
+            if not torch.equal(mem.memory_steps[0, :3], expect_local):
+                raise AssertionError(f"kv steps mismatch: {mem.memory_steps[0, :3].tolist()}")
+            if not torch.equal(mem.gws.last_step[0, :3], expect_local):
+                raise AssertionError(f"gws steps mismatch: {mem.gws.last_step[0, :3].tolist()}")
+            if not torch.equal(mem.ltm.semantic.step[0, :3], expect_local):
+                raise AssertionError(f"ltm_sem steps mismatch: {mem.ltm.semantic.step[0, :3].tolist()}")
+            if not torch.equal(mem.ltm.episodic.step[0, :3], expect_local):
+                raise AssertionError(f"ltm_epi steps mismatch: {mem.ltm.episodic.step[0, :3].tolist()}")
+            if not torch.equal(mem.sym_mem.step[:3], expect_local):
+                raise AssertionError(f"sym steps mismatch: {mem.sym_mem.step[:3].tolist()}")
+
+            if int(mem.time_step[0].item()) != 3:
+                raise AssertionError(f"time_step={int(mem.time_step[0].item())}, expected 3")
+            if int(mem.gws.global_step[0].item()) != 3:
+                raise AssertionError(f"gws.global_step={int(mem.gws.global_step[0].item())}, expected 3")
+            if int(mem.ltm.semantic.global_step[0].item()) != 3:
+                raise AssertionError(f"ltm_sem.global_step={int(mem.ltm.semantic.global_step[0].item())}, expected 3")
+            if int(mem.ltm.episodic.global_step[0].item()) != 3:
+                raise AssertionError(f"ltm_epi.global_step={int(mem.ltm.episodic.global_step[0].item())}, expected 3")
+            if int(mem.sym_mem.global_step.item()) != 3:
+                raise AssertionError(f"sym.global_step={int(mem.sym_mem.global_step.item())}, expected 3")
+
+            bank = mem.ExportMemoryBank(topk=3)
+            assert bank is not None
+            expected = torch.tensor([30.0, 20.0, 10.0], device=self.device, dtype=mem.dtype)
+            for k in ("gws", "kv", "ltm_sem", "ltm_epi", "sym"):
+                got = bank[k][0, :, 0]
+                assert torch.allclose(got, expected), f"{k} export not latest-first after reset: got {got.tolist()}"
+
+            print("ReorderMemorySteps test passed.")
+            return True
+        except AssertionError as e:
+            print(f"ReorderMemorySteps test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"ReorderMemorySteps test error: {e}")
+            return False
+
     def TestMemoryExtractorForward(self):
         try:
             cfg = dict(
@@ -3167,7 +3401,7 @@ class TestMemoryMTool:
             state = mem1.ExportState()
 
             mem2 = MemoryExtractor(**cfg).to(self.device).eval()
-            mem2.load_state_dict(mem1.state_dict(), strict=False) 
+            mem2.load_state_dict(mem1.state_dict(), strict=True)
             mem2.ImportState(state, importGws=True, importLtm=True, importSym=True)
 
             y1 = self.CallMemForward(mem1, x, tdError=td, reward=rwd, emotion=emotion)
@@ -3567,6 +3801,8 @@ class TestMemoryMTool:
             "LongTermMemory": self.TestLongTermMemory(),
             "EpisodicEvictTouch": self.TestEpisodicEvictionTouchPrefersKeepHighTouch(),
             "EpisodicEvictAbsReward": self.TestEpisodicEvictionAbsRewardForNegative(),
+            "ExportMemoryBankLatestFirst": self.TestExportMemoryBankLatestFirstOrder(),
+            "ReorderMemorySteps": self.TestReorderMemorySteps(),
             "MemoryExtractorForward": self.TestMemoryExtractorForward(),
             "StateSaveRestore": self.TestStateSaveRestore(),
             "ExportImportRoundTrip": self.TestExportImportStateRoundTrip(),

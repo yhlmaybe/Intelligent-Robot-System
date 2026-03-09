@@ -633,7 +633,6 @@ class AttentionExtractor(AGICoreModule):
         if uncertainty is None:
             uncertainty = x.new_zeros(B, device=self.device, dtype=self.dtype) 
 
-        # Handle sequence padding
         if S % self.num_caps != 0:
             pad_len = self.num_caps - (S % self.num_caps)
             x = F.pad(x, (0,0,0,pad_len))
@@ -645,12 +644,9 @@ class AttentionExtractor(AGICoreModule):
             keep = (~keyPaddingMask).unsqueeze(-1)
             x = x * keep
         
-        # Use detached version of tdError for checkpointing
-        # td_error_detached = tdError.detach() if tdError is not None else None
         for blk in self.temporal_blocks:
             x = blk(x, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty)
 
-        # Create capsule mask
         chunk = S // self.num_caps
 
         if keyPaddingMask is not None:
@@ -671,7 +667,6 @@ class AttentionExtractor(AGICoreModule):
         routed = self.caps_out_proj(routed)
         routed = F.layer_norm(routed, (E,))
 
-        # Fusion of different representations
         routed_mean = routed.mean(dim=1) # [B,E]
         
         if keyPaddingMask is not None:
