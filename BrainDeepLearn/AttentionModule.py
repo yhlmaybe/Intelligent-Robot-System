@@ -164,9 +164,9 @@ class MultiHeadAttention(AGICoreModule):
         self.o_adapter = GrowableLoRALinear(self.out_proj)
         self.rope = RotaryEmbedding(self.head_dim)
 
-        self.register_buffer("hebbian_weights", torch.zeros(1, self.num_heads, self.head_dim, self.head_dim), persistent=False)  # (B,H,D,D)
-        self.register_buffer("U", torch.zeros(1, self.num_heads, self.head_dim, self.rank), persistent=False) 
-        self.register_buffer("V", torch.zeros(1, self.num_heads, self.head_dim, self.rank), persistent=False)
+        self.register_buffer("hebbian_weights", torch.zeros(1, self.num_heads, self.head_dim, self.head_dim), persistent=True)  # (B,H,D,D)
+        self.register_buffer("U", torch.zeros(1, self.num_heads, self.head_dim, self.rank), persistent=True) 
+        self.register_buffer("V", torch.zeros(1, self.num_heads, self.head_dim, self.rank), persistent=True)
 
         self.ResetParameters()
 

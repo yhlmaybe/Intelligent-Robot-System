@@ -80,7 +80,7 @@ class SiteSpec:
 class AGICoreModule(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
-        self.register_buffer("anchor_", torch.empty(0), persistent=False)
+        self.register_buffer("anchor_", torch.empty(0), persistent=True)
 
     @property
     def device(self):
@@ -113,7 +113,7 @@ class RotaryEmbedding(AGICoreModule):
             inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / float(self.dim)))
         else:
             inv_freq = torch.empty(0, dtype=torch.float32)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("inv_freq", inv_freq, persistent=True)
 
     def BuildCosSin(
         self,

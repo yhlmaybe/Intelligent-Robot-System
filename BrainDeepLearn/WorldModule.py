@@ -105,7 +105,7 @@ class S4DCell(AGICoreModule):
             nn.Dropout(float(dropout)),
             nn.Linear(ffnMult * self.deter_dim, self.deter_dim, bias=True),)
 
-        self.register_buffer("x", torch.zeros(1, self.ssm_dim), persistent=False)
+        self.register_buffer("x", torch.zeros(1, self.ssm_dim), persistent=True)
 
     def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
         if self.x.size(0) != B:

@@ -643,10 +643,10 @@ class ConsciousnessExtractor(AGICoreModule):
             nn.LayerNorm(self.dev_dim),
             nn.Linear(self.dev_dim, hyperHiddenDim),)
 
-        self.register_buffer("_dev_trace", torch.zeros(1, self.dev_dim), persistent=False)
-        self.register_buffer("_last_self_intent", torch.zeros(1, self.intent_dim), persistent=False)
-        self.register_buffer("_last_sem", torch.zeros(1, self.self_dim), persistent=False)
-        self.register_buffer("_step", torch.zeros(1, dtype=torch.long), persistent=False)
+        self.register_buffer("_dev_trace", torch.zeros(1, self.dev_dim), persistent=True)
+        self.register_buffer("_last_self_intent", torch.zeros(1, self.intent_dim), persistent=True)
+        self.register_buffer("_last_sem", torch.zeros(1, self.self_dim), persistent=True)
+        self.register_buffer("_step", torch.zeros(1, dtype=torch.long), persistent=True)
 
     @torch.no_grad()
     def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
