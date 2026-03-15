@@ -849,6 +849,7 @@ class Agent:
         reward: Optional[torch.Tensor] = None,
         done: Optional[torch.Tensor] = None,
         sampleActions: bool = True,
+        returnDecision: bool = False,
         deterministicActor: bool = False,):
 
         frame = frame.to(self.device)
@@ -877,12 +878,17 @@ class Agent:
             if step_out is None: return None
             total_loss = step_out["losses"]["total_loss"]
             packed = pack_action(step_out["decision"])
+            if returnDecision:
+                return (*packed, total_loss, step_out["decision"])
             return (*packed, total_loss)
         else:  
             with torch.no_grad():  
                 step_out = self.brain.Step(frame,textExt,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
                 if step_out is None: return None
-                return pack_action(step_out["decision"])
+                packed = pack_action(step_out["decision"])
+                if returnDecision:
+                    return (*packed, step_out["decision"])
+                return packed
 
 
     def Save(self, path: str):
@@ -979,17 +985,40 @@ class Agent:
 
     def ConvertNpImagesKeysMouses(
         self,
-        imgs: np.ndarray,
-        keys: np.ndarray,
-        mouse: np.ndarray,
-        reward: np.ndarray,
-        done: np.ndarray,
+        imgs: Optional[Union[np.ndarray, torch.Tensor]],
+        keys: Optional[Union[np.ndarray, torch.Tensor]],
+        mouseClick: Optional[Union[np.ndarray, torch.Tensor]],
+        mouseMove: Optional[Union[np.ndarray, torch.Tensor]],
+        reward: Optional[Union[np.ndarray, torch.Tensor]],
+        done: Optional[Union[np.ndarray, torch.Tensor]],
         *,
         size: Optional[Tuple[int, int]] = (BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE),
-        device: Optional[torch.device] = None,) -> Dict[str, List]:
+        device: Optional[torch.device] = None,) -> Dict[str, Optional[torch.Tensor]]:
+
+        def ensure_tensor(x):
+            if x is None:
+                return None
+            if isinstance(x, np.ndarray):
+                return torch.from_numpy(x)
+            if isinstance(x, torch.Tensor):
+                return x
+            return torch.as_tensor(x)
 
         if imgs is not None:
-            img_tensor = torch.from_numpy(imgs).permute(0, 3, 1, 2).contiguous().float() / 255.0  # [B,3,H,W]
+            img_tensor = ensure_tensor(imgs)
+            if img_tensor.dim() == 3:
+                img_tensor = img_tensor.unsqueeze(0)
+            if img_tensor.dim() != 4:
+                raise ValueError(f"Unexpected image batch shape: {tuple(img_tensor.shape)}")
+
+            was_float = torch.is_floating_point(img_tensor)
+            if img_tensor.size(1) not in (1, 3, 4) and img_tensor.size(-1) in (1, 3, 4):
+                img_tensor = img_tensor.permute(0, 3, 1, 2).contiguous()
+
+            img_tensor = img_tensor.float()
+            if (not was_float) or img_tensor.detach().max().item() > 1.0:
+                img_tensor = img_tensor / 255.0
+
             if size is not None:
                 out_h, out_w = size
                 img_tensor = F.interpolate(img_tensor,size=(out_h, out_w),mode="bilinear",align_corners=False,antialias=True,)
@@ -998,18 +1027,25 @@ class Agent:
 
         def convert_tensor(x):
             if x is not None:
-                x_tensor = torch.from_numpy(x).float()
+                x_tensor = ensure_tensor(x).float()
                 if device is not None:
                     x_tensor = x_tensor.to(device)
             else: x_tensor = None
             return x_tensor
 
         key_tensor = convert_tensor(keys)
-        mouse_tensor = convert_tensor(mouse)
+        mouse_click_tensor = convert_tensor(mouseClick)
+        mouse_move_tensor = convert_tensor(mouseMove)
         reward_tensor = convert_tensor(reward)
         done_tensor = convert_tensor(done)
 
-        return {"frames": img_tensor, "keys": key_tensor, "mouses": mouse_tensor, "rewards": reward_tensor, "dones": done_tensor,}
+        return {
+            "frames": img_tensor,
+            "keys": key_tensor,
+            "mouse_clicks": mouse_click_tensor,
+            "mouse_moves": mouse_move_tensor,
+            "rewards": reward_tensor,
+            "dones": done_tensor,}
 
 
     def UpdateWrappers(self, wrappers, action: str, **kwargs):

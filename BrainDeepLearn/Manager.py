@@ -37,10 +37,15 @@ class OfflineGameDataset(Dataset):
         p = Path(root)
         self.imgs = sorted((p / "frames").glob("*.png"))
         self.keys = sorted((p / "keys").glob("*.npy"))
-        self.mouse = sorted((p / "mouse").glob("*.npy"))
+        self.mouse_click = sorted((p / "mouse_click").glob("*.npy"))
+        self.mouse_move = sorted((p / "mouse_move").glob("*.npy"))
         self.reward = sorted((p / "reward").glob("*.npy")) 
         self.done = sorted((p / "done").glob("*.npy")) 
-        assert len(self.imgs) == len(self.keys) == len(self.mouse)==len(self.reward) == len(self.done), "frames/keys/mouse/reward/done The number of files is inconsistent."
+        self.texts = sorted((p / "texts").glob("*.txt"))
+
+        assert len(self.imgs) == len(self.keys) == len(self.mouse_click) == len(self.mouse_move) == len(self.reward) == len(self.done), "frames/keys/mouse_click/mouse_move/reward/done The number of files is inconsistent."
+        if self.texts:
+            assert len(self.texts) == len(self.imgs), "texts The number of files is inconsistent."
 
     def __len__(self) -> int:
         return len(self.imgs)
@@ -48,10 +53,14 @@ class OfflineGameDataset(Dataset):
     def __getitem__(self, idx: int):
         imgs = iio.imread(self.imgs[idx])
         keys = np.load(self.keys[idx]).astype(np.float32)
-        mouse = np.load(self.mouse[idx]).astype(np.float32)
+        mouse_click = np.load(self.mouse_click[idx]).astype(np.float32)
+        mouse_move = np.load(self.mouse_move[idx]).astype(np.float32)
         reward = np.load(self.reward[idx]).astype(np.float32)
         done = np.load(self.done[idx]).astype(np.float32)
-        return imgs, keys, mouse, reward, done
+        ext_text = None
+        if self.texts:
+            ext_text = self.texts[idx].read_text(encoding="utf-8").strip()
+        return imgs, keys, mouse_click, mouse_move, reward, done, ext_text
 
 
 
@@ -201,6 +210,11 @@ class ManagerFunction:
     def TrainLoop(self,root: str, epochs: int, batchSize: int, valSplit: float, resume: bool, onlineLearning = False, *, worldMemPath: str = None, memMemPath: str = None, ckptPath: str = None,):
         try:
             torch.autograd.set_detect_anomaly(True)
+            ckptPath = ckptPath or BasicParameters.CKPT_PATH_TRAIN
+
+            self.controller.stop_requested = False
+            self.controller.pause_requested = False
+            self.controller.reset_hebbian = False
 
             ds = OfflineGameDataset(root)
 
@@ -210,8 +224,6 @@ class ManagerFunction:
 
             if onlineLearning:
                 agent.UpdateAllWrappers("autogrow")
-
-            SEQ_LEN = agent.brain.SEQ_LEN
 
             start_epoch = 0
             best_val = float("inf")
@@ -230,32 +242,63 @@ class ManagerFunction:
                 train_ds, val_ds, test_ds = torch.utils.data.random_split(
                     ds, [n_train, n_val, n_test])
             else:
-                n_used = len(train_ds) + len(val_ds)
-                n_left = len(ds) - n_used
-                if n_left > 0:
-                    test_ds, = torch.utils.data.random_split(ds, [n_left])
-                else:
-                    test_ds = val_ds
+                train_indices = list(train_ds.indices) if hasattr(train_ds, "indices") else list(range(len(train_ds)))
+                val_indices = list(val_ds.indices) if hasattr(val_ds, "indices") else []
+                used = set(train_indices) | set(val_indices)
+                test_indices = [idx for idx in range(len(ds)) if idx not in used]
+                test_ds = torch.utils.data.Subset(ds, test_indices) if len(test_indices) > 0 else val_ds
 
             train_dl = DataLoader(train_ds, batch_size=batchSize, shuffle=False, num_workers=0, pin_memory=True,)
             val_dl = DataLoader(val_ds, batch_size=batchSize, shuffle=False, num_workers=0)
             test_dl = DataLoader(test_ds, batch_size=batchSize, shuffle=False, num_workers=0)
 
-            bce = nn.BCELoss()
             mse = nn.MSELoss()
-
-            all_codes = []
-            for grp in RAW_KEYBOARD_LAYOUT.values():
-                all_codes += list(grp.values())
-
-            max_code = max(all_codes)
-            keys_dim = max_code + 1 + 2
 
             patience = 5 
             min_delta = 1e-4 
             no_improve = 0
             target_acc = 0.90 
             max_gap = 0.1
+
+            def unpack_batch(batch):
+                img_b, key_b, mouse_click_b, mouse_move_b, reward_b, done_b, ext_text_b = batch
+
+                if ext_text_b is not None:
+                    if isinstance(ext_text_b, tuple):
+                        ext_text_b = list(ext_text_b)
+                    elif isinstance(ext_text_b, list):
+                        ext_text_b = ext_text_b
+                    else:
+                        ext_text_b = [ext_text_b]
+
+                    ext_text_b = [
+                        None if (t is None or str(t).strip() == "") else str(t)
+                        for t in ext_text_b]
+
+                return img_b, key_b, mouse_click_b, mouse_move_b, reward_b, done_b, ext_text_b
+
+            def compute_supervised_loss_and_metrics(
+                key_pred: Optional[torch.Tensor],
+                click_pred: Optional[torch.Tensor],
+                mouse_move_pred: Optional[torch.Tensor],
+                keys_t: Optional[torch.Tensor],
+                mouse_click_t: Optional[torch.Tensor],
+                mouse_move_t: Optional[torch.Tensor],):
+
+                key_targets = keys_t.float()
+                click_targets = mouse_click_t.float()
+                move_targets = mouse_move_t.float()
+
+                cur_loss = (
+                    mse(key_pred.float(), key_targets)
+                    + mse(click_pred.float(), click_targets)
+                    + 0.05 * mse(mouse_move_pred.float(), move_targets))
+
+                total_correct = float((key_pred.float() == key_targets).float().sum().item())
+                total_correct += float((click_pred.float() == click_targets).float().sum().item())
+                total_elems = int(key_targets.numel() + click_targets.numel())
+
+                return cur_loss, total_correct, total_elems
 
             self.controller.SetStatus("training", "Training started", epoch=start_epoch, total_epochs=epochs, batch=0, total_batches=len(train_dl),)
 
@@ -274,13 +317,22 @@ class ManagerFunction:
 
                 agent.ResetBrainState(B=batchSize, isOnlineLearning=onlineLearning)
 
-                for bi, (img_b, key_b, mouse_b, reward_b, done_b, ext_text_b) in enumerate(train_dl, start=1):
+                for bi, batch in enumerate(train_dl, start=1):
+                    img_b, key_b, mouse_click_b, mouse_move_b, reward_b, done_b, ext_text_b = unpack_batch(batch)
 
-                    pack = agent.ConvertNpImagesKeysMouses(imgs=img_b, keys=key_b, mouse=mouse_b, reward=reward_b, done=done_b, device=self.device,)
-
+                    pack = agent.ConvertNpImagesKeysMouses(
+                        imgs=img_b,
+                        keys=key_b,
+                        mouseClick=mouse_click_b,
+                        mouseMove=mouse_move_b,
+                        reward=reward_b,
+                        done=done_b,
+                        device=self.device,)
+                    
                     frames = pack["frames"]
                     keys_t = pack["keys"]
-                    mouse_t = pack["mouses"]
+                    mouse_click_t = pack["mouse_clicks"]
+                    mouse_move_t = pack["mouse_moves"]
                     reward_t = pack["rewards"]
                     done_t = pack["dones"]
 
@@ -288,14 +340,25 @@ class ManagerFunction:
                         agent.ResetHebbianMemory()
                         self.controller.RequestCancelResetHebbian()
 
-                    key_pred, click_pred, mouse_pred, model_loss = agent.Act(frames, textExt=ext_text_b, reward=reward_t, done=done_t, deterministicActor=False,)
+                    act_out = agent.Act(
+                        frames,
+                        textExt=ext_text_b,
+                        reward=reward_t,
+                        done=done_t,
+                        sampleActions=True,
+                        deterministicActor=False,)
+                    
+                    if act_out is None:
+                        continue
 
-                    bc_loss = torch.zeros((), device=self.device)
-                    if keys_t is not None:
-                        K_use = min(keys_t.size(1), keys_dim)
-                        bc_loss = bc_loss + bce(key_pred[:, :K_use], keys_t[:, :K_use].float())
-                    if mouse_t is not None:
-                        bc_loss = bc_loss + 0.05 * mse(mouse_pred, mouse_t)
+                    key_pred, click_pred, mouse_move_pred, model_loss = act_out
+                    bc_loss, _, _ = compute_supervised_loss_and_metrics(
+                        key_pred,
+                        click_pred,
+                        mouse_move_pred,
+                        keys_t,
+                        mouse_click_t,
+                        mouse_move_t,)
 
                     loss = model_loss + bc_loss
 
@@ -342,33 +405,52 @@ class ManagerFunction:
 
                 def eval_split(dl):
                     brain.eval()
+                    agent.ResetBrainState(B=batchSize, isOnlineLearning=onlineLearning)
                     split_loss = 0.0
                     split_batches = 0
                     total_correct = 0
                     total_elems = 0
 
                     with torch.no_grad():
-                        for (img_b, key_b, mouse_b, reward_b, done_b, ext_text_b) in dl:
-                            v_pack = agent.ConvertNpImagesKeysMouses(imgs=img_b, keys=key_b, mouse=mouse_b, reward=reward_b, done=done_b, device=self.device,)
+                        for batch in dl:
+                            img_b, key_b, mouse_click_b, mouse_move_b, reward_b, done_b, ext_text_b = unpack_batch(batch)
 
+                            v_pack = agent.ConvertNpImagesKeysMouses(
+                                imgs=img_b,
+                                keys=key_b,
+                                mouseClick=mouse_click_b,
+                                mouseMove=mouse_move_b,
+                                reward=reward_b,
+                                done=done_b,
+                                device=self.device,)
+                            
                             v_frames = v_pack["frames"]
                             v_keys_t = v_pack["keys"]
-                            v_mouse_t = v_pack["mouses"]
+                            v_mouse_click_t = v_pack["mouse_clicks"]
+                            v_mouse_move_t = v_pack["mouse_moves"]
 
-                            v_key_pred, v_click_pred, v_mouse_pred = agent.Act(v_frames, textExt=ext_text_b, reward=None, done=None, deterministicActor=True,)
+                            act_out = agent.Act(
+                                v_frames,
+                                textExt=ext_text_b,
+                                reward=None,
+                                done=None,
+                                sampleActions=True,
+                                deterministicActor=True,)
+                            
+                            if act_out is None:
+                                continue
 
-                            cur_loss = torch.zeros((), device=self.device)
-                            if v_keys_t is not None:
-                                K_use = min(v_key_pred.size(1), v_keys_t.size(1), keys_dim,)
-                                cur_loss = cur_loss + bce(v_key_pred[:, :K_use], v_keys_t[:, :K_use].float(),)
-
-                                pred_bin = (v_key_pred[:, :K_use] > 0.5).float()
-                                tgt_bin = v_keys_t[:, :K_use].float()
-                                total_correct += (pred_bin == tgt_bin).float().sum().item()
-                                total_elems += pred_bin.numel()
-
-                            if v_mouse_t is not None:
-                                cur_loss = cur_loss + 0.05 * mse(v_mouse_pred, v_mouse_t)
+                            v_key_pred, v_click_pred, v_mouse_move_pred = act_out
+                            cur_loss, correct, elems = compute_supervised_loss_and_metrics(
+                                v_key_pred,
+                                v_click_pred,
+                                v_mouse_move_pred,
+                                v_keys_t,
+                                v_mouse_click_t,
+                                v_mouse_move_t,)
+                            
+                            total_correct += correct
+                            total_elems += elems
 
                             split_loss += float(cur_loss.item())
                             split_batches += 1
@@ -384,6 +466,7 @@ class ManagerFunction:
                 if improved:
                     best_val = avg_val
                     no_improve = 0
+                    agent.SaveRuntimeMemories()
 
                     ckpt = {
                         "epoch": ep + 1,
@@ -397,6 +480,9 @@ class ManagerFunction:
                         else None,
                         "val_indices": list(val_ds.indices)
                         if hasattr(val_ds, "indices")
+                        else None,
+                        "test_indices": list(test_ds.indices)
+                        if hasattr(test_ds, "indices")
                         else None,
                         "rng": {
                             "python": random.getstate(),
@@ -413,7 +499,8 @@ class ManagerFunction:
 
                 if (val_acc >= target_acc and test_acc >= target_acc and abs(val_acc - test_acc) <= max_gap):
                     self.controller.SetStatus("completed", f"Val/Test accuracies high & close: val={val_acc:.3f}, test={test_acc:.3f}",)
-                    agent.UpdateAllWrappers("commit")
+                    if onlineLearning:
+                        agent.UpdateAllWrappers("commit")
                     break
 
                 if no_improve >= patience:
@@ -546,10 +633,9 @@ class ManagerFunction:
 
             code_to_name: dict[int, str] = {}
             all_codes = []
-            for grp, mp in RAW_KEYBOARD_LAYOUT.items():
-                for name, code in mp.items():
-                    code_to_name.setdefault(code, name)
-                    all_codes.append(code)
+            for name, code in RAW_KEYBOARD_LAYOUT.items():
+                code_to_name.setdefault(code, name)
+                all_codes.append(code)
             max_code = max(all_codes)
 
             frame_buf: List[np.ndarray] = []
@@ -715,22 +801,15 @@ class ManagerFunction:
                 shutil.rmtree(root)
             (root / "frames").mkdir(parents=True, exist_ok=True)
             (root / "keys").mkdir(parents=True, exist_ok=True)
-            (root / "mouse").mkdir(parents=True, exist_ok=True)
+            (root / "mouse_click").mkdir(parents=True, exist_ok=True)
+            (root / "mouse_move").mkdir(parents=True, exist_ok=True)
             (root / "reward").mkdir(parents=True, exist_ok=True)
             (root / "done").mkdir(parents=True, exist_ok=True)
             (root / "texts").mkdir(parents=True, exist_ok=True)
 
-            all_codes = []
-            for grp in RAW_KEYBOARD_LAYOUT.values():
-                all_codes += list(grp.values())
+            all_codes = list(RAW_KEYBOARD_LAYOUT.values())
             max_code = max(all_codes)
-            keys_dim = max_code + 1 + 2
-
-            base_codes = [RAW_KEYBOARD_LAYOUT["base_keys"][k] for k in RAW_KEYBOARD_LAYOUT["base_keys"]]
-            extra_codes = []
-            for grp in ["menu_keys", "system_keys", "alpha_keys"]:
-                extra_codes += [RAW_KEYBOARD_LAYOUT[grp][k] for k in RAW_KEYBOARD_LAYOUT[grp]]
-            skill_codes = [RAW_KEYBOARD_LAYOUT["skill_keys"][k] for k in RAW_KEYBOARD_LAYOUT["skill_keys"]]
+            keys_dim = max_code + 1
 
             H, W = BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE
 
@@ -743,19 +822,18 @@ class ManagerFunction:
                 iio.imwrite(str(root / "frames" / f"{i:05d}.png"), img)
 
                 keys = np.zeros((keys_dim,), dtype=np.float32)
-                for code in base_codes:
-                    keys[code] = 1.0 if rng.random() < 0.10 else 0.0
-                for code in extra_codes:
+                for code in all_codes:
                     keys[code] = 1.0 if rng.random() < 0.05 else 0.0
-                if rng.random() >= 0.50:
-                    keys[rng.choice(skill_codes)] = 1.0
 
-                keys[max_code + 1] = 1.0 if rng.random() < 0.15 else 0.0
-                keys[max_code + 2] = 1.0 if rng.random() < 0.05 else 0.0
                 np.save(str(root / "keys" / f"{i:05d}.npy"), keys)
 
-                mouse = rng.normal(loc=0.0, scale=2.0, size=(2,)).astype(np.float32)
-                np.save(str(root / "mouse" / f"{i:05d}.npy"), mouse)
+                mouse_click = np.zeros((2,), dtype=np.float32)
+                mouse_click[0] = 1.0 if rng.random() < 0.15 else 0.0
+                mouse_click[1] = 1.0 if rng.random() < 0.05 else 0.0
+                np.save(str(root / "mouse_click" / f"{i:05d}.npy"), mouse_click)
+
+                mouse_move = rng.normal(loc=0.0, scale=2.0, size=(2,)).astype(np.float32)
+                np.save(str(root / "mouse_move" / f"{i:05d}.npy"), mouse_move)
 
                 reward = rng.normal(loc=0.0, scale=2.0, size=(1,)).astype(np.float32)
                 np.save(str(root / "reward" / f"{i:05d}.npy"), reward)
@@ -808,17 +886,18 @@ class ManagerFunction:
             def has_existing_data(p: Path) -> bool:
                 frames_dir = p / "frames"
                 keys_dir = p / "keys"
-                mouse_dir = p / "mouse"
+                mouse_click_dir = p / "mouse_click"
+                mouse_move_dir = p / "mouse_move"
                 reward_dir = p / "reward"
                 done_dir = p / "done"
-                if not (frames_dir.exists() and keys_dir.exists() and mouse_dir.exists() and reward_dir.exists() and done_dir.exists()):
+                if not (frames_dir.exists() and keys_dir.exists() and mouse_click_dir.exists() and mouse_move_dir.exists() and reward_dir.exists() and done_dir.exists()):
                     return False
                 if not any(frames_dir.glob("*.png")):
                     return False
                 return True
 
             if not has_existing_data(root):
-                print(f"[Train] no dataset found at {root}, please prepare frames/keys/mouse/reward/done first.")
+                print(f"[Train] no dataset found at {root}, please prepare frames/keys/mouse_click/mouse_move/reward/done first.")
                 return {"ok": False, "msg": "no dataset"}
 
             print(f"[Train] use existing dataset at: {root}")
