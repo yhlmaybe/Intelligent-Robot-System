@@ -2682,6 +2682,57 @@ class TestIntentionMTool:
             "loss_recall_total": stats["recall_loss_total"],}
         return bundle, symProbs, extras
 
+    def TestIntentionExtractorIOShapes(self) -> bool:
+        try:
+            model = self.MakeTestModel()
+            model.eval()
+
+            B = 2
+            selfState, intentState, ocrTexts, extTexts, _ = self.MakeDummyBatch(
+                model,
+                batch_size=B,
+                with_ocr=True,
+                with_ext=True,
+                with_cons=True,
+                compact_text=True,)
+
+            def print_shape(name: str, tensor: torch.Tensor):
+                print(f"{name}: {tuple(tensor.shape)}")
+
+            def print_nested(prefix: str, obj):
+                if isinstance(obj, torch.Tensor):
+                    print_shape(prefix, obj)
+                elif isinstance(obj, dict):
+                    for key, value in obj.items():
+                        next_prefix = f"{prefix}.{key}" if prefix else key
+                        print_nested(next_prefix, value)
+
+            with torch.no_grad():
+                if selfState is not None:
+                    print_shape("input.selfState", selfState)
+                if intentState is not None:
+                    print_shape("input.intentState", intentState)
+
+                intentSem, symProbs, extras = model(
+                    selfState,
+                    intentState,
+                    ocrTexts=ocrTexts,
+                    extTexts=extTexts,
+                    prioritizeExt=False,)
+
+                if intentSem is not None:
+                    print_shape("output.intentSem", intentSem)
+                if symProbs is not None:
+                    print_shape("output.symProbs", symProbs)
+                print_nested("output.extras", extras)
+
+            assert intentSem is not None and intentSem.shape == (B, model.dimSem)
+            assert symProbs is not None and symProbs.shape == (B, int(model.conceptEmb.size(0)))
+            return True
+        except Exception as e:
+            print("TestIntentionExtractorIOShapes error:", type(e).__name__, e)
+            return False
+
     @staticmethod
     def BestSeen(history: List[float]) -> float:
         if len(history) <= 0:
@@ -3368,6 +3419,7 @@ class TestIntentionMTool:
 
     def RunAll(self) -> Dict[str, bool]:
         results = {
+            "IntentionExtractorIOShapes": self.TestIntentionExtractorIOShapes(),
             "ForwardVariants": self.ForwardVariants(),
             "TrainStepSmokeBase": self.TrainStepSmokeBase(),
             "AllTrainableGradCoverageBase": self.AllTrainableGradCoverageBase(),

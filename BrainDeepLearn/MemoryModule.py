@@ -3316,6 +3316,62 @@ class TestMemoryMTool:
             print(f"MemoryExtractor forward test error: {e}")
             return False
 
+    def TestMemoryExtractorIOShapes(self):
+        try:
+            cfg = dict(
+                inputDim=1024,
+                ssmStateDim=1024,
+                memoryDim=1024,
+                memorySize=32,
+                symSize=64,
+                ltmSize=64,
+                nsK=32,
+                outputDim=1024,
+                gwsSlots=8,
+                gwsTtl=6,
+                compressEvery=50,
+                emotionDim=64,)
+
+            cfg = self.FilterKwargs(MemoryExtractor, cfg)
+
+            mem = MemoryExtractor(**cfg).to(self.device)
+            mem.eval()
+
+            B = 2
+            x = torch.randn(B, cfg["inputDim"], device=self.device)
+            td = torch.randn(B, device=self.device)
+            reward = torch.randn(B, device=self.device)
+            emotion = torch.randn(B, cfg["emotionDim"], device=self.device)
+            source_label = torch.zeros(B, dtype=torch.int8, device=self.device)
+
+            def print_shape(name: str, tensor: torch.Tensor):
+                print(f"{name}: {tuple(tensor.shape)}")
+
+            with torch.no_grad():
+                print_shape("input.x", x)
+                print_shape("input.tdError", td)
+                print_shape("input.emotion", emotion)
+                print_shape("input.reward", reward)
+                print_shape("input.sourceLabel", source_label)
+
+                y = mem(
+                    x,
+                    tdError=td,
+                    emotion=emotion,
+                    reward=reward,
+                    sourceLabel=source_label,)
+                print_shape("output.y", y)
+
+            assert y.shape == (B, cfg["outputDim"]), f"Output shape mismatch: {y.shape}"
+            print("MemoryExtractor IO shapes test passed.")
+            return True
+        except AssertionError as e:
+            print(f"MemoryExtractor IO shapes test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"MemoryExtractor IO shapes test error: {e}")
+            return False
+
     def TestStateSaveRestore(self):
         try:
             cfg = dict(
@@ -3804,6 +3860,7 @@ class TestMemoryMTool:
             "ExportMemoryBankLatestFirst": self.TestExportMemoryBankLatestFirstOrder(),
             "ReorderMemorySteps": self.TestReorderMemorySteps(),
             "MemoryExtractorForward": self.TestMemoryExtractorForward(),
+            "MemoryExtractorIOShapes": self.TestMemoryExtractorIOShapes(),
             "StateSaveRestore": self.TestStateSaveRestore(),
             "ExportImportRoundTrip": self.TestExportImportStateRoundTrip(),
             "AutoCompress": self.TestAutoCompress(),

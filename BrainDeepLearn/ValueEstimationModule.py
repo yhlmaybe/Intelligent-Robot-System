@@ -1397,7 +1397,8 @@ class ValueEstimationExtractor(AGICoreModule):
             + 0.10 * loss_micro
             + loss_git
             + loss_mix
-            + loss_hebb_wd)
+            + loss_hebb_wd
+            + loss_unc)
 
         with torch.no_grad():
             self._prev_h = h.detach() # [B, H]
@@ -2002,6 +2003,54 @@ class TestValueEstimationMTool:
             print(f"ExtractorFunctional error: {e}")
             return False
 
+    def TestValueEstimatorIOShapes(self) -> bool:
+        try:
+            torch.manual_seed(142)
+            B = 2
+            mem, attn, state = self.RandBatch(B)
+            reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
+
+            est = self.NewEstimator(useHebb=False).train()
+
+            def print_shape(name: str, tensor: torch.Tensor):
+                print(f"{name}: {tuple(tensor.shape)}")
+
+            print_shape("input.memory", mem)
+            print_shape("input.attn", attn)
+            print_shape("input.state", state)
+            print_shape("input.rewardExt", reward)
+            print_shape("input.policyEntropyPrev", entropy)
+            print_shape("input.done", done)
+            print_shape("input.worldDeltaTransport", d_tr)
+            print_shape("input.worldDeltaPhysics", d_ph)
+
+            out = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
+
+            out_dict = out._asdict()
+            for key, value in out_dict.items():
+                if isinstance(value, torch.Tensor):
+                    print_shape(f"output.{key}", value)
+                elif isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, torch.Tensor):
+                            print_shape(f"output.{key}.{sub_key}", sub_value)
+
+            ok = True
+            ok &= (out.value.shape == (B, 1))
+            ok &= (out.tdError.shape == (B,))
+            ok &= (out.loss.shape == ())
+            ok &= (out.emotion.shape[0] == B)
+            ok &= (out.uncertainty.shape == (B,))
+            ok &= (out.rComps is not None and out.rComps["v_micro"].shape == (B, 1))
+            ok &= (out.rComps is not None and out.rComps["unc_total"].shape == (B,))
+            ok &= (out.extras is not None and torch.is_tensor(out.extras["loss_td"]))
+
+            print(f"ValueEstimator IO shapes {'pass' if ok else 'fail'}")
+            return ok
+        except Exception as e:
+            print(f"ValueEstimator IO shapes error: {e}")
+            return False
+
     def TestTDUncertaintyBounds(self) -> bool:
         try:
             torch.manual_seed(43)
@@ -2591,6 +2640,7 @@ class TestValueEstimationMTool:
     def RunAll(self):
         results = {
             "ExtractorFunctional": self.TestExtractorFunctional(),
+            "ValueEstimatorIOShapes": self.TestValueEstimatorIOShapes(),
             "TDUncertaintyBounds": self.TestTDUncertaintyBounds(),
             "StateMachineAndMicroGraph": self.TestStateMachineAndMicroGraph(),
             "BatchResizeAndPredictorShapes": self.TestBatchResizeAndPredictorShapes(),

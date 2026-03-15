@@ -288,7 +288,7 @@ class ManagerFunction:
                         agent.ResetHebbianMemory()
                         self.controller.RequestCancelResetHebbian()
 
-                    key_pred, mouse_pred, model_loss = agent.Act(frames, textExt=ext_text_b, reward=reward_t, done=done_t, deterministicActor=False,)
+                    key_pred, click_pred, mouse_pred, model_loss = agent.Act(frames, textExt=ext_text_b, reward=reward_t, done=done_t, deterministicActor=False,)
 
                     bc_loss = torch.zeros((), device=self.device)
                     if keys_t is not None:
@@ -355,7 +355,7 @@ class ManagerFunction:
                             v_keys_t = v_pack["keys"]
                             v_mouse_t = v_pack["mouses"]
 
-                            v_key_pred, v_mouse_pred, _ = agent.Act(v_frames, textExt=ext_text_b, reward=None, done=None, deterministicActor=True,)
+                            v_key_pred, v_click_pred, v_mouse_pred = agent.Act(v_frames, textExt=ext_text_b, reward=None, done=None, deterministicActor=True,)
 
                             cur_loss = torch.zeros((), device=self.device)
                             if v_keys_t is not None:
@@ -571,9 +571,10 @@ class ManagerFunction:
                         agent.ResetHebbianMemory()
                         self.controller.RequestCancelResetHebbian()
 
-                    key_vec, mouse, _ = agent.Act(frames,reward=None,done=None,sampleActions=True,deterministicActor=True,)
+                    keys, clicks, mouse = agent.Act(frames,reward=None,done=None,sampleActions=True,deterministicActor=True,)
 
-                    kv = key_vec[0].detach().cpu()
+                    kv = keys[0].detach().cpu()
+                    ck = clicks[0].detach().cpu()
                     ms = mouse[0].detach().cpu()
 
                     pressed_names: list[str] = []
@@ -581,9 +582,9 @@ class ManagerFunction:
                         if float(kv[code]) > 0.5:
                             pressed_names.append(code_to_name.get(code, f"Key{code}"))
 
-                    if float(kv[max_code + 1]) > 0.5:
+                    if float(ck[0]) > 0.5:
                         pressed_names.append("MouseLeft")
-                    if float(kv[max_code + 2]) > 0.5:
+                    if float(ck[1]) > 0.5:
                         pressed_names.append("MouseRight")
 
                     names_str = "[" + ", ".join(pressed_names) + "]" if pressed_names else "[]"

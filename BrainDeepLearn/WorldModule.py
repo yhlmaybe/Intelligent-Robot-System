@@ -2406,6 +2406,8 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
 
         return h_next, z_next, s_next, s4x_next, r_pred, d_prob
 
+    def ExportState(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.base.ExportState()
 
     @torch.no_grad()
     def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
@@ -2824,6 +2826,81 @@ class TestWorldMTool:
 
         except Exception as e:
             print(f"ForwardTrain finite&grad FAILED: {type(e).__name__}: {e}")
+            return False
+
+    def TestWorldForwardIOShapes(self) -> bool:
+        try:
+            torch.manual_seed(0)
+
+            wm = RSSMWorldModel(
+                visionDim=1024,
+                actionDim=256,
+                deterDim=512,
+                stochDim=64,
+                stateDim=512,
+                ssmDim=64,
+                useDecoder=True,
+                useMemory=False,
+                nsEnabled=True,).to(self.device)
+            wm.train()
+
+            B = 2
+            wm.ResetState(batchSize=B)
+
+            vision = torch.randn(B, wm.vision_dim, device=self.device)
+            keys = torch.zeros(B, self.key_dim, device=self.device)
+            keys[:, min(7, self.key_dim - 1)] = 1.0
+            keys[:, min(33, self.key_dim - 1)] = 1.0
+            click = torch.zeros(B, 2, device=self.device)
+            mouse = torch.randn(B, 2, device=self.device)
+            reward = torch.randn(B, device=self.device)
+            done = torch.zeros(B, device=self.device)
+
+            def print_shape(name: str, tensor: torch.Tensor):
+                print(f"{name}: {tuple(tensor.shape)}")
+
+            with torch.no_grad():
+                print_shape("input.visionIn", vision)
+                print_shape("input.keysVec", keys)
+                print_shape("input.mouseClick", click)
+                print_shape("input.mouseSeq", mouse)
+                print_shape("input.reward", reward)
+                print_shape("input.done", done)
+
+            out = wm.ForwardTrain(
+                vision,
+                keys,
+                click,
+                mouse,
+                reward,
+                done,
+                sample=False)
+
+            for key, value in out.items():
+                if isinstance(value, torch.Tensor):
+                    print_shape(f"output.{key}", value)
+
+            expected = {
+                "h_next": (B, wm.deter_dim),
+                "z_next": (B, wm.stoch_dim),
+                "s_next": (B, wm.state_dim),
+                "r_pred": (B,),
+                "d_prob": (B,),
+                "mu_p": (B, wm.stoch_dim),
+                "logstd_p": (B, wm.stoch_dim),
+                "mu_q": (B, wm.stoch_dim),
+                "logstd_q": (B, wm.stoch_dim),}
+
+            for name, shape in expected.items():
+                if tuple(out[name].shape) != shape:
+                    print(f"World forward IO shape mismatch: {name}={tuple(out[name].shape)} expected={shape}")
+                    return False
+
+            print("World forward IO shapes test passed.")
+            return True
+
+        except Exception as e:
+            print(f"World forward IO shapes FAILED: {type(e).__name__}: {e}")
             return False
 
 
@@ -3457,6 +3534,7 @@ class TestWorldMTool:
             "RSSMStepPosterior": self.TestRSSMStepPosterior(),
             "RSSMStepPriorOnly": self.TestRSSMStepPriorOnly(),
             "ForwardTrainFiniteGrad": self.TestForwardTrainFiniteGrad(),
+            "WorldForwardIOShapes": self.TestWorldForwardIOShapes(),
             "LossDecrease": self.TestLossDecrease(),
             "ConnRegReset": self.TestConnRegReset(),
             "ExportWorldMemoryBank": self.TestExportWorldMemoryBank(),

@@ -1483,6 +1483,44 @@ class TestConsciousMTool:
             print("TestForwardShapes error:", e)
             return False
 
+    def TestConsciousnessExtractorIOShapes(self) -> bool:
+        try:
+            model = self.BuildModel(useHebb=True)
+            model.ResetState()
+
+            B = 2
+            memory_bank, world_bank = self.DummyBankDicts(B=B, Nm=9, Nw=6)
+
+            def print_shape(name: str, tensor: torch.Tensor):
+                print(f"{name}: {tuple(tensor.shape)}")
+
+            def print_nested(prefix: str, obj):
+                if isinstance(obj, torch.Tensor):
+                    print_shape(prefix, obj)
+                elif isinstance(obj, dict):
+                    for key, value in obj.items():
+                        next_prefix = f"{prefix}.{key}" if prefix else key
+                        print_nested(next_prefix, value)
+                elif hasattr(obj, "_asdict"):
+                    for key, value in obj._asdict().items():
+                        next_prefix = f"{prefix}.{key}" if prefix else key
+                        print_nested(next_prefix, value)
+
+            with torch.no_grad():
+                print_nested("input.memoryBank", memory_bank)
+                print_nested("input.worldBank", world_bank)
+
+                out = model(memory_bank, world_bank)
+
+                print_nested("output", out)
+
+            assert out.self_sem.shape == (B, self.self_dim)
+            assert out.intent_sem.shape == (B, self.intent_dim)
+            return True
+        except Exception as e:
+            print("ConsciousnessExtractor IO shapes error:", type(e).__name__, e)
+            return False
+
     def TestStateFlow(self) -> bool:
         try:
             model = self.BuildModel(useHebb=True)
@@ -1940,6 +1978,7 @@ class TestConsciousMTool:
     def RunAll(self) -> Dict[str, bool]:
         results = {
             "ForwardShapes": self.TestForwardShapes(),
+            "ConsciousnessExtractorIOShapes": self.TestConsciousnessExtractorIOShapes(),
             "DictBankInterface": self.TestDictBankInterface(),
             "StateFlow": self.TestStateFlow(),
             "EvalModeInferenceBranch": self.TestEvalModeInferenceBranch(),

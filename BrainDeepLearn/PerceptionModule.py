@@ -1022,6 +1022,37 @@ class TestPerceptionMTool:
             print(f"PerceiveExtractor test error: {e}")
             return False
 
+    def TestPerceiveExtractorIOShapes(self):
+        try:
+            batch_size = 2
+            img_size = 512
+            embed_dim = 512
+
+            model = PerceiveExtractor(
+                imgSize=img_size,
+                patchSize=1,
+                embedDim=embed_dim,
+                numHeads=8,
+                numLayers=6,
+                useHebbian=True).to(self.device)
+            x = torch.randn(batch_size, 3, img_size, img_size, device=self.device)
+
+            with torch.no_grad():
+                out = model(x)
+
+            expected_out_shape = (batch_size, embed_dim * 2)
+            assert tuple(out.shape) == expected_out_shape, f"Output shape does not match: {out.shape}"
+
+            print(f"PerceiveExtractor forward input shape: {tuple(x.shape)}")
+            print(f"PerceiveExtractor forward output shape: {tuple(out.shape)}")
+            return True
+        except AssertionError as e:
+            print(f"TestPerceiveExtractorIOShapes failed: {e}")
+            return False
+        except Exception as e:
+            print(f"TestPerceiveExtractorIOShapes error: {e}")
+            return False
+
     def TrainStepSmoke(self):
         try:
             model = PerceiveExtractor(imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=True).to(self.device)
@@ -1620,6 +1651,7 @@ class TestPerceptionMTool:
             "HebbianConv2d": self.TestHebbianConv2d(),
             "HebbianLinear": self.TestHebbianLinear(),
             "PerceiveExtractorForward": self.TestPerceiveExtractor(),
+            "PerceiveExtractorIOShapes": self.TestPerceiveExtractorIOShapes(),
             "TrainStepSmoke": self.TrainStepSmoke(),
             "NoNanAfterManySteps": self.NoNanAfterManySteps(),
             "ParamsActuallyChange": self.ParamsActuallyChange(),

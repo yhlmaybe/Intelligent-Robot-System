@@ -1151,6 +1151,50 @@ class TestAttentionMTool:
             print(f"AttentionExtractor test error: {e}")
             return False
 
+    def TestAttentionExtractorIOShapes(self):
+        try:
+            batch_size = 2
+            seq_len = 16
+            embed_dim = 1024
+
+            model = AttentionExtractor(
+                embedDim=embed_dim,
+                sequenceLength=seq_len,
+                numHeads=16,
+                temporalLayers=2,
+                routingIterations=3,
+                hebbianRate=0.0,
+                useHebbian=False,
+                gradientClipVal=0.5).to(self.device)
+            model.eval()
+
+            x = torch.randn(batch_size, seq_len, embed_dim, device=self.device)
+            kpm = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=self.device)
+            kpm[:, -2:] = True
+            td = torch.randn(batch_size, device=self.device)
+            uncertainty = torch.rand(batch_size, device=self.device)
+
+            def print_shape(name: str, tensor: torch.Tensor):
+                print(f"{name}: {tuple(tensor.shape)}")
+
+            with torch.no_grad():
+                print_shape("input.x", x)
+                print_shape("input.keyPaddingMask", kpm)
+                print_shape("input.tdError", td)
+                print_shape("input.uncertainty", uncertainty)
+                y = model(x, keyPaddingMask=kpm, tdError=td, uncertainty=uncertainty)
+                print_shape("output.y", y)
+
+            expected_out_shape = (batch_size, embed_dim)
+            assert tuple(y.shape) == expected_out_shape, f"Output shape mismatch: {y.shape}"
+            return True
+        except AssertionError as e:
+            print(f"TestAttentionExtractorIOShapes failed: {e}")
+            return False
+        except Exception as e:
+            print(f"TestAttentionExtractorIOShapes error: {e}")
+            return False
+
     def TrainStepSmoke(self):
         try:
             torch.manual_seed(123)
@@ -1762,6 +1806,7 @@ class TestAttentionMTool:
             "DynamicRouting": self.TestDynamicRouting(),
             "HebbianFusion": self.TestHebbianFusion(),
             "AttentionExtractorForward": self.TestAttentionExtractor(),
+            "AttentionExtractorIOShapes": self.TestAttentionExtractorIOShapes(),
             "TrainStepSmoke": self.TrainStepSmoke(),
             "NoNanAfterManySteps": self.NoNanAfterManySteps(),
             "ParamsActuallyChange": self.ParamsActuallyChange(),
