@@ -23,7 +23,7 @@ from WorldModule import  TestWorldMTool
 from ValueEstimationModule import  TestValueEstimationMTool
 from ConsciousnessModule import TestConsciousMTool
 from IntentionModule import TestIntentionMTool
-from OCRModule import TestOCRMTool
+from OCRModule import TestOCRMTool, OCREngineExtractor
 from AGICore import Agent, BrainCore, BasicParameters
 
 try:
@@ -61,6 +61,36 @@ class OfflineGameDataset(Dataset):
         if self.texts:
             ext_text = self.texts[idx].read_text(encoding="utf-8").strip()
         return imgs, keys, mouse_click, mouse_move, reward, done, ext_text
+
+
+class OfflineOCRDataset(Dataset):
+    def __init__(self, root: str) -> None:
+        p = Path(root)
+        self.imgs = sorted((p / "frames").glob("*.png"))
+        self.boxes = sorted((p / "boxes").glob("*.npy"))
+        self.texts = sorted((p / "texts").glob("*.txt"))
+
+        assert len(self.imgs) == len(self.boxes) == len(self.texts), "frames/boxes/texts The number of files is inconsistent."
+        if len(self.imgs) == 0:
+            raise RuntimeError(f"no OCR samples found under {p}")
+
+    def __len__(self) -> int:
+        return len(self.imgs)
+
+    def __getitem__(self, idx: int):
+        img = iio.imread(self.imgs[idx])
+        boxes = np.load(self.boxes[idx]).astype(np.float32)
+        if boxes.ndim == 1:
+            boxes = boxes.reshape(-1, 4)
+        if boxes.ndim != 2 or boxes.shape[1] != 4:
+            raise ValueError(f"OCR boxes must have shape [N, 4], but got {boxes.shape} from {self.boxes[idx]}")
+
+        texts = self.texts[idx].read_text(encoding="utf-8").splitlines()
+        if len(boxes) != len(texts):
+            raise ValueError(
+                f"OCR texts/boxes count mismatch at {self.texts[idx]} and {self.boxes[idx]}: "
+                f"{len(texts)} vs {len(boxes)}")
+        return img, boxes, texts
 
 
 
@@ -171,6 +201,34 @@ class ManagerFunction:
         self.br_thread.start()
         return True
 
+    def StartOCRTraining(
+        self,
+        root: str,
+        epochs: int = 5,
+        batchSize: int = 32,
+        valSplit: float = 0.1,
+        resume: bool = True,
+        onlineLearning: bool = False,
+        *,
+        ckptPath: str,
+        outPath: str,):
+        if self.is_begin:
+            self.controller.SetStatus("recur", "Training or Deploy is already running")
+            return False
+        self.is_begin = True
+
+        self.br_thread = threading.Thread(
+            target=self.OCRTrainLoop,
+            args=(root, epochs, batchSize, valSplit, resume),
+            kwargs={
+                "onlineLearning": onlineLearning,
+                "ckptPath": ckptPath,
+                "outPath": outPath,},
+                
+            daemon=False)
+        self.br_thread.start()
+        return True
+
     def Stop(self):
         if self.is_begin:
             self.controller.RequestStop()
@@ -206,6 +264,514 @@ class ManagerFunction:
 
     def GetCurrentStatus(self):
         return self.controller.GetStatus()
+
+    def PrepareOCRBatch(
+        self,
+        imgsBatch,
+        boxesBatch,
+        textsBatch,
+        engine: OCREngineExtractor,
+        *,
+        device: Optional[torch.device] = None,
+        imageSize: int = BasicParameters.IMAGE_SIZE,
+        targetH: int = 32,
+        maxW: int = 256,):
+        device = device or self.device
+
+        if isinstance(imgsBatch, tuple):
+            imgsBatch = list(imgsBatch)
+        if isinstance(boxesBatch, tuple):
+            boxesBatch = list(boxesBatch)
+        if isinstance(textsBatch, tuple):
+            textsBatch = list(textsBatch)
+
+        detect_imgs: List[torch.Tensor] = []
+        gt_shrink_batch: List[torch.Tensor] = []
+        gt_thresh_batch: List[torch.Tensor] = []
+        gt_mask_batch: List[torch.Tensor] = []
+        line_imgs_list: List[torch.Tensor] = []
+        flat_targets: List[int] = []
+        target_lengths: List[int] = []
+        norm_texts: List[str] = []
+
+        for img, raw_boxes, raw_texts in zip(imgsBatch, boxesBatch, textsBatch):
+            if isinstance(img, np.ndarray):
+                img_t = torch.from_numpy(img)
+            elif isinstance(img, torch.Tensor):
+                img_t = img.detach().cpu()
+            else:
+                raise TypeError(f"unsupported OCR image type: {type(img)}")
+
+            if img_t.ndim == 2:
+                img_t = img_t.unsqueeze(-1)
+            if img_t.ndim != 3:
+                raise ValueError(f"OCR image must have 2 or 3 dims, but got shape {tuple(img_t.shape)}")
+
+            if img_t.shape[-1] in (1, 3):
+                img_t = img_t.permute(2, 0, 1)
+            elif img_t.shape[0] not in (1, 3):
+                raise ValueError(f"OCR image channel layout is invalid: {tuple(img_t.shape)}")
+
+            img_t = img_t.float()
+            if img_t.max().item() > 1.0:
+                img_t = img_t / 255.0
+
+            if img_t.size(0) == 1:
+                img_rgb = img_t.repeat(3, 1, 1)
+            else:
+                img_rgb = img_t[:3]
+
+            _, h0, w0 = img_rgb.shape
+            img_rgb = F.interpolate(
+                img_rgb.unsqueeze(0),
+                size=(imageSize, imageSize),
+                mode="bilinear",
+                align_corners=False,).squeeze(0)
+
+            detect_imgs.append(img_rgb)
+
+            gt_shrink = torch.zeros(1, imageSize, imageSize, dtype=img_rgb.dtype)
+            gt_thresh = torch.zeros(1, imageSize, imageSize, dtype=img_rgb.dtype)
+            gt_mask = torch.ones(1, imageSize, imageSize, dtype=img_rgb.dtype)
+
+            boxes_np = np.asarray(raw_boxes, dtype=np.float32).reshape(-1, 4)
+            texts = list(raw_texts)
+            if len(boxes_np) != len(texts):
+                raise ValueError(f"OCR texts/boxes count mismatch in batch: {len(texts)} vs {len(boxes_np)}")
+
+            scale_x = float(imageSize) / float(max(1, w0))
+            scale_y = float(imageSize) / float(max(1, h0))
+
+            rec_boxes: List[np.ndarray] = []
+            rec_texts: List[str] = []
+            for box, raw_text in zip(boxes_np, texts):
+                text = "".join(ch for ch in str(raw_text).strip() if ch in engine.char2Idx)
+                if not text:
+                    continue
+
+                x1, y1, x2, y2 = [float(v) for v in box.tolist()]
+                x1 = int(round(x1 * scale_x))
+                y1 = int(round(y1 * scale_y))
+                x2 = int(round(x2 * scale_x))
+                y2 = int(round(y2 * scale_y))
+
+                x1 = max(0, min(imageSize - 1, x1))
+                y1 = max(0, min(imageSize - 1, y1))
+                x2 = max(x1 + 1, min(imageSize, x2))
+                y2 = max(y1 + 1, min(imageSize, y2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                gt_thresh[:, y1:y2, x1:x2] = 1.0
+
+                shrink_dx = max(1, int(round((x2 - x1) * 0.15)))
+                shrink_dy = max(1, int(round((y2 - y1) * 0.15)))
+                sx1 = min(max(0, x1 + shrink_dx), imageSize - 1)
+                sy1 = min(max(0, y1 + shrink_dy), imageSize - 1)
+                sx2 = max(sx1 + 1, min(imageSize, x2 - shrink_dx))
+                sy2 = max(sy1 + 1, min(imageSize, y2 - shrink_dy))
+                gt_shrink[:, sy1:sy2, sx1:sx2] = 1.0
+
+                rec_boxes.append(np.array([x1, y1, x2, y2], dtype=np.int32))
+                rec_texts.append(text)
+
+            gt_shrink_batch.append(gt_shrink)
+            gt_thresh_batch.append(gt_thresh)
+            gt_mask_batch.append(gt_mask)
+
+            if len(rec_boxes) == 0:
+                continue
+
+            line_imgs = engine.CropAndResizeLines(
+                img_rgb,
+                rec_boxes,
+                targetH=targetH,
+                maxW=maxW,)
+
+            if line_imgs.size(0) == 0:
+                continue
+
+            line_imgs_list.append(line_imgs.cpu())
+            for text in rec_texts:
+                ids = [int(engine.char2Idx[ch]) for ch in text]
+                flat_targets.extend(ids)
+                target_lengths.append(len(ids))
+                norm_texts.append(text)
+
+        if len(detect_imgs) == 0:
+            return None
+
+        detect_imgs_t = torch.stack(detect_imgs, dim=0).to(device)
+        gt_shrink_t = torch.stack(gt_shrink_batch, dim=0).to(device)
+        gt_thresh_t = torch.stack(gt_thresh_batch, dim=0).to(device)
+        gt_mask_t = torch.stack(gt_mask_batch, dim=0).to(device)
+
+        if len(line_imgs_list) == 0:
+            recog_imgs_t = torch.empty(0, 1, targetH, maxW, device=device, dtype=detect_imgs_t.dtype)
+            targets_t = torch.empty(0, dtype=torch.long, device=device)
+            target_lengths_t = torch.empty(0, dtype=torch.long, device=device)
+        else:
+            recog_imgs_t = torch.cat(line_imgs_list, dim=0).to(device)
+            targets_t = torch.tensor(flat_targets, dtype=torch.long, device=device)
+            target_lengths_t = torch.tensor(target_lengths, dtype=torch.long, device=device)
+
+        return (
+            detect_imgs_t,
+            gt_shrink_t,
+            gt_thresh_t,
+            gt_mask_t,
+            recog_imgs_t,
+            targets_t,
+            target_lengths_t,
+            norm_texts,
+        )
+
+    def SaveOCRParameters(self, engine: OCREngineExtractor, path: str) -> None:
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        ocr_state = {k: v.detach().cpu() for k, v in engine.state_dict().items()}
+        brain_state = {f"OCR.{k}": v for k, v in ocr_state.items()}
+
+        torch.save({
+            "ocr": ocr_state,
+            "brain": brain_state,
+        }, str(out_path))
+
+    def LoadOCRCheckpoint(
+        self,
+        engine: OCREngineExtractor,
+        optimizer: torch.optim.Optimizer,
+        dataset: Dataset,
+        path: str,):
+        ckpt = torch.load(path, map_location=self.device)
+
+        if "ocr" in ckpt:
+            engine.load_state_dict(ckpt["ocr"], strict=True)
+        elif "brain" in ckpt:
+            ocr_state = {
+                k[len("OCR."):]: v
+                for k, v in ckpt["brain"].items()
+                if k.startswith("OCR.")
+            }
+            if len(ocr_state) == 0:
+                raise KeyError(f"checkpoint {path} has no OCR weights")
+            engine.load_state_dict(ocr_state, strict=False)
+        else:
+            raise KeyError(f"checkpoint {path} has no 'ocr' or 'brain' field")
+
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+
+        if "rng" in ckpt:
+            random.setstate(ckpt["rng"]["python"])
+            torch.set_rng_state(ckpt["rng"]["torch"].cpu())
+            np.random.set_state(ckpt["rng"]["numpy"])
+
+        train_ds = val_ds = test_ds = None
+        if ckpt.get("train_indices") is not None:
+            train_ds = torch.utils.data.Subset(dataset, ckpt["train_indices"])
+            val_ds = torch.utils.data.Subset(dataset, ckpt["val_indices"])
+            if ckpt.get("test_indices") is not None:
+                test_ds = torch.utils.data.Subset(dataset, ckpt["test_indices"])
+
+        start_epoch = int(ckpt.get("epoch", 0))
+        best_val = float(ckpt.get("best_val", float("inf")))
+        return start_epoch, best_val, train_ds, val_ds, test_ds
+
+    def OCRTrainLoop(
+        self,
+        root: str,
+        epochs: int,
+        batchSize: int,
+        valSplit: float,
+        resume: bool,
+        onlineLearning: bool = False,
+        *,
+        ckptPath: str,
+        outPath: str,):
+        try:
+            torch.autograd.set_detect_anomaly(True)
+
+            self.controller.stop_requested = False
+            self.controller.pause_requested = False
+            self.controller.reset_hebbian = False
+
+            del onlineLearning
+
+            engine = OCREngineExtractor().to(self.device)
+
+            ds = OfflineOCRDataset(root)
+            optimizer = torch.optim.Adam(engine.parameters(), lr=1e-3)
+
+            start_epoch = 0
+            best_val = float("inf")
+            train_ds = val_ds = test_ds = None
+
+            testSplit = 0.1
+            if resume and Path(ckptPath).exists():
+                start_epoch, best_val, train_ds, val_ds, test_ds = self.LoadOCRCheckpoint(
+                    engine, optimizer, ds, ckptPath)
+
+            if train_ds is None:
+                n_total = len(ds)
+                n_test = int(n_total * testSplit)
+                n_val = int(n_total * valSplit)
+                n_train = n_total - n_val - n_test
+                train_ds, val_ds, test_ds = torch.utils.data.random_split(
+                    ds, [n_train, n_val, n_test])
+            elif test_ds is None:
+                train_indices = list(train_ds.indices) if hasattr(train_ds, "indices") else list(range(len(train_ds)))
+                val_indices = list(val_ds.indices) if hasattr(val_ds, "indices") else []
+                used = set(train_indices) | set(val_indices)
+                test_indices = [idx for idx in range(len(ds)) if idx not in used]
+                test_ds = torch.utils.data.Subset(ds, test_indices) if len(test_indices) > 0 else val_ds
+
+            def collate_ocr_batch(batch):
+                imgs, boxes, texts = zip(*batch)
+                return list(imgs), list(boxes), list(texts)
+
+            pin_memory = bool(getattr(self.device, "type", "") == "cuda")
+            train_dl = DataLoader(
+                train_ds,
+                batch_size=batchSize,
+                shuffle=True,
+                num_workers=0,
+                pin_memory=pin_memory,
+                collate_fn=collate_ocr_batch,)
+            val_dl = DataLoader(
+                val_ds,
+                batch_size=batchSize,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=pin_memory,
+                collate_fn=collate_ocr_batch,)
+            test_dl = DataLoader(
+                test_ds,
+                batch_size=batchSize,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=pin_memory,
+                collate_fn=collate_ocr_batch,)
+
+            patience = 5
+            min_delta = 1e-4
+            no_improve = 0
+
+            def eval_split(dl):
+                engine.eval()
+                split_loss = 0.0
+                split_batches = 0
+                correct = 0
+                total = 0
+
+                with torch.no_grad():
+                    for imgs_b, boxes_b, texts_b in dl:
+                        prepared = self.PrepareOCRBatch(
+                            imgs_b,
+                            boxes_b,
+                            texts_b,
+                            engine,
+                            device=self.device,)
+                        if prepared is None:
+                            continue
+
+                        (
+                            detect_imgs_t,
+                            gt_shrink_t,
+                            gt_thresh_t,
+                            gt_mask_t,
+                            recog_imgs_t,
+                            targets_t,
+                            target_lengths_t,
+                            norm_texts,
+                        ) = prepared
+
+                        det_out = engine.ForwardDetect(
+                            detect_imgs_t,
+                            gtShrink=gt_shrink_t,
+                            gtThresh=gt_thresh_t,
+                            gtMask=gt_mask_t,)
+                        det_loss = det_out["loss"]
+
+                        rec_loss = det_loss.new_zeros(())
+                        if recog_imgs_t.size(0) > 0 and targets_t.numel() > 0:
+                            rec_out = engine.ForwardRecognize(
+                                recog_imgs_t,
+                                targetsTensor=targets_t,
+                                targetLengths=target_lengths_t,)
+                            rec_loss = rec_out["loss"]
+
+                            pairs = engine.CtcGreedyDecodeWithConf(
+                                rec_out["log_probs"],
+                                idx2Char=engine.idx2Char,
+                                blankIndex=engine.blankIndex,)
+                            pred_texts = [txt for txt, _ in pairs]
+                            correct += sum(int(pred == target) for pred, target in zip(pred_texts, norm_texts))
+                            total += len(norm_texts)
+
+                        loss = det_loss + rec_loss
+                        split_loss += float(loss.item())
+                        split_batches += 1
+
+                avg_loss = split_loss / max(1, split_batches)
+                acc = correct / max(1, total)
+                return avg_loss, acc
+
+            self.controller.SetStatus(
+                "training",
+                "OCR training started",
+                epoch=start_epoch,
+                total_epochs=epochs,
+                batch=0,
+                total_batches=len(train_dl),)
+
+            for ep in range(start_epoch, epochs):
+                if self.controller.ShouldStop():
+                    self.controller.SetStatus("stopped", "OCR training stopped")
+                    break
+
+                while self.controller.ShouldPause():
+                    self.controller.SetStatus("paused", "OCR training paused")
+                    time.sleep(0.2)
+
+                engine.train()
+
+                epoch_loss = 0.0
+                nb = 0
+
+                for bi, batch in enumerate(train_dl, start=1):
+                    imgs_b, boxes_b, texts_b = batch
+                    prepared = self.PrepareOCRBatch(
+                        imgs_b,
+                        boxes_b,
+                        texts_b,
+                        engine,
+                        device=self.device,)
+                    if prepared is None:
+                        continue
+
+                    (
+                        detect_imgs_t,
+                        gt_shrink_t,
+                        gt_thresh_t,
+                        gt_mask_t,
+                        recog_imgs_t,
+                        targets_t,
+                        target_lengths_t,
+                        norm_texts,
+                    ) = prepared
+
+                    det_out = engine.ForwardDetect(
+                        detect_imgs_t,
+                        gtShrink=gt_shrink_t,
+                        gtThresh=gt_thresh_t,
+                        gtMask=gt_mask_t,)
+                    det_loss = det_out["loss"]
+
+                    rec_loss = det_loss.new_zeros(())
+                    rec_out = None
+                    if recog_imgs_t.size(0) > 0 and targets_t.numel() > 0:
+                        rec_out = engine.ForwardRecognize(
+                            recog_imgs_t,
+                            targetsTensor=targets_t,
+                            targetLengths=target_lengths_t,)
+                        rec_loss = rec_out["loss"]
+
+                    loss = det_loss + rec_loss
+
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(engine.parameters(), 1.0)
+                    optimizer.step()
+
+                    with torch.no_grad():
+                        batch_acc = 0.0
+                        if rec_out is not None and len(norm_texts) > 0:
+                            pairs = engine.CtcGreedyDecodeWithConf(
+                                rec_out["log_probs"].detach(),
+                                idx2Char=engine.idx2Char,
+                                blankIndex=engine.blankIndex,)
+                            pred_texts = [txt for txt, _ in pairs]
+                            batch_acc = (
+                                sum(int(pred == target) for pred, target in zip(pred_texts, norm_texts))
+                                / max(1, len(norm_texts)))
+
+                    epoch_loss += float(loss.item())
+                    nb += 1
+
+                    self.controller.SetStatus(
+                        "training",
+                        f"OCR training... acc={batch_acc:.3f}",
+                        epoch=ep + 1,
+                        total_epochs=epochs,
+                        batch=bi,
+                        total_batches=len(train_dl),
+                        train_loss=float(loss.item()),)
+
+                    if self.controller.ShouldStop():
+                        break
+                    while self.controller.ShouldPause():
+                        self.controller.SetStatus("paused", "OCR training paused")
+                        time.sleep(0.2)
+
+                avg_train = epoch_loss / max(1, nb)
+                avg_val, val_acc = eval_split(val_dl)
+                test_loss, test_acc = eval_split(test_dl)
+
+                improved = (best_val - avg_val) > min_delta
+                if improved:
+                    best_val = avg_val
+                    no_improve = 0
+                    self.SaveOCRParameters(engine, outPath)
+
+                    ckpt_dir = Path(ckptPath).parent
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    torch.save({
+                        "epoch": ep + 1,
+                        "best_val": best_val,
+                        "ocr": engine.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "train_indices": list(train_ds.indices) if hasattr(train_ds, "indices") else None,
+                        "val_indices": list(val_ds.indices) if hasattr(val_ds, "indices") else None,
+                        "test_indices": list(test_ds.indices) if hasattr(test_ds, "indices") else None,
+                        "rng": {
+                            "python": random.getstate(),
+                            "torch": torch.get_rng_state(),
+                            "numpy": np.random.get_state(),
+                        },
+                    }, ckptPath)
+                else:
+                    no_improve += 1
+
+                self.controller.SetStatus(
+                    "training",
+                    (
+                        f"OCR epoch {ep+1}/{epochs} done | "
+                        f"train {avg_train:.4f} | "
+                        f"val {avg_val:.4f}, acc={val_acc:.3f} | "
+                        f"test {test_loss:.4f}, acc={test_acc:.3f}"
+                    ),
+                    epoch=ep + 1,
+                    total_epochs=epochs,
+                    val_loss=avg_val,)
+
+                if no_improve >= patience:
+                    self.controller.SetStatus("completed", "OCR validation stabilized, early stop.")
+                    break
+
+                if self.controller.ShouldStop():
+                    self.controller.SetStatus("stopped", "OCR training stopped")
+                    break
+
+            else:
+                self.controller.SetStatus("completed", "OCR training completed")
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.controller.SetStatus("error", f"OCR training error: {e}", trace=tb)
+        finally:
+            self.is_begin = False
 
     def TrainLoop(self,root: str, epochs: int, batchSize: int, valSplit: float, resume: bool, onlineLearning = False, *, worldMemPath: str = None, memMemPath: str = None, ckptPath: str = None,):
         try:
@@ -870,6 +1436,77 @@ class ManagerFunction:
             print(f"TestModuleTrain failed with error: {e}")
             print(f"Traceback: {traceback.format_exc()}")
             raise
+
+    def TrainOCRModule(
+        self,
+        onlineLearning: bool,
+        epochs: int = 6,
+        batchSize: int = 8,
+        valSplit: float = 0.2,
+        isResume: bool = False,
+        *,
+        dataRoot: str = BasicParameters.DATA_ROOT_PATH,) -> Dict[str, Any]:
+        try:
+            root = Path(dataRoot)
+            frames_dir = root / "frames"
+            boxes_dir = root / "boxes"
+            texts_dir = root / "texts"
+
+            if not frames_dir.exists() or not boxes_dir.exists() or not texts_dir.exists():
+                print(f"[TrainOCR] no dataset found at {root}, please prepare frames/boxes/texts first.")
+                return {"ok": False, "msg": "no ocr dataset"}
+
+            if not any(frames_dir.glob("*.png")) or not any(boxes_dir.glob("*.npy")) or not any(texts_dir.glob("*.txt")):
+                print(f"[TrainOCR] no OCR samples found at {root}.")
+                return {"ok": False, "msg": "empty ocr dataset"}
+
+            is_test_root = Path(dataRoot) == Path(BasicParameters.DATA_ROOT_PATH_TEST)
+            ckpt_path = (
+                "BrainDeepLearn/TestData/ocr_training_checkpoint.pth"
+                if is_test_root
+                else "BrainDeepLearn/Data/ocr_training_checkpoint.pth")
+            out_path = (
+                "BrainDeepLearn/TestData/ocr_module_parameter.pth"
+                if is_test_root
+                else "BrainDeepLearn/Data/ocr_module_parameter.pth")
+
+            print(f"[TrainOCR] use existing OCR dataset at: {root}")
+
+            ok = self.StartOCRTraining(
+                str(root),
+                epochs=epochs,
+                batchSize=batchSize,
+                valSplit=valSplit,
+                resume=isResume,
+                onlineLearning=onlineLearning,
+                ckptPath=ckpt_path,
+                outPath=out_path,)
+
+            if not ok:
+                print("StartOCRTraining returns False (training may already be running)")
+                return {"ok": False, "msg": "already_running"}
+
+            self.message_thread = threading.Thread(
+                target=self.MonitorTraining,
+                args=(),
+                daemon=False,)
+            self.message_thread.start()
+
+            return {"ok": True}
+
+        except Exception as e:
+            print(f"TrainOCRModule failed with error: {e}")
+            print(f"Traceback: {traceback.format_exc()}")
+            raise
+
+    def TestOCRModuleTrain(self, onlineLearning: bool) -> Dict[str, Any]:
+        return self.TrainOCRModule(
+            onlineLearning=onlineLearning,
+            epochs=1,
+            batchSize=4,
+            valSplit=0.2,
+            isResume=False,
+            dataRoot=BasicParameters.DATA_ROOT_PATH_TEST,)
 
     def TrainModule(
         self,
