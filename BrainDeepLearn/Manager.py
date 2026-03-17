@@ -8,7 +8,6 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import shutil
 import traceback
 import os
@@ -24,74 +23,13 @@ from ValueEstimationModule import  TestValueEstimationMTool
 from ConsciousnessModule import TestConsciousMTool
 from IntentionModule import TestIntentionMTool
 from OCRModule import TestOCRMTool, OCREngineExtractor
+from DataPreprocess import DataPreprocessor, OfflineGameDataset, OfflineOCRDataset
 from AGICore import Agent, BrainCore, BasicParameters
 
 try:
     import imageio.v3 as iio
 except Exception:
     iio = None  
-
-
-class OfflineGameDataset(Dataset):
-    def __init__(self, root: str) -> None:
-        p = Path(root)
-        self.imgs = sorted((p / "frames").glob("*.png"))
-        self.keys = sorted((p / "keys").glob("*.npy"))
-        self.mouse_click = sorted((p / "mouse_click").glob("*.npy"))
-        self.mouse_move = sorted((p / "mouse_move").glob("*.npy"))
-        self.reward = sorted((p / "reward").glob("*.npy")) 
-        self.done = sorted((p / "done").glob("*.npy")) 
-        self.texts = sorted((p / "texts").glob("*.txt"))
-
-        assert len(self.imgs) == len(self.keys) == len(self.mouse_click) == len(self.mouse_move) == len(self.reward) == len(self.done), "frames/keys/mouse_click/mouse_move/reward/done The number of files is inconsistent."
-        if self.texts:
-            assert len(self.texts) == len(self.imgs), "texts The number of files is inconsistent."
-
-    def __len__(self) -> int:
-        return len(self.imgs)
-
-    def __getitem__(self, idx: int):
-        imgs = iio.imread(self.imgs[idx])
-        keys = np.load(self.keys[idx]).astype(np.float32)
-        mouse_click = np.load(self.mouse_click[idx]).astype(np.float32)
-        mouse_move = np.load(self.mouse_move[idx]).astype(np.float32)
-        reward = np.load(self.reward[idx]).astype(np.float32)
-        done = np.load(self.done[idx]).astype(np.float32)
-        ext_text = None
-        if self.texts:
-            ext_text = self.texts[idx].read_text(encoding="utf-8").strip()
-        return imgs, keys, mouse_click, mouse_move, reward, done, ext_text
-
-
-class OfflineOCRDataset(Dataset):
-    def __init__(self, root: str) -> None:
-        p = Path(root)
-        self.imgs = sorted((p / "frames").glob("*.png"))
-        self.boxes = sorted((p / "boxes").glob("*.npy"))
-        self.texts = sorted((p / "texts").glob("*.txt"))
-
-        assert len(self.imgs) == len(self.boxes) == len(self.texts), "frames/boxes/texts The number of files is inconsistent."
-        if len(self.imgs) == 0:
-            raise RuntimeError(f"no OCR samples found under {p}")
-
-    def __len__(self) -> int:
-        return len(self.imgs)
-
-    def __getitem__(self, idx: int):
-        img = iio.imread(self.imgs[idx])
-        boxes = np.load(self.boxes[idx]).astype(np.float32)
-        if boxes.ndim == 1:
-            boxes = boxes.reshape(-1, 4)
-        if boxes.ndim != 2 or boxes.shape[1] != 4:
-            raise ValueError(f"OCR boxes must have shape [N, 4], but got {boxes.shape} from {self.boxes[idx]}")
-
-        texts = self.texts[idx].read_text(encoding="utf-8").splitlines()
-        if len(boxes) != len(texts):
-            raise ValueError(
-                f"OCR texts/boxes count mismatch at {self.texts[idx]} and {self.boxes[idx]}: "
-                f"{len(texts)} vs {len(boxes)}")
-        return img, boxes, texts
-
 
 
 class ModuleController:
@@ -224,7 +162,7 @@ class ManagerFunction:
                 "onlineLearning": onlineLearning,
                 "ckptPath": ckptPath,
                 "outPath": outPath,},
-                
+
             daemon=False)
         self.br_thread.start()
         return True
@@ -265,166 +203,7 @@ class ManagerFunction:
     def GetCurrentStatus(self):
         return self.controller.GetStatus()
 
-    def PrepareOCRBatch(
-        self,
-        imgsBatch,
-        boxesBatch,
-        textsBatch,
-        engine: OCREngineExtractor,
-        *,
-        device: Optional[torch.device] = None,
-        imageSize: int = BasicParameters.IMAGE_SIZE,
-        targetH: int = 32,
-        maxW: int = 256,):
-        device = device or self.device
 
-        if isinstance(imgsBatch, tuple):
-            imgsBatch = list(imgsBatch)
-        if isinstance(boxesBatch, tuple):
-            boxesBatch = list(boxesBatch)
-        if isinstance(textsBatch, tuple):
-            textsBatch = list(textsBatch)
-
-        detect_imgs: List[torch.Tensor] = []
-        gt_shrink_batch: List[torch.Tensor] = []
-        gt_thresh_batch: List[torch.Tensor] = []
-        gt_mask_batch: List[torch.Tensor] = []
-        line_imgs_list: List[torch.Tensor] = []
-        flat_targets: List[int] = []
-        target_lengths: List[int] = []
-        norm_texts: List[str] = []
-
-        for img, raw_boxes, raw_texts in zip(imgsBatch, boxesBatch, textsBatch):
-            if isinstance(img, np.ndarray):
-                img_t = torch.from_numpy(img)
-            elif isinstance(img, torch.Tensor):
-                img_t = img.detach().cpu()
-            else:
-                raise TypeError(f"unsupported OCR image type: {type(img)}")
-
-            if img_t.ndim == 2:
-                img_t = img_t.unsqueeze(-1)
-            if img_t.ndim != 3:
-                raise ValueError(f"OCR image must have 2 or 3 dims, but got shape {tuple(img_t.shape)}")
-
-            if img_t.shape[-1] in (1, 3):
-                img_t = img_t.permute(2, 0, 1)
-            elif img_t.shape[0] not in (1, 3):
-                raise ValueError(f"OCR image channel layout is invalid: {tuple(img_t.shape)}")
-
-            img_t = img_t.float()
-            if img_t.max().item() > 1.0:
-                img_t = img_t / 255.0
-
-            if img_t.size(0) == 1:
-                img_rgb = img_t.repeat(3, 1, 1)
-            else:
-                img_rgb = img_t[:3]
-
-            _, h0, w0 = img_rgb.shape
-            img_rgb = F.interpolate(
-                img_rgb.unsqueeze(0),
-                size=(imageSize, imageSize),
-                mode="bilinear",
-                align_corners=False,).squeeze(0)
-
-            detect_imgs.append(img_rgb)
-
-            gt_shrink = torch.zeros(1, imageSize, imageSize, dtype=img_rgb.dtype)
-            gt_thresh = torch.zeros(1, imageSize, imageSize, dtype=img_rgb.dtype)
-            gt_mask = torch.ones(1, imageSize, imageSize, dtype=img_rgb.dtype)
-
-            boxes_np = np.asarray(raw_boxes, dtype=np.float32).reshape(-1, 4)
-            texts = list(raw_texts)
-            if len(boxes_np) != len(texts):
-                raise ValueError(f"OCR texts/boxes count mismatch in batch: {len(texts)} vs {len(boxes_np)}")
-
-            scale_x = float(imageSize) / float(max(1, w0))
-            scale_y = float(imageSize) / float(max(1, h0))
-
-            rec_boxes: List[np.ndarray] = []
-            rec_texts: List[str] = []
-            for box, raw_text in zip(boxes_np, texts):
-                text = "".join(ch for ch in str(raw_text).strip() if ch in engine.char2Idx)
-                if not text:
-                    continue
-
-                x1, y1, x2, y2 = [float(v) for v in box.tolist()]
-                x1 = int(round(x1 * scale_x))
-                y1 = int(round(y1 * scale_y))
-                x2 = int(round(x2 * scale_x))
-                y2 = int(round(y2 * scale_y))
-
-                x1 = max(0, min(imageSize - 1, x1))
-                y1 = max(0, min(imageSize - 1, y1))
-                x2 = max(x1 + 1, min(imageSize, x2))
-                y2 = max(y1 + 1, min(imageSize, y2))
-                if x2 <= x1 or y2 <= y1:
-                    continue
-
-                gt_thresh[:, y1:y2, x1:x2] = 1.0
-
-                shrink_dx = max(1, int(round((x2 - x1) * 0.15)))
-                shrink_dy = max(1, int(round((y2 - y1) * 0.15)))
-                sx1 = min(max(0, x1 + shrink_dx), imageSize - 1)
-                sy1 = min(max(0, y1 + shrink_dy), imageSize - 1)
-                sx2 = max(sx1 + 1, min(imageSize, x2 - shrink_dx))
-                sy2 = max(sy1 + 1, min(imageSize, y2 - shrink_dy))
-                gt_shrink[:, sy1:sy2, sx1:sx2] = 1.0
-
-                rec_boxes.append(np.array([x1, y1, x2, y2], dtype=np.int32))
-                rec_texts.append(text)
-
-            gt_shrink_batch.append(gt_shrink)
-            gt_thresh_batch.append(gt_thresh)
-            gt_mask_batch.append(gt_mask)
-
-            if len(rec_boxes) == 0:
-                continue
-
-            line_imgs = engine.CropAndResizeLines(
-                img_rgb,
-                rec_boxes,
-                targetH=targetH,
-                maxW=maxW,)
-
-            if line_imgs.size(0) == 0:
-                continue
-
-            line_imgs_list.append(line_imgs.cpu())
-            for text in rec_texts:
-                ids = [int(engine.char2Idx[ch]) for ch in text]
-                flat_targets.extend(ids)
-                target_lengths.append(len(ids))
-                norm_texts.append(text)
-
-        if len(detect_imgs) == 0:
-            return None
-
-        detect_imgs_t = torch.stack(detect_imgs, dim=0).to(device)
-        gt_shrink_t = torch.stack(gt_shrink_batch, dim=0).to(device)
-        gt_thresh_t = torch.stack(gt_thresh_batch, dim=0).to(device)
-        gt_mask_t = torch.stack(gt_mask_batch, dim=0).to(device)
-
-        if len(line_imgs_list) == 0:
-            recog_imgs_t = torch.empty(0, 1, targetH, maxW, device=device, dtype=detect_imgs_t.dtype)
-            targets_t = torch.empty(0, dtype=torch.long, device=device)
-            target_lengths_t = torch.empty(0, dtype=torch.long, device=device)
-        else:
-            recog_imgs_t = torch.cat(line_imgs_list, dim=0).to(device)
-            targets_t = torch.tensor(flat_targets, dtype=torch.long, device=device)
-            target_lengths_t = torch.tensor(target_lengths, dtype=torch.long, device=device)
-
-        return (
-            detect_imgs_t,
-            gt_shrink_t,
-            gt_thresh_t,
-            gt_mask_t,
-            recog_imgs_t,
-            targets_t,
-            target_lengths_t,
-            norm_texts,
-        )
 
     def SaveOCRParameters(self, engine: OCREngineExtractor, path: str) -> None:
         out_path = Path(path)
@@ -435,8 +214,7 @@ class ManagerFunction:
 
         torch.save({
             "ocr": ocr_state,
-            "brain": brain_state,
-        }, str(out_path))
+            "brain": brain_state,}, str(out_path))
 
     def LoadOCRCheckpoint(
         self,
@@ -452,8 +230,7 @@ class ManagerFunction:
             ocr_state = {
                 k[len("OCR."):]: v
                 for k, v in ckpt["brain"].items()
-                if k.startswith("OCR.")
-            }
+                if k.startswith("OCR.")}
             if len(ocr_state) == 0:
                 raise KeyError(f"checkpoint {path} has no OCR weights")
             engine.load_state_dict(ocr_state, strict=False)
@@ -499,9 +276,8 @@ class ManagerFunction:
 
             del onlineLearning
 
-            engine = OCREngineExtractor().to(self.device)
-
             ds = OfflineOCRDataset(root)
+            engine = OCREngineExtractor().to(self.device)
             optimizer = torch.optim.Adam(engine.parameters(), lr=1e-3)
 
             start_epoch = 0
@@ -532,6 +308,7 @@ class ManagerFunction:
                 return list(imgs), list(boxes), list(texts)
 
             pin_memory = bool(getattr(self.device, "type", "") == "cuda")
+
             train_dl = DataLoader(
                 train_ds,
                 batch_size=batchSize,
@@ -539,6 +316,7 @@ class ManagerFunction:
                 num_workers=0,
                 pin_memory=pin_memory,
                 collate_fn=collate_ocr_batch,)
+            
             val_dl = DataLoader(
                 val_ds,
                 batch_size=batchSize,
@@ -546,6 +324,7 @@ class ManagerFunction:
                 num_workers=0,
                 pin_memory=pin_memory,
                 collate_fn=collate_ocr_batch,)
+            
             test_dl = DataLoader(
                 test_ds,
                 batch_size=batchSize,
@@ -561,62 +340,62 @@ class ManagerFunction:
             def eval_split(dl):
                 engine.eval()
                 split_loss = 0.0
-                split_batches = 0
-                correct = 0
-                total = 0
+                split_samples = 0
+                total_correct = 0
+                total_elems = 0
 
                 with torch.no_grad():
                     for imgs_b, boxes_b, texts_b in dl:
-                        prepared = self.PrepareOCRBatch(
-                            imgs_b,
-                            boxes_b,
-                            texts_b,
-                            engine,
-                            device=self.device,)
-                        if prepared is None:
-                            continue
+                        for img, boxes, texts in zip(imgs_b, boxes_b, texts_b):
+                            sample: Dict[str, Any] = DataPreprocessor.PrepareOCRSample(
+                                img, 
+                                boxes,
+                                texts,
+                                char2Idx=engine.char2Idx,
+                                imageSize=BasicParameters.IMAGE_SIZE,
+                                targetH=32,
+                                maxW=256,
+                                device=self.device,)
 
-                        (
-                            detect_imgs_t,
-                            gt_shrink_t,
-                            gt_thresh_t,
-                            gt_mask_t,
-                            recog_imgs_t,
-                            targets_t,
-                            target_lengths_t,
-                            norm_texts,
-                        ) = prepared
+                            detect_img = sample["detect_img"].unsqueeze(0) # [1, 3, H, W]
+                            gt_shrink = sample["gt_shrink"].unsqueeze(0) # [1, 1, H, W]
+                            gt_thresh = sample["gt_thresh"].unsqueeze(0) # [1, 1, H, W]
+                            gt_mask = sample["gt_mask"].unsqueeze(0) # [1, 1, H, W]
 
-                        det_out = engine.ForwardDetect(
-                            detect_imgs_t,
-                            gtShrink=gt_shrink_t,
-                            gtThresh=gt_thresh_t,
-                            gtMask=gt_mask_t,)
-                        det_loss = det_out["loss"]
+                            det_out = engine.ForwardDetect(
+                                detect_img,
+                                gtShrink=gt_shrink,
+                                gtThresh=gt_thresh,
+                                gtMask=gt_mask,)
+                            det_loss = det_out["loss"] # []
 
-                        rec_loss = det_loss.new_zeros(())
-                        if recog_imgs_t.size(0) > 0 and targets_t.numel() > 0:
-                            rec_out = engine.ForwardRecognize(
-                                recog_imgs_t,
-                                targetsTensor=targets_t,
-                                targetLengths=target_lengths_t,)
-                            rec_loss = rec_out["loss"]
+                            rec_loss = det_loss.new_zeros(()) # []
+                            recog_imgs = sample["recog_imgs"] # [N_line, 1, targetH, maxW]
+                            targets = sample["targets"] # [sum(target_lengths)]
+                            target_lengths = sample["target_lengths"] # [N_line]
+                            norm_texts = sample["norm_texts"]
 
-                            pairs = engine.CtcGreedyDecodeWithConf(
-                                rec_out["log_probs"],
-                                idx2Char=engine.idx2Char,
-                                blankIndex=engine.blankIndex,)
-                            pred_texts = [txt for txt, _ in pairs]
-                            correct += sum(int(pred == target) for pred, target in zip(pred_texts, norm_texts))
-                            total += len(norm_texts)
+                            if recog_imgs.size(0) > 0 and targets.numel() > 0:
+                                rec_out = engine.ForwardRecognize(
+                                    recog_imgs,
+                                    targetsTensor=targets,
+                                    targetLengths=target_lengths,)
+                                rec_loss = rec_out["loss"] # []
 
-                        loss = det_loss + rec_loss
-                        split_loss += float(loss.item())
-                        split_batches += 1
+                                pairs = engine.CtcGreedyDecodeWithConf(
+                                    rec_out["log_probs"], # [T, N_line, C_vocab]
+                                    idx2Char=engine.idx2Char,
+                                    blankIndex=engine.blankIndex,)
+                                pred_texts = [txt for txt, _ in pairs]
+                                total_correct += sum(int(pred == target) for pred, target in zip(pred_texts, norm_texts))
+                                total_elems += len(norm_texts)
 
-                avg_loss = split_loss / max(1, split_batches)
-                acc = correct / max(1, total)
-                return avg_loss, acc
+                            split_loss += float((det_loss + rec_loss).item())
+                            split_samples += 1
+
+                avg_split_loss = split_loss / max(1, split_samples)
+                split_acc = (total_correct / total_elems if total_elems > 0 else 0.0)
+                return avg_split_loss, split_acc
 
             self.controller.SetStatus(
                 "training",
@@ -636,73 +415,79 @@ class ManagerFunction:
                     time.sleep(0.2)
 
                 engine.train()
-
                 epoch_loss = 0.0
                 nb = 0
 
                 for bi, batch in enumerate(train_dl, start=1):
                     imgs_b, boxes_b, texts_b = batch
-                    prepared = self.PrepareOCRBatch(
-                        imgs_b,
-                        boxes_b,
-                        texts_b,
-                        engine,
-                        device=self.device,)
-                    if prepared is None:
+                    sample_losses: List[torch.Tensor] = []
+                    batch_correct = 0
+                    batch_elems = 0
+
+                    for img, boxes, texts in zip(imgs_b, boxes_b, texts_b):
+                        sample: Dict[str, Any] = DataPreprocessor.PrepareOCRSample(
+                            img,  
+                            boxes, 
+                            texts,
+                            char2Idx=engine.char2Idx,
+                            imageSize=BasicParameters.IMAGE_SIZE,
+                            targetH=32,
+                            maxW=256,
+                            device=self.device,)
+
+                        detect_img = sample["detect_img"].unsqueeze(0) # [1, 3, H, W]
+                        gt_shrink = sample["gt_shrink"].unsqueeze(0) # [1, 1, H, W]
+                        gt_thresh = sample["gt_thresh"].unsqueeze(0) # [1, 1, H, W]
+                        gt_mask = sample["gt_mask"].unsqueeze(0) # [1, 1, H, W]
+
+                        det_out = engine.ForwardDetect(
+                            detect_img,
+                            gtShrink=gt_shrink,
+                            gtThresh=gt_thresh,
+                            gtMask=gt_mask,)
+                        det_loss = det_out["loss"]
+
+                        rec_loss = det_loss.new_zeros(())
+                        recog_imgs = sample["recog_imgs"] # [N_line, 1, targetH, maxW]
+                        targets = sample["targets"] # [sum(target_lengths)]
+                        target_lengths = sample["target_lengths"] # [N_line]
+                        norm_texts = sample["norm_texts"]
+
+                        if recog_imgs.size(0) > 0 and targets.numel() > 0:
+                            rec_out = engine.ForwardRecognize(
+                                recog_imgs,
+                                targetsTensor=targets,
+                                targetLengths=target_lengths,)
+                            rec_loss = rec_out["loss"] # []
+
+                            with torch.no_grad():
+                                pairs = engine.CtcGreedyDecodeWithConf(
+                                    rec_out["log_probs"].detach(), # [T, N_line, C_vocab]
+                                    idx2Char=engine.idx2Char,
+                                    blankIndex=engine.blankIndex,)
+                                pred_texts = [txt for txt, _ in pairs]
+                                batch_correct += sum(int(pred == target) for pred, target in zip(pred_texts, norm_texts))
+                                batch_elems += len(norm_texts)
+
+                        sample_losses.append(det_loss + rec_loss)
+
+                    if len(sample_losses) == 0:
                         continue
 
-                    (
-                        detect_imgs_t,
-                        gt_shrink_t,
-                        gt_thresh_t,
-                        gt_mask_t,
-                        recog_imgs_t,
-                        targets_t,
-                        target_lengths_t,
-                        norm_texts,
-                    ) = prepared
-
-                    det_out = engine.ForwardDetect(
-                        detect_imgs_t,
-                        gtShrink=gt_shrink_t,
-                        gtThresh=gt_thresh_t,
-                        gtMask=gt_mask_t,)
-                    det_loss = det_out["loss"]
-
-                    rec_loss = det_loss.new_zeros(())
-                    rec_out = None
-                    if recog_imgs_t.size(0) > 0 and targets_t.numel() > 0:
-                        rec_out = engine.ForwardRecognize(
-                            recog_imgs_t,
-                            targetsTensor=targets_t,
-                            targetLengths=target_lengths_t,)
-                        rec_loss = rec_out["loss"]
-
-                    loss = det_loss + rec_loss
+                    loss = torch.stack(sample_losses).mean() # []
+                    rec_acc = (batch_correct / batch_elems) if batch_elems > 0 else 0.0
 
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(engine.parameters(), 1.0)
                     optimizer.step()
 
-                    with torch.no_grad():
-                        batch_acc = 0.0
-                        if rec_out is not None and len(norm_texts) > 0:
-                            pairs = engine.CtcGreedyDecodeWithConf(
-                                rec_out["log_probs"].detach(),
-                                idx2Char=engine.idx2Char,
-                                blankIndex=engine.blankIndex,)
-                            pred_texts = [txt for txt, _ in pairs]
-                            batch_acc = (
-                                sum(int(pred == target) for pred, target in zip(pred_texts, norm_texts))
-                                / max(1, len(norm_texts)))
-
                     epoch_loss += float(loss.item())
                     nb += 1
 
                     self.controller.SetStatus(
                         "training",
-                        f"OCR training... acc={batch_acc:.3f}",
+                        f"OCR training... rec_acc={rec_acc:.3f}",
                         epoch=ep + 1,
                         total_epochs=epochs,
                         batch=bi,
@@ -711,6 +496,7 @@ class ManagerFunction:
 
                     if self.controller.ShouldStop():
                         break
+
                     while self.controller.ShouldPause():
                         self.controller.SetStatus("paused", "OCR training paused")
                         time.sleep(0.2)
@@ -772,6 +558,8 @@ class ManagerFunction:
             self.controller.SetStatus("error", f"OCR training error: {e}", trace=tb)
         finally:
             self.is_begin = False
+
+
 
     def TrainLoop(self,root: str, epochs: int, batchSize: int, valSplit: float, resume: bool, onlineLearning = False, *, worldMemPath: str = None, memMemPath: str = None, ckptPath: str = None,):
         try:
@@ -1444,7 +1232,7 @@ class ManagerFunction:
         self,
         onlineLearning: bool,
         epochs: int = 6,
-        batchSize: int = 8,
+        batchSize: int = 4,
         valSplit: float = 0.2,
         isResume: bool = False,
         *,
@@ -1455,7 +1243,7 @@ class ManagerFunction:
             boxes_dir = root / "boxes"
             texts_dir = root / "texts"
 
-            if not frames_dir.exists() or not boxes_dir.exists() or not texts_dir.exists():
+            if not (frames_dir.exists() and boxes_dir.exists() and texts_dir.exists()):
                 print(f"[TrainOCR] no dataset found at {root}, please prepare frames/boxes/texts first.")
                 return {"ok": False, "msg": "no ocr dataset"}
 
@@ -1489,10 +1277,7 @@ class ManagerFunction:
                 print("StartOCRTraining returns False (training may already be running)")
                 return {"ok": False, "msg": "already_running"}
 
-            self.message_thread = threading.Thread(
-                target=self.MonitorTraining,
-                args=(),
-                daemon=False,)
+            self.message_thread = threading.Thread(target=self.MonitorTraining, args=(), daemon=False)
             self.message_thread.start()
 
             return {"ok": True}
@@ -1502,14 +1287,127 @@ class ManagerFunction:
             print(f"Traceback: {traceback.format_exc()}")
             raise
 
-    def TestOCRModuleTrain(self, onlineLearning: bool) -> Dict[str, Any]:
-        return self.TrainOCRModule(
-            onlineLearning=onlineLearning,
-            epochs=1,
-            batchSize=4,
-            valSplit=0.2,
-            isResume=False,
-            dataRoot=BasicParameters.DATA_ROOT_PATH_TEST,)
+    def TestOCRModuleTrain(
+        self,
+        onlineLearning: bool,
+        *,
+        dataRoot: str = BasicParameters.DATA_ROOT_PATH_TEST,
+        nSamples: int = 32,
+        epochs: int = 1,
+        batchSize: int = 4,
+        valSplit: float = 0.2,
+        seed: int = 42,) -> Dict[str, Any]:
+        if self.is_begin:
+            return {"ok": False, "msg": "StartOCRTraining returns False (training may already be running)"}
+
+        try:
+            root = Path(dataRoot)
+            frames_dir = root / "frames"
+            boxes_dir = root / "boxes"
+            texts_dir = root / "texts"
+
+            def has_existing_ocr_data(p: Path) -> bool:
+                return (
+                    (p / "frames").exists()
+                    and (p / "boxes").exists()
+                    and (p / "texts").exists()
+                    and any((p / "frames").glob("*.png"))
+                    and any((p / "boxes").glob("*.npy"))
+                    and any((p / "texts").glob("*.txt")))
+
+            if not has_existing_ocr_data(root):
+                if iio is None:
+                    raise RuntimeError("imageio.v3 error")
+
+                rng = np.random.default_rng(seed)
+                if root.exists():
+                    shutil.rmtree(root)
+                frames_dir.mkdir(parents=True, exist_ok=True)
+                boxes_dir.mkdir(parents=True, exist_ok=True)
+                texts_dir.mkdir(parents=True, exist_ok=True)
+
+                vocab_path = Path("BrainDeepLearn/ModuleSetting/OCRKeys.txt")
+                if not vocab_path.exists():
+                    raise FileNotFoundError(f"OCR vocab file not found: {vocab_path}")
+
+                vocab_chars = [
+                    line.strip()
+                    for line in vocab_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()]
+                if len(vocab_chars) == 0:
+                    raise RuntimeError(f"OCR vocab file is empty: {vocab_path}")
+
+                h_img = BasicParameters.IMAGE_SIZE
+                w_img = BasicParameters.IMAGE_SIZE
+
+                for i in range(nSamples):
+                    img = rng.integers(0, 32, size=(h_img, w_img, 3), dtype=np.uint8)
+                    n_lines = int(rng.integers(1, 5))
+                    boxes: List[List[float]] = []
+                    texts: List[str] = []
+
+                    top_margin = 24
+                    bottom_margin = 24
+                    usable_h = max(80, h_img - top_margin - bottom_margin)
+                    lane_h = max(28, usable_h // max(1, n_lines))
+
+                    for li in range(n_lines):
+                        line_h = int(rng.integers(24, min(56, lane_h + 1)))
+                        y1_base = top_margin + li * lane_h
+                        y1_jitter = int(rng.integers(0, max(1, lane_h - line_h + 1)))
+                        y1 = min(h_img - line_h - 1, y1_base + y1_jitter)
+                        y2 = min(h_img, y1 + line_h)
+
+                        x1 = int(rng.integers(16, 64))
+                        line_w = int(rng.integers(96, min(360, w_img - x1)))
+                        x2 = min(w_img, x1 + line_w)
+
+                        bg_val = int(rng.integers(120, 220))
+                        img[y1:y2, x1:x2, :] = bg_val
+
+                        text_len = int(rng.integers(2, 9))
+                        text = "".join(rng.choice(vocab_chars, size=text_len, replace=True).tolist())
+                        texts.append(text)
+                        boxes.append([float(x1), float(y1), float(x2), float(y2)])
+
+                        inner_y1 = min(y2 - 1, y1 + 4)
+                        inner_y2 = max(inner_y1 + 1, y2 - 4)
+                        cursor_x = x1 + 6
+                        char_w = max(6, (max(1, x2 - x1 - 12)) // max(1, text_len))
+                        for ch in text:
+                            stripe_w = max(2, char_w // 3)
+                            glyph_h = max(4, inner_y2 - inner_y1)
+                            tone = int((hash(ch) % 120) + 40)
+                            gx1 = min(x2 - 1, cursor_x + int(rng.integers(0, max(1, char_w - stripe_w + 1))))
+                            gx2 = min(x2, gx1 + stripe_w)
+                            gy1 = inner_y1
+                            gy2 = min(inner_y2, gy1 + glyph_h)
+                            img[gy1:gy2, gx1:gx2, :] = tone
+                            cursor_x += char_w
+                            if cursor_x >= x2 - 4:
+                                break
+
+                    iio.imwrite(str(frames_dir / f"{i:05d}.png"), img)
+                    np.save(str(boxes_dir / f"{i:05d}.npy"), np.asarray(boxes, dtype=np.float32))
+                    texts_dir.joinpath(f"{i:05d}.txt").write_text("\n".join(texts), encoding="utf-8")
+
+                print(f"[TestOCR] created random OCR dataset at: {root}")
+            else:
+                print(f"[TestOCR] use existing OCR dataset at: {root}")
+
+            return self.TrainOCRModule(
+                onlineLearning=onlineLearning,
+                epochs=epochs,
+                batchSize=batchSize,
+                valSplit=valSplit,
+                isResume=False,
+                dataRoot=str(root),)
+
+        except Exception as e:
+            print(f"TestOCRModuleTrain failed with error: {e}")
+            print(f"Traceback: {traceback.format_exc()}")
+            raise
+
 
     def TrainModule(
         self,
