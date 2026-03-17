@@ -47,13 +47,17 @@ class BasicParameters:
     MEMORY_MEMORY_PATH = "BrainDeepLearn/Data/MemoryMemory.pt"
     WORLD_MEMORY_PATH = "BrainDeepLearn/Data/WorldMemory.pt"
     MODULEPARAMETER_PATH = "BrainDeepLearn/Data/module_parameter.pth"
+    OCR_MODULEPARAMETER_PATH = "BrainDeepLearn/Data/ocr_module_parameter.pth"
     DATA_ROOT_PATH = "BrainDeepLearn/Data"
     CKPT_PATH_TRAIN = "BrainDeepLearn/Data/training_checkpoint.pth"
+    OCR_CKPT_PATH_TRAIN = "BrainDeepLearn/Data/ocr_training_checkpoint.pth"
 
     MEMORY_MEMORY_PATH_TEST = "BrainDeepLearn/TestData/MemoryMemory.pt"
     WORLD_MEMORY_PATH_TEST = "BrainDeepLearn/TestData/WorldMemory.pt"
+    OCR_MODULEPARAMETER_PATH_TEST = "BrainDeepLearn/TestData/ocr_module_parameter.pth"
     DATA_ROOT_PATH_TEST = "BrainDeepLearn/TestData"
     CKPT_PATH_TEST = "BrainDeepLearn/TestData/training_test_checkpoint.pth"
+    OCR_CKPT_PATH_TEST = "BrainDeepLearn/TestData/ocr_training_checkpoint.pth"
 
 
 @dataclass

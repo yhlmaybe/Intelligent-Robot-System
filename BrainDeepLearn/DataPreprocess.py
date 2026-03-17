@@ -16,6 +16,13 @@ except Exception:
     iio = None
 
 
+def ResolveOCRTextsDir(root: Path, *, preferNamedDir: bool = False) -> Path:
+    ocr_texts_dir = root / "OCRTexts"
+    if preferNamedDir or ocr_texts_dir.exists():
+        return ocr_texts_dir
+    return root / "texts"
+
+
 class OfflineGameDataset(Dataset):
     def __init__(self, root: str) -> None:
         p = Path(root)
@@ -55,7 +62,7 @@ class OfflineOCRDataset(Dataset):
         p = Path(root)
         self.imgs = sorted((p / "frames").glob("*.png"))
         self.boxes = sorted((p / "boxes").glob("*.npy"))
-        self.texts = sorted((p / "texts").glob("*.txt"))
+        self.texts = sorted(ResolveOCRTextsDir(p).glob("*.txt"))
 
         assert len(self.imgs) == len(self.boxes) == len(self.texts), "frames/boxes/texts The number of files is inconsistent."
         if len(self.imgs) == 0:

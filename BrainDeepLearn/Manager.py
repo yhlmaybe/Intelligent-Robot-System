@@ -23,7 +23,7 @@ from ValueEstimationModule import  TestValueEstimationMTool
 from ConsciousnessModule import TestConsciousMTool
 from IntentionModule import TestIntentionMTool
 from OCRModule import TestOCRMTool, OCREngineExtractor
-from DataPreprocess import DataPreprocessor, OfflineGameDataset, OfflineOCRDataset
+from DataPreprocess import DataPreprocessor, OfflineGameDataset, OfflineOCRDataset, ResolveOCRTextsDir
 from AGICore import Agent, BrainCore, BasicParameters
 
 try:
@@ -141,27 +141,30 @@ class ManagerFunction:
 
     def StartOCRTraining(
         self,
-        root: str,
         epochs: int = 5,
         batchSize: int = 32,
         valSplit: float = 0.1,
         resume: bool = True,
         onlineLearning: bool = False,
+        isTest: bool = False,
         *,
-        ckptPath: str,
-        outPath: str,):
+        root: Optional[str] = None,):
         if self.is_begin:
             self.controller.SetStatus("recur", "Training or Deploy is already running")
             return False
         self.is_begin = True
+
+        ckpt_path = BasicParameters.OCR_CKPT_PATH_TEST if isTest else BasicParameters.OCR_CKPT_PATH_TRAIN
+        out_path = BasicParameters.OCR_MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.OCR_MODULEPARAMETER_PATH
+        root = root or (BasicParameters.DATA_ROOT_PATH_TEST if isTest else BasicParameters.DATA_ROOT_PATH)
 
         self.br_thread = threading.Thread(
             target=self.OCRTrainLoop,
             args=(root, epochs, batchSize, valSplit, resume),
             kwargs={
                 "onlineLearning": onlineLearning,
-                "ckptPath": ckptPath,
-                "outPath": outPath,},
+                "ckptPath": ckpt_path,
+                "outPath": out_path,},
 
             daemon=False)
         self.br_thread.start()
@@ -1236,42 +1239,32 @@ class ManagerFunction:
         valSplit: float = 0.2,
         isResume: bool = False,
         *,
-        dataRoot: str = BasicParameters.DATA_ROOT_PATH,) -> Dict[str, Any]:
+        dataRoot: Optional[str] = None,
+        isTest: bool = False,) -> Dict[str, Any]:
         try:
-            root = Path(dataRoot)
+            root = Path(dataRoot or (BasicParameters.DATA_ROOT_PATH_TEST if isTest else BasicParameters.DATA_ROOT_PATH))
             frames_dir = root / "frames"
             boxes_dir = root / "boxes"
-            texts_dir = root / "texts"
+            ocr_texts_dir = ResolveOCRTextsDir(root)
 
-            if not (frames_dir.exists() and boxes_dir.exists() and texts_dir.exists()):
-                print(f"[TrainOCR] no dataset found at {root}, please prepare frames/boxes/texts first.")
+            if not (frames_dir.exists() and boxes_dir.exists() and ocr_texts_dir.exists()):
+                print(f"[TrainOCR] no dataset found at {root}, please prepare frames/boxes/OCRTexts first.")
                 return {"ok": False, "msg": "no ocr dataset"}
 
-            if not any(frames_dir.glob("*.png")) or not any(boxes_dir.glob("*.npy")) or not any(texts_dir.glob("*.txt")):
+            if not any(frames_dir.glob("*.png")) or not any(boxes_dir.glob("*.npy")) or not any(ocr_texts_dir.glob("*.txt")):
                 print(f"[TrainOCR] no OCR samples found at {root}.")
                 return {"ok": False, "msg": "empty ocr dataset"}
-
-            is_test_root = Path(dataRoot) == Path(BasicParameters.DATA_ROOT_PATH_TEST)
-            ckpt_path = (
-                "BrainDeepLearn/TestData/ocr_training_checkpoint.pth"
-                if is_test_root
-                else "BrainDeepLearn/Data/ocr_training_checkpoint.pth")
-            out_path = (
-                "BrainDeepLearn/TestData/ocr_module_parameter.pth"
-                if is_test_root
-                else "BrainDeepLearn/Data/ocr_module_parameter.pth")
 
             print(f"[TrainOCR] use existing OCR dataset at: {root}")
 
             ok = self.StartOCRTraining(
-                str(root),
                 epochs=epochs,
                 batchSize=batchSize,
                 valSplit=valSplit,
                 resume=isResume,
                 onlineLearning=onlineLearning,
-                ckptPath=ckpt_path,
-                outPath=out_path,)
+                isTest=isTest,
+                root=str(root),)
 
             if not ok:
                 print("StartOCRTraining returns False (training may already be running)")
@@ -1304,16 +1297,17 @@ class ManagerFunction:
             root = Path(dataRoot)
             frames_dir = root / "frames"
             boxes_dir = root / "boxes"
-            texts_dir = root / "texts"
+            ocr_texts_dir = ResolveOCRTextsDir(root, preferNamedDir=True)
 
             def has_existing_ocr_data(p: Path) -> bool:
+                texts_dir = ResolveOCRTextsDir(p)
                 return (
                     (p / "frames").exists()
                     and (p / "boxes").exists()
-                    and (p / "texts").exists()
+                    and texts_dir.exists()
                     and any((p / "frames").glob("*.png"))
                     and any((p / "boxes").glob("*.npy"))
-                    and any((p / "texts").glob("*.txt")))
+                    and any(texts_dir.glob("*.txt")))
 
             if not has_existing_ocr_data(root):
                 if iio is None:
@@ -1324,7 +1318,7 @@ class ManagerFunction:
                     shutil.rmtree(root)
                 frames_dir.mkdir(parents=True, exist_ok=True)
                 boxes_dir.mkdir(parents=True, exist_ok=True)
-                texts_dir.mkdir(parents=True, exist_ok=True)
+                ocr_texts_dir.mkdir(parents=True, exist_ok=True)
 
                 vocab_path = Path("BrainDeepLearn/ModuleSetting/OCRKeys.txt")
                 if not vocab_path.exists():
@@ -1389,7 +1383,7 @@ class ManagerFunction:
 
                     iio.imwrite(str(frames_dir / f"{i:05d}.png"), img)
                     np.save(str(boxes_dir / f"{i:05d}.npy"), np.asarray(boxes, dtype=np.float32))
-                    texts_dir.joinpath(f"{i:05d}.txt").write_text("\n".join(texts), encoding="utf-8")
+                    ocr_texts_dir.joinpath(f"{i:05d}.txt").write_text("\n".join(texts), encoding="utf-8")
 
                 print(f"[TestOCR] created random OCR dataset at: {root}")
             else:
@@ -1401,7 +1395,8 @@ class ManagerFunction:
                 batchSize=batchSize,
                 valSplit=valSplit,
                 isResume=False,
-                dataRoot=str(root),)
+                dataRoot=str(root),
+                isTest=True,)
 
         except Exception as e:
             print(f"TestOCRModuleTrain failed with error: {e}")
