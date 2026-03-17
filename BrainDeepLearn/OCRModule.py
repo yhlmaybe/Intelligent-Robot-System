@@ -363,6 +363,13 @@ class CRNNRecognizer(nn.Module):
         seq = self.FeaturesToSeq(x) 
 
         rnn_out, _ = self.rnn(seq)
+        print(f"CRNNRecognizer rnn_out shape: {tuple(rnn_out.shape)}")
+        if not torch.isfinite(rnn_out).all():
+            bad = int((~torch.isfinite(rnn_out)).sum().item())
+            raise RuntimeError(
+                f"CRNNRecognizer rnn_out contains non-finite values before fc: "
+                f"bad={bad}, shape={tuple(rnn_out.shape)}"
+            )
         logits = self.fc(rnn_out) 
         log_probs = F.log_softmax(logits, dim=-1)
 
@@ -1003,6 +1010,36 @@ class TestOCRMTool:
             print("RecognizeForwardShapes error:", e)
             return False
 
+    def RecognizeForwardShapes512Square(self) -> bool:
+        try:
+            rec = CRNNRecognizer(imgH=32, inCh=3, nClasses=6634, rnnHidden=64).to(self.device)
+            rec.eval()
+
+            B, H, W = 1, 512, 512
+            imgs = torch.randn(B, 3, H, W, device=self.device)
+
+            with torch.no_grad():
+                out = rec(imgs)
+                logits = out["logits"]
+                log_probs = out["log_probs"]
+
+            T, B2, C = log_probs.shape
+            assert B2 == B and C == rec.nClasses
+            assert T > 0
+
+            assert logits.shape == (T, B, rec.nClasses)
+            assert torch.isfinite(logits).all()
+            assert torch.isfinite(log_probs).all()
+
+            print(f"RecognizeForwardShapes512Square passed. logits shape={tuple(logits.shape)}")
+            return True
+        except AssertionError as e:
+            print("RecognizeForwardShapes512Square failed:", e)
+            return False
+        except Exception as e:
+            print("RecognizeForwardShapes512Square error:", e)
+            return False
+
     def RecognizeCtcGradSmoke(self) -> bool:
         try:
             nClasses = 32
@@ -1252,6 +1289,7 @@ class TestOCRMTool:
             "DetectForwardShapes": self.DetectForwardShapes(),
             "DetectLossGradSmoke": self.DetectLossGradSmoke(),
             "RecognizeForwardShapes": self.RecognizeForwardShapes(),
+            "RecognizeForwardShapes512Square": self.RecognizeForwardShapes512Square(),
             "RecognizeCtcGradSmoke": self.RecognizeCtcGradSmoke(),
             "EngineForwardDetectAndLoss": self.EngineForwardDetectAndLoss(),
             "EngineForwardRecognizeAndLoss": self.EngineForwardRecognizeAndLoss(),

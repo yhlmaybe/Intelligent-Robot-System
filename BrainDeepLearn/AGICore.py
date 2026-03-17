@@ -12,7 +12,7 @@ import os
 import math
 import copy
 
-#import debugpy
+import debugpy
 
 from dataclasses import dataclass, field
 from collections import deque
@@ -833,7 +833,7 @@ class Agent:
 
     def SaveRuntimeMemories(self):
         if self.wm_mem_path is not None:
-            world = self._GetRuntimeWorld()
+            world = self.GetRuntimeWorld()
             world._use_memory = True
             world._mem_path = self.wm_mem_path
             world.SaveMemory(self.wm_mem_path)

@@ -270,10 +270,11 @@ bool BrainDeepLearnInterface::TestOCRModule()
 
 bool BrainDeepLearnInterface::TestModuleTrain(bool onlineLearning)
 {
-    return RunPythonAsync([this, onlineLearning]()
-    {
-        (void)CALL_METHOD_RET_BOOL("TestModuleTrain", "b", onlineLearning);
-    });
+    CALL_METHOD_RET_BOOL("TestModuleTrain", "b", onlineLearning);
+    //return RunPythonAsync([this, onlineLearning]()
+    //{
+    //    (void)CALL_METHOD_RET_BOOL("TestModuleTrain", "b", onlineLearning);
+    //});
 }
 
 bool BrainDeepLearnInterface::TestOCRModuleTrain(bool onlineLearning)

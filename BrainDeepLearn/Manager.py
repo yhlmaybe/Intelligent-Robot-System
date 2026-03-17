@@ -428,26 +428,29 @@ class ManagerFunction:
                             v_keys_t = v_pack["keys"]
                             v_mouse_click_t = v_pack["mouse_clicks"]
                             v_mouse_move_t = v_pack["mouse_moves"]
+                            v_reward_t = v_pack["rewards"]
+                            v_done_t = v_pack["dones"]
 
                             act_out = agent.Act(
                                 v_frames,
                                 textExt=ext_text_b,
-                                reward=None,
-                                done=None,
+                                reward=v_reward_t,
+                                done=v_done_t,
                                 sampleActions=True,
                                 deterministicActor=True,)
                             
                             if act_out is None:
                                 continue
 
-                            v_key_pred, v_click_pred, v_mouse_move_pred = act_out
-                            cur_loss, correct, elems = compute_supervised_loss_and_metrics(
+                            v_key_pred, v_click_pred, v_mouse_move_pred, v_model_loss = act_out
+                            bc_loss, correct, elems = compute_supervised_loss_and_metrics(
                                 v_key_pred,
                                 v_click_pred,
                                 v_mouse_move_pred,
                                 v_keys_t,
                                 v_mouse_click_t,
                                 v_mouse_move_t,)
+                            cur_loss = v_model_loss + bc_loss
                             
                             total_correct += correct
                             total_elems += elems
@@ -853,16 +856,16 @@ class ManagerFunction:
 
             print("[SmokeTest] start train...")
 
-            ok = self.StartTraining(epochs=epochs,batchSize=batchSize,valSplit=valSplit,resume=False, onlineLearning=onlineLearning, isTest=True)
+            """ok = self.StartTraining(epochs=epochs,batchSize=batchSize,valSplit=valSplit,resume=False, onlineLearning=onlineLearning, isTest=True)
 
             if not ok:
                 print("StartTraining returns False (training may already be running)")
                 return {"False": False, "msg": "StartTraining returns False (training may already be running)"}
 
             self.message_thread = threading.Thread(target=self.MonitorTraining,args=(),daemon=False,)
-            self.message_thread.start()
+            self.message_thread.start()"""
 
-            #self.TrainLoop(root, epochs, batchSize, valSplit, False, onlineLearning, worldMemPath=BasicParameters.WORLD_MEMORY_PATH_TEST, memMemPath=BasicParameters.MEMORY_MEMORY_PATH_TEST,ckptPath=BasicParameters.CKPT_PATH_TEST)
+            self.TrainLoop(root, epochs, batchSize, valSplit, False, onlineLearning, worldMemPath=BasicParameters.WORLD_MEMORY_PATH_TEST, memMemPath=BasicParameters.MEMORY_MEMORY_PATH_TEST,ckptPath=BasicParameters.CKPT_PATH_TEST)
         
             return {"ok": True}
 
