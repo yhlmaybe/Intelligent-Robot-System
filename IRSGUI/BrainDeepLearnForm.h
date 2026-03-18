@@ -58,13 +58,13 @@ private slots:
 
     void TestTrainOCRModule();
 
+    void TestTrainOCRRecognitionModule();
+
     void TestConsciousnessModule();
 
     void TestIntentionModule();
 
     void TestOCRModule();
-
-
 
     void TrainModule();
 

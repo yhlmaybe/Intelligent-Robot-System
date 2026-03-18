@@ -363,13 +363,6 @@ class CRNNRecognizer(nn.Module):
         seq = self.FeaturesToSeq(x) 
 
         rnn_out, _ = self.rnn(seq)
-        print(f"CRNNRecognizer rnn_out shape: {tuple(rnn_out.shape)}")
-        if not torch.isfinite(rnn_out).all():
-            bad = int((~torch.isfinite(rnn_out)).sum().item())
-            raise RuntimeError(
-                f"CRNNRecognizer rnn_out contains non-finite values before fc: "
-                f"bad={bad}, shape={tuple(rnn_out.shape)}"
-            )
         logits = self.fc(rnn_out) 
         log_probs = F.log_softmax(logits, dim=-1)
 

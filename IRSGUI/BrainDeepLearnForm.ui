@@ -144,10 +144,41 @@
        <string>Test</string>
       </attribute>
       <layout class="QGridLayout" name="gridLayout_2">
+       <item row="5" column="0">
+        <widget class="QPushButton" name="testValueEstimationModule_pushButton">
+         <property name="text">
+          <string>Test Value Estimation Module</string>
+         </property>
+        </widget>
+       </item>
        <item row="0" column="0">
         <widget class="QPushButton" name="testPerceptionModule_pushButton">
          <property name="text">
           <string>Test Perception Module</string>
+         </property>
+        </widget>
+       </item>
+       <item row="4" column="0">
+        <widget class="QPushButton" name="testWorldModule_pushButton">
+         <property name="text">
+          <string>Test World Module</string>
+         </property>
+         <property name="shortcut">
+          <string>Ctrl+S</string>
+         </property>
+        </widget>
+       </item>
+       <item row="10" column="0">
+        <widget class="QPushButton" name="testTrainOCRModule_pushButton">
+         <property name="text">
+          <string>Test Train OCR Module</string>
+         </property>
+        </widget>
+       </item>
+       <item row="7" column="0">
+        <widget class="QPushButton" name="testOCRModule_pushButton">
+         <property name="text">
+          <string>Test OCR Module</string>
          </property>
         </widget>
        </item>
@@ -165,41 +196,17 @@
          </property>
         </widget>
        </item>
+       <item row="9" column="0">
+        <widget class="QPushButton" name="testTrainModule_pushButton">
+         <property name="text">
+          <string>Test Train Module</string>
+         </property>
+        </widget>
+       </item>
        <item row="3" column="0">
         <widget class="QPushButton" name="testDecisionModule_pushButton">
          <property name="text">
           <string>Test Decision Module</string>
-         </property>
-        </widget>
-       </item>
-       <item row="4" column="0">
-        <widget class="QPushButton" name="testWorldModule_pushButton">
-         <property name="text">
-          <string>Test World Module</string>
-         </property>
-         <property name="shortcut">
-          <string>Ctrl+S</string>
-         </property>
-        </widget>
-       </item>
-       <item row="5" column="0">
-        <widget class="QPushButton" name="testValueEstimationModule_pushButton">
-         <property name="text">
-          <string>Test Value Estimation Module</string>
-         </property>
-        </widget>
-       </item>
-       <item row="6" column="0">
-        <widget class="QPushButton" name="testConsciousnessModule_pushButton">
-         <property name="text">
-          <string>Test Consciousness Module</string>
-         </property>
-        </widget>
-       </item>
-       <item row="7" column="0">
-        <widget class="QPushButton" name="testOCRModule_pushButton">
-         <property name="text">
-          <string>Test OCR Module</string>
          </property>
         </widget>
        </item>
@@ -210,17 +217,17 @@
          </property>
         </widget>
        </item>
-       <item row="9" column="0">
-        <widget class="QPushButton" name="testTrainModule_pushButton">
+       <item row="6" column="0">
+        <widget class="QPushButton" name="testConsciousnessModule_pushButton">
          <property name="text">
-          <string>Test Train Module</string>
+          <string>Test Consciousness Module</string>
          </property>
         </widget>
        </item>
-       <item row="10" column="0">
-        <widget class="QPushButton" name="testTrainOCRModule_pushButton">
+       <item row="11" column="0">
+        <widget class="QPushButton" name="testTrainOCRRecognitionModule_pushButton">
          <property name="text">
-          <string>Test Train OCR Module</string>
+          <string>Test Train OCR Recognition Module</string>
          </property>
         </widget>
        </item>

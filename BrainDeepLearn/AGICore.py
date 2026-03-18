@@ -48,16 +48,25 @@ class BasicParameters:
     WORLD_MEMORY_PATH = "BrainDeepLearn/Data/WorldMemory.pt"
     MODULEPARAMETER_PATH = "BrainDeepLearn/Data/module_parameter.pth"
     OCR_MODULEPARAMETER_PATH = "BrainDeepLearn/Data/ocr_module_parameter.pth"
+    OCR_RECOGNIZER_MODULEPARAMETER_PATH = "BrainDeepLearn/Data/ocr_recognizer_parameter.pth"
     DATA_ROOT_PATH = "BrainDeepLearn/Data"
+    OCR_DATA_ROOT_PATH = "BrainDeepLearn/Data/OCR"
+    OCR_RECOGNIZER_DATA_ROOT_PATH = "BrainDeepLearn/Data/OCRRecognition"
     CKPT_PATH_TRAIN = "BrainDeepLearn/Data/training_checkpoint.pth"
     OCR_CKPT_PATH_TRAIN = "BrainDeepLearn/Data/ocr_training_checkpoint.pth"
+    OCR_RECOGNIZER_CKPT_PATH_TRAIN = "BrainDeepLearn/Data/ocr_recognizer_training_checkpoint.pth"
 
     MEMORY_MEMORY_PATH_TEST = "BrainDeepLearn/TestData/MemoryMemory.pt"
     WORLD_MEMORY_PATH_TEST = "BrainDeepLearn/TestData/WorldMemory.pt"
+    MODULEPARAMETER_PATH_TEST = "BrainDeepLearn/TestData/module_parameter.pth"
     OCR_MODULEPARAMETER_PATH_TEST = "BrainDeepLearn/TestData/ocr_module_parameter.pth"
+    OCR_RECOGNIZER_MODULEPARAMETER_PATH_TEST = "BrainDeepLearn/TestData/ocr_recognizer_parameter.pth"
     DATA_ROOT_PATH_TEST = "BrainDeepLearn/TestData"
+    OCR_DATA_ROOT_PATH_TEST = "BrainDeepLearn/TestData/OCR"
+    OCR_RECOGNIZER_DATA_ROOT_PATH_TEST = "BrainDeepLearn/TestData/OCRRecognition"
     CKPT_PATH_TEST = "BrainDeepLearn/TestData/training_test_checkpoint.pth"
     OCR_CKPT_PATH_TEST = "BrainDeepLearn/TestData/ocr_training_checkpoint.pth"
+    OCR_RECOGNIZER_CKPT_PATH_TEST = "BrainDeepLearn/TestData/ocr_recognizer_training_checkpoint.pth"
 
 
 @dataclass

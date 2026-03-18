@@ -33,6 +33,7 @@ BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manage
     connect(ui->testValueEstimationModule_pushButton, SIGNAL(clicked()), this, SLOT(TestValueEstimationModule()));
     connect(ui->testTrainModule_pushButton, SIGNAL(clicked()), this, SLOT(TestTrainModule()));
     connect(ui->testTrainOCRModule_pushButton, SIGNAL(clicked()), this, SLOT(TestTrainOCRModule()));
+    connect(ui->testTrainOCRRecognitionModule_pushButton, SIGNAL(clicked()), this, SLOT(TestTrainOCRRecognitionModule()));
     connect(ui->testConsciousnessModule_pushButton, SIGNAL(clicked()), this, SLOT(TestConsciousnessModule()));
     connect(ui->testIntentionModule_pushButton, SIGNAL(clicked()), this, SLOT(TestIntentionModule()));
     connect(ui->testOCRModule_pushButton, SIGNAL(clicked()), this, SLOT(TestOCRModule()));
@@ -125,14 +126,12 @@ void BrainDeepLearnForm::TestTrainModule()
 
 void BrainDeepLearnForm::TestTrainOCRModule()
 {
-    if(ui->onlineLearning_checkBox->isChecked())
-    {
-        brainDeepLearn->TestOCRModuleTrain(true);
-    }
-    else
-    {
-        brainDeepLearn->TestOCRModuleTrain(false);
-    }
+    brainDeepLearn->TestOCRModuleTrain(); 
+}
+
+void BrainDeepLearnForm::TestTrainOCRRecognitionModule()
+{
+    brainDeepLearn->TestOCRRecognitionTrain();
 }
 
 void BrainDeepLearnForm::TestConsciousnessModule()

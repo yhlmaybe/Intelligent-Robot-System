@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -14,13 +15,6 @@ try:
     import imageio.v3 as iio
 except Exception:
     iio = None
-
-
-def ResolveOCRTextsDir(root: Path, *, preferNamedDir: bool = False) -> Path:
-    ocr_texts_dir = root / "OCRTexts"
-    if preferNamedDir or ocr_texts_dir.exists():
-        return ocr_texts_dir
-    return root / "texts"
 
 
 class OfflineGameDataset(Dataset):
@@ -61,12 +55,21 @@ class OfflineOCRDataset(Dataset):
     def __init__(self, root: str) -> None:
         p = Path(root)
         self.imgs = sorted((p / "frames").glob("*.png"))
+        self.texts = sorted((p / "OCRTexts").glob("*.txt"))
         self.boxes = sorted((p / "boxes").glob("*.npy"))
-        self.texts = sorted(ResolveOCRTextsDir(p).glob("*.txt"))
 
-        assert len(self.imgs) == len(self.boxes) == len(self.texts), "frames/boxes/texts The number of files is inconsistent."
+        assert len(self.imgs) == len(self.texts), "frames/OCRTexts The number of files is inconsistent."
         if len(self.imgs) == 0:
             raise RuntimeError(f"no OCR samples found under {p}")
+
+        self.use_text_annotations = False
+        for txt_path in self.texts:
+            if DataPreprocessor.TextFileLooksLikeOCRAnnotations(txt_path):
+                self.use_text_annotations = True
+                break
+
+        if not self.use_text_annotations:
+            assert len(self.boxes) == len(self.imgs), "frames/boxes/OCRTexts The number of files is inconsistent."
 
     def __len__(self) -> int:
         return len(self.imgs)
@@ -76,18 +79,63 @@ class OfflineOCRDataset(Dataset):
             raise RuntimeError("imageio.v3 cant use")
 
         img = iio.imread(self.imgs[idx])
-        boxes = np.load(self.boxes[idx]).astype(np.float32)
-        if boxes.ndim == 1:
-            boxes = boxes.reshape(-1, 4)
-        if boxes.ndim != 2 or boxes.shape[1] != 4:
-            raise ValueError(f"OCR boxes must have shape [N, 4], but got {boxes.shape} from {self.boxes[idx]}")
+        if self.use_text_annotations:
+            boxes, texts, ignore_flags = DataPreprocessor.LoadOCRAnnotations(self.texts[idx])
+        else:
+            boxes = np.load(self.boxes[idx]).astype(np.float32)
+            if boxes.ndim == 1:
+                boxes = boxes.reshape(-1, 4)
+            if boxes.ndim != 2 or boxes.shape[1] != 4:
+                raise ValueError(f"OCR boxes must have shape [N, 4], but got {boxes.shape} from {self.boxes[idx]}")
 
-        texts = self.texts[idx].read_text(encoding="utf-8").splitlines()
+            texts = self.texts[idx].read_text(encoding="utf-8").splitlines()
+            ignore_flags = np.zeros((len(texts),), dtype=np.float32)
+
         if len(boxes) != len(texts):
             raise ValueError(
-                f"OCR texts/boxes count mismatch at {self.texts[idx]} and {self.boxes[idx]}: "
+                f"OCR texts/boxes count mismatch at {self.texts[idx]}: "
                 f"{len(texts)} vs {len(boxes)}")
-        return img, boxes, texts
+        if len(ignore_flags) != len(texts):
+            raise ValueError(f"OCR ignore flags/texts mismatch at {self.texts[idx]}: {len(ignore_flags)} vs {len(texts)}")
+        return img, boxes, texts, ignore_flags
+
+
+class OfflineOCRRecognitionDataset(Dataset):
+    def __init__(self, root: str) -> None:
+        p = Path(root)
+        self.imgs = sorted((p / "frames").glob("*.png"))
+        self.texts = sorted((p / "OCRTexts").glob("*.txt"))
+
+        assert len(self.imgs) == len(self.texts), "frames/OCRTexts The number of files is inconsistent."
+        if len(self.imgs) == 0:
+            raise RuntimeError(f"no OCR recognition samples found under {p}")
+
+    def __len__(self) -> int:
+        return len(self.imgs)
+
+    def __getitem__(self, idx: int):
+        if iio is None:
+            raise RuntimeError("imageio.v3 cant use")
+
+        img = iio.imread(self.imgs[idx])
+        raw_lines = [
+            line.strip()
+            for line in self.texts[idx].read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+        if len(raw_lines) == 0:
+            text = ""
+            ignore_flag = 1
+        elif len(raw_lines) == 1 and DataPreprocessor.LooksLikeOCRAnnotationLine(raw_lines[0]):
+            _, ignore_flag, text = DataPreprocessor.ParseOCRAnnotationLine(raw_lines[0])
+        elif len(raw_lines) == 1:
+            text = raw_lines[0]
+            ignore_flag = 0
+        else:
+            raise ValueError(
+                f"OCR recognition label file must contain exactly one non-empty line: {self.texts[idx]}")
+
+        return img, text, np.float32(ignore_flag)
 
 
 @dataclass
@@ -101,6 +149,106 @@ class DataResizeMeta:
 
 
 class DataPreprocessor:
+    @staticmethod
+    def SplitOCRCsvLine(line: str) -> List[str]:
+        cleaned = str(line).strip().lstrip("\ufeff").strip()
+        cleaned = cleaned.lstrip(",")
+        if not cleaned:
+            return []
+        return next(csv.reader([cleaned], skipinitialspace=True))
+
+    @staticmethod
+    def LooksLikeOCRAnnotationLine(line: str) -> bool:
+        parts = DataPreprocessor.SplitOCRCsvLine(line)
+        if len(parts) < 6:
+            return False
+
+        for coord_count in (8, 4):
+            if len(parts) < coord_count + 2:
+                continue
+            try:
+                [float(parts[i]) for i in range(coord_count)]
+                return parts[coord_count].strip() in ("0", "1")
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def TextFileLooksLikeOCRAnnotations(path: Union[str, Path]) -> bool:
+        txt_path = Path(path)
+        if not txt_path.exists():
+            return False
+
+        for raw_line in txt_path.read_text(encoding="utf-8").splitlines():
+            if raw_line.strip():
+                return DataPreprocessor.LooksLikeOCRAnnotationLine(raw_line)
+        return False
+
+    @staticmethod
+    def ParseOCRAnnotationLine(line: str) -> Tuple[np.ndarray, int, str]:
+        parts = DataPreprocessor.SplitOCRCsvLine(line)
+        if len(parts) < 6:
+            raise ValueError(f"OCR annotation line has too few fields: {line!r}")
+
+        coord_count = None
+        for cand in (8, 4):
+            if len(parts) < cand + 2:
+                continue
+            try:
+                [float(parts[i]) for i in range(cand)]
+                if parts[cand].strip() not in ("0", "1"):
+                    continue
+                coord_count = cand
+                break
+            except Exception:
+                continue
+
+        if coord_count is None:
+            raise ValueError(f"OCR annotation line has invalid coordinates: {line!r}")
+
+        coords = [float(parts[i]) for i in range(coord_count)]
+        idx = coord_count
+
+        ignore_flag = int(parts[idx].strip())
+        idx += 1
+
+        text = ",".join(parts[idx:]).strip() if idx < len(parts) else ""
+        if ignore_flag:
+            text = text.replace("#", "")
+        if coord_count == 8:
+            xs = coords[0::2]
+            ys = coords[1::2]
+            box = np.asarray([min(xs), min(ys), max(xs), max(ys)], dtype=np.float32)
+        else:
+            x1, y1, x2, y2 = coords
+            box = np.asarray([min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)], dtype=np.float32)
+
+        return box, int(ignore_flag), text
+
+    @staticmethod
+    def LoadOCRAnnotations(path: Union[str, Path]) -> Tuple[np.ndarray, List[str], np.ndarray]:
+        boxes: List[np.ndarray] = []
+        texts: List[str] = []
+        ignore_flags: List[float] = []
+
+        txt_path = Path(path)
+        for line_no, raw_line in enumerate(txt_path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not raw_line.strip():
+                continue
+            try:
+                box, ignore_flag, text = DataPreprocessor.ParseOCRAnnotationLine(raw_line)
+            except Exception as e:
+                raise ValueError(f"failed to parse OCR annotation line {line_no} in {txt_path}: {e}") from e
+
+            boxes.append(box.astype(np.float32))
+            texts.append(text)
+            ignore_flags.append(float(ignore_flag))
+
+        if len(boxes) == 0:
+            return np.empty((0, 4), dtype=np.float32), [], np.empty((0,), dtype=np.float32)
+
+        return np.stack(boxes, axis=0).astype(np.float32), texts, np.asarray(ignore_flags, dtype=np.float32)
+
     @staticmethod
     def ToImageTensor(image: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
         if isinstance(image, np.ndarray):
@@ -267,7 +415,8 @@ class DataPreprocessor:
     def NormalizeTextLine(text: Optional[str], char2Idx: dict) -> str:
         if text is None:
             return ""
-        return "".join(ch for ch in str(text).strip() if ch in char2Idx)
+        cleaned = str(text).strip()
+        return "".join(ch for ch in cleaned if ch in char2Idx)
 
     @staticmethod
     def OCRBuildDbTargets(
@@ -314,6 +463,7 @@ class DataPreprocessor:
         boxes: Union[np.ndarray, torch.Tensor],
         texts: List[str],
         *,
+        ignoreFlags: Optional[Union[np.ndarray, torch.Tensor, List[float], List[int]]] = None,
         char2Idx: dict,
         imageSize: int,
         targetH: int = 32,
@@ -327,12 +477,18 @@ class DataPreprocessor:
         texts_list = list(texts)
         if len(boxes_np) != len(texts_list):
             raise ValueError(f"OCR texts/boxes count mismatch in sample: {len(texts_list)} vs {len(boxes_np)}")
+        if ignoreFlags is None:
+            ignore_flags_np = np.zeros((len(texts_list),), dtype=np.float32)
+        else:
+            ignore_flags_np = np.asarray(ignoreFlags, dtype=np.float32).reshape(-1)
+        if len(ignore_flags_np) != len(texts_list):
+            raise ValueError(f"OCR ignore flags/texts count mismatch in sample: {len(ignore_flags_np)} vs {len(texts_list)}")
 
         det_boxes: List[np.ndarray] = []
         rec_boxes: List[np.ndarray] = []
         rec_texts: List[str] = []
 
-        for box, raw_text in zip(boxes_np, texts_list):
+        for box, raw_text, ignore_flag in zip(boxes_np, texts_list, ignore_flags_np):
             x1, y1, x2, y2 = [int(round(v)) for v in box.tolist()]
             x1 = max(0, min(imageSize - 1, x1))
             y1 = max(0, min(imageSize - 1, y1))
@@ -343,6 +499,8 @@ class DataPreprocessor:
 
             det_boxes.append(np.array([x1, y1, x2, y2], dtype=np.int32))
 
+            if bool(ignore_flag):
+                continue
             text = DataPreprocessor.NormalizeTextLine(raw_text, char2Idx)
             if not text:
                 continue
@@ -398,4 +556,47 @@ class DataPreprocessor:
             "targets": targets,
             "target_lengths": target_lengths,
             "norm_texts": rec_texts,
+            "ignore_flags": ignore_flags_np,
             "resize_meta": resize_meta,}
+
+    @staticmethod
+    def PrepareOCRRecognitionSample(
+        image: Union[np.ndarray, torch.Tensor],
+        text: Optional[str],
+        *,
+        ignoreFlag: Union[bool, int, float] = False,
+        char2Idx: dict,
+        targetH: int = 32,
+        maxW: int = 256,
+        device: Optional[torch.device] = None,) -> Dict[str, Any]:
+        image_t = DataPreprocessor.ToImageTensor(image)
+        _, h_img, w_img = image_t.shape
+
+        recog_imgs = DataPreprocessor.CropAndResizeLineImages(
+            image_t,
+            np.asarray([[0.0, 0.0, float(w_img), float(h_img)]], dtype=np.float32),
+            targetH=targetH,
+            maxW=maxW,)
+
+        ignore = bool(ignoreFlag)
+        norm_text = "" if ignore else DataPreprocessor.NormalizeTextLine(text, char2Idx)
+
+        if recog_imgs.size(0) == 0 or not norm_text:
+            targets = torch.empty(0, dtype=torch.long)
+            target_lengths = torch.empty(0, dtype=torch.long)
+        else:
+            ids = [int(char2Idx[ch]) for ch in norm_text]
+            targets = torch.tensor(ids, dtype=torch.long)
+            target_lengths = torch.tensor([len(ids)], dtype=torch.long)
+
+        if device is not None:
+            recog_imgs = recog_imgs.to(device)
+            targets = targets.to(device)
+            target_lengths = target_lengths.to(device)
+
+        return {
+            "recog_imgs": recog_imgs,
+            "targets": targets,
+            "target_lengths": target_lengths,
+            "norm_text": norm_text,
+            "ignore": ignore,}

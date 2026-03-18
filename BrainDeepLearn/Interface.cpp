@@ -71,11 +71,11 @@ bool BrainDeepLearnInterface::TrainModule(bool isOnlineLearning, int epochs, int
     });
 }
 
-bool BrainDeepLearnInterface::TrainOCRModule(bool isOnlineLearning, int epochs, int batchSize, double valSplit, bool resume) 
+bool BrainDeepLearnInterface::TrainOCRModule(int epochs, int batchSize, double valSplit, bool resume) 
 {
-    return RunPythonAsync([this, isOnlineLearning, epochs, batchSize, valSplit, resume]()
+    return RunPythonAsync([this, epochs, batchSize, valSplit, resume]()
     {
-        (void)CALL_METHOD_RET_BOOL("TrainOCRModule", "biidi", isOnlineLearning, epochs, batchSize, valSplit, resume?1:0);
+        (void)CALL_METHOD_RET_BOOL("TrainOCRModule", "iidi", epochs, batchSize, valSplit, resume?1:0);
     });
 }
 
@@ -270,18 +270,27 @@ bool BrainDeepLearnInterface::TestOCRModule()
 
 bool BrainDeepLearnInterface::TestModuleTrain(bool onlineLearning)
 {
-    CALL_METHOD_RET_BOOL("TestModuleTrain", "b", onlineLearning);
+    return CALL_METHOD_RET_BOOL("TestModuleTrain", "b", onlineLearning);
     //return RunPythonAsync([this, onlineLearning]()
     //{
     //    (void)CALL_METHOD_RET_BOOL("TestModuleTrain", "b", onlineLearning);
     //});
 }
 
-bool BrainDeepLearnInterface::TestOCRModuleTrain(bool onlineLearning)
+bool BrainDeepLearnInterface::TestOCRModuleTrain()
 {
-    CALL_METHOD_RET_BOOL("TestOCRModuleTrain", "b", onlineLearning);
+    return CALL_METHOD_NOARG("TestOCRModuleTrain");
     //return RunPythonAsync([this, onlineLearning]()
     //{
     //    (void)CALL_METHOD_RET_BOOL("TestOCRModuleTrain", "b", onlineLearning);
     //});
+}
+
+bool BrainDeepLearnInterface::TestOCRRecognitionTrain()
+{
+    return CALL_METHOD_NOARG("TestOCRRecognitionTrain");
+    // return RunPythonAsync([this, onlineLearning]()
+    //{
+    //     (void)CALL_METHOD_RET_BOOL("TestOCRRecognitionTrain", "b", onlineLearning);
+    // });
 }
