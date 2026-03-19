@@ -26,7 +26,7 @@ from ValueEstimationModule import ValueEstimationExtractor,ValueEstimationOnline
 from ConsciousnessModule import ConsciousnessExtractor
 from IntentionModule import IntentionExtractor, IntentionOnlineWrapper
 from OCRModule import OCREngineExtractor
-from ModuleDimensionManager import ModuleDim
+from ModuleMessagerManager import ModuleDim, ModuleMessagerManager
  
 
 
@@ -200,6 +200,7 @@ class BrainCore(nn.Module):
         self.mem_copy = copy.deepcopy(self.mem)
         self.attn_copy = copy.deepcopy(self.attn)
         self.critic_copy = copy.deepcopy(self.critic)
+        self.moduleMessager = ModuleMessagerManager(maxSteps=256)
 
         self.ResetBuffers(B=1, isOnlineLearning=self.is_online_learning,device=self.device)
 
@@ -249,6 +250,13 @@ class BrainCore(nn.Module):
         if self.is_online_learning and not isTrain:
             raise RuntimeError(f"Wrappers can only be used during training, but isTrain is {isTrain}, isUseWrappers is {self.is_online_learning}")
 
+        isBeginStep = True
+
+        def saveModuleOutput(moduleName: str, output: Any):
+            nonlocal isBeginStep
+            self.moduleMessager.SaveModuleOutput(moduleName, output, isBeginStep=isBeginStep)
+            isBeginStep = False
+
         B, dev = frame.size(0), frame.device
         if self.buf_B != B:
             self.ResetBuffers(B=B, isOnlineLearning=self.is_online_learning, device=dev)
@@ -295,9 +303,11 @@ class BrainCore(nn.Module):
         B, C, H, W = frame.shape
 
         perc_feats = self.perc(frame) # [B, D_perc]
-        self.OCR(frame)
+        ocr_items = self.OCR(frame)
 
         self.perc_buffer.append(perc_feats)
+        saveModuleOutput("Perception", {
+            "feat": perc_feats,})
 
         if len(self.perc_buffer) > self.SEQ_LEN:
             del self.perc_buffer[:BasicParameters.IMAGE_RM_LEN]
@@ -322,6 +332,7 @@ class BrainCore(nn.Module):
         else:
             a_enc_prev = self.world.action_encoder(self.prev_keys, self.prev_mouse, self.prev_clicks) # [B, D_act]
             w_out = self.world.StepPosterior(visionIn=world_vis_in, actionEnc=a_enc_prev, sample=False)
+        saveModuleOutput("World", w_out)
 
         s_t = w_out["s_next"] # [B, D_world]
         r_t = w_out["r_pred"].detach() # [B]
@@ -352,21 +363,31 @@ class BrainCore(nn.Module):
             critic_out = self.critic(memory=self.prev_mem,attn=self.prev_attn,state=s_t,rewardExt=r_t,
                                      policyEntropyPrev=self.prev_entropy,done=d_t,
                                      worldDeltaTransport=d_tr,worldDeltaPhysics=d_ph,)
+        saveModuleOutput("ValueEstimation", critic_out)
 
         td_sig = critic_out.tdError.detach() # [B]
         unc_sig = critic_out.uncertainty.detach() # [B]
         emotion_sig = critic_out.emotion.detach() # [B, D_emotion]
 
         atten_out = self.attn(percs_seq, tdError=td_sig, uncertainty=unc_sig) # [B, D_attn]
+        saveModuleOutput("Attention", atten_out)
 
         mem_feat = self.mem(atten_out, tdError=td_sig,emotion=emotion_sig,reward=r_t) # [B, D_mem], [B, D_mem]
+        saveModuleOutput("Memory", mem_feat)
 
         memory_bank = self.mem.ExportMemoryBank(topk = BasicParameters.CONSCIOUSNESSTEM) # Optional[Dict[str, Tensor]]
         world_bank = self.world.ExportWorldMemoryBank(topk = BasicParameters.CONSCIOUSNESSTEM) # Optional[Dict[str, Tensor]]
 
         conscious_out = self.conscious(memoryBank=memory_bank, worldBank=world_bank) # self_sem/intention_sem: [B, D_cons]
+        saveModuleOutput("Consciousness", {
+            "self_sem": conscious_out.self_sem,
+            "intent_sem": conscious_out.intent_sem,
+            "extras": conscious_out.extras,})
 
         fuse_ocr = self.OCR.ExportFusedTexts() # List[List[str]]
+        saveModuleOutput("OCR", {
+            "items": ocr_items,
+            "texts": fuse_ocr,})
 
         intent_sem, sym_probs, intention_extras = self.intention(
             conscious_out.self_sem,
@@ -374,6 +395,12 @@ class BrainCore(nn.Module):
             ocrTexts=fuse_ocr,
             extTexts=textExt,
             prioritizeExt=self.prioritize_ext_str,) # [B, D_intent], [B, K_sym], Dict[str, Tensor]
+        saveModuleOutput("Intention", {
+            "intent_sem": intent_sem,
+            "sym_probs": sym_probs,
+            "extras": intention_extras,
+            "ocr_texts": fuse_ocr,
+            "ext_texts": textExt,})
 
         if self.is_online_learning:
             actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionLogit": 
@@ -402,6 +429,7 @@ class BrainCore(nn.Module):
             else:
                 act_out = self.actor(stateFeat=mem_feat,intentFeat=intent_sem,sample=sampleActions,
                                     deterministic=deterministicActor,prevOptionLogit=self.prev_option_logit,prior=prior)
+        saveModuleOutput("Decision", act_out)
 
         keys_act = act_out["keyboard"]["keys_act"] # [B, K_key]
         click_sample = act_out["mouse"]["click_sample"] # [B, 2]
@@ -466,6 +494,7 @@ class BrainCore(nn.Module):
             losses["conscious_loss"] = conscious_loss
             losses["intention_loss"] = intention_loss
             losses["total_loss"] = total_loss
+            saveModuleOutput("Losses", losses)
 
         return {
             "decision": act_out,
@@ -853,6 +882,9 @@ class Agent:
 
         if self.mem_mem_path is not None:
             self.brain.mem.SaveState(self.mem_mem_path)
+
+    def ExportModuleMessagerData(self, nSteps: int = 0):
+        return self.brain.moduleMessager.ExportDict(nSteps=nSteps)
 
     def Act(
         self,

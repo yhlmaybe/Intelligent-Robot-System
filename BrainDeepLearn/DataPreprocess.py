@@ -158,20 +158,24 @@ class DataPreprocessor:
         return next(csv.reader([cleaned], skipinitialspace=True))
 
     @staticmethod
-    def LooksLikeOCRAnnotationLine(line: str) -> bool:
-        parts = DataPreprocessor.SplitOCRCsvLine(line)
-        if len(parts) < 6:
-            return False
-
+    def ResolveOCRAnnotationLayout(parts: List[str]) -> Optional[Tuple[int, bool]]:
         for coord_count in (8, 4):
-            if len(parts) < coord_count + 2:
+            if len(parts) < coord_count + 1:
                 continue
             try:
                 [float(parts[i]) for i in range(coord_count)]
-                return parts[coord_count].strip() in ("0", "1")
             except Exception:
                 continue
-        return False
+            has_ignore_flag = (
+                len(parts) >= coord_count + 2
+                and parts[coord_count].strip() in ("0", "1"))
+            return coord_count, has_ignore_flag
+        return None
+
+    @staticmethod
+    def LooksLikeOCRAnnotationLine(line: str) -> bool:
+        parts = DataPreprocessor.SplitOCRCsvLine(line)
+        return DataPreprocessor.ResolveOCRAnnotationLayout(parts) is not None
 
     @staticmethod
     def TextFileLooksLikeOCRAnnotations(path: Union[str, Path]) -> bool:
@@ -187,30 +191,23 @@ class DataPreprocessor:
     @staticmethod
     def ParseOCRAnnotationLine(line: str) -> Tuple[np.ndarray, int, str]:
         parts = DataPreprocessor.SplitOCRCsvLine(line)
-        if len(parts) < 6:
+        if len(parts) < 5:
             raise ValueError(f"OCR annotation line has too few fields: {line!r}")
 
-        coord_count = None
-        for cand in (8, 4):
-            if len(parts) < cand + 2:
-                continue
-            try:
-                [float(parts[i]) for i in range(cand)]
-                if parts[cand].strip() not in ("0", "1"):
-                    continue
-                coord_count = cand
-                break
-            except Exception:
-                continue
-
-        if coord_count is None:
+        layout = DataPreprocessor.ResolveOCRAnnotationLayout(parts)
+        if layout is None:
             raise ValueError(f"OCR annotation line has invalid coordinates: {line!r}")
+        coord_count, has_ignore_flag = layout
 
         coords = [float(parts[i]) for i in range(coord_count)]
         idx = coord_count
 
-        ignore_flag = int(parts[idx].strip())
-        idx += 1
+        if has_ignore_flag:
+            ignore_flag = int(parts[idx].strip())
+            idx += 1
+        else:
+            preview_text = ",".join(parts[idx:]).strip() if idx < len(parts) else ""
+            ignore_flag = 1 if "#" in preview_text else 0
 
         text = ",".join(parts[idx:]).strip() if idx < len(parts) else ""
         if ignore_flag:

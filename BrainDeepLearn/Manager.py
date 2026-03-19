@@ -23,12 +23,7 @@ from ValueEstimationModule import  TestValueEstimationMTool
 from ConsciousnessModule import TestConsciousMTool
 from IntentionModule import TestIntentionMTool
 from OCRModule import TestOCRMTool, OCREngineExtractor
-from DataPreprocess import (
-    DataPreprocessor,
-    OfflineGameDataset,
-    OfflineOCRDataset,
-    OfflineOCRRecognitionDataset,
-)
+from DataPreprocess import DataPreprocessor, OfflineGameDataset, OfflineOCRDataset, OfflineOCRRecognitionDataset
 from AGICore import Agent, BrainCore, BasicParameters
 
 try:
@@ -694,8 +689,7 @@ class ManagerFunction:
                     nb += 1
 
                     self.controller.SetStatus(
-                        "training",
-                        (
+                        "training",(
                             f"OCR training... rec_acc={rec_acc:.3f}"
                             if trainRecognition else
                             "OCR training..."),
@@ -1462,9 +1456,6 @@ class ManagerFunction:
             agent = Agent(brain,isTrain=False,device=self.device,worldMemoryPath=BasicParameters.WORLD_MEMORY_PATH,memMemoryPath=BasicParameters.MEMORY_MEMORY_PATH,)
             agent.ResetBrainState(isOnlineLearning=False)
 
-            seq_len = brain.SEQ_LEN
-            rm_len = BasicParameters.IMAGE_RM_LEN
-
             if iio is None:
                 raise RuntimeError("imageio.v3 cant use")
 
@@ -1477,33 +1468,44 @@ class ManagerFunction:
                 all_codes.append(code)
             max_code = max(all_codes)
 
-            frame_buf: List[np.ndarray] = []
-
             with iio.imopen(f"<video{cameraIndex}>", "r") as cam:
                 for frame_np in cam:
                     if self.controller.ShouldStop():
                         break
 
-                    frame_buf.append(frame_np)
-
-                    if len(frame_buf) < seq_len:
-                        continue
-
-                    pack = agent.StackNpImagesKeysMouses(imgs=frame_buf,B=1, T=seq_len,device=self.device,)
+                    pack = agent.ConvertNpImagesKeysMouses(
+                        imgs=frame_np,
+                        keys=None,
+                        mouseClick=None,
+                        mouseMove=None,
+                        reward=None,
+                        done=None,
+                        device=self.device,)
+                    
                     frames = pack["frames"]
 
                     if self.controller.ShouldResetHebbian():
                         agent.ResetHebbianMemory()
                         self.controller.RequestCancelResetHebbian()
 
-                    keys, clicks, mouse = agent.Act(frames,reward=None,done=None,sampleActions=True,deterministicActor=True,)
+                    act_out = agent.Act(
+                        frames,
+                        reward=None,
+                        done=None,
+                        sampleActions=True,
+                        deterministicActor=True,)
+                    if act_out is None:
+                        continue
+
+                    keys, clicks, mouse = act_out
 
                     kv = keys[0].detach().cpu()
                     ck = clicks[0].detach().cpu()
                     ms = mouse[0].detach().cpu()
 
                     pressed_names: list[str] = []
-                    for code in range(max_code + 1):
+                    limit = min(max_code + 1, int(kv.numel()))
+                    for code in range(limit):
                         if float(kv[code]) > 0.5:
                             pressed_names.append(code_to_name.get(code, f"Key{code}"))
 
@@ -1515,9 +1517,6 @@ class ManagerFunction:
                     names_str = "[" + ", ".join(pressed_names) + "]" if pressed_names else "[]"
 
                     self.controller.SetStatus("is_begin",(f"keys:{names_str} "f"mouse:dx={float(ms[0]):.3f},dy={float(ms[1]):.3f}"),)
-
-                    drop_n = len(frame_buf) - rm_len
-                    del frame_buf[:drop_n]
 
             self.controller.SetStatus("stopped", "Deployment stopped")
 
