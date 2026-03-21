@@ -1,6 +1,10 @@
 #include "BrainDeepLearnForm.h"
 #include "ui_BrainDeepLearnForm.h"
 
+#include <QDir>
+#include <QFileDialog>
+#include <QStringList>
+
 BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manager> mag, QWidget *parent):
     QWidget(parent),
     ui(new Ui::BrainDeepLearnForm)
@@ -40,6 +44,14 @@ BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manage
 
     connect(ui->trainModule_pushButton, SIGNAL(clicked()), this, SLOT(TrainModule()));
     connect(ui->trainOCRModule_pushButton, SIGNAL(clicked()), this, SLOT(TrainOCRModule()));
+    connect(ui->OCRTrainPicture_pushButton, SIGNAL(clicked()), this, SLOT(SetOCRTrainPicturePath()));
+    connect(ui->OCRTrainText_pushButton, SIGNAL(clicked()), this, SLOT(SetOCRTrainTextPath()));
+    connect(ui->OCRRecognizeTrainPicture_pushButton, SIGNAL(clicked()), this, SLOT(SetOCRRecognizeTrainPicturePath()));
+    connect(ui->OCRRecognizeTrainText_pushButton, SIGNAL(clicked()), this, SLOT(SetOCRRecognizeTrainTextPath()));
+    connect(ui->OCRCheckPoint_pushButton, SIGNAL(clicked()), this, SLOT(SetOCRCheckPointPath()));
+    connect(ui->OCRRecognizeCheckPoint_pushButton, SIGNAL(clicked()), this, SLOT(SetOCRRecognizeCheckPointPath()));
+    connect(ui->OCRParameter_pushButton, SIGNAL(clicked()), this, SLOT(SetOCRParameterPath()));
+    connect(ui->OCRRecognizeParameter_pushButton, SIGNAL(clicked()), this, SLOT(SetOCRRecognizeParameterPath()));
     connect(ui->deployModule_pushButton, SIGNAL(clicked()), this, SLOT(DeployModule()));
     connect(ui->stop_pushButton, SIGNAL(clicked()), this, SLOT(StopModule()));
     connect(ui->pause_pushButton, SIGNAL(clicked()), this, SLOT(PauseModule()));
@@ -49,12 +61,34 @@ BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manage
 
     connect(ui->clear_pushButton, SIGNAL(clicked()), this, SLOT(ClearText()));
     connect(ui->close_pushButton, SIGNAL(clicked()), this, SLOT(CloseForm()));
+
+    RefreshPathBrowserFromParameters();
 }
 
 
 BrainDeepLearnForm::~BrainDeepLearnForm()
 {
     delete ui;
+}
+
+QString BrainDeepLearnForm::StatusValueToQString(BrainDeepLearnInterface::StatusValue& value)
+{
+    if (int* v = boost::get<int>(&value))
+    {
+        return QString::number(*v);
+    }
+
+    if (double* v = boost::get<double>(&value))
+    {
+        return QString::number(*v);
+    }
+
+    if (std::string* v = boost::get<std::string>(&value))
+    {
+        return QString::fromStdString(*v);
+    }
+
+    return QString();
 }
 
 void BrainDeepLearnForm::AddData(QString data)
@@ -159,6 +193,46 @@ void BrainDeepLearnForm::TrainOCRModule()
     brainDeepLearn->TrainOCRModule();
 }
 
+void BrainDeepLearnForm::SetOCRTrainPicturePath()
+{
+    ChooseFolderAndSetParameter("Select OCR Train Picture Folder", "OCR_FRAMES_PATH");
+}
+
+void BrainDeepLearnForm::SetOCRTrainTextPath()
+{
+    ChooseFolderAndSetParameter("Select OCR Train Text Folder", "OCR_TEXTS_PATH");
+}
+
+void BrainDeepLearnForm::SetOCRRecognizeTrainPicturePath()
+{
+    ChooseFolderAndSetParameter("Select OCR Recognize Train Picture Folder", "OCR_RECOGNIZER_FRAMES_PATH");
+}
+
+void BrainDeepLearnForm::SetOCRRecognizeTrainTextPath()
+{
+    ChooseFolderAndSetParameter("Select OCR Recognize Train Text Folder", "OCR_RECOGNIZER_TEXTS_PATH");
+}
+
+void BrainDeepLearnForm::SetOCRCheckPointPath()
+{
+    ChooseFolderAndSetParameter("Select OCR Check Point Folder", "OCR_CKPT_PATH_TRAIN", "ocr_training_checkpoint.pth");
+}
+
+void BrainDeepLearnForm::SetOCRRecognizeCheckPointPath()
+{
+    ChooseFolderAndSetParameter("Select OCR Recognize Check Point Folder", "OCR_RECOGNIZER_CKPT_PATH_TRAIN", "ocr_recognizer_training_checkpoint.pth");
+}
+
+void BrainDeepLearnForm::SetOCRParameterPath()
+{
+    ChooseFolderAndSetParameter("Select OCR Parameter Folder", "OCR_MODULEPARAMETER_PATH", "ocr_module_parameter.pth");
+}
+
+void BrainDeepLearnForm::SetOCRRecognizeParameterPath()
+{
+    ChooseFolderAndSetParameter("Select OCR Recognize Parameter Folder", "OCR_RECOGNIZER_MODULEPARAMETER_PATH", "ocr_recognizer_parameter.pth");
+}
+
 
 void BrainDeepLearnForm::ExportParmFromCheckpoint()
 {
@@ -188,4 +262,59 @@ void BrainDeepLearnForm::ResumeModule()
 void BrainDeepLearnForm::ResetHebbianMemory()
 {
     brainDeepLearn->ResetHebbianMemory();
+}
+
+void BrainDeepLearnForm::ChooseFolderAndSetParameter(QString title, std::string parameterName, QString fileName)
+{
+    QString selectedDir = QFileDialog::getExistingDirectory(
+        this,
+        title,
+        QDir::homePath(),
+        QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
+
+    if (selectedDir.isEmpty())
+    {
+        return;
+    }
+
+    QString finalPath = selectedDir;
+    if (!fileName.isEmpty())
+    {
+        finalPath = QDir(selectedDir).filePath(fileName);
+    }
+
+    if (brainDeepLearn->SetBasicParameters(parameterName, finalPath.toStdString()))
+    {
+        RefreshPathBrowserFromParameters();
+        AddData(QString("Set %1 = %2").arg(QString::fromStdString(parameterName), finalPath));
+    }
+    else
+    {
+        AddData(QString("Set %1 failed").arg(QString::fromStdString(parameterName)));
+    }
+}
+
+void BrainDeepLearnForm::RefreshPathBrowserFromParameters()
+{
+    BrainDeepLearnInterface::StatusMap parameters;
+    if (!brainDeepLearn->GetBasicParametersDict(parameters))
+    {
+        ui->path_textBrowser->setPlainText("GetBasicParametersDict failed");
+        return;
+    }
+
+    QStringList lines;
+    for (std::pair<std::string, BrainDeepLearnInterface::StatusValue> item : parameters)
+    {
+        QString key = QString::fromStdString(item.first);
+        if (!key.contains("PATH"))
+        {
+            continue;
+        }
+
+        QString value = StatusValueToQString(item.second);
+        lines << QString("%1 = %2").arg(key, value);
+    }
+
+    ui->path_textBrowser->setPlainText(lines.join("\n\n"));
 }

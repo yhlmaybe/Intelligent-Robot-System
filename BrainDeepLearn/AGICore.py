@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Tuple, List, Dict, Any, Optional, Union
 import threading
 import random
+import ast
 
 import numpy as np
 import torch
@@ -12,7 +13,7 @@ import os
 import math
 import copy
 
-import debugpy
+#import debugpy
 
 from dataclasses import dataclass, field
 from collections import deque
@@ -37,20 +38,36 @@ def ToDevice(x, device):
 
 class BasicParameters:
     IMAGE_SIZE = 512
+
     IMAGE_SEQ_LEN = 16
+
     IMAGE_RM_LEN = math.ceil(IMAGE_SEQ_LEN * 1 / 10)
 
     MEMORY_CALLBACK_LEN = 16
 
     CONSCIOUSNESSTEM = 1 * 1024
 
+    DATA_ROOT_PATH = "BrainDeepLearn/Data"
+    OCR_DATA_ROOT_PATH = "BrainDeepLearn/Data/OCR"
+
+    DATA_FRAMES_PATH = "BrainDeepLearn/Data/frames"
+    DATA_KEYS_PATH = "BrainDeepLearn/Data/keys"
+    DATA_MOUSE_CLICK_PATH = "BrainDeepLearn/Data/mouse_click"
+    DATA_MOUSE_MOVE_PATH = "BrainDeepLearn/Data/mouse_move"
+    DATA_REWARD_PATH = "BrainDeepLearn/Data/reward"
+    DATA_DONE_PATH = "BrainDeepLearn/Data/done"
+    DATA_TEXTS_PATH = "BrainDeepLearn/Data/texts"
+    OCR_FRAMES_PATH = "BrainDeepLearn/Data/OCR/frames"
+    OCR_TEXTS_PATH = "BrainDeepLearn/Data/OCR/OCRTexts"
+    OCR_RECOGNIZER_FRAMES_PATH = "BrainDeepLearn/Data/OCRRecognition/frames"
+    OCR_RECOGNIZER_TEXTS_PATH = "BrainDeepLearn/Data/OCRRecognition/OCRTexts"
+
     MEMORY_MEMORY_PATH = "BrainDeepLearn/Data/MemoryMemory.pt"
     WORLD_MEMORY_PATH = "BrainDeepLearn/Data/WorldMemory.pt"
     MODULEPARAMETER_PATH = "BrainDeepLearn/Data/module_parameter.pth"
     OCR_MODULEPARAMETER_PATH = "BrainDeepLearn/Data/ocr_module_parameter.pth"
     OCR_RECOGNIZER_MODULEPARAMETER_PATH = "BrainDeepLearn/Data/ocr_recognizer_parameter.pth"
-    DATA_ROOT_PATH = "BrainDeepLearn/Data"
-    OCR_DATA_ROOT_PATH = "BrainDeepLearn/Data/OCR"
+
     OCR_RECOGNIZER_DATA_ROOT_PATH = "BrainDeepLearn/Data/OCRRecognition"
     CKPT_PATH_TRAIN = "BrainDeepLearn/Data/training_checkpoint.pth"
     OCR_CKPT_PATH_TRAIN = "BrainDeepLearn/Data/ocr_training_checkpoint.pth"
@@ -67,6 +84,89 @@ class BasicParameters:
     CKPT_PATH_TEST = "BrainDeepLearn/TestData/training_test_checkpoint.pth"
     OCR_CKPT_PATH_TEST = "BrainDeepLearn/TestData/ocr_training_checkpoint.pth"
     OCR_RECOGNIZER_CKPT_PATH_TEST = "BrainDeepLearn/TestData/ocr_recognizer_training_checkpoint.pth"
+
+    @classmethod
+    def Get(cls, name: str):
+        attrName = str(name).strip()
+        if not cls.IsConfigAttribute(attrName):
+            raise AttributeError(f"BasicParameters has no attribute: {attrName}")
+        return getattr(cls, attrName)
+
+    @classmethod
+    def Set(cls, name: str, value: str) -> bool:
+        try:
+            attrName = str(name).strip()
+            if not cls.IsConfigAttribute(attrName):
+                return False
+            if not isinstance(value, str):
+                return False
+
+            currentValue = getattr(cls, attrName)
+            parsedValue = cls.ParseValueFromString(value, currentValue)
+            setattr(cls, attrName, parsedValue)
+            cls.RefreshDerivedParameters(attrName)
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def GetStringDict(cls) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        for name in cls.__dict__.keys():
+            if cls.IsConfigAttribute(name):
+                result[str(name)] = str(getattr(cls, name))
+        return result
+
+    @classmethod
+    def ParseValueFromString(cls, value: str, currentValue: Any):
+        text = value.strip()
+
+        if isinstance(currentValue, bool):
+            textLower = text.lower()
+            if textLower in ("true", "1", "yes", "on"):
+                return True
+            if textLower in ("false", "0", "no", "off"):
+                return False
+            raise ValueError(f"cannot parse bool from: {value}")
+
+        if isinstance(currentValue, int) and not isinstance(currentValue, bool):
+            return int(text)
+
+        if isinstance(currentValue, float):
+            return float(text)
+
+        if isinstance(currentValue, str):
+            return value
+
+        try:
+            parsed = ast.literal_eval(text)
+        except Exception:
+            parsed = text
+
+        if currentValue is None:
+            return parsed
+
+        currentType = type(currentValue)
+        if isinstance(parsed, currentType):
+            return parsed
+
+        return currentType(parsed)
+
+    @classmethod
+    def RefreshDerivedParameters(cls, changedName: str = ""):
+        if changedName == "IMAGE_SEQ_LEN":
+            cls.IMAGE_RM_LEN = math.ceil(cls.IMAGE_SEQ_LEN * 1 / 10)
+
+    @classmethod
+    def IsConfigAttribute(cls, name: str) -> bool:
+        if str(name).strip() == "":
+            return False
+        if name not in cls.__dict__:
+            return False
+        value = cls.__dict__[name]
+        if isinstance(value, (classmethod, staticmethod)):
+            return False
+        return not callable(getattr(cls, name))
 
 
 @dataclass

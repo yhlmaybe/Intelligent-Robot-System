@@ -27,6 +27,74 @@
         return ok; \
     }())
 
+#define CALL_METHOD_RET_STATUSVALUE(outValue, name, fmt, ...) \
+    ([&]{ \
+        if (!pManagerObj) return false; \
+        PyGILState_STATE g = PyGILState_Ensure(); \
+        PyObject* r = PyObject_CallMethod(pManagerObj, name, fmt, __VA_ARGS__); \
+        bool ok = false; \
+        if (r) \
+        { \
+            if (PyLong_Check(r)) \
+            { \
+                outValue = (int)PyLong_AsLong(r); \
+                ok = (PyErr_Occurred() == nullptr); \
+            } \
+            else if (PyFloat_Check(r)) \
+            { \
+                outValue = PyFloat_AsDouble(r); \
+                ok = (PyErr_Occurred() == nullptr); \
+            } \
+            else if (PyUnicode_Check(r)) \
+            { \
+                const char* text = PyUnicode_AsUTF8(r); \
+                if (text) \
+                { \
+                    outValue = std::string(text); \
+                    ok = true; \
+                } \
+            } \
+        } \
+        else \
+        { \
+            PyErr_Print(); \
+        } \
+        Py_XDECREF(r); \
+        PyGILState_Release(g); \
+        return ok; \
+    }())
+
+#define CALL_METHOD_RET_STATUSMAP(outMap, name) \
+    ([&]{ \
+        if (!pManagerObj) return false; \
+        PyGILState_STATE g = PyGILState_Ensure(); \
+        PyObject* r = PyObject_CallMethod(pManagerObj, name, nullptr); \
+        bool ok = false; \
+        if (r && PyDict_Check(r)) \
+        { \
+            outMap.clear(); \
+            PyObject* key = nullptr; \
+            PyObject* val = nullptr; \
+            Py_ssize_t pos = 0; \
+            while (PyDict_Next(r, &pos, &key, &val)) \
+            { \
+                if (!PyUnicode_Check(key)) continue; \
+                std::string k = PyUnicode_AsUTF8(key); \
+                if (PyLong_Check(val)) outMap[k] = (int)PyLong_AsLong(val); \
+                else if (PyFloat_Check(val)) outMap[k] = PyFloat_AsDouble(val); \
+                else if (PyUnicode_Check(val)) outMap[k] = std::string(PyUnicode_AsUTF8(val)); \
+            } \
+            ok = true; \
+        } \
+        else if (!r) \
+        { \
+            PyErr_Print(); \
+        } \
+        Py_XDECREF(r); \
+        PyGILState_Release(g); \
+        return ok; \
+    }())
+
 #define CALL_METHOD_NOARG(name) \
     ([&]{ \
         if (!pManagerObj) return false;  \
@@ -68,6 +136,12 @@ public:
     bool RunPythonAsync(PyTask task);
 
     bool GetCurrentStatus(StatusMap& status);
+
+    bool SetBasicParameters(std::string name, std::string value);
+
+    bool GetBasicParameters(std::string name, StatusValue& value);
+
+    bool GetBasicParametersDict(StatusMap& parameters);
 
     bool TestPerceptionModule();
 

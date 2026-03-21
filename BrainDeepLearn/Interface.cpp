@@ -172,28 +172,22 @@ bool BrainDeepLearnInterface::RunPythonAsync(PyTask task)
 
 bool BrainDeepLearnInterface::GetCurrentStatus(StatusMap& status) 
 {
-    if (!pManagerObj) return false;
-    PyGILState_STATE g = PyGILState_Ensure();
-    PyObject* r = PyObject_CallMethod(pManagerObj, "GetCurrentStatus", nullptr);
-    if (!r || !PyDict_Check(r)) 
-    { 
-        Py_XDECREF(r); PyGILState_Release(g); return false; 
-    }
-    status.clear();
-    PyObject *key, *val; Py_ssize_t pos=0;
-    while (PyDict_Next(r, &pos, &key, &val)) 
-    {
-        if (PyUnicode_Check(key)) 
-        {
-            std::string k = PyUnicode_AsUTF8(key);
-            if (PyLong_Check(val)) status[k] = (int)PyLong_AsLong(val);
-            else if (PyFloat_Check(val)) status[k] = PyFloat_AsDouble(val);
-            else if (PyUnicode_Check(val)) status[k] = std::string(PyUnicode_AsUTF8(val));
-        }
-    }
-    Py_DECREF(r);
-    PyGILState_Release(g);
-    return true;
+    return CALL_METHOD_RET_STATUSMAP(status, "GetCurrentStatus");
+}
+
+bool BrainDeepLearnInterface::SetBasicParameters(std::string name, std::string value)
+{
+    return CALL_METHOD_RET_BOOL("SetBasicParameters", "ss", name.c_str(), value.c_str());
+}
+
+bool BrainDeepLearnInterface::GetBasicParameters(std::string name, StatusValue& value)
+{
+    return CALL_METHOD_RET_STATUSVALUE(value, "GetBasicParameters", "s", name.c_str());
+}
+
+bool BrainDeepLearnInterface::GetBasicParametersDict(StatusMap& parameters)
+{
+    return CALL_METHOD_RET_STATUSMAP(parameters, "GetBasicParametersDict");
 }
 
 bool BrainDeepLearnInterface::TestPerceptionModule()

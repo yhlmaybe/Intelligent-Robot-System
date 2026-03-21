@@ -72,6 +72,22 @@ private slots:
 
     void ExportParmFromCheckpoint();
 
+    void SetOCRTrainPicturePath();
+
+    void SetOCRTrainTextPath();
+
+    void SetOCRRecognizeTrainPicturePath();
+
+    void SetOCRRecognizeTrainTextPath();
+
+    void SetOCRCheckPointPath();
+
+    void SetOCRRecognizeCheckPointPath();
+
+    void SetOCRParameterPath();
+
+    void SetOCRRecognizeParameterPath();
+
     void DeployModule();
 
     void StopModule();
@@ -81,6 +97,11 @@ private slots:
     void ResumeModule();
 
     void ResetHebbianMemory();
+
+private:
+    QString StatusValueToQString(BrainDeepLearnInterface::StatusValue& value);
+    void ChooseFolderAndSetParameter(QString title, std::string parameterName, QString fileName = "");
+    void RefreshPathBrowserFromParameters();
 };
 
 #endif // BRAINDEEPLEARNFORM_H

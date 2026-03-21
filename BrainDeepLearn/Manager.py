@@ -120,6 +120,18 @@ class ManagerFunction:
             "OCR": TestOCRMTool(),
             "intention": TestIntentionMTool(),}
 
+    def SetBasicParameters(self, name: str, value: str):
+        if self.is_begin or (self.br_thread is not None and self.br_thread.is_alive()):
+            self.controller.SetStatus("recur", "Training or Deploy is already running")
+            return False
+        return BasicParameters.Set(name=name, value=value)
+    
+    def GetBasicParameters(self, name: str):
+        return BasicParameters.Get(name=name)
+    
+    def GetBasicParametersDict(self):
+        return BasicParameters.GetStringDict()
+
     def StartTraining(self, epochs: int = 5, batchSize: int = 32, valSplit: float = 0.1, resume: bool = True, onlineLearning:bool = False,isTest: bool = False):
         if self.is_begin:
             self.controller.SetStatus("recur", "Training or Deploy is already running")
@@ -127,14 +139,14 @@ class ManagerFunction:
         self.is_begin = True
 
         ckpt_path = BasicParameters.CKPT_PATH_TEST if isTest else BasicParameters.CKPT_PATH_TRAIN
+        out_path = BasicParameters.MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.MODULEPARAMETER_PATH
         wm_mem_path = BasicParameters.WORLD_MEMORY_PATH_TEST if isTest else BasicParameters.WORLD_MEMORY_PATH
         mem_mem_path = BasicParameters.MEMORY_MEMORY_PATH_TEST if isTest else BasicParameters.MEMORY_MEMORY_PATH
-        root = BasicParameters.DATA_ROOT_PATH_TEST if isTest else BasicParameters.DATA_ROOT_PATH
 
         self.br_thread = threading.Thread(
             target=self.TrainLoop, args=(
-                root, epochs, batchSize, valSplit, resume, onlineLearning),
-                kwargs={"worldMemPath": wm_mem_path, "memMemPath": mem_mem_path, "ckptPath": ckpt_path}, 
+                epochs, batchSize, valSplit, resume, onlineLearning),
+                kwargs={"worldMemPath": wm_mem_path, "memMemPath": mem_mem_path, "ckptPath": ckpt_path, "outPath": out_path, "isTest": isTest}, 
                 daemon=False)
         self.br_thread.start()
         return True
@@ -148,8 +160,7 @@ class ManagerFunction:
         isTest: bool = False,
         *,
         trainDetection: bool = True,
-        trainRecognition: bool = True,
-        root: Optional[str] = None,):
+        trainRecognition: bool = True,):
         if self.is_begin:
             self.controller.SetStatus("recur", "Training or Deploy is already running")
             return False
@@ -158,12 +169,12 @@ class ManagerFunction:
         ckpt_path = BasicParameters.OCR_CKPT_PATH_TEST if isTest else BasicParameters.OCR_CKPT_PATH_TRAIN
         out_path = BasicParameters.OCR_MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.OCR_MODULEPARAMETER_PATH
         recognizer_init_path = BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH
-        root = root or (BasicParameters.DATA_ROOT_PATH_TEST if isTest else BasicParameters.DATA_ROOT_PATH)
 
         self.br_thread = threading.Thread(
             target=self.OCRTrainLoop,
-            args=(root, epochs, batchSize, valSplit, resume),
+            args=(epochs, batchSize, valSplit, resume),
             kwargs={
+                "isTest": isTest,
                 "ckptPath": ckpt_path,
                 "outPath": out_path,
                 "trainDetection": trainDetection,
@@ -180,9 +191,7 @@ class ManagerFunction:
         batchSize: int = 32,
         valSplit: float = 0.1,
         resume: bool = True,
-        isTest: bool = False,
-        *,
-        root: Optional[str] = None,):
+        isTest: bool = False):
         if self.is_begin:
             self.controller.SetStatus("recur", "Training or Deploy is already running")
             return False
@@ -190,12 +199,12 @@ class ManagerFunction:
 
         ckpt_path = BasicParameters.OCR_RECOGNIZER_CKPT_PATH_TEST if isTest else BasicParameters.OCR_RECOGNIZER_CKPT_PATH_TRAIN
         out_path = BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH
-        root = root or (BasicParameters.OCR_RECOGNIZER_DATA_ROOT_PATH_TEST if isTest else BasicParameters.OCR_RECOGNIZER_DATA_ROOT_PATH)
 
         self.br_thread = threading.Thread(
             target=self.OCRRecognitionTrainLoop,
-            args=(root, epochs, batchSize, valSplit, resume),
+            args=(epochs, batchSize, valSplit, resume),
             kwargs={
+                "isTest": isTest,
                 "ckptPath": ckpt_path,
                 "outPath": out_path,},
             daemon=False)
@@ -239,6 +248,17 @@ class ManagerFunction:
         return self.controller.GetStatus()
 
 
+
+    def SaveModuleParameters(self, brain: BrainCore, path: str) -> None:
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        brain_state = {
+            k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+            for k, v in brain.state_dict().items()}
+
+        torch.save({
+            "brain": brain_state,}, str(out_path))
 
     def SaveOCRParameters(self, engine: OCREngineExtractor, path: str) -> None:
         out_path = Path(path)
@@ -407,12 +427,12 @@ class ManagerFunction:
 
     def OCRTrainLoop(
         self,
-        root: str,
         epochs: int,
         batchSize: int,
         valSplit: float,
         resume: bool,
         *,
+        isTest: bool,
         ckptPath: str,
         outPath: str,
         trainDetection: bool = True,
@@ -428,7 +448,7 @@ class ManagerFunction:
             if not trainDetection and not trainRecognition:
                 raise ValueError("OCRTrainLoop requires trainDetection or trainRecognition to be True")
 
-            ds = OfflineOCRDataset(root)
+            ds = OfflineOCRDataset(isTest=isTest)
             engine = OCREngineExtractor().to(self.device)
 
             if recognizerInitPath and Path(recognizerInitPath).exists() and not (resume and Path(ckptPath).exists()):
@@ -762,12 +782,12 @@ class ManagerFunction:
 
     def OCRRecognitionTrainLoop(
         self,
-        root: str,
         epochs: int,
         batchSize: int,
         valSplit: float,
         resume: bool,
         *,
+        isTest: bool,
         ckptPath: str,
         outPath: str,):
         try:
@@ -777,7 +797,7 @@ class ManagerFunction:
             self.controller.pause_requested = False
             self.controller.reset_hebbian = False
 
-            ds = OfflineOCRRecognitionDataset(root)
+            ds = OfflineOCRRecognitionDataset(isTest=isTest)
             engine = OCREngineExtractor().to(self.device)
             for p in engine.backbone.parameters():
                 p.requires_grad = False
@@ -1037,16 +1057,17 @@ class ManagerFunction:
 
 
 
-    def TrainLoop(self,root: str, epochs: int, batchSize: int, valSplit: float, resume: bool, onlineLearning = False, *, worldMemPath: str = None, memMemPath: str = None, ckptPath: str = None,):
+    def TrainLoop(self, epochs: int, batchSize: int, valSplit: float, resume: bool, onlineLearning = False, *, isTest: bool = False, worldMemPath: str = None, memMemPath: str = None, ckptPath: str = None, outPath: str = None,):
         try:
             torch.autograd.set_detect_anomaly(True)
             ckptPath = ckptPath or BasicParameters.CKPT_PATH_TRAIN
+            outPath = outPath or (BasicParameters.MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.MODULEPARAMETER_PATH)
 
             self.controller.stop_requested = False
             self.controller.pause_requested = False
             self.controller.reset_hebbian = False
 
-            ds = OfflineGameDataset(root)
+            ds = OfflineGameDataset(isTest=isTest)
 
             brain = BrainCore(device=self.device, plasticHebbian=True, plasticOnlineLearning=onlineLearning, usePlanner=False,)
 
@@ -1300,6 +1321,7 @@ class ManagerFunction:
                     best_val = avg_val
                     no_improve = 0
                     agent.SaveRuntimeMemories()
+                    self.SaveModuleParameters(brain, outPath)
 
                     ckpt = {
                         "epoch": ep + 1,
@@ -1352,8 +1374,6 @@ class ManagerFunction:
             self.controller.SetStatus("error", f"Training error: {e}", trace=tb)
         finally:
             self.is_begin = False
-
-
 
 
     def ExportParamsFromCheckpoint(
@@ -1635,6 +1655,7 @@ class ManagerFunction:
 
             rng = np.random.default_rng(seed)
             root = Path(dataRoot)
+            BasicParameters.Set("DATA_ROOT_PATH_TEST", str(root))
             if root.exists():
                 shutil.rmtree(root)
             (root / "frames").mkdir(parents=True, exist_ok=True)
@@ -1700,7 +1721,7 @@ class ManagerFunction:
             self.message_thread = threading.Thread(target=self.MonitorTraining,args=(),daemon=False,)
             self.message_thread.start()"""
 
-            self.TrainLoop(root, epochs, batchSize, valSplit, False, onlineLearning, worldMemPath=BasicParameters.WORLD_MEMORY_PATH_TEST, memMemPath=BasicParameters.MEMORY_MEMORY_PATH_TEST,ckptPath=BasicParameters.CKPT_PATH_TEST)
+            self.TrainLoop(epochs, batchSize, valSplit, False, onlineLearning, isTest=True, worldMemPath=BasicParameters.WORLD_MEMORY_PATH_TEST, memMemPath=BasicParameters.MEMORY_MEMORY_PATH_TEST,ckptPath=BasicParameters.CKPT_PATH_TEST)
         
             return {"ok": True}
 
@@ -1725,6 +1746,7 @@ class ManagerFunction:
 
         try:
             root = Path(dataRoot)
+            BasicParameters.Set("OCR_DATA_ROOT_PATH_TEST", str(root))
             frames_dir = root / "frames"
             ocr_texts_dir = root / "OCRTexts"
 
@@ -1836,8 +1858,7 @@ class ManagerFunction:
                 resume=False,
                 isTest=True,
                 trainDetection=True,
-                trainRecognition=True,
-                root=str(root),)
+                trainRecognition=True,)
 
             if not ok:
                 print("StartOCRTraining returns False (training may already be running)")
@@ -1868,6 +1889,7 @@ class ManagerFunction:
 
         try:
             root = Path(dataRoot)
+            BasicParameters.Set("OCR_RECOGNIZER_DATA_ROOT_PATH_TEST", str(root))
             frames_dir = root / "frames"
             texts_dir = root / "OCRTexts"
 
@@ -1952,8 +1974,7 @@ class ManagerFunction:
                 batchSize=batchSize,
                 valSplit=valSplit,
                 resume=False,
-                isTest=True,
-                root=str(root),)
+                isTest=True,)
 
             if not ok:
                 print("StartOCRRecognitionTraining returns False (training may already be running)")
@@ -1978,35 +1999,48 @@ class ManagerFunction:
         isResume: bool = False,
         *,
         trainDetection: bool = True,
-        trainRecognition: bool = True,
-        dataRoot: str = BasicParameters.OCR_DATA_ROOT_PATH,) -> Dict[str, Any]:
+        trainRecognition: bool = True,) -> Dict[str, Any]:
         try:
-            root = Path(dataRoot)
-            frames_dir = root / "frames"
-            boxes_dir = root / "boxes"
-            ocr_texts_dir = root / "OCRTexts"
+            frames_dir = Path(BasicParameters.OCR_FRAMES_PATH)
+            ocr_texts_dir = Path(BasicParameters.OCR_TEXTS_PATH)
 
             if not (trainDetection or trainRecognition):
                 print("[TrainOCR] trainDetection and trainRecognition cannot both be False.")
                 return {"ok": False, "msg": "no_train_target"}
 
             txt_files = sorted(ocr_texts_dir.glob("*.txt")) if ocr_texts_dir.exists() else []
-            has_box_files = boxes_dir.exists() and any(boxes_dir.glob("*.npy"))
-            has_text_annotations = any(DataPreprocessor.TextFileLooksLikeOCRAnnotations(p) for p in txt_files)
+            frame_files = sorted(frames_dir.glob("*.png")) if frames_dir.exists() else []
 
             if not (frames_dir.exists() and ocr_texts_dir.exists()):
-                print(f"[TrainOCR] no dataset found at {root}, please prepare frames/OCRTexts first.")
+                print(
+                    "[TrainOCR] no dataset found, please prepare these folders first: "
+                    f"{BasicParameters.OCR_FRAMES_PATH}, "
+                    f"{BasicParameters.OCR_TEXTS_PATH}.")
                 return {"ok": False, "msg": "no ocr dataset"}
 
-            if not any(frames_dir.glob("*.png")) or not txt_files:
-                print(f"[TrainOCR] no OCR samples found at {root}.")
+            if not frame_files or not txt_files:
+                print("[TrainOCR] no OCR samples found in configured OCR folders.")
                 return {"ok": False, "msg": "empty ocr dataset"}
 
-            if not has_box_files and not has_text_annotations:
-                print(f"[TrainOCR] OCR labels at {root} need either boxes/*.npy or annotation txt lines with coords/flag/text.")
-                return {"ok": False, "msg": "invalid ocr labels"}
+            if len(frame_files) != len(txt_files):
+                print("[TrainOCR] OCR frames and OCRTexts file counts are inconsistent.")
+                return {"ok": False, "msg": "invalid ocr dataset"}
 
-            print(f"[TrainOCR] use existing OCR dataset at: {root}")
+            for txt_path in txt_files:
+                try:
+                    boxes, texts, ignore_flags = DataPreprocessor.LoadOCRAnnotations(txt_path)
+                except Exception as e:
+                    print(f"[TrainOCR] failed to parse OCR annotation file {txt_path}: {e}")
+                    return {"ok": False, "msg": "invalid ocr labels"}
+
+                if len(boxes) == 0 or len(texts) == 0 or len(ignore_flags) != len(texts):
+                    print(f"[TrainOCR] OCR annotation file is empty or invalid: {txt_path}")
+                    return {"ok": False, "msg": "invalid ocr labels"}
+
+            print(
+                "[TrainOCR] use configured OCR folders: "
+                f"{BasicParameters.OCR_FRAMES_PATH}, "
+                f"{BasicParameters.OCR_TEXTS_PATH}.")
 
             ok = self.StartOCRTraining(
                 epochs=epochs,
@@ -2015,8 +2049,7 @@ class ManagerFunction:
                 resume=isResume,
                 isTest=False,
                 trainDetection=trainDetection,
-                trainRecognition=trainRecognition,
-                root=str(root),)
+                trainRecognition=trainRecognition,)
 
             if not ok:
                 print("StartOCRTraining returns False (training may already be running)")
@@ -2034,35 +2067,43 @@ class ManagerFunction:
 
     def TrainOCRRecognitionModule(
         self,
-        onlineLearning: bool,
         epochs: int = 6,
         batchSize: int = 8,
         valSplit: float = 0.2,
-        isResume: bool = False,
-        *,
-        dataRoot: str = BasicParameters.OCR_RECOGNIZER_DATA_ROOT_PATH,) -> Dict[str, Any]:
+        isResume: bool = False,) -> Dict[str, Any]:
         try:
-            root = Path(dataRoot)
-            frames_dir = root / "frames"
-            texts_dir = root / "OCRTexts"
+            frames_dir = Path(BasicParameters.OCR_RECOGNIZER_FRAMES_PATH)
+            texts_dir = Path(BasicParameters.OCR_RECOGNIZER_TEXTS_PATH)
 
             if not (frames_dir.exists() and texts_dir.exists()):
-                print(f"[TrainOCRRec] no dataset found at {root}, please prepare frames/OCRTexts first.")
+                print(
+                    "[TrainOCRRec] no dataset found, please prepare these folders first: "
+                    f"{BasicParameters.OCR_RECOGNIZER_FRAMES_PATH}, "
+                    f"{BasicParameters.OCR_RECOGNIZER_TEXTS_PATH}.")
                 return {"ok": False, "msg": "no ocr recognition dataset"}
 
-            if not any(frames_dir.glob("*.png")) or not any(texts_dir.glob("*.txt")):
-                print(f"[TrainOCRRec] no OCR recognition samples found at {root}.")
+            frame_files = sorted(frames_dir.glob("*.png"))
+            text_files = sorted(texts_dir.glob("*.txt"))
+
+            if not frame_files or not text_files:
+                print("[TrainOCRRec] no OCR recognition samples found in configured OCR recognition folders.")
                 return {"ok": False, "msg": "empty ocr recognition dataset"}
 
-            print(f"[TrainOCRRec] use existing OCR recognition dataset at: {root}")
+            if len(frame_files) != len(text_files):
+                print("[TrainOCRRec] OCR recognition frames and OCRTexts file counts are inconsistent.")
+                return {"ok": False, "msg": "invalid ocr recognition dataset"}
+
+            print(
+                "[TrainOCRRec] use configured OCR recognition folders: "
+                f"{BasicParameters.OCR_RECOGNIZER_FRAMES_PATH}, "
+                f"{BasicParameters.OCR_RECOGNIZER_TEXTS_PATH}.")
 
             ok = self.StartOCRRecognitionTraining(
                 epochs=epochs,
                 batchSize=batchSize,
                 valSplit=valSplit,
                 resume=isResume,
-                isTest=False,
-                root=str(root),)
+                isTest=False,)
 
             if not ok:
                 print("StartOCRRecognitionTraining returns False (training may already be running)")
@@ -2085,30 +2126,61 @@ class ManagerFunction:
         epochs: int = 6,
         batchSize: int = 1,
         valSplit: float = 0.2,
-        isResume: bool = False,
-        *,
-        dataRoot: str = BasicParameters.DATA_ROOT_PATH,) -> Dict[str, Any]:
+        isResume: bool = False,) -> Dict[str, Any]:
         try:
-            root = Path(dataRoot)
+            def has_existing_data() -> bool:
+                frames_dir = Path(BasicParameters.DATA_FRAMES_PATH)
+                keys_dir = Path(BasicParameters.DATA_KEYS_PATH)
+                mouse_click_dir = Path(BasicParameters.DATA_MOUSE_CLICK_PATH)
+                mouse_move_dir = Path(BasicParameters.DATA_MOUSE_MOVE_PATH)
+                reward_dir = Path(BasicParameters.DATA_REWARD_PATH)
+                done_dir = Path(BasicParameters.DATA_DONE_PATH)
+                texts_dir = Path(BasicParameters.DATA_TEXTS_PATH)
 
-            def has_existing_data(p: Path) -> bool:
-                frames_dir = p / "frames"
-                keys_dir = p / "keys"
-                mouse_click_dir = p / "mouse_click"
-                mouse_move_dir = p / "mouse_move"
-                reward_dir = p / "reward"
-                done_dir = p / "done"
                 if not (frames_dir.exists() and keys_dir.exists() and mouse_click_dir.exists() and mouse_move_dir.exists() and reward_dir.exists() and done_dir.exists()):
                     return False
-                if not any(frames_dir.glob("*.png")):
+                frame_files = sorted(frames_dir.glob("*.png"))
+                key_files = sorted(keys_dir.glob("*.npy"))
+                mouse_click_files = sorted(mouse_click_dir.glob("*.npy"))
+                mouse_move_files = sorted(mouse_move_dir.glob("*.npy"))
+                reward_files = sorted(reward_dir.glob("*.npy"))
+                done_files = sorted(done_dir.glob("*.npy"))
+                counts = [
+                    len(frame_files),
+                    len(key_files),
+                    len(mouse_click_files),
+                    len(mouse_move_files),
+                    len(reward_files),
+                    len(done_files),]
+                if counts[0] == 0:
                     return False
+                if len(set(counts)) != 1:
+                    return False
+                if texts_dir.exists():
+                    text_count = len(sorted(texts_dir.glob("*.txt")))
+                    if text_count not in (0, counts[0]):
+                        return False
                 return True
 
-            if not has_existing_data(root):
-                print(f"[Train] no dataset found at {root}, please prepare frames/keys/mouse_click/mouse_move/reward/done first.")
+            if not has_existing_data():
+                print(
+                    "[Train] no dataset found, please prepare these folders first: "
+                    f"{BasicParameters.DATA_FRAMES_PATH}, "
+                    f"{BasicParameters.DATA_KEYS_PATH}, "
+                    f"{BasicParameters.DATA_MOUSE_CLICK_PATH}, "
+                    f"{BasicParameters.DATA_MOUSE_MOVE_PATH}, "
+                    f"{BasicParameters.DATA_REWARD_PATH}, "
+                    f"{BasicParameters.DATA_DONE_PATH}.")
                 return {"ok": False, "msg": "no dataset"}
 
-            print(f"[Train] use existing dataset at: {root}")
+            print(
+                "[Train] use configured dataset folders: "
+                f"{BasicParameters.DATA_FRAMES_PATH}, "
+                f"{BasicParameters.DATA_KEYS_PATH}, "
+                f"{BasicParameters.DATA_MOUSE_CLICK_PATH}, "
+                f"{BasicParameters.DATA_MOUSE_MOVE_PATH}, "
+                f"{BasicParameters.DATA_REWARD_PATH}, "
+                f"{BasicParameters.DATA_DONE_PATH}.")
 
             ok = self.StartTraining(epochs=epochs, batchSize=batchSize, valSplit=valSplit, resume=isResume, onlineLearning=onlineLearning,isTest=False,)
 

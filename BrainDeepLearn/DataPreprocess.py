@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from torch.utils.data import Dataset
+from AGICore import BasicParameters
 
 try:
     import imageio.v3 as iio
@@ -18,15 +19,24 @@ except Exception:
 
 
 class OfflineGameDataset(Dataset):
-    def __init__(self, root: str) -> None:
-        p = Path(root)
-        self.imgs = sorted((p / "frames").glob("*.png"))
-        self.keys = sorted((p / "keys").glob("*.npy"))
-        self.mouse_click = sorted((p / "mouse_click").glob("*.npy"))
-        self.mouse_move = sorted((p / "mouse_move").glob("*.npy"))
-        self.reward = sorted((p / "reward").glob("*.npy"))
-        self.done = sorted((p / "done").glob("*.npy"))
-        self.texts = sorted((p / "texts").glob("*.txt"))
+    def __init__(self, isTest: bool = False) -> None:
+        if isTest:
+            p = Path(BasicParameters.DATA_ROOT_PATH_TEST)
+            self.imgs = sorted((p / "frames").glob("*.png"))
+            self.keys = sorted((p / "keys").glob("*.npy"))
+            self.mouse_click = sorted((p / "mouse_click").glob("*.npy"))
+            self.mouse_move = sorted((p / "mouse_move").glob("*.npy"))
+            self.reward = sorted((p / "reward").glob("*.npy"))
+            self.done = sorted((p / "done").glob("*.npy"))
+            self.texts = sorted((p / "texts").glob("*.txt"))
+        else:
+            self.imgs = sorted(Path(BasicParameters.DATA_FRAMES_PATH).glob("*.png"))
+            self.keys = sorted(Path(BasicParameters.DATA_KEYS_PATH).glob("*.npy"))
+            self.mouse_click = sorted(Path(BasicParameters.DATA_MOUSE_CLICK_PATH).glob("*.npy"))
+            self.mouse_move = sorted(Path(BasicParameters.DATA_MOUSE_MOVE_PATH).glob("*.npy"))
+            self.reward = sorted(Path(BasicParameters.DATA_REWARD_PATH).glob("*.npy"))
+            self.done = sorted(Path(BasicParameters.DATA_DONE_PATH).glob("*.npy"))
+            self.texts = sorted(Path(BasicParameters.DATA_TEXTS_PATH).glob("*.txt"))
 
         assert len(self.imgs) == len(self.keys) == len(self.mouse_click) == len(self.mouse_move) == len(self.reward) == len(self.done), "frames/keys/mouse_click/mouse_move/reward/done The number of files is inconsistent."
         if self.texts:
@@ -52,21 +62,27 @@ class OfflineGameDataset(Dataset):
 
 
 class OfflineOCRDataset(Dataset):
-    def __init__(self, root: str) -> None:
-        p = Path(root)
-        self.imgs = sorted((p / "frames").glob("*.png"))
-        self.texts = sorted((p / "OCRTexts").glob("*.txt"))
-        self.boxes = sorted((p / "boxes").glob("*.npy"))
+    def __init__(self, isTest: bool = False) -> None:
+        if isTest:
+            p = Path(BasicParameters.OCR_DATA_ROOT_PATH_TEST)
+            self.imgs = sorted((p / "frames").glob("*.png"))
+            self.texts = sorted((p / "OCRTexts").glob("*.txt"))
+            self.boxes = sorted((p / "boxes").glob("*.npy"))
+            self.use_text_annotations = False
+            for txt_path in self.texts:
+                if DataPreprocessor.TextFileLooksLikeOCRAnnotations(txt_path):
+                    self.use_text_annotations = True
+                    break
+        else:
+            self.imgs = sorted(Path(BasicParameters.OCR_FRAMES_PATH).glob("*.png"))
+            self.texts = sorted(Path(BasicParameters.OCR_TEXTS_PATH).glob("*.txt"))
+            self.boxes = []
+            p = Path(BasicParameters.OCR_DATA_ROOT_PATH)
+            self.use_text_annotations = True
 
         assert len(self.imgs) == len(self.texts), "frames/OCRTexts The number of files is inconsistent."
         if len(self.imgs) == 0:
             raise RuntimeError(f"no OCR samples found under {p}")
-
-        self.use_text_annotations = False
-        for txt_path in self.texts:
-            if DataPreprocessor.TextFileLooksLikeOCRAnnotations(txt_path):
-                self.use_text_annotations = True
-                break
 
         if not self.use_text_annotations:
             assert len(self.boxes) == len(self.imgs), "frames/boxes/OCRTexts The number of files is inconsistent."
@@ -101,10 +117,15 @@ class OfflineOCRDataset(Dataset):
 
 
 class OfflineOCRRecognitionDataset(Dataset):
-    def __init__(self, root: str) -> None:
-        p = Path(root)
-        self.imgs = sorted((p / "frames").glob("*.png"))
-        self.texts = sorted((p / "OCRTexts").glob("*.txt"))
+    def __init__(self, isTest: bool = False) -> None:
+        if isTest:
+            p = Path(BasicParameters.OCR_RECOGNIZER_DATA_ROOT_PATH_TEST)
+            self.imgs = sorted((p / "frames").glob("*.png"))
+            self.texts = sorted((p / "OCRTexts").glob("*.txt"))
+        else:
+            self.imgs = sorted(Path(BasicParameters.OCR_RECOGNIZER_FRAMES_PATH).glob("*.png"))
+            self.texts = sorted(Path(BasicParameters.OCR_RECOGNIZER_TEXTS_PATH).glob("*.txt"))
+            p = Path(BasicParameters.OCR_RECOGNIZER_DATA_ROOT_PATH)
 
         assert len(self.imgs) == len(self.texts), "frames/OCRTexts The number of files is inconsistent."
         if len(self.imgs) == 0:
