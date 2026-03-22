@@ -3,6 +3,7 @@
 
 #include <python3.8/Python.h>//it must be placed before <QWidget>, otherwise an error will be reported
 #include <QWidget>
+#include <QImage>
 #include <QScrollBar>
 #include <mutex>
 
@@ -21,10 +22,12 @@ public:
     explicit BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manager> mag, QWidget *parent = nullptr);
     ~BrainDeepLearnForm();
 
+    bool GetCurrentVisualData(QImage& image, QString& text, double& updatedAt);
+    bool SetVisualStateEnabled(bool enabled);
+
 private:
     Ui::BrainDeepLearnForm *ui;
     mutable std::mutex message_mtx;
-
     std::shared_ptr<PythonInteraction::Manager> pyManager = nullptr;
 
     BrainDeepLearnForm(const BrainDeepLearnForm&) = delete;
@@ -37,7 +40,6 @@ public slots:
 
 
 private slots:
-
     void CloseForm();
 
     void ClearText();

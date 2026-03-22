@@ -8,6 +8,9 @@
 #include <QSharedMemory>
 #include <QMessageBox>
 #include <QPointer>
+#include <QImage>
+#include <atomic>
+#include <thread>
 
 #include "../IRSManager/IRSCoreManager.h"
 #include "../include/IRSFunction.h"
@@ -15,6 +18,7 @@
 #include "JointDatasForm.h"
 #include "EndEffectorDatasForm.h"
 #include "BrainDeepLearnForm.h"
+#include "VisualForm.h"
 
 namespace Ui {
 class MainWindow;
@@ -32,6 +36,8 @@ signals:
     void SetJointDatasFormDatas(QString QMessage);
     void SetEndEffectorDatasFormDatas(QString QMessage);
     void SetBrainDeepLearnFormDatas(QString QMessage);
+    void SetVisualFormDatas(QString QMessage);
+    void SetVisualFormVisualData(QImage bitmap, QString text);
 
 private:
     explicit MainWindow(QWidget *parent = 0);
@@ -56,7 +62,14 @@ private:
 
     BrainDeepLearnForm *brain_deep_learn_form;
 
+    VisualForm *visual_form;
+
     mutable std::mutex message_mtx;
+    mutable std::mutex visual_poll_mtx;
+
+    std::thread visual_poll_thread;
+    std::atomic<bool> visual_poll_running{false};
+    double last_visual_updated_at = 0.0;
 
     bool is_running = false;
 
@@ -74,6 +87,8 @@ private slots:
 
     void OpenBrainDeepLearnForm();
 
+    void OpenVisualForm();
+
     void SetServoNo();
 
     void GetServoNo();
@@ -89,6 +104,10 @@ private slots:
     void SetJointPosition();
 
     void SetGoalPoint();
+
+    void StartVisualPolling();
+
+    void StopVisualPolling();
 
     void SetPythonMessageToTextBrowser(const char* data, std::size_t len, const std::string& mouduleName);
 };

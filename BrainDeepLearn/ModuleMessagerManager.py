@@ -272,6 +272,7 @@ class ModuleMessagerManager:
             self.TrimHistory()
             return stepId
 
+
     def GetStep(self):
         with self.lock:
             if len(self.steps) == 0:

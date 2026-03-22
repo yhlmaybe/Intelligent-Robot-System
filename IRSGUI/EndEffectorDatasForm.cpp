@@ -1,11 +1,14 @@
 #include "EndEffectorDatasForm.h"
 #include "ui_EndEffectorDatasForm.h"
 
+#include <QTextDocument>
+
 EndEffectorDatasForm::EndEffectorDatasForm(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::EndEffectorDatasForm)
 {
     ui->setupUi(this);
+    ui->datas_textBrowser->document()->setMaximumBlockCount(1000);
 
     setWindowFlags(Qt::Window | Qt::CustomizeWindowHint | Qt::WindowTitleHint);
     setAttribute(Qt::WA_DeleteOnClose);

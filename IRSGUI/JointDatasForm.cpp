@@ -1,11 +1,14 @@
 #include "JointDatasForm.h"
 #include "ui_JointDatasForm.h"
 
+#include <QTextDocument>
+
 JointDatasForm::JointDatasForm(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::JointDatasForm)
 {
     ui->setupUi(this);
+    ui->datas_textBrowser->document()->setMaximumBlockCount(1000);
 
     setWindowFlags(Qt::Window | Qt::CustomizeWindowHint | Qt::WindowTitleHint);
     setAttribute(Qt::WA_DeleteOnClose);

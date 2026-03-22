@@ -1,6 +1,9 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 
+#include <QTextDocument>
+#include <chrono>
+
 void IRS_MESSAGE(std::string message)
 {
     MainWindow *mainWindow = MainWindow::GetInstance();
@@ -27,6 +30,9 @@ void IRS_FORM_MESSAGE(std::string message, MessageFunction fun)
         break;
     case MessageFunction::BrainDeepLearnFormDatas:
         functionName = "SetBrainDeepLearnFormDatas";
+        break;
+    case MessageFunction::VisualFormDatas:
+        functionName = "SetVisualFormDatas";
         break;
     default:
         functionName = "SetMessage";
@@ -76,29 +82,37 @@ MainWindow::MainWindow(QWidget *parent) :
         return;
     }
     ui->setupUi(this);
+    ui->MessageText->document()->setMaximumBlockCount(1000);
+
+    qRegisterMetaType<QImage>("QImage");
 
     Initiate();
 
     joint_datas_form = new JointDatasForm();
     end_effector_datas_form = new EndEffectorDatasForm();
     brain_deep_learn_form = new BrainDeepLearnForm(py_manager);
+    visual_form = new VisualForm();
 
     forms.push_back(joint_datas_form);
     forms.push_back(end_effector_datas_form);
     forms.push_back(brain_deep_learn_form);
+    forms.push_back(visual_form);
 
-    
     connect(this, &MainWindow::SetJointDatasFormDatas, joint_datas_form, &JointDatasForm::AddData);
     connect(this, &MainWindow::SetEndEffectorDatasFormDatas, end_effector_datas_form, &EndEffectorDatasForm::AddData);
     connect(this, &MainWindow::SetBrainDeepLearnFormDatas, brain_deep_learn_form, &BrainDeepLearnForm::AddData);
+    connect(this, &MainWindow::SetVisualFormDatas, visual_form, &VisualForm::SetText);
+    connect(this, &MainWindow::SetVisualFormVisualData, visual_form, &VisualForm::SetVisualData);
+    connect(visual_form, &VisualForm::VisualShown, this, &MainWindow::StartVisualPolling);
+    connect(visual_form, &VisualForm::VisualHidden, this, &MainWindow::StopVisualPolling);
 
     connect(ui->actionJoint_Datas, &QAction::triggered, this, &MainWindow::OpenJointDatasForm);
     connect(ui->actionEnd_Effector_Datas, &QAction::triggered, this, &MainWindow::OpenEndEffectDatasForm);
     connect(ui->actionBrainDeepLearn_Setting, &QAction::triggered, this, &MainWindow::OpenBrainDeepLearnForm);
+    connect(ui->actionVisual_Form, &QAction::triggered, this, &MainWindow::OpenVisualForm);
 
     connect(ui->SetServoNo_Button, SIGNAL(clicked()), this, SLOT(SetServoNo()));
     connect(ui->GetServoNo_Button, SIGNAL(clicked()), this, SLOT(GetServoNo()));
-    connect(ui->Initiate_Button, SIGNAL(clicked()), this, SLOT(Initiate()));
     connect(ui->StateReset_Button, SIGNAL(clicked()), this, SLOT(StateReset()));
     connect(ui->setJointPosition_Button, SIGNAL(clicked()), this, SLOT(SetJointPosition()));
     connect(ui->setGoalPoint_Button, SIGNAL(clicked()), this, SLOT(SetGoalPoint()));
@@ -108,6 +122,7 @@ MainWindow::MainWindow(QWidget *parent) :
 
 MainWindow::~MainWindow()
 {  
+    StopVisualPolling();
     QSharedMemory sharedMemory("IRSUniqueKey");
     sharedMemory.detach();
     delete ui; 
@@ -115,6 +130,7 @@ MainWindow::~MainWindow()
 
 void MainWindow::closeEvent(QCloseEvent *event) 
 {
+    StopVisualPolling();
     IRSCoreHandle::End();
     rclcpp::shutdown();
     for(QWidget *form : forms)
@@ -184,6 +200,11 @@ void MainWindow::OpenEndEffectDatasForm()
 void MainWindow::OpenBrainDeepLearnForm()
 {
     brain_deep_learn_form->show();
+}
+
+void MainWindow::OpenVisualForm()
+{
+    visual_form->show();
 }
 
 void MainWindow::SetServoNo()
@@ -301,6 +322,99 @@ void MainWindow::SetGoalPoint()
     {
         IRS_MESSAGE("the joint needs to be initialized before set position");
     }
+}
+
+void MainWindow::StartVisualPolling()
+{
+    if (!brain_deep_learn_form)
+    {
+        return;
+    }
+
+    
+    std::lock_guard<std::mutex> lock(visual_poll_mtx);
+    if (visual_poll_running.load())
+    {
+        return;
+    }
+    last_visual_updated_at = 0.0;
+    visual_poll_running.store(true);
+    
+
+    if (!brain_deep_learn_form->SetVisualStateEnabled(true))
+    {
+        std::lock_guard<std::mutex> lock(visual_poll_mtx);
+        visual_poll_running.store(false);
+        return;
+    }
+
+    if (visual_poll_thread.joinable())
+    {
+        visual_poll_thread.join();
+    }
+
+    visual_poll_thread = std::thread([this]()
+    {
+        while (visual_poll_running.load())
+        {
+            QImage image;
+            QString text;
+            double updatedAt = 0.0;
+
+            if (brain_deep_learn_form->GetCurrentVisualData(image, text, updatedAt))
+            {
+                bool shouldPublish = false;
+                {
+                    std::lock_guard<std::mutex> lock(visual_poll_mtx);
+                    if (updatedAt > last_visual_updated_at)
+                    {
+                        last_visual_updated_at = updatedAt;
+                        shouldPublish = true;
+                    }
+                }
+
+                if (shouldPublish)
+                {
+                    QMetaObject::invokeMethod(
+                        this,
+                        [this, image, text]()
+                        {
+                            emit SetVisualFormVisualData(image, text);
+                        },
+                        Qt::QueuedConnection);
+                }
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
+}
+
+void MainWindow::StopVisualPolling()
+{
+    std::thread threadToJoin;
+    {
+        std::lock_guard<std::mutex> lock(visual_poll_mtx);
+        visual_poll_running.store(false);
+        if (visual_poll_thread.joinable())
+        {
+            threadToJoin = std::move(visual_poll_thread);
+        }
+    }
+
+    if (threadToJoin.joinable())
+    {
+        threadToJoin.join();
+    }
+
+    if (brain_deep_learn_form)
+    {
+        brain_deep_learn_form->SetVisualStateEnabled(false);
+    }
+
+    std::lock_guard<std::mutex> lock(visual_poll_mtx);
+    visual_poll_running.store(false);
+    last_visual_updated_at = 0.0;
 }
 
 void MainWindow::SetPythonMessageToTextBrowser(const char *data, std::size_t len, const std::string &mouduleName)

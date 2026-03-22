@@ -7,7 +7,6 @@ import ast
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import traceback
 import os
 import math
@@ -206,7 +205,8 @@ class BrainCore(nn.Module):
         plasticHebbian: bool = True,
         prioritizeExtStr: bool = True,
         plasticOnlineLearning: bool = False,
-        usePlanner: bool = True,):
+        usePlanner: bool = True,
+        saveModuleMessagerOutput: bool = True,):
         super().__init__()
         self.SEQ_LEN = seqLen
         self.is_online_learning = plasticOnlineLearning
@@ -301,8 +301,12 @@ class BrainCore(nn.Module):
         self.attn_copy = copy.deepcopy(self.attn)
         self.critic_copy = copy.deepcopy(self.critic)
         self.moduleMessager = ModuleMessagerManager(maxSteps=256)
+        self.save_module_messager_output = bool(saveModuleMessagerOutput)
 
         self.ResetBuffers(B=1, isOnlineLearning=self.is_online_learning,device=self.device)
+
+    def SetModuleMessagerEnabled(self, enabled: bool):
+        self.save_module_messager_output = bool(enabled)
 
     @torch.no_grad()
     def ResetBuffers(self, B: int = 1, isOnlineLearning: bool = False, device: Optional[torch.device] = None):
@@ -354,6 +358,8 @@ class BrainCore(nn.Module):
 
         def saveModuleOutput(moduleName: str, output: Any):
             nonlocal isBeginStep
+            if not self.save_module_messager_output:
+                return
             self.moduleMessager.SaveModuleOutput(moduleName, output, isBeginStep=isBeginStep)
             isBeginStep = False
 
@@ -601,6 +607,7 @@ class BrainCore(nn.Module):
             "world": {"state": s_t, "reward": r_t, "done": d_t}, # state:[B, D_world], reward/done:[B]
             "critic": critic_out,
             "features": {"perc": percs_seq, "attn": atten_out, "mem": mem_feat}, # perc:[B, T, D_perc], attn:[B, D_attn], mem:[B, D_mem]
+            "OCR": ocr_items,
             "losses": losses}
         
 
@@ -994,7 +1001,6 @@ class Agent:
         reward: Optional[torch.Tensor] = None,
         done: Optional[torch.Tensor] = None,
         sampleActions: bool = True,
-        returnDecision: bool = False,
         deterministicActor: bool = False,):
 
         frame = frame.to(self.device)
@@ -1023,17 +1029,15 @@ class Agent:
             if step_out is None: return None
             total_loss = step_out["losses"]["total_loss"]
             packed = pack_action(step_out["decision"])
-            if returnDecision:
-                return (*packed, total_loss, step_out["decision"])
-            return (*packed, total_loss)
+
+            return (*packed, total_loss, step_out["OCR"])
         else:  
             with torch.no_grad():  
                 step_out = self.brain.Step(frame,textExt,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
                 if step_out is None: return None
                 packed = pack_action(step_out["decision"])
-                if returnDecision:
-                    return (*packed, step_out["decision"])
-                return packed
+
+                return (*packed, step_out["OCR"])
 
 
     def Save(self, path: str):
@@ -1128,69 +1132,8 @@ class Agent:
         self.brain.mem.ResetHebbianMemory()
         self.brain.conscious.ResetHebbianMemory()
 
-    def ConvertNpImagesKeysMouses(
-        self,
-        imgs: Optional[Union[np.ndarray, torch.Tensor]],
-        keys: Optional[Union[np.ndarray, torch.Tensor]],
-        mouseClick: Optional[Union[np.ndarray, torch.Tensor]],
-        mouseMove: Optional[Union[np.ndarray, torch.Tensor]],
-        reward: Optional[Union[np.ndarray, torch.Tensor]],
-        done: Optional[Union[np.ndarray, torch.Tensor]],
-        *,
-        size: Optional[Tuple[int, int]] = (BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE),
-        device: Optional[torch.device] = None,) -> Dict[str, Optional[torch.Tensor]]:
 
-        def ensure_tensor(x):
-            if x is None:
-                return None
-            if isinstance(x, np.ndarray):
-                return torch.from_numpy(x)
-            if isinstance(x, torch.Tensor):
-                return x
-            return torch.as_tensor(x)
 
-        if imgs is not None:
-            img_tensor = ensure_tensor(imgs)
-            if img_tensor.dim() == 3:
-                img_tensor = img_tensor.unsqueeze(0)
-            if img_tensor.dim() != 4:
-                raise ValueError(f"Unexpected image batch shape: {tuple(img_tensor.shape)}")
-
-            was_float = torch.is_floating_point(img_tensor)
-            if img_tensor.size(1) not in (1, 3, 4) and img_tensor.size(-1) in (1, 3, 4):
-                img_tensor = img_tensor.permute(0, 3, 1, 2).contiguous()
-
-            img_tensor = img_tensor.float()
-            if (not was_float) or img_tensor.detach().max().item() > 1.0:
-                img_tensor = img_tensor / 255.0
-
-            if size is not None:
-                out_h, out_w = size
-                img_tensor = F.interpolate(img_tensor,size=(out_h, out_w),mode="bilinear",align_corners=False,antialias=True,)
-            if device is not None: img_tensor = img_tensor.to(device)
-        else: img_tensor = None
-
-        def convert_tensor(x):
-            if x is not None:
-                x_tensor = ensure_tensor(x).float()
-                if device is not None:
-                    x_tensor = x_tensor.to(device)
-            else: x_tensor = None
-            return x_tensor
-
-        key_tensor = convert_tensor(keys)
-        mouse_click_tensor = convert_tensor(mouseClick)
-        mouse_move_tensor = convert_tensor(mouseMove)
-        reward_tensor = convert_tensor(reward)
-        done_tensor = convert_tensor(done)
-
-        return {
-            "frames": img_tensor,
-            "keys": key_tensor,
-            "mouse_clicks": mouse_click_tensor,
-            "mouse_moves": mouse_move_tensor,
-            "rewards": reward_tensor,
-            "dones": done_tensor,}
 
 
     def UpdateWrappers(self, wrappers, action: str, **kwargs):

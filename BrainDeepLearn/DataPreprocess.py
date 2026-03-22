@@ -281,9 +281,9 @@ class DataPreprocessor:
         if img_t.ndim != 3:
             raise ValueError(f"image must have 2 or 3 dims, but got shape {tuple(img_t.shape)}")
 
-        if img_t.shape[-1] in (1, 3):
+        if img_t.shape[-1] in (1, 3, 4):
             img_t = img_t.permute(2, 0, 1)
-        elif img_t.shape[0] not in (1, 3):
+        elif img_t.shape[0] not in (1, 3, 4):
             raise ValueError(f"image channel layout is invalid: {tuple(img_t.shape)}")
 
         img_t = img_t.float()
@@ -300,7 +300,9 @@ class DataPreprocessor:
     @staticmethod
     def ResizeImage(
         imageTensor: torch.Tensor,
-        size: Union[int, Tuple[int, int]],) -> Tuple[torch.Tensor, DataResizeMeta]:
+        size: Union[int, Tuple[int, int]],
+        *,
+        antialias: bool = False,) -> Tuple[torch.Tensor, DataResizeMeta]:
         if isinstance(size, int):
             dst_h = int(size)
             dst_w = int(size)
@@ -313,7 +315,8 @@ class DataPreprocessor:
             imageTensor.unsqueeze(0),
             size=(dst_h, dst_w),
             mode="bilinear",
-            align_corners=False,).squeeze(0)
+            align_corners=False,
+            antialias=bool(antialias),).squeeze(0)
 
         meta = DataResizeMeta(
             src_h=int(src_h),
@@ -372,6 +375,86 @@ class DataPreprocessor:
         resized_image_t, resize_meta = DataPreprocessor.ResizeImage(image_t, size=size)
         scaled_boxes = DataPreprocessor.ScaleBoxesXYXY(boxes, resize_meta, clamp=True)
         return resized_image_t, scaled_boxes, resize_meta
+
+    @staticmethod
+    def ConvertNpImagesKeysMouses(
+        imgs: Optional[Union[np.ndarray, torch.Tensor]],
+        keys: Optional[Union[np.ndarray, torch.Tensor]],
+        mouseClick: Optional[Union[np.ndarray, torch.Tensor]],
+        mouseMove: Optional[Union[np.ndarray, torch.Tensor]],
+        reward: Optional[Union[np.ndarray, torch.Tensor]],
+        done: Optional[Union[np.ndarray, torch.Tensor]],
+        *,
+        size: Optional[Tuple[int, int]] = (BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE),
+        device: Optional[torch.device] = None,
+        needVisualState: bool = True,) -> Dict[str, Any]:
+
+        original_images: List[np.ndarray] = []
+        resize_meta: List[DataResizeMeta] = []
+
+        if imgs is not None:
+            img_tensor = torch.as_tensor(imgs)
+            if img_tensor.ndim == 3:
+                image_samples = [img_tensor]
+            elif img_tensor.ndim == 4:
+                image_samples = [img_tensor[i] for i in range(int(img_tensor.shape[0]))]
+            else:
+                raise ValueError(f"Unexpected image batch shape: {tuple(img_tensor.shape)}")
+
+            resized_samples: List[torch.Tensor] = []
+            for sample in image_samples:
+                if needVisualState:
+                    if isinstance(sample, torch.Tensor):
+                        original_image = sample.detach().cpu().numpy()
+                    else:
+                        original_image = np.asarray(sample)
+                    original_images.append(np.array(original_image, copy=True))
+
+                sample_tensor = DataPreprocessor.ToImageTensor(sample)
+
+                if size is None:
+                    resized_tensor = sample_tensor.clone()
+                    _, src_h, src_w = sample_tensor.shape
+                    meta = DataResizeMeta(
+                        src_h=int(src_h),
+                        src_w=int(src_w),
+                        dst_h=int(src_h),
+                        dst_w=int(src_w),
+                        scale_x=1.0,
+                        scale_y=1.0,)
+                else:
+                    resized_tensor, meta = DataPreprocessor.ResizeImage(
+                        sample_tensor,
+                        size=size,
+                        antialias=True,)
+
+                resized_samples.append(resized_tensor)
+                if needVisualState:
+                    resize_meta.append(meta)
+
+            img_tensor = torch.stack(resized_samples, dim=0) if len(resized_samples) > 0 else torch.empty(0)
+            if device is not None:
+                img_tensor = img_tensor.to(device)
+        else:
+            img_tensor = None
+
+        def convert_tensor(value: Optional[Union[np.ndarray, torch.Tensor]]):
+            if value is None:
+                return None
+            value_tensor = torch.as_tensor(value).float()
+            if device is not None:
+                value_tensor = value_tensor.to(device)
+            return value_tensor
+
+        return {
+            "frames": img_tensor,
+            "original_images": original_images,
+            "resize_meta": resize_meta,
+            "keys": convert_tensor(keys),
+            "mouse_clicks": convert_tensor(mouseClick),
+            "mouse_moves": convert_tensor(mouseMove),
+            "rewards": convert_tensor(reward),
+            "dones": convert_tensor(done),}
 
     @staticmethod
     def CropAndResizeLineImages(

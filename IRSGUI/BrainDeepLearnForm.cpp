@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QStringList>
+#include <QTextDocument>
 
 BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manager> mag, QWidget *parent):
     QWidget(parent),
@@ -15,6 +16,7 @@ BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manage
     qRegisterMetaType<QTextCursor>("QTextCursor");
 
     ui->setupUi(this);
+    ui->message_textBrowser->document()->setMaximumBlockCount(1000);
 
     brainDeepLearn = std::make_shared<BrainDeepLearnInterface>(mag, [this](std::string msg)
     {
@@ -69,6 +71,39 @@ BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manage
 BrainDeepLearnForm::~BrainDeepLearnForm()
 {
     delete ui;
+}
+
+bool BrainDeepLearnForm::GetCurrentVisualData(QImage& image, QString& text, double& updatedAt)
+{
+    BrainDeepLearnInterface::VisualStatus status;
+    if (!brainDeepLearn->GetCurrentVisualStatus(status))
+    {
+        return false;
+    }
+
+    text = QString::fromStdString(status.text);
+    updatedAt = status.updatedAt;
+
+    const std::size_t expectedSize = static_cast<std::size_t>(status.width) * static_cast<std::size_t>(status.height) * 3;
+    if (status.width <= 0 || status.height <= 0 || status.bitmapRgb.size() < expectedSize)
+    {
+        image = QImage();
+        return true;
+    }
+
+    QImage rawImage(
+        status.bitmapRgb.data(),
+        status.width,
+        status.height,
+        status.width * 3,
+        QImage::Format_RGB888);
+    image = rawImage.copy();
+    return true;
+}
+
+bool BrainDeepLearnForm::SetVisualStateEnabled(bool enabled)
+{
+    return brainDeepLearn->SetVisualStateEnabled(enabled);
 }
 
 QString BrainDeepLearnForm::StatusValueToQString(BrainDeepLearnInterface::StatusValue& value)

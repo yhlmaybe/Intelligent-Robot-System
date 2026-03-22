@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Tuple, List, Dict, Any, Optional, Union
+from typing import Callable, Tuple, List, Dict, Any, Optional, Union
 from pathlib import Path
 import threading
 import random
@@ -23,7 +23,7 @@ from ValueEstimationModule import  TestValueEstimationMTool
 from ConsciousnessModule import TestConsciousMTool
 from IntentionModule import TestIntentionMTool
 from OCRModule import TestOCRMTool, OCREngineExtractor
-from DataPreprocess import DataPreprocessor, OfflineGameDataset, OfflineOCRDataset, OfflineOCRRecognitionDataset
+from DataPreprocess import DataPreprocessor, DataResizeMeta, OfflineGameDataset, OfflineOCRDataset, OfflineOCRRecognitionDataset
 from AGICore import Agent, BrainCore, BasicParameters
 
 try:
@@ -41,10 +41,20 @@ class ModuleController:
             "batch": 0, "total_batches": 0,
             "train_loss": 0.0, "val_loss": 0.0,
             "message": "Waiting to start",
-            "trace": ""}
+            "trace": "",
+            "visual": self.EmptyVisualStatus(),}
         self.stop_requested = False
         self.pause_requested = False
         self.reset_hebbian = False
+        self.visual_state_enabled = True
+
+    def EmptyVisualStatus(self, *, touch: bool = False) -> Dict[str, Any]:
+        return {
+            "bitmap": [],
+            "text": "",
+            "ocr_texts": [],
+            "items": [],
+            "updated_at": (time.time() if touch else 0.0),}
 
     def SetStatus(self, state: str, message: str, **kwargs):
         with self._lock:
@@ -65,7 +75,8 @@ class ModuleController:
             "batch": 0, "total_batches": 0,
             "train_loss": 0.0, "val_loss": 0.0,
             "message": "Waiting to start",
-            "trace": ""}
+            "trace": "",
+            "visual": self.EmptyVisualStatus(),}
 
     def RequestStop(self):
         with self._lock:
@@ -99,6 +110,16 @@ class ModuleController:
         with self._lock:
             return self.reset_hebbian
 
+    def SetVisualStateEnabled(self, enabled: bool):
+        with self._lock:
+            self.visual_state_enabled = bool(enabled)
+            if not self.visual_state_enabled:
+                self.status["visual"] = self.EmptyVisualStatus(touch=True)
+
+    def IsVisualStateEnabled(self) -> bool:
+        with self._lock:
+            return self.visual_state_enabled
+
 
 class ManagerFunction:
     def __init__(self, device: Optional[str] = None):
@@ -121,7 +142,7 @@ class ManagerFunction:
             "intention": TestIntentionMTool(),}
 
     def SetBasicParameters(self, name: str, value: str):
-        if self.is_begin or (self.br_thread is not None and self.br_thread.is_alive()):
+        if self.is_begin:
             self.controller.SetStatus("recur", "Training or Deploy is already running")
             return False
         return BasicParameters.Set(name=name, value=value)
@@ -132,24 +153,40 @@ class ManagerFunction:
     def GetBasicParametersDict(self):
         return BasicParameters.GetStringDict()
 
-    def StartTraining(self, epochs: int = 5, batchSize: int = 32, valSplit: float = 0.1, resume: bool = True, onlineLearning:bool = False,isTest: bool = False):
+    def StartBackgroundTask(
+        self,
+        target: Callable[..., Any],
+        *,
+        args: Tuple[Any, ...] = (),
+        kwargs: Optional[Dict[str, Any]] = None,) -> bool:
         if self.is_begin:
             self.controller.SetStatus("recur", "Training or Deploy is already running")
             return False
-        self.is_begin = True
 
+        self.is_begin = True
+        self.br_thread = threading.Thread(
+            target=target,
+            args=args,
+            kwargs=(kwargs or {}),
+            daemon=False)
+        self.br_thread.start()
+        return True
+
+    def StartTraining(self, epochs: int = 5, batchSize: int = 32, valSplit: float = 0.1, resume: bool = True, onlineLearning:bool = False,isTest: bool = False):
         ckpt_path = BasicParameters.CKPT_PATH_TEST if isTest else BasicParameters.CKPT_PATH_TRAIN
         out_path = BasicParameters.MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.MODULEPARAMETER_PATH
         wm_mem_path = BasicParameters.WORLD_MEMORY_PATH_TEST if isTest else BasicParameters.WORLD_MEMORY_PATH
         mem_mem_path = BasicParameters.MEMORY_MEMORY_PATH_TEST if isTest else BasicParameters.MEMORY_MEMORY_PATH
 
-        self.br_thread = threading.Thread(
-            target=self.TrainLoop, args=(
-                epochs, batchSize, valSplit, resume, onlineLearning),
-                kwargs={"worldMemPath": wm_mem_path, "memMemPath": mem_mem_path, "ckptPath": ckpt_path, "outPath": out_path, "isTest": isTest}, 
-                daemon=False)
-        self.br_thread.start()
-        return True
+        return self.StartBackgroundTask(
+            self.TrainLoop,
+            args=(epochs, batchSize, valSplit, resume, onlineLearning),
+            kwargs={
+                "worldMemPath": wm_mem_path,
+                "memMemPath": mem_mem_path,
+                "ckptPath": ckpt_path,
+                "outPath": out_path,
+                "isTest": isTest,})
 
     def StartOCRTraining(
         self,
@@ -161,17 +198,12 @@ class ManagerFunction:
         *,
         trainDetection: bool = True,
         trainRecognition: bool = True,):
-        if self.is_begin:
-            self.controller.SetStatus("recur", "Training or Deploy is already running")
-            return False
-        self.is_begin = True
-
         ckpt_path = BasicParameters.OCR_CKPT_PATH_TEST if isTest else BasicParameters.OCR_CKPT_PATH_TRAIN
         out_path = BasicParameters.OCR_MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.OCR_MODULEPARAMETER_PATH
         recognizer_init_path = BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH
 
-        self.br_thread = threading.Thread(
-            target=self.OCRTrainLoop,
+        return self.StartBackgroundTask(
+            self.OCRTrainLoop,
             args=(epochs, batchSize, valSplit, resume),
             kwargs={
                 "isTest": isTest,
@@ -179,11 +211,7 @@ class ManagerFunction:
                 "outPath": out_path,
                 "trainDetection": trainDetection,
                 "trainRecognition": trainRecognition,
-                "recognizerInitPath": recognizer_init_path,},
-
-            daemon=False)
-        self.br_thread.start()
-        return True
+                "recognizerInitPath": recognizer_init_path,})
 
     def StartOCRRecognitionTraining(
         self,
@@ -192,24 +220,16 @@ class ManagerFunction:
         valSplit: float = 0.1,
         resume: bool = True,
         isTest: bool = False):
-        if self.is_begin:
-            self.controller.SetStatus("recur", "Training or Deploy is already running")
-            return False
-        self.is_begin = True
-
         ckpt_path = BasicParameters.OCR_RECOGNIZER_CKPT_PATH_TEST if isTest else BasicParameters.OCR_RECOGNIZER_CKPT_PATH_TRAIN
         out_path = BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH
 
-        self.br_thread = threading.Thread(
-            target=self.OCRRecognitionTrainLoop,
+        return self.StartBackgroundTask(
+            self.OCRRecognitionTrainLoop,
             args=(epochs, batchSize, valSplit, resume),
             kwargs={
                 "isTest": isTest,
                 "ckptPath": ckpt_path,
-                "outPath": out_path,},
-            daemon=False)
-        self.br_thread.start()
-        return True
+                "outPath": out_path,})
 
     def Stop(self):
         if self.is_begin:
@@ -247,7 +267,326 @@ class ManagerFunction:
     def GetCurrentStatus(self):
         return self.controller.GetStatus()
 
+    def SetVisualStateEnabled(self, enabled: bool):
+        self.controller.SetVisualStateEnabled(enabled)
+        return True
 
+    def GetVisualStateEnabled(self):
+        return self.controller.IsVisualStateEnabled()
+
+    def ResetControllerFlags(self) -> None:
+        with self.controller._lock:
+            self.controller.stop_requested = False
+            self.controller.pause_requested = False
+            self.controller.reset_hebbian = False
+
+    def WaitWhilePaused(self, pausedMessage: str) -> None:
+        while self.controller.ShouldPause():
+            self.controller.SetStatus("paused", pausedMessage)
+            time.sleep(2)
+
+    def StartMessageMonitor(self, monitorFn: Callable[[], None]) -> None:
+        self.message_thread = threading.Thread(target=monitorFn, args=(), daemon=False)
+        self.message_thread.start()
+
+    def RunNamedTest(self, testKey: str):
+        return self.test[str(testKey)].RunAll()
+
+    def CreateDataLoader(
+        self,
+        dataset: Dataset,
+        *,
+        batchSize: int,
+        shuffle: bool,
+        collateFn: Optional[Callable[..., Any]] = None,
+        pinMemory: Optional[bool] = None,) -> DataLoader:
+        loader_kwargs: Dict[str, Any] = {
+            "batch_size": batchSize,
+            "shuffle": shuffle,
+            "num_workers": 0,
+            "pin_memory": (
+                bool(getattr(self.device, "type", "") == "cuda")
+                if pinMemory is None else
+                bool(pinMemory)),}
+        if collateFn is not None:
+            loader_kwargs["collate_fn"] = collateFn
+        return DataLoader(dataset, **loader_kwargs)
+
+    def SplitDataset(
+        self,
+        dataset: Dataset,
+        *,
+        valSplit: float,
+        testSplit: float = 0.1,
+        trainDataset: Optional[Dataset] = None,
+        valDataset: Optional[Dataset] = None,
+        testDataset: Optional[Dataset] = None,):
+        if trainDataset is None:
+            n_total = len(dataset)
+            n_test = int(n_total * testSplit)
+            n_val = int(n_total * valSplit)
+            n_train = n_total - n_val - n_test
+            trainDataset, valDataset, testDataset = torch.utils.data.random_split(
+                dataset,
+                [n_train, n_val, n_test])
+        elif testDataset is None:
+            train_indices = list(trainDataset.indices) if hasattr(trainDataset, "indices") else list(range(len(trainDataset)))
+            val_indices = list(valDataset.indices) if hasattr(valDataset, "indices") else []
+            used = set(train_indices) | set(val_indices)
+            test_indices = [idx for idx in range(len(dataset)) if idx not in used]
+            testDataset = torch.utils.data.Subset(dataset, test_indices) if test_indices else valDataset
+
+        return trainDataset, valDataset, testDataset
+
+    def HasGameDataset(self, dataRoot: Optional[Union[str, Path]] = None) -> bool:
+        if dataRoot is None:
+            frames_dir = Path(BasicParameters.DATA_FRAMES_PATH)
+            keys_dir = Path(BasicParameters.DATA_KEYS_PATH)
+            mouse_click_dir = Path(BasicParameters.DATA_MOUSE_CLICK_PATH)
+            mouse_move_dir = Path(BasicParameters.DATA_MOUSE_MOVE_PATH)
+            reward_dir = Path(BasicParameters.DATA_REWARD_PATH)
+            done_dir = Path(BasicParameters.DATA_DONE_PATH)
+            texts_dir = Path(BasicParameters.DATA_TEXTS_PATH)
+        else:
+            root = Path(dataRoot)
+            frames_dir = root / "frames"
+            keys_dir = root / "keys"
+            mouse_click_dir = root / "mouse_click"
+            mouse_move_dir = root / "mouse_move"
+            reward_dir = root / "reward"
+            done_dir = root / "done"
+            texts_dir = root / "texts"
+
+        required_dirs = [frames_dir, keys_dir, mouse_click_dir, mouse_move_dir, reward_dir, done_dir]
+        if not all(p.exists() for p in required_dirs):
+            return False
+
+        counts = [
+            len(sorted(frames_dir.glob("*.png"))),
+            len(sorted(keys_dir.glob("*.npy"))),
+            len(sorted(mouse_click_dir.glob("*.npy"))),
+            len(sorted(mouse_move_dir.glob("*.npy"))),
+            len(sorted(reward_dir.glob("*.npy"))),
+            len(sorted(done_dir.glob("*.npy"))),]
+        if counts[0] == 0 or len(set(counts)) != 1:
+            return False
+
+        if texts_dir.exists():
+            text_count = len(sorted(texts_dir.glob("*.txt")))
+            if text_count not in (0, counts[0]):
+                return False
+        return True
+
+    def HasOcrDataset(self, dataRoot: Optional[Union[str, Path]] = None) -> bool:
+        if dataRoot is None:
+            root = Path(BasicParameters.OCR_DATA_ROOT_PATH)
+            frames_dir = Path(BasicParameters.OCR_FRAMES_PATH)
+            texts_dir = Path(BasicParameters.OCR_TEXTS_PATH)
+        else:
+            root = Path(dataRoot)
+            frames_dir = root / "frames"
+            texts_dir = root / "OCRTexts"
+
+        if not (frames_dir.exists() and texts_dir.exists()):
+            return False
+
+        frame_files = sorted(frames_dir.glob("*.png"))
+        txt_files = sorted(texts_dir.glob("*.txt"))
+        if not frame_files or not txt_files or len(frame_files) != len(txt_files):
+            return False
+
+        boxes_dir = root / "boxes"
+        return any(boxes_dir.glob("*.npy")) or any(
+            DataPreprocessor.TextFileLooksLikeOCRAnnotations(txt_path)
+            for txt_path in txt_files)
+
+    def HasOcrRecognitionDataset(self, dataRoot: Optional[Union[str, Path]] = None) -> bool:
+        if dataRoot is None:
+            frames_dir = Path(BasicParameters.OCR_RECOGNIZER_FRAMES_PATH)
+            texts_dir = Path(BasicParameters.OCR_RECOGNIZER_TEXTS_PATH)
+        else:
+            root = Path(dataRoot)
+            frames_dir = root / "frames"
+            texts_dir = root / "OCRTexts"
+
+        if not (frames_dir.exists() and texts_dir.exists()):
+            return False
+
+        frame_files = sorted(frames_dir.glob("*.png"))
+        text_files = sorted(texts_dir.glob("*.txt"))
+        return bool(frame_files) and bool(text_files) and len(frame_files) == len(text_files)
+
+    def MonitorStatus(
+        self,
+        *,
+        prefix: str,
+        monitorName: str,
+        renderStatus: Callable[[Dict[str, Any]], str],
+        terminalStates: Tuple[str, ...],
+        sleepSeconds: float,) -> None:
+        try:
+            while True:
+                st = self.GetCurrentStatus()
+                print(f"[{prefix}] {renderStatus(st)}")
+
+                if st["state"] == "error":
+                    trace = st.get("trace")
+                    if trace:
+                        print(f"\n====== {prefix} ERROR TRACEBACK ======\n")
+                        print(trace)
+                        print("====================================\n")
+
+                if st["state"] in terminalStates:
+                    self.controller.ResteStatus()
+                    break
+
+                time.sleep(sleepSeconds)
+
+        except Exception as e:
+            print(f"[{monitorName}] monitor raised: {e}")
+            print(traceback.format_exc())
+
+    def RestoreOcrItemsToOriginal(
+        self,
+        ocrItems: Optional[List[Dict[str, Any]]],
+        resizeMeta: Optional[DataResizeMeta] = None,) -> List[Dict[str, Any]]:
+        restored_items = [dict(item) for item in (ocrItems or [])]
+        if not restored_items:
+            return restored_items
+
+        boxes: List[List[float]] = []
+        valid_indices: List[int] = []
+        for idx, item in enumerate(restored_items):
+            box = item.get("box", None)
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                item["box"] = (0, 0, 0, 0)
+                continue
+            boxes.append([float(box[0]), float(box[1]), float(box[2]), float(box[3])])
+            valid_indices.append(idx)
+
+        if not boxes:
+            return restored_items
+
+        boxes_np = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+        if resizeMeta is not None:
+            boxes_np = DataPreprocessor.RestoreBoxesXYXY(boxes_np, resizeMeta, clamp=True)
+
+        for idx, box in zip(valid_indices, boxes_np):
+            x1, y1, x2, y2 = [int(round(float(v))) for v in box.tolist()]
+            restored_items[idx]["box"] = (x1, y1, x2, y2)
+
+        return restored_items
+
+    def DrawBoxesOnImage(
+        self,
+        image: Union[np.ndarray, torch.Tensor],
+        ocrItems: Optional[List[Dict[str, Any]]],
+        *,
+        color: Tuple[int, int, int] = (255, 0, 0),
+        thickness: int = 2,) -> np.ndarray:
+        if isinstance(image, torch.Tensor):
+            canvas = image.detach().cpu().numpy()
+        else:
+            canvas = np.asarray(image)
+
+        if canvas.ndim == 2:
+            canvas = canvas[..., None]
+        if canvas.ndim != 3:
+            raise ValueError(f"visual image must have 2 or 3 dims, but got {canvas.shape}")
+
+        if canvas.shape[0] in (1, 3, 4) and canvas.shape[-1] not in (1, 3, 4):
+            canvas = np.moveaxis(canvas, 0, -1)
+
+        if canvas.shape[-1] == 1:
+            canvas = np.repeat(canvas, 3, axis=-1)
+        elif canvas.shape[-1] >= 3:
+            canvas = canvas[..., :3]
+        else:
+            raise ValueError(f"visual image channel layout is invalid: {canvas.shape}")
+
+        canvas = np.ascontiguousarray(np.array(canvas, copy=True))
+        if canvas.size == 0:
+            return canvas
+
+        h_img, w_img = canvas.shape[:2]
+        thick = max(1, int(thickness))
+
+        for item in ocrItems or []:
+            box = item.get("box", None)
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                continue
+
+            x1, y1, x2, y2 = [int(v) for v in box]
+            x1 = max(0, min(w_img - 1, x1))
+            y1 = max(0, min(h_img - 1, y1))
+            x2 = max(x1 + 1, min(w_img, x2))
+            y2 = max(y1 + 1, min(h_img, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            canvas[y1:min(h_img, y1 + thick), x1:x2] = color
+            canvas[max(0, y2 - thick):y2, x1:x2] = color
+            canvas[y1:y2, x1:min(w_img, x1 + thick)] = color
+            canvas[y1:y2, max(0, x2 - thick):x2] = color
+
+        return canvas
+
+    def FormatVisualText(
+        self,
+        title: str,
+        ocrTexts: List[str],
+        extraLines: Optional[List[str]] = None,) -> str:
+        lines: List[str] = []
+        title_text = str(title).strip()
+        if title_text:
+            lines.append(title_text)
+
+        if extraLines:
+            for line in extraLines:
+                line_text = str(line).strip()
+                if line_text:
+                    lines.append(line_text)
+
+        lines.append("OCR Text:")
+        if ocrTexts:
+            lines.extend(ocrTexts)
+        else:
+            lines.append("<empty>")
+
+        return "\n".join(lines)
+
+    def BuildVisualPayload(
+        self,
+        image: Optional[Union[np.ndarray, torch.Tensor]],
+        *,
+        ocrTexts: Optional[List[str]] = None,
+        ocrItems: Optional[List[Dict[str, Any]]] = None,
+        resizeMeta: Optional[DataResizeMeta] = None,
+        title: str = "",
+        extraLines: Optional[List[str]] = None,
+        drawBoxes: bool = True,) -> Dict[str, Any]:
+        updated_at = time.time()
+        clean_texts = [str(text).strip() for text in (ocrTexts or []) if str(text).strip() != ""]
+        restored_items = self.RestoreOcrItemsToOriginal(ocrItems, resizeMeta)
+
+        if image is None:
+            payload = self.controller.EmptyVisualStatus()
+            payload["text"] = self.FormatVisualText(title, clean_texts, extraLines)
+            payload["ocr_texts"] = clean_texts
+            payload["items"] = restored_items
+            payload["updated_at"] = updated_at
+            return payload
+
+        bitmap_rgb = self.DrawBoxesOnImage(
+            image,
+            restored_items if drawBoxes else None)
+
+        return {
+            "bitmap": bitmap_rgb.tolist(),
+            "text": self.FormatVisualText(title, clean_texts, extraLines),
+            "ocr_texts": clean_texts,
+            "items": restored_items,
+            "updated_at": updated_at,}
 
     def SaveModuleParameters(self, brain: BrainCore, path: str) -> None:
         out_path = Path(path)
@@ -441,9 +780,7 @@ class ManagerFunction:
         try:
             torch.autograd.set_detect_anomaly(True)
 
-            self.controller.stop_requested = False
-            self.controller.pause_requested = False
-            self.controller.reset_hebbian = False
+            self.ResetControllerFlags()
 
             if not trainDetection and not trainRecognition:
                 raise ValueError("OCRTrainLoop requires trainDetection or trainRecognition to be True")
@@ -500,49 +837,35 @@ class ManagerFunction:
                     ckptPath,
                     allowOptimizerMismatch=True)
 
-            if train_ds is None:
-                n_total = len(ds)
-                n_test = int(n_total * testSplit)
-                n_val = int(n_total * valSplit)
-                n_train = n_total - n_val - n_test
-                train_ds, val_ds, test_ds = torch.utils.data.random_split(
-                    ds, [n_train, n_val, n_test])
-            elif test_ds is None:
-                train_indices = list(train_ds.indices) if hasattr(train_ds, "indices") else list(range(len(train_ds)))
-                val_indices = list(val_ds.indices) if hasattr(val_ds, "indices") else []
-                used = set(train_indices) | set(val_indices)
-                test_indices = [idx for idx in range(len(ds)) if idx not in used]
-                test_ds = torch.utils.data.Subset(ds, test_indices) if len(test_indices) > 0 else val_ds
+            train_ds, val_ds, test_ds = self.SplitDataset(
+                ds,
+                valSplit=valSplit,
+                testSplit=testSplit,
+                trainDataset=train_ds,
+                valDataset=val_ds,
+                testDataset=test_ds)
 
             def collate_ocr_batch(batch):
                 imgs, boxes, texts, ignore_flags = zip(*batch)
                 return list(imgs), list(boxes), list(texts), list(ignore_flags)
 
-            pin_memory = bool(getattr(self.device, "type", "") == "cuda")
-
-            train_dl = DataLoader(
+            train_dl = self.CreateDataLoader(
                 train_ds,
-                batch_size=batchSize,
+                batchSize=batchSize,
                 shuffle=True,
-                num_workers=0,
-                pin_memory=pin_memory,
-                collate_fn=collate_ocr_batch,)
+                collateFn=collate_ocr_batch)
 
-            val_dl = DataLoader(
+            val_dl = self.CreateDataLoader(
                 val_ds,
-                batch_size=batchSize,
+                batchSize=batchSize,
                 shuffle=False,
-                num_workers=0,
-                pin_memory=pin_memory,
-                collate_fn=collate_ocr_batch,)
+                collateFn=collate_ocr_batch)
 
-            test_dl = DataLoader(
+            test_dl = self.CreateDataLoader(
                 test_ds,
-                batch_size=batchSize,
+                batchSize=batchSize,
                 shuffle=False,
-                num_workers=0,
-                pin_memory=pin_memory,
-                collate_fn=collate_ocr_batch,)
+                collateFn=collate_ocr_batch)
 
             patience = 5
             min_delta = 1e-4
@@ -622,16 +945,15 @@ class ManagerFunction:
                 epoch=start_epoch,
                 total_epochs=epochs,
                 batch=0,
-                total_batches=len(train_dl),)
+                total_batches=len(train_dl),
+                visual=self.controller.EmptyVisualStatus(touch=True),)
 
             for ep in range(start_epoch, epochs):
                 if self.controller.ShouldStop():
                     self.controller.SetStatus("stopped", "OCR training stopped")
                     break
 
-                while self.controller.ShouldPause():
-                    self.controller.SetStatus("paused", "OCR training paused")
-                    time.sleep(0.2)
+                self.WaitWhilePaused("OCR training paused")
 
                 engine.train()
                 epoch_loss = 0.0
@@ -642,6 +964,7 @@ class ManagerFunction:
                     sample_losses: List[torch.Tensor] = []
                     batch_correct = 0
                     batch_elems = 0
+                    latest_visual = None
 
                     for img, boxes, texts, ignore_flags in zip(imgs_b, boxes_b, texts_b, ignore_b):
                         sample: Dict[str, Any] = DataPreprocessor.PrepareOCRSample(
@@ -656,9 +979,9 @@ class ManagerFunction:
                             device=self.device,)
 
                         zero = sample["detect_img"].new_zeros(())
+                        detect_img = sample["detect_img"].unsqueeze(0) # [1, 3, H, W]
                         det_loss = zero
                         if trainDetection:
-                            detect_img = sample["detect_img"].unsqueeze(0) # [1, 3, H, W]
                             gt_shrink = sample["gt_shrink"].unsqueeze(0) # [1, 1, H, W]
                             gt_thresh = sample["gt_thresh"].unsqueeze(0) # [1, 1, H, W]
                             gt_mask = sample["gt_mask"].unsqueeze(0) # [1, 1, H, W]
@@ -692,9 +1015,31 @@ class ManagerFunction:
                                 batch_correct += sum(int(pred == target) for pred, target in zip(pred_texts, norm_texts))
                                 batch_elems += len(norm_texts)
 
+                        pred_ocr_items: List[Dict[str, Any]] = []
+                        pred_ocr_texts: List[str] = []
+                        with torch.no_grad():
+                            pred_ocr_batch = engine(detect_img.detach())
+                            if pred_ocr_batch:
+                                pred_ocr_items = pred_ocr_batch[0]
+                            pred_ocr_texts = [
+                                str(item.get("text", "")).strip()
+                                for item in pred_ocr_items
+                                if str(item.get("text", "")).strip() != ""]
+
+                        if self.controller.IsVisualStateEnabled():
+                            latest_visual = self.BuildVisualPayload(
+                                img,
+                                ocrTexts=pred_ocr_texts,
+                                ocrItems=pred_ocr_items,
+                                resizeMeta=sample["resize_meta"],
+                                title="OCR Train",
+                                extraLines=[
+                                    f"epoch {ep + 1}/{epochs}",
+                                    f"batch {bi}/{len(train_dl)}"],)
+
                         sample_losses.append(det_loss + rec_loss)
 
-                    if len(sample_losses) == 0:
+                    if not sample_losses:
                         continue
 
                     loss = torch.stack(sample_losses).mean() # []
@@ -708,23 +1053,26 @@ class ManagerFunction:
                     epoch_loss += float(loss.item())
                     nb += 1
 
+                    status_kwargs = {
+                        "epoch": ep + 1,
+                        "total_epochs": epochs,
+                        "batch": bi,
+                        "total_batches": len(train_dl),
+                        "train_loss": float(loss.item()),}
+                    if latest_visual is not None:
+                        status_kwargs["visual"] = latest_visual
+
                     self.controller.SetStatus(
                         "training",(
                             f"OCR training... rec_acc={rec_acc:.3f}"
                             if trainRecognition else
                             "OCR training..."),
-                        epoch=ep + 1,
-                        total_epochs=epochs,
-                        batch=bi,
-                        total_batches=len(train_dl),
-                        train_loss=float(loss.item()),)
+                        **status_kwargs)
 
                     if self.controller.ShouldStop():
                         break
 
-                    while self.controller.ShouldPause():
-                        self.controller.SetStatus("paused", "OCR training paused")
-                        time.sleep(0.2)
+                    self.WaitWhilePaused("OCR training paused")
 
                 avg_train = epoch_loss / max(1, nb)
                 avg_val, val_acc = eval_split(val_dl)
@@ -793,9 +1141,7 @@ class ManagerFunction:
         try:
             torch.autograd.set_detect_anomaly(True)
 
-            self.controller.stop_requested = False
-            self.controller.pause_requested = False
-            self.controller.reset_hebbian = False
+            self.ResetControllerFlags()
 
             ds = OfflineOCRRecognitionDataset(isTest=isTest)
             engine = OCREngineExtractor().to(self.device)
@@ -817,48 +1163,35 @@ class ManagerFunction:
                 start_epoch, best_val, train_ds, val_ds, test_ds = self.LoadOCRRecognizerCheckpoint(
                     engine, optimizer, ds, ckptPath)
 
-            if train_ds is None:
-                n_total = len(ds)
-                n_test = int(n_total * testSplit)
-                n_val = int(n_total * valSplit)
-                n_train = n_total - n_val - n_test
-                train_ds, val_ds, test_ds = torch.utils.data.random_split(
-                    ds, [n_train, n_val, n_test])
-            elif test_ds is None:
-                train_indices = list(train_ds.indices) if hasattr(train_ds, "indices") else list(range(len(train_ds)))
-                val_indices = list(val_ds.indices) if hasattr(val_ds, "indices") else []
-                used = set(train_indices) | set(val_indices)
-                test_indices = [idx for idx in range(len(ds)) if idx not in used]
-                test_ds = torch.utils.data.Subset(ds, test_indices) if len(test_indices) > 0 else val_ds
+            train_ds, val_ds, test_ds = self.SplitDataset(
+                ds,
+                valSplit=valSplit,
+                testSplit=testSplit,
+                trainDataset=train_ds,
+                valDataset=val_ds,
+                testDataset=test_ds)
 
             def collate_rec_batch(batch):
                 imgs, texts, ignore_flags = zip(*batch)
                 return list(imgs), list(texts), list(ignore_flags)
 
-            pin_memory = bool(getattr(self.device, "type", "") == "cuda")
-            train_dl = DataLoader(
+            train_dl = self.CreateDataLoader(
                 train_ds,
-                batch_size=batchSize,
+                batchSize=batchSize,
                 shuffle=True,
-                num_workers=0,
-                pin_memory=pin_memory,
-                collate_fn=collate_rec_batch,)
+                collateFn=collate_rec_batch)
 
-            val_dl = DataLoader(
+            val_dl = self.CreateDataLoader(
                 val_ds,
-                batch_size=batchSize,
+                batchSize=batchSize,
                 shuffle=False,
-                num_workers=0,
-                pin_memory=pin_memory,
-                collate_fn=collate_rec_batch,)
+                collateFn=collate_rec_batch)
 
-            test_dl = DataLoader(
+            test_dl = self.CreateDataLoader(
                 test_ds,
-                batch_size=batchSize,
+                batchSize=batchSize,
                 shuffle=False,
-                num_workers=0,
-                pin_memory=pin_memory,
-                collate_fn=collate_rec_batch,)
+                collateFn=collate_rec_batch)
 
             patience = 5
             min_delta = 1e-4
@@ -916,16 +1249,15 @@ class ManagerFunction:
                 epoch=start_epoch,
                 total_epochs=epochs,
                 batch=0,
-                total_batches=len(train_dl),)
+                total_batches=len(train_dl),
+                visual=self.controller.EmptyVisualStatus(touch=True),)
 
             for ep in range(start_epoch, epochs):
                 if self.controller.ShouldStop():
                     self.controller.SetStatus("stopped", "OCR recognizer training stopped")
                     break
 
-                while self.controller.ShouldPause():
-                    self.controller.SetStatus("paused", "OCR recognizer training paused")
-                    time.sleep(0.2)
+                self.WaitWhilePaused("OCR recognizer training paused")
 
                 engine.train()
                 epoch_loss = 0.0
@@ -936,6 +1268,7 @@ class ManagerFunction:
                     sample_losses: List[torch.Tensor] = []
                     batch_correct = 0
                     batch_elems = 0
+                    latest_visual = None
 
                     for img, text, ignore_flag in zip(imgs_b, texts_b, ignore_b):
                         sample = DataPreprocessor.PrepareOCRRecognitionSample(
@@ -969,9 +1302,19 @@ class ManagerFunction:
                             batch_correct += int(pred_text == norm_text)
                             batch_elems += 1
 
+                        if self.controller.IsVisualStateEnabled():
+                            latest_visual = self.BuildVisualPayload(
+                                img,
+                                ocrTexts=([pred_text] if pred_text != "" else []),
+                                title="OCR Recognition Train",
+                                extraLines=[
+                                    f"epoch {ep + 1}/{epochs}",
+                                    f"batch {bi}/{len(train_dl)}"],
+                                drawBoxes=False,)
+
                         sample_losses.append(rec_loss)
 
-                    if len(sample_losses) == 0:
+                    if not sample_losses:
                         continue
 
                     loss = torch.stack(sample_losses).mean() # []
@@ -985,21 +1328,24 @@ class ManagerFunction:
                     epoch_loss += float(loss.item())
                     nb += 1
 
+                    status_kwargs = {
+                        "epoch": ep + 1,
+                        "total_epochs": epochs,
+                        "batch": bi,
+                        "total_batches": len(train_dl),
+                        "train_loss": float(loss.item()),}
+                    if latest_visual is not None:
+                        status_kwargs["visual"] = latest_visual
+
                     self.controller.SetStatus(
                         "training",
                         f"OCR recognizer training... acc={rec_acc:.3f}",
-                        epoch=ep + 1,
-                        total_epochs=epochs,
-                        batch=bi,
-                        total_batches=len(train_dl),
-                        train_loss=float(loss.item()),)
+                        **status_kwargs)
 
                     if self.controller.ShouldStop():
                         break
 
-                    while self.controller.ShouldPause():
-                        self.controller.SetStatus("paused", "OCR recognizer training paused")
-                        time.sleep(0.2)
+                    self.WaitWhilePaused("OCR recognizer training paused")
 
                 avg_train = epoch_loss / max(1, nb)
                 avg_val, val_acc = eval_split(val_dl)
@@ -1063,9 +1409,7 @@ class ManagerFunction:
             ckptPath = ckptPath or BasicParameters.CKPT_PATH_TRAIN
             outPath = outPath or (BasicParameters.MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.MODULEPARAMETER_PATH)
 
-            self.controller.stop_requested = False
-            self.controller.pause_requested = False
-            self.controller.reset_hebbian = False
+            self.ResetControllerFlags()
 
             ds = OfflineGameDataset(isTest=isTest)
 
@@ -1078,30 +1422,36 @@ class ManagerFunction:
 
             start_epoch = 0
             best_val = float("inf")
-            train_ds, val_ds = None, None
+            train_ds = val_ds = test_ds = None
 
             testSplit = 0.1
 
             if resume and Path(ckptPath).exists():
                 start_epoch, best_val, train_ds, val_ds = self.LoadCheckpoint(brain, agent, ds, ckptPath)
 
-            if train_ds is None:
-                n_total = len(ds)
-                n_test = int(n_total * testSplit)
-                n_val = int(n_total * valSplit)
-                n_train = n_total - n_val - n_test
-                train_ds, val_ds, test_ds = torch.utils.data.random_split(
-                    ds, [n_train, n_val, n_test])
-            else:
-                train_indices = list(train_ds.indices) if hasattr(train_ds, "indices") else list(range(len(train_ds)))
-                val_indices = list(val_ds.indices) if hasattr(val_ds, "indices") else []
-                used = set(train_indices) | set(val_indices)
-                test_indices = [idx for idx in range(len(ds)) if idx not in used]
-                test_ds = torch.utils.data.Subset(ds, test_indices) if len(test_indices) > 0 else val_ds
+            train_ds, val_ds, test_ds = self.SplitDataset(
+                ds,
+                valSplit=valSplit,
+                testSplit=testSplit,
+                trainDataset=train_ds,
+                valDataset=val_ds,
+                testDataset=test_ds)
 
-            train_dl = DataLoader(train_ds, batch_size=batchSize, shuffle=False, num_workers=0, pin_memory=True,)
-            val_dl = DataLoader(val_ds, batch_size=batchSize, shuffle=False, num_workers=0)
-            test_dl = DataLoader(test_ds, batch_size=batchSize, shuffle=False, num_workers=0)
+            train_dl = self.CreateDataLoader(
+                train_ds,
+                batchSize=batchSize,
+                shuffle=False,
+                pinMemory=True)
+            val_dl = self.CreateDataLoader(
+                val_ds,
+                batchSize=batchSize,
+                shuffle=False,
+                pinMemory=False)
+            test_dl = self.CreateDataLoader(
+                test_ds,
+                batchSize=batchSize,
+                shuffle=False,
+                pinMemory=False)
 
             mse = nn.MSELoss()
 
@@ -1151,16 +1501,14 @@ class ManagerFunction:
 
                 return cur_loss, total_correct, total_elems
 
-            self.controller.SetStatus("training", "Training started", epoch=start_epoch, total_epochs=epochs, batch=0, total_batches=len(train_dl),)
+            self.controller.SetStatus("training", "Training started", epoch=start_epoch, total_epochs=epochs, batch=0, total_batches=len(train_dl), visual=self.controller.EmptyVisualStatus(touch=True),)
 
             for ep in range(start_epoch, epochs):
                 if self.controller.ShouldStop():
                     self.controller.SetStatus("stopped", "Training stopped")
                     break
 
-                while self.controller.ShouldPause():
-                    self.controller.SetStatus("paused", "Training paused")
-                    time.sleep(0.2)
+                self.WaitWhilePaused("Training paused")
 
                 brain.train()
                 epoch_loss = 0.0
@@ -1171,16 +1519,20 @@ class ManagerFunction:
                 for bi, batch in enumerate(train_dl, start=1):
                     img_b, key_b, mouse_click_b, mouse_move_b, reward_b, done_b, ext_text_b = unpack_batch(batch)
 
-                    pack = agent.ConvertNpImagesKeysMouses(
+                    visual_enabled = self.controller.IsVisualStateEnabled()
+                    pack = DataPreprocessor.ConvertNpImagesKeysMouses(
                         imgs=img_b,
                         keys=key_b,
                         mouseClick=mouse_click_b,
                         mouseMove=mouse_move_b,
                         reward=reward_b,
                         done=done_b,
-                        device=self.device,)
+                        device=self.device,
+                        needVisualState=visual_enabled,)
                     
                     frames = pack["frames"]
+                    original_images = pack["original_images"]
+                    resize_meta = pack["resize_meta"]
                     keys_t = pack["keys"]
                     mouse_click_t = pack["mouse_clicks"]
                     mouse_move_t = pack["mouse_moves"]
@@ -1202,7 +1554,7 @@ class ManagerFunction:
                     if act_out is None:
                         continue
 
-                    key_pred, click_pred, mouse_move_pred, model_loss = act_out
+                    key_pred, click_pred, mouse_move_pred, model_loss, ocr_items = act_out
                     bc_loss, _, _ = compute_supervised_loss_and_metrics(
                         key_pred,
                         click_pred,
@@ -1239,13 +1591,38 @@ class ManagerFunction:
                     epoch_loss += float(loss.item())
                     nb += 1
 
-                    self.controller.SetStatus("training", "Training...", epoch=ep + 1, total_epochs=epochs, batch=bi, total_batches=len(train_dl), train_loss=float(loss.item()),)
+                    visual_payload = None
+                    if visual_enabled and original_images:
+                        batch_ocr_items = (ocr_items[0] if (ocr_items is not None and len(ocr_items) > 0) else [])
+                        batch_ocr_texts = [
+                            str(item.get("text", "")).strip()
+                            for item in batch_ocr_items
+                            if str(item.get("text", "")).strip() != ""]
+                        resize_meta_0 = resize_meta[0] if resize_meta else None
+                        visual_payload = self.BuildVisualPayload(
+                            original_images[0],
+                            ocrTexts=batch_ocr_texts,
+                            ocrItems=batch_ocr_items,
+                            resizeMeta=resize_meta_0,
+                            title="Train",
+                            extraLines=[
+                                f"epoch {ep + 1}/{epochs}",
+                                f"batch {bi}/{len(train_dl)}"],)
+
+                    status_kwargs = {
+                        "epoch": ep + 1,
+                        "total_epochs": epochs,
+                        "batch": bi,
+                        "total_batches": len(train_dl),
+                        "train_loss": float(loss.item()),}
+                    if visual_payload is not None:
+                        status_kwargs["visual"] = visual_payload
+
+                    self.controller.SetStatus("training", "Training...", **status_kwargs)
 
                     if self.controller.ShouldStop():
                         break
-                    while self.controller.ShouldPause():
-                        self.controller.SetStatus("paused", "Training paused")
-                        time.sleep(0.2)
+                    self.WaitWhilePaused("Training paused")
 
                 avg_train = epoch_loss / max(1, nb)
 
@@ -1266,14 +1643,15 @@ class ManagerFunction:
                         for batch in dl:
                             img_b, key_b, mouse_click_b, mouse_move_b, reward_b, done_b, ext_text_b = unpack_batch(batch)
 
-                            v_pack = agent.ConvertNpImagesKeysMouses(
+                            v_pack = DataPreprocessor.ConvertNpImagesKeysMouses(
                                 imgs=img_b,
                                 keys=key_b,
                                 mouseClick=mouse_click_b,
                                 mouseMove=mouse_move_b,
                                 reward=reward_b,
                                 done=done_b,
-                                device=self.device,)
+                                device=self.device,
+                                needVisualState=False,)
                             
                             v_frames = v_pack["frames"]
                             v_keys_t = v_pack["keys"]
@@ -1293,7 +1671,7 @@ class ManagerFunction:
                             if act_out is None:
                                 continue
 
-                            v_key_pred, v_click_pred, v_mouse_move_pred, v_model_loss = act_out
+                            v_key_pred, v_click_pred, v_mouse_move_pred, v_model_loss, ocr_items = act_out
                             bc_loss, correct, elems = compute_supervised_loss_and_metrics(
                                 v_key_pred,
                                 v_click_pred,
@@ -1436,18 +1814,16 @@ class ManagerFunction:
         return start_epoch, best_val, train_ds, val_ds
 
     def StartDeployment(self, cameraIndex: int = 0, useHebbian: bool = True, usePlanner: bool = True):
-        if self.is_begin:
-            self.controller.SetStatus("recur", "Training or Deploy is already running")
-            return False
-        self.is_begin = True
-        self.controller.stop_requested = False 
-        self.br_thread = threading.Thread(target=self.DeployLoop,args=(cameraIndex,),kwargs={"useHebbian": useHebbian, "usePlanner": usePlanner},daemon=False,)
-        self.br_thread.start()
-        return True
+        return self.StartBackgroundTask(
+            self.DeployLoop,
+            args=(cameraIndex,),
+            kwargs={"useHebbian": useHebbian, "usePlanner": usePlanner,})
 
 
     def DeployLoop(self, cameraIndex: int,* ,useHebbian: bool = True, usePlanner: bool = True,):
         try:
+            self.ResetControllerFlags()
+
             brain = BrainCore(device=self.device,plasticHebbian=useHebbian,plasticOnlineLearning=False,usePlanner=usePlanner,)
 
             model_path = BasicParameters.MODULEPARAMETER_PATH
@@ -1479,7 +1855,7 @@ class ManagerFunction:
             if iio is None:
                 raise RuntimeError("imageio.v3 cant use")
 
-            self.controller.SetStatus("is_begin", "Deployment started")
+            self.controller.SetStatus("is_begin", "Deployment started", visual=self.controller.EmptyVisualStatus(touch=True))
 
             code_to_name: dict[int, str] = {}
             all_codes = []
@@ -1493,16 +1869,20 @@ class ManagerFunction:
                     if self.controller.ShouldStop():
                         break
 
-                    pack = agent.ConvertNpImagesKeysMouses(
+                    visual_enabled = self.controller.IsVisualStateEnabled()
+                    pack = DataPreprocessor.ConvertNpImagesKeysMouses(
                         imgs=frame_np,
                         keys=None,
                         mouseClick=None,
                         mouseMove=None,
                         reward=None,
                         done=None,
-                        device=self.device,)
+                        device=self.device,
+                        needVisualState=visual_enabled,)
                     
                     frames = pack["frames"]
+                    original_images = pack["original_images"]
+                    resize_meta = pack["resize_meta"]
 
                     if self.controller.ShouldResetHebbian():
                         agent.ResetHebbianMemory()
@@ -1517,7 +1897,7 @@ class ManagerFunction:
                     if act_out is None:
                         continue
 
-                    keys, clicks, mouse = act_out
+                    keys, clicks, mouse, ocr_items = act_out
 
                     kv = keys[0].detach().cpu()
                     ck = clicks[0].detach().cpu()
@@ -1536,7 +1916,29 @@ class ManagerFunction:
 
                     names_str = "[" + ", ".join(pressed_names) + "]" if pressed_names else "[]"
 
-                    self.controller.SetStatus("is_begin",(f"keys:{names_str} "f"mouse:dx={float(ms[0]):.3f},dy={float(ms[1]):.3f}"),)
+                    deploy_items = (ocr_items[0] if (ocr_items is not None and len(ocr_items) > 0) else [])
+                    deploy_texts = [
+                        str(item.get("text", "")).strip()
+                        for item in deploy_items
+                        if str(item.get("text", "")).strip() != ""]
+                    resize_meta_0 = resize_meta[0] if resize_meta else None
+                    visual_payload = None
+                    if visual_enabled and original_images:
+                        visual_payload = self.BuildVisualPayload(
+                            original_images[0],
+                            ocrTexts=deploy_texts,
+                            ocrItems=deploy_items,
+                            resizeMeta=resize_meta_0,
+                            title="Deploy",
+                            extraLines=[
+                                f"keys:{names_str}",
+                                f"mouse:dx={float(ms[0]):.3f},dy={float(ms[1]):.3f}"],)
+
+                    status_kwargs = {}
+                    if visual_payload is not None:
+                        status_kwargs["visual"] = visual_payload
+
+                    self.controller.SetStatus("is_begin",(f"keys:{names_str} "f"mouse:dx={float(ms[0]):.3f},dy={float(ms[1]):.3f}"), **status_kwargs)
 
             self.controller.SetStatus("stopped", "Deployment stopped")
 
@@ -1549,91 +1951,52 @@ class ManagerFunction:
 
 
     def TestPerceptionModule(self):
-        t = self.test["perception"]
-        return t.RunAll()
+        return self.RunNamedTest("perception")
 
     def TestAttentionModule(self):
-        t = self.test["attention"]
-        return t.RunAll()
+        return self.RunNamedTest("attention")
 
     def TestMemoryModule(self):
-        t = self.test["memory"]
-        return t.RunAll()
+        return self.RunNamedTest("memory")
 
     def TestDecisionModule(self):
-        t = self.test["decision"]
-        return t.RunAll()
+        return self.RunNamedTest("decision")
 
     def TestWorldModule(self):
-        t = self.test["world"]
-        return t.RunAll()
+        return self.RunNamedTest("world")
 
     def TestValueEstimationModule(self):
-        t = self.test["value"]
-        return t.RunAll()
+        return self.RunNamedTest("value")
     
     def TestConsciousnessModule(self):
-        t = self.test["consciousness"]
-        return t.RunAll()
+        return self.RunNamedTest("consciousness")
     
     def TestIntentionModule(self):
-        t = self.test["intention"]
-        return t.RunAll()
+        return self.RunNamedTest("intention")
     
     def TestOCRModule(self):
-        t = self.test["OCR"]
-        return t.RunAll()
+        return self.RunNamedTest("OCR")
     
 
     def MonitorTraining(self):
-        try:
-            while True:
-                st = self.GetCurrentStatus()
-                print(
-                    f"[TRAIN] {st['state']} | epoch {st['epoch']}/{st['total_epochs']} "
-                    f"| batch {st['batch']}/{st['total_batches']} "
-                    f"| train_loss={st['train_loss']:.4f} | msg={st['message']}")
-
-                if st["state"] == "error":
-                    trace = st.get("trace")
-                    if trace:
-                        print("\n====== TRAIN ERROR TRACEBACK ======\n")
-                        print(trace)
-                        print("===================================\n")
-
-                if st["state"] in ("completed", "stopped", "error"):
-                    self.controller.ResteStatus()
-                    break
-
-                time.sleep(1)
-
-        except Exception as e:
-            print(f"[MonitorTraining] monitor raised: {e}")
-            print(traceback.format_exc())
+        self.MonitorStatus(
+            prefix="TRAIN",
+            monitorName="MonitorTraining",
+            renderStatus=lambda st: (
+                f"{st['state']} | epoch {st['epoch']}/{st['total_epochs']} "
+                f"| batch {st['batch']}/{st['total_batches']} "
+                f"| train_loss={st['train_loss']:.4f} | msg={st['message']}"),
+            terminalStates=("completed", "stopped", "error"),
+            sleepSeconds=1.0,)
 
 
     def MonitorDeployment(self):
-        try:
-            while True:
-                st = self.GetCurrentStatus()
-                print(f"[DEPLOY] {st['state']} | msg={st['message']}")
-
-                if st["state"] == "error":
-                    trace = st.get("trace")
-                    if trace:
-                        print("\n====== DEPLOY ERROR TRACEBACK ======\n")
-                        print(trace)
-                        print("====================================\n")
-
-                if st["state"] in ("stopped", "error"):
-                    self.controller.ResteStatus()
-                    break
-
-                time.sleep(0.5)
-
-        except Exception as e:
-            print(f"[MonitorDeployment] monitor raised: {e}")
-            print(traceback.format_exc())
+        self.MonitorStatus(
+            prefix="DEPLOY",
+            monitorName="MonitorDeployment",
+            renderStatus=lambda st: f"{st['state']} | msg={st['message']}",
+            terminalStates=("stopped", "error"),
+            sleepSeconds=0.5,)
 
 
     def TestModuleTrain(
@@ -1650,65 +2013,70 @@ class ManagerFunction:
             return {"False": False, "msg": "StartTraining returns False (training may already be running)"} 
 
         try:
-            if iio is None:
-                raise RuntimeError("imageio.v3 error")
-
-            rng = np.random.default_rng(seed)
             root = Path(dataRoot)
             BasicParameters.Set("DATA_ROOT_PATH_TEST", str(root))
-            if root.exists():
-                shutil.rmtree(root)
-            (root / "frames").mkdir(parents=True, exist_ok=True)
-            (root / "keys").mkdir(parents=True, exist_ok=True)
-            (root / "mouse_click").mkdir(parents=True, exist_ok=True)
-            (root / "mouse_move").mkdir(parents=True, exist_ok=True)
-            (root / "reward").mkdir(parents=True, exist_ok=True)
-            (root / "done").mkdir(parents=True, exist_ok=True)
-            (root / "texts").mkdir(parents=True, exist_ok=True)
 
-            all_codes = list(RAW_KEYBOARD_LAYOUT.values())
-            max_code = max(all_codes)
-            keys_dim = max_code + 1
+            if not self.HasGameDataset(root):
+                if iio is None:
+                    raise RuntimeError("imageio.v3 error")
 
-            H, W = BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE
+                rng = np.random.default_rng(seed)
+                if root.exists():
+                    shutil.rmtree(root)
+                (root / "frames").mkdir(parents=True, exist_ok=True)
+                (root / "keys").mkdir(parents=True, exist_ok=True)
+                (root / "mouse_click").mkdir(parents=True, exist_ok=True)
+                (root / "mouse_move").mkdir(parents=True, exist_ok=True)
+                (root / "reward").mkdir(parents=True, exist_ok=True)
+                (root / "done").mkdir(parents=True, exist_ok=True)
+                (root / "texts").mkdir(parents=True, exist_ok=True)
 
-            templates = ["move left", "move right", "move forward", "move back",
-                        "use skill", "defend", "attack", "pickup item",
-                        "open menu", "retreat",]
+                all_codes = list(RAW_KEYBOARD_LAYOUT.values())
+                max_code = max(all_codes)
+                keys_dim = max_code + 1
 
-            for i in range(nSamples):
-                img = rng.integers(0, 256, size=(H, W, 3), dtype=np.uint8)
-                iio.imwrite(str(root / "frames" / f"{i:05d}.png"), img)
+                H, W = BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE
 
-                keys = np.zeros((keys_dim,), dtype=np.float32)
-                for code in all_codes:
-                    keys[code] = 1.0 if rng.random() < 0.05 else 0.0
+                templates = ["move left", "move right", "move forward", "move back",
+                            "use skill", "defend", "attack", "pickup item",
+                            "open menu", "retreat",]
 
-                np.save(str(root / "keys" / f"{i:05d}.npy"), keys)
+                for i in range(nSamples):
+                    img = rng.integers(0, 256, size=(H, W, 3), dtype=np.uint8)
+                    iio.imwrite(str(root / "frames" / f"{i:05d}.png"), img)
 
-                mouse_click = np.zeros((2,), dtype=np.float32)
-                mouse_click[0] = 1.0 if rng.random() < 0.15 else 0.0
-                mouse_click[1] = 1.0 if rng.random() < 0.05 else 0.0
-                np.save(str(root / "mouse_click" / f"{i:05d}.npy"), mouse_click)
+                    keys = np.zeros((keys_dim,), dtype=np.float32)
+                    for code in all_codes:
+                        keys[code] = 1.0 if rng.random() < 0.05 else 0.0
 
-                mouse_move = rng.normal(loc=0.0, scale=2.0, size=(2,)).astype(np.float32)
-                np.save(str(root / "mouse_move" / f"{i:05d}.npy"), mouse_move)
+                    np.save(str(root / "keys" / f"{i:05d}.npy"), keys)
 
-                reward = rng.normal(loc=0.0, scale=2.0, size=(1,)).astype(np.float32)
-                np.save(str(root / "reward" / f"{i:05d}.npy"), reward)
+                    mouse_click = np.zeros((2,), dtype=np.float32)
+                    mouse_click[0] = 1.0 if rng.random() < 0.15 else 0.0
+                    mouse_click[1] = 1.0 if rng.random() < 0.05 else 0.0
+                    np.save(str(root / "mouse_click" / f"{i:05d}.npy"), mouse_click)
 
-                done = rng.normal(loc=0.0, scale=2.0, size=(1,)).astype(np.float32)
-                np.save(str(root / "done" / f"{i:05d}.npy"), done)
+                    mouse_move = rng.normal(loc=0.0, scale=2.0, size=(2,)).astype(np.float32)
+                    np.save(str(root / "mouse_move" / f"{i:05d}.npy"), mouse_move)
 
+                    reward = rng.normal(loc=0.0, scale=2.0, size=(1,)).astype(np.float32)
+                    np.save(str(root / "reward" / f"{i:05d}.npy"), reward)
 
-                if rng.random() < 0.35:
-                    ext_text = ""
-                else:
-                    n_words = int(rng.integers(1, 4)) 
-                    picks = rng.choice(templates, size=n_words, replace=False).tolist()
-                    ext_text = " | ".join(picks)
-                with open(root / "texts" / f"{i:05d}.txt", "w", encoding="utf-8") as f:
-                    f.write(ext_text)
+                    done = rng.normal(loc=0.0, scale=2.0, size=(1,)).astype(np.float32)
+                    np.save(str(root / "done" / f"{i:05d}.npy"), done)
+
+                    if rng.random() < 0.35:
+                        ext_text = ""
+                    else:
+                        n_words = int(rng.integers(1, 4))
+                        picks = rng.choice(templates, size=n_words, replace=False).tolist()
+                        ext_text = " | ".join(picks)
+                    with open(root / "texts" / f"{i:05d}.txt", "w", encoding="utf-8") as f:
+                        f.write(ext_text)
+
+                print(f"[SmokeTest] created random game dataset at: {root}")
+            else:
+                print(f"[SmokeTest] use existing game dataset at: {root}")
 
             print("[SmokeTest] start train...")
 
@@ -1750,18 +2118,7 @@ class ManagerFunction:
             frames_dir = root / "frames"
             ocr_texts_dir = root / "OCRTexts"
 
-            def has_existing_ocr_data(p: Path) -> bool:
-                texts_dir = p / "OCRTexts"
-                return (
-                    (p / "frames").exists()
-                    and texts_dir.exists()
-                    and any((p / "frames").glob("*.png"))
-                    and any(texts_dir.glob("*.txt"))
-                    and (
-                        any((p / "boxes").glob("*.npy"))
-                        or any(DataPreprocessor.TextFileLooksLikeOCRAnnotations(tp) for tp in texts_dir.glob("*.txt"))))
-
-            if not has_existing_ocr_data(root):
+            if not self.HasOcrDataset(root):
                 if iio is None:
                     raise RuntimeError("imageio.v3 error")
 
@@ -1864,8 +2221,7 @@ class ManagerFunction:
                 print("StartOCRTraining returns False (training may already be running)")
                 return {"ok": False, "msg": "already_running"}
 
-            self.message_thread = threading.Thread(target=self.MonitorTraining, args=(), daemon=False)
-            self.message_thread.start()
+            self.StartMessageMonitor(self.MonitorTraining)
 
             return {"ok": True}
 
@@ -1893,14 +2249,7 @@ class ManagerFunction:
             frames_dir = root / "frames"
             texts_dir = root / "OCRTexts"
 
-            def has_existing_rec_data(p: Path) -> bool:
-                return (
-                    (p / "frames").exists()
-                    and (p / "OCRTexts").exists()
-                    and any((p / "frames").glob("*.png"))
-                    and any((p / "OCRTexts").glob("*.txt")))
-
-            if not has_existing_rec_data(root):
+            if not self.HasOcrRecognitionDataset(root):
                 if iio is None:
                     raise RuntimeError("imageio.v3 error")
 
@@ -1980,8 +2329,7 @@ class ManagerFunction:
                 print("StartOCRRecognitionTraining returns False (training may already be running)")
                 return {"ok": False, "msg": "already_running"}
 
-            self.message_thread = threading.Thread(target=self.MonitorTraining, args=(), daemon=False)
-            self.message_thread.start()
+            self.StartMessageMonitor(self.MonitorTraining)
 
             return {"ok": True}
 
@@ -2001,29 +2349,18 @@ class ManagerFunction:
         trainDetection: bool = True,
         trainRecognition: bool = True,) -> Dict[str, Any]:
         try:
-            frames_dir = Path(BasicParameters.OCR_FRAMES_PATH)
-            ocr_texts_dir = Path(BasicParameters.OCR_TEXTS_PATH)
-
             if not (trainDetection or trainRecognition):
                 print("[TrainOCR] trainDetection and trainRecognition cannot both be False.")
                 return {"ok": False, "msg": "no_train_target"}
 
+            ocr_texts_dir = Path(BasicParameters.OCR_TEXTS_PATH)
             txt_files = sorted(ocr_texts_dir.glob("*.txt")) if ocr_texts_dir.exists() else []
-            frame_files = sorted(frames_dir.glob("*.png")) if frames_dir.exists() else []
 
-            if not (frames_dir.exists() and ocr_texts_dir.exists()):
+            if not self.HasOcrDataset():
                 print(
-                    "[TrainOCR] no dataset found, please prepare these folders first: "
+                    "[TrainOCR] no valid OCR dataset found, please prepare these folders first: "
                     f"{BasicParameters.OCR_FRAMES_PATH}, "
                     f"{BasicParameters.OCR_TEXTS_PATH}.")
-                return {"ok": False, "msg": "no ocr dataset"}
-
-            if not frame_files or not txt_files:
-                print("[TrainOCR] no OCR samples found in configured OCR folders.")
-                return {"ok": False, "msg": "empty ocr dataset"}
-
-            if len(frame_files) != len(txt_files):
-                print("[TrainOCR] OCR frames and OCRTexts file counts are inconsistent.")
                 return {"ok": False, "msg": "invalid ocr dataset"}
 
             for txt_path in txt_files:
@@ -2033,7 +2370,7 @@ class ManagerFunction:
                     print(f"[TrainOCR] failed to parse OCR annotation file {txt_path}: {e}")
                     return {"ok": False, "msg": "invalid ocr labels"}
 
-                if len(boxes) == 0 or len(texts) == 0 or len(ignore_flags) != len(texts):
+                if not boxes or not texts or len(ignore_flags) != len(texts):
                     print(f"[TrainOCR] OCR annotation file is empty or invalid: {txt_path}")
                     return {"ok": False, "msg": "invalid ocr labels"}
 
@@ -2055,8 +2392,7 @@ class ManagerFunction:
                 print("StartOCRTraining returns False (training may already be running)")
                 return {"ok": False, "msg": "already_running"}
 
-            self.message_thread = threading.Thread(target=self.MonitorTraining, args=(), daemon=False)
-            self.message_thread.start()
+            self.StartMessageMonitor(self.MonitorTraining)
 
             return {"ok": True}
 
@@ -2072,25 +2408,11 @@ class ManagerFunction:
         valSplit: float = 0.2,
         isResume: bool = False,) -> Dict[str, Any]:
         try:
-            frames_dir = Path(BasicParameters.OCR_RECOGNIZER_FRAMES_PATH)
-            texts_dir = Path(BasicParameters.OCR_RECOGNIZER_TEXTS_PATH)
-
-            if not (frames_dir.exists() and texts_dir.exists()):
+            if not self.HasOcrRecognitionDataset():
                 print(
-                    "[TrainOCRRec] no dataset found, please prepare these folders first: "
+                    "[TrainOCRRec] no valid OCR recognition dataset found, please prepare these folders first: "
                     f"{BasicParameters.OCR_RECOGNIZER_FRAMES_PATH}, "
                     f"{BasicParameters.OCR_RECOGNIZER_TEXTS_PATH}.")
-                return {"ok": False, "msg": "no ocr recognition dataset"}
-
-            frame_files = sorted(frames_dir.glob("*.png"))
-            text_files = sorted(texts_dir.glob("*.txt"))
-
-            if not frame_files or not text_files:
-                print("[TrainOCRRec] no OCR recognition samples found in configured OCR recognition folders.")
-                return {"ok": False, "msg": "empty ocr recognition dataset"}
-
-            if len(frame_files) != len(text_files):
-                print("[TrainOCRRec] OCR recognition frames and OCRTexts file counts are inconsistent.")
                 return {"ok": False, "msg": "invalid ocr recognition dataset"}
 
             print(
@@ -2109,8 +2431,7 @@ class ManagerFunction:
                 print("StartOCRRecognitionTraining returns False (training may already be running)")
                 return {"ok": False, "msg": "already_running"}
 
-            self.message_thread = threading.Thread(target=self.MonitorTraining, args=(), daemon=False)
-            self.message_thread.start()
+            self.StartMessageMonitor(self.MonitorTraining)
 
             return {"ok": True}
 
@@ -2128,41 +2449,7 @@ class ManagerFunction:
         valSplit: float = 0.2,
         isResume: bool = False,) -> Dict[str, Any]:
         try:
-            def has_existing_data() -> bool:
-                frames_dir = Path(BasicParameters.DATA_FRAMES_PATH)
-                keys_dir = Path(BasicParameters.DATA_KEYS_PATH)
-                mouse_click_dir = Path(BasicParameters.DATA_MOUSE_CLICK_PATH)
-                mouse_move_dir = Path(BasicParameters.DATA_MOUSE_MOVE_PATH)
-                reward_dir = Path(BasicParameters.DATA_REWARD_PATH)
-                done_dir = Path(BasicParameters.DATA_DONE_PATH)
-                texts_dir = Path(BasicParameters.DATA_TEXTS_PATH)
-
-                if not (frames_dir.exists() and keys_dir.exists() and mouse_click_dir.exists() and mouse_move_dir.exists() and reward_dir.exists() and done_dir.exists()):
-                    return False
-                frame_files = sorted(frames_dir.glob("*.png"))
-                key_files = sorted(keys_dir.glob("*.npy"))
-                mouse_click_files = sorted(mouse_click_dir.glob("*.npy"))
-                mouse_move_files = sorted(mouse_move_dir.glob("*.npy"))
-                reward_files = sorted(reward_dir.glob("*.npy"))
-                done_files = sorted(done_dir.glob("*.npy"))
-                counts = [
-                    len(frame_files),
-                    len(key_files),
-                    len(mouse_click_files),
-                    len(mouse_move_files),
-                    len(reward_files),
-                    len(done_files),]
-                if counts[0] == 0:
-                    return False
-                if len(set(counts)) != 1:
-                    return False
-                if texts_dir.exists():
-                    text_count = len(sorted(texts_dir.glob("*.txt")))
-                    if text_count not in (0, counts[0]):
-                        return False
-                return True
-
-            if not has_existing_data():
+            if not self.HasGameDataset():
                 print(
                     "[Train] no dataset found, please prepare these folders first: "
                     f"{BasicParameters.DATA_FRAMES_PATH}, "
@@ -2188,8 +2475,7 @@ class ManagerFunction:
                 print("StartTraining returns False (training may already be running)")
                 return {"False": False, "msg": "StartTraining returns False (training may already be running)"}
 
-            self.message_thread = threading.Thread(target=self.MonitorTraining,args=(),daemon=False,)
-            self.message_thread.start()
+            self.StartMessageMonitor(self.MonitorTraining)
 
             return {"ok": True}
 
@@ -2211,8 +2497,7 @@ class ManagerFunction:
                 print("StartDeployment returns False (deployment may already be running)")
                 return {"ok": False, "msg": "already_running"}
 
-            self.message_thread = threading.Thread(target=self.MonitorDeployment,args=(),daemon=False,)
-            self.message_thread.start()
+            self.StartMessageMonitor(self.MonitorDeployment)
 
             return {"ok": True}
 

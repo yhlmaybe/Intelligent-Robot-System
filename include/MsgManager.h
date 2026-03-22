@@ -8,7 +8,7 @@
 #include <pugixml.hpp>
 
 
-enum MessageFunction { Default, JointDatas, EndEffectorDatas, BrainDeepLearnFormDatas };
+enum MessageFunction { Default, JointDatas, EndEffectorDatas, BrainDeepLearnFormDatas, VisualFormDatas };
 
 struct ServoMsg
 {

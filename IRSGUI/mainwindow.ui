@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>809</width>
-    <height>535</height>
+    <width>1085</width>
+    <height>899</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -15,61 +15,7 @@
   </property>
   <widget class="QWidget" name="centralWidget">
    <layout class="QGridLayout" name="gridLayout">
-    <item row="0" column="2">
-     <widget class="QPushButton" name="start_Button">
-      <property name="text">
-       <string>Start</string>
-      </property>
-     </widget>
-    </item>
-    <item row="11" column="2">
-     <widget class="QPushButton" name="SetServoNo_Button">
-      <property name="text">
-       <string>SetServoNo</string>
-      </property>
-     </widget>
-    </item>
-    <item row="2" column="1" colspan="2">
-     <widget class="QLabel" name="jointName_label">
-      <property name="text">
-       <string>Joint Name</string>
-      </property>
-      <property name="alignment">
-       <set>Qt::AlignBottom|Qt::AlignHCenter</set>
-      </property>
-     </widget>
-    </item>
-    <item row="5" column="1" colspan="2">
-     <widget class="QLineEdit" name="jointPosition_lineEdit">
-      <property name="sizePolicy">
-       <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
-        <horstretch>0</horstretch>
-        <verstretch>0</verstretch>
-       </sizepolicy>
-      </property>
-     </widget>
-    </item>
     <item row="9" column="1" colspan="2">
-     <widget class="QPushButton" name="setGoalPoint_Button">
-      <property name="sizePolicy">
-       <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
-        <horstretch>0</horstretch>
-        <verstretch>0</verstretch>
-       </sizepolicy>
-      </property>
-      <property name="text">
-       <string>Set Goal Point</string>
-      </property>
-     </widget>
-    </item>
-    <item row="1" column="2">
-     <widget class="QPushButton" name="end_Button">
-      <property name="text">
-       <string>End</string>
-      </property>
-     </widget>
-    </item>
-    <item row="6" column="1" colspan="2">
      <widget class="QPushButton" name="setJointPosition_Button">
       <property name="sizePolicy">
        <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
@@ -82,24 +28,7 @@
       </property>
      </widget>
     </item>
-    <item row="7" column="1" colspan="2">
-     <widget class="QLabel" name="goalPoint_label">
-      <property name="text">
-       <string>Goal Point</string>
-      </property>
-      <property name="alignment">
-       <set>Qt::AlignBottom|Qt::AlignHCenter</set>
-      </property>
-     </widget>
-    </item>
-    <item row="1" column="1">
-     <widget class="QPushButton" name="StateReset_Button">
-      <property name="text">
-       <string>StateReset</string>
-      </property>
-     </widget>
-    </item>
-    <item row="10" column="1">
+    <item row="13" column="1">
      <widget class="QLabel" name="ServoNo_Lable">
       <property name="layoutDirection">
        <enum>Qt::LeftToRight</enum>
@@ -113,7 +42,7 @@
      </widget>
     </item>
     <item row="8" column="1" colspan="2">
-     <widget class="QLineEdit" name="goalPoint_lineEdit">
+     <widget class="QLineEdit" name="jointPosition_lineEdit">
       <property name="sizePolicy">
        <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
         <horstretch>0</horstretch>
@@ -122,28 +51,14 @@
       </property>
      </widget>
     </item>
-    <item row="10" column="2">
-     <widget class="QPushButton" name="GetServoNo_Button">
-      <property name="text">
-       <string>GetServoNo</string>
-      </property>
-     </widget>
-    </item>
-    <item row="0" column="0" rowspan="12">
+    <item row="0" column="0" rowspan="15">
      <widget class="QPlainTextEdit" name="MessageText">
       <property name="readOnly">
        <bool>true</bool>
       </property>
      </widget>
     </item>
-    <item row="0" column="1">
-     <widget class="QPushButton" name="Initiate_Button">
-      <property name="text">
-       <string>Initiate</string>
-      </property>
-     </widget>
-    </item>
-    <item row="4" column="1" colspan="2">
+    <item row="7" column="1" colspan="2">
      <widget class="QLabel" name="jointPosition_label">
       <property name="text">
        <string>Joint Position</string>
@@ -153,7 +68,27 @@
       </property>
      </widget>
     </item>
-    <item row="3" column="1" colspan="2">
+    <item row="14" column="1">
+     <widget class="QLineEdit" name="ServoNo_LineEdit">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
+        <horstretch>0</horstretch>
+        <verstretch>0</verstretch>
+       </sizepolicy>
+      </property>
+     </widget>
+    </item>
+    <item row="11" column="1" colspan="2">
+     <widget class="QLineEdit" name="goalPoint_lineEdit">
+      <property name="sizePolicy">
+       <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
+        <horstretch>0</horstretch>
+        <verstretch>0</verstretch>
+       </sizepolicy>
+      </property>
+     </widget>
+    </item>
+    <item row="6" column="1" colspan="2">
      <widget class="QComboBox" name="jointName_comboBox">
       <property name="sizePolicy">
        <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
@@ -163,13 +98,71 @@
       </property>
      </widget>
     </item>
-    <item row="11" column="1">
-     <widget class="QLineEdit" name="ServoNo_LineEdit">
+    <item row="5" column="1" colspan="2">
+     <widget class="QLabel" name="jointName_label">
+      <property name="text">
+       <string>Joint Name</string>
+      </property>
+      <property name="alignment">
+       <set>Qt::AlignBottom|Qt::AlignHCenter</set>
+      </property>
+     </widget>
+    </item>
+    <item row="10" column="1" colspan="2">
+     <widget class="QLabel" name="goalPoint_label">
+      <property name="text">
+       <string>Goal Point</string>
+      </property>
+      <property name="alignment">
+       <set>Qt::AlignBottom|Qt::AlignHCenter</set>
+      </property>
+     </widget>
+    </item>
+    <item row="3" column="1" colspan="2">
+     <widget class="QPushButton" name="StateReset_Button">
+      <property name="text">
+       <string>StateReset</string>
+      </property>
+     </widget>
+    </item>
+    <item row="14" column="2">
+     <widget class="QPushButton" name="SetServoNo_Button">
+      <property name="text">
+       <string>SetServoNo</string>
+      </property>
+     </widget>
+    </item>
+    <item row="13" column="2">
+     <widget class="QPushButton" name="GetServoNo_Button">
+      <property name="text">
+       <string>GetServoNo</string>
+      </property>
+     </widget>
+    </item>
+    <item row="12" column="1" colspan="2">
+     <widget class="QPushButton" name="setGoalPoint_Button">
       <property name="sizePolicy">
        <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
         <horstretch>0</horstretch>
         <verstretch>0</verstretch>
        </sizepolicy>
+      </property>
+      <property name="text">
+       <string>Set Goal Point</string>
+      </property>
+     </widget>
+    </item>
+    <item row="2" column="1" colspan="2">
+     <widget class="QPushButton" name="end_Button">
+      <property name="text">
+       <string>End</string>
+      </property>
+     </widget>
+    </item>
+    <item row="1" column="1" colspan="2">
+     <widget class="QPushButton" name="start_Button">
+      <property name="text">
+       <string>Start</string>
       </property>
      </widget>
     </item>
@@ -180,7 +173,7 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>809</width>
+     <width>1085</width>
      <height>22</height>
     </rect>
    </property>
@@ -189,12 +182,16 @@
      <string>Tools</string>
     </property>
     <addaction name="separator"/>
+    <addaction name="separator"/>
     <addaction name="actionJoint_Datas"/>
     <addaction name="actionEnd_Effector_Datas"/>
+    <addaction name="separator"/>
+    <addaction name="separator"/>
+    <addaction name="actionVisual_Form"/>
    </widget>
    <widget class="QMenu" name="menuDeepLearn">
     <property name="title">
-     <string>DeepLearn</string>
+     <string>BrainCore</string>
     </property>
     <addaction name="actionBrainDeepLearn_Setting"/>
    </widget>
@@ -214,6 +211,11 @@
   <action name="actionBrainDeepLearn_Setting">
    <property name="text">
     <string>Setting</string>
+   </property>
+  </action>
+  <action name="actionVisual_Form">
+   <property name="text">
+    <string>Visual</string>
    </property>
   </action>
  </widget>

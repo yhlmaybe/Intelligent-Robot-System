@@ -5,6 +5,7 @@
 #include <string>
 #include <thread>
 #include <map>
+#include <vector>
 #include <boost/variant.hpp>
 #include <functional>
 #include <stdexcept>
@@ -114,6 +115,15 @@ public:
     using StatusMap = std::map<std::string, StatusValue>;
     using PyTask = std::function<void()>;
 
+    struct VisualStatus
+    {
+        int width = 0;
+        int height = 0;
+        std::vector<unsigned char> bitmapRgb;
+        std::string text;
+        double updatedAt = 0.0;
+    };
+
     BrainDeepLearnInterface(std::shared_ptr<PythonInteraction::Manager> mag, std::function<void(std::string)> printCallBack = nullptr);
     ~BrainDeepLearnInterface();
 
@@ -136,6 +146,10 @@ public:
     bool RunPythonAsync(PyTask task);
 
     bool GetCurrentStatus(StatusMap& status);
+
+    bool GetCurrentVisualStatus(VisualStatus& status);
+
+    bool SetVisualStateEnabled(bool enabled);
 
     bool SetBasicParameters(std::string name, std::string value);
 
@@ -178,6 +192,10 @@ private:
 
     std::thread brThread;
     std::atomic<bool> brThreadRunning{false};
+
+    static bool ExtractUtf8String(PyObject* value, std::string& out);
+    static double ExtractFloatValue(PyObject* value, double defaultValue = 0.0);
+    static bool ParseBitmapList(PyObject* bitmapObj, VisualStatus& status);
 
     void Init();
 
