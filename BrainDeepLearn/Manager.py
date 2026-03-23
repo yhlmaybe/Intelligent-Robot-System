@@ -129,6 +129,7 @@ class ManagerFunction:
         self.br_thread: Optional[threading.Thread] = None
         self.message_thread: Optional[threading.Thread] = None
         self.is_begin = False
+        self.overrideCheckpointWithModuleParams = True
 
         self.test = {
             "perception": TestPerceptionMTool(),
@@ -153,6 +154,13 @@ class ManagerFunction:
     def GetBasicParametersDict(self):
         return BasicParameters.GetStringDict()
 
+    def SetOverrideCheckpointWithModuleParams(self, enabled: bool):
+        if self.is_begin:
+            self.controller.SetStatus("recur", "Training or Deploy is already running")
+            return False
+        self.overrideCheckpointWithModuleParams = bool(enabled)
+        return True
+
     def StartBackgroundTask(
         self,
         target: Callable[..., Any],
@@ -172,11 +180,21 @@ class ManagerFunction:
         self.br_thread.start()
         return True
 
-    def StartTraining(self, epochs: int = 5, batchSize: int = 32, valSplit: float = 0.1, resume: bool = True, onlineLearning:bool = False,isTest: bool = False):
+    def StartTraining(
+        self,
+        epochs: int = 5,
+        batchSize: int = 32,
+        valSplit: float = 0.1,
+        resume: bool = True,
+        onlineLearning: bool = False,
+        isTest: bool = False,
+        *,
+        overrideCheckpointWithModuleParams: Optional[bool] = None,):
         ckpt_path = BasicParameters.CKPT_PATH_TEST if isTest else BasicParameters.CKPT_PATH_TRAIN
         out_path = BasicParameters.MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.MODULEPARAMETER_PATH
         wm_mem_path = BasicParameters.WORLD_MEMORY_PATH_TEST if isTest else BasicParameters.WORLD_MEMORY_PATH
         mem_mem_path = BasicParameters.MEMORY_MEMORY_PATH_TEST if isTest else BasicParameters.MEMORY_MEMORY_PATH
+        override_enabled = bool(self.overrideCheckpointWithModuleParams) if overrideCheckpointWithModuleParams is None else bool(overrideCheckpointWithModuleParams)
 
         return self.StartBackgroundTask(
             self.TrainLoop,
@@ -186,7 +204,8 @@ class ManagerFunction:
                 "memMemPath": mem_mem_path,
                 "ckptPath": ckpt_path,
                 "outPath": out_path,
-                "isTest": isTest,})
+                "isTest": isTest,
+                "overrideCheckpointWithModuleParams": override_enabled,})
 
     def StartOCRTraining(
         self,
@@ -197,10 +216,12 @@ class ManagerFunction:
         isTest: bool = False,
         *,
         trainDetection: bool = True,
-        trainRecognition: bool = True,):
+        trainRecognition: bool = True,
+        overrideCheckpointWithModuleParams: Optional[bool] = None,):
         ckpt_path = BasicParameters.OCR_CKPT_PATH_TEST if isTest else BasicParameters.OCR_CKPT_PATH_TRAIN
         out_path = BasicParameters.OCR_MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.OCR_MODULEPARAMETER_PATH
         recognizer_init_path = BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH
+        override_enabled = bool(self.overrideCheckpointWithModuleParams) if overrideCheckpointWithModuleParams is None else bool(overrideCheckpointWithModuleParams)
 
         return self.StartBackgroundTask(
             self.OCRTrainLoop,
@@ -211,7 +232,8 @@ class ManagerFunction:
                 "outPath": out_path,
                 "trainDetection": trainDetection,
                 "trainRecognition": trainRecognition,
-                "recognizerInitPath": recognizer_init_path,})
+                "recognizerInitPath": recognizer_init_path,
+                "overrideCheckpointWithModuleParams": override_enabled,})
 
     def StartOCRRecognitionTraining(
         self,
@@ -219,9 +241,12 @@ class ManagerFunction:
         batchSize: int = 32,
         valSplit: float = 0.1,
         resume: bool = True,
-        isTest: bool = False):
+        isTest: bool = False,
+        *,
+        overrideCheckpointWithModuleParams: Optional[bool] = None):
         ckpt_path = BasicParameters.OCR_RECOGNIZER_CKPT_PATH_TEST if isTest else BasicParameters.OCR_RECOGNIZER_CKPT_PATH_TRAIN
         out_path = BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH
+        override_enabled = bool(self.overrideCheckpointWithModuleParams) if overrideCheckpointWithModuleParams is None else bool(overrideCheckpointWithModuleParams)
 
         return self.StartBackgroundTask(
             self.OCRRecognitionTrainLoop,
@@ -229,7 +254,8 @@ class ManagerFunction:
             kwargs={
                 "isTest": isTest,
                 "ckptPath": ckpt_path,
-                "outPath": out_path,})
+                "outPath": out_path,
+                "overrideCheckpointWithModuleParams": override_enabled,})
 
     def Stop(self):
         if self.is_begin:
@@ -623,6 +649,49 @@ class ManagerFunction:
             "ocr": ocr_state,
             "brain": brain_state,}, str(out_path))
 
+    def LoadTorchPayload(self, path: str):
+        try:
+            return torch.load(path, map_location=self.device, weights_only=True)
+        except TypeError:
+            return torch.load(path, map_location=self.device)
+        except Exception as e:
+            print(f"Safe mode loading failed: {e}, try the normal mode")
+            return torch.load(path, map_location=self.device)
+
+    def LoadBrainWeights(self, brain: BrainCore, path: str) -> None:
+        payload = self.LoadTorchPayload(path)
+
+        if isinstance(payload, dict) and "brain" in payload:
+            brain_state = payload["brain"]
+        elif isinstance(payload, dict):
+            brain_state = payload
+        else:
+            raise TypeError(f"checkpoint {path} has invalid brain weights payload")
+
+        brain.load_state_dict(brain_state, strict=False)
+
+    def ApplyParameterOverrideAfterResume(
+        self,
+        *,
+        enabled: bool,
+        parameterPath: Optional[str],
+        loadFn: Callable[[str], None],
+        logPrefix: str,) -> bool:
+        if not enabled:
+            return False
+        if not parameterPath:
+            print(f"[{logPrefix}] parameter override skipped: parameter path is empty")
+            return False
+
+        override_path = Path(parameterPath)
+        if not override_path.exists():
+            print(f"[{logPrefix}] parameter override skipped, file not found: {override_path}")
+            return False
+
+        loadFn(str(override_path))
+        print(f"[{logPrefix}] checkpoint weights overridden from parameter file: {override_path}")
+        return True
+
     def LoadOCRWeightsIntoEngine(self, engine: OCREngineExtractor, path: str) -> None:
         payload = torch.load(path, map_location=self.device)
 
@@ -776,7 +845,8 @@ class ManagerFunction:
         outPath: str,
         trainDetection: bool = True,
         trainRecognition: bool = True,
-        recognizerInitPath: Optional[str] = None,):
+        recognizerInitPath: Optional[str] = None,
+        overrideCheckpointWithModuleParams: bool = False,):
         try:
             torch.autograd.set_detect_anomaly(True)
 
@@ -787,30 +857,7 @@ class ManagerFunction:
 
             ds = OfflineOCRDataset(isTest=isTest)
             engine = OCREngineExtractor().to(self.device)
-
-            if recognizerInitPath and Path(recognizerInitPath).exists() and not (resume and Path(ckptPath).exists()):
-                self.LoadRecognizerWeightsIntoEngine(engine, recognizerInitPath)
-            elif not trainRecognition and not (resume and Path(ckptPath).exists()):
-                init_candidates = [Path(outPath), Path(ckptPath)]
-                init_error = None
-                loaded = False
-                for init_path in init_candidates:
-                    if not init_path.exists():
-                        continue
-                    try:
-                        self.LoadOCRWeightsIntoEngine(engine, str(init_path))
-                        loaded = True
-                        break
-                    except Exception as e:
-                        init_error = e
-
-                if not loaded:
-                    msg = (
-                        "detect-only OCR training requires existing OCR weights "
-                        "or recognizerInitPath to preserve recognizer parameters")
-                    if init_error is not None:
-                        raise RuntimeError(msg) from init_error
-                    raise FileNotFoundError(msg)
+            has_resume_ckpt = resume and Path(ckptPath).exists()
 
             for p in engine.backbone.parameters():
                 p.requires_grad = trainDetection
@@ -829,13 +876,42 @@ class ManagerFunction:
             train_ds = val_ds = test_ds = None
 
             testSplit = 0.1
-            if resume and Path(ckptPath).exists():
+            if has_resume_ckpt:
                 start_epoch, best_val, train_ds, val_ds, test_ds = self.LoadOCRCheckpoint(
                     engine,
                     optimizer,
                     ds,
                     ckptPath,
                     allowOptimizerMismatch=True)
+                self.ApplyParameterOverrideAfterResume(
+                    enabled=overrideCheckpointWithModuleParams,
+                    parameterPath=outPath,
+                    loadFn=lambda path: self.LoadOCRWeightsIntoEngine(engine, path),
+                    logPrefix="TrainOCR")
+            else:
+                if recognizerInitPath and Path(recognizerInitPath).exists():
+                    self.LoadRecognizerWeightsIntoEngine(engine, recognizerInitPath)
+                elif not trainRecognition:
+                    init_candidates = [Path(outPath), Path(ckptPath)]
+                    init_error = None
+                    loaded = False
+                    for init_path in init_candidates:
+                        if not init_path.exists():
+                            continue
+                        try:
+                            self.LoadOCRWeightsIntoEngine(engine, str(init_path))
+                            loaded = True
+                            break
+                        except Exception as e:
+                            init_error = e
+
+                    if not loaded:
+                        msg = (
+                            "detect-only OCR training requires existing OCR weights "
+                            "or recognizerInitPath to preserve recognizer parameters")
+                        if init_error is not None:
+                            raise RuntimeError(msg) from init_error
+                        raise FileNotFoundError(msg)
 
             train_ds, val_ds, test_ds = self.SplitDataset(
                 ds,
@@ -1137,7 +1213,8 @@ class ManagerFunction:
         *,
         isTest: bool,
         ckptPath: str,
-        outPath: str,):
+        outPath: str,
+        overrideCheckpointWithModuleParams: bool = False,):
         try:
             torch.autograd.set_detect_anomaly(True)
 
@@ -1162,6 +1239,11 @@ class ManagerFunction:
             if resume and Path(ckptPath).exists():
                 start_epoch, best_val, train_ds, val_ds, test_ds = self.LoadOCRRecognizerCheckpoint(
                     engine, optimizer, ds, ckptPath)
+                self.ApplyParameterOverrideAfterResume(
+                    enabled=overrideCheckpointWithModuleParams,
+                    parameterPath=outPath,
+                    loadFn=lambda path: self.LoadRecognizerWeightsIntoEngine(engine, path),
+                    logPrefix="TrainOCRRec")
 
             train_ds, val_ds, test_ds = self.SplitDataset(
                 ds,
@@ -1403,7 +1485,7 @@ class ManagerFunction:
 
 
 
-    def TrainLoop(self, epochs: int, batchSize: int, valSplit: float, resume: bool, onlineLearning = False, *, isTest: bool = False, worldMemPath: str = None, memMemPath: str = None, ckptPath: str = None, outPath: str = None,):
+    def TrainLoop(self, epochs: int, batchSize: int, valSplit: float, resume: bool, onlineLearning = False, *, isTest: bool = False, worldMemPath: str = None, memMemPath: str = None, ckptPath: str = None, outPath: str = None, overrideCheckpointWithModuleParams: bool = False,):
         try:
             torch.autograd.set_detect_anomaly(True)
             ckptPath = ckptPath or BasicParameters.CKPT_PATH_TRAIN
@@ -1428,6 +1510,11 @@ class ManagerFunction:
 
             if resume and Path(ckptPath).exists():
                 start_epoch, best_val, train_ds, val_ds = self.LoadCheckpoint(brain, agent, ds, ckptPath)
+                self.ApplyParameterOverrideAfterResume(
+                    enabled=overrideCheckpointWithModuleParams,
+                    parameterPath=outPath,
+                    loadFn=lambda path: self.LoadBrainWeights(brain, path),
+                    logPrefix="Train")
 
             train_ds, val_ds, test_ds = self.SplitDataset(
                 ds,
@@ -1829,22 +1916,12 @@ class ManagerFunction:
             model_path = BasicParameters.MODULEPARAMETER_PATH
 
             if os.path.exists(model_path):
-                try:
-                    sd = torch.load(model_path, map_location=self.device, weights_only=True)
-                except Exception as e:
-                    print(f"Safe mode loading failed: {e}, try the normal mode")
-                    sd = torch.load(model_path, map_location=self.device)
+                self.LoadBrainWeights(brain, model_path)
             else:
                 msg = f"The module file is not exit: {model_path}"
                 print(msg)
-                sd = None
                 self.controller.SetStatus("error", msg)
                 return 
-
-            if isinstance(sd, dict) and "brain" in sd:
-                brain.load_state_dict(sd["brain"], strict=False)
-            else:
-                brain.load_state_dict(sd, strict=False)
 
             brain.to(self.device)
             brain.eval()
@@ -2347,7 +2424,8 @@ class ManagerFunction:
         isResume: bool = False,
         *,
         trainDetection: bool = True,
-        trainRecognition: bool = True,) -> Dict[str, Any]:
+        trainRecognition: bool = True,
+        overrideCheckpointWithModuleParams: Optional[bool] = None,) -> Dict[str, Any]:
         try:
             if not (trainDetection or trainRecognition):
                 print("[TrainOCR] trainDetection and trainRecognition cannot both be False.")
@@ -2386,7 +2464,8 @@ class ManagerFunction:
                 resume=isResume,
                 isTest=False,
                 trainDetection=trainDetection,
-                trainRecognition=trainRecognition,)
+                trainRecognition=trainRecognition,
+                overrideCheckpointWithModuleParams=overrideCheckpointWithModuleParams,)
 
             if not ok:
                 print("StartOCRTraining returns False (training may already be running)")
@@ -2406,7 +2485,9 @@ class ManagerFunction:
         epochs: int = 6,
         batchSize: int = 8,
         valSplit: float = 0.2,
-        isResume: bool = False,) -> Dict[str, Any]:
+        isResume: bool = False,
+        *,
+        overrideCheckpointWithModuleParams: Optional[bool] = None,) -> Dict[str, Any]:
         try:
             if not self.HasOcrRecognitionDataset():
                 print(
@@ -2425,7 +2506,8 @@ class ManagerFunction:
                 batchSize=batchSize,
                 valSplit=valSplit,
                 resume=isResume,
-                isTest=False,)
+                isTest=False,
+                overrideCheckpointWithModuleParams=overrideCheckpointWithModuleParams,)
 
             if not ok:
                 print("StartOCRRecognitionTraining returns False (training may already be running)")
@@ -2447,7 +2529,9 @@ class ManagerFunction:
         epochs: int = 6,
         batchSize: int = 1,
         valSplit: float = 0.2,
-        isResume: bool = False,) -> Dict[str, Any]:
+        isResume: bool = False,
+        *,
+        overrideCheckpointWithModuleParams: Optional[bool] = None,) -> Dict[str, Any]:
         try:
             if not self.HasGameDataset():
                 print(
@@ -2469,7 +2553,14 @@ class ManagerFunction:
                 f"{BasicParameters.DATA_REWARD_PATH}, "
                 f"{BasicParameters.DATA_DONE_PATH}.")
 
-            ok = self.StartTraining(epochs=epochs, batchSize=batchSize, valSplit=valSplit, resume=isResume, onlineLearning=onlineLearning,isTest=False,)
+            ok = self.StartTraining(
+                epochs=epochs,
+                batchSize=batchSize,
+                valSplit=valSplit,
+                resume=isResume,
+                onlineLearning=onlineLearning,
+                isTest=False,
+                overrideCheckpointWithModuleParams=overrideCheckpointWithModuleParams,)
 
             if not ok:
                 print("StartTraining returns False (training may already be running)")

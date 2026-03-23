@@ -371,6 +371,11 @@ bool BrainDeepLearnInterface::SetVisualStateEnabled(bool enabled)
     return CALL_METHOD_RET_BOOL("SetVisualStateEnabled", "i", enabled ? 1 : 0);
 }
 
+bool BrainDeepLearnInterface::SetOverrideCheckpointWithModuleParams(bool enabled)
+{
+    return CALL_METHOD_RET_BOOL("SetOverrideCheckpointWithModuleParams", "i", enabled ? 1 : 0);
+}
+
 bool BrainDeepLearnInterface::SetBasicParameters(std::string name, std::string value)
 {
     return CALL_METHOD_RET_BOOL("SetBasicParameters", "ss", name.c_str(), value.c_str());
