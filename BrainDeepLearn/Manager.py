@@ -172,7 +172,15 @@ class ManagerFunction:
         self.br_thread.start()
         return True
 
-    def StartTraining(self, epochs: int = 5, batchSize: int = 32, valSplit: float = 0.1, resume: bool = True, onlineLearning:bool = False,isTest: bool = False):
+    def StartTraining(
+        self,
+        epochs: int = 5,
+        batchSize: int = 32,
+        valSplit: float = 0.1,
+        resume: bool = True,
+        onlineLearning: bool = False,
+        isTest: bool = False,
+        saveEverySampleCount = 2000,):
         ckpt_path = BasicParameters.CKPT_PATH_TEST if isTest else BasicParameters.CKPT_PATH_TRAIN
         out_path = BasicParameters.MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.MODULEPARAMETER_PATH
         wm_mem_path = BasicParameters.WORLD_MEMORY_PATH_TEST if isTest else BasicParameters.WORLD_MEMORY_PATH
@@ -186,7 +194,8 @@ class ManagerFunction:
                 "memMemPath": mem_mem_path,
                 "ckptPath": ckpt_path,
                 "outPath": out_path,
-                "isTest": isTest,})
+                "isTest": isTest,
+                "saveEverySampleCount": saveEverySampleCount,})
 
     def StartOCRTraining(
         self,
@@ -195,6 +204,7 @@ class ManagerFunction:
         valSplit: float = 0.1,
         resume: bool = True,
         isTest: bool = False,
+        saveEverySampleCount = 2000,
         *,
         trainDetection: bool = True,
         trainRecognition: bool = True,):
@@ -211,7 +221,8 @@ class ManagerFunction:
                 "outPath": out_path,
                 "trainDetection": trainDetection,
                 "trainRecognition": trainRecognition,
-                "recognizerInitPath": recognizer_init_path,})
+                "recognizerInitPath": recognizer_init_path,
+                "saveEverySampleCount": saveEverySampleCount,})
 
     def StartOCRRecognitionTraining(
         self,
@@ -219,7 +230,8 @@ class ManagerFunction:
         batchSize: int = 32,
         valSplit: float = 0.1,
         resume: bool = True,
-        isTest: bool = False):
+        isTest: bool = False,
+        saveEverySampleCount = 2000):
         ckpt_path = BasicParameters.OCR_RECOGNIZER_CKPT_PATH_TEST if isTest else BasicParameters.OCR_RECOGNIZER_CKPT_PATH_TRAIN
         out_path = BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.OCR_RECOGNIZER_MODULEPARAMETER_PATH
 
@@ -229,7 +241,8 @@ class ManagerFunction:
             kwargs={
                 "isTest": isTest,
                 "ckptPath": ckpt_path,
-                "outPath": out_path,})
+                "outPath": out_path,
+                "saveEverySampleCount": saveEverySampleCount,})
 
     def Stop(self):
         if self.is_begin:
@@ -377,6 +390,25 @@ class ManagerFunction:
                 return False
         return True
 
+    def SummarizeImageDirectory(self, path: Union[str, Path]) -> str:
+        img_dir = Path(path)
+        if not img_dir.exists():
+            return "missing"
+
+        img_files = DataPreprocessor.ListImageFiles(img_dir)
+        if not img_files:
+            return "0 supported image files"
+
+        suffix_counts: Dict[str, int] = {}
+        for img_path in img_files:
+            suffix = img_path.suffix.lower() or "<no_ext>"
+            suffix_counts[suffix] = suffix_counts.get(suffix, 0) + 1
+
+        suffix_summary = ", ".join(
+            f"{suffix}:{count}"
+            for suffix, count in sorted(suffix_counts.items()))
+        return f"{len(img_files)} image files ({suffix_summary})"
+
     def HasOcrDataset(self, dataRoot: Optional[Union[str, Path]] = None) -> bool:
         if dataRoot is None:
             root = Path(BasicParameters.OCR_DATA_ROOT_PATH)
@@ -390,7 +422,7 @@ class ManagerFunction:
         if not (frames_dir.exists() and texts_dir.exists()):
             return False
 
-        frame_files = sorted(frames_dir.glob("*.png"))
+        frame_files = DataPreprocessor.ListImageFiles(frames_dir)
         txt_files = sorted(texts_dir.glob("*.txt"))
         if not frame_files or not txt_files or len(frame_files) != len(txt_files):
             return False
@@ -412,7 +444,7 @@ class ManagerFunction:
         if not (frames_dir.exists() and texts_dir.exists()):
             return False
 
-        frame_files = sorted(frames_dir.glob("*.png"))
+        frame_files = DataPreprocessor.ListImageFiles(frames_dir)
         text_files = sorted(texts_dir.glob("*.txt"))
         return bool(frame_files) and bool(text_files) and len(frame_files) == len(text_files)
 
@@ -623,6 +655,21 @@ class ManagerFunction:
             "ocr": ocr_state,
             "brain": brain_state,}, str(out_path))
 
+    def CaptureRngState(self) -> Dict[str, Any]:
+        return {
+            "python": random.getstate(),
+            "torch": torch.get_rng_state(),
+            "numpy": np.random.get_state(),}
+
+    def ShouldTriggerPeriodicSave(
+        self,
+        previousCount: int,
+        currentCount: int,
+        saveEverySampleCount: int,) -> bool:
+        return (
+            int(currentCount) > int(previousCount)
+            and (int(currentCount) // int(saveEverySampleCount)) > (int(previousCount) // int(saveEverySampleCount)))
+
     def LoadOCRWeightsIntoEngine(self, engine: OCREngineExtractor, path: str) -> None:
         payload = torch.load(path, map_location=self.device)
 
@@ -714,7 +761,8 @@ class ManagerFunction:
 
         start_epoch = int(ckpt.get("epoch", 0))
         best_val = float(ckpt.get("best_val", float("inf")))
-        return start_epoch, best_val, train_ds, val_ds, test_ds
+        processed_sample_count_total = int(ckpt.get("processed_sample_count_total", 0))
+        return start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds
 
     def LoadOCRRecognizerCheckpoint(
         self,
@@ -762,7 +810,8 @@ class ManagerFunction:
 
         start_epoch = int(ckpt.get("epoch", 0))
         best_val = float(ckpt.get("best_val", float("inf")))
-        return start_epoch, best_val, train_ds, val_ds, test_ds
+        processed_sample_count_total = int(ckpt.get("processed_sample_count_total", 0))
+        return start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds
 
     def OCRTrainLoop(
         self,
@@ -771,6 +820,7 @@ class ManagerFunction:
         valSplit: float,
         resume: bool,
         *,
+        saveEverySampleCount: 2000,
         isTest: bool,
         ckptPath: str,
         outPath: str,
@@ -781,7 +831,7 @@ class ManagerFunction:
             torch.autograd.set_detect_anomaly(True)
 
             self.ResetControllerFlags()
-
+    
             if not trainDetection and not trainRecognition:
                 raise ValueError("OCRTrainLoop requires trainDetection or trainRecognition to be True")
 
@@ -826,11 +876,12 @@ class ManagerFunction:
 
             start_epoch = 0
             best_val = float("inf")
+            processed_sample_count_total = 0
             train_ds = val_ds = test_ds = None
 
             testSplit = 0.1
             if resume and Path(ckptPath).exists():
-                start_epoch, best_val, train_ds, val_ds, test_ds = self.LoadOCRCheckpoint(
+                start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds = self.LoadOCRCheckpoint(
                     engine,
                     optimizer,
                     ds,
@@ -934,6 +985,28 @@ class ManagerFunction:
                 avg_split_loss = split_loss / max(1, split_samples)
                 split_acc = (total_correct / total_elems if total_elems > 0 else 0.0)
                 return avg_split_loss, split_acc
+
+            def BuildOCRCheckpointPayload(epochValue: int) -> Dict[str, Any]:
+                return {
+                    "epoch": int(epochValue),
+                    "best_val": best_val,
+                    "ocr": engine.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "train_indices": list(train_ds.indices) if hasattr(train_ds, "indices") else None,
+                    "val_indices": list(val_ds.indices) if hasattr(val_ds, "indices") else None,
+                    "test_indices": list(test_ds.indices) if hasattr(test_ds, "indices") else None,
+                    "processed_sample_count_total": processed_sample_count_total,
+                    "rng": self.CaptureRngState(),}
+
+            def SaveOCRTrainingArtifacts(epochValue: int, *, logPeriodic: bool = False) -> None:
+                self.SaveOCRParameters(engine, outPath)
+                ckpt_dir = Path(ckptPath).parent
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(BuildOCRCheckpointPayload(epochValue), ckptPath)
+                if logPeriodic:
+                    print(
+                        f"[TrainOCR] periodic save at processed_sample_count_total={processed_sample_count_total} "
+                        f"(epoch {ep + 1}, batch {bi})")
 
             self.controller.SetStatus(
                 "training",(
@@ -1050,6 +1123,14 @@ class ManagerFunction:
                     torch.nn.utils.clip_grad_norm_(engine.parameters(), 1.0)
                     optimizer.step()
 
+                    previous_processed_sample_count_total = processed_sample_count_total
+                    processed_sample_count_total += len(sample_losses)
+                    if self.ShouldTriggerPeriodicSave(
+                        previous_processed_sample_count_total,
+                        processed_sample_count_total,
+                        saveEverySampleCount):
+                        SaveOCRTrainingArtifacts(ep, logPeriodic=True)
+
                     epoch_loss += float(loss.item())
                     nb += 1
 
@@ -1082,22 +1163,7 @@ class ManagerFunction:
                 if improved:
                     best_val = avg_val
                     no_improve = 0
-                    self.SaveOCRParameters(engine, outPath)
-
-                    ckpt_dir = Path(ckptPath).parent
-                    ckpt_dir.mkdir(parents=True, exist_ok=True)
-                    torch.save({
-                        "epoch": ep + 1,
-                        "best_val": best_val,
-                        "ocr": engine.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "train_indices": list(train_ds.indices) if hasattr(train_ds, "indices") else None,
-                        "val_indices": list(val_ds.indices) if hasattr(val_ds, "indices") else None,
-                        "test_indices": list(test_ds.indices) if hasattr(test_ds, "indices") else None,
-                        "rng": {
-                            "python": random.getstate(),
-                            "torch": torch.get_rng_state(),
-                            "numpy": np.random.get_state(),},}, ckptPath)
+                    SaveOCRTrainingArtifacts(ep + 1)
                 else:
                     no_improve += 1
 
@@ -1135,6 +1201,7 @@ class ManagerFunction:
         valSplit: float,
         resume: bool,
         *,
+        saveEverySampleCount: 2000,
         isTest: bool,
         ckptPath: str,
         outPath: str,):
@@ -1142,7 +1209,7 @@ class ManagerFunction:
             torch.autograd.set_detect_anomaly(True)
 
             self.ResetControllerFlags()
-
+    
             ds = OfflineOCRRecognitionDataset(isTest=isTest)
             engine = OCREngineExtractor().to(self.device)
             for p in engine.backbone.parameters():
@@ -1156,11 +1223,12 @@ class ManagerFunction:
 
             start_epoch = 0
             best_val = float("inf")
+            processed_sample_count_total = 0
             train_ds = val_ds = test_ds = None
 
             testSplit = 0.1
             if resume and Path(ckptPath).exists():
-                start_epoch, best_val, train_ds, val_ds, test_ds = self.LoadOCRRecognizerCheckpoint(
+                start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds = self.LoadOCRRecognizerCheckpoint(
                     engine, optimizer, ds, ckptPath)
 
             train_ds, val_ds, test_ds = self.SplitDataset(
@@ -1242,6 +1310,28 @@ class ManagerFunction:
                 avg_split_loss = split_loss / max(1, split_samples)
                 split_acc = (total_correct / total_elems if total_elems > 0 else 0.0)
                 return avg_split_loss, split_acc
+
+            def BuildOCRRecognizerCheckpointPayload(epochValue: int) -> Dict[str, Any]:
+                return {
+                    "epoch": int(epochValue),
+                    "best_val": best_val,
+                    "recognizer": engine.recognizer.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "train_indices": list(train_ds.indices) if hasattr(train_ds, "indices") else None,
+                    "val_indices": list(val_ds.indices) if hasattr(val_ds, "indices") else None,
+                    "test_indices": list(test_ds.indices) if hasattr(test_ds, "indices") else None,
+                    "processed_sample_count_total": processed_sample_count_total,
+                    "rng": self.CaptureRngState(),}
+
+            def SaveOCRRecognizerTrainingArtifacts(epochValue: int, *, logPeriodic: bool = False) -> None:
+                self.SaveOCRRecognizerParameters(engine, outPath)
+                ckpt_dir = Path(ckptPath).parent
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(BuildOCRRecognizerCheckpointPayload(epochValue), ckptPath)
+                if logPeriodic:
+                    print(
+                        f"[TrainOCRRec] periodic save at processed_sample_count_total={processed_sample_count_total} "
+                        f"(epoch {ep + 1}, batch {bi})")
 
             self.controller.SetStatus(
                 "training",
@@ -1325,6 +1415,14 @@ class ManagerFunction:
                     torch.nn.utils.clip_grad_norm_(engine.recognizer.parameters(), 1.0)
                     optimizer.step()
 
+                    previous_processed_sample_count_total = processed_sample_count_total
+                    processed_sample_count_total += len(sample_losses)
+                    if self.ShouldTriggerPeriodicSave(
+                        previous_processed_sample_count_total,
+                        processed_sample_count_total,
+                        saveEverySampleCount):
+                        SaveOCRRecognizerTrainingArtifacts(ep, logPeriodic=True)
+
                     epoch_loss += float(loss.item())
                     nb += 1
 
@@ -1355,22 +1453,7 @@ class ManagerFunction:
                 if improved:
                     best_val = avg_val
                     no_improve = 0
-                    self.SaveOCRRecognizerParameters(engine, outPath)
-
-                    ckpt_dir = Path(ckptPath).parent
-                    ckpt_dir.mkdir(parents=True, exist_ok=True)
-                    torch.save({
-                        "epoch": ep + 1,
-                        "best_val": best_val,
-                        "recognizer": engine.recognizer.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "train_indices": list(train_ds.indices) if hasattr(train_ds, "indices") else None,
-                        "val_indices": list(val_ds.indices) if hasattr(val_ds, "indices") else None,
-                        "test_indices": list(test_ds.indices) if hasattr(test_ds, "indices") else None,
-                        "rng": {
-                            "python": random.getstate(),
-                            "torch": torch.get_rng_state(),
-                            "numpy": np.random.get_state(),},}, ckptPath)
+                    SaveOCRRecognizerTrainingArtifacts(ep + 1)
                 else:
                     no_improve += 1
 
@@ -1403,14 +1486,27 @@ class ManagerFunction:
 
 
 
-    def TrainLoop(self, epochs: int, batchSize: int, valSplit: float, resume: bool, onlineLearning = False, *, isTest: bool = False, worldMemPath: str = None, memMemPath: str = None, ckptPath: str = None, outPath: str = None,):
+    def TrainLoop(
+        self,
+        epochs: int,
+        batchSize: int,
+        valSplit: float,
+        resume: bool,
+        onlineLearning = False,
+        *,
+        saveEverySampleCount: 2000,
+        isTest: bool = False,
+        worldMemPath: str = None,
+        memMemPath: str = None,
+        ckptPath: str = None,
+        outPath: str = None,):
         try:
             torch.autograd.set_detect_anomaly(True)
             ckptPath = ckptPath or BasicParameters.CKPT_PATH_TRAIN
             outPath = outPath or (BasicParameters.MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.MODULEPARAMETER_PATH)
 
             self.ResetControllerFlags()
-
+    
             ds = OfflineGameDataset(isTest=isTest)
 
             brain = BrainCore(device=self.device, plasticHebbian=True, plasticOnlineLearning=onlineLearning, usePlanner=False,)
@@ -1422,12 +1518,13 @@ class ManagerFunction:
 
             start_epoch = 0
             best_val = float("inf")
+            processed_sample_count_total = 0
             train_ds = val_ds = test_ds = None
 
             testSplit = 0.1
 
             if resume and Path(ckptPath).exists():
-                start_epoch, best_val, train_ds, val_ds = self.LoadCheckpoint(brain, agent, ds, ckptPath)
+                start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds = self.LoadCheckpoint(brain, agent, ds, ckptPath)
 
             train_ds, val_ds, test_ds = self.SplitDataset(
                 ds,
@@ -1500,6 +1597,38 @@ class ManagerFunction:
                 total_elems = int(key_targets.numel() + click_targets.numel())
 
                 return cur_loss, total_correct, total_elems
+
+            def BuildTrainCheckpointPayload(epochValue: int) -> Dict[str, Any]:
+                return {
+                    "epoch": int(epochValue),
+                    "best_val": best_val,
+                    "brain": brain.state_dict(),
+                    "opt_actor": agent.opt_actor.state_dict(),
+                    "opt_critic": agent.opt_critic.state_dict(),
+                    "opt_world": agent.opt_world.state_dict(),
+                    "train_indices": list(train_ds.indices)
+                    if hasattr(train_ds, "indices")
+                    else None,
+                    "val_indices": list(val_ds.indices)
+                    if hasattr(val_ds, "indices")
+                    else None,
+                    "test_indices": list(test_ds.indices)
+                    if hasattr(test_ds, "indices")
+                    else None,
+                    "processed_sample_count_total": processed_sample_count_total,
+                    "rng": self.CaptureRngState(),
+                    "buffers": brain.ExportBuffers(),}
+
+            def SaveTrainArtifacts(epochValue: int, *, logPeriodic: bool = False) -> None:
+                agent.SaveRuntimeMemories()
+                self.SaveModuleParameters(brain, outPath)
+                ckpt_dir = Path(ckptPath).parent
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(BuildTrainCheckpointPayload(epochValue), ckptPath)
+                if logPeriodic:
+                    print(
+                        f"[Train] periodic save at processed_sample_count_total={processed_sample_count_total} "
+                        f"(epoch {ep + 1}, batch {bi})")
 
             self.controller.SetStatus("training", "Training started", epoch=start_epoch, total_epochs=epochs, batch=0, total_batches=len(train_dl), visual=self.controller.EmptyVisualStatus(touch=True),)
 
@@ -1587,6 +1716,14 @@ class ManagerFunction:
                     agent.opt_world.step()
                     agent.opt_critic.step()
                     agent.opt_actor.step()
+
+                    previous_processed_sample_count_total = processed_sample_count_total
+                    processed_sample_count_total += int(frames.size(0))
+                    if self.ShouldTriggerPeriodicSave(
+                        previous_processed_sample_count_total,
+                        processed_sample_count_total,
+                        saveEverySampleCount):
+                        SaveTrainArtifacts(ep, logPeriodic=True)
 
                     epoch_loss += float(loss.item())
                     nb += 1
@@ -1698,31 +1835,7 @@ class ManagerFunction:
                 if improved:
                     best_val = avg_val
                     no_improve = 0
-                    agent.SaveRuntimeMemories()
-                    self.SaveModuleParameters(brain, outPath)
-
-                    ckpt = {
-                        "epoch": ep + 1,
-                        "best_val": best_val,
-                        "brain": brain.state_dict(),
-                        "opt_actor": agent.opt_actor.state_dict(),
-                        "opt_critic": agent.opt_critic.state_dict(),
-                        "opt_world": agent.opt_world.state_dict(),
-                        "train_indices": list(train_ds.indices)
-                        if hasattr(train_ds, "indices")
-                        else None,
-                        "val_indices": list(val_ds.indices)
-                        if hasattr(val_ds, "indices")
-                        else None,
-                        "test_indices": list(test_ds.indices)
-                        if hasattr(test_ds, "indices")
-                        else None,
-                        "rng": {
-                            "python": random.getstate(),
-                            "torch": torch.get_rng_state(),
-                            "numpy": np.random.get_state(),},
-                        "buffers": brain.ExportBuffers(),}
-                    torch.save(ckpt, ckptPath)
+                    SaveTrainArtifacts(ep + 1)
                 else:
                     no_improve += 1
 
@@ -1798,20 +1911,25 @@ class ManagerFunction:
         agent.opt_critic.load_state_dict(ckpt["opt_critic"])
         agent.opt_world.load_state_dict(ckpt["opt_world"])
 
-        brain.ImportBuffers(ckpt["buffers"])
-        random.setstate(ckpt["rng"]["python"])
-        torch.set_rng_state(ckpt["rng"]["torch"].cpu())
-        np.random.set_state(ckpt["rng"]["numpy"])
+        if "buffers" in ckpt:
+            brain.ImportBuffers(ckpt["buffers"])
 
+        if "rng" in ckpt:
+            random.setstate(ckpt["rng"]["python"])
+            torch.set_rng_state(ckpt["rng"]["torch"].cpu())
+            np.random.set_state(ckpt["rng"]["numpy"])
+
+        train_ds = val_ds = test_ds = None
         if ckpt.get("train_indices") is not None:
             train_ds = torch.utils.data.Subset(dataset, ckpt["train_indices"])
             val_ds = torch.utils.data.Subset(dataset, ckpt["val_indices"])
-        else:
-            train_ds = val_ds = None
+            if ckpt.get("test_indices") is not None:
+                test_ds = torch.utils.data.Subset(dataset, ckpt["test_indices"])
 
         start_epoch = int(ckpt.get("epoch", 0))
         best_val = float(ckpt.get("best_val", float("inf")))
-        return start_epoch, best_val, train_ds, val_ds
+        processed_sample_count_total = int(ckpt.get("processed_sample_count_total", 0))
+        return start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds
 
     def StartDeployment(self, cameraIndex: int = 0, useHebbian: bool = True, usePlanner: bool = True):
         return self.StartBackgroundTask(
@@ -2345,22 +2463,31 @@ class ManagerFunction:
         batchSize: int = 4,
         valSplit: float = 0.2,
         isResume: bool = False,
+        saveEverySampleCount: Optional[int] = None,
         *,
         trainDetection: bool = True,
         trainRecognition: bool = True,) -> Dict[str, Any]:
         try:
+            if saveEverySampleCount is None:
+                saveEverySampleCount = BasicParameters.SAVE_EVERY_SAMPLE_COUNT
             if not (trainDetection or trainRecognition):
                 print("[TrainOCR] trainDetection and trainRecognition cannot both be False.")
                 return {"ok": False, "msg": "no_train_target"}
 
+            frames_dir = Path(BasicParameters.OCR_FRAMES_PATH)
             ocr_texts_dir = Path(BasicParameters.OCR_TEXTS_PATH)
             txt_files = sorted(ocr_texts_dir.glob("*.txt")) if ocr_texts_dir.exists() else []
 
             if not self.HasOcrDataset():
+                pairing_hint = ""
+                if "test_images" in str(frames_dir).lower() and "train_gts" in str(ocr_texts_dir).lower():
+                    pairing_hint = " It looks like OCR_FRAMES_PATH points to test_images while OCR_TEXTS_PATH points to train_gts; use matching train_images/train_gts folders for training."
                 print(
-                    "[TrainOCR] no valid OCR dataset found, please prepare these folders first: "
-                    f"{BasicParameters.OCR_FRAMES_PATH}, "
-                    f"{BasicParameters.OCR_TEXTS_PATH}.")
+                    "[TrainOCR] no valid OCR dataset found. "
+                    f"frames={BasicParameters.OCR_FRAMES_PATH} ({self.SummarizeImageDirectory(frames_dir)}), "
+                    f"texts={BasicParameters.OCR_TEXTS_PATH} ({len(txt_files)} txt). "
+                    "Expected matching image/txt counts with parseable OCR annotations."
+                    f"{pairing_hint}")
                 return {"ok": False, "msg": "invalid ocr dataset"}
 
             for txt_path in txt_files:
@@ -2370,7 +2497,7 @@ class ManagerFunction:
                     print(f"[TrainOCR] failed to parse OCR annotation file {txt_path}: {e}")
                     return {"ok": False, "msg": "invalid ocr labels"}
 
-                if not boxes or not texts or len(ignore_flags) != len(texts):
+                if len(texts) == 0 or len(boxes) != len(texts) or len(ignore_flags) != len(texts):
                     print(f"[TrainOCR] OCR annotation file is empty or invalid: {txt_path}")
                     return {"ok": False, "msg": "invalid ocr labels"}
 
@@ -2385,6 +2512,7 @@ class ManagerFunction:
                 valSplit=valSplit,
                 resume=isResume,
                 isTest=False,
+                saveEverySampleCount=saveEverySampleCount,
                 trainDetection=trainDetection,
                 trainRecognition=trainRecognition,)
 
@@ -2406,13 +2534,22 @@ class ManagerFunction:
         epochs: int = 6,
         batchSize: int = 8,
         valSplit: float = 0.2,
-        isResume: bool = False,) -> Dict[str, Any]:
+        isResume: bool = False,
+        saveEverySampleCount: Optional[int] = None,) -> Dict[str, Any]:
         try:
+            if saveEverySampleCount is None:
+                saveEverySampleCount = BasicParameters.SAVE_EVERY_SAMPLE_COUNT
+
+            frames_dir = Path(BasicParameters.OCR_RECOGNIZER_FRAMES_PATH)
+            texts_dir = Path(BasicParameters.OCR_RECOGNIZER_TEXTS_PATH)
+            text_files = sorted(texts_dir.glob("*.txt")) if texts_dir.exists() else []
+
             if not self.HasOcrRecognitionDataset():
                 print(
-                    "[TrainOCRRec] no valid OCR recognition dataset found, please prepare these folders first: "
-                    f"{BasicParameters.OCR_RECOGNIZER_FRAMES_PATH}, "
-                    f"{BasicParameters.OCR_RECOGNIZER_TEXTS_PATH}.")
+                    "[TrainOCRRec] no valid OCR recognition dataset found. "
+                    f"frames={BasicParameters.OCR_RECOGNIZER_FRAMES_PATH} ({self.SummarizeImageDirectory(frames_dir)}), "
+                    f"texts={BasicParameters.OCR_RECOGNIZER_TEXTS_PATH} ({len(text_files)} txt). "
+                    "Expected matching image/txt counts.")
                 return {"ok": False, "msg": "invalid ocr recognition dataset"}
 
             print(
@@ -2425,7 +2562,8 @@ class ManagerFunction:
                 batchSize=batchSize,
                 valSplit=valSplit,
                 resume=isResume,
-                isTest=False,)
+                isTest=False,
+                saveEverySampleCount=saveEverySampleCount,)
 
             if not ok:
                 print("StartOCRRecognitionTraining returns False (training may already be running)")
@@ -2447,8 +2585,11 @@ class ManagerFunction:
         epochs: int = 6,
         batchSize: int = 1,
         valSplit: float = 0.2,
-        isResume: bool = False,) -> Dict[str, Any]:
+        isResume: bool = False,
+        saveEverySampleCount: Optional[int] = None,) -> Dict[str, Any]:
         try:
+            if saveEverySampleCount is None:
+                saveEverySampleCount = BasicParameters.SAVE_EVERY_SAMPLE_COUNT
             if not self.HasGameDataset():
                 print(
                     "[Train] no dataset found, please prepare these folders first: "
@@ -2469,7 +2610,7 @@ class ManagerFunction:
                 f"{BasicParameters.DATA_REWARD_PATH}, "
                 f"{BasicParameters.DATA_DONE_PATH}.")
 
-            ok = self.StartTraining(epochs=epochs, batchSize=batchSize, valSplit=valSplit, resume=isResume, onlineLearning=onlineLearning,isTest=False,)
+            ok = self.StartTraining(epochs=epochs, batchSize=batchSize, valSplit=valSplit, resume=isResume, onlineLearning=onlineLearning, isTest=False, saveEverySampleCount=saveEverySampleCount,)
 
             if not ok:
                 print("StartTraining returns False (training may already be running)")

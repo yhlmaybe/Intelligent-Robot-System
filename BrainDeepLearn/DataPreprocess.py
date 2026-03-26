@@ -65,7 +65,7 @@ class OfflineOCRDataset(Dataset):
     def __init__(self, isTest: bool = False) -> None:
         if isTest:
             p = Path(BasicParameters.OCR_DATA_ROOT_PATH_TEST)
-            self.imgs = sorted((p / "frames").glob("*.png"))
+            self.imgs = DataPreprocessor.ListImageFiles(p / "frames")
             self.texts = sorted((p / "OCRTexts").glob("*.txt"))
             self.boxes = sorted((p / "boxes").glob("*.npy"))
             self.use_text_annotations = False
@@ -74,7 +74,7 @@ class OfflineOCRDataset(Dataset):
                     self.use_text_annotations = True
                     break
         else:
-            self.imgs = sorted(Path(BasicParameters.OCR_FRAMES_PATH).glob("*.png"))
+            self.imgs = DataPreprocessor.ListImageFiles(Path(BasicParameters.OCR_FRAMES_PATH))
             self.texts = sorted(Path(BasicParameters.OCR_TEXTS_PATH).glob("*.txt"))
             self.boxes = []
             p = Path(BasicParameters.OCR_DATA_ROOT_PATH)
@@ -120,10 +120,10 @@ class OfflineOCRRecognitionDataset(Dataset):
     def __init__(self, isTest: bool = False) -> None:
         if isTest:
             p = Path(BasicParameters.OCR_RECOGNIZER_DATA_ROOT_PATH_TEST)
-            self.imgs = sorted((p / "frames").glob("*.png"))
+            self.imgs = DataPreprocessor.ListImageFiles(p / "frames")
             self.texts = sorted((p / "OCRTexts").glob("*.txt"))
         else:
-            self.imgs = sorted(Path(BasicParameters.OCR_RECOGNIZER_FRAMES_PATH).glob("*.png"))
+            self.imgs = DataPreprocessor.ListImageFiles(Path(BasicParameters.OCR_RECOGNIZER_FRAMES_PATH))
             self.texts = sorted(Path(BasicParameters.OCR_RECOGNIZER_TEXTS_PATH).glob("*.txt"))
             p = Path(BasicParameters.OCR_RECOGNIZER_DATA_ROOT_PATH)
 
@@ -170,6 +170,19 @@ class DataResizeMeta:
 
 
 class DataPreprocessor:
+    SUPPORTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+
+    @staticmethod
+    def ListImageFiles(path: Union[str, Path]) -> List[Path]:
+        img_dir = Path(path)
+        if not img_dir.exists():
+            return []
+
+        return sorted([
+                item for item in img_dir.iterdir()
+                if item.is_file() and item.suffix.lower() in DataPreprocessor.SUPPORTED_IMAGE_SUFFIXES],
+            key=lambda item: item.name)
+
     @staticmethod
     def SplitOCRCsvLine(line: str) -> List[str]:
         cleaned = str(line).strip().lstrip("\ufeff").strip()
