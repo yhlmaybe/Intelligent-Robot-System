@@ -151,6 +151,8 @@ public:
 
     bool SetVisualStateEnabled(bool enabled);
 
+    bool SetOverrideCheckpointWithModuleParams(bool enabled);
+
     bool SetBasicParameters(std::string name, std::string value);
 
     bool GetBasicParameters(std::string name, StatusValue& value);
