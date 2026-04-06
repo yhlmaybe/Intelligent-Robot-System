@@ -18,6 +18,16 @@ except Exception:
     iio = None
 
 
+def LoadImageFirstFrame(path: Union[str, Path]) -> np.ndarray:
+    if iio is None:
+        raise RuntimeError("imageio.v3 cant use")
+
+    try:
+        return np.asarray(iio.imread(path, index=0))
+    except Exception as e:
+        raise ValueError(f"failed to read image {path}: {e}") from e
+
+
 class OfflineGameDataset(Dataset):
     def __init__(self, isTest: bool = False) -> None:
         if isTest:
@@ -46,10 +56,7 @@ class OfflineGameDataset(Dataset):
         return len(self.imgs)
 
     def __getitem__(self, idx: int):
-        if iio is None:
-            raise RuntimeError("imageio.v3 cant use")
-
-        imgs = iio.imread(self.imgs[idx])
+        imgs = LoadImageFirstFrame(self.imgs[idx])
         keys = np.load(self.keys[idx]).astype(np.float32)
         mouse_click = np.load(self.mouse_click[idx]).astype(np.float32)
         mouse_move = np.load(self.mouse_move[idx]).astype(np.float32)
@@ -91,10 +98,7 @@ class OfflineOCRDataset(Dataset):
         return len(self.imgs)
 
     def __getitem__(self, idx: int):
-        if iio is None:
-            raise RuntimeError("imageio.v3 cant use")
-
-        img = iio.imread(self.imgs[idx])
+        img = LoadImageFirstFrame(self.imgs[idx])
         if self.use_text_annotations:
             boxes, texts, ignore_flags = DataPreprocessor.LoadOCRAnnotations(self.texts[idx])
         else:
@@ -135,10 +139,7 @@ class OfflineOCRRecognitionDataset(Dataset):
         return len(self.imgs)
 
     def __getitem__(self, idx: int):
-        if iio is None:
-            raise RuntimeError("imageio.v3 cant use")
-
-        img = iio.imread(self.imgs[idx])
+        img = LoadImageFirstFrame(self.imgs[idx])
         raw_lines = [
             line.strip()
             for line in self.texts[idx].read_text(encoding="utf-8").splitlines()
@@ -288,6 +289,14 @@ class DataPreprocessor:
             img_t = image.detach().cpu()
         else:
             raise TypeError(f"unsupported image type: {type(image)}")
+
+        if img_t.ndim == 4:
+            if img_t.shape[-1] in (1, 3, 4):
+                img_t = img_t[0]
+            elif img_t.shape[0] in (1, 3, 4):
+                img_t = img_t[..., 0]
+            else:
+                raise ValueError(f"image must have 2 or 3 dims, but got shape {tuple(img_t.shape)}")
 
         if img_t.ndim == 2:
             img_t = img_t.unsqueeze(-1)
@@ -475,7 +484,7 @@ class DataPreprocessor:
         boxes: Union[np.ndarray, torch.Tensor],
         *,
         targetH: int = 32,
-        maxW: int = 256,) -> torch.Tensor:
+        maxW: int = 512,) -> torch.Tensor:
         c, h_img, w_img = imageTensor.shape
         if c < 3:
             raise ValueError(f"imageTensor channel count must be at least 3, but got {c}")
@@ -538,8 +547,7 @@ class DataPreprocessor:
         *,
         imageHeight: int,
         imageWidth: int,
-        dtype: torch.dtype = torch.float32,
-        shrinkRatio: float = 0.15,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dtype: torch.dtype = torch.float32,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         gt_shrink = torch.zeros(1, imageHeight, imageWidth, dtype=dtype)
         gt_thresh = torch.zeros(1, imageHeight, imageWidth, dtype=dtype)
         gt_mask = torch.ones(1, imageHeight, imageWidth, dtype=dtype)
@@ -560,14 +568,7 @@ class DataPreprocessor:
                 continue
 
             gt_thresh[:, y1:y2, x1:x2] = 1.0
-
-            shrink_dx = max(1, int(round((x2 - x1) * shrinkRatio)))
-            shrink_dy = max(1, int(round((y2 - y1) * shrinkRatio)))
-            sx1 = min(max(0, x1 + shrink_dx), imageWidth - 1)
-            sy1 = min(max(0, y1 + shrink_dy), imageHeight - 1)
-            sx2 = max(sx1 + 1, min(imageWidth, x2 - shrink_dx))
-            sy2 = max(sy1 + 1, min(imageHeight, y2 - shrink_dy))
-            gt_shrink[:, sy1:sy2, sx1:sx2] = 1.0
+            gt_shrink[:, y1:y2, x1:x2] = 1.0
 
         return gt_shrink, gt_thresh, gt_mask
 
@@ -581,7 +582,7 @@ class DataPreprocessor:
         char2Idx: dict,
         imageSize: int,
         targetH: int = 32,
-        maxW: int = 256,
+        maxW: int = 512,
         device: Optional[torch.device] = None,) -> Dict[str, Any]:
         img_rgb, boxes_np, resize_meta = DataPreprocessor.PrepareImageAndBoxes(
             image,
@@ -681,7 +682,7 @@ class DataPreprocessor:
         ignoreFlag: Union[bool, int, float] = False,
         char2Idx: dict,
         targetH: int = 32,
-        maxW: int = 256,
+        maxW: int = 512,
         device: Optional[torch.device] = None,) -> Dict[str, Any]:
         image_t = DataPreprocessor.ToImageTensor(image)
         _, h_img, w_img = image_t.shape
