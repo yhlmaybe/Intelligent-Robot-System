@@ -992,6 +992,27 @@ class Agent:
         if self.mem_mem_path is not None:
             self.brain.mem.SaveState(self.mem_mem_path)
 
+    def LoadTorchPayload(self, path: str):
+        try:
+            return torch.load(path, map_location=self.device, weights_only=True)
+        except TypeError:
+            return torch.load(path, map_location=self.device)
+        except Exception as e:
+            print(f"Safe mode loading failed: {e}, try the normal mode")
+            return torch.load(path, map_location=self.device)
+
+    def LoadBrainWeights(self, path: str):
+        payload = self.LoadTorchPayload(path)
+
+        if isinstance(payload, dict) and "brain" in payload:
+            brain_state = payload["brain"]
+        elif isinstance(payload, dict):
+            brain_state = payload
+        else:
+            raise TypeError(f"checkpoint {path} has invalid brain weights payload")
+
+        self.brain.load_state_dict(brain_state, strict=False)
+
     def ExportModuleMessagerData(self, nSteps: int = 0):
         return self.brain.moduleMessager.ExportDict(nSteps=nSteps)
 

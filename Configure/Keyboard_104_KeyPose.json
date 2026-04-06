@@ -1,0 +1,3259 @@
+{
+    "version": "1.0",
+    "keyboard_name": "keyboard_v1",
+    "layout_name": "raw_104",
+    "coordinate_frame": {
+        "name": "world",
+        "unit_position": "mm",
+        "unit_rotation": "quaternion_xyzw",
+        "z_axis_positive": "up"
+    },
+    "keyboard_pose": {
+        "present": true,
+        "relative_to": "world",
+        "position": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+        },
+        "rotation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 1.0
+        }
+    },
+    "key_local_frame": {
+        "name": "keyboard_pose",
+        "unit_position": "mm",
+        "unit_rotation": "quaternion_xyzw",
+        "z_axis_positive": "up",
+        "description": "All key local poses, local press points and local top normals are expressed relative to keyboard_pose."
+    },
+    "keys": {
+        "Esc": {
+            "label": "Esc",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F1": {
+            "label": "F1",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F2": {
+            "label": "F2",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F3": {
+            "label": "F3",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F4": {
+            "label": "F4",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F5": {
+            "label": "F5",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F6": {
+            "label": "F6",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F7": {
+            "label": "F7",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F8": {
+            "label": "F8",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F9": {
+            "label": "F9",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F10": {
+            "label": "F10",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F11": {
+            "label": "F11",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F12": {
+            "label": "F12",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "PrintScreen": {
+            "label": "PrintScreen",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "ScrollLock": {
+            "label": "ScrollLock",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Pause": {
+            "label": "Pause",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Grave": {
+            "label": "Grave",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "1": {
+            "label": "1",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "2": {
+            "label": "2",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "3": {
+            "label": "3",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "4": {
+            "label": "4",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "5": {
+            "label": "5",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "6": {
+            "label": "6",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "7": {
+            "label": "7",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "8": {
+            "label": "8",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "9": {
+            "label": "9",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "0": {
+            "label": "0",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Minus": {
+            "label": "Minus",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Equal": {
+            "label": "Equal",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Backspace": {
+            "label": "Backspace",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 36.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Tab": {
+            "label": "Tab",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 27.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Q": {
+            "label": "Q",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "W": {
+            "label": "W",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "E": {
+            "label": "E",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "R": {
+            "label": "R",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "T": {
+            "label": "T",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Y": {
+            "label": "Y",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "U": {
+            "label": "U",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "I": {
+            "label": "I",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "O": {
+            "label": "O",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "P": {
+            "label": "P",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "LeftBracket": {
+            "label": "LeftBracket",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "RightBracket": {
+            "label": "RightBracket",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "TildeBackslash": {
+            "label": "TildeBackslash",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 27.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "CapsLock": {
+            "label": "CapsLock",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 33.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "A": {
+            "label": "A",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "S": {
+            "label": "S",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "D": {
+            "label": "D",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "F": {
+            "label": "F",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "G": {
+            "label": "G",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "H": {
+            "label": "H",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "J": {
+            "label": "J",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "K": {
+            "label": "K",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "L": {
+            "label": "L",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Semicolon": {
+            "label": "Semicolon",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Apostrophe": {
+            "label": "Apostrophe",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Enter": {
+            "label": "Enter",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 42.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Shift": {
+            "label": "Shift",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 42.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Z": {
+            "label": "Z",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "X": {
+            "label": "X",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "C": {
+            "label": "C",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "V": {
+            "label": "V",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "B": {
+            "label": "B",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "N": {
+            "label": "N",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "M": {
+            "label": "M",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Comma": {
+            "label": "Comma",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Dot": {
+            "label": "Dot",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Slash": {
+            "label": "Slash",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "RShift": {
+            "label": "RShift",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 51.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Ctrl": {
+            "label": "Ctrl",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 22.5,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Win": {
+            "label": "Win",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 22.5,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Alt": {
+            "label": "Alt",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 22.5,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Space": {
+            "label": "Space",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 117.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "RAlt": {
+            "label": "RAlt",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 22.5,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "RWin": {
+            "label": "RWin",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 22.5,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Menu": {
+            "label": "Menu",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 22.5,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "RCtrl": {
+            "label": "RCtrl",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 22.5,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Insert": {
+            "label": "Insert",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Home": {
+            "label": "Home",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "PageUp": {
+            "label": "PageUp",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Delete": {
+            "label": "Delete",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "End": {
+            "label": "End",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "PageDown": {
+            "label": "PageDown",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "ArrowUp": {
+            "label": "ArrowUp",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "ArrowLeft": {
+            "label": "ArrowLeft",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "ArrowDown": {
+            "label": "ArrowDown",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "ArrowRight": {
+            "label": "ArrowRight",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "NumLock": {
+            "label": "NumLock",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "NumpadDivide": {
+            "label": "NumpadDivide",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "NumpadMultiply": {
+            "label": "NumpadMultiply",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "NumpadMinus": {
+            "label": "NumpadMinus",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Numpad7": {
+            "label": "Numpad7",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Numpad8": {
+            "label": "Numpad8",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Numpad9": {
+            "label": "Numpad9",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "NumpadPlus": {
+            "label": "NumpadPlus",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 36.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Numpad4": {
+            "label": "Numpad4",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Numpad5": {
+            "label": "Numpad5",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Numpad6": {
+            "label": "Numpad6",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Numpad1": {
+            "label": "Numpad1",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Numpad2": {
+            "label": "Numpad2",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Numpad3": {
+            "label": "Numpad3",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "NumpadEnter": {
+            "label": "NumpadEnter",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 36.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "Numpad0": {
+            "label": "Numpad0",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 36.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        },
+        "NumpadDot": {
+            "label": "NumpadDot",
+            "present": true,
+            "local_pose": {
+                "position": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0
+                },
+                "rotation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0
+                }
+            },
+            "size": {
+                "width": 18.0,
+                "height": 18.0
+            },
+            "local_press_point": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+            },
+            "local_top_normal": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0
+            }
+        }
+    }
+}
