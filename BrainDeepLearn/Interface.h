@@ -129,7 +129,7 @@ public:
 
     bool TrainModule(bool isOnlineLearning = false, int epochs = 5, int batchSize = 1, double valSplit = 0.1, bool resume = true);
 
-    bool TrainOCRModule(int epochs = 5, int batchSize = 1, double valSplit = 0.1, bool resume = true);
+    bool TrainOCRModule(int epochs = 400, int batchSize = 1, double valSplit = 0.1, bool resume = true);
 
     bool DeployModule(int cameraIndex = 0, bool useHebbian = true, bool usePlanner = true);
 

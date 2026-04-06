@@ -22,7 +22,7 @@ from WorldModule import  TestWorldMTool
 from ValueEstimationModule import  TestValueEstimationMTool
 from ConsciousnessModule import TestConsciousMTool
 from IntentionModule import TestIntentionMTool
-from OCRModule import TestOCRMTool, OCREngineExtractor
+from OCRModule import TestOCRMTool, OCREngineExtractor, IouXyxy
 from DataPreprocess import DataPreprocessor, DataResizeMeta, OfflineGameDataset, OfflineOCRDataset, OfflineOCRRecognitionDataset
 from AGICore import Agent, BrainCore, BasicParameters
 
@@ -538,6 +538,14 @@ class ManagerFunction:
         else:
             canvas = np.asarray(image)
 
+        if canvas.ndim == 4:
+            if canvas.shape[-1] in (1, 3, 4):
+                canvas = canvas[0]
+            elif canvas.shape[0] in (1, 3, 4):
+                canvas = canvas[..., 0]
+            else:
+                raise ValueError(f"visual image must have 2 or 3 dims, but got {canvas.shape}")
+
         if canvas.ndim == 2:
             canvas = canvas[..., None]
         if canvas.ndim != 3:
@@ -686,6 +694,64 @@ class ManagerFunction:
         return (
             int(currentCount) > int(previousCount)
             and (int(currentCount) // int(saveEverySampleCount)) > (int(previousCount) // int(saveEverySampleCount)))
+
+    def ComputeOcrBoxMatchStats(
+        self,
+        predBoxes: List[Union[np.ndarray, torch.Tensor, Tuple[int, int, int, int]]],
+        gtBoxes: List[Union[np.ndarray, torch.Tensor, Tuple[int, int, int, int]]],
+        *,
+        iouThresh: float = 0.7,) -> Tuple[int, int, int]:
+        pred_list = [
+            tuple(float(v) for v in np.asarray(box, dtype=np.float32).reshape(-1)[:4].tolist())
+            for box in predBoxes]
+        gt_list = [
+            tuple(float(v) for v in np.asarray(box, dtype=np.float32).reshape(-1)[:4].tolist())
+            for box in gtBoxes]
+
+        candidates: List[Tuple[float, int, int]] = []
+        for pred_idx, pred_box in enumerate(pred_list):
+            for gt_idx, gt_box in enumerate(gt_list):
+                iou = float(IouXyxy(pred_box, gt_box))
+                if iou >= float(iouThresh):
+                    candidates.append((iou, pred_idx, gt_idx))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        matched_pred = set()
+        matched_gt = set()
+        tp = 0
+        for _, pred_idx, gt_idx in candidates:
+            if pred_idx in matched_pred or gt_idx in matched_gt:
+                continue
+            matched_pred.add(pred_idx)
+            matched_gt.add(gt_idx)
+            tp += 1
+
+        fp = max(0, len(pred_list) - tp)
+        fn = max(0, len(gt_list) - tp)
+        return tp, fp, fn
+
+    def ComputeOcrCharMatchStats(
+        self,
+        predText: str,
+        targetText: str,) -> Tuple[int, int]:
+        pred = str(predText)
+        target = str(targetText)
+        aligned_len = min(len(pred), len(target))
+        correct = sum(1 for idx in range(aligned_len) if pred[idx] == target[idx])
+        total = max(len(pred), len(target))
+        return correct, total
+
+    def ComputeOcrHmean(
+        self,
+        tp: int,
+        fp: int,
+        fn: int,) -> float:
+        precision = float(tp) / max(1.0, float(tp + fp))
+        recall = float(tp) / max(1.0, float(tp + fn))
+        if precision + recall <= 0.0:
+            return 0.0
+        return 2.0 * precision * recall / (precision + recall)
 
 
     def LoadTorchPayload(self, path: str):
@@ -888,7 +954,7 @@ class ManagerFunction:
         trainDetection: bool = True,
         trainRecognition: bool = True,
         recognizerInitPath: Optional[str] = None,
-        overrideCheckpointWithModuleParams: bool = False,):
+        overrideCheckpointWithModuleParams: bool = True,):
         try:
             torch.autograd.set_detect_anomaly(True)
 
@@ -911,7 +977,7 @@ class ManagerFunction:
             trainable_params = [p for p in engine.parameters() if p.requires_grad]
             if len(trainable_params) == 0:
                 raise RuntimeError("no trainable OCR parameters selected")
-            optimizer = torch.optim.Adam(trainable_params, lr=1e-3)
+            optimizer = torch.optim.Adam(trainable_params, lr=3e-4)
 
             start_epoch = 0
             best_val = float("inf")
@@ -926,11 +992,6 @@ class ManagerFunction:
                     ds,
                     ckptPath,
                     allowOptimizerMismatch=True)
-                self.ApplyParameterOverrideAfterResume(
-                    enabled=overrideCheckpointWithModuleParams,
-                    parameterPath=outPath,
-                    loadFn=lambda path: self.LoadOCRWeightsIntoEngine(engine, path),
-                    logPrefix="TrainOCR")
             else:
                 if recognizerInitPath and Path(recognizerInitPath).exists():
                     self.LoadRecognizerWeightsIntoEngine(engine, recognizerInitPath)
@@ -955,6 +1016,12 @@ class ManagerFunction:
                         if init_error is not None:
                             raise RuntimeError(msg) from init_error
                         raise FileNotFoundError(msg)
+                    
+            self.ApplyParameterOverrideAfterResume(
+                enabled=overrideCheckpointWithModuleParams,
+                parameterPath=outPath,
+                loadFn=lambda path: self.LoadOCRWeightsIntoEngine(engine, path),
+                logPrefix="TrainOCR")
 
             train_ds, val_ds, test_ds = self.SplitDataset(
                 ds,
@@ -986,16 +1053,23 @@ class ManagerFunction:
                 shuffle=False,
                 collateFn=collate_ocr_batch)
 
-            patience = 5
+            patience = 10
             min_delta = 1e-4
             no_improve = 0
+            box_metric_threshold = 0.95
+            text_metric_threshold = 0.95
+            box_iou_threshold = 0.7
+            validation_interval = max(1, int(epochs) // 10)
 
             def eval_split(dl):
                 engine.eval()
                 split_loss = 0.0
                 split_samples = 0
-                total_correct = 0
-                total_elems = 0
+                box_tp = 0
+                box_fp = 0
+                box_fn = 0
+                total_char_correct = 0
+                total_char_count = 0
 
                 with torch.no_grad():
                     for imgs_b, boxes_b, texts_b, ignore_b in dl:
@@ -1006,13 +1080,14 @@ class ManagerFunction:
                                 texts,
                                 ignoreFlags=ignore_flags,
                                 char2Idx=engine.char2Idx,
-                                imageSize=BasicParameters.IMAGE_SIZE,
+                                imageSize=768,
                                 targetH=32,
-                                maxW=256,
+                                maxW=512,
                                 device=self.device,)
 
                             zero = sample["detect_img"].new_zeros(())
                             det_loss = zero
+                            det_boxes_pred: List[np.ndarray] = []
                             if trainDetection:
                                 detect_img = sample["detect_img"].unsqueeze(0) # [1, 3, H, W]
                                 gt_shrink = sample["gt_shrink"].unsqueeze(0) # [1, 1, H, W]
@@ -1025,6 +1100,17 @@ class ManagerFunction:
                                     gtThresh=gt_thresh,
                                     gtMask=gt_mask,)
                                 det_loss = det_out["loss"] # []
+                                det_boxes_pred = engine.BitmapToBoxes(
+                                    det_out["bin_map"][0],
+                                    threshValue=0.3,
+                                    minArea=10)
+                                tp, fp, fn = self.ComputeOcrBoxMatchStats(
+                                    det_boxes_pred,
+                                    sample["det_boxes"],
+                                    iouThresh=box_iou_threshold)
+                                box_tp += tp
+                                box_fp += fp
+                                box_fn += fn
 
                             rec_loss = zero # []
                             recog_imgs = sample["recog_imgs"] # [N_line, 1, targetH, maxW]
@@ -1044,15 +1130,20 @@ class ManagerFunction:
                                     idx2Char=engine.idx2Char,
                                     blankIndex=engine.blankIndex,)
                                 pred_texts = [txt for txt, _ in pairs]
-                                total_correct += sum(int(pred == target) for pred, target in zip(pred_texts, norm_texts))
-                                total_elems += len(norm_texts)
+                                for pred_text, target_text in zip(pred_texts, norm_texts):
+                                    correct_chars, total_chars = self.ComputeOcrCharMatchStats(
+                                        pred_text,
+                                        target_text)
+                                    total_char_correct += correct_chars
+                                    total_char_count += total_chars
 
                             split_loss += float((det_loss + rec_loss).item())
                             split_samples += 1
 
                 avg_split_loss = split_loss / max(1, split_samples)
-                split_acc = (total_correct / total_elems if total_elems > 0 else 0.0)
-                return avg_split_loss, split_acc
+                box_hmean = self.ComputeOcrHmean(box_tp, box_fp, box_fn) if trainDetection else 0.0
+                text_char_acc = (total_char_correct / max(1, total_char_count)) if trainRecognition else 0.0
+                return avg_split_loss, box_hmean, text_char_acc
 
             def BuildOCRCheckpointPayload(epochValue: int) -> Dict[str, Any]:
                 return {
@@ -1103,8 +1194,8 @@ class ManagerFunction:
                 for bi, batch in enumerate(train_dl, start=1):
                     imgs_b, boxes_b, texts_b, ignore_b = batch
                     sample_losses: List[torch.Tensor] = []
-                    batch_correct = 0
-                    batch_elems = 0
+                    batch_char_correct = 0
+                    batch_char_total = 0
                     latest_visual = None
 
                     for img, boxes, texts, ignore_flags in zip(imgs_b, boxes_b, texts_b, ignore_b):
@@ -1114,31 +1205,33 @@ class ManagerFunction:
                             texts,
                             ignoreFlags=ignore_flags,
                             char2Idx=engine.char2Idx,
-                            imageSize=BasicParameters.IMAGE_SIZE,
+                            imageSize=768,
                             targetH=32,
-                            maxW=256,
+                            maxW=512,
                             device=self.device,)
 
                         zero = sample["detect_img"].new_zeros(())
                         detect_img = sample["detect_img"].unsqueeze(0) # [1, 3, H, W]
                         det_loss = zero
+                        det_forward_out: Optional[Dict[str, torch.Tensor]] = None
                         if trainDetection:
                             gt_shrink = sample["gt_shrink"].unsqueeze(0) # [1, 1, H, W]
                             gt_thresh = sample["gt_thresh"].unsqueeze(0) # [1, 1, H, W]
                             gt_mask = sample["gt_mask"].unsqueeze(0) # [1, 1, H, W]
 
-                            det_out = engine.ForwardDetect(
+                            det_forward_out = engine.ForwardDetect(
                                 detect_img,
                                 gtShrink=gt_shrink,
                                 gtThresh=gt_thresh,
                                 gtMask=gt_mask,)
-                            det_loss = det_out["loss"] # []
+                            det_loss = det_forward_out["loss"] # []
 
                         rec_loss = zero # []
                         recog_imgs = sample["recog_imgs"] # [N_line, 1, targetH, maxW]
                         targets = sample["targets"] # [sum(target_lengths)]
                         target_lengths = sample["target_lengths"] # [N_line]
                         norm_texts = sample["norm_texts"]
+                        rec_forward_texts: List[str] = []
 
                         if trainRecognition and recog_imgs.size(0) > 0 and targets.numel() > 0:
                             rec_out = engine.ForwardRecognize(
@@ -1152,22 +1245,85 @@ class ManagerFunction:
                                     rec_out["log_probs"].detach(), # [T, N_line, C_vocab]
                                     idx2Char=engine.idx2Char,
                                     blankIndex=engine.blankIndex,)
-                                pred_texts = [txt for txt, _ in pairs]
-                                batch_correct += sum(int(pred == target) for pred, target in zip(pred_texts, norm_texts))
-                                batch_elems += len(norm_texts)
+                                rec_forward_texts = [txt for txt, _ in pairs]
+                                for pred_text, target_text in zip(rec_forward_texts, norm_texts):
+                                    correct_chars, total_chars = self.ComputeOcrCharMatchStats(
+                                        pred_text,
+                                        target_text)
+                                    batch_char_correct += correct_chars
+                                    batch_char_total += total_chars
 
                         pred_ocr_items: List[Dict[str, Any]] = []
                         pred_ocr_texts: List[str] = []
-                        with torch.no_grad():
-                            pred_ocr_batch = engine(detect_img.detach())
-                            if pred_ocr_batch:
-                                pred_ocr_items = pred_ocr_batch[0]
-                            pred_ocr_texts = [
-                                str(item.get("text", "")).strip()
-                                for item in pred_ocr_items
-                                if str(item.get("text", "")).strip() != ""]
-
                         if self.controller.IsVisualStateEnabled():
+                            with torch.no_grad():
+                                if det_forward_out is None:
+                                    det_forward_out = engine.ForwardDetect(detect_img.detach())
+
+                                prob_map_vis = det_forward_out["prob_map"].detach()
+                                bin_map_vis = det_forward_out["bin_map"].detach()
+                                pm_np = prob_map_vis[0].cpu().squeeze(0).numpy()
+                                h_map, w_map = pm_np.shape
+                                forward_boxes = engine.BitmapToBoxes(
+                                    bin_map_vis[0],
+                                    threshValue=0.3,
+                                    minArea=10)
+
+                                for box in forward_boxes:
+                                    x1, y1, x2, y2 = [int(v) for v in box.tolist()]
+                                    x1 = max(0, x1)
+                                    y1 = max(0, y1)
+                                    x2 = min(w_map, x2)
+                                    y2 = min(h_map, y2)
+                                    region = pm_np[y1:y2, x1:x2]
+                                    det_score = float(region.mean()) if region.size != 0 else 0.0
+                                    pred_ocr_items.append({
+                                        "box": (x1, y1, x2, y2),
+                                        "text": "",
+                                        "det_score": float(det_score),
+                                        "score": float(det_score),})
+
+                                restored_pred_box_items = self.RestoreOcrItemsToOriginal(
+                                    pred_ocr_items,
+                                    sample["resize_meta"])
+                                pred_ocr_texts.append("Forward boxes:")
+                                if restored_pred_box_items:
+                                    for item in restored_pred_box_items:
+                                        box_value = item.get("box", None)
+                                        det_score = float(item.get("det_score", 0.0))
+                                        if isinstance(box_value, (list, tuple)) and len(box_value) == 4:
+                                            x1, y1, x2, y2 = [int(v) for v in box_value]
+                                            pred_ocr_texts.append(
+                                                f"[{x1}, {y1}, {x2}, {y2}] det={det_score:.3f}")
+                                else:
+                                    pred_ocr_texts.append("<empty>")
+
+                                pred_ocr_texts.append("Forward texts:")
+                                rec_forward_items: List[Dict[str, Any]] = []
+                                for box, text_value in zip(sample["rec_boxes"], rec_forward_texts):
+                                    x1, y1, x2, y2 = [int(v) for v in box.tolist()]
+                                    rec_forward_items.append({
+                                        "box": (x1, y1, x2, y2),
+                                        "text": str(text_value).strip(),})
+
+                                restored_rec_forward_items = self.RestoreOcrItemsToOriginal(
+                                    rec_forward_items,
+                                    sample["resize_meta"])
+                                if restored_rec_forward_items:
+                                    for item, target_text in zip(restored_rec_forward_items, norm_texts):
+                                        box_value = item.get("box", None)
+                                        pred_text = str(item.get("text", "")).strip()
+                                        display_text = pred_text if pred_text != "" else "<blank>"
+                                        if isinstance(box_value, (list, tuple)) and len(box_value) == 4:
+                                            x1, y1, x2, y2 = [int(v) for v in box_value]
+                                            pred_ocr_texts.append(
+                                                f"[{x1}, {y1}, {x2}, {y2}] pred={display_text} | gt={target_text}")
+                                        else:
+                                            pred_ocr_texts.append(
+                                                f"pred={display_text} | gt={target_text}")
+                                else:
+                                    pred_ocr_texts.append("<empty>")
+
                             latest_visual = self.BuildVisualPayload(
                                 img,
                                 ocrTexts=pred_ocr_texts,
@@ -1184,11 +1340,11 @@ class ManagerFunction:
                         continue
 
                     loss = torch.stack(sample_losses).mean() # []
-                    rec_acc = (batch_correct / batch_elems) if batch_elems > 0 else 0.0
+                    train_text_char_acc = (batch_char_correct / max(1, batch_char_total)) if trainRecognition else 0.0
 
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(engine.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(engine.parameters(), 3.0)
                     optimizer.step()
 
                     previous_processed_sample_count_total = processed_sample_count_total
@@ -1213,7 +1369,7 @@ class ManagerFunction:
 
                     self.controller.SetStatus(
                         "training",(
-                            f"OCR training... rec_acc={rec_acc:.3f}"
+                            f"OCR training... text_char_acc={train_text_char_acc:.3f}"
                             if trainRecognition else
                             "OCR training..."),
                         **status_kwargs)
@@ -1224,30 +1380,67 @@ class ManagerFunction:
                     self.WaitWhilePaused("OCR training paused")
 
                 avg_train = epoch_loss / max(1, nb)
-                avg_val, val_acc = eval_split(val_dl)
-                test_loss, test_acc = eval_split(test_dl)
+                should_validate = (((ep + 1) % validation_interval) == 0) or ((ep + 1) == epochs)
+                if should_validate:
+                    avg_val, val_box_hmean, val_text_char_acc = eval_split(val_dl)
+                    test_loss, test_box_hmean, test_text_char_acc = eval_split(test_dl)
 
-                improved = (best_val - avg_val) > min_delta
-                if improved:
-                    best_val = avg_val
-                    no_improve = 0
-                    SaveOCRTrainingArtifacts(ep + 1)
+                    improved = (best_val - avg_val) > min_delta
+                    if improved:
+                        best_val = avg_val
+                        no_improve = 0
+                        SaveOCRTrainingArtifacts(ep + 1)
+                    else:
+                        no_improve += 1
+
+                    self.controller.SetStatus(
+                        "training",(
+                            f"OCR epoch {ep+1}/{epochs} done | "
+                            f"train {avg_train:.4f} | "
+                            f"val_loss {avg_val:.4f}, "
+                            f"val_box_hmean={(f'{float(val_box_hmean):.3f}' if trainDetection else 'n/a')}, "
+                            f"val_text_char_acc={(f'{float(val_text_char_acc):.3f}' if trainRecognition else 'n/a')} | "
+                            f"test_loss {test_loss:.4f}, "
+                            f"test_box_hmean={(f'{float(test_box_hmean):.3f}' if trainDetection else 'n/a')}, "
+                            f"test_text_char_acc={(f'{float(test_text_char_acc):.3f}' if trainRecognition else 'n/a')}"),
+                        epoch=ep + 1,
+                        total_epochs=epochs,
+                        val_loss=avg_val,)
+
+                    loss_stabilized = (no_improve >= patience)
+                    box_metric_ready = (
+                        (not trainDetection)
+                        or (val_box_hmean >= box_metric_threshold and test_box_hmean >= box_metric_threshold))
+                    text_metric_ready = (
+                        (not trainRecognition)
+                        or (val_text_char_acc >= text_metric_threshold and test_text_char_acc >= text_metric_threshold))
+
+                    if loss_stabilized and box_metric_ready and text_metric_ready:
+                        if trainDetection and trainRecognition:
+                            completion_msg = (
+                                "OCR validation loss stabilized and both box_hmean/text_char_acc "
+                                "reached threshold on val/test, early stop.")
+                        elif trainDetection:
+                            completion_msg = (
+                                "OCR validation loss stabilized and box_hmean reached threshold "
+                                "on val/test, early stop.")
+                        else:
+                            completion_msg = (
+                                "OCR validation loss stabilized and text_char_acc reached threshold "
+                                "on val/test, early stop.")
+                        self.controller.SetStatus("completed", completion_msg)
+                        break
                 else:
-                    no_improve += 1
-
-                self.controller.SetStatus(
-                    "training",(
-                        f"OCR epoch {ep+1}/{epochs} done | "
-                        f"train {avg_train:.4f} | "
-                        f"val {avg_val:.4f}, acc={val_acc:.3f} | "
-                        f"test {test_loss:.4f}, acc={test_acc:.3f}"),
-                    epoch=ep + 1,
-                    total_epochs=epochs,
-                    val_loss=avg_val,)
-
-                if no_improve >= patience:
-                    self.controller.SetStatus("completed", "OCR validation stabilized, early stop.")
-                    break
+                    next_eval_epoch = min(epochs, (((ep + 1) // validation_interval) + 1) * validation_interval)
+                    self.controller.SetStatus(
+                        "training",
+                        (
+                            f"OCR epoch {ep+1}/{epochs} done | "
+                            f"train {avg_train:.4f} | "
+                            f"validation skipped (interval={validation_interval}, next={next_eval_epoch})"
+                        ),
+                        epoch=ep + 1,
+                        total_epochs=epochs,)
 
                 if self.controller.ShouldStop():
                     self.controller.SetStatus("stopped", "OCR training stopped")
@@ -1288,7 +1481,7 @@ class ManagerFunction:
             for p in engine.recognizer.parameters():
                 p.requires_grad = True
 
-            optimizer = torch.optim.Adam(engine.recognizer.parameters(), lr=1e-3)
+            optimizer = torch.optim.Adam(engine.recognizer.parameters(), lr=3e-4)
 
             start_epoch = 0
             best_val = float("inf")
@@ -1299,11 +1492,12 @@ class ManagerFunction:
             if resume and Path(ckptPath).exists():
                 start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds = self.LoadOCRRecognizerCheckpoint(
                     engine, optimizer, ds, ckptPath)
-                self.ApplyParameterOverrideAfterResume(
-                    enabled=overrideCheckpointWithModuleParams,
-                    parameterPath=outPath,
-                    loadFn=lambda path: self.LoadRecognizerWeightsIntoEngine(engine, path),
-                    logPrefix="TrainOCRRec")
+                
+            self.ApplyParameterOverrideAfterResume(
+                enabled=overrideCheckpointWithModuleParams,
+                parameterPath=outPath,
+                loadFn=lambda path: self.LoadRecognizerWeightsIntoEngine(engine, path),
+                logPrefix="TrainOCRRec")
 
             train_ds, val_ds, test_ds = self.SplitDataset(
                 ds,
@@ -1355,7 +1549,7 @@ class ManagerFunction:
                                 ignoreFlag=ignore_flag,
                                 char2Idx=engine.char2Idx,
                                 targetH=32,
-                                maxW=256,
+                                maxW=512,
                                 device=self.device,)
 
                             recog_imgs = sample["recog_imgs"] # [N_line, 1, targetH, maxW]
@@ -1441,7 +1635,7 @@ class ManagerFunction:
                             ignoreFlag=ignore_flag,
                             char2Idx=engine.char2Idx,
                             targetH=32,
-                            maxW=256,
+                            maxW=512,
                             device=self.device,)
 
                         recog_imgs = sample["recog_imgs"] # [N_line, 1, targetH, maxW]
@@ -1486,7 +1680,7 @@ class ManagerFunction:
 
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(engine.recognizer.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(engine.recognizer.parameters(), 3.0)
                     optimizer.step()
 
                     previous_processed_sample_count_total = processed_sample_count_total
@@ -1600,11 +1794,12 @@ class ManagerFunction:
 
             if resume and Path(ckptPath).exists():
                 start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds = self.LoadCheckpoint(brain, agent, ds, ckptPath)
-                self.ApplyParameterOverrideAfterResume(
-                    enabled=overrideCheckpointWithModuleParams,
-                    parameterPath=outPath,
-                    loadFn=lambda path: self.LoadBrainWeights(brain, path),
-                    logPrefix="Train")
+                
+            self.ApplyParameterOverrideAfterResume(
+                enabled=overrideCheckpointWithModuleParams,
+                parameterPath=outPath,
+                loadFn=lambda path: self.LoadBrainWeights(brain, path),
+                logPrefix="Train")
 
             train_ds, val_ds, test_ds = self.SplitDataset(
                 ds,

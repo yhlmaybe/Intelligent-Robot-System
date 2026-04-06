@@ -46,7 +46,7 @@ class BasicParameters:
 
     CONSCIOUSNESSTEM = 1 * 1024
 
-    SAVE_EVERY_SAMPLE_COUNT = 2000
+    SAVE_EVERY_SAMPLE_COUNT = 500
 
     DATA_ROOT_PATH = "BrainDeepLearn/Data"
     OCR_DATA_ROOT_PATH = "BrainDeepLearn/Data/OCR"

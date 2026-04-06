@@ -239,7 +239,7 @@ class DBLoss(nn.Module):
         self,
         lambdaProb: float = 1.0,
         lambdaBin: float = 1.0,
-        lambdaThresh: float = 10.0,):
+        lambdaThresh: float = 1.0,):
         super().__init__()
         self.lambdaProb = float(lambdaProb)
         self.lambdaBin = float(lambdaBin)
@@ -395,7 +395,7 @@ class OCREngineExtractor(nn.Module):
     def __init__(
         self,
         vocabCharsPath: str = "/home/yhl/Documents/Intelligent-Robot-System/BrainDeepLearn/ModuleSetting/OCRKeys.txt",
-        dbK: float = 50.0,
+        dbK: float = 15.0,
         *,
         temporalSteps: int = 0, 
         fuseTopK: int = 8,
@@ -537,7 +537,7 @@ class OCREngineExtractor(nn.Module):
         imageTensor: torch.Tensor,
         boxes: List[np.ndarray],
         targetH: int = 32,
-        maxW: int = 256,) -> torch.Tensor:
+        maxW: int = 512,) -> torch.Tensor:
 
         c, h_img, w_img = imageTensor.shape
 
@@ -614,7 +614,7 @@ class OCREngineExtractor(nn.Module):
             boxes = self.BitmapToBoxes(bm, threshValue=binThresh, minArea=minBoxArea)
 
             if len(boxes) != 0:
-                line_imgs = self.CropAndResizeLines(img, boxes, targetH=32, maxW=256)
+                line_imgs = self.CropAndResizeLines(img, boxes, targetH=32, maxW=512)
 
                 if line_imgs.size(0) != 0:
                     rec_out = self.recognizer(line_imgs)
