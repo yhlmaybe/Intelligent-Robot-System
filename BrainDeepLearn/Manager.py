@@ -121,6 +121,7 @@ class ModuleController:
             return self.visual_state_enabled
 
 
+
 class ManagerFunction:
     def __init__(self, device: Optional[str] = None):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -130,6 +131,7 @@ class ManagerFunction:
         self.message_thread: Optional[threading.Thread] = None
         self.is_begin = False
         self.overrideCheckpointWithModuleParams = True
+        self.agent_handle: Optional[AgentHandle] = None
 
         self.test = {
             "perception": TestPerceptionMTool(),
@@ -141,6 +143,51 @@ class ManagerFunction:
             "consciousness": TestConsciousMTool(),
             "OCR": TestOCRMTool(),
             "intention": TestIntentionMTool(),}
+        
+    def InitAgentHnandle(self):
+        self.agent_handle = AgentHandle()
+        return True
+
+    def AgentHandleForward(
+        self,
+        cameraIndex: int = 0,
+        reward: Optional[float] = None,
+        done: Optional[float] = None,
+        textExt: Optional[List[Optional[str]]] = None,
+        sampleActions: bool = True,
+        deterministicActor: bool = False,):
+        if self.agent_handle is None:
+            raise RuntimeError("agent_handle has not been initialized")
+        if iio is None:
+            raise RuntimeError("imageio.v3 cant use")
+
+        frame_np = iio.imread(f"<video{int(cameraIndex)}>", index=0)
+        if frame_np is None:
+            raise RuntimeError(f"cannot read frame from camera {int(cameraIndex)}")
+
+        converted = DataPreprocessor.ConvertCppCameraFrame(
+            bitmap=frame_np,
+            reward=reward,
+            done=done,
+            device=self.device,
+            needVisualState=False,)
+
+        act_out = self.agent_handle.ForwardStep(
+            converted["frames"],
+            textExt=textExt,
+            reward=converted["rewards"],
+            done=converted["dones"],
+            sampleActions=sampleActions,
+            deterministicActor=deterministicActor,)
+        return self.agent_handle.agent.UnpackActPacked(act_out)
+
+    def ResteAgentHandleHebbian(self):
+        if self.agent_handle is None:
+            raise RuntimeError("agent_handle has not been initialized")
+        
+        self.agent_handle.agent.ResetHebbianMemory()
+        return True
+
 
     def SetBasicParameters(self, name: str, value: str):
         if self.is_begin:
@@ -1958,7 +2005,11 @@ class ManagerFunction:
                     if act_out is None:
                         continue
 
-                    key_pred, click_pred, mouse_move_pred, model_loss, ocr_items = act_out
+                    key_pred = act_out["keys"]
+                    click_pred = act_out["mouse_clicks"]
+                    mouse_move_pred = act_out["mouse_move"]
+                    model_loss = act_out["loss"]
+                    ocr_items = act_out["OCR"]
                     bc_loss, _, _ = compute_supervised_loss_and_metrics(
                         key_pred,
                         click_pred,
@@ -2083,7 +2134,11 @@ class ManagerFunction:
                             if act_out is None:
                                 continue
 
-                            v_key_pred, v_click_pred, v_mouse_move_pred, v_model_loss, ocr_items = act_out
+                            v_key_pred = act_out["keys"]
+                            v_click_pred = act_out["mouse_clicks"]
+                            v_mouse_move_pred = act_out["mouse_move"]
+                            v_model_loss = act_out["loss"]
+                            ocr_items = act_out["OCR"]
                             bc_loss, correct, elems = compute_supervised_loss_and_metrics(
                                 v_key_pred,
                                 v_click_pred,
@@ -2280,7 +2335,10 @@ class ManagerFunction:
                     if act_out is None:
                         continue
 
-                    keys, clicks, mouse, ocr_items = act_out
+                    keys = act_out["keys"]
+                    clicks = act_out["mouse_clicks"]
+                    mouse = act_out["mouse_move"]
+                    ocr_items = act_out["OCR"]
 
                     kv = keys[0].detach().cpu()
                     ck = clicks[0].detach().cpu()
@@ -2924,3 +2982,63 @@ class ManagerFunction:
             print(f"DeployModule failed with error: {e}")
             print(f"Traceback: {traceback.format_exc()}")
             raise
+
+
+class AgentHandle:
+    def __init__(
+        self,
+        *,
+        brainParameterPath: str = BasicParameters.MODULEPARAMETER_PATH,
+        device: Optional[str] = None,
+        worldMemoryPath: str = BasicParameters.WORLD_MEMORY_PATH,
+        memMemoryPath: str = BasicParameters.MEMORY_MEMORY_PATH,
+        seqLen: int = BasicParameters.IMAGE_SEQ_LEN,
+        plasticHebbian: bool = True,
+        prioritizeExtStr: bool = True,
+        usePlanner: bool = True,
+        saveModuleMessagerOutput: bool = True,):
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+        parameter_path = str(brainParameterPath).strip()
+        if parameter_path == "":
+            raise ValueError("brainParameterPath must not be empty")
+
+        resolved_path = Path(parameter_path)
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"brain parameter file not found: {resolved_path}")
+
+        self.brain = BrainCore(
+            device=self.device,
+            seqLen=seqLen,
+            plasticHebbian=plasticHebbian,
+            prioritizeExtStr=prioritizeExtStr,
+            plasticOnlineLearning=False,
+            usePlanner=usePlanner,
+            saveModuleMessagerOutput=saveModuleMessagerOutput,)
+
+        self.agent = Agent(
+            self.brain,
+            isTrain=False,
+            device=self.device,
+            worldMemoryPath=worldMemoryPath,
+            memMemoryPath=memMemoryPath)
+
+        self.agent.LoadBrainWeights(str(resolved_path))
+        self.brain.eval()
+
+    def ForwardStep(
+        self,
+        frame: torch.Tensor,
+        *,
+        textExt: Optional[List[Optional[str]]] = None,
+        reward: Optional[int] = None,
+        done: Optional[int] = None,
+        sampleActions: bool = True,
+        deterministicActor: bool = False,):
+        return self.agent.Act(
+            frame,
+            textExt=textExt,
+            reward=reward,
+            done=done,
+            sampleActions=sampleActions,
+            deterministicActor=deterministicActor,)

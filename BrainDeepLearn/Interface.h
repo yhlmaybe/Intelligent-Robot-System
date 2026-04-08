@@ -107,7 +107,6 @@
         return ok; \
     }())
 
-
 class BrainDeepLearnInterface 
 {
 public:
@@ -142,6 +141,12 @@ public:
     bool Resume();
 
     bool ResetHebbianMemory();
+
+    bool InitAgentHnandle();
+
+    bool AgentHandleForward(StatusValue& result, int cameraIndex = 0, double reward = 0.0, double done = 0.0);
+
+    bool ResteAgentHandleHebbian();
 
     bool RunPythonAsync(PyTask task);
 

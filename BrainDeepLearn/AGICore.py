@@ -3,6 +3,7 @@ from typing import Tuple, List, Dict, Any, Optional, Union
 import threading
 import random
 import ast
+import json
 
 import numpy as np
 import torch
@@ -503,6 +504,7 @@ class BrainCore(nn.Module):
             ocrTexts=fuse_ocr,
             extTexts=textExt,
             prioritizeExt=self.prioritize_ext_str,) # [B, D_intent], [B, K_sym], Dict[str, Tensor]
+        intention_texts = [] if intention_extras is None else intention_extras.get("recall_texts", [])
         saveModuleOutput("Intention", {
             "intent_sem": intent_sem,
             "sym_probs": sym_probs,
@@ -610,6 +612,7 @@ class BrainCore(nn.Module):
             "critic": critic_out,
             "features": {"perc": percs_seq, "attn": atten_out, "mem": mem_feat}, # perc:[B, T, D_perc], attn:[B, D_attn], mem:[B, D_mem]
             "OCR": ocr_items,
+            "intention_texts": intention_texts,
             "losses": losses}
         
 
@@ -1032,7 +1035,7 @@ class Agent:
         if done is not None:
             done = done.to(self.device)
 
-        def pack_action(decision_out: Dict[str, Any]):
+        def build_action_output(decision_out: Dict[str, Any]) -> Dict[str, Any]:
             mouse_head = decision_out["mouse"]
             kb_head = decision_out["keyboard"]
 
@@ -1040,27 +1043,84 @@ class Agent:
                 keys = kb_head["keys_act"] # [B, K_key]
                 clicks = mouse_head["click_sample"] # [B, 2]
                 mouse = mouse_head["a"] # [B, 2]
-                return keys, clicks, mouse
+            else:
+                keys = (torch.sigmoid(kb_head["keys_logits"]) > 0.5).float() # [B, K_key]
+                clicks = (torch.sigmoid(mouse_head["click_logits"]) > 0.5).float() # [B, 2]
+                mouse = mouse_head["mu"] # [B, 2]
 
-            keys = (torch.sigmoid(kb_head["keys_logits"]) > 0.5).float() # [B, K_key]
-            clicks = (torch.sigmoid(mouse_head["click_logits"]) > 0.5).float() # [B, 2]
-            mouse = mouse_head["mu"] # [B, 2]
-            return keys, clicks, mouse
+            return {
+                "keys": keys,
+                "mouse_clicks": clicks,
+                "mouse_move": mouse,}
 
         if self.is_train:
             step_out = self.brain.Step(frame,textExt,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
             if step_out is None: return None
-            total_loss = step_out["losses"]["total_loss"]
-            packed = pack_action(step_out["decision"])
-
-            return (*packed, total_loss, step_out["OCR"])
+            act_out = build_action_output(step_out["decision"])
+            act_out["loss"] = step_out["losses"]["total_loss"]
+            act_out["OCR"] = step_out["OCR"]
+            act_out["intention_texts"] = step_out.get("intention_texts", [])
+            return act_out
         else:  
             with torch.no_grad():  
                 step_out = self.brain.Step(frame,textExt,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
                 if step_out is None: return None
-                packed = pack_action(step_out["decision"])
+                act_out = build_action_output(step_out["decision"])
+                act_out["loss"] = None
+                act_out["OCR"] = step_out["OCR"]
+                act_out["intention_texts"] = step_out.get("intention_texts", [])
+                return act_out
 
-                return (*packed, step_out["OCR"])
+
+    def UnpackActPacked(self, actOut: Optional[Dict[str, Any]]) -> str:
+        key_names: List[str] = []
+        mouse_clicks: List[str] = []
+        mouse_move: Optional[Dict[str, float]] = None
+        intention_texts: List[str] = []
+
+        if actOut is None:
+            return json.dumps({
+                "key_names": key_names,
+                "mouse_clicks": mouse_clicks,
+                "mouse_move": mouse_move,
+                "intention_texts": intention_texts,}, ensure_ascii=False)
+
+        keys_tensor = actOut.get("keys")
+        clicks_tensor = actOut.get("mouse_clicks")
+        mouse_tensor = actOut.get("mouse_move")
+        intention_texts_value = actOut.get("intention_texts")
+
+        keys_tensor = keys_tensor.detach().float().cpu() if keys_tensor is not None else None
+        clicks_tensor = clicks_tensor.detach().float().cpu() if clicks_tensor is not None else None
+        mouse_tensor = mouse_tensor.detach().float().cpu() if mouse_tensor is not None else None
+
+        if isinstance(intention_texts_value, list):
+            intention_texts = [str(item) for item in intention_texts_value]
+        elif intention_texts_value is not None:
+            intention_texts = [str(intention_texts_value)]
+
+        index_to_key = {int(key_index): str(key_name) for key_name, key_index in RAW_KEYBOARD_LAYOUT.items()}
+
+        if keys_tensor is not None:
+            active_indices = (keys_tensor[0] > 0.5).nonzero(as_tuple=False).view(-1).tolist()
+            key_names = [index_to_key[int(idx)] for idx in active_indices if int(idx) in index_to_key]
+
+        if clicks_tensor is not None:
+            if float(clicks_tensor[0, 0].item()) > 0.5:
+                mouse_clicks.append("left")
+            if float(clicks_tensor[0, 1].item()) > 0.5:
+                mouse_clicks.append("right")
+
+        if mouse_tensor is not None:
+            mouse_move = {
+                "x": float(mouse_tensor[0, 0].item()),
+                "y": float(mouse_tensor[0, 1].item()),}
+
+        return json.dumps({
+            "key_names": key_names,
+            "mouse_clicks": mouse_clicks,
+            "mouse_move": mouse_move,
+            "intention_texts": intention_texts,}, ensure_ascii=False)
 
 
     def Save(self, path: str):

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Tuple, Dict, Optional
+from typing import Any, List, Tuple, Dict, Optional
 from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear, RoPEMultiheadAttention
 
 import copy
@@ -1533,7 +1533,7 @@ class IntentionExtractor(AGICoreModule):
         ocrTexts: Optional[List[List[str]]] = None,
         extTexts: Optional[List[Optional[str]]] = None,
         *,
-        prioritizeExt: bool = False,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        prioritizeExt: bool = False,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, Any]]:
 
         device = self.device
         batch_size = self.InferBatchSize(selfState, intentState, ocrTexts, extTexts)
@@ -1548,7 +1548,7 @@ class IntentionExtractor(AGICoreModule):
             batchSize=batch_size,
             device=device,) # cons_sem: [B, D]
         
-        extras: Dict[str, torch.Tensor] = dict(cons_extras)
+        extras: Dict[str, Any] = dict(cons_extras)
         if cons_sem is not None:
             extras["cons_sem"] = cons_sem.detach()
 
@@ -1750,46 +1750,27 @@ class IntentionExtractor(AGICoreModule):
                 hasOcrMask=has_ocr_mask,
                 semExt=sem_ext,
                 hasExtMask=has_ext_mask,)
-            
-            extras.update(self.RunRecallFromSemantic(
+
+            recall_output = self.RunRecallFromSemantic(
                 recallSem=recall_sem_train,
                 recallSemValid=recall_sem_valid,
                 batchSize=batch_size,
                 ocrTexts=ocrTexts,
                 extTexts=extTexts,
-                device=device,))
+                device=device,)
+            extras.update(recall_output)
+
+            recall_pred_ids_train = recall_output.get("recall_pred_ids")
+            if recall_pred_ids_train is not None:
+                recall_pred_flat = recall_pred_ids_train.reshape(recall_pred_ids_train.size(0), -1)
+                extras["recall_texts"] = self.TokenIdsToTexts(recall_pred_flat)
+            else:
+                extras["recall_texts"] = []
         else:
-            recall_pred_ids, _ = self.RecallGenerateFromSemantic(
+            _, recall_texts = self.RecallGenerateFromSemantic(
                 intentSem,
                 maxLen=self.recall_safety_max_len,)
-            
-            recall_targets = self.BuildRecallTargetsFromGenerated(
-                recall_pred_ids,
-                stride=self.max_seq_len,) # [B, N, T]
-            
-            recall_target_valid = recall_targets.ne(self.pad_idx).any(dim=-1) # [B, N]
-            recall_mem = intentSem.unsqueeze(1) # [B, 1, D]
-            recall_valid_sem = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
-
-            recall_logits, recall_hidden, recall_has_sem = self.DecodeRecallChunked(
-                recallSem=recall_mem,
-                recallSemValid=recall_valid_sem,
-                recallTargets=recall_targets,)
-            
-            recall_valid = recall_target_valid & recall_has_sem
-            recall_cond = intentSem.unsqueeze(1).expand(batch_size, recall_targets.size(1), self.dimSem)
-
-            self.CacheRecallState(
-                recallLogits=recall_logits,
-                recallHidden=recall_hidden,
-                recallTargets=recall_targets,
-                recallValid=recall_valid,
-                consSem=recall_cond,)
-                
-            extras["recall_logits"] = recall_logits.detach()
-            extras["recall_targets"] = recall_targets.detach()
-            extras["recall_valid"] = recall_valid.detach()
-            extras["recall_pred_ids"] = recall_pred_ids.detach()
+            extras["recall_texts"] = recall_texts
 
         return intentSem, symProbs, extras
 

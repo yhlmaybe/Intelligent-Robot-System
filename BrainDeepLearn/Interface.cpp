@@ -276,6 +276,21 @@ bool BrainDeepLearnInterface::ResetHebbianMemory()
     });
 }
 
+bool BrainDeepLearnInterface::InitAgentHnandle()
+{
+    return CALL_METHOD_NOARG("InitAgentHnandle");
+}
+
+bool BrainDeepLearnInterface::AgentHandleForward(StatusValue& result, int cameraIndex, double reward, double done)
+{
+    return CALL_METHOD_RET_STATUSVALUE(result, "AgentHandleForward", "idd", cameraIndex, reward, done);
+}
+
+bool BrainDeepLearnInterface::ResteAgentHandleHebbian()
+{
+    return CALL_METHOD_NOARG("ResteAgentHandleHebbian");
+}
+
 bool BrainDeepLearnInterface::RunPythonAsync(PyTask task)
 {
     if (brThreadRunning.load(std::memory_order_acquire)) 

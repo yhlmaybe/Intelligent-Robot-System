@@ -479,6 +479,33 @@ class DataPreprocessor:
             "dones": convert_tensor(done),}
 
     @staticmethod
+    def ConvertCppCameraFrame(
+        bitmap: Union[List[Any], np.ndarray, torch.Tensor],
+        reward: Optional[float],
+        done: Optional[float],
+        *,
+        device: Optional[torch.device] = None,
+        needVisualState: bool = False,) -> Dict[str, Any]:
+        if isinstance(bitmap, torch.Tensor):
+            bitmap_value: Union[np.ndarray, torch.Tensor] = bitmap
+        else:
+            bitmap_value = np.asarray(bitmap)
+
+        reward_value = None if reward is None else np.asarray([float(reward)], dtype=np.float32)
+        done_value = None if done is None else np.asarray([float(done)], dtype=np.float32)
+
+        return DataPreprocessor.ConvertNpImagesKeysMouses(
+            imgs=bitmap_value,
+            keys=None,
+            mouseClick=None,
+            mouseMove=None,
+            reward=reward_value,
+            done=done_value,
+            size=(BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE),
+            device=device,
+            needVisualState=needVisualState,)
+
+    @staticmethod
     def CropAndResizeLineImages(
         imageTensor: torch.Tensor,
         boxes: Union[np.ndarray, torch.Tensor],
