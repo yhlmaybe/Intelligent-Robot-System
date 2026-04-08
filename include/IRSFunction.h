@@ -34,6 +34,7 @@ namespace IRSThreadTools
         T pop();
         void stop();
         void reset();
+        void clearandpush(const T &item);
 
     private:
         std::queue<T> queue_;
@@ -80,6 +81,17 @@ namespace IRSThreadTools
         stopped_ = false;
         while (!queue_.empty())
             queue_.pop();
+    }
+
+    template <typename T>
+    void ThreadSafeQueue<T>::clearandpush(const T &item)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopped_ = false;
+        while (!queue_.empty())
+            queue_.pop();
+        queue_.push(item);
+        cond_.notify_one();
     }
 
     class IRSThreadBase

@@ -1,5 +1,230 @@
 #include "Interface.h"
 
+namespace
+{
+    struct JsonQueueObj
+    {
+        PyObject_HEAD
+        IRSThreadTools::ThreadSafeQueue<std::string>* queue;
+        bool valid;
+    };
+
+    static void JsonQueueDealloc(JsonQueueObj* self)
+    {
+        if (self)
+        {
+            self->valid = false;
+        }
+        Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
+    }
+
+    static bool JsonValueToString(PyObject* value, std::string& jsonText)
+    {
+        if (!value)
+        {
+            return false;
+        }
+
+        if (PyUnicode_Check(value))
+        {
+            const char* text = PyUnicode_AsUTF8(value);
+            if (!text)
+            {
+                return false;
+            }
+            jsonText = text;
+            return true;
+        }
+
+        PyObject* jsonModule = PyImport_ImportModule("json");
+        if (!jsonModule)
+        {
+            return false;
+        }
+
+        PyObject* dumped = PyObject_CallMethod(jsonModule, "dumps", "O", value);
+        Py_DECREF(jsonModule);
+        if (!dumped)
+        {
+            return false;
+        }
+
+        const char* text = PyUnicode_AsUTF8(dumped);
+        if (!text)
+        {
+            Py_DECREF(dumped);
+            return false;
+        }
+
+        jsonText = text;
+        Py_DECREF(dumped);
+        return true;
+    }
+
+    static PyObject* JsonQueuePush(JsonQueueObj* self, PyObject* args)
+    {
+        if (!self || !self->valid || !self->queue)
+        {
+            Py_RETURN_FALSE;
+        }
+
+        PyObject* value = nullptr;
+        if (!PyArg_ParseTuple(args, "O", &value))
+        {
+            return nullptr;
+        }
+
+        std::string jsonText;
+        if (!JsonValueToString(value, jsonText))
+        {
+            return nullptr;
+        }
+
+        self->queue->push(jsonText);
+        Py_RETURN_TRUE;
+    }
+
+    static PyObject* JsonQueueStop(JsonQueueObj* self, PyObject*)
+    {
+        if (!self || !self->valid || !self->queue)
+        {
+            Py_RETURN_FALSE;
+        }
+
+        self->queue->stop();
+        Py_RETURN_TRUE;
+    }
+
+    static PyObject* JsonQueueReset(JsonQueueObj* self, PyObject*)
+    {
+        if (!self || !self->valid || !self->queue)
+        {
+            Py_RETURN_FALSE;
+        }
+
+        self->queue->reset();
+        Py_RETURN_TRUE;
+    }
+
+    static PyObject* JsonQueueClearAndPush(JsonQueueObj* self, PyObject* args)
+    {
+        if (!self || !self->valid || !self->queue)
+        {
+            Py_RETURN_FALSE;
+        }
+
+        PyObject* value = nullptr;
+        if (!PyArg_ParseTuple(args, "O", &value))
+        {
+            return nullptr;
+        }
+
+        std::string jsonText;
+        if (!JsonValueToString(value, jsonText))
+        {
+            return nullptr;
+        }
+
+        self->queue->clearandpush(jsonText);
+        Py_RETURN_TRUE;
+    }
+
+    static PyMethodDef JsonQueueMethods[] = {
+        {"push", reinterpret_cast<PyCFunction>(JsonQueuePush), METH_VARARGS, nullptr},
+        {"clearandpush", reinterpret_cast<PyCFunction>(JsonQueueClearAndPush), METH_VARARGS, nullptr},
+        {"stop", reinterpret_cast<PyCFunction>(JsonQueueStop), METH_NOARGS, nullptr},
+        {"reset", reinterpret_cast<PyCFunction>(JsonQueueReset), METH_NOARGS, nullptr},
+        {nullptr, nullptr, 0, nullptr}
+    };
+
+    static PyTypeObject JsonQueueType =
+        {
+            PyVarObject_HEAD_INIT(NULL, 0) /* ob_base */
+            nullptr,                       /* tp_name */
+            sizeof(JsonQueueObj),         /* tp_basicsize */
+            0,                           /* tp_itemsize */
+            0,                           /* tp_dealloc */
+            0,                           /* tp_vectorcall_offset / tp_print */
+            0,                           /* tp_getattr */
+            0,                           /* tp_setattr */
+            0,                           /* tp_as_async */
+            0,                           /* tp_repr */
+            0,                           /* tp_as_number */
+            0,                           /* tp_as_sequence */
+            0,                           /* tp_as_mapping */
+            0,                           /* tp_hash */
+            0,                           /* tp_call */
+            0,                           /* tp_str */
+            0,                           /* tp_getattro */
+            0,                           /* tp_setattro */
+            0,                           /* tp_as_buffer */
+            Py_TPFLAGS_DEFAULT,          /* tp_flags */
+            "C++ backed JSON queue",     /* tp_doc */
+            0,                           /* tp_traverse */
+            0,                           /* tp_clear */
+            0,                           /* tp_richcompare */
+            0,                           /* tp_weaklistoffset */
+            0,                           /* tp_iter */
+            0,                           /* tp_iternext */
+            0,                           /* tp_methods */
+            0,                           /* tp_members */
+            0,                           /* tp_getset */
+            0,                           /* tp_base */
+            0,                           /* tp_dict */
+            0,                           /* tp_descr_get */
+            0,                           /* tp_descr_set */
+            0,                           /* tp_dictoffset */
+            0,                           /* tp_init */
+            0,                           /* tp_alloc */
+            0,                           /* tp_new */
+            0,                           /* tp_free (Python 3.9+) */
+            0,                           /* tp_is_gc */
+            0,                           /* tp_bases */
+            0,                           /* tp_mro */
+            0,                           /* tp_cache */
+            0,                           /* tp_subclasses */
+            0,                           /* tp_weaklist */
+            0,                           /* tp_del */
+            0,                           /* tp_version_tag */
+            0,                           /* tp_finalize */
+            0,                           /* tp_vectorcall */
+            0                            /* tp_print */
+    };
+
+    static bool EnsureJsonQueueType()
+    {
+        if (JsonQueueType.tp_name)
+        {
+            return true;
+        }
+
+        JsonQueueType.tp_name = const_cast<char*>("cpp.JsonQueue");
+        JsonQueueType.tp_basicsize = sizeof(JsonQueueObj);
+        JsonQueueType.tp_flags = Py_TPFLAGS_DEFAULT;
+        JsonQueueType.tp_doc = const_cast<char*>("C++ backed JSON queue");
+        JsonQueueType.tp_methods = JsonQueueMethods;
+        JsonQueueType.tp_dealloc = reinterpret_cast<destructor>(JsonQueueDealloc);
+        JsonQueueType.tp_new = PyType_GenericNew;
+        JsonQueueType.tp_getattro = PyObject_GenericGetAttr;
+        JsonQueueType.tp_setattro = PyObject_GenericSetAttr;
+
+        return PyType_Ready(&JsonQueueType) == 0;
+    }
+
+    static PyObject* NewJsonQueueObject(IRSThreadTools::ThreadSafeQueue<std::string>* queue)
+    {
+        JsonQueueObj* obj = PyObject_New(JsonQueueObj, &JsonQueueType);
+        if (!obj)
+        {
+            return nullptr;
+        }
+
+        obj->queue = queue;
+        obj->valid = true;
+        return reinterpret_cast<PyObject*>(obj);
+    }
+}
+
 bool BrainDeepLearnInterface::ExtractUtf8String(PyObject* value, std::string& out)
 {
     if (!value || !PyUnicode_Check(value))
@@ -200,6 +425,12 @@ BrainDeepLearnInterface::~BrainDeepLearnInterface()
     PyGILState_Release(g);
 }
 
+IRSThreadTools::ThreadSafeQueue<std::string> &BrainDeepLearnInterface::GetJsonQueue()
+{
+    static IRSThreadTools::ThreadSafeQueue<std::string> instance;
+    return instance;
+}
+
 void BrainDeepLearnInterface::PrintMessage(std::string str)
 {
     if(printMessageCB)
@@ -274,6 +505,91 @@ bool BrainDeepLearnInterface::ResetHebbianMemory()
     {
         (void)CALL_METHOD_NOARG("ResetHebbianMemory"); 
     });
+}
+
+bool BrainDeepLearnInterface::SetJsonQueue()
+{
+    if (!pManagerObj)
+    {
+        return false;
+    }
+
+    PyGILState_STATE g = PyGILState_Ensure();
+
+    if (!EnsureJsonQueueType())
+    {
+        PyErr_Print();
+        PyGILState_Release(g);
+        return false;
+    }
+
+    PyObject* queueObj = NewJsonQueueObject(&GetJsonQueue());
+    if (!queueObj)
+    {
+        PyGILState_Release(g);
+        return false;
+    }
+
+    PyObject* r = PyObject_CallMethod(pManagerObj, "SetJsonQueue", "O", queueObj);
+    bool ok = r && PyObject_IsTrue(r);
+    if (!r)
+    {
+        PyErr_Print();
+    }
+
+    Py_XDECREF(r);
+    Py_DECREF(queueObj);
+    PyGILState_Release(g);
+    return ok;
+}
+
+bool BrainDeepLearnInterface::SetParameterReceiver(std::optional<double> reward, std::optional<double> done, std::optional<std::string> textExt)
+{
+    if (!pManagerObj)
+    {
+        return false;
+    }
+
+    PyGILState_STATE g = PyGILState_Ensure();
+
+    PyObject* rewardObj = reward.has_value() ? PyFloat_FromDouble(*reward) : Py_None;
+    PyObject* doneObj = done.has_value() ? PyFloat_FromDouble(*done) : Py_None;
+    PyObject* textObj = textExt.has_value() ? PyUnicode_FromString(textExt->c_str()) : Py_None;
+
+    if (rewardObj == Py_None)
+    {
+        Py_INCREF(Py_None);
+    }
+    if (doneObj == Py_None)
+    {
+        Py_INCREF(Py_None);
+    }
+    if (textObj == Py_None)
+    {
+        Py_INCREF(Py_None);
+    }
+
+    bool ok = false;
+    if (rewardObj && doneObj && textObj)
+    {
+        PyObject* r = PyObject_CallMethod(pManagerObj, "SetParameterReceiver", "OOO", rewardObj, doneObj, textObj);
+        ok = r && PyObject_IsTrue(r);
+        if (!r)
+        {
+            PyErr_Print();
+        }
+        Py_XDECREF(r);
+    }
+    else
+    {
+        PyErr_Print();
+    }
+
+    Py_XDECREF(rewardObj);
+    Py_XDECREF(doneObj);
+    Py_XDECREF(textObj);
+    PyGILState_Release(g);
+    return ok;
 }
 
 bool BrainDeepLearnInterface::InitAgentHnandle()

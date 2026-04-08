@@ -100,6 +100,12 @@ private slots:
 
     void ResetHebbianMemory();
 
+    void SetRewardParameter();
+
+    void SetDoneParameter();
+
+    void SetTextExtParameter();
+
 private:
     QString StatusValueToQString(BrainDeepLearnInterface::StatusValue& value);
     void ChooseFolderAndSetParameter(QString title, std::string parameterName, QString fileName = "");

@@ -60,6 +60,9 @@ BrainDeepLearnForm::BrainDeepLearnForm(std::shared_ptr<PythonInteraction::Manage
     connect(ui->resume_pushButton, SIGNAL(clicked()), this, SLOT(ResumeModule()));
     connect(ui->saveParameter_pushButton, SIGNAL(clicked()), this, SLOT(ExportParmFromCheckpoint()));
     connect(ui->resetState_pushButton, SIGNAL(clicked()), this, SLOT(ResetHebbianMemory()));
+    connect(ui->reward_pushButton, SIGNAL(clicked()), this, SLOT(SetRewardParameter()));
+    connect(ui->done_pushButton, SIGNAL(clicked()), this, SLOT(SetDoneParameter()));
+    connect(ui->textExt_pushButton, SIGNAL(clicked()), this, SLOT(SetTextExtParameter()));
 
     connect(ui->clear_pushButton, SIGNAL(clicked()), this, SLOT(ClearText()));
     connect(ui->close_pushButton, SIGNAL(clicked()), this, SLOT(CloseForm()));
@@ -297,6 +300,59 @@ void BrainDeepLearnForm::ResumeModule()
 void BrainDeepLearnForm::ResetHebbianMemory()
 {
     brainDeepLearn->ResetHebbianMemory();
+}
+
+void BrainDeepLearnForm::SetRewardParameter()
+{
+    bool rewardOk = false;
+    const double rewardValue = ui->reward_lineEdit->text().trimmed().toDouble(&rewardOk);
+    if (!rewardOk)
+    {
+        AddData("Reward value is invalid");
+        return;
+    }
+
+    if (brainDeepLearn->SetParameterReceiver(rewardValue, std::nullopt, std::nullopt))
+    {
+        AddData(QString("Set reward = %1").arg(rewardValue));
+    }
+    else
+    {
+        AddData("Set reward failed");
+    }
+}
+
+void BrainDeepLearnForm::SetDoneParameter()
+{
+    bool doneOk = false;
+    const double doneValue = ui->done_lineEdit->text().trimmed().toDouble(&doneOk);
+    if (!doneOk)
+    {
+        AddData("Done value is invalid");
+        return;
+    }
+
+    if (brainDeepLearn->SetParameterReceiver(std::nullopt, doneValue, std::nullopt))
+    {
+        AddData(QString("Set done = %1").arg(doneValue));
+    }
+    else
+    {
+        AddData("Set done failed");
+    }
+}
+
+void BrainDeepLearnForm::SetTextExtParameter()
+{
+    const std::string textExtValue = ui->textExt_lineEdit->text().trimmed().toStdString();
+    if (brainDeepLearn->SetParameterReceiver(std::nullopt, std::nullopt, textExtValue))
+    {
+        AddData(QString("Set textExt = %1").arg(QString::fromStdString(textExtValue)));
+    }
+    else
+    {
+        AddData("Set textExt failed");
+    }
 }
 
 void BrainDeepLearnForm::ChooseFolderAndSetParameter(QString title, std::string parameterName, QString fileName)

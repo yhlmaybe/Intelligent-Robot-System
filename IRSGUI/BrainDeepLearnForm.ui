@@ -17,16 +17,16 @@
    <string>BrainDeepLearnForm</string>
   </property>
   <layout class="QGridLayout" name="gridLayout">
-   <item row="0" column="0" colspan="3">
+   <item row="0" column="0">
     <widget class="QSplitter" name="horizontalSplitter">
      <property name="orientation">
       <enum>Qt::Horizontal</enum>
      </property>
-     <property name="childrenCollapsible">
-      <bool>false</bool>
-     </property>
      <property name="handleWidth">
       <number>6</number>
+     </property>
+     <property name="childrenCollapsible">
+      <bool>false</bool>
      </property>
      <widget class="QWidget" name="leftPanelWidget">
       <layout class="QVBoxLayout" name="verticalLayout">
@@ -74,7 +74,7 @@
        </size>
       </property>
       <property name="currentIndex">
-       <number>2</number>
+       <number>0</number>
       </property>
       <widget class="QWidget" name="tab_Function">
        <attribute name="title">
@@ -155,6 +155,51 @@
              <string>Save Parameter Overrdie</string>
             </property>
            </widget>
+          </item>
+          <item>
+           <layout class="QHBoxLayout" name="horizontalLayout_9">
+            <property name="sizeConstraint">
+             <enum>QLayout::SetDefaultConstraint</enum>
+            </property>
+            <item>
+             <layout class="QVBoxLayout" name="verticalLayout_8">
+              <item>
+               <widget class="QLineEdit" name="reward_lineEdit"/>
+              </item>
+              <item>
+               <widget class="QLineEdit" name="done_lineEdit"/>
+              </item>
+              <item>
+               <widget class="QLineEdit" name="textExt_lineEdit"/>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <layout class="QVBoxLayout" name="verticalLayout_9">
+              <item>
+               <widget class="QPushButton" name="reward_pushButton">
+                <property name="text">
+                 <string>Reward Evaluate</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="done_pushButton">
+                <property name="text">
+                 <string>Done Evaluate</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="textExt_pushButton">
+                <property name="text">
+                 <string>Inject Extra Text</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+           </layout>
           </item>
          </layout>
         </item>

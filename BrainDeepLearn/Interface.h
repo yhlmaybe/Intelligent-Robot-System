@@ -10,12 +10,14 @@
 #include <functional>
 #include <stdexcept>
 #include <memory>
+#include <optional>
 #include <cstdio>
 #include <mutex>
 #include <atomic>
 #include <thread>
 
 #include "../include/PythonInteraction.h"
+#include "../include/IRSFunction.h"
 
 #define CALL_METHOD_RET_BOOL(name, fmt, ...) \
     ([&]{ \
@@ -126,6 +128,8 @@ public:
     BrainDeepLearnInterface(std::shared_ptr<PythonInteraction::Manager> mag, std::function<void(std::string)> printCallBack = nullptr);
     ~BrainDeepLearnInterface();
 
+    static IRSThreadTools::ThreadSafeQueue<std::string> &GetJsonQueue();
+
     bool TrainModule(bool isOnlineLearning = false, int epochs = 5, int batchSize = 1, double valSplit = 0.1, bool resume = true);
 
     bool TrainOCRModule(int epochs = 400, int batchSize = 1, double valSplit = 0.1, bool resume = true);
@@ -141,6 +145,10 @@ public:
     bool Resume();
 
     bool ResetHebbianMemory();
+
+    bool SetJsonQueue();
+
+    bool SetParameterReceiver(std::optional<double> reward = std::nullopt, std::optional<double> done = std::nullopt, std::optional<std::string> textExt = std::nullopt);
 
     bool InitAgentHnandle();
 

@@ -43,6 +43,7 @@ class ModuleController:
             "message": "Waiting to start",
             "trace": "",
             "visual": self.EmptyVisualStatus(),}
+        self.parameter_receiver: Dict[str, Any] = self.EmptyParameterReceiver()
         self.stop_requested = False
         self.pause_requested = False
         self.reset_hebbian = False
@@ -56,6 +57,12 @@ class ModuleController:
             "items": [],
             "updated_at": (time.time() if touch else 0.0),}
 
+    def EmptyParameterReceiver(self) -> Dict[str, Any]:
+        return {
+            "reward": None,
+            "done": None,
+            "textExt": None,}
+
     def SetStatus(self, state: str, message: str, **kwargs):
         with self._lock:
             self.status["state"] = state
@@ -67,6 +74,18 @@ class ModuleController:
     def GetStatus(self) -> Dict[str, Any]:
         with self._lock:
             return dict(self.status)
+        
+    def SetParameterReceiver(self, reward = None, done = None, textExt = None):
+        with self._lock:
+            self.parameter_receiver["reward"] = reward
+            self.parameter_receiver["done"] = done
+            self.parameter_receiver["textExt"] = textExt
+
+    def GetParameterReceiver(self) -> Dict[str, Any]:
+        with self._lock:
+            current = dict(self.parameter_receiver)
+            self.parameter_receiver = self.EmptyParameterReceiver()
+            return current
         
     def ResteStatus(self):
         self.status: Dict[str, Any] = {
@@ -132,6 +151,7 @@ class ManagerFunction:
         self.is_begin = False
         self.overrideCheckpointWithModuleParams = True
         self.agent_handle: Optional[AgentHandle] = None
+        self.json_queue = None
 
         self.test = {
             "perception": TestPerceptionMTool(),
@@ -146,6 +166,14 @@ class ManagerFunction:
         
     def InitAgentHnandle(self):
         self.agent_handle = AgentHandle()
+        return True
+
+    def SetJsonQueue(self, queue):
+        self.json_queue = queue
+        return True
+
+    def SetParameterReceiver(self, reward = None, done = None, textExt = None):
+        self.controller.SetParameterReceiver(reward=reward, done=done, textExt=textExt)
         return True
 
     def AgentHandleForward(
@@ -2295,68 +2323,70 @@ class ManagerFunction:
 
             self.controller.SetStatus("is_begin", "Deployment started", visual=self.controller.EmptyVisualStatus(touch=True))
 
-            code_to_name: dict[int, str] = {}
-            all_codes = []
-            for name, code in RAW_KEYBOARD_LAYOUT.items():
-                code_to_name.setdefault(code, name)
-                all_codes.append(code)
-            max_code = max(all_codes)
+            while not self.controller.ShouldStop():
+                frame_np = iio.imread(f"<video{int(cameraIndex)}>", index=0)
+                if frame_np is None:
+                    raise RuntimeError(f"cannot read frame from camera {int(cameraIndex)}")
 
-            with iio.imopen(f"<video{cameraIndex}>", "r") as cam:
-                for frame_np in cam:
-                    if self.controller.ShouldStop():
-                        break
+                visual_enabled = self.controller.IsVisualStateEnabled()
+                pack = DataPreprocessor.ConvertNpImagesKeysMouses(
+                    imgs=frame_np,
+                    keys=None,
+                    mouseClick=None,
+                    mouseMove=None,
+                    reward=None,
+                    done=None,
+                    device=self.device,
+                    needVisualState=visual_enabled,)
 
-                    visual_enabled = self.controller.IsVisualStateEnabled()
-                    pack = DataPreprocessor.ConvertNpImagesKeysMouses(
-                        imgs=frame_np,
-                        keys=None,
-                        mouseClick=None,
-                        mouseMove=None,
-                        reward=None,
-                        done=None,
-                        device=self.device,
-                        needVisualState=visual_enabled,)
-                    
-                    frames = pack["frames"]
-                    original_images = pack["original_images"]
-                    resize_meta = pack["resize_meta"]
+                frames = pack["frames"]
+                original_images = pack["original_images"]
+                resize_meta = pack["resize_meta"]
 
-                    if self.controller.ShouldResetHebbian():
-                        agent.ResetHebbianMemory()
-                        self.controller.RequestCancelResetHebbian()
+                if self.controller.ShouldResetHebbian():
+                    agent.ResetHebbianMemory()
+                    self.controller.RequestCancelResetHebbian()
 
-                    act_out = agent.Act(
-                        frames,
-                        reward=None,
-                        done=None,
-                        sampleActions=True,
-                        deterministicActor=True,)
-                    if act_out is None:
-                        continue
+                parameters = self.controller.GetParameterReceiver()
 
-                    keys = act_out["keys"]
-                    clicks = act_out["mouse_clicks"]
-                    mouse = act_out["mouse_move"]
+                reward_param = parameters["reward"]
+                done_param = parameters["done"]
+                text_param = parameters["textExt"]
+
+                reward_tensor = None
+                if reward_param is not None:
+                    reward_tensor = torch.tensor([[float(reward_param)]], dtype=torch.float32, device=self.device)
+
+                done_tensor = None
+                if done_param is not None:
+                    done_tensor = torch.tensor([[float(done_param)]], dtype=torch.float32, device=self.device)
+
+                text_ext = None
+                if text_param is not None:
+                    if isinstance(text_param, (list, tuple)):
+                        text_ext = [None if (item is None or str(item).strip() == "") else str(item) for item in text_param]
+                    else:
+                        text_value = str(text_param).strip()
+                        text_ext = [None if text_value == "" else text_value]
+
+                act_out = agent.Act(
+                    frames,
+                    textExt=text_ext,
+                    reward=reward_tensor,
+                    done=done_tensor,
+                    sampleActions=True,
+                    deterministicActor=True,)
+                if act_out is None:
+                    continue
+
+                act_json = agent.UnpackActPacked(act_out)
+                if self.json_queue is not None:
+                    self.json_queue.clearandpush(act_json)
+               
+                status_kwargs = {}
+
+                if visual_enabled and original_images:
                     ocr_items = act_out["OCR"]
-
-                    kv = keys[0].detach().cpu()
-                    ck = clicks[0].detach().cpu()
-                    ms = mouse[0].detach().cpu()
-
-                    pressed_names: list[str] = []
-                    limit = min(max_code + 1, int(kv.numel()))
-                    for code in range(limit):
-                        if float(kv[code]) > 0.5:
-                            pressed_names.append(code_to_name.get(code, f"Key{code}"))
-
-                    if float(ck[0]) > 0.5:
-                        pressed_names.append("MouseLeft")
-                    if float(ck[1]) > 0.5:
-                        pressed_names.append("MouseRight")
-
-                    names_str = "[" + ", ".join(pressed_names) + "]" if pressed_names else "[]"
-
                     deploy_items = (ocr_items[0] if (ocr_items is not None and len(ocr_items) > 0) else [])
                     deploy_texts = [
                         str(item.get("text", "")).strip()
@@ -2364,22 +2394,19 @@ class ManagerFunction:
                         if str(item.get("text", "")).strip() != ""]
                     resize_meta_0 = resize_meta[0] if resize_meta else None
                     visual_payload = None
-                    if visual_enabled and original_images:
-                        visual_payload = self.BuildVisualPayload(
-                            original_images[0],
-                            ocrTexts=deploy_texts,
-                            ocrItems=deploy_items,
-                            resizeMeta=resize_meta_0,
-                            title="Deploy",
-                            extraLines=[
-                                f"keys:{names_str}",
-                                f"mouse:dx={float(ms[0]):.3f},dy={float(ms[1]):.3f}"],)
 
-                    status_kwargs = {}
+                    visual_payload = self.BuildVisualPayload(
+                        original_images[0],
+                        ocrTexts=deploy_texts,
+                        ocrItems=deploy_items,
+                        resizeMeta=resize_meta_0,
+                        title="Deploy",
+                        extraLines=deploy_texts,)
+
                     if visual_payload is not None:
                         status_kwargs["visual"] = visual_payload
 
-                    self.controller.SetStatus("is_begin",(f"keys:{names_str} "f"mouse:dx={float(ms[0]):.3f},dy={float(ms[1]):.3f}"), **status_kwargs)
+                self.controller.SetStatus("is_begin", act_json, **status_kwargs)
 
             self.controller.SetStatus("stopped", "Deployment stopped")
 
