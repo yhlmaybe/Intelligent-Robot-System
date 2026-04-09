@@ -22,7 +22,7 @@ namespace IRSCoreManager
 
             BrainDeepLearnInterface::GetJsonQueue().reset();
 
-            IRSCoreModule::EnvironmentalPerception::GetInstance()->Start();
+            IRSCoreEnvironment::EnvironmentalPerception::GetInstance()->Start();
 
             IRSCoreModule::ServoManagerNode::GetInstance()->Start();
 
@@ -43,7 +43,7 @@ namespace IRSCoreManager
         if (IsNodeRunning.load())
         {
             IsNodeRunning.store(false, std::memory_order_release);
-            IRSCoreModule::EnvironmentalPerception::GetInstance()->Stop();
+            IRSCoreEnvironment::EnvironmentalPerception::GetInstance()->Stop();
             BrainDeepLearnInterface::GetJsonQueue().stop();
             IRSCoreDecision::BrainDecisionNode::GetInstance()->Stop();
             GetGoalPointsQueue().stop();
@@ -56,7 +56,7 @@ namespace IRSCoreManager
     {
         if (IsNodeRunning.load())
         {
-            IRSCoreModule::EnvironmentalPerception::GetInstance()->Stop();
+            IRSCoreEnvironment::EnvironmentalPerception::GetInstance()->Stop();
             BrainDeepLearnInterface::GetJsonQueue().stop();
             IRSCoreDecision::BrainDecisionNode::GetInstance()->Stop();
             GetGoalPointsQueue().stop();
@@ -64,11 +64,11 @@ namespace IRSCoreManager
 
             BrainDeepLearnInterface::GetJsonQueue().reset();
             GetGoalPointsQueue().reset();
-            IRSCoreModule::EnvironmentalPerception::GetInstance()->Reset();
+            IRSCoreEnvironment::EnvironmentalPerception::GetInstance()->Reset();
             IRSCoreModule::ServoManagerNode::GetInstance()->Reset();
             IRSCoreDecision::BrainDecisionNode::GetInstance()->Reset();
 
-            IRSCoreModule::EnvironmentalPerception::GetInstance()->Start();
+            IRSCoreEnvironment::EnvironmentalPerception::GetInstance()->Start();
             IRSCoreModule::ServoManagerNode::GetInstance()->Start();
             IRSCoreDecision::BrainDecisionNode::GetInstance()->Start();
         }
@@ -86,7 +86,7 @@ namespace IRSCoreManager
 
     std::vector<Eigen::Vector3d> IRSCoreHandle::GetEnvironmentPoints()
     {
-        return IRSCoreModule::EnvironmentalPerception::GetInstance()->GetPointClouds();
+        return IRSCoreEnvironment::EnvironmentalPerception::GetInstance()->GetPointClouds();
     }
 
     void IRSCoreHandle::UrdfSrdfXMLInitial()

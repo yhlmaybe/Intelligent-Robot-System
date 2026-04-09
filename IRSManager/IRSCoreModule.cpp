@@ -306,27 +306,7 @@ namespace IRSCoreModule
         PublishTransforms(joint_positions, state->header.stamp);
     }
 
-    EnvironmentalPerception::EnvironmentalPerception(unsigned interval_ms) : interval_ms_(interval_ms)
-    {
-    }
 
-    EnvironmentalPerception *EnvironmentalPerception::GetInstance()
-    {
-        static EnvironmentalPerception *instance = new EnvironmentalPerception(100);
-        return instance;
-    }
-
-    std::vector<Eigen::Vector3d> EnvironmentalPerception::GetPointClouds()
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-        return cloud_points_;
-    }
-
-    void EnvironmentalPerception::Reset()
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-        cloud_points_.clear();
-    }
 
 
     ServoManagerNode::ServoManagerNode()
@@ -412,7 +392,7 @@ namespace IRSCoreModule
                     continue;
                 }
             }
-            std::vector<Eigen::Vector3d> env_points = EnvironmentalPerception::GetInstance()->GetPointClouds();
+            std::vector<Eigen::Vector3d> env_points = IRSCoreEnvironment::EnvironmentalPerception::GetInstance()->GetPointClouds();
             std::vector<TrajectoryPoint> trace = motion_manager->Plan(joint_names, joint_values, env_points, TIMEINTERVAL);
             if (trace.size() == 0)
             {

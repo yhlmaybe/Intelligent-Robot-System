@@ -33,6 +33,8 @@
 #include "../MathematicalTool/MotionManager.h"
 #include "../BrainDeepLearn/Interface.h"
 
+#include "IRSCoreEnvironment.h"
+
 namespace IRSCoreModule
 {
     using MimicMap = std::map<std::string, urdf::JointMimicSharedPtr>;
@@ -120,26 +122,6 @@ namespace IRSCoreModule
         rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub;
 
         MimicMap mimic;
-    };
-
-    class EnvironmentalPerception : public IRSThreadTools::IRSThreadBase
-    {
-    public:
-        EnvironmentalPerception(unsigned interval_ms = 100);
-
-        static EnvironmentalPerception *GetInstance();
-
-        std::vector<Eigen::Vector3d> GetPointClouds();
-
-        void Reset();
-
-    private:
-        unsigned interval_ms_;
-        std::vector<Eigen::Vector3d> cloud_points_;
-        mutable std::mutex mtx_;
-
-        EnvironmentalPerception(const EnvironmentalPerception &) = delete;
-        EnvironmentalPerception &operator=(const EnvironmentalPerception &) = delete;
     };
 
 
