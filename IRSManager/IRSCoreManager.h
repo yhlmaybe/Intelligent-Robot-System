@@ -2,6 +2,7 @@
 #define IRSCOREMANAGER_H
 
 #include "IRSCoreModule.h"
+#include "IRSCoreDecision.h"
 
 class IRSCoreHandle
 {

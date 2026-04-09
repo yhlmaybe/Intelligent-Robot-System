@@ -45,6 +45,8 @@ target_link_libraries(IRSMANAGER_LIST ${orocos_kdl_LIBRARIES} ${kdl_parser_LIBRA
 
 target_link_libraries(IRSMANAGER_LIST MATHEMATICALTOOL_LIST)
 
+target_link_libraries(IRSMANAGER_LIST BRAINDEEPLEARN_LIST)
+
 #include_directories(${OMPL_INCLUDE_DIRS})
 
 #install dir, use cmake.. and make install

@@ -17,9 +17,13 @@ void IRSCoreHandle::Start()
 
         GetGoalPointsQueue().reset();
 
-        EnvironmentalPerception::GetInstance()->Start();
-        
+        BrainDeepLearnInterface::GetJsonQueue().reset();
+
+        EnvironmentalPerception::GetInstance() -> Start();
+
         ServoManagerNode::GetInstance()->Start();
+        
+        IRSCoreDecision::BrainDecisionNode::GetInstance()->Start();
 
         auto state = ServoManagerNode::GetInstance()->GetCurrentRobotState();
 
@@ -36,6 +40,8 @@ void IRSCoreHandle::End()
     {   
         IsNodeRunning.store(false, std::memory_order_release);
         EnvironmentalPerception::GetInstance()->Stop();
+        BrainDeepLearnInterface::GetJsonQueue().stop();
+        IRSCoreDecision::BrainDecisionNode::GetInstance()->Stop();
         GetGoalPointsQueue().stop();
         ServoManagerNode::GetInstance()->Stop();
         ROSNodeExecutor::GetInstance()->Stop();
@@ -47,15 +53,20 @@ void IRSCoreHandle::ResetServoState()
     if (IsNodeRunning.load())
     {
         EnvironmentalPerception::GetInstance()->Stop();
+        BrainDeepLearnInterface::GetJsonQueue().stop();
+        IRSCoreDecision::BrainDecisionNode::GetInstance()->Stop();
         GetGoalPointsQueue().stop();
         ServoManagerNode::GetInstance()->Stop();
 
+        BrainDeepLearnInterface::GetJsonQueue().reset();
         GetGoalPointsQueue().reset();
         EnvironmentalPerception::GetInstance()->Reset();
         ServoManagerNode::GetInstance()->Reset();
+        IRSCoreDecision::BrainDecisionNode::GetInstance()->Reset();
 
         EnvironmentalPerception::GetInstance()->Start();
         ServoManagerNode::GetInstance()->Start();
+        IRSCoreDecision::BrainDecisionNode::GetInstance()->Start();
     }
 }
 
