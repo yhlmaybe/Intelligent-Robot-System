@@ -1,163 +1,168 @@
 #include "IRSCoreManager.h"
 
-std::atomic<bool> IsNodeRunning(false);
-
-IRSThreadTools::ThreadSafeQueue<std::vector<Eigen::Vector3d>>& IRSCoreHandle::GetGoalPointsQueue()
+namespace IRSCoreManager
 {
-    return IRSGoalPoints::GetGoalPointsQueue();
-}
 
-void IRSCoreHandle::Start()
-{   
-    if(!IsNodeRunning.load())
+    std::atomic<bool> IsNodeRunning(false);
+
+    IRSThreadTools::ThreadSafeQueue<std::vector<Eigen::Vector3d>> &IRSCoreHandle::GetGoalPointsQueue()
     {
-        IsNodeRunning.store(true, std::memory_order_release);
-
-        UrdfSrdfXMLInitial();    
-
-        GetGoalPointsQueue().reset();
-
-        BrainDeepLearnInterface::GetJsonQueue().reset();
-
-        EnvironmentalPerception::GetInstance() -> Start();
-
-        ServoManagerNode::GetInstance()->Start();
-        
-        IRSCoreDecision::BrainDecisionNode::GetInstance()->Start();
-
-        auto state = ServoManagerNode::GetInstance()->GetCurrentRobotState();
-
-        ROSNodeInitial(state);
-
-        ROSNodeExecutor::GetInstance()->Start();
+        return IRSCoreModule::IRSGoalPoints::GetGoalPointsQueue();
     }
-    else IRS_MESSAGE("IRS core already start");
-}
 
-void IRSCoreHandle::End()
-{
-    if(IsNodeRunning.load())
-    {   
-        IsNodeRunning.store(false, std::memory_order_release);
-        EnvironmentalPerception::GetInstance()->Stop();
-        BrainDeepLearnInterface::GetJsonQueue().stop();
-        IRSCoreDecision::BrainDecisionNode::GetInstance()->Stop();
-        GetGoalPointsQueue().stop();
-        ServoManagerNode::GetInstance()->Stop();
-        ROSNodeExecutor::GetInstance()->Stop();
-    }
-}
-
-void IRSCoreHandle::ResetServoState()
-{
-    if (IsNodeRunning.load())
+    void IRSCoreHandle::Start()
     {
-        EnvironmentalPerception::GetInstance()->Stop();
-        BrainDeepLearnInterface::GetJsonQueue().stop();
-        IRSCoreDecision::BrainDecisionNode::GetInstance()->Stop();
-        GetGoalPointsQueue().stop();
-        ServoManagerNode::GetInstance()->Stop();
+        if (!IsNodeRunning.load())
+        {
+            IsNodeRunning.store(true, std::memory_order_release);
 
-        BrainDeepLearnInterface::GetJsonQueue().reset();
-        GetGoalPointsQueue().reset();
-        EnvironmentalPerception::GetInstance()->Reset();
-        ServoManagerNode::GetInstance()->Reset();
-        IRSCoreDecision::BrainDecisionNode::GetInstance()->Reset();
+            UrdfSrdfXMLInitial();
 
-        EnvironmentalPerception::GetInstance()->Start();
-        ServoManagerNode::GetInstance()->Start();
-        IRSCoreDecision::BrainDecisionNode::GetInstance()->Start();
+            GetGoalPointsQueue().reset();
+
+            BrainDeepLearnInterface::GetJsonQueue().reset();
+
+            IRSCoreModule::EnvironmentalPerception::GetInstance()->Start();
+
+            IRSCoreModule::ServoManagerNode::GetInstance()->Start();
+
+            IRSCoreDecision::BrainDecisionNode::GetInstance()->Start();
+
+            auto state = IRSCoreModule::ServoManagerNode::GetInstance()->GetCurrentRobotState();
+
+            ROSNodeInitial(state);
+
+            IRSCoreModule::ROSNodeExecutor::GetInstance()->Start();
+        }
+        else
+            IRS_MESSAGE("IRS core already start");
     }
-}
 
-void IRSCoreHandle::SetJointPosition(std::string name, double position)
-{
-    ServoManagerNode::GetInstance()->SetJointPosition(name, position);
-}
-
-std::shared_ptr<moveit::core::RobotState> IRSCoreHandle::GetCurrentRobotState()
-{
-    return ServoManagerNode::GetInstance()->GetCurrentRobotState();
-}
-
-std::vector<Eigen::Vector3d> IRSCoreHandle::GetEnvironmentPoints()
-{
-    return EnvironmentalPerception::GetInstance()->GetPointClouds();
-}
-
-void IRSCoreHandle::UrdfSrdfXMLInitial()
-{
-    char cwd[PATH_MAX];
-    if (getcwd(cwd, sizeof(cwd)) == NULL)
+    void IRSCoreHandle::End()
     {
-        IRS_MESSAGE("get urdf and srdf cwd() error");
-        return;
+        if (IsNodeRunning.load())
+        {
+            IsNodeRunning.store(false, std::memory_order_release);
+            IRSCoreModule::EnvironmentalPerception::GetInstance()->Stop();
+            BrainDeepLearnInterface::GetJsonQueue().stop();
+            IRSCoreDecision::BrainDecisionNode::GetInstance()->Stop();
+            GetGoalPointsQueue().stop();
+            IRSCoreModule::ServoManagerNode::GetInstance()->Stop();
+            IRSCoreModule::ROSNodeExecutor::GetInstance()->Stop();
+        }
     }
-    std::string urdf_file = std::string(cwd) + "/Configure/Arm_R_SLDASM.urdf";
-    std::ifstream inurdf(urdf_file);
-    if (inurdf)
+
+    void IRSCoreHandle::ResetServoState()
     {
-        inurdf.seekg(0, std::ios::end);
-        URDF_XML.resize(inurdf.tellg());
-        inurdf.seekg(0, std::ios::beg);
-        inurdf.read(&URDF_XML[0], URDF_XML.size());
-        inurdf.close();
+        if (IsNodeRunning.load())
+        {
+            IRSCoreModule::EnvironmentalPerception::GetInstance()->Stop();
+            BrainDeepLearnInterface::GetJsonQueue().stop();
+            IRSCoreDecision::BrainDecisionNode::GetInstance()->Stop();
+            GetGoalPointsQueue().stop();
+            IRSCoreModule::ServoManagerNode::GetInstance()->Stop();
+
+            BrainDeepLearnInterface::GetJsonQueue().reset();
+            GetGoalPointsQueue().reset();
+            IRSCoreModule::EnvironmentalPerception::GetInstance()->Reset();
+            IRSCoreModule::ServoManagerNode::GetInstance()->Reset();
+            IRSCoreDecision::BrainDecisionNode::GetInstance()->Reset();
+
+            IRSCoreModule::EnvironmentalPerception::GetInstance()->Start();
+            IRSCoreModule::ServoManagerNode::GetInstance()->Start();
+            IRSCoreDecision::BrainDecisionNode::GetInstance()->Start();
+        }
     }
 
-    std::string oldMeshVisualPath = "${URDF_VISUAL_MESH_PATH}";
-    std::string newMeshVisualPath = "file://" + std::string(cwd) + "/Configure/meshes/visual";
-    std::string oldMeshcollisionPath = "${URDF_COLLISION_MESH_PATH}";
-    std::string newMeshcollisionPath = "file://" + std::string(cwd) + "/Configure/meshes/collision";
-
-    ReplacePathsInUrdf(URDF_XML, oldMeshVisualPath, newMeshVisualPath);
-    ReplacePathsInUrdf(URDF_XML, oldMeshcollisionPath, newMeshcollisionPath);
-
-    std::string srdf_file = std::string(cwd) + "/Configure/Arm_R_SLDASM.srdf";
-    std::ifstream insrdf(srdf_file);
-    if (insrdf)
+    void IRSCoreHandle::SetJointPosition(std::string name, double position)
     {
-        insrdf.seekg(0, std::ios::end);
-        SRDF_XML.resize(insrdf.tellg());
-        insrdf.seekg(0, std::ios::beg);
-        insrdf.read(&SRDF_XML[0], SRDF_XML.size());
-        insrdf.close();
+        IRSCoreModule::ServoManagerNode::GetInstance()->SetJointPosition(name, position);
     }
-}
 
-bool IRSCoreHandle::ReplacePathsInUrdf(std::string &urdfContent, const std::string &oldKey, const std::string &newKey)
-{
-    size_t pos = 0;
-    bool modified = false;
-    while ((pos = urdfContent.find(oldKey, pos)) != std::string::npos) 
+    std::shared_ptr<moveit::core::RobotState> IRSCoreHandle::GetCurrentRobotState()
     {
-        urdfContent.replace(pos, oldKey.length(), newKey);
-        pos += newKey.length(); 
-        modified = true;
+        return IRSCoreModule::ServoManagerNode::GetInstance()->GetCurrentRobotState();
     }
-    return modified;
+
+    std::vector<Eigen::Vector3d> IRSCoreHandle::GetEnvironmentPoints()
+    {
+        return IRSCoreModule::EnvironmentalPerception::GetInstance()->GetPointClouds();
+    }
+
+    void IRSCoreHandle::UrdfSrdfXMLInitial()
+    {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd)) == NULL)
+        {
+            IRS_MESSAGE("get urdf and srdf cwd() error");
+            return;
+        }
+        std::string urdf_file = std::string(cwd) + "/Configure/Arm_R_SLDASM.urdf";
+        std::ifstream inurdf(urdf_file);
+        if (inurdf)
+        {
+            inurdf.seekg(0, std::ios::end);
+            URDF_XML.resize(inurdf.tellg());
+            inurdf.seekg(0, std::ios::beg);
+            inurdf.read(&URDF_XML[0], URDF_XML.size());
+            inurdf.close();
+        }
+
+        std::string oldMeshVisualPath = "${URDF_VISUAL_MESH_PATH}";
+        std::string newMeshVisualPath = "file://" + std::string(cwd) + "/Configure/meshes/visual";
+        std::string oldMeshcollisionPath = "${URDF_COLLISION_MESH_PATH}";
+        std::string newMeshcollisionPath = "file://" + std::string(cwd) + "/Configure/meshes/collision";
+
+        ReplacePathsInUrdf(URDF_XML, oldMeshVisualPath, newMeshVisualPath);
+        ReplacePathsInUrdf(URDF_XML, oldMeshcollisionPath, newMeshcollisionPath);
+
+        std::string srdf_file = std::string(cwd) + "/Configure/Arm_R_SLDASM.srdf";
+        std::ifstream insrdf(srdf_file);
+        if (insrdf)
+        {
+            insrdf.seekg(0, std::ios::end);
+            SRDF_XML.resize(insrdf.tellg());
+            insrdf.seekg(0, std::ios::beg);
+            insrdf.read(&SRDF_XML[0], SRDF_XML.size());
+            insrdf.close();
+        }
+    }
+
+    bool IRSCoreHandle::ReplacePathsInUrdf(std::string &urdfContent, const std::string &oldKey, const std::string &newKey)
+    {
+        size_t pos = 0;
+        bool modified = false;
+        while ((pos = urdfContent.find(oldKey, pos)) != std::string::npos)
+        {
+            urdfContent.replace(pos, oldKey.length(), newKey);
+            pos += newKey.length();
+            modified = true;
+        }
+        return modified;
+    }
+
+    std::string IRSCoreHandle::ROSNodeInitial(std::shared_ptr<moveit::core::RobotState> robotState)
+    {
+        std::shared_ptr<IRSCoreModule::UrdfPublisherNode> urdf_publisher_node = std::make_shared<IRSCoreModule::UrdfPublisherNode>();
+        IRSCoreModule::ROSNodeExecutor::GetInstance()->AddNode(urdf_publisher_node);
+
+        std::shared_ptr<IRSCoreModule::JointStateListenerNode> joint_state_listen_node = std::make_shared<IRSCoreModule::JointStateListenerNode>(robotState);
+        IRSCoreModule::ROSNodeExecutor::GetInstance()->AddNode(joint_state_listen_node);
+
+        return "ros node initial";
+    }
+
+    std::vector<std::string> IRSCoreHandle::GetActiveNodeName()
+    {
+        auto node = rclcpp::Node::make_shared("node_names_collector");
+        auto node_graph = node->get_node_graph_interface();
+        return node_graph->get_node_names();
+    }
+
+    bool IRSCoreHandle::IsActiveNode(std::string name)
+    {
+        std::vector<std::string> names = IRSCoreHandle::GetActiveNodeName();
+        return std::find(names.begin(), names.end(), name) != names.end();
+    }
+
 }
-
-std::string IRSCoreHandle::ROSNodeInitial(std::shared_ptr<moveit::core::RobotState> robotState)
-{
-    std::shared_ptr<UrdfPublisherNode> urdf_publisher_node  = std::make_shared<UrdfPublisherNode>();
-    ROSNodeExecutor::GetInstance()->AddNode(urdf_publisher_node);
-
-    std::shared_ptr<JointStateListenerNode> joint_state_listen_node = std::make_shared<JointStateListenerNode>(robotState);
-    ROSNodeExecutor::GetInstance()->AddNode(joint_state_listen_node);
-
-    return "ros node initial";
-}
-
-std::vector<std::string> IRSCoreHandle::GetActiveNodeName()
-{
-    auto node = rclcpp::Node::make_shared("node_names_collector");
-    auto node_graph = node->get_node_graph_interface();
-    return node_graph->get_node_names();
-}
-
-bool IRSCoreHandle::IsActiveNode(std::string name)
-{
-    std::vector<std::string> names = IRSCoreHandle::GetActiveNodeName();
-    return std::find(names.begin(), names.end(), name) != names.end();
-}
-

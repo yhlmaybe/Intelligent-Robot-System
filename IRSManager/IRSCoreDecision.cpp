@@ -10,12 +10,7 @@
 #include <utility>
 
 #include "../BrainDeepLearn/Interface.h"
-
-class IRSGoalPoints
-{
-public:
-    static IRSThreadTools::ThreadSafeQueue<std::vector<Eigen::Vector3d>>& GetGoalPointsQueue();
-};
+#include "IRSCoreModule.h"
 
 namespace IRSCoreDecision
 {
@@ -618,7 +613,7 @@ namespace IRSCoreDecision
 
         if (!goalPoints.empty())
         {
-            IRSGoalPoints::GetGoalPointsQueue().push(goalPoints);
+            IRSCoreModule::IRSGoalPoints::GetGoalPointsQueue().push(goalPoints);
         }
     }
 

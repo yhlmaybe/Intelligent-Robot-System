@@ -131,7 +131,7 @@ MainWindow::~MainWindow()
 void MainWindow::closeEvent(QCloseEvent *event) 
 {
     StopVisualPolling();
-    IRSCoreHandle::End();
+    IRSCoreManager::IRSCoreHandle::End();
     rclcpp::shutdown();
     for(QWidget *form : forms)
     {
@@ -221,11 +221,11 @@ void MainWindow::Start()
 {
     if (!is_running)
     {
-        IRSCoreHandle::Start();
+        IRSCoreManager::IRSCoreHandle::Start();
         is_running = true;
 
         ui->jointName_comboBox->clear();
-        std::vector<std::string> joint_names = IRSCoreHandle::GetCurrentRobotState()->getVariableNames();
+        std::vector<std::string> joint_names = IRSCoreManager::IRSCoreHandle::GetCurrentRobotState()->getVariableNames();
         for (std::string name : joint_names)
         {
             ui->jointName_comboBox->addItem(QString::fromStdString(name));
@@ -239,7 +239,7 @@ void MainWindow::Start()
 
 void MainWindow::End()
 {
-    IRSCoreHandle::End();
+    IRSCoreManager::IRSCoreHandle::End();
     is_running = false;
 }
 
@@ -247,7 +247,7 @@ void MainWindow::StateReset()
 {
     if(is_running)
     {
-        IRSCoreHandle::ResetServoState();
+        IRSCoreManager::IRSCoreHandle::ResetServoState();
     }
     else 
     {
@@ -276,7 +276,7 @@ void MainWindow::SetJointPosition()
             return;
         }
 
-        IRSCoreHandle::SetJointPosition(joint_name.toStdString(), position_double);
+        IRSCoreManager::IRSCoreHandle::SetJointPosition(joint_name.toStdString(), position_double);
     }
     else 
     {
@@ -316,7 +316,7 @@ void MainWindow::SetGoalPoint()
         }
 
         std::vector<Eigen::Vector3d> point_vec{Eigen::Vector3d(x, y, z)};
-        IRSCoreHandle::GetGoalPointsQueue().push(point_vec);
+        IRSCoreManager::IRSCoreHandle::GetGoalPointsQueue().push(point_vec);
     }
     else
     {
