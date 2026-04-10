@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace AttentionGuideReconstruction
 {
@@ -12,259 +13,62 @@ namespace AttentionGuideReconstruction
     {
     }
 
-    InputPreprocessor::InputPreprocessor(PreprocessConfig config)
+    InputPreprocessor::InputPreprocessor(Config config)
         : config_(config)
     {
     }
 
-    void InputPreprocessor::SetConfig(PreprocessConfig config)
+    InputPreprocessor::DepthProcessResult InputPreprocessor::Process(DepthImage depthImage)
     {
-        config_ = config;
+        DepthProcessResult result;
+        result.width = depthImage.width;
+        result.height = depthImage.height;
+        result.sourceFormat = depthImage.format;
 
-        while (cachedFrames_.size() > config_.maxCachedFrames)
+        if (!ValidateDepthImage(depthImage, &result.errorMessage))
         {
-            cachedFrames_.pop_front();
-        }
-    }
-
-    std::shared_ptr<InputPreprocessor::RawFrame> InputPreprocessor::ReceiveFrame(ColorImage colorImage, DepthImage depthImage, double timestampSec, std::uint64_t frameId, std::string *errorMessage)
-    {
-        if (!std::isfinite(timestampSec) || timestampSec < 0.0)
-        {
-            if (errorMessage)
-            {
-                *errorMessage = "timestampSec must be a non-negative finite value.";
-            }
-            return nullptr;
+            return result;
         }
 
-        if (!ValidateColorImage(colorImage, errorMessage) || !ValidateDepthImage(depthImage, errorMessage))
+        result.depthMeters = DecodeDepthImage(depthImage);
+        if (result.depthMeters.size() != static_cast<std::size_t>(depthImage.width) * static_cast<std::size_t>(depthImage.height))
         {
-            return nullptr;
+            result.errorMessage = "Failed to decode depth image.";
+            result.depthMeters.clear();
+            return result;
         }
 
-        std::shared_ptr<RawFrame> frame = std::make_shared<RawFrame>();
-        frame->frameId = frameId;
-        frame->timestampSec = timestampSec;
-        frame->colorImage = std::move(colorImage);
-        frame->depthImage = std::move(depthImage);
-        return frame;
-    }
+        ApplyDepthRange(&result.depthMeters);
 
-    bool InputPreprocessor::ProcessDepth(std::shared_ptr<RawFrame> frame, std::string *errorMessage)
-    {
-        if (!frame)
+        if (config_.enableMedianFilter && config_.medianFilterRadius > 0)
         {
-            if (errorMessage)
-            {
-                *errorMessage = "frame is null.";
-            }
-            return false;
+            result.depthMeters = ApplyMedianFilter(
+                std::move(result.depthMeters),
+                depthImage.width,
+                depthImage.height,
+                config_.medianFilterRadius,
+                &result.filteredPixelCount);
         }
 
-        if (!ValidateDepthImage(frame->depthImage, errorMessage))
+        if (config_.enableHoleFill && config_.holeFillRadius > 0)
         {
-            return false;
-        }
-
-        frame->depthMeters = DecodeDepthImage(frame->depthImage);
-        if (frame->depthMeters.empty())
-        {
-            if (errorMessage)
-            {
-                *errorMessage = "Failed to decode depth image.";
-            }
-            return false;
-        }
-
-        if (config_.enableMedianFilter)
-        {
-            frame->depthMeters = ApplyMedianFilter(
-                std::move(frame->depthMeters),
-                frame->depthImage.width,
-                frame->depthImage.height,
-                config_.medianFilterRadius);
-        }
-
-        if (config_.enableHoleFill)
-        {
-            frame->depthMeters = FillDepthHoles(
-                std::move(frame->depthMeters),
-                frame->depthImage.width,
-                frame->depthImage.height,
+            result.depthMeters = FillDepthHoles(
+                std::move(result.depthMeters),
+                depthImage.width,
+                depthImage.height,
                 config_.holeFillRadius,
-                config_.minHoleFillNeighbors);
+                config_.minHoleFillNeighbors,
+                &result.holeFilledPixelCount);
         }
 
-        return true;
-    }
+        ComputeStatistics(
+            result.depthMeters,
+            &result.validDepthRatio,
+            &result.minDepthMeters,
+            &result.maxDepthMeters);
 
-    bool InputPreprocessor::AlignFrame(std::shared_ptr<RawFrame> frame, std::string *errorMessage)
-    {
-        if (!frame)
-        {
-            if (errorMessage)
-            {
-                *errorMessage = "frame is null.";
-            }
-            return false;
-        }
-
-        if (!ValidateColorImage(frame->colorImage, errorMessage) || !ValidateDepthImage(frame->depthImage, errorMessage))
-        {
-            return false;
-        }
-
-        frame->alignedColorImage = ResizeColorImage(
-            frame->colorImage,
-            frame->depthImage.width,
-            frame->depthImage.height,
-            config_.alignmentOffsetX,
-            config_.alignmentOffsetY);
-
-        return true;
-    }
-
-    std::shared_ptr<InputPreprocessor::ProcessedFrame> InputPreprocessor::PackFrame(std::shared_ptr<RawFrame> frame, std::string *errorMessage)
-    {
-        if (!frame)
-        {
-            if (errorMessage)
-            {
-                *errorMessage = "frame is null.";
-            }
-            return nullptr;
-        }
-
-        if (frame->depthMeters.empty())
-        {
-            if (errorMessage)
-            {
-                *errorMessage = "ProcessDepth must be called before PackFrame.";
-            }
-            return nullptr;
-        }
-
-        if (frame->alignedColorImage.data.empty())
-        {
-            if (!AlignFrame(frame, errorMessage))
-            {
-                return nullptr;
-            }
-        }
-
-        std::vector<float> rawDepthMeters = DecodeDepthImage(frame->depthImage);
-        if (rawDepthMeters.empty())
-        {
-            if (errorMessage)
-            {
-                *errorMessage = "Failed to decode raw depth image during PackFrame.";
-            }
-            return nullptr;
-        }
-
-        std::shared_ptr<ProcessedFrame> processedFrame = std::make_shared<ProcessedFrame>();
-        processedFrame->frameId = frame->frameId;
-        processedFrame->timestampSec = frame->timestampSec;
-        processedFrame->colorImage = frame->alignedColorImage;
-        processedFrame->depthMeters = frame->depthMeters;
-        processedFrame->deltaTimeFromPreviousFrameSec = cachedFrames_.empty() ? 0.0 : frame->timestampSec - cachedFrames_.back()->timestampSec;
-
-        ComputeFrameStatistics(
-            std::move(rawDepthMeters),
-            processedFrame->depthMeters,
-            processedFrame->rawValidDepthRatio,
-            processedFrame->processedValidDepthRatio,
-            processedFrame->filteredPixelCount,
-            processedFrame->holeFilledPixelCount);
-
-        return processedFrame;
-    }
-
-    bool InputPreprocessor::CacheFrame(std::shared_ptr<ProcessedFrame> frame, std::string *errorMessage)
-    {
-        if (!frame)
-        {
-            if (errorMessage)
-            {
-                *errorMessage = "processed frame is null.";
-            }
-            return false;
-        }
-
-        cachedFrames_.push_back(frame);
-        while (cachedFrames_.size() > config_.maxCachedFrames)
-        {
-            cachedFrames_.pop_front();
-        }
-
-        return true;
-    }
-
-    std::shared_ptr<InputPreprocessor::ProcessedFrame> InputPreprocessor::RunPipeline(ColorImage colorImage, DepthImage depthImage, double timestampSec, std::uint64_t frameId, std::string *errorMessage)
-    {
-        std::shared_ptr<RawFrame> frame = ReceiveFrame(std::move(colorImage), std::move(depthImage), timestampSec, frameId, errorMessage);
-        if (!frame)
-        {
-            return nullptr;
-        }
-
-        if (!ProcessDepth(frame, errorMessage))
-        {
-            return nullptr;
-        }
-
-        if (!AlignFrame(frame, errorMessage))
-        {
-            return nullptr;
-        }
-
-        std::shared_ptr<ProcessedFrame> processedFrame = PackFrame(frame, errorMessage);
-        if (!processedFrame)
-        {
-            return nullptr;
-        }
-
-        if (!CacheFrame(processedFrame, errorMessage))
-        {
-            return nullptr;
-        }
-
-        return processedFrame;
-    }
-
-    std::shared_ptr<InputPreprocessor::ProcessedFrame> InputPreprocessor::GetLatestFrame()
-    {
-        if (cachedFrames_.empty())
-        {
-            return nullptr;
-        }
-
-        return cachedFrames_.back();
-    }
-
-    std::vector<std::shared_ptr<InputPreprocessor::ProcessedFrame>> InputPreprocessor::GetFramesByTimeWindow(double beginTimestampSec, double endTimestampSec)
-    {
-        std::vector<std::shared_ptr<ProcessedFrame>> frames;
-        if (beginTimestampSec > endTimestampSec)
-        {
-            return frames;
-        }
-
-        for (std::shared_ptr<ProcessedFrame> frame : cachedFrames_)
-        {
-            if (frame && frame->timestampSec >= beginTimestampSec && frame->timestampSec <= endTimestampSec)
-            {
-                frames.push_back(frame);
-            }
-        }
-
-        return frames;
-    }
-
-    void InputPreprocessor::ClearCache()
-    {
-        cachedFrames_.clear();
+        result.success = true;
+        return result;
     }
 
     std::size_t InputPreprocessor::ToIndex(std::uint32_t x, std::uint32_t y, std::uint32_t width)
@@ -275,44 +79,6 @@ namespace AttentionGuideReconstruction
     bool InputPreprocessor::IsValidDepth(float depth)
     {
         return std::isfinite(depth) && depth > 0.0f;
-    }
-
-    std::uint32_t InputPreprocessor::ClampCoordinate(int value, std::uint32_t upperBoundExclusive)
-    {
-        if (upperBoundExclusive == 0)
-        {
-            return 0;
-        }
-
-        if (value <= 0)
-        {
-            return 0;
-        }
-
-        const std::uint32_t maxValue = upperBoundExclusive - 1;
-        if (static_cast<std::uint32_t>(value) >= upperBoundExclusive)
-        {
-            return maxValue;
-        }
-
-        return static_cast<std::uint32_t>(value);
-    }
-
-    std::uint32_t InputPreprocessor::GetColorChannels(ColorFormat format)
-    {
-        switch (format)
-        {
-        case ColorFormat::kGray8:
-            return 1;
-        case ColorFormat::kRGB8:
-        case ColorFormat::kBGR8:
-            return 3;
-        case ColorFormat::kRGBA8:
-        case ColorFormat::kBGRA8:
-            return 4;
-        default:
-            return 0;
-        }
     }
 
     std::uint32_t InputPreprocessor::GetDepthBytesPerPixel(DepthFormat format)
@@ -328,66 +94,22 @@ namespace AttentionGuideReconstruction
         }
     }
 
-    bool InputPreprocessor::ValidateColorImage(ColorImage colorImage, std::string *errorMessage)
-    {
-        if (colorImage.width == 0 || colorImage.height == 0)
-        {
-            if (errorMessage)
-            {
-                *errorMessage = "Color image width and height must be positive.";
-            }
-            return false;
-        }
-
-        std::uint32_t expectedChannels = GetColorChannels(colorImage.format);
-        if (expectedChannels == 0)
-        {
-            if (errorMessage)
-            {
-                *errorMessage = "Unsupported color image format.";
-            }
-            return false;
-        }
-
-        if (colorImage.channels != expectedChannels)
-        {
-            if (errorMessage)
-            {
-                *errorMessage = "Color image channel count does not match the declared format.";
-            }
-            return false;
-        }
-
-        std::uint64_t minimumStride = static_cast<std::uint64_t>(colorImage.width) * colorImage.channels;
-        if (colorImage.rowStrideBytes < minimumStride)
-        {
-            if (errorMessage)
-            {
-                *errorMessage = "Color image rowStrideBytes is too small.";
-            }
-            return false;
-        }
-
-        std::uint64_t requiredBytes = static_cast<std::uint64_t>(colorImage.rowStrideBytes) * colorImage.height;
-        if (colorImage.data.size() < requiredBytes)
-        {
-            if (errorMessage)
-            {
-                *errorMessage = "Color image buffer is too small.";
-            }
-            return false;
-        }
-
-        return true;
-    }
-
     bool InputPreprocessor::ValidateDepthImage(DepthImage depthImage, std::string *errorMessage)
     {
         if (depthImage.width == 0 || depthImage.height == 0)
         {
             if (errorMessage)
             {
-                *errorMessage = "Depth image width and height must be positive.";
+                *errorMessage = "Depth image width and height must be greater than zero.";
+            }
+            return false;
+        }
+
+        if (depthImage.format == DepthFormat::kUnknown)
+        {
+            if (errorMessage)
+            {
+                *errorMessage = "Depth image format is unknown.";
             }
             return false;
         }
@@ -402,31 +124,31 @@ namespace AttentionGuideReconstruction
             return false;
         }
 
-        std::uint64_t minimumStride = static_cast<std::uint64_t>(depthImage.width) * bytesPerPixel;
-        if (depthImage.rowStrideBytes < minimumStride)
+        std::uint64_t minStride = static_cast<std::uint64_t>(depthImage.width) * static_cast<std::uint64_t>(bytesPerPixel);
+        if (depthImage.rowStrideBytes < minStride)
         {
             if (errorMessage)
             {
-                *errorMessage = "Depth image rowStrideBytes is too small.";
+                *errorMessage = "Depth image rowStrideBytes is smaller than the minimum required stride.";
             }
             return false;
         }
 
-        std::uint64_t requiredBytes = static_cast<std::uint64_t>(depthImage.rowStrideBytes) * depthImage.height;
+        std::uint64_t requiredBytes = static_cast<std::uint64_t>(depthImage.rowStrideBytes) * static_cast<std::uint64_t>(depthImage.height);
         if (depthImage.data.size() < requiredBytes)
         {
             if (errorMessage)
             {
-                *errorMessage = "Depth image buffer is too small.";
+                *errorMessage = "Depth image data buffer is smaller than rowStrideBytes * height.";
             }
             return false;
         }
 
-        if (!std::isfinite(depthImage.scaleToMeters) || depthImage.scaleToMeters <= 0.0f)
+        if (depthImage.format == DepthFormat::kUInt16Millimeters && (!std::isfinite(depthImage.scaleToMeters) || depthImage.scaleToMeters <= 0.0f))
         {
             if (errorMessage)
             {
-                *errorMessage = "Depth image scaleToMeters must be positive.";
+                *errorMessage = "Depth image scaleToMeters must be a positive finite value for uint16 depth input.";
             }
             return false;
         }
@@ -436,224 +158,247 @@ namespace AttentionGuideReconstruction
 
     std::vector<float> InputPreprocessor::DecodeDepthImage(DepthImage depthImage)
     {
-        std::vector<float> depthMeters(static_cast<std::size_t>(depthImage.width) * depthImage.height, 0.0f);
-        std::uint32_t bytesPerPixel = GetDepthBytesPerPixel(depthImage.format);
-        if (bytesPerPixel == 0)
-        {
-            return depthMeters;
-        }
+        std::vector<float> depthMeters(static_cast<std::size_t>(depthImage.width) * static_cast<std::size_t>(depthImage.height), 0.0f);
 
         for (std::uint32_t y = 0; y < depthImage.height; ++y)
         {
-            std::uint8_t *rowPointer = depthImage.data.data() + static_cast<std::size_t>(y) * depthImage.rowStrideBytes;
+            const std::uint8_t *row = depthImage.data.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(depthImage.rowStrideBytes);
             for (std::uint32_t x = 0; x < depthImage.width; ++x)
             {
-                std::uint8_t *pixelPointer = rowPointer + static_cast<std::size_t>(x) * bytesPerPixel;
-                float depthValue = 0.0f;
-
+                std::size_t index = ToIndex(x, y, depthImage.width);
                 if (depthImage.format == DepthFormat::kUInt16Millimeters)
                 {
                     std::uint16_t rawDepth = 0;
-                    std::memcpy(&rawDepth, pixelPointer, sizeof(rawDepth));
-                    depthValue = static_cast<float>(rawDepth) * depthImage.scaleToMeters;
+                    std::memcpy(&rawDepth, row + static_cast<std::size_t>(x) * 2, sizeof(std::uint16_t));
+                    depthMeters[index] = rawDepth == 0 ? 0.0f : static_cast<float>(rawDepth) * depthImage.scaleToMeters;
                 }
                 else if (depthImage.format == DepthFormat::kFloat32Meters)
                 {
                     float rawDepth = 0.0f;
-                    std::memcpy(&rawDepth, pixelPointer, sizeof(rawDepth));
-                    depthValue = rawDepth * depthImage.scaleToMeters;
+                    std::memcpy(&rawDepth, row + static_cast<std::size_t>(x) * 4, sizeof(float));
+                    depthMeters[index] = rawDepth;
                 }
-
-                if (!std::isfinite(depthValue) || depthValue < config_.minValidDepthMeters || depthValue > config_.maxValidDepthMeters)
-                {
-                    depthValue = 0.0f;
-                }
-
-                depthMeters[ToIndex(x, y, depthImage.width)] = depthValue;
             }
         }
 
         return depthMeters;
     }
 
-    std::vector<float> InputPreprocessor::ApplyMedianFilter(std::vector<float> depthMeters, std::uint32_t width, std::uint32_t height, std::uint32_t radius)
+    void InputPreprocessor::ApplyDepthRange(std::vector<float> *depthMeters)
     {
-        if (radius == 0 || depthMeters.empty())
+        if (!depthMeters)
+        {
+            return;
+        }
+
+        for (float &depth : *depthMeters)
+        {
+            if (!std::isfinite(depth) || depth < config_.minValidDepthMeters || depth > config_.maxValidDepthMeters)
+            {
+                depth = 0.0f;
+            }
+        }
+    }
+
+    std::vector<float> InputPreprocessor::ApplyMedianFilter(std::vector<float> depthMeters, std::uint32_t width, std::uint32_t height, std::uint32_t radius, std::uint32_t *changedPixelCount)
+    {
+        if (changedPixelCount)
+        {
+            *changedPixelCount = 0;
+        }
+
+        if (depthMeters.empty() || radius == 0)
         {
             return depthMeters;
         }
 
-        std::vector<float> filteredDepth = depthMeters;
-        std::vector<float> values;
-        values.reserve(static_cast<std::size_t>((radius * 2 + 1) * (radius * 2 + 1)));
+        std::vector<float> source = depthMeters;
+        std::vector<float> neighbors;
 
         for (std::uint32_t y = 0; y < height; ++y)
         {
             for (std::uint32_t x = 0; x < width; ++x)
             {
-                std::size_t centerIndex = ToIndex(x, y, width);
-                if (!IsValidDepth(depthMeters[centerIndex]))
+                std::size_t index = ToIndex(x, y, width);
+                if (!IsValidDepth(source[index]))
                 {
                     continue;
                 }
 
-                values.clear();
-                int minY = std::max<int>(0, static_cast<int>(y) - static_cast<int>(radius));
-                int maxY = std::min<int>(static_cast<int>(height) - 1, static_cast<int>(y) + static_cast<int>(radius));
-                int minX = std::max<int>(0, static_cast<int>(x) - static_cast<int>(radius));
-                int maxX = std::min<int>(static_cast<int>(width) - 1, static_cast<int>(x) + static_cast<int>(radius));
+                neighbors.clear();
+                std::int32_t xBegin = static_cast<std::int32_t>(x) - static_cast<std::int32_t>(radius);
+                std::int32_t xEnd = static_cast<std::int32_t>(x) + static_cast<std::int32_t>(radius);
+                std::int32_t yBegin = static_cast<std::int32_t>(y) - static_cast<std::int32_t>(radius);
+                std::int32_t yEnd = static_cast<std::int32_t>(y) + static_cast<std::int32_t>(radius);
 
-                for (int sampleY = minY; sampleY <= maxY; ++sampleY)
+                for (std::int32_t ny = yBegin; ny <= yEnd; ++ny)
                 {
-                    for (int sampleX = minX; sampleX <= maxX; ++sampleX)
+                    if (ny < 0 || ny >= static_cast<std::int32_t>(height))
                     {
-                        float value = depthMeters[ToIndex(static_cast<std::uint32_t>(sampleX), static_cast<std::uint32_t>(sampleY), width)];
-                        if (IsValidDepth(value))
+                        continue;
+                    }
+                    for (std::int32_t nx = xBegin; nx <= xEnd; ++nx)
+                    {
+                        if (nx < 0 || nx >= static_cast<std::int32_t>(width))
                         {
-                            values.push_back(value);
+                            continue;
+                        }
+
+                        float neighborDepth = source[ToIndex(static_cast<std::uint32_t>(nx), static_cast<std::uint32_t>(ny), width)];
+                        if (IsValidDepth(neighborDepth))
+                        {
+                            neighbors.push_back(neighborDepth);
                         }
                     }
                 }
 
-                if (values.size() < 3)
+                if (neighbors.empty())
                 {
                     continue;
                 }
 
-                std::size_t medianIndex = values.size() / 2;
-                std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(medianIndex), values.end());
-                filteredDepth[centerIndex] = values[medianIndex];
+                std::size_t medianIndex = neighbors.size() / 2;
+                std::nth_element(neighbors.begin(), neighbors.begin() + static_cast<std::ptrdiff_t>(medianIndex), neighbors.end());
+                float filteredDepth = neighbors[medianIndex];
+                if (std::fabs(filteredDepth - source[index]) > 1e-6f && changedPixelCount)
+                {
+                    *changedPixelCount += 1;
+                }
+                depthMeters[index] = filteredDepth;
             }
         }
 
-        return filteredDepth;
+        return depthMeters;
     }
 
-    std::vector<float> InputPreprocessor::FillDepthHoles(std::vector<float> depthMeters, std::uint32_t width, std::uint32_t height, std::uint32_t radius, std::uint32_t minNeighbors)
+    std::vector<float> InputPreprocessor::FillDepthHoles(std::vector<float> depthMeters, std::uint32_t width, std::uint32_t height, std::uint32_t radius, std::uint32_t minNeighbors, std::uint32_t *filledPixelCount)
     {
-        if (radius == 0 || depthMeters.empty())
+        if (filledPixelCount)
+        {
+            *filledPixelCount = 0;
+        }
+
+        if (depthMeters.empty() || radius == 0)
         {
             return depthMeters;
         }
 
-        std::vector<float> filledDepth = depthMeters;
+        std::vector<float> source = depthMeters;
+        std::vector<float> neighbors;
+
         for (std::uint32_t y = 0; y < height; ++y)
         {
             for (std::uint32_t x = 0; x < width; ++x)
             {
-                std::size_t centerIndex = ToIndex(x, y, width);
-                if (IsValidDepth(depthMeters[centerIndex]))
+                std::size_t index = ToIndex(x, y, width);
+                if (IsValidDepth(source[index]))
                 {
                     continue;
                 }
 
-                float sum = 0.0f;
-                std::uint32_t validNeighbors = 0;
-                int minY = std::max<int>(0, static_cast<int>(y) - static_cast<int>(radius));
-                int maxY = std::min<int>(static_cast<int>(height) - 1, static_cast<int>(y) + static_cast<int>(radius));
-                int minX = std::max<int>(0, static_cast<int>(x) - static_cast<int>(radius));
-                int maxX = std::min<int>(static_cast<int>(width) - 1, static_cast<int>(x) + static_cast<int>(radius));
+                neighbors.clear();
+                std::int32_t xBegin = static_cast<std::int32_t>(x) - static_cast<std::int32_t>(radius);
+                std::int32_t xEnd = static_cast<std::int32_t>(x) + static_cast<std::int32_t>(radius);
+                std::int32_t yBegin = static_cast<std::int32_t>(y) - static_cast<std::int32_t>(radius);
+                std::int32_t yEnd = static_cast<std::int32_t>(y) + static_cast<std::int32_t>(radius);
 
-                for (int sampleY = minY; sampleY <= maxY; ++sampleY)
+                for (std::int32_t ny = yBegin; ny <= yEnd; ++ny)
                 {
-                    for (int sampleX = minX; sampleX <= maxX; ++sampleX)
+                    if (ny < 0 || ny >= static_cast<std::int32_t>(height))
                     {
-                        float value = depthMeters[ToIndex(static_cast<std::uint32_t>(sampleX), static_cast<std::uint32_t>(sampleY), width)];
-                        if (IsValidDepth(value))
+                        continue;
+                    }
+                    for (std::int32_t nx = xBegin; nx <= xEnd; ++nx)
+                    {
+                        if (nx < 0 || nx >= static_cast<std::int32_t>(width))
                         {
-                            sum += value;
-                            ++validNeighbors;
+                            continue;
+                        }
+
+                        float neighborDepth = source[ToIndex(static_cast<std::uint32_t>(nx), static_cast<std::uint32_t>(ny), width)];
+                        if (IsValidDepth(neighborDepth))
+                        {
+                            neighbors.push_back(neighborDepth);
                         }
                     }
                 }
 
-                if (validNeighbors >= minNeighbors)
+                if (neighbors.size() < static_cast<std::size_t>(minNeighbors))
                 {
-                    filledDepth[centerIndex] = sum / static_cast<float>(validNeighbors);
+                    continue;
+                }
+
+                float sumDepth = 0.0f;
+                for (float neighborDepth : neighbors)
+                {
+                    sumDepth += neighborDepth;
+                }
+
+                depthMeters[index] = sumDepth / static_cast<float>(neighbors.size());
+                if (filledPixelCount)
+                {
+                    *filledPixelCount += 1;
                 }
             }
         }
 
-        return filledDepth;
+        return depthMeters;
     }
 
-    InputPreprocessor::ColorImage InputPreprocessor::ResizeColorImage(ColorImage colorImage, std::uint32_t targetWidth, std::uint32_t targetHeight, int offsetX, int offsetY)
+    void InputPreprocessor::ComputeStatistics(std::vector<float> depthMeters, float *validDepthRatio, float *minDepthMeters, float *maxDepthMeters)
     {
-        ColorImage resizedImage;
-        resizedImage.width = targetWidth;
-        resizedImage.height = targetHeight;
-        resizedImage.channels = colorImage.channels;
-        resizedImage.rowStrideBytes = targetWidth * colorImage.channels;
-        resizedImage.format = colorImage.format;
-        resizedImage.data.resize(static_cast<std::size_t>(resizedImage.rowStrideBytes) * targetHeight, 0U);
-
-        if (targetWidth == 0 || targetHeight == 0 || colorImage.width == 0 || colorImage.height == 0)
+        if (validDepthRatio)
         {
-            return resizedImage;
+            *validDepthRatio = 0.0f;
+        }
+        if (minDepthMeters)
+        {
+            *minDepthMeters = 0.0f;
+        }
+        if (maxDepthMeters)
+        {
+            *maxDepthMeters = 0.0f;
         }
 
-        for (std::uint32_t targetY = 0; targetY < targetHeight; ++targetY)
-        {
-            std::uint32_t sourceY = ClampCoordinate(
-                static_cast<int>((static_cast<std::uint64_t>(targetY) * colorImage.height) / targetHeight) + offsetY,
-                colorImage.height);
-            for (std::uint32_t targetX = 0; targetX < targetWidth; ++targetX)
-            {
-                std::uint32_t sourceX = ClampCoordinate(
-                    static_cast<int>((static_cast<std::uint64_t>(targetX) * colorImage.width) / targetWidth) + offsetX,
-                    colorImage.width);
-
-                std::uint8_t *sourcePixel = colorImage.data.data() + static_cast<std::size_t>(sourceY) * colorImage.rowStrideBytes + static_cast<std::size_t>(sourceX) * colorImage.channels;
-                std::uint8_t *targetPixel = resizedImage.data.data() + static_cast<std::size_t>(targetY) * resizedImage.rowStrideBytes + static_cast<std::size_t>(targetX) * resizedImage.channels;
-
-                std::memcpy(targetPixel, sourcePixel, colorImage.channels);
-            }
-        }
-
-        return resizedImage;
-    }
-
-    float InputPreprocessor::ComputeValidDepthRatio(std::vector<float> depthMeters)
-    {
         if (depthMeters.empty())
         {
-            return 0.0f;
+            return;
         }
 
         std::size_t validCount = 0;
+        float minDepth = std::numeric_limits<float>::max();
+        float maxDepth = 0.0f;
+
         for (float depth : depthMeters)
         {
-            if (IsValidDepth(depth))
+            if (!IsValidDepth(depth))
             {
-                ++validCount;
+                continue;
             }
+
+            validCount += 1;
+            minDepth = std::min(minDepth, depth);
+            maxDepth = std::max(maxDepth, depth);
         }
 
-        return static_cast<float>(validCount) / static_cast<float>(depthMeters.size());
-    }
-
-    void InputPreprocessor::ComputeFrameStatistics(std::vector<float> rawDepthMeters, std::vector<float> processedDepthMeters, float &rawValidDepthRatio, float &processedValidDepthRatio, std::uint32_t &filteredPixelCount, std::uint32_t &holeFilledPixelCount)
-    {
-        rawValidDepthRatio = ComputeValidDepthRatio(rawDepthMeters);
-        processedValidDepthRatio = ComputeValidDepthRatio(processedDepthMeters);
-        filteredPixelCount = 0;
-        holeFilledPixelCount = 0;
-
-        std::size_t count = std::min(rawDepthMeters.size(), processedDepthMeters.size());
-        for (std::size_t index = 0; index < count; ++index)
+        if (validDepthRatio)
         {
-            bool rawValid = IsValidDepth(rawDepthMeters[index]);
-            bool processedValid = IsValidDepth(processedDepthMeters[index]);
+            *validDepthRatio = static_cast<float>(validCount) / static_cast<float>(depthMeters.size());
+        }
 
-            if (!rawValid && processedValid)
-            {
-                ++holeFilledPixelCount;
-            }
-            else if (rawValid && processedValid && std::fabs(rawDepthMeters[index] - processedDepthMeters[index]) > 1e-5f)
-            {
-                ++filteredPixelCount;
-            }
+        if (validCount == 0)
+        {
+            return;
+        }
+
+        if (minDepthMeters)
+        {
+            *minDepthMeters = minDepth;
+        }
+        if (maxDepthMeters)
+        {
+            *maxDepthMeters = maxDepth;
         }
     }
 
-}
+} // namespace AttentionGuideReconstruction

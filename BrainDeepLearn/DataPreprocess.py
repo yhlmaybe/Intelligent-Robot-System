@@ -574,9 +574,8 @@ class DataPreprocessor:
         *,
         imageHeight: int,
         imageWidth: int,
-        dtype: torch.dtype = torch.float32,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        gt_shrink = torch.zeros(1, imageHeight, imageWidth, dtype=dtype)
-        gt_thresh = torch.zeros(1, imageHeight, imageWidth, dtype=dtype)
+        dtype: torch.dtype = torch.float32,) -> Tuple[torch.Tensor, torch.Tensor]:
+        gt_boxes = torch.zeros(1, imageHeight, imageWidth, dtype=dtype)
         gt_mask = torch.ones(1, imageHeight, imageWidth, dtype=dtype)
 
         boxes_np = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
@@ -594,10 +593,9 @@ class DataPreprocessor:
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            gt_thresh[:, y1:y2, x1:x2] = 1.0
-            gt_shrink[:, y1:y2, x1:x2] = 1.0
+            gt_boxes[:, y1:y2, x1:x2] = 1.0
 
-        return gt_shrink, gt_thresh, gt_mask
+        return gt_boxes, gt_mask
 
     @staticmethod
     def PrepareOCRSample(
@@ -650,7 +648,7 @@ class DataPreprocessor:
             rec_boxes.append(np.array([x1, y1, x2, y2], dtype=np.int32))
             rec_texts.append(text)
 
-        gt_shrink, gt_thresh, gt_mask = DataPreprocessor.OCRBuildDbTargets(
+        gt_boxes, gt_mask = DataPreprocessor.OCRBuildDbTargets(
             det_boxes,
             imageHeight=imageSize,
             imageWidth=imageSize,
@@ -679,8 +677,7 @@ class DataPreprocessor:
 
         if device is not None:
             img_rgb = img_rgb.to(device)
-            gt_shrink = gt_shrink.to(device)
-            gt_thresh = gt_thresh.to(device)
+            gt_boxes = gt_boxes.to(device)
             gt_mask = gt_mask.to(device)
             recog_imgs = recog_imgs.to(device)
             targets = targets.to(device)
@@ -691,8 +688,7 @@ class DataPreprocessor:
             "scaled_boxes": boxes_np,
             "det_boxes": det_boxes,
             "rec_boxes": rec_boxes,
-            "gt_shrink": gt_shrink,
-            "gt_thresh": gt_thresh,
+            "gt_boxes": gt_boxes,
             "gt_mask": gt_mask,
             "recog_imgs": recog_imgs,
             "targets": targets,

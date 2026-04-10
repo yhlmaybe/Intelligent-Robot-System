@@ -168,28 +168,17 @@ class DBBackbone(nn.Module):
 
 
 class DBHead(nn.Module):
-    def __init__(self, inCh: int = 256, kValue: float = 50.0):
+    def __init__(self, inCh: int = 256):
         super().__init__()
-        self.k = float(kValue)
 
         self.probConv = nn.Sequential(
             ConvBNReLU(inCh, 64, kSize=3, stride=1, padding=1),
             nn.Conv2d(64, 1, kernel_size=1),)
 
-        self.threshConv = nn.Sequential(
-            ConvBNReLU(inCh, 64, kSize=3, stride=1, padding=1),
-            nn.Conv2d(64, 1, kernel_size=1),)
-
-    def forward(self, featTensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, featTensor: torch.Tensor) -> torch.Tensor:
         prob_logits = self.probConv(featTensor)
-        thresh_logits = self.threshConv(featTensor)
-
         prob_map = torch.sigmoid(prob_logits)
-        thresh_map = torch.sigmoid(thresh_logits)
-
-        bin_map = torch.sigmoid(self.k * (prob_map - thresh_map))
-
-        return prob_map, thresh_map, bin_map # [B, 1, H, W]
+        return prob_map # [B, 1, H, W]
 
 
 def BalancedBceLoss(predTensor: torch.Tensor, gtTensor: torch.Tensor, maskTensor: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -238,39 +227,29 @@ class DBLoss(nn.Module):
     def __init__(
         self,
         lambdaProb: float = 1.0,
-        lambdaBin: float = 1.0,
-        lambdaThresh: float = 1.0,):
+        lambdaMask: float = 1.0,):
         super().__init__()
         self.lambdaProb = float(lambdaProb)
-        self.lambdaBin = float(lambdaBin)
-        self.lambdaThresh = float(lambdaThresh)
+        self.lambdaMask = float(lambdaMask)
 
     def forward(
         self,
         probMap: torch.Tensor,
-        binMap: torch.Tensor,
-        threshMap: torch.Tensor,
-        gtShrink: torch.Tensor,
-        gtThresh: torch.Tensor,
+        gtBoxes: torch.Tensor,
         gtMask: Optional[torch.Tensor] = None,) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
         if gtMask is None:
-            gtMask = torch.ones_like(gtShrink)
+            gtMask = torch.ones_like(gtBoxes)
 
-        loss_prob = BalancedBceLoss(probMap, gtShrink, gtMask)
-        loss_bin = DiceLoss(binMap, gtShrink, gtMask)
-
-        l1 = torch.abs(threshMap - gtThresh) * gtMask
-        loss_thresh = l1.sum() / gtMask.sum().clamp(min=1.0)
+        loss_prob = BalancedBceLoss(probMap, gtBoxes, gtMask)
+        loss_mask = DiceLoss(probMap, gtBoxes, gtMask)
 
         total = (self.lambdaProb * loss_prob
-            + self.lambdaBin * loss_bin
-            + self.lambdaThresh * loss_thresh)
+            + self.lambdaMask * loss_mask)
 
         stats = {"loss_prob": loss_prob.detach(),
-            "loss_bin": loss_bin.detach(),
-            "loss_thresh": loss_thresh.detach(),}
-        
+            "loss_mask": loss_mask.detach(),}
+
         return total, stats
 
 
@@ -395,7 +374,6 @@ class OCREngineExtractor(nn.Module):
     def __init__(
         self,
         vocabCharsPath: str = "/home/yhl/Documents/Intelligent-Robot-System/BrainDeepLearn/ModuleSetting/OCRKeys.txt",
-        dbK: float = 15.0,
         *,
         temporalSteps: int = 0, 
         fuseTopK: int = 8,
@@ -420,7 +398,7 @@ class OCREngineExtractor(nn.Module):
         self._last_ocr_texts_batch: List[List[str]] = []
 
         self.backbone = DBBackbone(inCh=3, baseCh=64)
-        self.dbHead = DBHead(inCh=256, kValue=dbK)
+        self.dbHead = DBHead(inCh=256)
         self.dbLoss = DBLoss()
 
         self.blankIndex = 0
@@ -451,26 +429,20 @@ class OCREngineExtractor(nn.Module):
     def ForwardDetect(
         self,
         imagesTensor: torch.Tensor,
-        gtShrink: Optional[torch.Tensor] = None,
-        gtThresh: Optional[torch.Tensor] = None,
+        gtBoxes: Optional[torch.Tensor] = None,
         gtMask: Optional[torch.Tensor] = None,) -> Dict[str, torch.Tensor]:
         feat = self.backbone(imagesTensor)
-        prob_map, thresh_map, bin_map = self.dbHead(feat)
+        prob_map = self.dbHead(feat)
 
         out: Dict[str, torch.Tensor] = {
-            "prob_map": prob_map,
-            "thresh_map": thresh_map,
-            "bin_map": bin_map,}
+            "prob_map": prob_map,}
 
-        if gtShrink is not None and gtThresh is not None:
+        if gtBoxes is not None:
             loss, stats = self.dbLoss(
                 probMap=prob_map,
-                binMap=bin_map,
-                threshMap=thresh_map,
-                gtShrink=gtShrink,
-                gtThresh=gtThresh,
+                gtBoxes=gtBoxes,
                 gtMask=gtMask,)
-            
+
             out["loss"] = loss
             for k, v in stats.items():
                 out[f"stat_{k}"] = v
@@ -593,7 +565,7 @@ class OCREngineExtractor(nn.Module):
         minBoxArea: int = 10,) -> List[List[OcrItem]]:
 
         feat = self.backbone(imagesTensor) # [B,256,H,W]
-        prob_map, thresh_map, bin_map = self.dbHead(feat) # [B,1,H,W]
+        prob_map = self.dbHead(feat) # [B,1,H,W]
 
         bsz = imagesTensor.size(0)
         results_batch: List[List[Tuple[np.ndarray, str, float, float]]] = []
@@ -605,13 +577,12 @@ class OCREngineExtractor(nn.Module):
 
         for bi in range(bsz):
             pm = prob_map[bi] 
-            bm = bin_map[bi]  
             img = imagesTensor[bi]  
 
             triplets: List[Tuple[np.ndarray, str, float, float]] = []
             frame_obs: List[OcrLineObs] = []  
 
-            boxes = self.BitmapToBoxes(bm, threshValue=binThresh, minArea=minBoxArea)
+            boxes = self.BitmapToBoxes(pm, threshValue=binThresh, minArea=minBoxArea)
 
             if len(boxes) != 0:
                 line_imgs = self.CropAndResizeLines(img, boxes, targetH=32, maxW=512)
@@ -892,7 +863,7 @@ class TestOCRMTool:
     def DetectForwardShapes(self) -> bool:
         try:
             backbone = DBBackbone(inCh=3, baseCh=64).to(self.device)
-            head = DBHead(inCh=256, kValue=50.0).to(self.device)
+            head = DBHead(inCh=256).to(self.device)
             backbone.eval()
             head.eval()
 
@@ -901,13 +872,11 @@ class TestOCRMTool:
 
             with torch.no_grad():
                 feat = backbone(imgs)
-                prob, thresh, binmap = head(feat)
+                prob = head(feat)
 
             assert prob.shape[0] == B and prob.shape[1] == 1
-            assert thresh.shape == prob.shape
-            assert binmap.shape == prob.shape
 
-            for t in (prob, thresh, binmap):
+            for t in (prob,):
                 assert torch.isfinite(t).all()
                 assert t.min().item() >= -1e-6 and t.max().item() <= 1.0 + 1e-6
 
@@ -923,7 +892,7 @@ class TestOCRMTool:
     def DetectLossGradSmoke(self) -> bool:
         try:
             backbone = DBBackbone(inCh=3, baseCh=64).to(self.device)
-            head = DBHead(inCh=256, kValue=50.0).to(self.device)
+            head = DBHead(inCh=256).to(self.device)
             crit = DBLoss().to(self.device)
 
             backbone.train()
@@ -933,13 +902,12 @@ class TestOCRMTool:
             imgs = torch.randn(B, 3, H, W, device=self.device)
 
             feat = backbone(imgs)
-            prob, thresh, binmap = head(feat)
+            prob = head(feat)
 
-            gtShrink = (torch.rand_like(prob) > 0.7).float()
-            gtThresh = torch.rand_like(prob)
+            gtBoxes = (torch.rand_like(prob) > 0.7).float()
             gtMask = (torch.rand_like(prob) > 0.1).float()
 
-            loss, stats = crit(probMap=prob, binMap=binmap, threshMap=thresh, gtShrink=gtShrink, gtThresh=gtThresh, gtMask=gtMask,)
+            loss, stats = crit(probMap=prob, gtBoxes=gtBoxes, gtMask=gtMask,)
 
             opt = torch.optim.Adam(list(backbone.parameters()) + list(head.parameters()), lr=1e-3)
             opt.zero_grad(set_to_none=True)
@@ -954,7 +922,7 @@ class TestOCRMTool:
                 "backbone.enc2.0.conv.weight",
                 "backbone.outConv.conv.weight",
                 "dbHead.probConv.0.conv.weight",
-                "dbHead.threshConv.0.conv.weight",]
+                ]
 
             ok_cov = self.GradCoverage(named, min_ratio=0.4, must_have=must_have)
             assert ok_cov, "DB detection grad coverage failed."
@@ -1090,13 +1058,12 @@ class TestOCRMTool:
 
             with torch.no_grad():
                 feat_tmp = engine.backbone(imgs)
-                prob_tmp, _, _ = engine.dbHead(feat_tmp)
+                prob_tmp = engine.dbHead(feat_tmp)
 
-            gtShrink = (torch.rand_like(prob_tmp) > 0.7).float()
-            gtThresh = torch.rand_like(prob_tmp)
+            gtBoxes = (torch.rand_like(prob_tmp) > 0.7).float()
             gtMask = (torch.rand_like(prob_tmp) > 0.1).float()
 
-            out = engine.ForwardDetect(imgs, gtShrink=gtShrink, gtThresh=gtThresh, gtMask=gtMask,)
+            out = engine.ForwardDetect(imgs, gtBoxes=gtBoxes, gtMask=gtMask,)
             assert "loss" in out
             loss = out["loss"]
 
@@ -1112,7 +1079,7 @@ class TestOCRMTool:
                 "backbone.enc1.0.conv.weight",
                 "backbone.enc4.1.conv.weight",
                 "dbHead.probConv.0.conv.weight",
-                "dbHead.threshConv.0.conv.weight",]
+                ]
 
             ok_cov = self.GradCoverage(named, min_ratio=0.4, must_have=must_have)
             assert ok_cov, "Engine detect grad coverage failed."

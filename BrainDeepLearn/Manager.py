@@ -1139,6 +1139,8 @@ class ManagerFunction:
             def eval_split(dl):
                 engine.eval()
                 split_loss = 0.0
+                split_det_loss = 0.0
+                split_rec_loss = 0.0
                 split_samples = 0
                 box_tp = 0
                 box_fp = 0
@@ -1165,18 +1167,16 @@ class ManagerFunction:
                             det_boxes_pred: List[np.ndarray] = []
                             if trainDetection:
                                 detect_img = sample["detect_img"].unsqueeze(0) # [1, 3, H, W]
-                                gt_shrink = sample["gt_shrink"].unsqueeze(0) # [1, 1, H, W]
-                                gt_thresh = sample["gt_thresh"].unsqueeze(0) # [1, 1, H, W]
+                                gt_boxes = sample["gt_boxes"].unsqueeze(0) # [1, 1, H, W]
                                 gt_mask = sample["gt_mask"].unsqueeze(0) # [1, 1, H, W]
 
                                 det_out = engine.ForwardDetect(
                                     detect_img,
-                                    gtShrink=gt_shrink,
-                                    gtThresh=gt_thresh,
+                                    gtBoxes=gt_boxes,
                                     gtMask=gt_mask,)
                                 det_loss = det_out["loss"] # []
                                 det_boxes_pred = engine.BitmapToBoxes(
-                                    det_out["bin_map"][0],
+                                    det_out["prob_map"][0],
                                     threshValue=0.3,
                                     minArea=10)
                                 tp, fp, fn = self.ComputeOcrBoxMatchStats(
@@ -1213,12 +1213,16 @@ class ManagerFunction:
                                     total_char_count += total_chars
 
                             split_loss += float((det_loss + rec_loss).item())
+                            split_det_loss += float(det_loss.item())
+                            split_rec_loss += float(rec_loss.item())
                             split_samples += 1
 
                 avg_split_loss = split_loss / max(1, split_samples)
+                avg_split_det_loss = split_det_loss / max(1, split_samples)
+                avg_split_rec_loss = split_rec_loss / max(1, split_samples)
                 box_hmean = self.ComputeOcrHmean(box_tp, box_fp, box_fn) if trainDetection else 0.0
                 text_char_acc = (total_char_correct / max(1, total_char_count)) if trainRecognition else 0.0
-                return avg_split_loss, box_hmean, text_char_acc
+                return avg_split_loss, avg_split_det_loss, avg_split_rec_loss, box_hmean, text_char_acc
 
             def BuildOCRCheckpointPayload(epochValue: int) -> Dict[str, Any]:
                 return {
@@ -1264,11 +1268,15 @@ class ManagerFunction:
 
                 engine.train()
                 epoch_loss = 0.0
+                epoch_det_loss = 0.0
+                epoch_rec_loss = 0.0
                 nb = 0
 
                 for bi, batch in enumerate(train_dl, start=1):
                     imgs_b, boxes_b, texts_b, ignore_b = batch
                     sample_losses: List[torch.Tensor] = []
+                    sample_det_losses: List[float] = []
+                    sample_rec_losses: List[float] = []
                     batch_char_correct = 0
                     batch_char_total = 0
                     latest_visual = None
@@ -1290,14 +1298,12 @@ class ManagerFunction:
                         det_loss = zero
                         det_forward_out: Optional[Dict[str, torch.Tensor]] = None
                         if trainDetection:
-                            gt_shrink = sample["gt_shrink"].unsqueeze(0) # [1, 1, H, W]
-                            gt_thresh = sample["gt_thresh"].unsqueeze(0) # [1, 1, H, W]
+                            gt_boxes = sample["gt_boxes"].unsqueeze(0) # [1, 1, H, W]
                             gt_mask = sample["gt_mask"].unsqueeze(0) # [1, 1, H, W]
 
                             det_forward_out = engine.ForwardDetect(
                                 detect_img,
-                                gtShrink=gt_shrink,
-                                gtThresh=gt_thresh,
+                                gtBoxes=gt_boxes,
                                 gtMask=gt_mask,)
                             det_loss = det_forward_out["loss"] # []
 
@@ -1336,11 +1342,10 @@ class ManagerFunction:
                                     det_forward_out = engine.ForwardDetect(detect_img.detach())
 
                                 prob_map_vis = det_forward_out["prob_map"].detach()
-                                bin_map_vis = det_forward_out["bin_map"].detach()
                                 pm_np = prob_map_vis[0].cpu().squeeze(0).numpy()
                                 h_map, w_map = pm_np.shape
                                 forward_boxes = engine.BitmapToBoxes(
-                                    bin_map_vis[0],
+                                    prob_map_vis[0],
                                     threshValue=0.3,
                                     minArea=10)
 
@@ -1410,11 +1415,15 @@ class ManagerFunction:
                                     f"batch {bi}/{len(train_dl)}"],)
 
                         sample_losses.append(det_loss + rec_loss)
+                        sample_det_losses.append(float(det_loss.item()))
+                        sample_rec_losses.append(float(rec_loss.item()))
 
                     if not sample_losses:
                         continue
 
                     loss = torch.stack(sample_losses).mean() # []
+                    batch_det_loss = sum(sample_det_losses) / max(1, len(sample_det_losses))
+                    batch_rec_loss = sum(sample_rec_losses) / max(1, len(sample_rec_losses))
                     train_text_char_acc = (batch_char_correct / max(1, batch_char_total)) if trainRecognition else 0.0
 
                     optimizer.zero_grad(set_to_none=True)
@@ -1431,6 +1440,8 @@ class ManagerFunction:
                         SaveOCRTrainingArtifacts(ep, logPeriodic=True)
 
                     epoch_loss += float(loss.item())
+                    epoch_det_loss += batch_det_loss
+                    epoch_rec_loss += batch_rec_loss
                     nb += 1
 
                     status_kwargs = {
@@ -1444,9 +1455,9 @@ class ManagerFunction:
 
                     self.controller.SetStatus(
                         "training",(
-                            f"OCR training... text_char_acc={train_text_char_acc:.3f}"
+                            f"OCR training... total_loss={float(loss.item()):.4f}, box_loss={batch_det_loss:.4f}, rec_loss={batch_rec_loss:.4f}, text_char_acc={train_text_char_acc:.3f}"
                             if trainRecognition else
-                            "OCR training..."),
+                            f"OCR training... total_loss={float(loss.item()):.4f}, box_loss={batch_det_loss:.4f}, rec_loss={batch_rec_loss:.4f}"),
                         **status_kwargs)
 
                     if self.controller.ShouldStop():
@@ -1455,10 +1466,12 @@ class ManagerFunction:
                     self.WaitWhilePaused("OCR training paused")
 
                 avg_train = epoch_loss / max(1, nb)
+                avg_train_box_loss = epoch_det_loss / max(1, nb)
+                avg_train_rec_loss = epoch_rec_loss / max(1, nb)
                 should_validate = (((ep + 1) % validation_interval) == 0) or ((ep + 1) == epochs)
                 if should_validate:
-                    avg_val, val_box_hmean, val_text_char_acc = eval_split(val_dl)
-                    test_loss, test_box_hmean, test_text_char_acc = eval_split(test_dl)
+                    avg_val, avg_val_box_loss, avg_val_rec_loss, val_box_hmean, val_text_char_acc = eval_split(val_dl)
+                    test_loss, test_box_loss, test_rec_loss, test_box_hmean, test_text_char_acc = eval_split(test_dl)
 
                     improved = (best_val - avg_val) > min_delta
                     if improved:
@@ -1471,11 +1484,11 @@ class ManagerFunction:
                     self.controller.SetStatus(
                         "training",(
                             f"OCR epoch {ep+1}/{epochs} done | "
-                            f"train {avg_train:.4f} | "
-                            f"val_loss {avg_val:.4f}, "
+                            f"train_loss {avg_train:.4f} (box={avg_train_box_loss:.4f}, rec={avg_train_rec_loss:.4f}) | "
+                            f"val_loss {avg_val:.4f} (box={avg_val_box_loss:.4f}, rec={avg_val_rec_loss:.4f}), "
                             f"val_box_hmean={(f'{float(val_box_hmean):.3f}' if trainDetection else 'n/a')}, "
                             f"val_text_char_acc={(f'{float(val_text_char_acc):.3f}' if trainRecognition else 'n/a')} | "
-                            f"test_loss {test_loss:.4f}, "
+                            f"test_loss {test_loss:.4f} (box={test_box_loss:.4f}, rec={test_rec_loss:.4f}), "
                             f"test_box_hmean={(f'{float(test_box_hmean):.3f}' if trainDetection else 'n/a')}, "
                             f"test_text_char_acc={(f'{float(test_text_char_acc):.3f}' if trainRecognition else 'n/a')}"),
                         epoch=ep + 1,
@@ -1511,7 +1524,7 @@ class ManagerFunction:
                         "training",
                         (
                             f"OCR epoch {ep+1}/{epochs} done | "
-                            f"train {avg_train:.4f} | "
+                            f"train_loss {avg_train:.4f} (box={avg_train_box_loss:.4f}, rec={avg_train_rec_loss:.4f}) | "
                             f"validation skipped (interval={validation_interval}, next={next_eval_epoch})"
                         ),
                         epoch=ep + 1,
