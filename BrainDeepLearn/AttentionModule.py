@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List, Dict
+from typing import Any, Optional, Tuple, List, Dict
 from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear, RotaryEmbedding
 
 
@@ -610,20 +610,45 @@ class AttentionExtractor(AGICoreModule):
             nn.Dropout(0.1),
             nn.Linear(embedDim * 2, embedDim),
             nn.LayerNorm(embedDim))
+
+        half_dim = max(1, embedDim // 2)
+        self.object_pool_norm = nn.LayerNorm(half_dim)
+        self.object_pool_key = nn.Linear(half_dim, half_dim)
+        self.object_pool_query = nn.Parameter(torch.randn(half_dim) * 0.02)
+        self.object_seq_proj = nn.Sequential(nn.LayerNorm(half_dim), nn.Linear(half_dim, embedDim), nn.GELU())
+        self.motion_seq_proj = nn.Sequential(nn.LayerNorm(half_dim), nn.Linear(half_dim, embedDim), nn.GELU())
+        self.quality_seq_proj = nn.Sequential(nn.LayerNorm(half_dim), nn.Linear(half_dim, embedDim), nn.GELU())
+        self.pred_error_seq_proj = nn.Sequential(nn.LayerNorm(half_dim), nn.Linear(half_dim, embedDim), nn.GELU())
+        self.goal_bias_proj = nn.Sequential(nn.LayerNorm(half_dim), nn.Linear(half_dim, embedDim), nn.GELU())
+        self.precision_bias = nn.Linear(1, embedDim)
             
 
     def ClipGrads(self):
         if self.gradient_clip_val > 0:
             torch.nn.utils.clip_grad_norm_(self.parameters(), self.gradient_clip_val)
 
+    def ObjectAttentionPool(self, objectSeq: torch.Tensor) -> torch.Tensor:
+        y = self.object_pool_norm(objectSeq)
+        B, S, K, D = y.shape
+        keys = self.object_pool_key(y.reshape(B * S * K, D)).reshape(B, S, K, D)
+        scale = max(float(keys.size(-1)) ** 0.5, 1.0)
+        scores = torch.einsum("bskd,d->bsk", keys, self.object_pool_query) / scale
+        weights = F.softmax(scores, dim=2)
+        return (objectSeq * weights.unsqueeze(-1)).sum(dim=2)
 
     def forward(
         self,
         x: torch.Tensor, # [B,S,E]
+        objectSeq: torch.Tensor,
+        motionSeq: torch.Tensor,
+        qualitySeq: torch.Tensor,
+        predErrorSeq: torch.Tensor,
+        goalBias: torch.Tensor,
+        precision: torch.Tensor,
         keyPaddingMask: Optional[torch.Tensor] = None,
         tdError: Optional[torch.Tensor] = None, # [-1 ,1] [B]
         uncertainty: Optional[torch.Tensor]=None, # [0 ,1] [B]
-        ) -> torch.Tensor: # [B] or scalar
+        returnExtras: bool = False,) -> torch.Tensor: # [B] or scalar
         
         B, S, E = x.shape
 
@@ -632,6 +657,30 @@ class AttentionExtractor(AGICoreModule):
 
         if uncertainty is None:
             uncertainty = x.new_zeros(B, device=self.device, dtype=self.dtype) 
+
+        extras: Dict[str, Any] = {}
+
+        def project_seq(sig: torch.Tensor, proj: nn.Module) -> torch.Tensor:
+            y = sig
+            if y.dim() == 4:
+                y = self.ObjectAttentionPool(y)
+            return proj(y)
+
+        structured_sum = (
+            project_seq(objectSeq, self.object_seq_proj)
+            + project_seq(motionSeq, self.motion_seq_proj)
+            + project_seq(qualitySeq, self.quality_seq_proj)
+            + project_seq(predErrorSeq, self.pred_error_seq_proj))
+        x = x + 0.0625 * structured_sum
+        extras["structured_terms"] = x.new_tensor(4.0)
+
+        goal_term = self.goal_bias_proj(goalBias)
+        x = x + 0.10 * goal_term.unsqueeze(1)
+        extras["goal_bias_norm"] = goal_term.detach().norm(dim=-1)
+
+        x = x * (0.75 + 0.50 * precision.view(B, 1, 1))
+        x = x + 0.05 * self.precision_bias(precision.view(B, 1)).unsqueeze(1)
+        extras["precision"] = precision.detach()
 
         if S % self.num_caps != 0:
             pad_len = self.num_caps - (S % self.num_caps)
@@ -692,7 +741,10 @@ class AttentionExtractor(AGICoreModule):
         mixed_per_head = torch.einsum("bhs,bse->bhe", strat_w, feats)  # [B,H,E]
         out = mixed_per_head.mean(dim=1)  # [B,E]
 
-        return self.output_proj(out)
+        out = self.output_proj(out)
+        if returnExtras:
+            return out, extras
+        return out
 
     def ResetHebbianMemory(self) -> None:
         for blk in self.temporal_blocks:
@@ -800,6 +852,14 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         tdError: Optional[torch.Tensor] = None,
         uncertainty: Optional[torch.Tensor] = None,
         deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]] = None,
+        *,
+        objectSeq: torch.Tensor,
+        motionSeq: torch.Tensor,
+        qualitySeq: torch.Tensor,
+        predErrorSeq: torch.Tensor,
+        goalBias: torch.Tensor,
+        precision: torch.Tensor,
+        returnExtras: bool = False,
         **kwargs,) -> torch.Tensor:
         B, S, E = x.shape
 
@@ -808,6 +868,30 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
 
         if uncertainty is None:
             uncertainty = x.new_zeros(B, device=self.base.device, dtype=self.base.dtype)  
+
+        extras: Dict[str, Any] = {}
+
+        def project_seq(sig: torch.Tensor, proj: nn.Module) -> torch.Tensor:
+            y = sig
+            if y.dim() == 4:
+                y = self.base.ObjectAttentionPool(y)
+            return proj(y)
+
+        structured_sum = (
+            project_seq(objectSeq, self.base.object_seq_proj)
+            + project_seq(motionSeq, self.base.motion_seq_proj)
+            + project_seq(qualitySeq, self.base.quality_seq_proj)
+            + project_seq(predErrorSeq, self.base.pred_error_seq_proj))
+        x = x + 0.0625 * structured_sum
+        extras["structured_terms"] = x.new_tensor(4.0)
+
+        goal_term = self.base.goal_bias_proj(goalBias)
+        x = x + 0.10 * goal_term.unsqueeze(1)
+        extras["goal_bias_norm"] = goal_term.detach().norm(dim=-1)
+
+        x = x * (0.75 + 0.50 * precision.view(B, 1, 1))
+        x = x + 0.05 * self.base.precision_bias(precision.view(B, 1)).unsqueeze(1)
+        extras["precision"] = precision.detach()
 
         num_caps = int(self.base.num_caps)
 
@@ -864,7 +948,10 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         mixed_per_head = torch.einsum("bhs,bse->bhe", strat_w, feats)
         out = mixed_per_head.mean(dim=1)
 
-        return self.base.output_proj(out)
+        out = self.base.output_proj(out)
+        if returnExtras:
+            return out, extras
+        return out
 
     @torch.no_grad()
     def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
@@ -1004,6 +1091,21 @@ class TestAttentionMTool:
         self.M = 3
         self.out_caps = 4
 
+    def AttentionInputs(self, B: int, S: int, E: int, dtype: torch.dtype = torch.float32) -> Dict[str, torch.Tensor]:
+        half = E // 2
+        return {
+            "objectSeq": torch.randn(B, S, 16, half, device=self.device, dtype=dtype),
+            "motionSeq": torch.randn(B, S, half, device=self.device, dtype=dtype),
+            "qualitySeq": torch.randn(B, S, half, device=self.device, dtype=dtype),
+            "predErrorSeq": torch.randn(B, S, half, device=self.device, dtype=dtype),
+            "goalBias": torch.randn(B, half, device=self.device, dtype=dtype),
+            "precision": torch.ones(B, device=self.device, dtype=dtype),}
+
+    def AttentionForward(self, model, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        args = self.AttentionInputs(int(x.size(0)), int(x.size(1)), int(x.size(2)), x.dtype)
+        args.update(kwargs)
+        return model(x, **args)
+
     def AdapterRankAndParams(self, adapter) -> Tuple[int, int]:
         rank_sum = 0
         param_cnt = 0
@@ -1136,7 +1238,7 @@ class TestAttentionMTool:
             x = torch.randn(self.B, self.S, self.E, device=self.device)
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device); kpm[:, -2:] = True
             td = torch.randn(self.B, device=self.device)
-            y = model(x, keyPaddingMask=kpm, tdError=td)
+            y = self.AttentionForward(model, x, keyPaddingMask=kpm, tdError=td)
             assert y.shape == (self.B, self.E)
 
             loss = y.mean()
@@ -1182,7 +1284,7 @@ class TestAttentionMTool:
                 print_shape("input.keyPaddingMask", kpm)
                 print_shape("input.tdError", td)
                 print_shape("input.uncertainty", uncertainty)
-                y = model(x, keyPaddingMask=kpm, tdError=td, uncertainty=uncertainty)
+                y = self.AttentionForward(model, x, keyPaddingMask=kpm, tdError=td, uncertainty=uncertainty)
                 print_shape("output.y", y)
 
             expected_out_shape = (batch_size, embed_dim)
@@ -1207,7 +1309,7 @@ class TestAttentionMTool:
             td = torch.randn(8, device=self.device)
             y = torch.randn(8, 12, device=self.device)
 
-            out = model(x, keyPaddingMask=None, tdError=td)
+            out = self.AttentionForward(model, x, keyPaddingMask=None, tdError=td)
             pred = head(out)
             loss = F.mse_loss(pred, y)
             opt.zero_grad(set_to_none=True)
@@ -1242,7 +1344,7 @@ class TestAttentionMTool:
                 td = torch.randn(8, device=self.device)
                 y = torch.randn(8, 12, device=self.device)
 
-                pred = head(model(x, tdError=td))
+                pred = head(self.AttentionForward(model, x, tdError=td))
                 loss = F.mse_loss(pred, y)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -1280,7 +1382,7 @@ class TestAttentionMTool:
                 x = torch.randn(8, 16, 64, device=self.device)
                 td = torch.randn(8, device=self.device)
                 y = torch.randn(8, 12, device=self.device)
-                pred = head(model(x, tdError=td))
+                pred = head(self.AttentionForward(model, x, tdError=td))
                 loss = F.mse_loss(pred, y)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -1314,10 +1416,10 @@ class TestAttentionMTool:
             data_td = torch.randn(B, device=self.device)
 
             with torch.no_grad():
-                start = F.mse_loss(head(model(data_x, tdError=data_td)), data_y).item()
+                start = F.mse_loss(head(self.AttentionForward(model, data_x, tdError=data_td)), data_y).item()
 
             for t in range(1, steps + 1):
-                pred = head(model(data_x, tdError=data_td))
+                pred = head(self.AttentionForward(model, data_x, tdError=data_td))
                 loss = F.mse_loss(pred, data_y)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -1327,7 +1429,7 @@ class TestAttentionMTool:
                     print(f"[AttentionTrain] step {t}/{steps} | mse={loss.item():.6f}")
 
             with torch.no_grad():
-                end = F.mse_loss(head(model(data_x, tdError=data_td)), data_y).item()
+                end = F.mse_loss(head(self.AttentionForward(model, data_x, tdError=data_td)), data_y).item()
 
             print(f"\n[AttentionTrain] loss start={start:.6f} -> end={end:.6f}")
             assert end <= 0.8 * start, "Training did not converge enough (<20% drop)."
@@ -1349,9 +1451,10 @@ class TestAttentionMTool:
 
             x = torch.randn(3, 16, 64, device=self.device)
             kpm = torch.zeros(3, 16, dtype=torch.bool, device=self.device)
+            args = self.AttentionInputs(3, 16, 64, x.dtype)
             with torch.no_grad():
-                y_base = base(x, keyPaddingMask=kpm, tdError=None)
-                y_wrap = wrapper(x, keyPaddingMask=kpm, tdError=None)
+                y_base = base(x, keyPaddingMask=kpm, tdError=None, **args)
+                y_wrap = wrapper(x, keyPaddingMask=kpm, tdError=None, **args)
 
             max_abs = (y_base - y_wrap).abs().max().item()
             assert max_abs < 1e-6, f"Wrapper forward differs when ranks=0: max_abs={max_abs:.3e}"
@@ -1415,7 +1518,7 @@ class TestAttentionMTool:
                 td = torch.randn(8, device=self.device)
                 y = torch.randn(8, 12, device=self.device)
 
-                pred = head(wrapper(x, tdError=td))
+                pred = head(self.AttentionForward(wrapper, x, tdError=td))
                 loss = F.mse_loss(pred, y)
 
                 opt.zero_grad(set_to_none=True)
@@ -1456,9 +1559,10 @@ class TestAttentionMTool:
             base.eval(); wrapper.eval()
             x_chk = torch.randn(2, 16, 64, device=self.device)
             kpm_chk = torch.zeros(2, 16, dtype=torch.bool, device=self.device)
+            args = self.AttentionInputs(2, 16, 64, x_chk.dtype)
             with torch.no_grad():
-                y0 = base(x_chk, keyPaddingMask=kpm_chk, tdError=None)
-                y1 = wrapper(x_chk, keyPaddingMask=kpm_chk, tdError=None)
+                y0 = base(x_chk, keyPaddingMask=kpm_chk, tdError=None, **args)
+                y1 = wrapper(x_chk, keyPaddingMask=kpm_chk, tdError=None, **args)
             assert torch.allclose(y0, y1, atol=1e-6, rtol=1e-4), "base vs wrapper mismatch after commit."
 
             print("WrapperManualGrowTrainAndCommit passed.")
@@ -1495,7 +1599,7 @@ class TestAttentionMTool:
                 td = torch.randn(16, device=self.device)
                 y = torch.randn(16, 12, device=self.device)
 
-                pred = head(wrapper(x, tdError=td))
+                pred = head(self.AttentionForward(wrapper, x, tdError=td))
                 loss = F.mse_loss(pred, y)
 
                 opt.zero_grad(set_to_none=True)
@@ -1517,9 +1621,10 @@ class TestAttentionMTool:
             base.eval(); wrapper.eval()
             x_chk = torch.randn(2, 16, 64, device=self.device)
             kpm_chk = torch.zeros(2, 16, dtype=torch.bool, device=self.device)
+            args = self.AttentionInputs(2, 16, 64, x_chk.dtype)
             with torch.no_grad():
-                y0 = base(x_chk, keyPaddingMask=kpm_chk, tdError=None)
-                y1 = wrapper(x_chk, keyPaddingMask=kpm_chk, tdError=None)
+                y0 = base(x_chk, keyPaddingMask=kpm_chk, tdError=None, **args)
+                y1 = wrapper(x_chk, keyPaddingMask=kpm_chk, tdError=None, **args)
             max_abs = (y0 - y1).abs().max().item()
             assert max_abs < 1e-6, f"Wrapper vs base mismatch after auto-commit: {max_abs:.3e}"
 
@@ -1554,7 +1659,7 @@ class TestAttentionMTool:
             td = torch.randn(6, device=self.device)
             y  = torch.randn(6, 10, device=self.device)
 
-            pred = head(wrapper(x, tdError=td))
+            pred = head(self.AttentionForward(wrapper, x, tdError=td))
             loss = F.mse_loss(pred, y)
 
             opt.zero_grad(set_to_none=True)
@@ -1586,7 +1691,7 @@ class TestAttentionMTool:
             td = torch.randn(8, device=self.device)
             y  = torch.randn(8, 12, device=self.device)
 
-            pred = head(model(x, tdError=td))
+            pred = head(self.AttentionForward(model, x, tdError=td))
             loss = F.mse_loss(pred, y)
 
             opt.zero_grad(set_to_none=True)
@@ -1636,9 +1741,10 @@ class TestAttentionMTool:
             kpm[:, -4:] = True
             x2[:, -4:, :] += torch.randn(B, 4, E, device=self.device) * 10.0
 
+            args = self.AttentionInputs(B, S, E, x1.dtype)
             with torch.no_grad():
-                y1 = model(x1, keyPaddingMask=kpm)
-                y2 = model(x2, keyPaddingMask=kpm)
+                y1 = model(x1, keyPaddingMask=kpm, **args)
+                y2 = model(x2, keyPaddingMask=kpm, **args)
 
             max_abs = (y1 - y2).abs().max().item()
             assert max_abs < 5e-5, f"Mask invariance fails, max_abs={max_abs:.3e}"
@@ -1784,7 +1890,7 @@ class TestAttentionMTool:
             td = torch.randn(1, device=self.device)
             y = torch.randn(1, 12, device=self.device)
 
-            pred = head(model(x, tdError=td))
+            pred = head(self.AttentionForward(model, x, tdError=td))
             loss = F.mse_loss(pred, y)
             head.zero_grad(set_to_none=True)
             loss.backward()

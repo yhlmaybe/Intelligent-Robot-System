@@ -1,6 +1,7 @@
 from __future__ import annotations
-from typing import Optional, Tuple, Dict, List, Union
+from typing import Any, Optional, Tuple, Dict, List, Union
 from pathlib import Path
+from types import SimpleNamespace
 from FunctionTools import AGICoreModule
 import numpy as np
 import torch
@@ -979,6 +980,7 @@ class MemoryExtractor(AGICoreModule):
         super().__init__()
 
         self.ssm_state_dim = ssmStateDim
+        self.input_dim = inputDim
         self.memory_dim = memoryDim
         self.output_dim = outputDim
         self.memory_size = memorySize
@@ -1173,6 +1175,28 @@ class MemoryExtractor(AGICoreModule):
 
         self.pending = []
 
+        self.visual_context_proj = nn.Sequential(
+            nn.LayerNorm(2048),
+            nn.Linear(2048, inputDim),
+            nn.SiLU(),
+            nn.Linear(inputDim, inputDim),)
+        self.ocr_context_proj = nn.Sequential(
+            nn.LayerNorm(512),
+            nn.Linear(512, inputDim),
+            nn.SiLU(),
+            nn.Linear(inputDim, inputDim),)
+        self.intent_context_proj = nn.Sequential(
+            nn.LayerNorm(512),
+            nn.Linear(512, inputDim),
+            nn.SiLU(),
+            nn.Linear(inputDim, inputDim),)
+        self.context_fuse = nn.Sequential(
+            nn.LayerNorm(inputDim * 4),
+            nn.Linear(inputDim * 4, inputDim),
+            nn.SiLU(),
+            nn.Linear(inputDim, inputDim),)
+        self.context_fuse_scale = nn.Parameter(torch.tensor(0.1))
+
     @torch.no_grad()
     def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype) -> None:
         B0 = int(self.h_state.size(0))
@@ -1313,11 +1337,31 @@ class MemoryExtractor(AGICoreModule):
         g = self.film_clip * torch.tanh(g)
         return g, b
 
+    def FuseExternalContext(
+        self,
+        x: torch.Tensor,
+        visualState: Any,
+        ocrSemantic: torch.Tensor,
+        intentHint: torch.Tensor,) -> torch.Tensor:
+        vis = torch.cat([
+            visualState.LegacyFeat,
+            visualState.MotionToken,
+            visualState.PredErrorToken], dim=-1)
+        visual_ctx = self.visual_context_proj(vis)
+        ocr_ctx = self.ocr_context_proj(ocrSemantic)
+        intent_ctx = self.intent_context_proj(intentHint)
+
+        fused = self.context_fuse(torch.cat([x, visual_ctx, ocr_ctx, intent_ctx], dim=-1))
+        return x + torch.tanh(self.context_fuse_scale) * fused
+
     def forward(self,
         x: torch.Tensor, # [B, inputDim]
         tdError: torch.Tensor, # [B] [-1, 1]
         emotion: torch.Tensor, # [B, emotionDim]
         reward: torch.Tensor, # [B] 
+        visualState: Any,
+        ocrSemantic: torch.Tensor,
+        intentHint: torch.Tensor,
         reset: bool = False,
         softReset: bool = False,
         sourceLabel: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -1340,6 +1384,12 @@ class MemoryExtractor(AGICoreModule):
             self.ResetAll()
         elif softReset:
             self.SoftReset()
+
+        x = self.FuseExternalContext(
+            x,
+            visualState=visualState,
+            ocrSemantic=ocrSemantic,
+            intentHint=intentHint)
 
         self.FlushPendingWrites()
 
@@ -2800,6 +2850,12 @@ class TestMemoryMTool:
     def RandnLikeGen(self, x: torch.Tensor, generator: torch.Generator | None = None):
         return torch.randn(x.shape, dtype=x.dtype, device=x.device, generator=generator)
 
+    def MakeVisualState(self, B: int, device: torch.device, dtype: torch.dtype = torch.float32):
+        return SimpleNamespace(
+            LegacyFeat=torch.randn(B, 1024, device=device, dtype=dtype),
+            MotionToken=torch.randn(B, 512, device=device, dtype=dtype),
+            PredErrorToken=torch.randn(B, 512, device=device, dtype=dtype),)
+
     def CallMemForward(
         self,
         mem,
@@ -2820,11 +2876,17 @@ class TestMemoryMTool:
         else:
             emotion = emotion.to(device=device)
 
+        visualState = self.MakeVisualState(B, device, x.dtype)
+        ocrSemantic = torch.randn(B, 512, device=device, dtype=x.dtype)
+        intentHint = torch.randn(B, 512, device=device, dtype=x.dtype)
         return mem(
             x,
             tdError=tdError,
             emotion=emotion,
             reward=reward,
+            visualState=visualState,
+            ocrSemantic=ocrSemantic,
+            intentHint=intentHint,
             reset=reset,
             softReset=softReset,
             sourceLabel=sourceLabel,)
@@ -3354,7 +3416,8 @@ class TestMemoryMTool:
                 print_shape("input.reward", reward)
                 print_shape("input.sourceLabel", source_label)
 
-                y = mem(
+                y = self.CallMemForward(
+                    mem,
                     x,
                     tdError=td,
                     emotion=emotion,

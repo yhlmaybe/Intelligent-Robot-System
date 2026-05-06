@@ -1153,6 +1153,7 @@ class GeoTropicalOut(NamedTuple):
     emotion: torch.Tensor 
     rComps: Dict[str, torch.Tensor]
     uncertainty: torch.Tensor
+    precision: torch.Tensor
     extras: Dict[str, torch.Tensor]
 
 
@@ -1328,6 +1329,7 @@ class ValueEstimationExtractor(AGICoreModule):
         base = (math.log(2.0) + float(self.unc_core.eps_prior))  
         unc_adj = (unc_total - base).clamp_min(0.0) # [B]
         unc01 = (1.0 - torch.exp(-unc_adj / max(self.unc_tau, 1e-6))).clamp(0.0, 1.0).detach() # [B]
+        precision = (1.0 - unc01).clamp(0.05, 1.0).detach() # [B]
 
         if not self.training:
             return GeoTropicalOut(
@@ -1337,6 +1339,7 @@ class ValueEstimationExtractor(AGICoreModule):
                 emotion=emotion,
                 rComps=None,
                 uncertainty=unc01,
+                precision=precision,
                 extras=None,)
 
 
@@ -1430,6 +1433,7 @@ class ValueEstimationExtractor(AGICoreModule):
             emotion=emotion,
             rComps=rComps,
             uncertainty=unc01,
+            precision=precision,
             extras=extras,)
 
 
@@ -1751,6 +1755,7 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         unc_base = math.log(2.0) + float(base.unc_core.eps_prior)
         unc_adj = (unc_total - unc_base).clamp_min(0.0)
         unc01 = (1.0 - torch.exp(-unc_adj / max(base.unc_tau, 1e-6))).clamp(0.0, 1.0)
+        precision = (1.0 - unc01).clamp(0.05, 1.0)
 
         if not self.training:
             return GeoTropicalOut(
@@ -1760,6 +1765,7 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
                 emotion=emotion,
                 rComps=None,
                 uncertainty=unc01,
+                precision=precision,
                 extras=None,)
         
         has_prev_pred = base._prev_v_next_pred is not None
@@ -1874,6 +1880,7 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
             emotion=emotion,
             rComps=rComps,
             uncertainty=unc01,
+            precision=precision,
             extras=extras,)
 
     @torch.no_grad()

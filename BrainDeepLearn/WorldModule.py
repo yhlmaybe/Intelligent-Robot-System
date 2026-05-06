@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass
 import os
 import torch
 import torch.nn as nn
@@ -27,6 +28,93 @@ def BalancedKL(muQ: torch.Tensor,logstdQ: torch.Tensor,muP: torch.Tensor,logstdP
         kl = torch.relu(kl - freeNats)
     return kl
 
+
+@dataclass
+class PredictedVisualPack:
+    GlobalFeat: torch.Tensor
+    ObjectTokens: torch.Tensor
+    MotionPred: torch.Tensor
+    LegacyFeat: torch.Tensor
+
+
+class PredictedVisualHead(nn.Module):
+    def __init__(
+        self,
+        stateDim: int,
+        globalFeatDim: int = 1024,
+        objectTokenDim: int = 512,
+        numObjectTokens: int = 16,
+        motionPredDim: int = 512,
+        legacyFeatDim: int = 1024,):
+        super().__init__()
+        self.global_feat_dim = int(globalFeatDim)
+        self.object_token_dim = int(objectTokenDim)
+        self.num_object_tokens = int(numObjectTokens)
+        self.motion_pred_dim = int(motionPredDim)
+        self.legacy_feat_dim = int(legacyFeatDim)
+
+        hidden = max(int(stateDim), self.global_feat_dim, self.object_token_dim * 2)
+
+        def head(outDim: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.LayerNorm(int(stateDim)),
+                nn.Linear(int(stateDim), hidden),
+                nn.GELU(),
+                nn.Linear(hidden, int(outDim)),)
+
+        self.global_head = head(self.global_feat_dim)
+        self.object_head = head(self.num_object_tokens * self.object_token_dim)
+        self.motion_head = head(self.motion_pred_dim)
+        self.legacy_head = head(self.legacy_feat_dim)
+
+    def forward(self, state: torch.Tensor) -> PredictedVisualPack:
+        B = int(state.size(0))
+        objects = self.object_head(state).view(B, self.num_object_tokens, self.object_token_dim)
+        return PredictedVisualPack(
+            GlobalFeat=self.global_head(state),
+            ObjectTokens=objects,
+            MotionPred=self.motion_head(state),
+            LegacyFeat=self.legacy_head(state),)
+
+class VisualReconstructor(nn.Module):
+    def __init__(
+        self,
+        globalFeatDim: int = 1024,
+        objectTokenDim: int = 512,
+        numObjectTokens: int = 16,
+        legacyFeatDim: int = 1024,):
+        super().__init__()
+        self.global_feat_dim = int(globalFeatDim)
+        self.object_token_dim = int(objectTokenDim)
+        self.num_object_tokens = int(numObjectTokens)
+        self.legacy_feat_dim = int(legacyFeatDim)
+
+        self.global_adapter = nn.Sequential(
+            nn.LayerNorm(self.global_feat_dim),
+            nn.Linear(self.global_feat_dim, self.global_feat_dim),)
+        self.object_adapter = nn.Sequential(
+            nn.LayerNorm(self.object_token_dim),
+            nn.Linear(self.object_token_dim, self.object_token_dim),)
+        self.legacy_adapter = nn.Sequential(
+            nn.LayerNorm(self.legacy_feat_dim),
+            nn.Linear(self.legacy_feat_dim, self.legacy_feat_dim),)
+        self.pred_error_basis = nn.Sequential(
+            nn.LayerNorm(self.global_feat_dim + self.object_token_dim),
+            nn.Linear(self.global_feat_dim + self.object_token_dim, self.global_feat_dim),
+            nn.GELU(),
+            nn.Linear(self.global_feat_dim, self.global_feat_dim),)
+
+    def forward(self, predictedVisual: PredictedVisualPack) -> Dict[str, torch.Tensor]:
+        global_feat = self.global_adapter(predictedVisual.GlobalFeat)
+        object_tokens = self.object_adapter(predictedVisual.ObjectTokens)
+        object_summary = object_tokens.mean(dim=1)
+        legacy_feat = self.legacy_adapter(predictedVisual.LegacyFeat)
+        return {
+            "LegacyFeat": legacy_feat,
+            "GlobalFeat": global_feat,
+            "ObjectTokens": object_tokens,
+            "MotionPred": predictedVisual.MotionPred,
+            "PredErrorBasis": self.pred_error_basis(torch.cat([global_feat, object_summary], dim=-1)),}
 
 class ActionEncoder(AGICoreModule):
     def __init__(
@@ -814,7 +902,12 @@ class RSSMWorldModel(AGICoreModule):
         nsLambdaAtLeastOne: float = 1e-2,
         nsLambdaImplication: float = 1e-2,
         memTopK = 4,
-        memTemp: float = 1.0,):
+        memTemp: float = 1.0,
+        globalFeatDim: int = 1024,
+        objectTokenDim: int = 512,
+        numObjectTokens: int = 16,
+        motionPredDim: int = 512,
+        legacyFeatDim: int = 1024,):
         super().__init__()
 
         self.vision_dim = visionDim
@@ -827,6 +920,11 @@ class RSSMWorldModel(AGICoreModule):
 
         self._mem_topk: int = int(memTopK)
         self._mem_temp: float = float(memTemp)
+        self.global_feat_dim = int(globalFeatDim)
+        self.object_token_dim = int(objectTokenDim)
+        self.num_object_tokens = int(numObjectTokens)
+        self.motion_pred_dim = int(motionPredDim)
+        self.legacy_feat_dim = int(legacyFeatDim)
 
         self._A_prev = None
 
@@ -918,6 +1016,25 @@ class RSSMWorldModel(AGICoreModule):
         self.phys_refiner = PhysRefinerHead(deterDim=self.deter_dim,actDim=self.stoch_dim)
 
         self.mix_gate = nn.Sequential(GrowableLoRALinear(nn.Linear(3 * self.state_dim, 3)))
+
+        self.future_action_head = nn.Sequential(
+            nn.LayerNorm(self.state_dim),
+            nn.Linear(self.state_dim, max(self.state_dim, self.action_dim)),
+            nn.GELU(),
+            nn.Linear(max(self.state_dim, self.action_dim), self.action_dim),
+            nn.LayerNorm(self.action_dim),)
+        self.predicted_visual_head = PredictedVisualHead(
+            stateDim=self.state_dim,
+            globalFeatDim=self.global_feat_dim,
+            objectTokenDim=self.object_token_dim,
+            numObjectTokens=self.num_object_tokens,
+            motionPredDim=self.motion_pred_dim,
+            legacyFeatDim=self.legacy_feat_dim,)
+        self.visual_reconstructor = VisualReconstructor(
+            globalFeatDim=self.global_feat_dim,
+            objectTokenDim=self.object_token_dim,
+            numObjectTokens=self.num_object_tokens,
+            legacyFeatDim=self.legacy_feat_dim,)
 
     def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
         B = int(B)
@@ -1168,6 +1285,129 @@ class RSSMWorldModel(AGICoreModule):
         self._z = z.detach().clone()
         self.s4.x = s4x.detach().clone()
 
+    def BuildPredictedVisual(self, state: torch.Tensor) -> Dict[str, Any]:
+        predicted_visual = self.predicted_visual_head(state)
+        reconstructed = self.visual_reconstructor(predicted_visual)
+        return {"predicted_visual": predicted_visual,"reconstructed_visual_state": reconstructed,}
+
+    def ObjectAttentionError(self, predictedObjects: torch.Tensor, targetObjects: torch.Tensor) -> torch.Tensor:
+        D = int(targetObjects.size(-1))
+        scores = torch.matmul(targetObjects, predictedObjects.transpose(1, 2)) / max(float(D) ** 0.5, 1.0)
+        weights = F.softmax(scores, dim=-1)
+        aligned_pred = torch.matmul(weights, predictedObjects)
+        return (aligned_pred - targetObjects).pow(2).mean(dim=(1, 2))
+
+    def ComputePredictionLoss(
+        self,
+        predictedVisual: PredictedVisualPack,
+        reconstructedVisualState: Dict[str, torch.Tensor],
+        targetVisualState: Any,
+        precision: torch.Tensor,) -> Dict[str, torch.Tensor]:
+        target = {
+            "GlobalFeat": targetVisualState.GlobalFeat.detach(),
+            "ObjectTokens": targetVisualState.ObjectTokens.detach(),
+            "LegacyFeat": targetVisualState.LegacyFeat.detach(),
+            "MotionPred": targetVisualState.MotionToken.detach(),}
+
+        global_err = (predictedVisual.GlobalFeat - target["GlobalFeat"]).pow(2).mean(dim=-1)
+        object_err = self.ObjectAttentionError(predictedVisual.ObjectTokens, target["ObjectTokens"])
+        legacy_err = (predictedVisual.LegacyFeat - target["LegacyFeat"]).pow(2).mean(dim=-1)
+        motion_err = (predictedVisual.MotionPred - target["MotionPred"]).pow(2).mean(dim=-1)
+
+        recon_err = (
+            (reconstructedVisualState["GlobalFeat"] - target["GlobalFeat"]).pow(2).mean(dim=-1)
+            + 0.5 * self.ObjectAttentionError(reconstructedVisualState["ObjectTokens"], target["ObjectTokens"])
+            + 0.25 * (reconstructedVisualState["MotionPred"] - target["MotionPred"]).pow(2).mean(dim=-1)
+            + 0.5 * (reconstructedVisualState["LegacyFeat"] - target["LegacyFeat"]).pow(2).mean(dim=-1))
+        basis_err = (reconstructedVisualState["PredErrorBasis"] - target["GlobalFeat"]).pow(2).mean(dim=-1)
+
+        per_sample = global_err + object_err + 0.5 * legacy_err + 0.25 * motion_err + 0.5 * recon_err + 0.1 * basis_err
+        p = precision.detach().view(-1).clamp(0.05, 1.0)
+        precision_loss = (p * per_sample).mean()
+
+        return {
+            "loss_pred_global": global_err.mean(),
+            "loss_pred_object": object_err.mean(),
+            "loss_pred_legacy": legacy_err.mean(),
+            "loss_pred_motion": motion_err.mean(),
+            "loss_pred_recon": recon_err.mean(),
+            "loss_pred_basis": basis_err.mean(),
+            "loss_pred_precision": precision_loss,
+            "loss_pred_total": precision_loss,}
+
+    def PriorRolloutFromStateAction(
+        self,
+        hPrev: torch.Tensor,
+        zPrev: torch.Tensor,
+        s4xPrev: torch.Tensor,
+        actionEnc: Optional[torch.Tensor] = None,
+        sample: bool = False,) -> Dict[str, torch.Tensor]:
+        s_prev_base = self.state_proj(torch.cat([hPrev, zPrev], dim=-1))
+        if actionEnc is None:
+            actionEnc = self.future_action_head(s_prev_base)
+
+        a_t = self.act_proj(actionEnc)
+
+        h_next, x_next = self.s4.StepWithX(zPrev, a_t, s4xPrev)
+        mu_p, logstd_p = self.prior_net(h_next).chunk(2, dim=-1)
+        logstd_p = logstd_p.clamp(-7.0, 2.0)
+
+        if self._ns_enabled:
+            ns_logits = self.ns_head_prior(h_next)
+            P_raw = torch.sigmoid(ns_logits)
+            Q, pen = self.NsProjectRuntime(P_raw, aloTau=0.60, implAlpha=1.0, temp=1.0)
+            conf = self.NsConfidence(Q).mean(dim=-1, keepdim=True)
+            dmu = self.ns_to_delta_mu(Q)
+            base_gate = torch.sigmoid(self.ns_gate_mu(torch.cat([h_next, dmu], dim=-1)))
+            gate_scale = (1.0 - 0.40 * pen.view(-1, 1)) * (0.6 + 0.4 * conf)
+            mu_p = mu_p + (base_gate * gate_scale).clamp(0.0, 1.0) * dmu
+
+        if sample:
+            z_next = mu_p + torch.exp(logstd_p) * torch.randn_like(mu_p)
+        else:
+            z_next = mu_p
+
+        s_base = self.state_proj(torch.cat([h_next, z_next], dim=-1))
+
+        A_t = self.conn(s_prev_base, a_t)
+        s_transport = self.conn.TransportApply(A_t, s_prev_base)
+        h_phys, _, _ = self.phys_refiner(hPrev, a_t, h_next)
+        s_phys = self.state_proj(torch.cat([h_phys, z_next], dim=-1))
+
+        d_tr = s_transport - s_base
+        d_ph = s_phys - s_base
+        w = F.softmax(self.mix_gate(torch.cat([s_base, d_tr, d_ph], dim=-1)), dim=-1)
+        s_next = w[:, 0:1] * s_base + w[:, 1:2] * s_transport + w[:, 2:3] * s_phys
+
+        trunk = self.rdone_trunk(self.rdone_ln(torch.cat([s_base, s_next, a_t], dim=-1)))
+        return {
+            "h_next": h_next,
+            "z_next": z_next,
+            "x_next": x_next,
+            "s_next": s_next,
+            "action_enc": actionEnc,
+            "r_pred": self.rew_head(trunk).squeeze(-1),
+            "d_prob": torch.sigmoid(self.done_head(trunk).squeeze(-1)),
+            "d_tr": d_tr,
+            "d_ph": d_ph,}
+
+    def PredictNextVisualFromPosterior(
+        self,
+        h: torch.Tensor,
+        z: torch.Tensor,
+        s4x: torch.Tensor,
+        actionEnc: Optional[torch.Tensor] = None,
+        sample: bool = False,) -> Dict[str, Any]:
+        rollout = self.PriorRolloutFromStateAction(
+            hPrev=h,
+            zPrev=z,
+            s4xPrev=s4x,
+            actionEnc=actionEnc,
+            sample=sample,)
+        pred = self.BuildPredictedVisual(rollout["s_next"])
+        pred["prior_rollout"] = rollout
+        return pred
+
     def NsProjectProbs(self, P: torch.Tensor, temp: float = 1.0) -> torch.Tensor:
         return self.ns_struct.ProjectTrain(P, temp=temp)
 
@@ -1374,6 +1614,13 @@ class RSSMWorldModel(AGICoreModule):
             out["recon"] = self.obs_dec(s_next)
             out["recon_target"] = visionIn
 
+        out.update(self.PredictNextVisualFromPosterior(
+            h_pred,
+            z_next,
+            x_next,
+            actionEnc=None,
+            sample=False,))
+
         self._h = h_pred.detach()
         self._z = z_next.detach()
 
@@ -1571,7 +1818,7 @@ class RSSMWorldModel(AGICoreModule):
             + reg_A
             + 1e-1 * aux_moe)
 
-        return {
+        out: Dict[str, Any] = {
             "loss": loss,
             "loss_recon": loss_recon,
             "loss_reward": loss_reward,
@@ -1594,8 +1841,20 @@ class RSSMWorldModel(AGICoreModule):
             "mu_p": mu_p,
             "logstd_p": logstd_p,
             "mu_q": mu_q,
-            "logstd_q": logstd_q,
-            **({"recon": recon, "recon_target": visionIn} if (self.use_decoder and recon is not None) else {}),}
+            "logstd_q": logstd_q,}
+
+        if self.use_decoder and recon is not None:
+            out["recon"] = recon
+            out["recon_target"] = visionIn
+
+        out.update(self.PredictNextVisualFromPosterior(
+            h_pred,
+            z1,
+            self.s4.x,
+            actionEnc=None,
+            sample=False,))
+
+        return out
 
 
     def ExportWorldMemoryBank(self, topk: int = 1024, onlyVals: bool = False) -> Optional[Dict[str, torch.Tensor]]:
@@ -2334,6 +2593,14 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         if self.base.use_decoder and recon is not None:
             out["recon"] = recon
             out["recon_target"] = visionIn
+
+        out.update(self.PredictNextVisualFromPosteriorWithDeltas(
+            h_pred,
+            z1,
+            self.base.s4.x,
+            actionEnc=None,
+            sample=False,
+            d=d,))
         return out
 
     @torch.no_grad()
@@ -2408,6 +2675,124 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
 
     def ExportState(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.base.ExportState()
+
+    def PriorRolloutFromStateAction(
+        self,
+        hPrev: torch.Tensor,
+        zPrev: torch.Tensor,
+        s4xPrev: torch.Tensor,
+        actionEnc: Optional[torch.Tensor] = None,
+        sample: bool = False,) -> Dict[str, torch.Tensor]:
+        d = self.ComposeLayerDelta(0)
+        return self.PriorRolloutFromStateActionWithDeltas(
+            hPrev,
+            zPrev,
+            s4xPrev,
+            actionEnc=actionEnc,
+            sample=sample,
+            d=d)
+
+    def PriorRolloutFromStateActionWithDeltas(
+        self,
+        hPrev: torch.Tensor,
+        zPrev: torch.Tensor,
+        s4xPrev: torch.Tensor,
+        actionEnc: Optional[torch.Tensor],
+        sample: bool,
+        d: Dict[str, Optional[torch.Tensor]],) -> Dict[str, torch.Tensor]:
+        s_prev_base = self.StateProj(torch.cat([hPrev, zPrev], dim=-1), d)
+        if actionEnc is None:
+            actionEnc = self.base.future_action_head(s_prev_base)
+
+        a_t = self.ActProj(actionEnc, d)
+        h_next, x_next = self.S4StepWithX(zPrev, a_t, s4xPrev, d)
+        mu_p, logstd_p = self.Prior(h_next, d).chunk(2, dim=-1)
+        logstd_p = logstd_p.clamp(-7.0, 2.0)
+
+        if self.base._ns_enabled:
+            ns_logits = self.base.ns_head_prior(h_next)
+            P_raw = torch.sigmoid(ns_logits)
+            Q, pen = self.base.NsProjectRuntime(P_raw, aloTau=0.60, implAlpha=1.0, temp=1.0)
+            conf = self.base.NsConfidence(Q).mean(dim=-1, keepdim=True)
+            dmu = self.base.ns_to_delta_mu(Q)
+            base_gate = torch.sigmoid(self.base.ns_gate_mu(torch.cat([h_next, dmu], dim=-1)))
+            gate_scale = (1.0 - 0.40 * pen.view(-1, 1)) * (0.6 + 0.4 * conf)
+            mu_p = mu_p + (base_gate * gate_scale).clamp(0.0, 1.0) * dmu
+
+        if sample:
+            z_next = mu_p + torch.exp(logstd_p) * torch.randn_like(mu_p)
+        else:
+            z_next = mu_p
+
+        s_base = self.StateProj(torch.cat([h_next, z_next], dim=-1), d)
+        A_t = self.ConnNet(s_prev_base, a_t, d)
+        s_transport = self.base.conn.TransportApply(A_t, s_prev_base)
+        h_phys, _, _ = self.PhysRefiner(hPrev, a_t, h_next, d)
+        s_phys = self.StateProj(torch.cat([h_phys, z_next], dim=-1), d)
+
+        d_tr = s_transport - s_base
+        d_ph = s_phys - s_base
+        w = F.softmax(self.MixGate(torch.cat([s_base, d_tr, d_ph], dim=-1), d), dim=-1)
+        s_next = w[:, 0:1] * s_base + w[:, 1:2] * s_transport + w[:, 2:3] * s_phys
+
+        trunk = self.RdoneTrunk(self.base.rdone_ln(torch.cat([s_base, s_next, a_t], dim=-1)), d)
+        return {
+            "h_next": h_next,
+            "z_next": z_next,
+            "x_next": x_next,
+            "s_next": s_next,
+            "action_enc": actionEnc,
+            "r_pred": self.Rew(trunk, d).squeeze(-1),
+            "d_prob": torch.sigmoid(self.Done(trunk, d).squeeze(-1)),
+            "d_tr": d_tr,
+            "d_ph": d_ph,}
+
+    def PredictNextVisualFromPosterior(
+        self,
+        h: torch.Tensor,
+        z: torch.Tensor,
+        s4x: torch.Tensor,
+        actionEnc: Optional[torch.Tensor] = None,
+        sample: bool = False,) -> Dict[str, Any]:
+        d = self.ComposeLayerDelta(0)
+        return self.PredictNextVisualFromPosteriorWithDeltas(
+            h,
+            z,
+            s4x,
+            actionEnc=actionEnc,
+            sample=sample,
+            d=d)
+
+    def PredictNextVisualFromPosteriorWithDeltas(
+        self,
+        h: torch.Tensor,
+        z: torch.Tensor,
+        s4x: torch.Tensor,
+        actionEnc: Optional[torch.Tensor],
+        sample: bool,
+        d: Dict[str, Optional[torch.Tensor]],) -> Dict[str, Any]:
+        rollout = self.PriorRolloutFromStateActionWithDeltas(
+            h,
+            z,
+            s4x,
+            actionEnc=actionEnc,
+            sample=sample,
+            d=d)
+        pred = self.base.BuildPredictedVisual(rollout["s_next"])
+        pred["prior_rollout"] = rollout
+        return pred
+
+    def ComputePredictionLoss(
+        self,
+        predictedVisual: PredictedVisualPack,
+        reconstructedVisualState: Dict[str, torch.Tensor],
+        targetVisualState: Any,
+        precision: torch.Tensor,) -> Dict[str, torch.Tensor]:
+        return self.base.ComputePredictionLoss(
+            predictedVisual=predictedVisual,
+            reconstructedVisualState=reconstructedVisualState,
+            targetVisualState=targetVisualState,
+            precision=precision,)
 
     @torch.no_grad()
     def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:

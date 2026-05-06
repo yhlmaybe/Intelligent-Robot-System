@@ -1,9 +1,34 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass, field
 from einops import rearrange, repeat
-from typing import Dict, List, Optional, Iterable, Tuple, Union
+from typing import Any, Dict, List, Optional, Iterable, Tuple, Union
 from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, RoPEMultiheadAttention
+
+
+@dataclass
+class TopDownContext:
+    GoalBias: Optional[torch.Tensor] = None
+    PredictedVisual: Optional[Any] = None
+    Precision: Optional[torch.Tensor] = None
+    SelfSemantic: Optional[torch.Tensor] = None
+    IntentSemantic: Optional[torch.Tensor] = None
+    MemoryCue: Optional[torch.Tensor] = None
+
+
+@dataclass
+class VisualState:
+    LegacyFeat: torch.Tensor
+    GlobalFeat: torch.Tensor
+    VentralFeat: torch.Tensor
+    DorsalFeat: torch.Tensor
+    MotionToken: torch.Tensor
+    QualityToken: torch.Tensor
+    PredErrorToken: torch.Tensor
+    ObjectTokens: torch.Tensor
+    PatchTokens: torch.Tensor
+    NextState: Dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 def ProjectFroNorm(tensor: torch.Tensor, maxNorm: Optional[float]):
@@ -338,11 +363,11 @@ class HebbianConv2d(AGICoreModule):
             self.EnsureB(B, self.device, self.dtype)
             w_eff = w.unsqueeze(0) + self.apply_scale * self.hebb_memory.detach()
         else:
-            w_eff = w.unsqueeze(0).expand(B, -1, -1, -1, -1)
+            w_eff = w.unsqueeze(0).expand(B, -1, -1, -1, -1).contiguous()
 
         x_big = x.reshape(1, B * inC, H, W)
 
-        w_big = w_eff.reshape(B * outC, w.size(1), w.size(2), w.size(3))
+        w_big = w_eff.reshape(B * outC, w.size(1), w.size(2), w.size(3)).clone()
 
         groups_total = B * g
 
@@ -357,6 +382,13 @@ class HebbianConv2d(AGICoreModule):
             padding=self.padding,
             dilation=self.dilation,
             groups=groups_total,)
+        if not torch.isfinite(out_big).all():
+            out_big = F.conv2d(
+                x_big.clone(), w_big.clone(), b_big,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=groups_total,)
         
         Hout, Wout = out_big.shape[-2], out_big.shape[-1]
         out = out_big.reshape(B, outC, Hout, Wout)
@@ -586,13 +618,17 @@ class PerceiveExtractor(AGICoreModule):
         useHebbian: bool = True,
         baseChannels: int = 64,
         dropout: float = 0.1,
-        posDrop: float = 0.1):
+        posDrop: float = 0.1,
+        objectTokenCount: int = 16):
         super().__init__()
 
         assert embedDim % numHeads == 0, "embed_dim must be divisible by num_heads"
 
         self.img_size = imgSize
         self.patch_size = patchSize
+        self.embed_dim = int(embedDim)
+        self.legacy_dim = int(embedDim * 2)
+        self.object_token_count = int(objectTokenCount)
         self.use_hebbian = useHebbian
         self.base_channels = baseChannels
 
@@ -675,11 +711,138 @@ class PerceiveExtractor(AGICoreModule):
             nn.SiLU(),
             nn.Linear(embedDim // 4, 1, bias=True))
 
+        self.ventral_proj = nn.Sequential(
+            nn.LayerNorm(embedDim),
+            nn.Linear(embedDim, embedDim),
+            nn.GELU(),
+            nn.LayerNorm(embedDim))
+
+        self.dorsal_proj = nn.Sequential(
+            nn.LayerNorm(embedDim * 2),
+            nn.Linear(embedDim * 2, embedDim),
+            nn.GELU(),
+            nn.LayerNorm(embedDim))
+
+        self.motion_proj = nn.Sequential(
+            nn.LayerNorm(embedDim * 2),
+            nn.Linear(embedDim * 2, embedDim),
+            nn.GELU(),
+            nn.LayerNorm(embedDim))
+
+        self.quality_proj = nn.Sequential(
+            nn.Linear(4, embedDim),
+            nn.LayerNorm(embedDim),
+            nn.SiLU(),
+            nn.Linear(embedDim, embedDim),
+            nn.LayerNorm(embedDim))
+
+        self.pred_error_input_dim = self.legacy_dim * 3 + embedDim * 2
+        self.pred_error_proj = nn.Sequential(
+            nn.LayerNorm(self.pred_error_input_dim),
+            nn.Linear(self.pred_error_input_dim, embedDim),
+            nn.GELU(),
+            nn.LayerNorm(embedDim))
+
+        self.object_queries = nn.Parameter(torch.randn(self.object_token_count, embedDim) * 0.02)
+        self.object_key = nn.Linear(embedDim, embedDim)
+        self.object_value = nn.Linear(embedDim, embedDim)
+        self.object_post = nn.Sequential(
+            nn.LayerNorm(embedDim),
+            nn.Linear(embedDim, embedDim),
+            nn.GELU(),
+            nn.LayerNorm(embedDim))
+
+        self.temporal_state = nn.GRUCell(self.legacy_dim, self.legacy_dim)
+        self.temporal_norm = nn.LayerNorm(self.legacy_dim)
+        self.topdown_gate = nn.Sequential(
+            nn.Linear(self.legacy_dim * 3, self.legacy_dim),
+            nn.SiLU(),
+            nn.Linear(self.legacy_dim, self.legacy_dim),
+            nn.Sigmoid())
+
+        self.legacy_fusion = nn.Sequential(
+            nn.LayerNorm(self.legacy_dim + embedDim * 5),
+            nn.Linear(self.legacy_dim + embedDim * 5, self.legacy_dim),
+            nn.GELU(),
+            nn.Linear(self.legacy_dim, self.legacy_dim),
+            nn.LayerNorm(self.legacy_dim))
+
+        self.motion_decoder = nn.Linear(embedDim, embedDim)
+        self.pred_error_decoder = nn.Linear(embedDim, self.pred_error_input_dim)
+
         self.InitWeights()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def QualityStats(self, x: torch.Tensor) -> torch.Tensor:
+        x_det = x.detach()
+        mean = x_det.mean(dim=(1, 2, 3))
+        std = x_det.std(dim=(1, 2, 3), unbiased=False)
+        if x_det.size(-1) > 1:
+            gx = (x_det[..., :, 1:] - x_det[..., :, :-1]).abs().mean(dim=(1, 2, 3))
+        else:
+            gx = torch.zeros_like(mean)
+        if x_det.size(-2) > 1:
+            gy = (x_det[..., 1:, :] - x_det[..., :-1, :]).abs().mean(dim=(1, 2, 3))
+        else:
+            gy = torch.zeros_like(mean)
+        grad = 0.5 * (gx + gy)
+        clipped = ((x_det <= 0.01) | (x_det >= 0.99)).float().mean(dim=(1, 2, 3))
+        return torch.stack([mean, std, grad, clipped], dim=-1)
+
+    def BuildObjectTokens(self, patchTokens: torch.Tensor) -> torch.Tensor:
+        B, _, D = patchTokens.shape
+        k = self.object_key(patchTokens)
+        v = self.object_value(patchTokens)
+        q = self.object_queries
+        scores = torch.einsum("kd,bnd->bkn", q, k) / max(float(D) ** 0.5, 1.0)
+        weights = F.softmax(scores, dim=-1)
+        tokens = torch.einsum("bkn,bnd->bkd", weights, v)
+        return self.object_post(tokens)
+
+    def ObjectAttentionError(self, currentObjects: torch.Tensor, predictedObjects: torch.Tensor) -> torch.Tensor:
+        D = int(currentObjects.size(-1))
+        scores = torch.matmul(currentObjects, predictedObjects.transpose(1, 2)) / max(float(D) ** 0.5, 1.0)
+        weights = F.softmax(scores, dim=-1)
+        aligned_pred = torch.matmul(weights, predictedObjects)
+        return (currentObjects - aligned_pred).mean(dim=1)
+
+    def BuildStructuredPredictionError(
+        self,
+        preliminaryLegacy: torch.Tensor,
+        globalFeat: torch.Tensor,
+        motionToken: torch.Tensor,
+        objectTokens: torch.Tensor,
+        predicted: Optional[Dict[str, torch.Tensor]],
+        precision: torch.Tensor,) -> torch.Tensor:
+        if predicted is None:
+            legacy_err = torch.zeros_like(preliminaryLegacy)
+            global_err = torch.zeros_like(globalFeat)
+            object_err = torch.zeros_like(motionToken)
+            motion_err = torch.zeros_like(motionToken)
+            basis_err = torch.zeros_like(globalFeat)
+        else:
+            legacy_err = preliminaryLegacy - predicted["LegacyFeat"].detach()
+            global_err = globalFeat - predicted["GlobalFeat"].detach()
+            object_err = self.ObjectAttentionError(objectTokens, predicted["ObjectTokens"].detach())
+            motion_err = motionToken - predicted["MotionPred"].detach()
+            basis_err = globalFeat - predicted["PredErrorBasis"].detach()
+
+        p = precision.view(-1, 1)
+        legacy_err = legacy_err * p
+        global_err = global_err * p
+        object_err = object_err * p
+        motion_err = motion_err * p
+        basis_err = basis_err * p
+
+        return torch.cat([legacy_err, global_err, object_err, motion_err, basis_err], dim=-1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        topDownContext: TopDownContext,
+        prevVisualState: Optional[VisualState] = None,) -> VisualState:
         # x: [B, 3, H, W]
-        feat = self.cnn_extractor(x)  # [B, C, Hf, Wf]
+        frame = x
+        feat = self.cnn_extractor(frame)  # [B, C, Hf, Wf]
 
         feat = self.cnn_feat_adapter(feat) 
 
@@ -712,9 +875,92 @@ class PerceiveExtractor(AGICoreModule):
 
         global_patch = (patch_tokens * patch_weights.unsqueeze(-1)).sum(dim=1)
 
-        fuse_out = torch.cat([out, global_patch], dim=1)
+        preliminary_legacy = torch.cat([out, global_patch], dim=1)
 
-        return fuse_out # [B, embed_dim * 2]
+        ventral_feat = self.ventral_proj(out)
+
+        if prevVisualState is not None:
+            prev_ventral = prevVisualState.VentralFeat
+            ventral_delta = ventral_feat - prev_ventral.detach()
+        else:
+            ventral_delta = torch.zeros_like(ventral_feat)
+
+        dorsal_feat = self.dorsal_proj(torch.cat([ventral_feat, ventral_delta], dim=-1))
+        motion_token = self.motion_proj(torch.cat([dorsal_feat, ventral_delta], dim=-1))
+
+        object_tokens = self.BuildObjectTokens(patch_tokens)
+
+        if (prevVisualState is not None
+            and "TemporalState" in prevVisualState.NextState):
+            h_prev = prevVisualState.NextState["TemporalState"]
+        else:
+            h_prev = preliminary_legacy.new_zeros(preliminary_legacy.shape)
+
+        h_next = self.temporal_state(preliminary_legacy, h_prev.detach())
+        temporal_feat = self.temporal_norm(h_next)
+
+        topdown_feat = topDownContext.MemoryCue
+        td_gate = self.topdown_gate(torch.cat([preliminary_legacy, temporal_feat, topdown_feat], dim=-1))
+        global_feat = td_gate * preliminary_legacy + (1.0 - td_gate) * temporal_feat
+
+        quality_token = self.quality_proj(self.QualityStats(frame))
+
+        predicted = topDownContext.PredictedVisual
+        pred_error_target = self.BuildStructuredPredictionError(
+            preliminary_legacy,
+            global_feat,
+            motion_token,
+            object_tokens,
+            predicted,
+            topDownContext.Precision)
+        pred_error_token = self.pred_error_proj(pred_error_target)
+
+        legacy_in = torch.cat([
+            global_feat,
+            ventral_feat,
+            dorsal_feat,
+            motion_token,
+            quality_token,
+            pred_error_token], dim=-1)
+        legacy_feat = self.legacy_fusion(legacy_in)
+
+        return VisualState(
+            LegacyFeat=legacy_feat,
+            GlobalFeat=global_feat,
+            VentralFeat=ventral_feat,
+            DorsalFeat=dorsal_feat,
+            MotionToken=motion_token,
+            QualityToken=quality_token,
+            PredErrorToken=pred_error_token,
+            ObjectTokens=object_tokens,
+            PatchTokens=patch_tokens,
+            NextState={
+                "TemporalState": h_next.detach(),
+                "PredErrorTarget": pred_error_target.detach()},)
+
+    def ComputePerceptionLoss(
+        self,
+        visualState: VisualState,
+        prevVisualState: Optional[VisualState] = None,) -> torch.Tensor:
+        loss = visualState.LegacyFeat.new_zeros(())
+
+        obj = visualState.ObjectTokens
+        obj_n = F.normalize(obj, dim=-1, eps=1e-6)
+        sim = torch.matmul(obj_n, obj_n.transpose(1, 2))
+        eye = torch.eye(obj.size(1), device=obj.device, dtype=torch.bool).unsqueeze(0)
+        diversity = sim.masked_select(~eye).pow(2).mean()
+        loss = loss + diversity
+
+        if prevVisualState is not None:
+            motion_target = (visualState.VentralFeat - prevVisualState.VentralFeat.detach()).detach()
+            motion_pred = self.motion_decoder(visualState.MotionToken)
+            loss = loss + F.smooth_l1_loss(motion_pred, motion_target)
+
+        pred_target = visualState.NextState["PredErrorTarget"]
+        pred_out = self.pred_error_decoder(visualState.PredErrorToken)
+        loss = loss + F.smooth_l1_loss(pred_out, pred_target)
+
+        return loss
 
     def InitWeights(self):
         for name, m in self.named_modules():
@@ -775,6 +1021,24 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         self.maxRankToken = int(maxRankToken)
         super().__init__(base, initRankEach=initRankEach, autoRank=autoRank, evThreshold=evThreshold, gradEma=gradEma)
 
+    def forward(
+        self,
+        x: torch.Tensor,
+        topDownContext: TopDownContext,
+        prevVisualState: Optional[VisualState] = None,) -> VisualState:
+        return super().forward(
+            x,
+            topDownContext=topDownContext,
+            prevVisualState=prevVisualState)
+
+    def ComputePerceptionLoss(
+        self,
+        visualState: VisualState,
+        prevVisualState: Optional[VisualState] = None,) -> torch.Tensor:
+        return self.base.ComputePerceptionLoss(
+            visualState,
+            prevVisualState=prevVisualState)
+
     def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
         C_feat = self.base.cnn_feat_adapter.C
         
@@ -826,15 +1090,19 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         tdError: Optional[torch.Tensor] = None,
         uncertainty: Optional[torch.Tensor] = None,
         deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]] = None,
-        **kwargs,) -> torch.Tensor:
-        feat = self.base.cnn_extractor(x)
+        **kwargs,) -> VisualState:
+        frame = x
+        topDownContext = kwargs["topDownContext"]
+        prevVisualState = kwargs.get("prevVisualState", None)
+
+        feat = self.base.cnn_extractor(frame)
         
         feat = self.base.cnn_feat_adapter(feat)
 
         deltaFeat2D = deltasPerLayer[0].get("feat", None)
         if deltaFeat2D is not None:
             C = deltaFeat2D.size(0)
-            w1x1 = deltaFeat2D.view(C, C, 1, 1).to(device=feat.device, dtype=feat.dtype)
+            w1x1 = deltaFeat2D.view(C, C, 1, 1)
             feat = feat + F.conv2d(feat, w1x1, bias=None, stride=1, padding=0)
 
         feat_patch = feat
@@ -852,7 +1120,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             E, Ckhw = deltaPatch2D.shape
             C_in = self.base.patch_embed.in_channels
             kh, kw = self.base.patch_embed.kernel_size
-            W_eff = W_eff + deltaPatch2D.view(E, C_in, kh, kw).to(device=feat_patch.device, dtype=feat_patch.dtype)
+            W_eff = W_eff + deltaPatch2D.view(E, C_in, kh, kw)
 
         patches = F.conv2d(
             feat_patch,
@@ -891,7 +1159,62 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         patch_weights = F.softmax(patch_scores, dim=1)
         global_patch = (patch_tokens * patch_weights.unsqueeze(-1)).sum(dim=1)
 
-        return torch.cat([out, global_patch], dim=1)
+        preliminary_legacy = torch.cat([out, global_patch], dim=1)
+
+        ventral_feat = self.base.ventral_proj(out)
+        if prevVisualState is not None:
+            ventral_delta = ventral_feat - prevVisualState.VentralFeat.detach()
+        else:
+            ventral_delta = torch.zeros_like(ventral_feat)
+
+        dorsal_feat = self.base.dorsal_proj(torch.cat([ventral_feat, ventral_delta], dim=-1))
+        motion_token = self.base.motion_proj(torch.cat([dorsal_feat, ventral_delta], dim=-1))
+        object_tokens = self.base.BuildObjectTokens(patch_tokens)
+
+        if (prevVisualState is not None
+            and "TemporalState" in prevVisualState.NextState):
+            h_prev = prevVisualState.NextState["TemporalState"]
+        else:
+            h_prev = preliminary_legacy.new_zeros(preliminary_legacy.shape)
+
+        h_next = self.base.temporal_state(preliminary_legacy, h_prev.detach())
+        temporal_feat = self.base.temporal_norm(h_next)
+
+        topdown_feat = topDownContext.MemoryCue
+        td_gate = self.base.topdown_gate(torch.cat([preliminary_legacy, temporal_feat, topdown_feat], dim=-1))
+        global_feat = td_gate * preliminary_legacy + (1.0 - td_gate) * temporal_feat
+
+        quality_token = self.base.quality_proj(self.base.QualityStats(frame))
+        pred_error_target = self.base.BuildStructuredPredictionError(
+            preliminary_legacy,
+            global_feat,
+            motion_token,
+            object_tokens,
+            topDownContext.PredictedVisual,
+            topDownContext.Precision)
+        pred_error_token = self.base.pred_error_proj(pred_error_target)
+
+        legacy_feat = self.base.legacy_fusion(torch.cat([
+            global_feat,
+            ventral_feat,
+            dorsal_feat,
+            motion_token,
+            quality_token,
+            pred_error_token], dim=-1))
+
+        return VisualState(
+            LegacyFeat=legacy_feat,
+            GlobalFeat=global_feat,
+            VentralFeat=ventral_feat,
+            DorsalFeat=dorsal_feat,
+            MotionToken=motion_token,
+            QualityToken=quality_token,
+            PredErrorToken=pred_error_token,
+            ObjectTokens=object_tokens,
+            PatchTokens=patch_tokens,
+            NextState={
+                "TemporalState": h_next.detach(),
+                "PredErrorTarget": pred_error_target.detach()},)
 
     @torch.no_grad()
     def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
@@ -930,6 +1253,20 @@ class TestPerceptionMTool:
     def __init__(self, device: Optional[torch.device] = None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         torch.manual_seed(42)
+
+    def MakeTopDownContext(self, model, B: int, dtype: torch.dtype = torch.float32, predictedVisual: Optional[Dict[str, torch.Tensor]] = None) -> TopDownContext:
+        runtime = model.base if hasattr(model, "base") else model
+        legacy_dim = int(runtime.legacy_dim)
+        return TopDownContext(
+            PredictedVisual=predictedVisual,
+            Precision=torch.ones(B, device=self.device, dtype=dtype),
+            MemoryCue=torch.zeros(B, legacy_dim, device=self.device, dtype=dtype),)
+
+    def PerceptionForward(self, model, x: torch.Tensor, prevVisualState: Optional[VisualState] = None, predictedVisual: Optional[Dict[str, torch.Tensor]] = None) -> VisualState:
+        return model(
+            x,
+            topDownContext=self.MakeTopDownContext(model, int(x.size(0)), x.dtype, predictedVisual),
+            prevVisualState=prevVisualState)
 
     def AdapterRankAndParams(self, adapter) -> Tuple[int, int]:
         rank_sum = 0
@@ -1010,9 +1347,9 @@ class TestPerceptionMTool:
         try:
             model = PerceiveExtractor(imgSize=512, patchSize=1, embedDim=512, numHeads=8, numLayers=6, useHebbian=True).to(self.device)
             x = torch.randn(2, 3, 512, 512, device=self.device)
-            out = model(x)
+            out = self.PerceptionForward(model, x)
             expected_dim = 512 * 2
-            assert out.shape == (2, expected_dim), f"Output shape does not match: {out.shape}"
+            assert tuple(out.LegacyFeat.shape) == (2, expected_dim), f"Output shape does not match: {out.LegacyFeat.shape}"
             print("PerceiveExtractor forward passed.")
             return True
         except AssertionError as e:
@@ -1038,19 +1375,72 @@ class TestPerceptionMTool:
             x = torch.randn(batch_size, 3, img_size, img_size, device=self.device)
 
             with torch.no_grad():
-                out = model(x)
+                out = self.PerceptionForward(model, x)
 
             expected_out_shape = (batch_size, embed_dim * 2)
-            assert tuple(out.shape) == expected_out_shape, f"Output shape does not match: {out.shape}"
+            assert tuple(out.LegacyFeat.shape) == expected_out_shape, f"Output shape does not match: {out.LegacyFeat.shape}"
 
             print(f"PerceiveExtractor forward input shape: {tuple(x.shape)}")
-            print(f"PerceiveExtractor forward output shape: {tuple(out.shape)}")
+            print(f"PerceiveExtractor forward output shape: {tuple(out.LegacyFeat.shape)}")
             return True
         except AssertionError as e:
             print(f"TestPerceiveExtractorIOShapes failed: {e}")
             return False
         except Exception as e:
             print(f"TestPerceiveExtractorIOShapes error: {e}")
+            return False
+
+    def TestPerceiveExtractorStructuredState(self):
+        try:
+            B = 2
+            model = PerceiveExtractor(
+                imgSize=64,
+                patchSize=1,
+                embedDim=512,
+                numHeads=8,
+                numLayers=2,
+                baseChannels=16,
+                useHebbian=True).to(self.device)
+            x = torch.randn(B, 3, 64, 64, device=self.device)
+
+            with torch.no_grad():
+                state0 = self.PerceptionForward(model, x)
+                out = self.PerceptionForward(model, x)
+                pred_visual = {
+                    "LegacyFeat": torch.randn(B, 1024, device=self.device),
+                    "GlobalFeat": torch.randn(B, 1024, device=self.device),
+                    "ObjectTokens": torch.randn(B, 16, 512, device=self.device),
+                    "MotionPred": torch.randn(B, 512, device=self.device),
+                    "PredErrorBasis": torch.randn(B, 1024, device=self.device),}
+                ctx = TopDownContext(
+                    GoalBias=torch.randn(B, 512, device=self.device),
+                    PredictedVisual=pred_visual,
+                    Precision=torch.ones(B, device=self.device),
+                    MemoryCue=torch.randn(B, 1024, device=self.device))
+                state1 = model(x, topDownContext=ctx, prevVisualState=state0)
+
+            assert tuple(out.LegacyFeat.shape) == (B, 1024), f"legacy forward shape mismatch: {out.LegacyFeat.shape}"
+            assert tuple(state1.LegacyFeat.shape) == (B, 1024)
+            assert tuple(state1.GlobalFeat.shape) == (B, 1024)
+            assert tuple(state1.VentralFeat.shape) == (B, 512)
+            assert tuple(state1.DorsalFeat.shape) == (B, 512)
+            assert tuple(state1.MotionToken.shape) == (B, 512)
+            assert tuple(state1.QualityToken.shape) == (B, 512)
+            assert tuple(state1.PredErrorToken.shape) == (B, 512)
+            assert tuple(state1.ObjectTokens.shape) == (B, 16, 512)
+            assert state1.PatchTokens.dim() == 3 and state1.PatchTokens.size(0) == B and state1.PatchTokens.size(-1) == 512
+            assert "TemporalState" in state1.NextState
+            assert "PredErrorTarget" in state1.NextState
+            model.ResetHebbianMemory()
+            assert tuple(state1.NextState["TemporalState"].shape) == (B, 1024)
+            assert tuple(state1.NextState["PredErrorTarget"].shape) == (B, model.pred_error_input_dim)
+            print("PerceiveExtractor structured state passed.")
+            return True
+        except AssertionError as e:
+            print(f"TestPerceiveExtractorStructuredState failed: {e}")
+            return False
+        except Exception as e:
+            print(f"TestPerceiveExtractorStructuredState error: {e}")
             return False
 
     def TrainStepSmoke(self):
@@ -1063,8 +1453,8 @@ class TestPerceptionMTool:
             x = torch.randn(8, 3, 64, 64, device=self.device)
             target = torch.randn(8, 16, device=self.device)
 
-            out = model(x)
-            pred = head(out)
+            out = self.PerceptionForward(model, x)
+            pred = head(out.LegacyFeat)
             loss = F.mse_loss(pred, target)
 
             opt.zero_grad(set_to_none=True)
@@ -1097,7 +1487,7 @@ class TestPerceptionMTool:
             for t in range(steps):
                 x = torch.randn(8, 3, 64, 64, device=self.device)
                 y = torch.randn(8, 16, device=self.device)
-                pred = head(model(x))
+                pred = head(self.PerceptionForward(model, x).LegacyFeat)
                 loss = F.mse_loss(pred, y)
 
                 opt.zero_grad(set_to_none=True)
@@ -1134,7 +1524,7 @@ class TestPerceptionMTool:
             for _ in range(steps):
                 x = torch.randn(8, 3, 64, 64, device=self.device)
                 y = torch.randn(8, 16, device=self.device)
-                pred = head(model(x))
+                pred = head(self.PerceptionForward(model, x).LegacyFeat)
                 loss = F.mse_loss(pred, y)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -1167,10 +1557,10 @@ class TestPerceptionMTool:
             data_y = torch.randn(B, 16, device=self.device)
 
             with torch.no_grad():
-                start = F.mse_loss(head(model(data_x)), data_y).item()
+                start = F.mse_loss(head(self.PerceptionForward(model, data_x).LegacyFeat), data_y).item()
 
             for t in range(1, steps + 1):
-                pred = head(model(data_x))
+                pred = head(self.PerceptionForward(model, data_x).LegacyFeat)
                 loss = F.mse_loss(pred, data_y)
 
                 opt.zero_grad(set_to_none=True)
@@ -1181,7 +1571,7 @@ class TestPerceptionMTool:
                     print(f"[PerceptionTrain] step {t}/{steps} | mse={loss.item():.6f}")
 
             with torch.no_grad():
-                end = F.mse_loss(head(model(data_x)), data_y).item()
+                end = F.mse_loss(head(self.PerceptionForward(model, data_x).LegacyFeat), data_y).item()
 
             print(f"\n[PerceptionTrain] loss start={start:.6f} -> end={end:.6f}")
             assert end <= 0.8 * start, "Training did not show sufficient convergence (<20% decline)."
@@ -1203,10 +1593,10 @@ class TestPerceptionMTool:
 
             x = torch.randn(3, 3, 64, 64, device=self.device)
             with torch.no_grad():
-                y_base = base(x)
-                y_wrap = wrapper(x)
+                y_base = self.PerceptionForward(base, x)
+                y_wrap = self.PerceptionForward(wrapper, x)
 
-            max_abs = (y_base - y_wrap).abs().max().item()
+            max_abs = (y_base.LegacyFeat - y_wrap.LegacyFeat).abs().max().item()
             assert max_abs < 1e-6, f"Wrapper forward differs when ranks=0: max_abs={max_abs:.3e}"
             print("WrapperForwardEqualWhenNoInitRank passed.")
             return True
@@ -1267,7 +1657,7 @@ class TestPerceptionMTool:
             for _ in range(8):
                 x = torch.randn(8, 3, img_size, img_size, device=self.device)
                 y = torch.randn(8, 16, device=self.device)
-                pred = head(wrapper(x))
+                pred = head(self.PerceptionForward(wrapper, x).LegacyFeat)
                 loss = F.mse_loss(pred, y)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -1331,9 +1721,9 @@ class TestPerceptionMTool:
             base.eval(); wrapper.eval()
             x_chk = torch.randn(2, 3, img_size, img_size, device=self.device)
             with torch.no_grad():
-                y0 = base(x_chk)
-                y1 = wrapper(x_chk)
-            assert torch.allclose(y0, y1, atol=1e-6, rtol=1e-4), "base vs wrapper mismatch after commit."
+                y0 = self.PerceptionForward(base, x_chk)
+                y1 = self.PerceptionForward(wrapper, x_chk)
+            assert torch.allclose(y0.LegacyFeat, y1.LegacyFeat, atol=1e-6, rtol=1e-4), "base vs wrapper mismatch after commit."
 
             print("WrapperManualGrowTrainAndCommit passed.")
             return True
@@ -1383,8 +1773,8 @@ class TestPerceptionMTool:
             x = torch.randn(8, 3, img_size, img_size, device=self.device)
             target = torch.randn(8, 16, device=self.device)
 
-            out = wrapper(x)
-            pred = head(out)
+            out = self.PerceptionForward(wrapper, x)
+            pred = head(out.LegacyFeat)
             loss = F.mse_loss(pred, target)
 
             opt.zero_grad(set_to_none=True)
@@ -1427,7 +1817,7 @@ class TestPerceptionMTool:
             grow_every = 5
 
             for t in range(1, steps + 1):
-                pred = head(wrapper(data_x))
+                pred = head(self.PerceptionForward(wrapper, data_x).LegacyFeat)
                 loss = F.mse_loss(pred, data_y)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -1460,9 +1850,9 @@ class TestPerceptionMTool:
             base.eval(); wrapper.eval()
             x_chk = torch.randn(2, 3, img_size, img_size, device=self.device)
             with torch.no_grad():
-                y0 = base(x_chk)
-                y1 = wrapper(x_chk)
-            max_abs = (y0 - y1).abs().max().item()
+                y0 = self.PerceptionForward(base, x_chk)
+                y1 = self.PerceptionForward(wrapper, x_chk)
+            max_abs = (y0.LegacyFeat - y1.LegacyFeat).abs().max().item()
             assert max_abs < 1e-6, f"Wrapper vs base mismatch after commit: {max_abs:.3e}"
 
             if total_rank == 0:
@@ -1509,7 +1899,7 @@ class TestPerceptionMTool:
 
             x = torch.randn(8, 3, 64, 64, device=self.device)
             y = torch.randn(8, 16, device=self.device)
-            pred = head(model(x))
+            pred = head(self.PerceptionForward(model, x).LegacyFeat)
             loss = F.mse_loss(pred, y)
 
             opt.zero_grad(set_to_none=True)
@@ -1554,11 +1944,11 @@ class TestPerceptionMTool:
                 data_y = torch.randn(B, 16, device=self.device)
 
                 with torch.no_grad():
-                    start = F.mse_loss(head(model(data_x)), data_y).item()
+                    start = F.mse_loss(head(self.PerceptionForward(model, data_x).LegacyFeat), data_y).item()
 
                 hist = []
                 for _ in range(steps):
-                    pred = head(model(data_x))
+                    pred = head(self.PerceptionForward(model, data_x).LegacyFeat)
                     loss = F.mse_loss(pred, data_y)
                     opt.zero_grad(set_to_none=True)
                     loss.backward()
@@ -1632,7 +2022,7 @@ class TestPerceptionMTool:
             model.eval(); head.train()  
             x = torch.randn(1, 3, 64, 64, device=self.device)
             y = torch.randn(1, 16, device=self.device)
-            pred = head(model(x))
+            pred = head(self.PerceptionForward(model, x).LegacyFeat)
             loss = F.mse_loss(pred, y)
             head.zero_grad(set_to_none=True)
             loss.backward()
@@ -1652,6 +2042,7 @@ class TestPerceptionMTool:
             "HebbianLinear": self.TestHebbianLinear(),
             "PerceiveExtractorForward": self.TestPerceiveExtractor(),
             "PerceiveExtractorIOShapes": self.TestPerceiveExtractorIOShapes(),
+            "PerceiveExtractorStructuredState": self.TestPerceiveExtractorStructuredState(),
             "TrainStepSmoke": self.TrainStepSmoke(),
             "NoNanAfterManySteps": self.NoNanAfterManySteps(),
             "ParamsActuallyChange": self.ParamsActuallyChange(),

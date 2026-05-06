@@ -18,7 +18,7 @@ import copy
 from dataclasses import dataclass, field
 from collections import deque
 
-from PerceptionModule import PerceiveExtractor, PerceptionOnlineWrapper
+from PerceptionModule import PerceiveExtractor, PerceptionOnlineWrapper, TopDownContext, VisualState
 from AttentionModule import AttentionExtractor, AttentionOnlineWrapper
 from MemoryModule import MemoryExtractor, MemoryType
 from DecisionModule import DecisionExtractor, DecisionOnlineWrapper, RAW_KEYBOARD_LAYOUT, DecisionPlannerExtractor, StableLogProbBernoulli
@@ -179,6 +179,10 @@ class BrainStepTrace:
     MouseDelta: Optional[torch.Tensor] = None
 
     PercBuffer: Optional[list[torch.Tensor]] = None
+    VisualBuffer: Optional[List[VisualState]] = None
+    VisualStateNow: Optional[VisualState] = None
+    OcrSemantic: Optional[torch.Tensor] = None
+    IntentHint: Optional[torch.Tensor] = None
     PercFeat: Optional[torch.Tensor] = None
     AttnFeat: Optional[torch.Tensor] = None
     MemFeat: Optional[torch.Tensor] = None
@@ -248,7 +252,12 @@ class BrainCore(nn.Module):
             stochDim=ModuleDim.WorldOutZState,
             stateDim=ModuleDim.WorldFeat,
             ssmDim=ModuleDim.WorldOutXState,
-            useMemory=True)
+            useMemory=True,
+            globalFeatDim=ModuleDim.PerceptionFeat,
+            objectTokenDim=ModuleDim.PerceptionEmbed,
+            numObjectTokens=16,
+            motionPredDim=ModuleDim.PerceptionEmbed,
+            legacyFeatDim=ModuleDim.PerceptionFeat)
 
         self.critic = ValueEstimationExtractor(
             memoryDim=ModuleDim.MemoryFeat, 
@@ -311,6 +320,129 @@ class BrainCore(nn.Module):
     def SetModuleMessagerEnabled(self, enabled: bool):
         self.save_module_messager_output = bool(enabled)
 
+    def RuntimeModule(self, mod: nn.Module) -> nn.Module:
+        return mod.base if hasattr(mod, "base") else mod
+
+    @torch.no_grad()
+    def ResizeStateBuffersForLoad(self, stateDict: Dict[str, Any]) -> None:
+        modules = dict(self.named_modules())
+        device = next(self.parameters()).device
+
+        for key, value in stateDict.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+
+            parts = str(key).split(".")
+            if len(parts) < 2:
+                continue
+
+            module_name = ".".join(parts[:-1])
+            buffer_name = parts[-1]
+            module = modules.get(module_name, None)
+            if module is None or buffer_name not in module._buffers:
+                continue
+
+            current = module._buffers.get(buffer_name)
+            if not isinstance(current, torch.Tensor):
+                continue
+            if tuple(current.shape) == tuple(value.shape):
+                continue
+
+            module._buffers[buffer_name] = torch.zeros(
+                tuple(value.shape),
+                device=device,
+                dtype=value.dtype)
+
+    def DetachVisualState(self, state: Optional[VisualState], *, clone: bool = False) -> Optional[VisualState]:
+        if state is None:
+            return None
+
+        def d(t: torch.Tensor) -> torch.Tensor:
+            out = t.detach()
+            return out.clone() if clone else out
+
+        return VisualState(
+            LegacyFeat=d(state.LegacyFeat),
+            GlobalFeat=d(state.GlobalFeat),
+            VentralFeat=d(state.VentralFeat),
+            DorsalFeat=d(state.DorsalFeat),
+            MotionToken=d(state.MotionToken),
+            QualityToken=d(state.QualityToken),
+            PredErrorToken=d(state.PredErrorToken),
+            ObjectTokens=d(state.ObjectTokens),
+            PatchTokens=d(state.PatchTokens),
+            NextState={k: d(v) for k, v in state.NextState.items() if isinstance(v, torch.Tensor)},)
+
+    def DetachRuntimeObject(self, obj: Any, *, clone: bool = False) -> Any:
+        if isinstance(obj, torch.Tensor):
+            out = obj.detach()
+            return out.clone() if clone else out
+        if isinstance(obj, dict):
+            return {k: self.DetachRuntimeObject(v, clone=clone) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self.DetachRuntimeObject(v, clone=clone) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(self.DetachRuntimeObject(v, clone=clone) for v in obj)
+        if isinstance(obj, deque):
+            return deque((self.DetachRuntimeObject(v, clone=clone) for v in obj), maxlen=obj.maxlen)
+        if hasattr(obj, "__dataclass_fields__"):
+            vals = {
+                name: self.DetachRuntimeObject(getattr(obj, name), clone=clone)
+                for name in obj.__dataclass_fields__.keys()}
+            return type(obj)(**vals)
+        return obj
+
+    def BuildTopDownContext(self) -> TopDownContext:
+        return TopDownContext(
+            GoalBias=self.prev_goal_bias,
+            PredictedVisual=self.prev_predicted_visual,
+            Precision=self.prev_precision,
+            SelfSemantic=self.prev_self_sem,
+            IntentSemantic=self.prev_intent_sem,
+            MemoryCue=self.prev_mem,)
+
+    def BuildVisualSequenceTensors(
+        self,
+        visualStates: List[VisualState],
+        *,
+        batchSize: int,
+        device: torch.device,
+        dtype: torch.dtype,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        recent = visualStates[-self.SEQ_LEN:]
+        T = len(recent)
+        start = self.SEQ_LEN - T
+
+        legacy = torch.zeros(batchSize, self.SEQ_LEN, ModuleDim.PerceptionFeat, device=device, dtype=dtype)
+        object_seq = torch.zeros(batchSize, self.SEQ_LEN, 16, ModuleDim.PerceptionEmbed, device=device, dtype=dtype)
+        motion_seq = torch.zeros(batchSize, self.SEQ_LEN, ModuleDim.PerceptionEmbed, device=device, dtype=dtype)
+        quality_seq = torch.zeros(batchSize, self.SEQ_LEN, ModuleDim.PerceptionEmbed, device=device, dtype=dtype)
+        pred_seq = torch.zeros(batchSize, self.SEQ_LEN, ModuleDim.PerceptionEmbed, device=device, dtype=dtype)
+        key_padding_mask = torch.ones(batchSize, self.SEQ_LEN, device=device, dtype=torch.bool)
+
+        for idx, vs in enumerate(recent, start=start):
+            legacy[:, idx] = vs.LegacyFeat.to(device=device, dtype=dtype)
+            obj = vs.ObjectTokens.to(device=device, dtype=dtype)
+            k = min(object_seq.size(2), obj.size(1))
+            object_seq[:, idx, :k] = obj[:, :k]
+            motion_seq[:, idx] = vs.MotionToken.to(device=device, dtype=dtype)
+            quality_seq[:, idx] = vs.QualityToken.to(device=device, dtype=dtype)
+            pred_seq[:, idx] = vs.PredErrorToken.to(device=device, dtype=dtype)
+            key_padding_mask[:, idx] = False
+
+        return legacy.contiguous(), object_seq.contiguous(), motion_seq.contiguous(), quality_seq.contiguous(), pred_seq.contiguous(), key_padding_mask
+
+    def EncodeOcrSemantic(self, ocrTexts: Optional[List[List[str]]], *, batchSize: int, device: torch.device) -> torch.Tensor:
+        intention_mod = self.RuntimeModule(self.intention)
+        if ocrTexts is None:
+            merged = [""] * batchSize
+        else:
+            merged = intention_mod.MergeOcrTexts(ocrTexts)
+        if len(merged) != batchSize:
+            merged = (merged + [""] * batchSize)[:batchSize]
+        with torch.no_grad():
+            sem, _, _ = intention_mod.EncodeStringsWithSlots(merged, device=device)
+        return sem.detach()
+
     @torch.no_grad()
     def ResetBuffers(self, B: int = 1, isOnlineLearning: bool = False, device: Optional[torch.device] = None):
         device = device or self.device
@@ -324,6 +456,8 @@ class BrainCore(nn.Module):
         self.prev_world_h = z(ModuleDim.WorldOutHState)
         self.prev_world_z = z(ModuleDim.WorldOutZState)
         self.prev_world_x = z(ModuleDim.WorldOutXState)
+        self.prev_world_s = z(ModuleDim.WorldFeat)
+        self.prev_done_flag = torch.ones(B, device=device, dtype=torch.bool)
 
         self.prev_keys = z(self.max_code + 1)
         self.prev_clicks = z(2)
@@ -336,9 +470,17 @@ class BrainCore(nn.Module):
 
         self.prev_entropy = z() 
 
+        self.prev_visual_state = None
+        self.prev_predicted_visual = None
+        self.prev_precision = torch.ones(B, device=device, dtype=torch.float32)
+        self.prev_goal_bias = z(ModuleDim.IntentionFeat)
+        self.prev_self_sem = None
+        self.prev_intent_sem = z(ModuleDim.IntentionFeat)
+
         self.buf_B = B
 
         self.perc_buffer = []
+        self.visual_state_buffer = []
 
         self.history = deque(maxlen=self.history_len)
 
@@ -411,22 +553,60 @@ class BrainCore(nn.Module):
 
         B, C, H, W = frame.shape
 
-        perc_feats = self.perc(frame) # [B, D_perc]
+        if isTrain:
+            prev_world_h_for_prediction = self.prev_world_h.detach()
+            prev_world_z_for_prediction = self.prev_world_z.detach()
+            prev_world_x_for_prediction = self.prev_world_x.detach()
+            prev_done_for_prediction = self.prev_done_flag.detach().clone()
+
+        top_down = self.BuildTopDownContext()
+        prev_visual_for_loss = self.prev_visual_state
+        visual_state = self.perc(
+            frame,
+            prevVisualState=prev_visual_for_loss,
+            topDownContext=top_down)
+        perc_feats = visual_state.LegacyFeat # [B, D_perc]
         ocr_items = self.OCR(frame)
+        fuse_ocr = self.OCR.ExportFusedTexts() # List[List[str]]
+        ocr_semantic = self.EncodeOcrSemantic(fuse_ocr, batchSize=B, device=dev)
 
-        self.perc_buffer.append(perc_feats)
+        visual_seq_src = self.visual_state_buffer + [visual_state]
+        if len(visual_seq_src) > self.SEQ_LEN:
+            visual_seq_src = visual_seq_src[-self.SEQ_LEN:]
+
+        percs_seq, object_seq, motion_seq, quality_seq, pred_error_seq, key_padding_mask = self.BuildVisualSequenceTensors(
+            visual_seq_src,
+            batchSize=B,
+            device=dev,
+            dtype=frame.dtype)
+
+        self.visual_state_buffer = [
+            self.DetachVisualState(v)
+            for v in visual_seq_src]
+        self.perc_buffer = [v.LegacyFeat for v in self.visual_state_buffer if v is not None]
+        self.prev_visual_state = self.DetachVisualState(visual_state)
+
         saveModuleOutput("Perception", {
-            "feat": perc_feats,})
+            "feat": perc_feats,
+            "visual_state": {
+                "global": visual_state.GlobalFeat,
+                "ventral": visual_state.VentralFeat,
+                "dorsal": visual_state.DorsalFeat,
+                "motion": visual_state.MotionToken,
+                "quality": visual_state.QualityToken,
+                "pred_error": visual_state.PredErrorToken,
+                "objects_mean": visual_state.ObjectTokens.mean(dim=1),},
+            "key_padding_mask": key_padding_mask,})
 
-        if len(self.perc_buffer) > self.SEQ_LEN:
-            del self.perc_buffer[:BasicParameters.IMAGE_RM_LEN]
-        elif len(self.perc_buffer) < self.SEQ_LEN:
-            return None 
-
-        percs_seq = torch.stack(self.perc_buffer, dim=1).contiguous() # [B, T, D_perc]
-
-        with torch.no_grad():
-            world_vis_in = self.attn(percs_seq) # [B, D_attn]
+        world_vis_in = self.attn(
+            percs_seq,
+            keyPaddingMask=key_padding_mask,
+            objectSeq=object_seq,
+            motionSeq=motion_seq,
+            qualitySeq=quality_seq,
+            predErrorSeq=pred_error_seq,
+            goalBias=top_down.GoalBias,
+            precision=top_down.Precision) # [B, D_attn]
         
         if isTrain:
             if self.is_online_learning:
@@ -458,6 +638,20 @@ class BrainCore(nn.Module):
         else:
             self.prev_world_x = w_out["x_next"].detach() # [B, D_world_x]
 
+        next_visual_prediction = w_out["reconstructed_visual_state"]
+
+        if doneFlag is not None:
+            done_now = doneFlag.detach().view(B) > 0.5
+        else:
+            done_now = d_t.detach().view(B) > 0.5
+
+        if B == 1 and bool(done_now.item()):
+            self.prev_predicted_visual = None
+        else:
+            self.prev_predicted_visual = self.DetachRuntimeObject(next_visual_prediction)
+
+        self.prev_world_s = s_t.detach()
+        self.prev_done_flag = done_now.detach()
 
         if self.is_online_learning:
             value_kwargs = {
@@ -476,12 +670,32 @@ class BrainCore(nn.Module):
 
         td_sig = critic_out.tdError.detach() # [B]
         unc_sig = critic_out.uncertainty.detach() # [B]
+        precision_sig = getattr(critic_out, "precision", (1.0 - unc_sig).clamp(0.05, 1.0)).detach() # [B]
         emotion_sig = critic_out.emotion.detach() # [B, D_emotion]
+        self.prev_precision = precision_sig.detach()
 
-        atten_out = self.attn(percs_seq, tdError=td_sig, uncertainty=unc_sig) # [B, D_attn]
+        atten_out = self.attn(
+            percs_seq,
+            keyPaddingMask=key_padding_mask,
+            tdError=td_sig,
+            uncertainty=unc_sig,
+            objectSeq=object_seq,
+            motionSeq=motion_seq,
+            qualitySeq=quality_seq,
+            predErrorSeq=pred_error_seq,
+            goalBias=top_down.GoalBias,
+            precision=precision_sig) # [B, D_attn]
         saveModuleOutput("Attention", atten_out)
 
-        mem_feat = self.mem(atten_out, tdError=td_sig,emotion=emotion_sig,reward=r_t) # [B, D_mem], [B, D_mem]
+        intent_hint_for_memory = self.prev_intent_sem
+        mem_feat = self.mem(
+            atten_out,
+            tdError=td_sig,
+            emotion=emotion_sig,
+            reward=r_t,
+            visualState=visual_state,
+            ocrSemantic=ocr_semantic,
+            intentHint=intent_hint_for_memory) # [B, D_mem], [B, D_mem]
         saveModuleOutput("Memory", mem_feat)
 
         memory_bank = self.mem.ExportMemoryBank(topk = BasicParameters.CONSCIOUSNESSTEM) # Optional[Dict[str, Tensor]]
@@ -493,7 +707,6 @@ class BrainCore(nn.Module):
             "intent_sem": conscious_out.intent_sem,
             "extras": conscious_out.extras,})
 
-        fuse_ocr = self.OCR.ExportFusedTexts() # List[List[str]]
         saveModuleOutput("OCR", {
             "items": ocr_items,
             "texts": fuse_ocr,})
@@ -511,6 +724,10 @@ class BrainCore(nn.Module):
             "extras": intention_extras,
             "ocr_texts": fuse_ocr,
             "ext_texts": textExt,})
+
+        self.prev_self_sem = conscious_out.self_sem.detach()
+        self.prev_intent_sem = intent_sem.detach()
+        self.prev_goal_bias = intent_sem.detach()
 
         if self.is_online_learning:
             actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionLogit": 
@@ -558,24 +775,33 @@ class BrainCore(nn.Module):
         self.prev_entropy = entropy_actor.detach() # [B]
 
         if not isTrain:
+            def trace_tensor(t: torch.Tensor) -> torch.Tensor:
+                return t.detach() if isinstance(t, torch.Tensor) else t
+
             trace = BrainStepTrace(
                 PercBuffer=copy.deepcopy(self.perc_buffer), # List[[B, D_perc]]
+                VisualBuffer=[
+                    self.DetachVisualState(v, clone=True)
+                    for v in self.visual_state_buffer],
+                VisualStateNow=self.DetachVisualState(visual_state, clone=True),
+                OcrSemantic=trace_tensor(ocr_semantic),
+                IntentHint=trace_tensor(intent_hint_for_memory),
                 ObsImg=fuse_ocr, # List[List[str]]
-                Keys=keys_act, # [B, K_key]
-                MouseClick=click_sample, # [B, 2]
-                MouseDelta=mouse_a, # [B, 2]
+                Keys=trace_tensor(keys_act), # [B, K_key]
+                MouseClick=trace_tensor(click_sample), # [B, 2]
+                MouseDelta=trace_tensor(mouse_a), # [B, 2]
 
-                PercFeat=perc_feats, # [B, D_perc]
-                AttnFeat=atten_out, # [B, D_attn]
-                MemFeat=mem_feat, # [B, D_mem]
-                WorldState=s_t, # [B, D_world]
-                WorldDeltaTransport=d_tr, # [B, D_world]
-                WorldDeltaPhysics=d_ph, # [B, D_world]
-                ConsciousnessState=conscious_out.intent_sem, # [B, D_cons]
-                IntentionState=intent_sem, # [B, D_intent]
-                Reward=r_t, # [B]
-                Done=d_t, # [B]
-                ActionEntropy=entropy_actor, # [B]
+                PercFeat=trace_tensor(perc_feats), # [B, D_perc]
+                AttnFeat=trace_tensor(atten_out), # [B, D_attn]
+                MemFeat=trace_tensor(mem_feat), # [B, D_mem]
+                WorldState=trace_tensor(s_t), # [B, D_world]
+                WorldDeltaTransport=trace_tensor(d_tr), # [B, D_world]
+                WorldDeltaPhysics=trace_tensor(d_ph), # [B, D_world]
+                ConsciousnessState=trace_tensor(conscious_out.intent_sem), # [B, D_cons]
+                IntentionState=trace_tensor(intent_sem), # [B, D_intent]
+                Reward=trace_tensor(r_t), # [B]
+                Done=trace_tensor(d_t), # [B]
+                ActionEntropy=trace_tensor(entropy_actor), # [B]
 
                 extras= {},)
         
@@ -596,13 +822,45 @@ class BrainCore(nn.Module):
 
             intention_loss, _ = self.intention.GetInternalLoss(sym_probs)
 
-            total_loss = world_loss + mem_loss + critic_loss + conscious_loss + intention_loss
+            perception_loss = self.perc.ComputePerceptionLoss(
+                visual_state,
+                prevVisualState=prev_visual_for_loss)
+
+            world_prediction_loss = world_loss.new_zeros(())
+            world_prediction_losses: Dict[str, torch.Tensor] = {}
+            if (B == 1
+                and not bool(prev_done_for_prediction.any().item())):
+                pred_train = self.world.PredictNextVisualFromPosterior(
+                    prev_world_h_for_prediction,
+                    prev_world_z_for_prediction,
+                    prev_world_x_for_prediction,
+                    actionEnc=None,
+                    sample=False,)
+                world_prediction_losses = self.world.ComputePredictionLoss(
+                    predictedVisual=pred_train["predicted_visual"],
+                    reconstructedVisualState=pred_train["reconstructed_visual_state"],
+                    targetVisualState=visual_state,
+                    precision=precision_sig,)
+                world_prediction_loss = world_prediction_losses.get("loss_pred_total", world_prediction_loss)
+
+            total_loss = (
+                world_loss
+                + mem_loss
+                + critic_loss
+                + conscious_loss
+                + intention_loss
+                + 0.05 * perception_loss
+                + 0.05 * world_prediction_loss)
             
             losses["world_loss"] = world_loss
             losses["memory_loss"] = mem_loss
             losses["critic_loss"] = critic_loss
             losses["conscious_loss"] = conscious_loss
             losses["intention_loss"] = intention_loss
+            losses["perception_loss"] = perception_loss
+            losses["world_prediction_loss"] = world_prediction_loss
+            for name, value in world_prediction_losses.items():
+                losses[f"world_{name}"] = value
             losses["total_loss"] = total_loss
             saveModuleOutput("Losses", losses)
 
@@ -610,7 +868,14 @@ class BrainCore(nn.Module):
             "decision": act_out,
             "world": {"state": s_t, "reward": r_t, "done": d_t}, # state:[B, D_world], reward/done:[B]
             "critic": critic_out,
-            "features": {"perc": percs_seq, "attn": atten_out, "mem": mem_feat}, # perc:[B, T, D_perc], attn:[B, D_attn], mem:[B, D_mem]
+            "features": {
+                "perc": percs_seq,
+                "attn": atten_out,
+                "mem": mem_feat,
+                "visualState": visual_state,
+                "precision": precision_sig,
+                "topDown": top_down,
+                "keyPaddingMask": key_padding_mask}, # perc:[B, T, D_perc], attn:[B, D_attn], mem:[B, D_mem]
             "OCR": ocr_items,
             "intention_texts": intention_texts,
             "losses": losses}
@@ -640,12 +905,24 @@ class BrainCore(nn.Module):
                 "h": h.detach().clone(),
                 "z": z.detach().clone(),
                 "x": x.detach().clone(),
+                "s": self.prev_world_s.detach().clone(),
+                "done": self.prev_done_flag.detach().clone(),
                 "A_prev": None if A_prev is None else A_prev.detach().clone(),},
             "mem_state": self.mem.ExportState(),
             "mem_pending": copy.deepcopy(self.mem.pending),
             "attn_state": attn_mod.ExportState(),
             "critic_state": critic_mod.ExportState(),
             "perc_buffer": [t.detach().clone() for t in self.perc_buffer],
+            "prev_visual_state": self.DetachVisualState(self.prev_visual_state, clone=True),
+            "prev_predicted_visual": self.DetachRuntimeObject(self.prev_predicted_visual, clone=True),
+            "prev_precision": self.prev_precision.detach().clone(),
+            "prev_goal_bias": self.prev_goal_bias.detach().clone(),
+            "prev_self_sem": None if self.prev_self_sem is None else self.prev_self_sem.detach().clone(),
+            "prev_intent_sem": self.prev_intent_sem.detach().clone(),
+            "visual_state_buffer": [
+                self.DetachVisualState(v, clone=True)
+                for v in self.visual_state_buffer
+                if v is not None],
             "ocr_state": {
                 "temporal_step": int(self.OCR._temporal_step),
                 "last_batch_size": int(self.OCR._last_batch_size),
@@ -699,6 +976,12 @@ class BrainCore(nn.Module):
         self.prev_world_h = world_state["h"].detach().clone()
         self.prev_world_z = world_state["z"].detach().clone()
         self.prev_world_x = world_state["x"].detach().clone()
+        self.prev_world_s = world_state.get(
+            "s",
+            torch.zeros(self.prev_mem.size(0), ModuleDim.WorldFeat, device=device, dtype=self.prev_mem.dtype))
+        self.prev_done_flag = world_state.get(
+            "done",
+            torch.ones(self.prev_mem.size(0), device=device, dtype=torch.bool))
 
         self.mem.ImportState(state["mem_state"], importGws=True, importLtm=True, importSym=True)
         self.mem.pending = state["mem_pending"]
@@ -706,6 +989,15 @@ class BrainCore(nn.Module):
         critic_mod.ImportState(state["critic_state"])
 
         self.perc_buffer = state["perc_buffer"]
+        self.prev_visual_state = state.get("prev_visual_state", None)
+        self.prev_predicted_visual = state.get("prev_predicted_visual", None)
+        self.prev_precision = state.get("prev_precision", torch.ones(self.prev_mem.size(0), device=device, dtype=self.prev_mem.dtype))
+        self.prev_goal_bias = state.get("prev_goal_bias", torch.zeros(self.prev_mem.size(0), ModuleDim.IntentionFeat, device=device, dtype=self.prev_mem.dtype))
+        self.prev_self_sem = state.get("prev_self_sem", None)
+        self.prev_intent_sem = state.get("prev_intent_sem", torch.zeros(self.prev_mem.size(0), ModuleDim.IntentionFeat, device=device, dtype=self.prev_mem.dtype))
+        self.visual_state_buffer = state.get("visual_state_buffer", [])
+        if not self.perc_buffer and self.visual_state_buffer:
+            self.perc_buffer = [v.LegacyFeat for v in self.visual_state_buffer if v is not None]
 
         ocr_state = state["ocr_state"]
         self.OCR._temporal_step = int(ocr_state["temporal_step"])
@@ -784,7 +1076,10 @@ class BrainCore(nn.Module):
 
     def SmoothWork(self, historyRef, lastRef, signal: str, attenModule: torch.Module, memModule: torch.Module, criticModule: torch.Module):
         try:
-            per_buffer_list = []
+            visual_buffer_list = []
+            visual_state_list = []
+            ocr_semantic_list = []
+            intent_hint_list = []
             atten_list = []
             mem_list = []
             world_state_list = []
@@ -795,7 +1090,10 @@ class BrainCore(nn.Module):
             entropy_list = []
 
             for tr in historyRef:
-                per_buffer_list.append(tr.PercBuffer)
+                visual_buffer_list.append(tr.VisualBuffer)
+                visual_state_list.append(tr.VisualStateNow)
+                ocr_semantic_list.append(tr.OcrSemantic)
+                intent_hint_list.append(tr.IntentHint)
                 atten_list.append(tr.AttnFeat)
                 mem_list.append(tr.MemFeat)
                 world_state_list.append(tr.WorldState)
@@ -844,11 +1142,34 @@ class BrainCore(nn.Module):
 
                     td_sig = value.tdError.detach()
                     unc_sig = value.uncertainty.detach()
+                    precision_sig = getattr(value, "precision", (1.0 - unc_sig).clamp(0.05, 1.0)).detach()
                     emotion_sig = value.emotion.detach()
 
-                    percs_seq = torch.stack(per_buffer_list[i], dim=1).contiguous()
-                    atten_out = attenModule(percs_seq, tdError=td_sig, uncertainty=unc_sig)
-                    memModule(atten_out, tdError=td_sig, emotion=emotion_sig, reward=reward_in, sourceLabel=MemoryType.SRC_IMAGINE)
+                    percs_seq, object_seq, motion_seq, quality_seq, pred_error_seq, key_padding_mask = self.BuildVisualSequenceTensors(
+                        visual_buffer_list[i],
+                        batchSize=reward_in.size(0),
+                        device=reward_in.device,
+                        dtype=reward_in.dtype)
+                    atten_out = attenModule(
+                        percs_seq,
+                        keyPaddingMask=key_padding_mask,
+                        tdError=td_sig,
+                        uncertainty=unc_sig,
+                        objectSeq=object_seq,
+                        motionSeq=motion_seq,
+                        qualitySeq=quality_seq,
+                        predErrorSeq=pred_error_seq,
+                        goalBias=intent_hint_list[i],
+                        precision=precision_sig)
+                    memModule(
+                        atten_out,
+                        tdError=td_sig,
+                        emotion=emotion_sig,
+                        reward=reward_in,
+                        visualState=visual_state_list[i],
+                        ocrSemantic=ocr_semantic_list[i],
+                        intentHint=intent_hint_list[i],
+                        sourceLabel=MemoryType.SRC_IMAGINE)
 
             self.extra_mem = memModule.ExportState(step=start)
 
@@ -1014,6 +1335,7 @@ class Agent:
         else:
             raise TypeError(f"checkpoint {path} has invalid brain weights payload")
 
+        self.brain.ResizeStateBuffersForLoad(brain_state)
         self.brain.load_state_dict(brain_state, strict=False)
 
     def ExportModuleMessagerData(self, nSteps: int = 0):
@@ -1149,6 +1471,7 @@ class Agent:
         payload = torch.load(path, map_location=mapLocation or self.device, weights_only=False)
 
         if isinstance(payload, dict) and ("brain" in payload):
+            self.brain.ResizeStateBuffersForLoad(payload["brain"])
             self.brain.load_state_dict(payload["brain"], strict=strict)
 
             if self.is_train:
@@ -1174,6 +1497,7 @@ class Agent:
             except Exception:
                 traceback.print_exc()
         else:
+            self.brain.ResizeStateBuffersForLoad(payload)
             self.brain.load_state_dict(payload, strict=strict)
 
         self.SaveRuntimeMemories()
