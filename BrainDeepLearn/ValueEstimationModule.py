@@ -26,13 +26,13 @@ class HebbianLinearFW(AGICoreModule):
         self.in_f = int(inFeatures)
         self.out_f = int(outFeatures)
         self.use_hebbian = useHebbian
+        self.use_bias = bool(bias)
 
         self.weight = nn.Parameter(torch.empty(self.out_f, self.in_f))
-        self.bias = nn.Parameter(torch.zeros(self.out_f)) if bias else None
+        self.bias = nn.Parameter(torch.zeros(self.out_f))
 
         nn.init.orthogonal_(self.weight)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
+        nn.init.zeros_(self.bias)
 
         self.register_buffer("H", torch.zeros(1, self.out_f, self.in_f))
 
@@ -68,7 +68,7 @@ class HebbianLinearFW(AGICoreModule):
         self.EnsureB(B, device=device, dtype=dtype)
 
         W = self.weight
-        b = self.bias if self.bias is not None else None
+        b = self.bias if self.use_bias else None
         y_base = F.linear(x, W, b) # [B,O]
 
         if not self.use_hebbian:
@@ -1984,11 +1984,13 @@ class TestValueEstimationMTool:
             ok &= (out_eval.value.shape == (B, 1))
             ok &= (out_eval.tdError.shape == (B,))
             ok &= (out_eval.uncertainty.shape == (B,))
+            ok &= (out_eval.precision.shape == (B,))
             ok &= (out_eval.emotion.shape[0] == B)
             ok &= (out_eval.loss is None and out_eval.extras is None and out_eval.rComps is None)
             ok &= torch.isfinite(out_eval.value).all().item()
             ok &= torch.isfinite(out_eval.tdError).all().item()
             ok &= torch.isfinite(out_eval.uncertainty).all().item()
+            ok &= torch.isfinite(out_eval.precision).all().item()
 
             est.train()
             out_t1 = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
@@ -2048,6 +2050,7 @@ class TestValueEstimationMTool:
             ok &= (out.loss.shape == ())
             ok &= (out.emotion.shape[0] == B)
             ok &= (out.uncertainty.shape == (B,))
+            ok &= (out.precision.shape == (B,))
             ok &= (out.rComps is not None and out.rComps["v_micro"].shape == (B, 1))
             ok &= (out.rComps is not None and out.rComps["unc_total"].shape == (B,))
             ok &= (out.extras is not None and torch.is_tensor(out.extras["loss_td"]))
@@ -2071,9 +2074,12 @@ class TestValueEstimationMTool:
             ok = True
             ok &= torch.isfinite(out.tdError).all().item()
             ok &= torch.isfinite(out.uncertainty).all().item()
+            ok &= torch.isfinite(out.precision).all().item()
             ok &= (float(out.tdError.abs().max().item()) <= 1.0 + 1e-6)
             ok &= (float(out.uncertainty.min().item()) >= -1e-6)
             ok &= (float(out.uncertainty.max().item()) <= 1.0 + 1e-6)
+            ok &= (float(out.precision.min().item()) >= 0.05 - 1e-6)
+            ok &= (float(out.precision.max().item()) <= 1.0 + 1e-6)
 
             print(f"TDUncertaintyBounds {'pass' if ok else 'fail'}")
             return ok

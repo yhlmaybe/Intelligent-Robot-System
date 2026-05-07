@@ -12,6 +12,7 @@ import traceback
 import os
 import math
 import copy
+import inspect
 
 #import debugpy
 
@@ -229,7 +230,10 @@ class BrainCore(nn.Module):
             embedDim=ModuleDim.AttentionFeat,
             sequenceLength=seqLen, 
             hebbianRate=(0.01 if plasticHebbian else 0.0), 
-            useHebbian=plasticHebbian)
+            useHebbian=plasticHebbian,
+            structuredDim=ModuleDim.PerceptionEmbed,
+            goalDim=ModuleDim.IntentionFeat,
+            objectTokenCount=self.perc.object_token_count)
         
         self.mem = MemoryExtractor(
             inputDim=ModuleDim.AttentionFeat,
@@ -255,7 +259,7 @@ class BrainCore(nn.Module):
             useMemory=True,
             globalFeatDim=ModuleDim.PerceptionFeat,
             objectTokenDim=ModuleDim.PerceptionEmbed,
-            numObjectTokens=16,
+            numObjectTokens=self.perc.object_token_count,
             motionPredDim=ModuleDim.PerceptionEmbed,
             legacyFeatDim=ModuleDim.PerceptionFeat)
 
@@ -322,6 +326,29 @@ class BrainCore(nn.Module):
 
     def RuntimeModule(self, mod: nn.Module) -> nn.Module:
         return mod.base if hasattr(mod, "base") else mod
+
+    @torch.no_grad()
+    def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None) -> None:
+        modules = (
+            self.RuntimeModule(self.perc),
+            self.RuntimeModule(self.attn),
+            self.RuntimeModule(self.actor),
+            self.RuntimeModule(self.critic),
+            self.RuntimeModule(self.mem),
+            self.RuntimeModule(self.conscious),)
+        seen = set()
+        for mod in modules:
+            if mod is None or id(mod) in seen:
+                continue
+            seen.add(id(mod))
+            reset_fn = getattr(mod, "ResetHebbianMemory", None)
+            if reset_fn is None:
+                continue
+            params = inspect.signature(reset_fn).parameters
+            if doneMask is not None and "doneMask" in params:
+                reset_fn(doneMask=doneMask)
+            else:
+                reset_fn()
 
     @torch.no_grad()
     def ResizeStateBuffersForLoad(self, stateDict: Dict[str, Any]) -> None:
@@ -413,7 +440,9 @@ class BrainCore(nn.Module):
         start = self.SEQ_LEN - T
 
         legacy = torch.zeros(batchSize, self.SEQ_LEN, ModuleDim.PerceptionFeat, device=device, dtype=dtype)
-        object_seq = torch.zeros(batchSize, self.SEQ_LEN, 16, ModuleDim.PerceptionEmbed, device=device, dtype=dtype)
+        perc_mod = self.RuntimeModule(self.perc)
+        object_token_count = int(getattr(perc_mod, "object_token_count", 16))
+        object_seq = torch.zeros(batchSize, self.SEQ_LEN, object_token_count, ModuleDim.PerceptionEmbed, device=device, dtype=dtype)
         motion_seq = torch.zeros(batchSize, self.SEQ_LEN, ModuleDim.PerceptionEmbed, device=device, dtype=dtype)
         quality_seq = torch.zeros(batchSize, self.SEQ_LEN, ModuleDim.PerceptionEmbed, device=device, dtype=dtype)
         pred_seq = torch.zeros(batchSize, self.SEQ_LEN, ModuleDim.PerceptionEmbed, device=device, dtype=dtype)
@@ -606,7 +635,8 @@ class BrainCore(nn.Module):
             qualitySeq=quality_seq,
             predErrorSeq=pred_error_seq,
             goalBias=top_down.GoalBias,
-            precision=top_down.Precision) # [B, D_attn]
+            precision=top_down.Precision,
+            applyPlasticity=False) # [B, D_attn]
         
         if isTrain:
             if self.is_online_learning:
@@ -670,7 +700,7 @@ class BrainCore(nn.Module):
 
         td_sig = critic_out.tdError.detach() # [B]
         unc_sig = critic_out.uncertainty.detach() # [B]
-        precision_sig = getattr(critic_out, "precision", (1.0 - unc_sig).clamp(0.05, 1.0)).detach() # [B]
+        precision_sig = critic_out.precision.detach() # [B]
         emotion_sig = critic_out.emotion.detach() # [B, D_emotion]
         self.prev_precision = precision_sig.detach()
 
@@ -684,7 +714,8 @@ class BrainCore(nn.Module):
             qualitySeq=quality_seq,
             predErrorSeq=pred_error_seq,
             goalBias=top_down.GoalBias,
-            precision=precision_sig) # [B, D_attn]
+            precision=precision_sig,
+            applyPlasticity=True) # [B, D_attn]
         saveModuleOutput("Attention", atten_out)
 
         intent_hint_for_memory = self.prev_intent_sem
@@ -773,6 +804,8 @@ class BrainCore(nn.Module):
         self.prev_mouse = mouse_a.detach() # [B, 2]
 
         self.prev_entropy = entropy_actor.detach() # [B]
+        if bool(done_now.any().item()):
+            self.ResetHebbianMemory(doneMask=done_now)
 
         if not isTrain:
             def trace_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -1142,7 +1175,7 @@ class BrainCore(nn.Module):
 
                     td_sig = value.tdError.detach()
                     unc_sig = value.uncertainty.detach()
-                    precision_sig = getattr(value, "precision", (1.0 - unc_sig).clamp(0.05, 1.0)).detach()
+                    precision_sig = value.precision.detach()
                     emotion_sig = value.emotion.detach()
 
                     percs_seq, object_seq, motion_seq, quality_seq, pred_error_seq, key_padding_mask = self.BuildVisualSequenceTensors(
@@ -1160,7 +1193,8 @@ class BrainCore(nn.Module):
                         qualitySeq=quality_seq,
                         predErrorSeq=pred_error_seq,
                         goalBias=intent_hint_list[i],
-                        precision=precision_sig)
+                        precision=precision_sig,
+                        applyPlasticity=True)
                     memModule(
                         atten_out,
                         tdError=td_sig,
@@ -1525,19 +1559,7 @@ class Agent:
         self.brain.ResetBuffers(B=B, isOnlineLearning=isOnlineLearning, device=self.device)
 
     def ResetHebbianMemory(self):
-        if self.brain.is_online_learning:
-            self.brain.perc.base.ResetHebbianMemory()
-            self.brain.attn.base.ResetHebbianMemory()
-            self.brain.actor.base.ResetHebbianMemory()
-            self.brain.critic.base.ResetHebbianMemory()
-        else:
-            self.brain.perc.ResetHebbianMemory()
-            self.brain.attn.ResetHebbianMemory()
-            self.brain.actor.ResetHebbianMemory()
-            self.brain.critic.ResetHebbianMemory()
-
-        self.brain.mem.ResetHebbianMemory()
-        self.brain.conscious.ResetHebbianMemory()
+        self.brain.ResetHebbianMemory()
 
 
 

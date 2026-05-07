@@ -572,10 +572,8 @@ class ConnNet(AGICoreModule):
 
         self.blocks = nn.ModuleList([FilmResidual(self.H, alpha=0.1, wrapLinear=wrapLinear) for _ in range(numBlocks)])
 
-        if self.use_lowrank:
-            self.head_uv = GeometricLinear(self.H, 2 * self.S * self.r, wrapLinear)
-        if self.use_full:
-            self.head_full = GeometricLinear(self.H, self.S * self.S, wrapLinear)
+        self.head_uv = GeometricLinear(self.H, 2 * self.S * self.r, wrapLinear)
+        self.head_full = GeometricLinear(self.H, self.S * self.S, wrapLinear)
         nBranches = int(self.use_lowrank) + int(self.use_full)
         self.mix = GeometricLinear(self.H, max(1, nBranches), wrapLinear)
 

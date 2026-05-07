@@ -15,13 +15,15 @@ class SelectiveSSM(AGICoreModule):
         embedDim: int,
         stateDim: int = 4, 
         convKernel: int = 4, 
-        useCausalConv: bool = True,):
+        useCausalConv: bool = True,
+        slowDtScale: float = 0.25,):
         super().__init__()
         E = embedDim
         N = stateDim
         self.E = E
         self.N = N
         self.use_causal_conv = bool(useCausalConv)
+        self.slow_dt_scale = float(slowDtScale)
 
         self.A_log = nn.Parameter(torch.randn(E, N))
 
@@ -36,11 +38,14 @@ class SelectiveSSM(AGICoreModule):
         self.dw_conv = nn.Conv1d(E, E, convKernel, groups=E, bias=True)
 
         self.out_norm = nn.LayerNorm(E)
+        self.time_mix_gate = nn.Linear(E, E)
 
         nn.init.xavier_uniform_(self.in_proj.weight, gain=0.5)
         nn.init.zeros_(self.in_proj.bias)
         nn.init.xavier_uniform_(self.param_proj.weight, gain=0.5)
         nn.init.zeros_(self.param_proj.bias)
+        nn.init.zeros_(self.time_mix_gate.weight)
+        nn.init.zeros_(self.time_mix_gate.bias)
 
     def CausalDwconv(self, u: torch.Tensor) -> torch.Tensor:
         B, S, E = u.shape
@@ -70,7 +75,7 @@ class SelectiveSSM(AGICoreModule):
 
         u = u + 0.5 * self.CausalDwconv(u)
 
-        gate_bias = (0.5 * tdError - 0.5 * uncertainty).view(B, 1, 1)
+        gate_bias = (0.5 * tdError - 0.5 * uncertainty)[:, None, None]
         g = torch.sigmoid(g + gate_bias) 
 
         p = self.param_proj(u) 
@@ -83,12 +88,13 @@ class SelectiveSSM(AGICoreModule):
 
         dt = F.softplus(dt_raw + self.dt_bias.view(1, 1, E))
 
-        dt = dt * (0.75 + 0.50 * mod.view(B, 1, 1)) 
+        dt = dt * (0.75 + 0.50 * mod[:, None, None])
 
         A_pos = F.softplus(self.A_log) + 1e-4
 
-        y = torch.empty((B, S, E), device=self.device, dtype=self.dtype)
-        state = torch.zeros((B, E, N), device=self.device, dtype=self.dtype)
+        y = torch.empty((B, S, E), device=x.device, dtype=x.dtype)
+        fast_state = torch.zeros((B, E, N), device=x.device, dtype=x.dtype)
+        slow_state = torch.zeros((B, E, N), device=x.device, dtype=x.dtype)
 
         has_mask = (keyPaddingMask is not None)
 
@@ -104,20 +110,30 @@ class SelectiveSSM(AGICoreModule):
             decay = torch.exp(-dt_t.unsqueeze(-1) * A_pos.unsqueeze(0))
             inj = B_t[:, t, :, :] * u_t.unsqueeze(-1)
 
-            new_state = decay * state + (1.0 - decay) * inj
+            new_fast = decay * fast_state + (1.0 - decay) * inj
 
             if keep is not None:
-                state = torch.where(keep, new_state, state) 
+                fast_state = torch.where(keep, new_fast, fast_state)
             else:
-                state = new_state
+                fast_state = new_fast
 
-            out_t = (C_t[:, t, :, :] * state).sum(dim=-1) + self.D.unsqueeze(0) * u_t
+            slow_dt = dt_t * self.slow_dt_scale
+            slow_decay = torch.exp(-slow_dt.unsqueeze(-1) * A_pos.unsqueeze(0))
+            new_slow = slow_decay * slow_state + (1.0 - slow_decay) * inj
+            if keep is not None:
+                slow_state = torch.where(keep, new_slow, slow_state)
+            else:
+                slow_state = new_slow
+            mix = torch.sigmoid(self.time_mix_gate(u_t)).unsqueeze(-1)
+            state_for_read = mix * fast_state + (1.0 - mix) * slow_state
+
+            out_t = (C_t[:, t, :, :] * state_for_read).sum(dim=-1) + self.D.unsqueeze(0) * u_t
             out_t = out_t * g[:, t, :]
 
             if keep is not None:
-                out_t = out_t * keep.squeeze(-1).to(self.dtype) 
+                out_t = out_t * keep.squeeze(-1)
 
-            y[:, t, :] = out_t.to(dtype=self.dtype)
+            y[:, t, :] = out_t
 
         return self.out_norm(y)
 
@@ -184,7 +200,7 @@ class MultiHeadAttention(AGICoreModule):
 
     def ModulateTau(self, tdError, uncertainty, B):
         tau = 1.0 + 0.5 * torch.tanh(self.temp_w_td * tdError + self.temp_w_unc * uncertainty) 
-        return tau.view(B,1,1,1)
+        return tau[:, None, None, None]
 
 
     def ResetParameters(self) -> None:
@@ -231,11 +247,11 @@ class MultiHeadAttention(AGICoreModule):
 
     def ComputeNeuromodulation(self, tdError: torch.Tensor, B: int) -> torch.Tensor:
         neuromod = 1.0 + 0.5 * tdError
-        return neuromod.view(B, 1, 1, 1)
+        return neuromod[:, None, None, None]
     
     def ComputeHebbMod(self, tdError: torch.Tensor, uncertainty: torch.Tensor, B: int) -> torch.Tensor:
         mod = ((tdError + 1.0) * 0.5) * (1.0 - uncertainty) # [B]
-        return mod.view(B, 1, 1, 1)
+        return mod[:, None, None, None]
 
 
     @torch.no_grad()
@@ -253,7 +269,7 @@ class MultiHeadAttention(AGICoreModule):
             denom = k.sum(dim=-2, keepdim=True).clamp_min(1.0) 
         else:
             S_len = v.size(2)
-            denom = torch.tensor(S_len, device=v.device, dtype=v.dtype)
+            denom = S_len
 
         eps = getattr(self, "hebb_eps", 1e-6)
         v = F.normalize(v, dim=-1, eps=eps)
@@ -288,19 +304,33 @@ class MultiHeadAttention(AGICoreModule):
             Ur = clamp_fro(Ur, maxn)
             Vr = clamp_fro(Vr, maxn)
 
-            self.U.copy_(Ur.to(self.dtype))
-            self.V.copy_(Vr.to(self.dtype))
+            self.U.copy_(Ur)
+            self.V.copy_(Vr)
         else:
             W_new = (1.0 - alpha_tensor) * self.hebbian_weights + alpha_tensor * hebb
             self.hebbian_weights.copy_(W_new)
 
 
-    def forward(self, query, key, value, tdError: torch.Tensor, uncertainty: torch.Tensor, keyPaddingMask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        tdError: torch.Tensor,
+        uncertainty: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        headGate: Optional[torch.Tensor] = None,
+        applyPlasticity: bool = True,):
         B, L, _ = query.shape
         self.EnsureB(B, device=self.device, dtype=self.dtype)
 
-        neuromod = self.ComputeNeuromodulation(tdError * self.td_unc_scale , B)
-        hebb_mod = self.ComputeHebbMod(tdError * self.td_unc_scale, uncertainty * self.td_unc_scale, B).to(self.dtype)
+        td = tdError
+        unc = uncertainty
+        td_eff = td * self.td_unc_scale
+        unc_eff = unc * self.td_unc_scale
+
+        neuromod = self.ComputeNeuromodulation(td_eff, B)
+        hebb_mod = self.ComputeHebbMod(td_eff, unc_eff, B)
 
         q_lin = self.q_adapter(query) 
         k_lin = self.k_adapter(key)
@@ -310,15 +340,17 @@ class MultiHeadAttention(AGICoreModule):
         k = k_lin.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = v_lin.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-        if self.use_hebbian and self.base_hebbian_rate > 0:
+        if applyPlasticity and self.use_hebbian and self.base_hebbian_rate > 0:
             alpha = self.base_hebbian_rate * hebb_mod
             if keyPaddingMask is not None:
-                keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, L, 1)
+                keep4 = (~keyPaddingMask).view(B, 1, L, 1)
                 self.UpdateHebbianWeights(v, q, alpha, keep4=keep4)
             else:
                 self.UpdateHebbianWeights(v, q, alpha, keep4=None)
 
         q = q * neuromod
+        if headGate is not None:
+            q = q * headGate
 
         if self.use_low_rank:
             vV = torch.matmul(v, self.V)
@@ -329,7 +361,7 @@ class MultiHeadAttention(AGICoreModule):
         delt = delt * hebb_mod
         v_fast = v + delt
 
-        tau = self.ModulateTau(tdError * self.td_unc_scale , uncertainty * self.td_unc_scale , B)
+        tau = self.ModulateTau(td_eff, unc_eff, B)
         q = q / tau
 
         q_attn = self.rope.Apply(q)
@@ -339,7 +371,7 @@ class MultiHeadAttention(AGICoreModule):
         scores = torch.matmul(q_attn, k_attn.transpose(-2, -1)) / math.sqrt(d)
         if keyPaddingMask is not None:
             mask = keyPaddingMask[:, None, None, :]  # bool [B,1,1,L]
-            mask_val = torch.tensor(-1e9 if q.dtype != torch.float16 else -1e4, dtype=q.dtype, device=q.device)
+            mask_val = -1e9 if q.dtype != torch.float16 else -1e4
             scores = scores.masked_fill(mask, mask_val)
 
         weights = F.softmax(scores, dim=-1)
@@ -380,12 +412,23 @@ class MultiHeadAttention(AGICoreModule):
 
 
 class TemporalAttention(AGICoreModule):
-    def __init__(self, embedDim: int, numHeads: int, layerIdx: int = 0, useHebbian: bool = True):
+    def __init__(
+        self,
+        embedDim: int,
+        numHeads: int,
+        layerIdx: int = 0,
+        useHebbian: bool = True,
+        slowDtScale: float = 0.25,):
         super().__init__()
 
         td_unc_scale = 1.0 / (layerIdx + 1)
         self.mhsa = MultiHeadAttention(embedDim, numHeads, tdUncScale=td_unc_scale, useHebbian=useHebbian)
-        self.ssm = SelectiveSSM(embedDim, stateDim=16, convKernel=4, useCausalConv=True)
+        self.ssm = SelectiveSSM(
+            embedDim,
+            stateDim=16,
+            convKernel=4,
+            useCausalConv=True,
+            slowDtScale=slowDtScale)
 
         self.gamma = nn.Parameter(1e-1 * torch.ones(embedDim), requires_grad=True)
 
@@ -407,17 +450,35 @@ class TemporalAttention(AGICoreModule):
         self.norm = nn.LayerNorm(embedDim)
         self.norm_ffn = nn.LayerNorm(embedDim)
 
-    def forward(self, x, tdError: torch.Tensor, uncertainty: torch.Tensor, keyPaddingMask: Optional[torch.Tensor]=None,):
+    def forward(
+        self,
+        x,
+        tdError: torch.Tensor,
+        uncertainty: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor]=None,
+        headGate: Optional[torch.Tensor] = None,
+        channelGate: Optional[torch.Tensor] = None,
+        applyPlasticity: bool = True,):
         residual = x
         x_norm = self.norm(x)
         
-        mhsa_out = self.mhsa(x_norm, x_norm, x_norm, keyPaddingMask=keyPaddingMask,tdError=tdError, uncertainty=uncertainty)
+        mhsa_out = self.mhsa(
+            x_norm,
+            x_norm,
+            x_norm,
+            keyPaddingMask=keyPaddingMask,
+            tdError=tdError,
+            uncertainty=uncertainty,
+            headGate=headGate,
+            applyPlasticity=applyPlasticity)
 
         ssm_out = self.ssm(x_norm, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty)
 
         w = torch.sigmoid(self.mix_gate(x_norm)) # [B,S,1]
 
         y = w * mhsa_out + (1 - w) * ssm_out # [B,S,E]
+        if channelGate is not None:
+            y = y * channelGate
 
         x = residual + self.dropout(y) * self.gamma
 
@@ -429,7 +490,7 @@ class TemporalAttention(AGICoreModule):
         out = residual + self.dropout(ffn_out) * self.gamma_ffn
 
         if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).unsqueeze(-1).to(out.dtype)  # [B,S,1]
+            keep = (~keyPaddingMask).unsqueeze(-1)  # [B,S,1]
             out = out * keep
         return out
 
@@ -523,14 +584,20 @@ class HebbianFusion(AGICoreModule):
             self.base_weights.copy_(eye + 0.05 * torch.randn_like(eye))
         self.ResetHebbianMemory()
 
-    def ResetHebbianMemory(self):
-        self.hebbian_memory.zero_()
+    @torch.no_grad()
+    def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
+        if doneMask is None:
+            self.hebbian_memory.zero_()
+            return
+        mask = doneMask.detach().view(-1)
+        if mask.numel() == self.hebbian_memory.size(0) and bool(mask.any().item()):
+            self.hebbian_memory[mask] = 0
 
     def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
         if self.hebbian_memory.shape[0] != B:
             self.hebbian_memory = torch.zeros(B, self.num_modes, self.embed_dim, self.embed_dim, device=device, dtype=dtype)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor: # inputs:[B,M,E]
+    def forward(self, inputs: torch.Tensor, applyPlasticity: bool = True) -> torch.Tensor: # inputs:[B,M,E]
         B, M, E = inputs.shape
 
         self.EnsureB(B, self.device, self.dtype)
@@ -552,7 +619,7 @@ class HebbianFusion(AGICoreModule):
 
         fused = torch.einsum("bmf,bm->bf", weighted, gate_w) # [B,E]
 
-        if self.use_hebbian and self.hebbian_rate > 0:
+        if applyPlasticity and self.use_hebbian and self.hebbian_rate > 0:
             with torch.no_grad():
                 norm = math.sqrt(E)
                 hebb_term = torch.einsum("bme,bf->bmef", inputs, fused) / (norm + 1e-8)
@@ -572,9 +639,15 @@ class AttentionExtractor(AGICoreModule):
         temporalLayers: int = 12,
         capsDim: int = 256,
         routingIterations: int = 6,
+        routingOutCaps: int = 8,
         hebbianRate: float = 0.01,
         useHebbian: bool = True,
-        gradientClipVal: float = 1.0,):
+        gradientClipVal: float = 1.0,
+        structuredDim: Optional[int] = None,
+        goalDim: Optional[int] = None,
+        objectTokenCount: int = 16,
+        useDistributedGating: bool = True,
+        slowDtScale: float = 0.25,):
         super().__init__()
 
         self.num_caps = sequenceLength
@@ -583,16 +656,26 @@ class AttentionExtractor(AGICoreModule):
         self.use_hebbian = useHebbian
         self.num_heads = numHeads
         self.caps_dim = capsDim
+        self.routing_out_caps = int(routingOutCaps)
+        self.structured_dim = int(structuredDim if structuredDim is not None else max(1, embedDim // 2))
+        self.goal_dim = int(goalDim if goalDim is not None else self.structured_dim)
+        self.object_token_count = int(objectTokenCount)
+        self.use_distributed_gating = bool(useDistributedGating)
 
         self.temporal_blocks: nn.ModuleList = nn.ModuleList([
-            TemporalAttention(embedDim, numHeads, idx, useHebbian=useHebbian)
+            TemporalAttention(
+                embedDim,
+                numHeads,
+                idx,
+                useHebbian=useHebbian,
+                slowDtScale=slowDtScale)
             for idx in range(temporalLayers)])
 
         self.caps_in_proj = nn.Sequential(
             nn.Linear(embedDim, self.caps_dim), 
             nn.LayerNorm(self.caps_dim), 
             nn.SiLU())
-        self.routing = DynamicRouting(sequenceLength, self.caps_dim, 32, self.caps_dim, iterations=routingIterations)
+        self.routing = DynamicRouting(sequenceLength, self.caps_dim, self.routing_out_caps, self.caps_dim, iterations=routingIterations)
         self.caps_out_proj = nn.Linear(self.caps_dim, embedDim)
 
         self.fusion = HebbianFusion(numModes=3, embedDim=embedDim, hebbianRate=hebbianRate, useHebbian=useHebbian)
@@ -611,21 +694,65 @@ class AttentionExtractor(AGICoreModule):
             nn.Linear(embedDim * 2, embedDim),
             nn.LayerNorm(embedDim))
 
-        half_dim = max(1, embedDim // 2)
-        self.object_pool_norm = nn.LayerNorm(half_dim)
-        self.object_pool_key = nn.Linear(half_dim, half_dim)
-        self.object_pool_query = nn.Parameter(torch.randn(half_dim) * 0.02)
-        self.object_seq_proj = nn.Sequential(nn.LayerNorm(half_dim), nn.Linear(half_dim, embedDim), nn.GELU())
-        self.motion_seq_proj = nn.Sequential(nn.LayerNorm(half_dim), nn.Linear(half_dim, embedDim), nn.GELU())
-        self.quality_seq_proj = nn.Sequential(nn.LayerNorm(half_dim), nn.Linear(half_dim, embedDim), nn.GELU())
-        self.pred_error_seq_proj = nn.Sequential(nn.LayerNorm(half_dim), nn.Linear(half_dim, embedDim), nn.GELU())
-        self.goal_bias_proj = nn.Sequential(nn.LayerNorm(half_dim), nn.Linear(half_dim, embedDim), nn.GELU())
+        self.object_pool_norm = nn.LayerNorm(self.structured_dim)
+        self.object_pool_key = nn.Linear(self.structured_dim, self.structured_dim)
+        self.object_pool_query = nn.Parameter(torch.randn(self.structured_dim) * 0.02)
+        self.object_seq_proj = nn.Sequential(nn.LayerNorm(self.structured_dim), nn.Linear(self.structured_dim, embedDim), nn.GELU())
+        self.motion_seq_proj = nn.Sequential(nn.LayerNorm(self.structured_dim), nn.Linear(self.structured_dim, embedDim), nn.GELU())
+        self.quality_seq_proj = nn.Sequential(nn.LayerNorm(self.structured_dim), nn.Linear(self.structured_dim, embedDim), nn.GELU())
+        self.pred_error_seq_proj = nn.Sequential(nn.LayerNorm(self.structured_dim), nn.Linear(self.structured_dim, embedDim), nn.GELU())
+        self.goal_bias_proj = nn.Sequential(nn.LayerNorm(self.goal_dim), nn.Linear(self.goal_dim, embedDim), nn.GELU())
         self.precision_bias = nn.Linear(1, embedDim)
+        gate_in_dim = self.goal_dim + 3
+        gate_hidden = max(32, embedDim // 2)
+        self.mod_gate = nn.Sequential(
+            nn.LayerNorm(gate_in_dim),
+            nn.Linear(gate_in_dim, gate_hidden),
+            nn.SiLU(),
+            nn.Linear(gate_hidden, numHeads + embedDim))
+        nn.init.zeros_(self.mod_gate[-1].weight)
+        nn.init.zeros_(self.mod_gate[-1].bias)
             
 
     def ClipGrads(self):
         if self.gradient_clip_val > 0:
             torch.nn.utils.clip_grad_norm_(self.parameters(), self.gradient_clip_val)
+
+    def SanitizeModulators(
+        self,
+        tdError: Optional[torch.Tensor],
+        uncertainty: Optional[torch.Tensor],
+        precision: torch.Tensor,
+        B: int,
+        x: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if tdError is None:
+            tdError = x.new_zeros(B)
+        if uncertainty is None:
+            uncertainty = x.new_zeros(B)
+        if precision is None:
+            precision = x.new_ones(B)
+
+        return tdError, uncertainty, precision
+
+    def ComputeDistributedGates(
+        self,
+        goalBias: torch.Tensor,
+        precision: torch.Tensor,
+        tdError: torch.Tensor,
+        uncertainty: torch.Tensor,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if not self.use_distributed_gating:
+            return None, None
+        B = goalBias.size(0)
+        gate_in = torch.cat([
+            goalBias,
+            precision[:, None],
+            tdError[:, None],
+            uncertainty[:, None]], dim=-1)
+        logits = self.mod_gate(gate_in)
+        head_logits, channel_logits = logits.split([self.num_heads, self.output_dim], dim=-1)
+        head_gate = 1.0 + 0.25 * torch.tanh(head_logits).view(B, self.num_heads, 1, 1)
+        channel_gate = 1.0 + 0.25 * torch.tanh(channel_logits).view(B, 1, self.output_dim)
+        return head_gate, channel_gate
 
     def ObjectAttentionPool(self, objectSeq: torch.Tensor) -> torch.Tensor:
         y = self.object_pool_norm(objectSeq)
@@ -648,15 +775,13 @@ class AttentionExtractor(AGICoreModule):
         keyPaddingMask: Optional[torch.Tensor] = None,
         tdError: Optional[torch.Tensor] = None, # [-1 ,1] [B]
         uncertainty: Optional[torch.Tensor]=None, # [0 ,1] [B]
-        returnExtras: bool = False,) -> torch.Tensor: # [B] or scalar
-        
+        returnExtras: bool = False,
+        applyPlasticity: bool = True,) -> torch.Tensor: # [B] or scalar
         B, S, E = x.shape
 
-        if tdError is None:
-            tdError = x.new_zeros(B, device=self.device, dtype=self.dtype) 
-
-        if uncertainty is None:
-            uncertainty = x.new_zeros(B, device=self.device, dtype=self.dtype) 
+        tdError, uncertainty, precision = self.SanitizeModulators(tdError, uncertainty, precision, B, x)
+        goalBias = goalBias
+        head_gate, channel_gate = self.ComputeDistributedGates(goalBias, precision, tdError, uncertainty)
 
         extras: Dict[str, Any] = {}
 
@@ -678,9 +803,12 @@ class AttentionExtractor(AGICoreModule):
         x = x + 0.10 * goal_term.unsqueeze(1)
         extras["goal_bias_norm"] = goal_term.detach().norm(dim=-1)
 
-        x = x * (0.75 + 0.50 * precision.view(B, 1, 1))
-        x = x + 0.05 * self.precision_bias(precision.view(B, 1)).unsqueeze(1)
+        x = x * (0.75 + 0.50 * precision[:, None, None])
+        x = x + 0.05 * self.precision_bias(precision[:, None]).unsqueeze(1)
         extras["precision"] = precision.detach()
+        if head_gate is not None:
+            extras["head_gate_mean"] = head_gate.detach().mean(dim=(1, 2, 3))
+            extras["channel_gate_mean"] = channel_gate.detach().mean(dim=(1, 2))
 
         if S % self.num_caps != 0:
             pad_len = self.num_caps - (S % self.num_caps)
@@ -694,7 +822,14 @@ class AttentionExtractor(AGICoreModule):
             x = x * keep
         
         for blk in self.temporal_blocks:
-            x = blk(x, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty)
+            x = blk(
+                x,
+                keyPaddingMask=keyPaddingMask,
+                tdError=tdError,
+                uncertainty=uncertainty,
+                headGate=head_gate,
+                channelGate=channel_gate,
+                applyPlasticity=applyPlasticity)
 
         chunk = S // self.num_caps
 
@@ -712,14 +847,14 @@ class AttentionExtractor(AGICoreModule):
         caps_mask = (valid_cnt.squeeze(-1) == 0)                      
 
         cap_in = self.caps_in_proj(caps)
-        routed = self.routing(cap_in, caps_mask) # [B,4,E]
+        routed = self.routing(cap_in, caps_mask) # [B,routingOutCaps,capsDim]
         routed = self.caps_out_proj(routed)
         routed = F.layer_norm(routed, (E,))
 
         routed_mean = routed.mean(dim=1) # [B,E]
         
         if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).to(x.dtype).unsqueeze(-1)  # [B,S,1]
+            keep = (~keyPaddingMask).unsqueeze(-1)  # [B,S,1]
             denom = keep.sum(dim=1, keepdim=True).clamp_min(1.0) # [B,1,1]
             temp_mean = (x * keep).sum(dim=1) / denom.squeeze(-1)  
         else:
@@ -730,7 +865,7 @@ class AttentionExtractor(AGICoreModule):
             routed_mean, 
             temp_mean + routed_mean], dim=1)  # [B,3,E]
         
-        fused = self.fusion(fusion_in)  # [B,E]
+        fused = self.fusion(fusion_in, applyPlasticity=applyPlasticity)  # [B,E]
 
         context = self.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))  # [B,E]
 
@@ -746,10 +881,28 @@ class AttentionExtractor(AGICoreModule):
             return out, extras
         return out
 
-    def ResetHebbianMemory(self) -> None:
+    @torch.no_grad()
+    def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None) -> None:
+        if doneMask is None:
+            for blk in self.temporal_blocks:
+                blk.mhsa.ResetHebbianMemory()
+            self.fusion.ResetHebbianMemory()
+            return
+
+        mask = doneMask.detach().view(-1).bool()
+        if not bool(mask.any().item()):
+            return
+
+        def zero_rows(t: torch.Tensor) -> None:
+            if t.size(0) == mask.numel():
+                t[mask] = 0
+
         for blk in self.temporal_blocks:
-            blk.mhsa.ResetHebbianMemory()
-        self.fusion.ResetHebbianMemory()
+            mhsa = blk.mhsa
+            zero_rows(mhsa.hebbian_weights)
+            zero_rows(mhsa.U)
+            zero_rows(mhsa.V)
+        self.fusion.ResetHebbianMemory(doneMask=mask)
 
     def AttenLowrankToFullrank(self):
         for blk in self.temporal_blocks:
@@ -860,14 +1013,13 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         goalBias: torch.Tensor,
         precision: torch.Tensor,
         returnExtras: bool = False,
+        applyPlasticity: bool = True,
         **kwargs,) -> torch.Tensor:
         B, S, E = x.shape
 
-        if tdError is None:
-            tdError = x.new_zeros(B, device=self.base.device, dtype=self.base.dtype) 
-
-        if uncertainty is None:
-            uncertainty = x.new_zeros(B, device=self.base.device, dtype=self.base.dtype)  
+        tdError, uncertainty, precision = self.base.SanitizeModulators(tdError, uncertainty, precision, B, x)
+        goalBias = goalBias
+        head_gate, channel_gate = self.base.ComputeDistributedGates(goalBias, precision, tdError, uncertainty)
 
         extras: Dict[str, Any] = {}
 
@@ -889,9 +1041,12 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         x = x + 0.10 * goal_term.unsqueeze(1)
         extras["goal_bias_norm"] = goal_term.detach().norm(dim=-1)
 
-        x = x * (0.75 + 0.50 * precision.view(B, 1, 1))
-        x = x + 0.05 * self.base.precision_bias(precision.view(B, 1)).unsqueeze(1)
+        x = x * (0.75 + 0.50 * precision[:, None, None])
+        x = x + 0.05 * self.base.precision_bias(precision[:, None]).unsqueeze(1)
         extras["precision"] = precision.detach()
+        if head_gate is not None:
+            extras["head_gate_mean"] = head_gate.detach().mean(dim=(1, 2, 3))
+            extras["channel_gate_mean"] = channel_gate.detach().mean(dim=(1, 2))
 
         num_caps = int(self.base.num_caps)
 
@@ -903,13 +1058,22 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
             S = x.size(1)
 
         if keyPaddingMask is not None:
-            keep0 = (~keyPaddingMask).unsqueeze(-1).to(x.dtype)
+            keep0 = (~keyPaddingMask).unsqueeze(-1)
             h = x * keep0
         else:
             h = x
 
         for layerIdx, blk in enumerate(self.base.temporal_blocks):
-            h = self.ForwardBlockWithDeltas(blk=blk, x=h, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty, delta=deltasPerLayer[layerIdx],)
+            h = self.ForwardBlockWithDeltas(
+                blk=blk,
+                x=h,
+                keyPaddingMask=keyPaddingMask,
+                tdError=tdError,
+                uncertainty=uncertainty,
+                delta=deltasPerLayer[layerIdx],
+                headGate=head_gate,
+                channelGate=channel_gate,
+                applyPlasticity=applyPlasticity)
 
         chunk = S // num_caps
         if keyPaddingMask is not None:
@@ -930,14 +1094,14 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
 
         routed_mean = routed.mean(dim=1)
         if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).to(h.dtype).unsqueeze(-1) 
+            keep = (~keyPaddingMask).unsqueeze(-1)
             denom = keep.sum(dim=1, keepdim=True).clamp_min(1.0) 
             temp_mean = (h * keep).sum(dim=1) / denom.squeeze(-1) 
         else:
             temp_mean = h.mean(dim=1)
 
         fusion_in = torch.stack([temp_mean, routed_mean, temp_mean + routed_mean], dim=1)  # [B,3,E]
-        fused = self.base.fusion(fusion_in)
+        fused = self.base.fusion(fusion_in, applyPlasticity=applyPlasticity)
 
         context = self.base.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))  # [B,E]
 
@@ -952,6 +1116,9 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         if returnExtras:
             return out, extras
         return out
+
+    def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None) -> None:
+        self.base.ResetHebbianMemory(doneMask=doneMask)
 
     @torch.no_grad()
     def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
@@ -982,7 +1149,10 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         keyPaddingMask: torch.Tensor,
         tdError: torch.Tensor,
         uncertainty: torch.Tensor,
-        delta: Dict[str, Optional[torch.Tensor]],) -> torch.Tensor:
+        delta: Dict[str, Optional[torch.Tensor]],
+        headGate: Optional[torch.Tensor] = None,
+        channelGate: Optional[torch.Tensor] = None,
+        applyPlasticity: bool = True,) -> torch.Tensor:
 
         mhsa = blk.mhsa
         B, S, E = x.shape
@@ -1021,15 +1191,17 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         k = k_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
         v = v_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
 
-        if mhsa.use_hebbian and mhsa.base_hebbian_rate > 0:
+        if applyPlasticity and mhsa.use_hebbian and mhsa.base_hebbian_rate > 0:
             alpha = mhsa.base_hebbian_rate * hebb_mod  
             if keyPaddingMask is not None:
-                keep4 = (~keyPaddingMask).to(v.dtype).view(B, 1, S, 1)
+                keep4 = (~keyPaddingMask).view(B, 1, S, 1)
                 mhsa.UpdateHebbianWeights(v, q, alpha, keep4=keep4)
             else:
                 mhsa.UpdateHebbianWeights(v, q, alpha, keep4=None)
 
         q = q * neuromod
+        if headGate is not None:
+            q = q * headGate
         q = q / tau
 
         if mhsa.use_low_rank:
@@ -1049,7 +1221,7 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
 
         if keyPaddingMask is not None:
             mask = keyPaddingMask[:, None, None, :] 
-            mask_val = torch.tensor(-1e9 if q.dtype != torch.float16 else -1e4,dtype=q.dtype, device=q.device)
+            mask_val = -1e9 if q.dtype != torch.float16 else -1e4
             scores = scores.masked_fill(mask, mask_val)
 
         weights = F.softmax(scores, dim=-1)
@@ -1063,6 +1235,8 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
 
         w = torch.sigmoid(blk.mix_gate(x_norm))
         y = w * mhsa_out + (1.0 - w) * ssm_out
+        if channelGate is not None:
+            y = y * channelGate
 
         x1 = residual0 + blk.dropout(y) * blk.gamma
 
@@ -1072,7 +1246,7 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         out2 = residual1 + blk.dropout(ffn_out) * blk.gamma_ffn
 
         if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).unsqueeze(-1).to(out2.dtype)
+            keep = (~keyPaddingMask).unsqueeze(-1)
             out2 = out2 * keep
 
         return out2
@@ -1143,6 +1317,158 @@ class TestAttentionMTool:
             s_eff = torch.tanh(s.detach()) * GetParametersScale(s.detach())
             delta = delta + s_eff * (B @ A)
         return delta
+
+    def AttentionStateMaxAbsDiff(self, a: Dict[str, Any], b: Dict[str, Any]) -> float:
+        vals = [(a["fusion_hebb"] - b["fusion_hebb"]).abs().max().item()]
+        for x, y in zip(a["mhsa"], b["mhsa"]):
+            vals.append((x["U"] - y["U"]).abs().max().item())
+            vals.append((x["V"] - y["V"]).abs().max().item())
+            vals.append((x["hebbW"] - y["hebbW"]).abs().max().item())
+        return max(vals)
+
+    def TestPlasticityGate(self):
+        try:
+            torch.manual_seed(444)
+            model = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=1,capsDim=16,routingIterations=2,hebbianRate=0.05,useHebbian=True).to(self.device)
+            model.eval()
+            x = torch.randn(2, 16, 64, device=self.device)
+            args = self.AttentionInputs(2, 16, 64, x.dtype)
+            td = torch.tensor([0.7, -0.2], device=self.device)
+            unc = torch.tensor([0.1, 0.4], device=self.device)
+
+            with torch.no_grad():
+                _ = model(x, tdError=td, uncertainty=unc, applyPlasticity=False, **args)
+                model.ResetHebbianMemory()
+                st0 = model.ExportState()
+                _ = model(x, tdError=td, uncertainty=unc, applyPlasticity=False, **args)
+                st1 = model.ExportState()
+                assert self.AttentionStateMaxAbsDiff(st0, st1) < 1e-12, "applyPlasticity=False changed Hebbian state"
+                _ = model(x, tdError=td, uncertainty=unc, applyPlasticity=True, **args)
+                st2 = model.ExportState()
+                assert self.AttentionStateMaxAbsDiff(st1, st2) > 1e-8, "applyPlasticity=True did not update Hebbian state"
+            print("PlasticityGate passed.")
+            return True
+        except AssertionError as e:
+            print(f"PlasticityGate failed: {e}")
+            return False
+        except Exception as e:
+            print(f"PlasticityGate error: {e}")
+            return False
+
+    def TestSelectiveDoneReset(self):
+        try:
+            torch.manual_seed(445)
+            model = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=1,capsDim=16,routingIterations=2,hebbianRate=0.05,useHebbian=True).to(self.device)
+            model.eval()
+            x = torch.randn(2, 16, 64, device=self.device)
+            args = self.AttentionInputs(2, 16, 64, x.dtype)
+            with torch.no_grad():
+                _ = model(x, tdError=torch.ones(2, device=self.device), uncertainty=torch.zeros(2, device=self.device), applyPlasticity=True, **args)
+                st0 = model.ExportState()
+                model.ResetHebbianMemory(doneMask=torch.zeros(2, dtype=torch.bool, device=self.device))
+                st_false = model.ExportState()
+                assert self.AttentionStateMaxAbsDiff(st0, st_false) < 1e-12, "all-false doneMask changed state"
+
+                model.ResetHebbianMemory(doneMask=torch.tensor([True, False], device=self.device))
+                for blk_idx, s in enumerate(st0["mhsa"]):
+                    mhsa_now = model.temporal_blocks[blk_idx].mhsa
+                    assert mhsa_now.U[0].abs().max().item() < 1e-12 and mhsa_now.V[0].abs().max().item() < 1e-12, "done row U/V not cleared"
+                    assert torch.allclose(mhsa_now.U[1], s["U"][1]) and torch.allclose(mhsa_now.V[1], s["V"][1]), "non-done row U/V changed"
+                assert model.fusion.hebbian_memory[0].abs().max().item() < 1e-12, "done row fusion memory not cleared"
+                assert torch.allclose(model.fusion.hebbian_memory[1], st0["fusion_hebb"][1]), "non-done fusion row changed"
+
+                model.ResetHebbianMemory(doneMask=torch.ones(2, dtype=torch.bool, device=self.device))
+                assert model.fusion.hebbian_memory.abs().max().item() < 1e-12, "all-true doneMask did not clear fusion"
+                for blk in model.temporal_blocks:
+                    assert blk.mhsa.U.abs().max().item() < 1e-12 and blk.mhsa.V.abs().max().item() < 1e-12, "all-true doneMask did not clear MHSA"
+            print("SelectiveDoneReset passed.")
+            return True
+        except AssertionError as e:
+            print(f"SelectiveDoneReset failed: {e}")
+            return False
+        except Exception as e:
+            print(f"SelectiveDoneReset error: {e}")
+            return False
+
+    def TestModulatorsPassThrough(self):
+        try:
+            model = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=1,capsDim=16,routingIterations=2,hebbianRate=0.0,useHebbian=False).to(self.device)
+            model.eval()
+            x = torch.randn(2, 16, 64, device=self.device)
+            args = self.AttentionInputs(2, 16, 64, x.dtype)
+            td = torch.tensor([-0.5, 0.5], device=self.device)
+            unc = torch.tensor([0.1, 0.7], device=self.device)
+            precision = torch.tensor([0.2, 1.0], device=self.device)
+            td_raw = torch.tensor([-2.0, 2.0], device=self.device)
+            unc_raw = torch.tensor([-1.0, 2.0], device=self.device)
+            precision_raw = torch.tensor([0.0, 2.0], device=self.device)
+            td_s, unc_s, precision_s = model.SanitizeModulators(td_raw, unc_raw, precision_raw, 2, x)
+            assert td_s is td_raw and unc_s is unc_raw and precision_s is precision_raw, "modulators should pass through unchanged"
+            with torch.no_grad():
+                y, extras = model(x, tdError=td, uncertainty=unc, precision=precision, returnExtras=True, **{k: v for k, v in args.items() if k != "precision"})
+            assert torch.isfinite(y).all(), "valid modulators produced non-finite output"
+            assert torch.allclose(extras["precision"], precision), "precision should pass through unchanged"
+
+            print("ModulatorsPassThrough passed.")
+            return True
+        except AssertionError as e:
+            print(f"ModulatorsPassThrough failed: {e}")
+            return False
+        except Exception as e:
+            print(f"ModulatorsPassThrough error: {e}")
+            return False
+
+    def TestRoutingAndDistributedGates(self):
+        try:
+            model = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=1,capsDim=16,routingIterations=2,hebbianRate=0.0,useHebbian=False).to(self.device)
+            assert model.routing.O == 8, f"default routingOutCaps should be 8, got {model.routing.O}"
+            assert model.routing.transformation.numel() == 16 * 8 * 16 * 16, "routing transformation parameter count mismatch"
+            B = 3
+            goal = torch.randn(B, 32, device=self.device)
+            td, unc, precision = model.SanitizeModulators(
+                torch.randn(B, device=self.device),
+                torch.rand(B, device=self.device),
+                torch.ones(B, device=self.device),
+                B,
+                goal)
+            head_gate, channel_gate = model.ComputeDistributedGates(goal, precision, td, unc)
+            assert tuple(head_gate.shape) == (B, 4, 1, 1), f"head gate shape mismatch: {head_gate.shape}"
+            assert tuple(channel_gate.shape) == (B, 1, 64), f"channel gate shape mismatch: {channel_gate.shape}"
+            assert torch.allclose(head_gate, torch.ones_like(head_gate)), "head gate should initialize neutral"
+            assert torch.allclose(channel_gate, torch.ones_like(channel_gate)), "channel gate should initialize neutral"
+            print("RoutingAndDistributedGates passed.")
+            return True
+        except AssertionError as e:
+            print(f"RoutingAndDistributedGates failed: {e}")
+            return False
+        except Exception as e:
+            print(f"RoutingAndDistributedGates error: {e}")
+            return False
+
+    def TestDualTimeConstantSSM(self):
+        try:
+            ssm = SelectiveSSM(self.E, stateDim=4, convKernel=4, useCausalConv=True, slowDtScale=0.25).to(self.device)
+            ssm.train()
+            x = torch.randn(self.B, self.S, self.E, device=self.device, requires_grad=True)
+            kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
+            kpm[:, -2:] = True
+            y = ssm(x, tdError=torch.randn(self.B, device=self.device), uncertainty=torch.rand(self.B, device=self.device), keyPaddingMask=kpm)
+            assert y.shape == (self.B, self.S, self.E), f"dual SSM shape mismatch: {y.shape}"
+            assert torch.isfinite(y).all(), "dual SSM output has non-finite values"
+            assert y[:, -2:].abs().max().item() < 1e-6, "masked dual SSM positions should be zero"
+            loss = y.square().mean()
+            loss.backward()
+            for n, p in ssm.named_parameters():
+                if p.grad is not None:
+                    assert torch.isfinite(p.grad).all(), f"dual SSM non-finite grad: {n}"
+            print("DualTimeConstantSSM passed.")
+            return True
+        except AssertionError as e:
+            print(f"DualTimeConstantSSM failed: {e}")
+            return False
+        except Exception as e:
+            print(f"DualTimeConstantSSM error: {e}")
+            return False
 
     def TestSimpleSSM(self):
         try:
@@ -1927,6 +2253,11 @@ class TestAttentionMTool:
             "LowrankFullrankConsistency": self.LowrankFullrankConsistency(),
             "HebbianMemoryLifecycleAttention": self.HebbianMemoryLifecycleAttention(),
             "WrapperKeepsBaseEval": self.WrapperKeepsBaseEval(),
+            "PlasticityGate": self.TestPlasticityGate(),
+            "SelectiveDoneReset": self.TestSelectiveDoneReset(),
+            "ModulatorsPassThrough": self.TestModulatorsPassThrough(),
+            "RoutingAndDistributedGates": self.TestRoutingAndDistributedGates(),
+            "DualTimeConstantSSM": self.TestDualTimeConstantSSM(),
             "SmallBatchSafety": self.SmallBatchSafety(),}
         passed = sum(1 for v in results.values() if v)
         print(f"\nAttention module tests (with wrapper): {passed}/{len(results)} passed.")

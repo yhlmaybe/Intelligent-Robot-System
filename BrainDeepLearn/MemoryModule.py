@@ -76,14 +76,16 @@ class SoftSymbolicRules(AGICoreModule):
         self.temporal_l2 = float(temporalL2)
         self.temporal_monotonic = bool(temporalMonotonic)
 
-        self.excl_logits = nn.Parameter(torch.empty(self.G_excl, self.K)) if self.G_excl > 0 else None
-        self.or_logits = nn.Parameter(torch.empty(self.G_or, self.K)) if self.G_or > 0 else None
+        self.excl_logits = nn.Parameter(torch.empty(self.G_excl, self.K))
+        self.or_logits = nn.Parameter(torch.empty(self.G_or, self.K))
         self.imp_logits = nn.Parameter(torch.full((self.K, self.K), -4.0))
 
         self.register_buffer("no_self_mask", ~torch.eye(self.K, dtype=torch.bool), persistent=True)
 
-        nn.init.normal_(self.excl_logits, mean=0.0, std=float(initStd))
-        nn.init.normal_(self.or_logits, mean=0.0, std=float(initStd))
+        if self.excl_logits.numel() > 0:
+            nn.init.normal_(self.excl_logits, mean=0.0, std=float(initStd))
+        if self.or_logits.numel() > 0:
+            nn.init.normal_(self.or_logits, mean=0.0, std=float(initStd))
 
         if seedDisjoint:
             self.SeedDisjointInit()
@@ -96,7 +98,7 @@ class SoftSymbolicRules(AGICoreModule):
         perm = torch.randperm(self.K, device=self.device)
         cursor = 0
 
-        if self.excl_logits is not None and self.G_excl > 0:
+        if self.excl_logits.numel() > 0 and self.G_excl > 0:
             self.excl_logits.fill_(-2.0)
             m = max(1, int(round(self.mass_excl)))
             for g in range(self.G_excl):
@@ -106,7 +108,7 @@ class SoftSymbolicRules(AGICoreModule):
                 self.excl_logits[g, idx] = 2.0
                 cursor = (cursor + m) % self.K
 
-        if self.or_logits is not None and self.G_or > 0:
+        if self.or_logits.numel() > 0 and self.G_or > 0:
             self.or_logits.fill_(-2.0)
             m = max(1, int(round(self.mass_or)))
             for g in range(self.G_or):
@@ -117,8 +119,8 @@ class SoftSymbolicRules(AGICoreModule):
                 cursor = (cursor + m) % self.K
 
     def Weights(self):
-        W_excl = torch.sigmoid(self.excl_logits) if self.excl_logits is not None else None #[G_excl, K]
-        W_or = torch.sigmoid(self.or_logits) if self.or_logits is not None else None #[G_excl, K]
+        W_excl = torch.sigmoid(self.excl_logits) #[G_excl, K]
+        W_or = torch.sigmoid(self.or_logits) #[G_or, K]
 
         A_imp = torch.sigmoid(self.imp_logits) #[K, K]
         A_imp = A_imp.masked_fill(~self.no_self_mask, 0.0) 
@@ -134,13 +136,13 @@ class SoftSymbolicRules(AGICoreModule):
 
         W_excl, W_or, A_imp = self.Weights()#[G_excl, K] , [G_or, K] , [K, K]
 
-        if W_excl is not None and W_excl.numel() > 0:
+        if W_excl.numel() > 0:
             s = torch.matmul(p_f, W_excl.t()) #[B, G_excl]
             s2 = torch.matmul(p_f.pow(2), W_excl.pow(2).t())
             excl_pen = 0.5 * (s.pow(2) - s2) 
             total_penalty = total_penalty + excl_pen.mean(dim=1) #[B]
 
-        if W_or is not None and W_or.numel() > 0:
+        if W_or.numel() > 0:
             eps = p_f.new_tensor(1e-6)
             z = (p_f.unsqueeze(1) * W_or.unsqueeze(0)).clamp(0.0, 1.0 - eps) #[B, G_or, K]
             prob_not_sat = torch.exp(torch.log1p(-z).sum(dim=-1)) 

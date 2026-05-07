@@ -446,9 +446,10 @@ class HebbianLinear(AGICoreModule):
         super().__init__()
         self.inFeatures = int(inFeatures)
         self.outFeatures = int(outFeatures)
+        self.use_bias = bool(bias)
 
         self.weight = nn.Parameter(torch.randn(outFeatures, inFeatures) * 0.01)
-        self.bias = nn.Parameter(torch.zeros(outFeatures)) if bias else None
+        self.bias = nn.Parameter(torch.zeros(outFeatures))
 
         self.hebb_rate = float(hebbRate)
         self.ema_alpha = float(emaMomentum)
@@ -479,7 +480,7 @@ class HebbianLinear(AGICoreModule):
 
         x2 = x.reshape(B, -1, self.inFeatures)  
         y2 = torch.einsum("bni,boi->bno", x2, w_eff)
-        if self.bias is not None:
+        if self.use_bias:
             y2 = y2 + self.bias.view(1, 1, -1)
         y = y2.view(*x.shape[:-1], self.outFeatures) 
 
@@ -555,11 +556,10 @@ class TransformerEncode(AGICoreModule):
 class ResidualBlock(AGICoreModule):
     def __init__(self, inChannels: int, outChannels: int, stride: int = 1, useHebbian: bool = False):
         super().__init__()
-        self.downsample = None
-        if stride != 1 or inChannels != outChannels:
-            self.downsample = nn.Sequential(
-                nn.Conv2d(inChannels, outChannels, kernel_size=1, stride=stride, bias=False),
-                Norm2d(outChannels))
+        self.use_downsample = bool(stride != 1 or inChannels != outChannels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(inChannels, outChannels, kernel_size=1, stride=stride, bias=False),
+            Norm2d(outChannels))
             
         self.conv1 = HebbianConv2d(inChannels, outChannels, 3, stride=stride, padding=1,bias=False, useHebbian=useHebbian)
         self.bn1 = Norm2d(outChannels)
@@ -568,7 +568,7 @@ class ResidualBlock(AGICoreModule):
         self.relu = nn.SiLU() 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x if self.downsample is None else self.downsample(x)
+        identity = self.downsample(x) if self.use_downsample else x
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out = out + identity
