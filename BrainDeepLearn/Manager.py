@@ -737,10 +737,15 @@ class ManagerFunction:
 
         ocr_state = {k: v.detach().cpu() for k, v in engine.state_dict().items()}
         brain_state = {f"OCR.{k}": v for k, v in ocr_state.items()}
+        ocr_meta = engine.OcrMetadata()
 
         torch.save({
             "ocr": ocr_state,
-            "brain": brain_state,}, str(out_path))
+            "brain": brain_state,
+            "vocab": ocr_meta["vocab"],
+            "ocr_meta": ocr_meta,
+            "legacy_prefixes": ocr_meta["legacy_prefixes"],
+            "addon_cfg": ocr_meta["addon_cfg"],}, str(out_path))
 
     def SaveOCRRecognizerParameters(self, engine: OCREngineExtractor, path: str) -> None:
         out_path = Path(path)
@@ -749,11 +754,15 @@ class ManagerFunction:
         rec_state = {k: v.detach().cpu() for k, v in engine.recognizer.state_dict().items()}
         ocr_state = {f"recognizer.{k}": v for k, v in rec_state.items()}
         brain_state = {f"OCR.recognizer.{k}": v for k, v in rec_state.items()}
+        ocr_meta = engine.OcrMetadata()
 
         torch.save({
             "recognizer": rec_state,
             "ocr": ocr_state,
-            "brain": brain_state,}, str(out_path))
+            "brain": brain_state,
+            "vocab": ocr_meta["vocab"],
+            "ocr_meta": ocr_meta,
+            "addon_cfg": ocr_meta["addon_cfg"],}, str(out_path))
 
     def CaptureRngState(self) -> Dict[str, Any]:
         return {
@@ -872,6 +881,43 @@ class ManagerFunction:
         print(f"[{logPrefix}] checkpoint weights overridden from parameter file: {override_path}")
         return True
 
+    def FilterLoadableStateDict(
+        self,
+        module: nn.Module,
+        stateDict: Dict[str, Any],
+        *,
+        logPrefix: str,) -> Dict[str, Any]:
+        current = module.state_dict()
+        filtered: Dict[str, Any] = {}
+        skipped: List[str] = []
+
+        for k, v in stateDict.items():
+            if k in current and isinstance(v, torch.Tensor):
+                if tuple(current[k].shape) != tuple(v.shape):
+                    skipped.append(str(k))
+                    continue
+            filtered[k] = v
+
+        if skipped:
+            preview = ", ".join(skipped[:8])
+            more = "" if len(skipped) <= 8 else f", ... +{len(skipped) - 8}"
+            print(f"[{logPrefix}] skipped shape-mismatched keys: {preview}{more}")
+
+        return filtered
+
+    def ConfigureOCRTrainingTargets(
+        self,
+        engine: OCREngineExtractor,
+        *,
+        trainDetection: bool,
+        trainRecognition: bool,) -> None:
+        for p in engine.backbone.parameters():
+            p.requires_grad = bool(trainDetection)
+        for p in engine.dbHead.parameters():
+            p.requires_grad = bool(trainDetection)
+        for p in engine.recognizer.parameters():
+            p.requires_grad = bool(trainRecognition)
+
     def LoadOCRWeightsIntoEngine(self, engine: OCREngineExtractor, path: str) -> None:
         payload = torch.load(path, map_location=self.device)
 
@@ -890,6 +936,7 @@ class ManagerFunction:
         if not ocr_state:
             raise KeyError(f"checkpoint {path} has no OCR weights")
 
+        ocr_state = self.FilterLoadableStateDict(engine, ocr_state, logPrefix="LoadOCR")
         engine.load_state_dict(ocr_state, strict=False)
 
     def LoadRecognizerWeightsIntoEngine(self, engine: OCREngineExtractor, path: str) -> None:
@@ -917,6 +964,7 @@ class ManagerFunction:
         if not rec_state:
             raise KeyError(f"checkpoint {path} has no recognizer weights")
 
+        rec_state = self.FilterLoadableStateDict(engine.recognizer, rec_state, logPrefix="LoadOCRRec")
         engine.recognizer.load_state_dict(rec_state, strict=False)
 
     def LoadOCRCheckpoint(
@@ -930,7 +978,8 @@ class ManagerFunction:
         ckpt = torch.load(path, map_location=self.device)
 
         if "ocr" in ckpt:
-            engine.load_state_dict(ckpt["ocr"], strict=True)
+            ocr_state = self.FilterLoadableStateDict(engine, ckpt["ocr"], logPrefix="LoadOCRCkpt")
+            engine.load_state_dict(ocr_state, strict=False)
         elif "brain" in ckpt:
             ocr_state = {
                 k[len("OCR."):]: v
@@ -938,6 +987,7 @@ class ManagerFunction:
                 if k.startswith("OCR.")}
             if len(ocr_state) == 0:
                 raise KeyError(f"checkpoint {path} has no OCR weights")
+            ocr_state = self.FilterLoadableStateDict(engine, ocr_state, logPrefix="LoadOCRCkpt")
             engine.load_state_dict(ocr_state, strict=False)
         else:
             raise KeyError(f"checkpoint {path} has no 'ocr' or 'brain' field")
@@ -948,6 +998,7 @@ class ManagerFunction:
             except ValueError:
                 if not allowOptimizerMismatch:
                     raise
+                print("[LoadOCRCkpt] optimizer state skipped because parameter groups changed")
 
         if "rng" in ckpt:
             random.setstate(ckpt["rng"]["python"])
@@ -975,7 +1026,8 @@ class ManagerFunction:
         ckpt = torch.load(path, map_location=self.device)
 
         if "recognizer" in ckpt:
-            engine.recognizer.load_state_dict(ckpt["recognizer"], strict=True)
+            rec_state = self.FilterLoadableStateDict(engine.recognizer, ckpt["recognizer"], logPrefix="LoadOCRRecCkpt")
+            engine.recognizer.load_state_dict(rec_state, strict=False)
         elif "ocr" in ckpt:
             rec_state = {
                 k[len("recognizer."):]: v
@@ -983,6 +1035,7 @@ class ManagerFunction:
                 if k.startswith("recognizer.")}
             if len(rec_state) == 0:
                 raise KeyError(f"checkpoint {path} has no recognizer weights")
+            rec_state = self.FilterLoadableStateDict(engine.recognizer, rec_state, logPrefix="LoadOCRRecCkpt")
             engine.recognizer.load_state_dict(rec_state, strict=False)
         elif "brain" in ckpt:
             rec_state = {
@@ -991,12 +1044,16 @@ class ManagerFunction:
                 if k.startswith("OCR.recognizer.")}
             if len(rec_state) == 0:
                 raise KeyError(f"checkpoint {path} has no recognizer weights")
+            rec_state = self.FilterLoadableStateDict(engine.recognizer, rec_state, logPrefix="LoadOCRRecCkpt")
             engine.recognizer.load_state_dict(rec_state, strict=False)
         else:
             raise KeyError(f"checkpoint {path} has no recognizer field")
 
         if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+            except ValueError:
+                print("[LoadOCRRecCkpt] optimizer state skipped because parameter groups changed")
 
         if "rng" in ckpt:
             random.setstate(ckpt["rng"]["python"])
@@ -1042,17 +1099,15 @@ class ManagerFunction:
             engine = OCREngineExtractor().to(self.device)
             has_resume_ckpt = resume and Path(ckptPath).exists()
 
-            for p in engine.backbone.parameters():
-                p.requires_grad = trainDetection
-            for p in engine.dbHead.parameters():
-                p.requires_grad = trainDetection
-            for p in engine.recognizer.parameters():
-                p.requires_grad = trainRecognition
+            self.ConfigureOCRTrainingTargets(
+                engine,
+                trainDetection=trainDetection,
+                trainRecognition=trainRecognition,)
 
             trainable_params = [p for p in engine.parameters() if p.requires_grad]
             if len(trainable_params) == 0:
                 raise RuntimeError("no trainable OCR parameters selected")
-            optimizer = torch.optim.Adam(trainable_params, lr=3e-4)
+            optimizer = torch.optim.AdamW(trainable_params, lr=3e-4, weight_decay=1e-2)
 
             start_epoch = 0
             best_val = float("inf")
@@ -1097,6 +1152,10 @@ class ManagerFunction:
                 parameterPath=outPath,
                 loadFn=lambda path: self.LoadOCRWeightsIntoEngine(engine, path),
                 logPrefix="TrainOCR")
+            self.ConfigureOCRTrainingTargets(
+                engine,
+                trainDetection=trainDetection,
+                trainRecognition=trainRecognition,)
 
             train_ds, val_ds, test_ds = self.SplitDataset(
                 ds,
@@ -1189,6 +1248,7 @@ class ManagerFunction:
 
                             rec_loss = zero # []
                             recog_imgs = sample["recog_imgs"] # [N_line, 1, targetH, maxW]
+                            recog_widths = sample["recog_widths"] # [N_line]
                             targets = sample["targets"] # [sum(target_lengths)]
                             target_lengths = sample["target_lengths"] # [N_line]
                             norm_texts = sample["norm_texts"]
@@ -1197,7 +1257,8 @@ class ManagerFunction:
                                 rec_out = engine.ForwardRecognize(
                                     recog_imgs,
                                     targetsTensor=targets,
-                                    targetLengths=target_lengths,)
+                                    targetLengths=target_lengths,
+                                    validWidths=recog_widths,)
                                 rec_loss = rec_out["loss"] # []
 
                                 pairs = engine.CtcGreedyDecodeWithConf(
@@ -1225,10 +1286,15 @@ class ManagerFunction:
                 return avg_split_loss, avg_split_det_loss, avg_split_rec_loss, box_hmean, text_char_acc
 
             def BuildOCRCheckpointPayload(epochValue: int) -> Dict[str, Any]:
+                ocr_meta = engine.OcrMetadata()
                 return {
                     "epoch": int(epochValue),
                     "best_val": best_val,
                     "ocr": engine.state_dict(),
+                    "vocab": ocr_meta["vocab"],
+                    "ocr_meta": ocr_meta,
+                    "legacy_prefixes": ocr_meta["legacy_prefixes"],
+                    "addon_cfg": ocr_meta["addon_cfg"],
                     "optimizer": optimizer.state_dict(),
                     "train_indices": list(train_ds.indices) if hasattr(train_ds, "indices") else None,
                     "val_indices": list(val_ds.indices) if hasattr(val_ds, "indices") else None,
@@ -1309,6 +1375,7 @@ class ManagerFunction:
 
                         rec_loss = zero # []
                         recog_imgs = sample["recog_imgs"] # [N_line, 1, targetH, maxW]
+                        recog_widths = sample["recog_widths"] # [N_line]
                         targets = sample["targets"] # [sum(target_lengths)]
                         target_lengths = sample["target_lengths"] # [N_line]
                         norm_texts = sample["norm_texts"]
@@ -1318,7 +1385,8 @@ class ManagerFunction:
                             rec_out = engine.ForwardRecognize(
                                 recog_imgs,
                                 targetsTensor=targets,
-                                targetLengths=target_lengths,)
+                                targetLengths=target_lengths,
+                                validWidths=recog_widths,)
                             rec_loss = rec_out["loss"] # []
 
                             with torch.no_grad():
@@ -1562,14 +1630,15 @@ class ManagerFunction:
     
             ds = OfflineOCRRecognitionDataset(isTest=isTest)
             engine = OCREngineExtractor().to(self.device)
-            for p in engine.backbone.parameters():
-                p.requires_grad = False
-            for p in engine.dbHead.parameters():
-                p.requires_grad = False
-            for p in engine.recognizer.parameters():
-                p.requires_grad = True
+            self.ConfigureOCRTrainingTargets(
+                engine,
+                trainDetection=False,
+                trainRecognition=True,)
 
-            optimizer = torch.optim.Adam(engine.recognizer.parameters(), lr=3e-4)
+            trainable_params = [p for p in engine.parameters() if p.requires_grad]
+            if len(trainable_params) == 0:
+                raise RuntimeError("no trainable OCR recognizer parameters selected")
+            optimizer = torch.optim.AdamW(trainable_params, lr=3e-4, weight_decay=1e-2)
 
             start_epoch = 0
             best_val = float("inf")
@@ -1586,6 +1655,10 @@ class ManagerFunction:
                 parameterPath=outPath,
                 loadFn=lambda path: self.LoadRecognizerWeightsIntoEngine(engine, path),
                 logPrefix="TrainOCRRec")
+            self.ConfigureOCRTrainingTargets(
+                engine,
+                trainDetection=False,
+                trainRecognition=True,)
 
             train_ds, val_ds, test_ds = self.SplitDataset(
                 ds,
@@ -1641,6 +1714,7 @@ class ManagerFunction:
                                 device=self.device,)
 
                             recog_imgs = sample["recog_imgs"] # [N_line, 1, targetH, maxW]
+                            recog_widths = sample["recog_widths"] # [N_line]
                             targets = sample["targets"] # [sum(target_lengths)]
                             target_lengths = sample["target_lengths"] # [N_line]
                             norm_text = sample["norm_text"]
@@ -1650,7 +1724,8 @@ class ManagerFunction:
                             rec_out = engine.ForwardRecognize(
                                 recog_imgs,
                                 targetsTensor=targets,
-                                targetLengths=target_lengths,)
+                                targetLengths=target_lengths,
+                                validWidths=recog_widths,)
                             rec_loss = rec_out["loss"] # []
 
                             pairs = engine.CtcGreedyDecodeWithConf(
@@ -1668,10 +1743,14 @@ class ManagerFunction:
                 return avg_split_loss, split_acc
 
             def BuildOCRRecognizerCheckpointPayload(epochValue: int) -> Dict[str, Any]:
+                ocr_meta = engine.OcrMetadata()
                 return {
                     "epoch": int(epochValue),
                     "best_val": best_val,
                     "recognizer": engine.recognizer.state_dict(),
+                    "vocab": ocr_meta["vocab"],
+                    "ocr_meta": ocr_meta,
+                    "addon_cfg": ocr_meta["addon_cfg"],
                     "optimizer": optimizer.state_dict(),
                     "train_indices": list(train_ds.indices) if hasattr(train_ds, "indices") else None,
                     "val_indices": list(val_ds.indices) if hasattr(val_ds, "indices") else None,
@@ -1727,6 +1806,7 @@ class ManagerFunction:
                             device=self.device,)
 
                         recog_imgs = sample["recog_imgs"] # [N_line, 1, targetH, maxW]
+                        recog_widths = sample["recog_widths"] # [N_line]
                         targets = sample["targets"] # [sum(target_lengths)]
                         target_lengths = sample["target_lengths"] # [N_line]
                         norm_text = sample["norm_text"]
@@ -1736,7 +1816,8 @@ class ManagerFunction:
                         rec_out = engine.ForwardRecognize(
                             recog_imgs,
                             targetsTensor=targets,
-                            targetLengths=target_lengths,)
+                            targetLengths=target_lengths,
+                            validWidths=recog_widths,)
                         rec_loss = rec_out["loss"] # []
 
                         with torch.no_grad():

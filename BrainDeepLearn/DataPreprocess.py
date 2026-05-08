@@ -506,12 +506,12 @@ class DataPreprocessor:
             needVisualState=needVisualState,)
 
     @staticmethod
-    def CropAndResizeLineImages(
+    def CropAndResizeLineImagesWithMeta(
         imageTensor: torch.Tensor,
         boxes: Union[np.ndarray, torch.Tensor],
         *,
         targetH: int = 32,
-        maxW: int = 512,) -> torch.Tensor:
+        maxW: int = 512,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         c, h_img, w_img = imageTensor.shape
         if c < 3:
             raise ValueError(f"imageTensor channel count must be at least 3, but got {c}")
@@ -521,7 +521,10 @@ class DataPreprocessor:
             + 0.587 * imageTensor[1]
             + 0.114 * imageTensor[2])
 
+        device = imageTensor.device
         line_tensors: List[torch.Tensor] = []
+        valid_widths: List[int] = []
+        truncated_flags: List[bool] = []
         boxes_np = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
 
         for box in boxes_np:
@@ -542,6 +545,7 @@ class DataPreprocessor:
 
             scale = targetH / float(h)
             new_w = max(1, int(round(w * scale)))
+            truncated = new_w > maxW
             patch_resized = F.interpolate(
                 patch,
                 size=(targetH, new_w),
@@ -552,14 +556,22 @@ class DataPreprocessor:
                 patch_resized = patch_resized[:, :, :, :maxW]
                 new_w = maxW
 
-            pad = torch.zeros(1, 1, targetH, maxW, dtype=imageTensor.dtype)
+            pad = torch.zeros(1, 1, targetH, maxW, dtype=imageTensor.dtype, device=device)
             pad[:, :, :, :new_w] = patch_resized
             line_tensors.append(pad)
+            valid_widths.append(int(new_w))
+            truncated_flags.append(bool(truncated))
 
         if not line_tensors:
-            return torch.empty(0, 1, targetH, maxW, dtype=imageTensor.dtype)
+            return (
+                torch.empty(0, 1, targetH, maxW, dtype=imageTensor.dtype, device=device),
+                torch.empty(0, dtype=torch.long, device=device),
+                torch.empty(0, dtype=torch.bool, device=device),)
 
-        return torch.cat(line_tensors, dim=0)
+        return (
+            torch.cat(line_tensors, dim=0),
+            torch.tensor(valid_widths, dtype=torch.long, device=device),
+            torch.tensor(truncated_flags, dtype=torch.bool, device=device),)
 
     @staticmethod
     def NormalizeTextLine(text: Optional[str], char2Idx: dict) -> str:
@@ -656,10 +668,12 @@ class DataPreprocessor:
 
         if len(rec_boxes) == 0:
             recog_imgs = torch.empty(0, 1, targetH, maxW, dtype=img_rgb.dtype)
+            recog_widths = torch.empty(0, dtype=torch.long)
+            recog_truncated = torch.empty(0, dtype=torch.bool)
             targets = torch.empty(0, dtype=torch.long)
             target_lengths = torch.empty(0, dtype=torch.long)
         else:
-            recog_imgs = DataPreprocessor.CropAndResizeLineImages(
+            recog_imgs, recog_widths, recog_truncated = DataPreprocessor.CropAndResizeLineImagesWithMeta(
                 img_rgb,
                 rec_boxes,
                 targetH=targetH,
@@ -680,6 +694,8 @@ class DataPreprocessor:
             gt_boxes = gt_boxes.to(device)
             gt_mask = gt_mask.to(device)
             recog_imgs = recog_imgs.to(device)
+            recog_widths = recog_widths.to(device)
+            recog_truncated = recog_truncated.to(device)
             targets = targets.to(device)
             target_lengths = target_lengths.to(device)
 
@@ -691,6 +707,8 @@ class DataPreprocessor:
             "gt_boxes": gt_boxes,
             "gt_mask": gt_mask,
             "recog_imgs": recog_imgs,
+            "recog_widths": recog_widths,
+            "recog_truncated": recog_truncated,
             "targets": targets,
             "target_lengths": target_lengths,
             "norm_texts": rec_texts,
@@ -710,7 +728,7 @@ class DataPreprocessor:
         image_t = DataPreprocessor.ToImageTensor(image)
         _, h_img, w_img = image_t.shape
 
-        recog_imgs = DataPreprocessor.CropAndResizeLineImages(
+        recog_imgs, recog_widths, recog_truncated = DataPreprocessor.CropAndResizeLineImagesWithMeta(
             image_t,
             np.asarray([[0.0, 0.0, float(w_img), float(h_img)]], dtype=np.float32),
             targetH=targetH,
@@ -729,11 +747,15 @@ class DataPreprocessor:
 
         if device is not None:
             recog_imgs = recog_imgs.to(device)
+            recog_widths = recog_widths.to(device)
+            recog_truncated = recog_truncated.to(device)
             targets = targets.to(device)
             target_lengths = target_lengths.to(device)
 
         return {
             "recog_imgs": recog_imgs,
+            "recog_widths": recog_widths,
+            "recog_truncated": recog_truncated,
             "targets": targets,
             "target_lengths": target_lengths,
             "norm_text": norm_text,

@@ -1,7 +1,8 @@
 from __future__ import annotations
-from typing import List, Tuple, Dict, Optional, Union, TypedDict
+from typing import Any, List, Tuple, Dict, Optional, Union, TypedDict
 from dataclasses import dataclass
 from collections import deque, defaultdict
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -9,6 +10,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import re
 import math
+
+
+def DefaultOcrVocabPath() -> str:
+    return str(Path(__file__).resolve().parent / "ModuleSetting" / "OCRKeys.txt")
+
+
+def WidthToCtcSteps(validWidths: torch.Tensor) -> torch.Tensor:
+    w = validWidths.to(torch.long)
+    w = torch.div(w, 2, rounding_mode="floor")
+    w = torch.div(w, 2, rounding_mode="floor")
+    w = (w - 1).clamp(min=1)
+    return w
 
 
 def NormText(s: str) -> str:
@@ -174,11 +187,40 @@ class DBHead(nn.Module):
         self.probConv = nn.Sequential(
             ConvBNReLU(inCh, 64, kSize=3, stride=1, padding=1),
             nn.Conv2d(64, 1, kernel_size=1),)
+        self.residual = DBResidualLogitHead(inCh=inCh)
+
+    def ForwardWithLogits(self, featTensor: torch.Tensor) -> Dict[str, torch.Tensor]:
+        base_prob_logits = self.probConv(featTensor)
+        delta_prob_logits = self.residual(featTensor)
+        prob_logits = base_prob_logits + delta_prob_logits
+        prob_map = torch.sigmoid(prob_logits)
+        return {
+            "prob_logits": prob_logits,
+            "prob_map": prob_map,
+            "base_prob_logits": base_prob_logits,
+            "delta_prob_logits": delta_prob_logits,}
 
     def forward(self, featTensor: torch.Tensor) -> torch.Tensor:
-        prob_logits = self.probConv(featTensor)
-        prob_map = torch.sigmoid(prob_logits)
+        prob_map = self.ForwardWithLogits(featTensor)["prob_map"]
         return prob_map # [B, 1, H, W]
+
+
+class DBResidualLogitHead(nn.Module):
+    def __init__(self, inCh: int = 256, midCh: int = 64):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(inCh, midCh, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.GroupNorm(16, midCh),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(midCh, 1, kernel_size=1, stride=1, padding=0, bias=True),)
+        self.alpha = nn.Parameter(torch.tensor(0.0))
+        nn.init.zeros_(self.block[-1].weight)
+        nn.init.zeros_(self.block[-1].bias)
+
+    def forward(self, featTensor: torch.Tensor) -> torch.Tensor:
+
+        scale = 1.0 + torch.tanh(self.alpha)
+        return scale * self.block(featTensor)
 
 
 def BalancedBceLoss(predTensor: torch.Tensor, gtTensor: torch.Tensor, maskTensor: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -206,6 +248,33 @@ def BalancedBceLoss(predTensor: torch.Tensor, gtTensor: torch.Tensor, maskTensor
 
     loss = (loss_pos + loss_neg)
     return loss.sum() / valid.sum().clamp(min=1.0)
+
+
+def BalancedBceWithLogitsLoss(logitsTensor: torch.Tensor, gtTensor: torch.Tensor, maskTensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+    gt = gtTensor.float()
+
+    if maskTensor is None:
+        mask = torch.ones_like(gt)
+    else:
+        mask = maskTensor
+
+    valid = (mask > 0.5).float()
+    pos = (gt > 0.5).float() * valid
+    neg = (1.0 - (gt > 0.5).float()) * valid
+
+    n_pos = pos.sum().clamp(min=1.0)
+    n_neg = neg.sum().clamp(min=1.0)
+
+    w_pos = n_neg / (n_pos + n_neg)
+    w_neg = n_pos / (n_pos + n_neg)
+    weight = w_pos * pos + w_neg * neg
+
+    loss = F.binary_cross_entropy_with_logits(
+        logitsTensor,
+        gt,
+        weight=weight,
+        reduction="sum",)
+    return loss / valid.sum().clamp(min=1.0)
 
 
 def DiceLoss(predTensor: torch.Tensor,gtTensor: torch.Tensor, maskTensor: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -236,13 +305,20 @@ class DBLoss(nn.Module):
         self,
         probMap: torch.Tensor,
         gtBoxes: torch.Tensor,
-        gtMask: Optional[torch.Tensor] = None,) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        gtMask: Optional[torch.Tensor] = None,
+        probLogits: Optional[torch.Tensor] = None,
+        gtTextMask: Optional[torch.Tensor] = None,) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
+        target = gtBoxes if gtTextMask is None else gtTextMask
 
         if gtMask is None:
-            gtMask = torch.ones_like(gtBoxes)
+            gtMask = torch.ones_like(target)
 
-        loss_prob = BalancedBceLoss(probMap, gtBoxes, gtMask)
-        loss_mask = DiceLoss(probMap, gtBoxes, gtMask)
+        if probLogits is None:
+            loss_prob = BalancedBceLoss(probMap, target, gtMask)
+        else:
+            loss_prob = BalancedBceWithLogitsLoss(probLogits, target, gtMask)
+        loss_mask = DiceLoss(probMap, target, gtMask)
 
         total = (self.lambdaProb * loss_prob
             + self.lambdaMask * loss_mask)
@@ -260,7 +336,8 @@ class CRNNRecognizer(nn.Module):
         imgH: int = 32,
         inCh: int = 1,
         nClasses: int = 96, 
-        rnnHidden: int = 256,):
+        rnnHidden: int = 256,
+        residualRank: int = 64,):
         super().__init__()
         self.imgH = int(imgH)
         self.nClasses = int(nClasses)
@@ -313,7 +390,21 @@ class CRNNRecognizer(nn.Module):
 
         self.fc = nn.Linear(rnnHidden * 2, self.nClasses)
 
-        self.ctcLoss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+        self.ctcLoss = nn.CTCLoss(blank=0, reduction="none", zero_infinity=True)
+        self.residualHead = LowRankCTCResidualHead(
+            inDim=512,
+            rank=int(residualRank),
+            nClasses=self.nClasses,) if int(residualRank) > 0 else None
+
+    def EncodeVisual(self, imgsTensor: torch.Tensor) -> torch.Tensor:
+        x = self.conv1(imgsTensor)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.conv5(x)
+        x = self.conv6(x)
+        x = self.conv7(x)
+        return x
 
     def FeaturesToSeq(self, featTensor: torch.Tensor) -> torch.Tensor:
         feat = featTensor
@@ -329,51 +420,84 @@ class CRNNRecognizer(nn.Module):
         self,
         imgsTensor: torch.Tensor,
         targetsTensor: Optional[torch.Tensor] = None,
-        targetLengths: Optional[torch.Tensor] = None,) -> Dict[str, torch.Tensor]:
+        targetLengths: Optional[torch.Tensor] = None,
+        inputLengths: Optional[torch.Tensor] = None,) -> Dict[str, torch.Tensor]:
 
-        x = self.conv1(imgsTensor)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
-        x = self.conv5(x)
-        x = self.conv6(x)
-        x = self.conv7(x) 
-
+        x = self.EncodeVisual(imgsTensor)
         seq = self.FeaturesToSeq(x) 
 
         rnn_out, _ = self.rnn(seq)
-        logits = self.fc(rnn_out) 
+        base_logits = self.fc(rnn_out)
+        delta_logits = self.residualHead(seq) if self.residualHead is not None else None
+        logits = base_logits if delta_logits is None else (base_logits + delta_logits)
         log_probs = F.log_softmax(logits, dim=-1)
 
         out: Dict[str, torch.Tensor] = {
             "logits": logits,
-            "log_probs": log_probs,}
+            "log_probs": log_probs,
+            "base_logits": base_logits,}
+        if delta_logits is not None:
+            out["delta_logits"] = delta_logits
 
         if targetsTensor is not None and targetLengths is not None:
             t, b, _ = log_probs.size()
-            input_lengths = torch.full(
-                size=(b,),
-                fill_value=t,
-                dtype=torch.long,
-                device=log_probs.device,)
+            if inputLengths is None:
+                input_lengths = torch.full(
+                    size=(b,),
+                    fill_value=t,
+                    dtype=torch.long,
+                    device=log_probs.device,)
+            else:
+                input_lengths = inputLengths.to(device=log_probs.device, dtype=torch.long).clamp(min=1, max=t)
+            target_lengths = targetLengths.to(device=log_probs.device, dtype=torch.long)
             
-            loss = self.ctcLoss(
+            per_sample = self.ctcLoss(
                 log_probs,
                 targetsTensor,
                 input_lengths,
-                targetLengths,)
+                target_lengths,)
+            valid = input_lengths >= target_lengths
+            per_sample = per_sample / target_lengths.clamp_min(1).to(per_sample.dtype)
+            loss = per_sample[valid].mean() if valid.any() else (per_sample.mean() * 0.0)
             
             out["loss"] = loss
+            out["input_lengths"] = input_lengths
+            out["ctc_invalid_ratio"] = (~valid).float().mean()
 
         return out
 
 
+class LowRankCTCResidualHead(nn.Module):
+    def __init__(self, inDim: int = 512, rank: int = 64, nClasses: int = 96, kernelSize: int = 5):
+        super().__init__()
+        self.norm = nn.LayerNorm(inDim)
+        self.down = nn.Linear(inDim, rank, bias=False)
+        self.dw = nn.Conv1d(
+            rank,
+            rank,
+            kernel_size=kernelSize,
+            padding=kernelSize // 2,
+            groups=rank,
+            bias=False,)
+        self.out = nn.Linear(rank, nClasses, bias=True)
+        self.alpha = nn.Parameter(torch.tensor(0.0))
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, seqTensor: torch.Tensor) -> torch.Tensor:
+        z = self.norm(seqTensor)
+        z = self.down(z)
+        z = z.permute(1, 2, 0)
+        z = F.gelu(self.dw(z))
+        z = z.permute(2, 0, 1)
+        scale = 1.0 + torch.tanh(self.alpha)
+        return scale * self.out(z)
 
 
 class OCREngineExtractor(nn.Module):
     def __init__(
         self,
-        vocabCharsPath: str = "/home/yhl/Documents/Intelligent-Robot-System/BrainDeepLearn/ModuleSetting/OCRKeys.txt",
+        vocabCharsPath: str = DefaultOcrVocabPath(),
         *,
         temporalSteps: int = 0, 
         fuseTopK: int = 8,
@@ -409,6 +533,23 @@ class OCREngineExtractor(nn.Module):
         self.recognizer = CRNNRecognizer(imgH=32,inCh=1, nClasses=len(self.idx2Char), rnnHidden=256,)
 
 
+    def OcrMetadata(self) -> Dict[str, Any]:
+        return {
+            "vocab": list(self.idx2Char),
+            "blank_index": int(self.blankIndex),
+            "legacy_prefixes": [
+                "backbone.",
+                "dbHead.probConv.",
+                "recognizer.conv",
+                "recognizer.rnn.",
+                "recognizer.fc.",],
+            "addon_cfg": {
+                "db_residual": self.dbHead.residual is not None,
+                "rec_residual_rank": (
+                    int(self.recognizer.residualHead.down.out_features)
+                    if self.recognizer.residualHead is not None else 0),
+                "width_aware_ctc": True,},}
+
     def LoadOcrVocabFromTxt(self, dictPath: str, *, encoding: str = "utf-8") -> str:
         chars: List[str] = []
         seen = set()
@@ -430,17 +571,19 @@ class OCREngineExtractor(nn.Module):
         self,
         imagesTensor: torch.Tensor,
         gtBoxes: Optional[torch.Tensor] = None,
-        gtMask: Optional[torch.Tensor] = None,) -> Dict[str, torch.Tensor]:
+        gtMask: Optional[torch.Tensor] = None,
+        gtTextMask: Optional[torch.Tensor] = None,) -> Dict[str, torch.Tensor]:
         feat = self.backbone(imagesTensor)
-        prob_map = self.dbHead(feat)
+        det_out = self.dbHead.ForwardWithLogits(feat)
 
-        out: Dict[str, torch.Tensor] = {
-            "prob_map": prob_map,}
+        out: Dict[str, torch.Tensor] = dict(det_out)
 
-        if gtBoxes is not None:
+        target = gtBoxes if gtTextMask is None else gtTextMask
+        if target is not None:
             loss, stats = self.dbLoss(
-                probMap=prob_map,
-                gtBoxes=gtBoxes,
+                probMap=det_out["prob_map"],
+                probLogits=det_out["prob_logits"],
+                gtBoxes=target,
                 gtMask=gtMask,)
 
             out["loss"] = loss
@@ -454,9 +597,17 @@ class OCREngineExtractor(nn.Module):
         self,
         lineImgs: torch.Tensor,
         targetsTensor: Optional[torch.Tensor] = None,
-        targetLengths: Optional[torch.Tensor] = None,) -> Dict[str, torch.Tensor]:
+        targetLengths: Optional[torch.Tensor] = None,
+        inputLengths: Optional[torch.Tensor] = None,
+        validWidths: Optional[torch.Tensor] = None,) -> Dict[str, torch.Tensor]:
 
-        return self.recognizer(lineImgs, targetsTensor, targetLengths)
+        if inputLengths is None and validWidths is not None:
+            inputLengths = WidthToCtcSteps(validWidths)
+        return self.recognizer(
+            lineImgs,
+            targetsTensor=targetsTensor,
+            targetLengths=targetLengths,
+            inputLengths=inputLengths,)
 
 
     def BitmapToBoxes(
@@ -510,6 +661,20 @@ class OCREngineExtractor(nn.Module):
         boxes: List[np.ndarray],
         targetH: int = 32,
         maxW: int = 512,) -> torch.Tensor:
+        line_imgs, _ = self.CropAndResizeLinesWithWidths(
+            imageTensor,
+            boxes,
+            targetH=targetH,
+            maxW=maxW,)
+        return line_imgs
+
+
+    def CropAndResizeLinesWithWidths(
+        self,
+        imageTensor: torch.Tensor,
+        boxes: List[np.ndarray],
+        targetH: int = 32,
+        maxW: int = 512,) -> Tuple[torch.Tensor, torch.Tensor]:
 
         c, h_img, w_img = imageTensor.shape
 
@@ -519,6 +684,7 @@ class OCREngineExtractor(nn.Module):
 
         device = imageTensor.device
         line_tensors: List[torch.Tensor] = []
+        valid_widths: List[int] = []
 
         for box in boxes:
             x1, y1, x2, y2 = box.tolist()
@@ -551,11 +717,16 @@ class OCREngineExtractor(nn.Module):
             pad = torch.zeros(1, 1, targetH, maxW, device=device, dtype=imageTensor.dtype)
             pad[:, :, :, :new_w] = patch_resized
             line_tensors.append(pad)
+            valid_widths.append(int(new_w))
 
         if not line_tensors:
-            return torch.empty(0, 1, targetH, maxW, dtype=imageTensor.dtype, device=device)
+            return (
+                torch.empty(0, 1, targetH, maxW, dtype=imageTensor.dtype, device=device),
+                torch.empty(0, dtype=torch.long, device=device),)
 
-        return torch.cat(line_tensors, dim=0) 
+        return (
+            torch.cat(line_tensors, dim=0),
+            torch.tensor(valid_widths, dtype=torch.long, device=device),)
 
 
     def forward(
@@ -585,10 +756,10 @@ class OCREngineExtractor(nn.Module):
             boxes = self.BitmapToBoxes(pm, threshValue=binThresh, minArea=minBoxArea)
 
             if len(boxes) != 0:
-                line_imgs = self.CropAndResizeLines(img, boxes, targetH=32, maxW=512)
+                line_imgs, valid_widths = self.CropAndResizeLinesWithWidths(img, boxes, targetH=32, maxW=512)
 
                 if line_imgs.size(0) != 0:
-                    rec_out = self.recognizer(line_imgs)
+                    rec_out = self.ForwardRecognize(line_imgs, validWidths=valid_widths)
                     pairs = self.CtcGreedyDecodeWithConf(
                         rec_out["log_probs"],
                         idx2Char=self.idx2Char,
@@ -872,13 +1043,19 @@ class TestOCRMTool:
 
             with torch.no_grad():
                 feat = backbone(imgs)
+                det_out = head.ForwardWithLogits(feat)
                 prob = head(feat)
 
             assert prob.shape[0] == B and prob.shape[1] == 1
+            assert det_out["prob_map"].shape == prob.shape
+            assert det_out["prob_logits"].shape == prob.shape
+            assert det_out["base_prob_logits"].shape == prob.shape
+            assert det_out["delta_prob_logits"].shape == prob.shape
 
-            for t in (prob,):
+            for t in (prob, det_out["prob_map"]):
                 assert torch.isfinite(t).all()
                 assert t.min().item() >= -1e-6 and t.max().item() <= 1.0 + 1e-6
+            assert torch.isfinite(det_out["prob_logits"]).all()
 
             print("DetectForwardShapes passed.")
             return True
@@ -902,12 +1079,17 @@ class TestOCRMTool:
             imgs = torch.randn(B, 3, H, W, device=self.device)
 
             feat = backbone(imgs)
-            prob = head(feat)
+            det_out = head.ForwardWithLogits(feat)
+            prob = det_out["prob_map"]
 
             gtBoxes = (torch.rand_like(prob) > 0.7).float()
             gtMask = (torch.rand_like(prob) > 0.1).float()
 
-            loss, stats = crit(probMap=prob, gtBoxes=gtBoxes, gtMask=gtMask,)
+            loss, stats = crit(
+                probMap=prob,
+                probLogits=det_out["prob_logits"],
+                gtBoxes=gtBoxes,
+                gtMask=gtMask,)
 
             opt = torch.optim.Adam(list(backbone.parameters()) + list(head.parameters()), lr=1e-3)
             opt.zero_grad(set_to_none=True)
@@ -922,6 +1104,7 @@ class TestOCRMTool:
                 "backbone.enc2.0.conv.weight",
                 "backbone.outConv.conv.weight",
                 "dbHead.probConv.0.conv.weight",
+                "dbHead.residual.block.3.weight",
                 ]
 
             ok_cov = self.GradCoverage(named, min_ratio=0.4, must_have=must_have)
@@ -1018,9 +1201,16 @@ class TestOCRMTool:
             targetLengths = torch.randint(1, max_len + 1, (B,), device=self.device, dtype=torch.long)
             total_len = int(targetLengths.sum().item())
             targets = torch.randint(1, nClasses, (total_len,), device=self.device, dtype=torch.long)
+            inputLengths = torch.full((B,), T, dtype=torch.long, device=self.device)
 
-            out = rec(imgs, targetsTensor=targets, targetLengths=targetLengths)
+            out = rec(
+                imgs,
+                targetsTensor=targets,
+                targetLengths=targetLengths,
+                inputLengths=inputLengths,)
             assert "loss" in out
+            assert "ctc_invalid_ratio" in out
+            assert float(out["ctc_invalid_ratio"].item()) == 0.0
             loss = out["loss"]
 
             opt = torch.optim.Adam(rec.parameters(), lr=1e-3)
@@ -1028,7 +1218,12 @@ class TestOCRMTool:
             loss.backward()
 
             named = dict(rec.named_parameters())
-            must_have = ["conv1.0.weight", "conv2.0.weight", "rnn.weight_ih_l0", "fc.weight",]
+            must_have = [
+                "conv1.0.weight",
+                "conv2.0.weight",
+                "rnn.weight_ih_l0",
+                "fc.weight",
+                "residualHead.out.weight",]
 
             ok_cov = self.GradCoverage(named, min_ratio=0.5, must_have=must_have)
             assert ok_cov, "CRNN grad coverage failed."
@@ -1065,6 +1260,7 @@ class TestOCRMTool:
 
             out = engine.ForwardDetect(imgs, gtBoxes=gtBoxes, gtMask=gtMask,)
             assert "loss" in out
+            assert "prob_logits" in out and out["prob_logits"].shape == out["prob_map"].shape
             loss = out["loss"]
 
             opt = torch.optim.Adam(list(engine.backbone.parameters()) + list(engine.dbHead.parameters()), lr=1e-3)
@@ -1079,6 +1275,7 @@ class TestOCRMTool:
                 "backbone.enc1.0.conv.weight",
                 "backbone.enc4.1.conv.weight",
                 "dbHead.probConv.0.conv.weight",
+                "dbHead.residual.block.3.weight",
                 ]
 
             ok_cov = self.GradCoverage(named, min_ratio=0.4, must_have=must_have)
@@ -1111,9 +1308,15 @@ class TestOCRMTool:
             targetLengths = torch.randint(1, max_len + 1, (B,), device=self.device, dtype=torch.long)
             total_len = int(targetLengths.sum().item())
             targets = torch.randint(1, rec.nClasses, (total_len,), device=self.device, dtype=torch.long)
+            validWidths = torch.full((B,), 128, dtype=torch.long, device=self.device)
 
-            out = engine.ForwardRecognize(imgs, targetsTensor=targets, targetLengths=targetLengths)
+            out = engine.ForwardRecognize(
+                imgs,
+                targetsTensor=targets,
+                targetLengths=targetLengths,
+                validWidths=validWidths,)
             assert "loss" in out
+            assert "ctc_invalid_ratio" in out
             loss = out["loss"]
 
             opt = torch.optim.Adam(rec.parameters(), lr=1e-3)
@@ -1125,7 +1328,8 @@ class TestOCRMTool:
                 "conv1.0.weight",
                 "conv4.0.weight",
                 "rnn.weight_ih_l0",
-                "fc.weight",]
+                "fc.weight",
+                "residualHead.out.weight",]
 
             ok_cov = self.GradCoverage(named, min_ratio=0.5, must_have=must_have)
             assert ok_cov, "Engine recognizer grad coverage failed."
@@ -1187,14 +1391,13 @@ class TestOCRMTool:
             B_det, H, W = 2, 256, 256
             imgs_det = torch.randn(B_det, 3, H, W, device=self.device)
 
-            feat = engine.backbone(imgs_det)
-            prob, thresh, binmap = engine.dbHead(feat)
-
+            det_probe = engine.ForwardDetect(imgs_det)
+            prob = det_probe["prob_map"]
             gtShrink = (torch.rand_like(prob) > 0.7).float()
-            gtThresh = torch.rand_like(prob)
             gtMask = (torch.rand_like(prob) > 0.1).float()
 
-            loss_det, stats_det = engine.dbLoss(probMap=prob, binMap=binmap, threshMap=thresh, gtShrink=gtShrink, gtThresh=gtThresh, gtMask=gtMask,)
+            det_out = engine.ForwardDetect(imgs_det, gtBoxes=gtShrink, gtMask=gtMask)
+            loss_det = det_out["loss"]
 
             rec = engine.recognizer
             B_rec = 3
@@ -1209,7 +1412,12 @@ class TestOCRMTool:
             total_len = int(targetLengths.sum().item())
             targets = torch.randint(1, rec.nClasses, (total_len,), device=self.device, dtype=torch.long)
 
-            out_rec = rec(imgs_rec, targetsTensor=targets, targetLengths=targetLengths)
+            validWidths = torch.full((B_rec,), 128, dtype=torch.long, device=self.device)
+            out_rec = rec(
+                imgs_rec,
+                targetsTensor=targets,
+                targetLengths=targetLengths,
+                inputLengths=WidthToCtcSteps(validWidths),)
             loss_rec = out_rec["loss"]
             total_loss = loss_det + loss_rec
 
@@ -1222,9 +1430,11 @@ class TestOCRMTool:
                 "backbone.enc1.0.conv.weight",
                 "backbone.enc4.1.conv.weight",
                 "dbHead.probConv.0.conv.weight",
+                "dbHead.residual.block.3.weight",
                 "recognizer.conv1.0.weight",
                 "recognizer.rnn.weight_ih_l0",
-                "recognizer.fc.weight",]
+                "recognizer.fc.weight",
+                "recognizer.residualHead.out.weight",]
 
             ok_cov = self.GradCoverage(named, min_ratio=0.5, must_have=must_have)
             assert ok_cov, "Engine joint grad coverage failed."
