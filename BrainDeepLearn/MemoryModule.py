@@ -41,6 +41,76 @@ class MemoryType:
     SRC_IMAGINE: int = 1 
     SRC_MIXED: int = 2
 
+
+def SourceConfidence(
+    source: torch.Tensor,
+    *,
+    dtype: torch.dtype = torch.float32,
+    real: float = 1.0,
+    mixed: float = 0.90,
+    imagine: float = 0.72,) -> torch.Tensor:
+    conf = torch.full(source.shape, float(real), device=source.device, dtype=dtype)
+    conf = torch.where(source == MemoryType.SRC_MIXED, conf.new_tensor(float(mixed)), conf)
+    conf = torch.where(source == MemoryType.SRC_IMAGINE, conf.new_tensor(float(imagine)), conf)
+    return conf
+
+
+def UnifiedMemoryScore(
+    query: torch.Tensor,
+    keys: torch.Tensor,
+    *,
+    age: torch.Tensor,
+    priority: Optional[torch.Tensor] = None,
+    touch: Optional[torch.Tensor] = None,
+    confidence: Optional[torch.Tensor] = None,
+    source: Optional[torch.Tensor] = None,
+    rewardAbs: Optional[torch.Tensor] = None,
+    novelty: Optional[torch.Tensor] = None,
+    validMask: Optional[torch.Tensor] = None,
+    baseAgeBeta: float = 0.003,
+    mixedExtraBeta: float = 0.006,
+    imagineExtraBeta: float = 0.018,) -> torch.Tensor:
+    if keys.dim() == 2:
+        sim = torch.matmul(query, keys.t())
+    elif keys.dim() == 3:
+        sim = torch.bmm(query.unsqueeze(1), keys.transpose(1, 2)).squeeze(1)
+    else:
+        raise ValueError(f"keys must be 2D or 3D, got {keys.dim()}D")
+
+    age_f = age
+    if source is None:
+        source = torch.zeros_like(age, dtype=torch.int8)
+    src = source
+
+    beta = torch.full_like(age_f, float(baseAgeBeta))
+    beta = torch.where(src == MemoryType.SRC_MIXED, beta + float(mixedExtraBeta), beta)
+    beta = torch.where(src == MemoryType.SRC_IMAGINE, beta + float(imagineExtraBeta), beta)
+    freshness = torch.exp(-beta * age_f)
+
+    if priority is None:
+        salience = torch.ones_like(age_f)
+    else:
+        salience = priority.float().clamp_min(0.0)
+    if rewardAbs is not None:
+        salience = salience * (1.0 + 0.5 * torch.tanh(rewardAbs.float().clamp_min(0.0)))
+    if novelty is not None:
+        salience = salience * (1.0 + 0.25 * torch.tanh(novelty.float().clamp_min(0.0)))
+
+    if touch is None:
+        rehearsal = torch.ones_like(age_f)
+    else:
+        rehearsal = 1.0 + 0.1 * torch.log1p(touch.float().clamp_min(0.0))
+
+    if confidence is None:
+        conf = SourceConfidence(src, dtype=sim.dtype)
+    else:
+        conf = confidence.float().clamp(0.0, 1.0)
+
+    score = sim * freshness * salience * rehearsal * conf
+    if validMask is not None:
+        score = score.masked_fill(~validMask, -1e9)
+    return score
+
 class SoftSymbolicRules(AGICoreModule):
     def __init__(
         self,
@@ -278,10 +348,9 @@ class SymbolicMemory(AGICoreModule):
             self.filled.add_(1)
         else:
             age = (self.global_step - self.step[:filled]).clamp(min=0)
-            eff = self.prio[:filled] * torch.exp(-0.01 * age) 
             src = self.source[:filled]
-            is_imag = (src == MemoryType.SRC_IMAGINE)
-            eff = eff * torch.where(is_imag, eff.new_tensor(0.6), eff.new_tensor(1.0))
+            eff = self.prio[:filled] * torch.exp(-0.01 * age.float())
+            eff = eff * SourceConfidence(src, dtype=eff.dtype)
             i = int(torch.argmin(eff).item())
 
         self.P_keys[i] = key
@@ -304,13 +373,20 @@ class SymbolicMemory(AGICoreModule):
         stored_keys = self.P_keys[:filled]  # [filled, K]
         stored_vals = self.P_vals[:filled]  # [filled, K]
 
-        sim = qSym @ stored_keys.t()
-
-        age = (self.global_step - self.step[:filled]).clamp(min=0)
+        age = (self.global_step - self.step[:filled]).clamp(min=0).float()
         prio = self.prio[:filled]
-
-        decay = torch.exp(-float(recentBias) * age).unsqueeze(0)
-        sim = sim * decay * prio.unsqueeze(0)
+        touch = self.touch[:filled]
+        src = self.source[:filled]
+        sim = UnifiedMemoryScore(
+            qSym,
+            stored_keys,
+            age=age.view(1, filled).expand(qSym.size(0), filled),
+            priority=prio.view(1, filled).expand(qSym.size(0), filled),
+            touch=touch.view(1, filled).expand(qSym.size(0), filled),
+            source=src.view(1, filled).expand(qSym.size(0), filled),
+            baseAgeBeta=float(recentBias),
+            mixedExtraBeta=0.02,
+            imagineExtraBeta=0.05,)
 
         k = max(1, min(int(topK), filled))
         top_sim, idx = StableTopk(sim, k)
@@ -450,7 +526,7 @@ class GlobalWorkspace(AGICoreModule):
         ) -> torch.Tensor:
         B = int(key.size(0))
 
-        self.EnsureB(B, device=key.device, dtype=key.dtype)
+        self.EnsureB(B, device=self.device, dtype=self.dtype)
 
         if priority is None:
             pr = torch.ones(B, device=self.device, dtype=self.dtype)
@@ -468,28 +544,26 @@ class GlobalWorkspace(AGICoreModule):
         else:
             tag_t = tagId # [B]
 
-        empty = (self.ttl <= 0) | (self.priority <= 0)
-        has_empty = empty.any(dim=1) 
-        idx_empty = empty.float().argmax(dim=1)
+        out_idx = torch.zeros(B, device=self.device, dtype=torch.long)
+        for i in range(B):
+            empty = (self.ttl[0] <= 0) | (self.priority[0] <= 0)
+            if bool(empty.any().item()):
+                idx = int(empty.float().argmax().item())
+            else:
+                age = (self.global_step[0] - self.last_step[0]).clamp(min=0).float()
+                eff = self.priority[0] * torch.exp(-age * self.recency_temp)
+                eff = eff * SourceConfidence(self.source[0], dtype=eff.dtype)
+                idx = int(torch.argmin(eff).item())
 
-        age = (self.global_step.unsqueeze(1) - self.last_step).clamp(min=0).float() 
-        freshness = torch.exp(-age * self.recency_temp) 
-        eff = self.priority * self.priority_temp * freshness 
-        idx_min = torch.argmin(eff, dim=1)
+            self.keys[0, idx] = key[i]
+            self.vals[0, idx] = val[i]
+            self.priority[0, idx] = pr[i]
+            self.ttl[0, idx] = ttl_t[i]
+            self.last_step[0, idx] = self.global_step[0]
+            self.source[0, idx] = tag_t[i]
+            out_idx[i] = idx
 
-        idx = torch.where(has_empty, idx_empty, idx_min) 
-        b_idx = torch.arange(B, device=self.device, dtype=torch.long)
-
-        self.keys[b_idx, idx] = key
-        self.vals[b_idx, idx] = val
-
-        self.priority[b_idx, idx] = pr
-
-        self.ttl[b_idx, idx] = ttl_t
-        self.last_step[b_idx, idx] = self.global_step
-        self.source[b_idx, idx] = tag_t
-
-        return idx # [B]
+        return out_idx # [B]
 
     def Attend(
         self,
@@ -502,26 +576,30 @@ class GlobalWorkspace(AGICoreModule):
 
         self.EnsureB(B, device=self.device, dtype=self.dtype)
 
-        alive = (self.ttl > 0) & (self.priority > 0) #[B, slots]
+        alive_one = (self.ttl[:1] > 0) & (self.priority[:1] > 0) #[1, slots]
 
         if tagMask is not None:
-            allowed = torch.zeros_like(alive, dtype=torch.bool)
+            allowed = torch.zeros_like(alive_one, dtype=torch.bool)
             for t in tagMask:
-                allowed |= (self.source == int(t))
-            alive = alive & allowed
+                allowed |= (self.source[:1] == int(t))
+            alive_one = alive_one & allowed
 
+        alive = alive_one.expand(B, self.slots)
         any_alive = alive.any(dim=1)
 
         q = query #[B, dim]
-        k = self.keys #[B, slots, dim]
-        sim = torch.bmm(q.unsqueeze(1), k.transpose(1, 2)).squeeze(1) #[B, slots]
-
-        age = (self.global_step.unsqueeze(1) - self.last_step).clamp(min=0).float() #[B, slots]
-        freshness = torch.exp(-age * self.recency_temp) #[B, slots]
-        bias = (self.priority * freshness) #[B, slots]
-        sim = sim * bias #[B, slots]
-
-        sim = sim.masked_fill(~alive, float("-inf"))
+        k = self.keys[:1].expand(B, self.slots, self.dim) #[B, slots, dim]
+        age = (self.global_step[:1].view(1, 1) - self.last_step[:1]).clamp(min=0).float().expand(B, self.slots)
+        sim = UnifiedMemoryScore(
+            q,
+            k,
+            age=age,
+            priority=self.priority[:1].expand(B, self.slots),
+            source=self.source[:1].expand(B, self.slots),
+            validMask=alive,
+            baseAgeBeta=float(self.recency_temp),
+            mixedExtraBeta=float(self.recency_temp) * 0.5,
+            imagineExtraBeta=float(self.recency_temp),)
 
         kk = max(1, min(int(topk), self.slots))
 
@@ -533,7 +611,7 @@ class GlobalWorkspace(AGICoreModule):
         w = F.softmax(top_sim, dim=-1)
 
         gather_idx = top_idx.unsqueeze(-1).expand(B, kk, self.dim)
-        v_top = torch.gather(self.vals, dim=1, index=gather_idx) #[B, kk, dim]
+        v_top = torch.gather(self.vals[:1].expand(B, self.slots, self.dim), dim=1, index=gather_idx) #[B, kk, dim]
 
         out = torch.einsum("bk,bkd->bd", w, v_top) #[B, dim]
 
@@ -542,8 +620,9 @@ class GlobalWorkspace(AGICoreModule):
             out[~any_alive] = 0.0
 
         with torch.no_grad():
-            b_idx = torch.arange(B, device=self.device, dtype=torch.long).unsqueeze(1).expand(B, kk)
-            self.last_step[b_idx, top_idx] = self.global_step.unsqueeze(1).expand(B, kk)
+            flat_idx = top_idx.reshape(-1)
+            if flat_idx.numel() > 0:
+                self.last_step[0, flat_idx] = self.global_step[0]
 
         return out #[B, dim]
 
@@ -601,13 +680,18 @@ class SemanticLTM(AGICoreModule):
         key: torch.Tensor,  # [B, D] 
         value: torch.Tensor,  # [B, D] 
         score: torch.Tensor, # [B,]
-        source: Optional[torch.Tensor] = None): #[int = MemoryType.SRC_REAL]
+        source: Optional[torch.Tensor] = None,
+        writeMask: Optional[torch.Tensor] = None): #[int = MemoryType.SRC_REAL]
 
         B = int(key.size(0))
         self.EnsureB(B, self.device, self.dtype)
 
         if source is None:
             source = torch.full((B,), MemoryType.SRC_REAL, device=self.device, dtype=torch.int8)
+        if writeMask is None:
+            writeMask = torch.ones(B, device=self.device, dtype=torch.bool)
+        if not bool(writeMask.any().item()):
+            return
 
         filled = self.filled #[B]
         gstep = self.global_step #[B]
@@ -628,16 +712,18 @@ class SemanticLTM(AGICoreModule):
 
         b_idx = torch.arange(B, device=self.device)
 
-        self.keys[b_idx, idx] = key
-        self.vals[b_idx, idx] = value
-        self.prio[b_idx, idx] = score
+        b_sel = b_idx[writeMask]
+        idx_sel = idx[writeMask]
+        self.keys[b_sel, idx_sel] = key[writeMask]
+        self.vals[b_sel, idx_sel] = value[writeMask]
+        self.prio[b_sel, idx_sel] = score[writeMask]
 
-        self.touch[b_idx, idx] = 1
-        self.step[b_idx, idx] = gstep
-        self.source[b_idx, idx] = source
+        self.touch[b_sel, idx_sel] = 1
+        self.step[b_sel, idx_sel] = gstep[writeMask]
+        self.source[b_sel, idx_sel] = source[writeMask]
 
         filled_new = torch.where(is_full, filled, filled + 1)
-        self.filled = filled_new
+        self.filled = torch.where(writeMask, filled_new, filled)
 
     def Retrieve(
         self, 
@@ -652,18 +738,22 @@ class SemanticLTM(AGICoreModule):
         slots = torch.arange(self.capacity, device=self.device).unsqueeze(0) #[1, capacity] 
         valid_mask = slots < filled.unsqueeze(1) #[B, capacity]
         any_valid = valid_mask.any(dim=1)  
-
-        Q = query #[B, D]
-        M = self.keys #[B, capacity, D]
-        sim = torch.bmm(Q.unsqueeze(1), M.transpose(1, 2)).squeeze(1) #[B, capacity]
+        if not bool(any_valid.any().item()):
+            return torch.zeros(B, self.dim, device=self.device, dtype=query.dtype)
 
         age = (gstep.unsqueeze(1) - self.step).clamp(min=0).float() #[B, capacity]
-        is_imag = (self.source == 1).float()
-        beta = 0.001 + 0.01 * is_imag
-        freshness = torch.exp(-beta * age)
-        sim = sim * freshness #[B, capacity]
-
-        sim = sim.masked_fill(~valid_mask, float("-inf"))
+        sim = UnifiedMemoryScore(
+            query,
+            self.keys,
+            age=age,
+            priority=self.prio,
+            touch=self.touch,
+            source=self.source,
+            validMask=valid_mask,
+            baseAgeBeta=0.001,
+            mixedExtraBeta=0.004,
+            imagineExtraBeta=0.012,)
+        sim = torch.where(any_valid.view(B, 1), sim, torch.zeros_like(sim))
 
         K = int(min(max(1, int(filled.max().item())), int(topk), self.capacity))
         top_sim, top_idx = StableTopk(sim, K) #[B, K]
@@ -695,6 +785,7 @@ class EpisodicLTM(AGICoreModule):
         self.register_buffer("keys", torch.zeros(B0, capacity, dim))
         self.register_buffer("vals", torch.zeros(B0, capacity, dim))
         self.register_buffer("rew", torch.zeros(B0, capacity))
+        self.register_buffer("rew_abs", torch.zeros(B0, capacity))
         self.register_buffer("prio", torch.zeros(B0, capacity))
         self.register_buffer("step", torch.zeros(B0, capacity, dtype=torch.long))
         self.register_buffer("touch", torch.zeros(B0, capacity, dtype=torch.long))
@@ -715,6 +806,7 @@ class EpisodicLTM(AGICoreModule):
         self.keys = torch.zeros(B, self.capacity, self.dim, device=device, dtype=dtype)
         self.vals = torch.zeros(B, self.capacity, self.dim, device=device, dtype=dtype)
         self.rew = torch.zeros(B, self.capacity, device=device, dtype=dtype)
+        self.rew_abs = torch.zeros(B, self.capacity, device=device, dtype=dtype)
         self.prio = torch.zeros(B, self.capacity, device=device, dtype=dtype)
         self.step = torch.zeros(B, self.capacity, device=device, dtype=torch.long)
         self.touch = torch.zeros(B, self.capacity, device=device, dtype=torch.long)
@@ -729,12 +821,17 @@ class EpisodicLTM(AGICoreModule):
         value: torch.Tensor, # [B, D]
         reward: torch.Tensor, # [B]
         score: torch.Tensor, # [B]
-        source: Optional[torch.Tensor] = None): #  [int = MemoryType.SRC_REAL]
+        source: Optional[torch.Tensor] = None,
+        writeMask: Optional[torch.Tensor] = None): #  [int = MemoryType.SRC_REAL]
         B = int(key.size(0))
         self.EnsureB(B, self.device, self.dtype)
 
         if source is None:
             source = torch.full((B,), MemoryType.SRC_REAL, device=self.device, dtype=torch.int8)
+        if writeMask is None:
+            writeMask = torch.ones(B, device=self.device, dtype=torch.bool)
+        if not bool(writeMask.any().item()):
+            return
 
         filled = self.filled 
         gstep = self.global_step  
@@ -748,7 +845,8 @@ class EpisodicLTM(AGICoreModule):
         age = (gstep.unsqueeze(1) - self.step).clamp(min=0).float()  
         freshness = torch.exp(-age * 0.01)
         touch_w = torch.log1p(self.touch.float() + 1.0) 
-        eff = (self.prio + 0.5 * self.rew) * freshness * touch_w
+        eff = (self.prio + 0.5 * self.rew_abs) * freshness * touch_w
+        eff = eff * SourceConfidence(self.source, dtype=eff.dtype)
         eff = torch.where(valid, eff, torch.full_like(eff, float("inf")))
 
         idx_evict = torch.argmin(eff, dim=1)  
@@ -756,16 +854,20 @@ class EpisodicLTM(AGICoreModule):
 
         b_idx = torch.arange(B, device=self.device)
 
-        self.keys[b_idx, idx] = key
-        self.vals[b_idx, idx] = value
-        self.rew[b_idx, idx] = reward
+        b_sel = b_idx[writeMask]
+        idx_sel = idx[writeMask]
+        self.keys[b_sel, idx_sel] = key[writeMask]
+        self.vals[b_sel, idx_sel] = value[writeMask]
+        self.rew[b_sel, idx_sel] = reward[writeMask]
+        self.rew_abs[b_sel, idx_sel] = reward[writeMask].abs()
 
-        self.prio[b_idx, idx] = score
+        self.prio[b_sel, idx_sel] = score[writeMask]
 
-        self.step[b_idx, idx] = gstep
-        self.touch[b_idx, idx] = 1
-        self.source[b_idx, idx] = source
-        self.filled = torch.where(is_full, filled, filled + 1)
+        self.step[b_sel, idx_sel] = gstep[writeMask]
+        self.touch[b_sel, idx_sel] = 1
+        self.source[b_sel, idx_sel] = source[writeMask]
+        filled_new = torch.where(is_full, filled, filled + 1)
+        self.filled = torch.where(writeMask, filled_new, filled)
 
     def Retrieve(self, query: torch.Tensor, topk: int = 8, recentBias: float = 0.05):
         B = int(query.size(0))
@@ -777,21 +879,23 @@ class EpisodicLTM(AGICoreModule):
         slots = torch.arange(self.capacity, device=self.device).unsqueeze(0) 
         valid_mask = slots < filled.unsqueeze(1) 
         any_valid = valid_mask.any(dim=1)
-
-        Q = query
-        M = self.keys
-        sim = torch.bmm(Q.unsqueeze(1), M.transpose(1, 2)).squeeze(1) 
+        if not bool(any_valid.any().item()):
+            return torch.zeros(B, self.dim, device=self.device, dtype=query.dtype)
 
         age = (gstep.unsqueeze(1) - self.step).clamp(min=0).float()
-        src = self.source
-        is_imag = (src == MemoryType.SRC_IMAGINE).float()
-
-        freshness = torch.exp(-recentBias * age)
-        extra_bias = 0.03
-        freshness = freshness * torch.exp(-extra_bias * age * is_imag)
-        sim = sim * freshness
-
-        sim = sim.masked_fill(~valid_mask, float("-inf"))
+        sim = UnifiedMemoryScore(
+            query,
+            self.keys,
+            age=age,
+            priority=self.prio,
+            touch=self.touch,
+            source=self.source,
+            rewardAbs=self.rew_abs,
+            validMask=valid_mask,
+            baseAgeBeta=float(recentBias),
+            mixedExtraBeta=0.02,
+            imagineExtraBeta=0.05,)
+        sim = torch.where(any_valid.view(B, 1), sim, torch.zeros_like(sim))
 
         K = int(min(max(1, int(filled.max().item())), int(topk), self.capacity))
         top_sim, idx = StableTopk(sim, K)
@@ -874,6 +978,7 @@ class LongTermMemory(AGICoreModule):
         self.episodic.keys.zero_()
         self.episodic.vals.zero_()
         self.episodic.rew.zero_()
+        self.episodic.rew_abs.zero_()
         self.episodic.prio.zero_()
         self.episodic.step.zero_()
         self.episodic.touch.zero_()
@@ -886,9 +991,9 @@ class LongTermMemory(AGICoreModule):
         self.semantic.StepTick()
         self.episodic.StepTick()
 
-    def Retrieve(self, query: torch.Tensor, topkSem: int = 6, topkEpi: int = 4):
+    def Retrieve(self, query: torch.Tensor, topkSem: int = 6, topkEpi: int = 4, epiQuery: Optional[torch.Tensor] = None):
         sem_out = self.semantic.Retrieve(query, topk=topkSem) #[B, D]
-        epi_out = self.episodic.Retrieve(query, topk=topkEpi) #[B, D]
+        epi_out = self.episodic.Retrieve(query if epiQuery is None else epiQuery, topk=topkEpi) #[B, D]
 
         return sem_out, epi_out
 
@@ -1022,6 +1127,8 @@ class MemoryExtractor(AGICoreModule):
         self.register_buffer("memory_importance", torch.zeros(B0, memorySize))
         self.register_buffer("memory_steps", torch.zeros(B0, memorySize, dtype=torch.long))
         self.register_buffer("memory_source", torch.zeros(B0, memorySize, dtype=torch.int8))
+        self.register_buffer("memory_reward_abs", torch.zeros(B0, memorySize))
+        self.register_buffer("memory_version", torch.zeros((), dtype=torch.long))
 
         self.emotion_dim = int(emotionDim)
 
@@ -1199,6 +1306,18 @@ class MemoryExtractor(AGICoreModule):
             nn.Linear(inputDim, inputDim),)
         self.context_fuse_scale = nn.Parameter(torch.tensor(0.1))
 
+        event_in_dim = inputDim + 2048 + 512 + 512 + self.emotion_dim + 1
+        self.event_context_proj = nn.Sequential(
+            nn.LayerNorm(event_in_dim),
+            nn.Linear(event_in_dim, memoryDim),
+            nn.SiLU(),
+            nn.Linear(memoryDim, memoryDim),)
+        self.event_completion_gate = nn.Sequential(
+            nn.Linear(memoryDim * 3 + 1, memoryDim),
+            nn.SiLU(),
+            nn.Linear(memoryDim, 1),
+            nn.Sigmoid(),)
+
     @torch.no_grad()
     def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype) -> None:
         B0 = int(self.h_state.size(0))
@@ -1215,6 +1334,7 @@ class MemoryExtractor(AGICoreModule):
         self.memory_importance = torch.zeros(B, self.memory_size, device=device, dtype=dtype)
         self.memory_steps = torch.zeros(B, self.memory_size, device=device, dtype=torch.long)
         self.memory_source = torch.zeros(B, self.memory_size, device=device, dtype=torch.int8)
+        self.memory_reward_abs = torch.zeros(B, self.memory_size, device=device, dtype=dtype)
 
         self.memory_emotion = torch.zeros(B, self.memory_size, self.emotion_dim, device=device, dtype=dtype)
 
@@ -1356,6 +1476,34 @@ class MemoryExtractor(AGICoreModule):
         fused = self.context_fuse(torch.cat([x, visual_ctx, ocr_ctx, intent_ctx], dim=-1))
         return x + torch.tanh(self.context_fuse_scale) * fused
 
+    def PatternSeparate(self, x: torch.Tensor) -> torch.Tensor:
+        k = max(1, int(self.memory_dim) // 8)
+        _, idx = torch.topk(x.abs(), k=k, dim=-1)
+        sparse = torch.zeros_like(x)
+        sparse.scatter_(1, idx, torch.gather(x, 1, idx))
+        return F.normalize(sparse, dim=-1)
+
+    def BuildEventCode(
+        self,
+        x: torch.Tensor,
+        visualState: Any,
+        ocrSemantic: torch.Tensor,
+        intentHint: torch.Tensor,
+        emotion: torch.Tensor,
+        tdError: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
+        vis = torch.cat([
+            visualState.LegacyFeat,
+            visualState.MotionToken,
+            visualState.PredErrorToken], dim=-1)
+        raw = self.event_context_proj(torch.cat([
+            x,
+            vis,
+            ocrSemantic,
+            intentHint,
+            emotion,
+            tdError.view(-1, 1),], dim=-1))
+        return raw, self.PatternSeparate(raw)
+
     def forward(self,
         x: torch.Tensor, # [B, inputDim]
         tdError: torch.Tensor, # [B] [-1, 1]
@@ -1411,6 +1559,13 @@ class MemoryExtractor(AGICoreModule):
         y_ssm = self.C_mat(h_mix) + self.D_mat(x) # [B, outputDim]
 
         key, val = self.EncodeKV(h_mix) # [B, memoryDim]
+        event_dense, event_key = self.BuildEventCode(
+            x,
+            visualState=visualState,
+            ocrSemantic=ocrSemantic,
+            intentHint=intentHint,
+            emotion=emotion_eff,
+            tdError=tdError_eff)
 
         emo_emb = self.emo_write_proj(emotion_eff) # [B, memoryDim]
 
@@ -1459,7 +1614,7 @@ class MemoryExtractor(AGICoreModule):
         mem_state = self.mem_film_norm(mem_recall * s2 + b2)
 
         self.pending.append(("kv",
-                             (key.detach(),val.detach(),importance.detach(),emotion_eff.detach(),src_all.detach())))
+                             (key.detach(),val.detach(),importance.detach(),emotion_eff.detach(),reward_eff.detach().abs(),src_all.detach())))
 
         msg = torch.cat([h_new, y_ssm, val], dim=-1) # [B, ssm+out+mem]
 
@@ -1483,7 +1638,10 @@ class MemoryExtractor(AGICoreModule):
                              (key.detach(),gws_val.detach(),prio.detach(),ttl.detach(),src_all.detach())))
         
 
-        sem_recall, epi_recall= self.ltm.Retrieve(key, topkSem=self.ltm_topk_sem, topkEpi=self.ltm_topk_epi) # [B, memoryDim]
+        sem_recall, epi_event_recall = self.ltm.Retrieve(key, topkSem=self.ltm_topk_sem, topkEpi=self.ltm_topk_epi, epiQuery=event_key) # [B, memoryDim]
+        epi_dense_recall = self.ltm.episodic.Retrieve(key, topk=self.ltm_topk_epi)
+        completion_gate = self.event_completion_gate(torch.cat([epi_event_recall, epi_dense_recall, event_dense, tdError_eff.view(B, 1)], dim=-1))
+        epi_recall = completion_gate * epi_event_recall + (1.0 - completion_gate) * epi_dense_recall + 0.05 * completion_gate * event_dense
 
         g3, b3 = self.FilmParams(self.film_sem, sem_in)  
         g4, b4 = self.FilmParams(self.film_epi, epi_in) 
@@ -1495,7 +1653,7 @@ class MemoryExtractor(AGICoreModule):
         epi_state = self.epi_film_norm(epi_recall * s4 + b4) # [B, memoryDim]
 
         self.pending.append(("ltm",
-                              (key.detach(),sem_in.detach(),epi_in.detach(),importance.detach(),tdError_eff.detach(),reward_eff.detach(),src_all.detach())))     
+                              (key.detach(),event_key.detach(),sem_in.detach(),epi_in.detach(),importance.detach(),tdError_eff.detach(),reward_eff.detach(),src_all.detach())))
 
         ltm_fused = self.ltm.fuser(sem_state, epi_state)
 
@@ -1522,6 +1680,8 @@ class MemoryExtractor(AGICoreModule):
 
         if (step0 % self.compress_every) == 0:
             self.pending.append(("compress", None))
+        if (step0 % max(1, self.compress_every // 4)) == 0:
+            self.pending.append(("consolidate", None))
 
         return fused_state
 
@@ -1573,6 +1733,7 @@ class MemoryExtractor(AGICoreModule):
         val: torch.Tensor, # [B, memory_dim]
         importance: torch.Tensor, # [B]
         emotion: torch.Tensor, # [B, emotion_dim]
+        rewardAbs: torch.Tensor, # [B]
         source: torch.Tensor # [B]
         ) -> None:
         B = int(key.size(0))
@@ -1596,26 +1757,33 @@ class MemoryExtractor(AGICoreModule):
         self.memory_importance[b_indices, target_idx] = imp_w
         self.memory_steps[b_indices, target_idx] = self.time_step.view(-1)
         self.memory_emotion[b_indices, target_idx] = emotion.detach()
+        self.memory_reward_abs[b_indices, target_idx] = rewardAbs.detach().clamp_min(0.0)
         self.memory_source[b_indices, target_idx] = src_w
 
         new_filled = (filled + 1).clamp(max=M)
         self.memory_filled.copy_(torch.where(is_full, filled, new_filled))
+        self.memory_version.add_(1)
 
     @torch.no_grad()
     def LtmOnlineStore(
         self, 
-        key: torch.Tensor, # [B, memory_dim]
+        keySem: torch.Tensor, # [B, memory_dim]
+        keyEpi: torch.Tensor, # [B, memory_dim]
         valSem: torch.Tensor, # [B, memory_dim]
         valEpi: torch.Tensor, # [B, memory_dim]
         importance: torch.Tensor, # [B]
         tdError: torch.Tensor, # [B]
         reward: torch.Tensor, # [B] [-10, 10]
         sourceLabel: torch.Tensor):
-        mask_base = (importance > self.ltm_online_imp_thresh) | (tdError.abs() > self.ltm_online_td_thresh)
+        source_conf = SourceConfidence(sourceLabel, dtype=importance.dtype)
+        salience = (importance + 0.35 * tdError.abs() + 0.15 * torch.tanh(reward.abs())) * source_conf
+        mask_base = (salience > self.ltm_online_imp_thresh) | (tdError.abs() > self.ltm_online_td_thresh)
         is_imag = (sourceLabel == MemoryType.SRC_IMAGINE)
-        mask_imag = is_imag & (importance > self.ltm_online_imp_thresh * 1.3)
-        mask_real = (~is_imag) & mask_base
-        mask = (mask_real | mask_imag)
+        is_mixed = (sourceLabel == MemoryType.SRC_MIXED)
+        mask_imag = is_imag & (salience > self.ltm_online_imp_thresh * 1.4)
+        mask_mixed = is_mixed & (salience > self.ltm_online_imp_thresh * 1.1)
+        mask_real = (sourceLabel == MemoryType.SRC_REAL) & mask_base
+        mask = (mask_real | mask_mixed | mask_imag)
 
         if not mask.any():
             return
@@ -1623,8 +1791,9 @@ class MemoryExtractor(AGICoreModule):
         sem = self.ltm.semantic
         epi = self.ltm.episodic
 
-        sem.Store(key=key, value=valSem, score=importance, source=sourceLabel)
-        epi.Store(key=key, value=valEpi, reward=reward, score=importance, source=sourceLabel)
+        sem.Store(key=keySem, value=valSem, score=salience, source=sourceLabel, writeMask=mask)
+        epi.Store(key=keyEpi, value=valEpi, reward=reward, score=salience, source=sourceLabel, writeMask=mask)
+        self.memory_version.add_(1)
 
     def Retrieve(
         self, 
@@ -1661,19 +1830,20 @@ class MemoryExtractor(AGICoreModule):
             steps = self.memory_steps # [B, M] 
             src = self.memory_source # [B, M]
 
-            sim = torch.bmm(query.unsqueeze(1), keys.transpose(1, 2)).squeeze(1) # [B, M]
-            sim = sim * imp_kv # [B, M]
-
             age = (self.time_step.view(B, 1) - steps).clamp(min=0).float() # [B, M]
-            base_decay = torch.exp(-0.05 * age) # [B, M]
-            is_imag = (src == MemoryType.SRC_IMAGINE).float() # [B, M]
-            extra_decay = torch.exp(-0.05 * age * is_imag) # [B, M]
-            sim = sim * (base_decay * extra_decay) # [B, M]
-
             ar = torch.arange(M, device=self.device).view(1, M)
             valid_mask = ar < filled.view(B, 1) # [B, M]
-
-            sim = sim.masked_fill(~valid_mask, -1e9)
+            sim = UnifiedMemoryScore(
+                query,
+                keys,
+                age=age,
+                priority=imp_kv,
+                source=src,
+                rewardAbs=self.memory_reward_abs,
+                validMask=valid_mask,
+                baseAgeBeta=0.05,
+                mixedExtraBeta=0.03,
+                imagineExtraBeta=0.05,)
             sim = torch.where(any_valid.view(B,1), sim, torch.zeros_like(sim)) # [B, M]
 
             k = int(min(self.topk, M, int(filled.max().item())))
@@ -1699,9 +1869,10 @@ class MemoryExtractor(AGICoreModule):
             src_sel = torch.gather(src, 1, top_idx) # [B, k]
             mask_real = (src_sel == MemoryType.SRC_REAL)
             mask_imag = (src_sel == MemoryType.SRC_IMAGINE)
+            mask_mixed = (src_sel == MemoryType.SRC_MIXED)
 
             w_real = attn * mask_real.float() # [B, k]
-            w_imag = attn * mask_imag.float() # [B, k]
+            w_imag = attn * (mask_imag.float() + 0.5 * mask_mixed.float()) # [B, k]
             eps = 1e-6
             sum_real = w_real.sum(dim=-1, keepdim=True) # [B, 1]
             sum_imag = w_imag.sum(dim=-1, keepdim=True) # [B, 1]
@@ -1812,8 +1983,8 @@ class MemoryExtractor(AGICoreModule):
 
         temp_imp = self.memory_importance * decay # [B, M]
 
-        is_imag = (self.memory_source == MemoryType.SRC_IMAGINE).float() # [B, M]
-        scores = temp_imp * (1.0 - 0.3 * is_imag) # [B, M]
+        scores = temp_imp * SourceConfidence(self.memory_source, dtype=temp_imp.dtype)
+        scores = scores * (1.0 + 0.5 * torch.tanh(self.memory_reward_abs.clamp_min(0.0))) # [B, M]
 
         scores = scores.masked_fill(~valid_mask, -1e9) # [B, M]
 
@@ -1840,6 +2011,7 @@ class MemoryExtractor(AGICoreModule):
         new_imps = gather_and_trim(self.memory_importance, sorted_idx, new_valid_mask, dim_last=False)
         new_steps = gather_and_trim(self.memory_steps, sorted_idx, new_valid_mask, dim_last=False)
         new_srcs = gather_and_trim(self.memory_source, sorted_idx, new_valid_mask, dim_last=False)
+        new_rew_abs = gather_and_trim(self.memory_reward_abs, sorted_idx, new_valid_mask, dim_last=False)
 
         m_b11 = cond_fill.view(B, 1, 1)
         m_b1 = cond_fill.view(B, 1)
@@ -1851,9 +2023,70 @@ class MemoryExtractor(AGICoreModule):
         self.memory_importance = torch.where(m_b1, new_imps, self.memory_importance)
         self.memory_steps = torch.where(m_b1, new_steps.long(), self.memory_steps)
         self.memory_source = torch.where(m_b1, new_srcs.to(torch.int8), self.memory_source)
+        self.memory_reward_abs = torch.where(m_b1, new_rew_abs, self.memory_reward_abs)
 
         self.memory_filled = torch.where(cond_fill, keep_nums, self.memory_filled)
         self.last_compress_step = torch.where(cond_fill, self.time_step, self.last_compress_step)
+
+    @torch.no_grad()
+    def ConsolidateMemory(self, topk: int = 8) -> None:
+        B = int(self.memory_filled.size(0))
+        device = self.device
+        dtype = self.dtype
+
+        epi = self.ltm.episodic
+        sem = self.ltm.semantic
+        if int(epi.filled.max().item()) <= 0:
+            return
+
+        C = int(epi.capacity)
+        slots = torch.arange(C, device=device).view(1, C)
+        valid = slots < epi.filled.view(B, 1)
+        age = (epi.global_step.view(B, 1) - epi.step).clamp(min=0).float()
+        source_conf = SourceConfidence(epi.source, dtype=dtype)
+        freshness = torch.exp(-0.001 * age)
+        salience = epi.prio * (1.0 + 0.5 * torch.tanh(epi.rew_abs.clamp_min(0.0)))
+        salience = salience * (1.0 + 0.1 * torch.log1p(epi.touch.float().clamp_min(0.0)))
+        salience = salience * freshness * source_conf
+        salience = salience.masked_fill(~valid, -1e9)
+        any_valid = valid.any(dim=1)
+        if not bool(any_valid.any().item()):
+            return
+        salience = torch.where(any_valid.view(B, 1), salience, torch.zeros_like(salience))
+        k = max(1, min(int(topk), C, int(epi.filled.max().item())))
+        top_score, top_idx = StableTopk(salience, k)
+
+        idx3 = top_idx.unsqueeze(-1).expand(B, k, int(self.memory_dim))
+        keys = torch.gather(epi.keys, 1, idx3)
+        vals = torch.gather(epi.vals, 1, idx3)
+        src = torch.gather(epi.source, 1, top_idx)
+        score = top_score.to(dtype=dtype)
+        keep = torch.isfinite(score) & (score > 0)
+        if not bool(keep.any().item()):
+            return
+
+        for j in range(k):
+            sem.Store(
+                key=keys[:, j],
+                value=vals[:, j],
+                score=score[:, j],
+                source=src[:, j],
+                writeMask=keep[:, j],)
+
+        sym_keep = keep & (src != MemoryType.SRC_IMAGINE)
+        if bool(sym_keep.any().item()):
+            vals_flat = vals.reshape(B * k, int(self.memory_dim))
+            src_flat = src.reshape(B * k)
+            score_flat = score.reshape(B * k)
+            sym_keep_flat = sym_keep.reshape(B * k)
+            P = self.ns_coder_post(vals_flat[sym_keep_flat])
+            for i in range(P.size(0)):
+                self.sym_mem.Store(
+                    key=F.normalize(P[i].detach(), dim=0),
+                    value=P[i].detach(),
+                    score=float(score_flat[sym_keep_flat][i].item()),
+                    source=int(src_flat[sym_keep_flat][i].item()),)
+        self.memory_version.add_(1)
 
 
     def FlushPendingWrites(self):
@@ -1866,12 +2099,12 @@ class MemoryExtractor(AGICoreModule):
                 self.gws.Write(key, ws_val,priority=prio,ttl=ttl,tagId=src,)
 
             elif kind == "kv":
-                key, val, imp, emo, src = payload
-                self.KvWrite(key=key,val=val,importance=imp,emotion=emo,source=src,)
+                key, val, imp, emo, rew_abs, src = payload
+                self.KvWrite(key=key,val=val,importance=imp,emotion=emo,rewardAbs=rew_abs,source=src,)
 
             elif kind == "ltm":
-                key, sem, epi, imp, td, rwd, src = payload
-                self.LtmOnlineStore(key=key,valSem=sem,valEpi=epi,importance=imp,tdError=td,reward=rwd,sourceLabel=src,)
+                key_sem, key_epi, sem, epi, imp, td, rwd, src = payload
+                self.LtmOnlineStore(keySem=key_sem,keyEpi=key_epi,valSem=sem,valEpi=epi,importance=imp,tdError=td,reward=rwd,sourceLabel=src,)
                 
             elif kind == "ns":
                 key, P_post, importance, src = payload
@@ -1879,6 +2112,9 @@ class MemoryExtractor(AGICoreModule):
 
             elif kind == "compress":
                 self.AutoCompress()
+
+            elif kind == "consolidate":
+                self.ConsolidateMemory()
 
         self.pending.clear()
 
@@ -1890,6 +2126,7 @@ class MemoryExtractor(AGICoreModule):
         self.time_step.zero_()
         self.memory_filled.zero_()
         self.last_compress_step.zero_()
+        self.memory_version.add_(1)
 
         self.ns_prev_P_post.zero_()
         self.ns_penalty_vec.zero_()
@@ -1907,6 +2144,7 @@ class MemoryExtractor(AGICoreModule):
         self.memory_steps.zero_()
         self.memory_emotion.zero_()
         self.memory_source.zero_()
+        self.memory_reward_abs.zero_()
 
         self.time_step.zero_()
         self.memory_filled.zero_()
@@ -1920,6 +2158,7 @@ class MemoryExtractor(AGICoreModule):
         self.ns_penalty_vec.zero_()
         self.ResetInternalLoss()
         self.pending.clear()
+        self.memory_version.add_(1)
 
     def ResetHebbianMemory(self):
         self.fast_weights.zero_()
@@ -1947,6 +2186,8 @@ class MemoryExtractor(AGICoreModule):
             "time_step": torch.zeros_like(self.time_step, device=dev),
             "memory_filled": torch.zeros_like(self.memory_filled, device=dev),
             "memory_source": torch.zeros_like(self.memory_source, device=dev),
+            "memory_reward_abs": torch.zeros_like(self.memory_reward_abs, device=dev),
+            "memory_version": torch.zeros_like(self.memory_version, device=dev),
 
             "last_compress_step": torch.zeros_like(self.last_compress_step, device=dev),
 
@@ -1971,6 +2212,7 @@ class MemoryExtractor(AGICoreModule):
             "ltm_epi_vals": epi.vals.clone().zero_().to(dev),
             "ltm_epi_prio": epi.prio.clone().zero_().to(dev),
             "ltm_epi_rew": epi.rew.clone().zero_().to(dev),
+            "ltm_epi_rew_abs": epi.rew_abs.clone().zero_().to(dev),
             "ltm_epi_step": epi.step.clone().zero_().to(dev),
             "ltm_epi_filled": epi.filled.clone().zero_().to(dev),
             "ltm_epi_global_step": epi.global_step.clone().zero_(),
@@ -1994,7 +2236,10 @@ class MemoryExtractor(AGICoreModule):
 
     @torch.no_grad()
     def SaveState(self, path: str):
-        torch.save({"state_dict": self.state_dict()}, path)
+        torch.save({
+            "state_dict": self.CollapseStateDictBatch(self.state_dict()),
+            "batch_first_only": True,
+            "memory_state_format": 2,}, path)
 
     @torch.no_grad()
     def LoadState(self, path: str):
@@ -2003,92 +2248,229 @@ class MemoryExtractor(AGICoreModule):
         
         obj = torch.load(path, weights_only=False)
         sd = obj["state_dict"]
-        
-        if "h_state" in sd:
-            saved_B = sd["h_state"].size(0)
-            current_B = self.h_state.size(0)
-            if saved_B != current_B:
-                self.EnsureB(saved_B, device=self.device, dtype=self.dtype)
-                self.gws.EnsureB(saved_B, device=self.device, dtype=self.dtype)
-                self.ltm.semantic.EnsureB(saved_B, device=self.device, dtype=self.dtype)
-                self.ltm.episodic.EnsureB(saved_B, device=self.device, dtype=self.dtype)
+        target_B = int(self.h_state.size(0))
+        self.EnsureB(target_B, device=self.device, dtype=self.dtype)
+        self.gws.EnsureB(target_B, device=self.device, dtype=self.dtype)
+        self.ltm.semantic.EnsureB(target_B, device=self.device, dtype=self.dtype)
+        self.ltm.episodic.EnsureB(target_B, device=self.device, dtype=self.dtype)
+        sd = self.ExpandStateDictBatch(sd, targetB=target_B)
 
-        self.load_state_dict(sd, strict=True)
+        self.load_state_dict(sd, strict=False)
         self.pending.clear()
+
+    def IsRuntimeBatchStateKey(self, key: str) -> bool:
+        if key in {
+            "h_state", "fast_weights", "memory_keys", "memory_values",
+            "memory_importance", "memory_steps", "memory_source",
+            "memory_reward_abs", "memory_emotion", "time_step",
+            "memory_filled", "last_compress_step", "ns_prev_P_post",
+            "ns_penalty_vec",}:
+            return True
+        return key.startswith("ltm.semantic.") or key.startswith("ltm.episodic.") or key.startswith("gws.")
+
+    def TargetBatchForStateKey(self, key: str, targetB: int) -> int:
+        return int(targetB)
+
+    def CollapseStateDictBatch(self, stateDict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+        for k, v in stateDict.items():
+            if isinstance(v, torch.Tensor) and self.IsRuntimeBatchStateKey(k) and v.dim() > 0:
+                out[k] = v[:1].detach().clone()
+            elif isinstance(v, torch.Tensor):
+                out[k] = v.detach().clone()
+            else:
+                out[k] = v
+        return out
+
+    def ExpandStateDictBatch(self, stateDict: Dict[str, torch.Tensor], *, targetB: int) -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+        for k, v in stateDict.items():
+            if not isinstance(v, torch.Tensor):
+                out[k] = v
+                continue
+            if self.IsRuntimeBatchStateKey(k) and v.dim() > 0:
+                B = self.TargetBatchForStateKey(k, targetB)
+                if int(v.size(0)) == 0:
+                    out[k] = v
+                elif int(v.size(0)) == B:
+                    out[k] = v
+                else:
+                    out[k] = v[:1].expand(B, *v.shape[1:]).clone()
+            else:
+                out[k] = v
+        return out
+
+    def CollapseExportStateBatch(self, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor) and self.IsExportBatchStateKey(k) and v.dim() > 0:
+                out[k] = v[:1].detach().clone()
+            elif isinstance(v, torch.Tensor):
+                out[k] = v.detach().clone()
+            else:
+                out[k] = v
+        out["batch_first_only"] = torch.tensor(True, device=self.device)
+        out["memory_state_format"] = torch.tensor(2, device=self.device, dtype=torch.long)
+        return out
+
+    def IsExportBatchStateKey(self, key: str) -> bool:
+        return key in {
+            "time_step", "memory_filled", "last_compress_step", "h_state",
+            "fast_weights", "ns_prev_P_post", "ns_penalty_vec",
+            "gws_global_step", "ltm_sem_global_step", "ltm_epi_global_step",
+            "memory_keys", "memory_values", "memory_importance",
+            "memory_steps", "memory_emotion", "memory_source",
+            "memory_reward_abs", "gws_keys", "gws_vals", "gws_priority",
+            "gws_ttl", "gws_last_step", "gws_source", "ltm_sem_keys",
+            "ltm_sem_vals", "ltm_sem_prio", "ltm_sem_touch",
+            "ltm_sem_step", "ltm_sem_filled", "ltm_sem_source",
+            "ltm_epi_keys", "ltm_epi_vals", "ltm_epi_prio",
+            "ltm_epi_rew", "ltm_epi_rew_abs", "ltm_epi_step",
+            "ltm_epi_touch", "ltm_epi_filled", "ltm_epi_source",}
 
 
     @torch.no_grad()
-    def ExportMemoryBank(self, topk: int = 1024,) -> Optional[Dict[str, torch.Tensor]]:
+    def ExportMemoryBank(
+        self,
+        topk: int = 1024,
+        *,
+        totalBudget: Optional[int] = None,
+        perTypeBudget: Optional[Dict[str, int]] = None,
+        includeMeta: bool = True,) -> Optional[Dict[str, torch.Tensor]]:
         device = self.device
         B = int(self.memory_filled.size(0)) # [B]
         topk = int(topk)
 
-        if topk <= 0 or self.memory_filled.min().item() <=0:
+        if topk <= 0:
             return None
 
+        type_keys = ("gws", "kv", "ltm_sem", "ltm_epi", "sym")
+        if perTypeBudget is None:
+            default_budget = topk if totalBudget is None else max(1, int(totalBudget) // len(type_keys))
+            perTypeBudget = {k: default_budget for k in type_keys}
+        else:
+            perTypeBudget = {k: int(perTypeBudget.get(k, topk)) for k in type_keys}
+
         out: Dict[str, torch.Tensor] = {}
+        meta: Dict[str, Dict[str, torch.Tensor]] = {}
 
         def GatherTopkLatestFirst(
             values: torch.Tensor,
             indices: torch.Tensor,
             steps: torch.Tensor,) -> torch.Tensor:
-            
+            if values.size(0) == 1 and B > 1:
+                values = values.expand(B, *values.shape[1:])
+            if steps.size(0) == 1 and B > 1:
+                steps = steps.expand(B, *steps.shape[1:])
             sel_steps = torch.gather(steps, 1, indices)
             time_order = torch.argsort(sel_steps, dim=1, descending=True)
             time_indices = torch.gather(indices, 1, time_order)
             idx_exp = time_indices.unsqueeze(-1).expand(B, time_indices.size(1), values.size(-1))
             return torch.gather(values, 1, idx_exp).contiguous()
 
+        def GatherMeta(
+            values: torch.Tensor,
+            indices: torch.Tensor,
+            steps: torch.Tensor,) -> torch.Tensor:
+            if values.size(0) == 1 and B > 1:
+                values = values.expand(B, *values.shape[1:])
+            if steps.size(0) == 1 and B > 1:
+                steps = steps.expand(B, *steps.shape[1:])
+            sel_steps = torch.gather(steps, 1, indices)
+            time_order = torch.argsort(sel_steps, dim=1, descending=True)
+            time_indices = torch.gather(indices, 1, time_order)
+            return torch.gather(values, 1, time_indices).contiguous()
+
         S_gws = int(self.gws.slots)
-        gws_valid = (self.gws.ttl > 0) & (self.gws.priority > 0)  # [B, S_gws]
-        K_gws = min(topk, S_gws, int(gws_valid.sum(dim=1).min().item()))
+        gws_valid = ((self.gws.ttl[:1] > 0) & (self.gws.priority[:1] > 0)).expand(B, S_gws)  # [B, S_gws]
+        K_gws = min(perTypeBudget["gws"], S_gws, int(gws_valid.sum(dim=1).max().item()))
         if K_gws > 0:
-            gws_age = (self.gws.global_step.unsqueeze(1) - self.gws.last_step).clamp(min=0).float()
-            gws_fresh = torch.exp(-gws_age * float(self.gws.recency_temp))
-            gws_scores = (self.gws.priority * gws_fresh).masked_fill(~gws_valid, -1e9)
+            gws_age = (self.gws.global_step[:1].view(1, 1) - self.gws.last_step[:1]).clamp(min=0).float().expand(B, S_gws)
+            gws_source = self.gws.source[:1].expand(B, S_gws)
+            gws_beta = torch.full_like(gws_age, float(self.gws.recency_temp))
+            gws_beta = torch.where(gws_source == MemoryType.SRC_MIXED, gws_beta + float(self.gws.recency_temp) * 0.5, gws_beta)
+            gws_beta = torch.where(gws_source == MemoryType.SRC_IMAGINE, gws_beta + float(self.gws.recency_temp), gws_beta)
+            gws_scores = self.gws.priority[:1].expand(B, S_gws) * torch.exp(-gws_beta * gws_age)
+            gws_scores = gws_scores * SourceConfidence(gws_source, dtype=gws_scores.dtype)
+            gws_scores = gws_scores.masked_fill(~gws_valid, -1e9)
             _, gws_idx = StableTopk(gws_scores, K_gws)  # [B, K_gws]
-            out["gws"] = GatherTopkLatestFirst(self.gws.vals, gws_idx, self.gws.last_step)
+            out["gws"] = GatherTopkLatestFirst(self.gws.vals[:1], gws_idx, self.gws.last_step[:1])
+            meta["gws"] = {
+                "score": GatherMeta(gws_scores, gws_idx, self.gws.last_step[:1]),
+                "source": GatherMeta(self.gws.source[:1], gws_idx, self.gws.last_step[:1]).float(),
+                "confidence": GatherMeta(SourceConfidence(self.gws.source[:1], dtype=self.dtype), gws_idx, self.gws.last_step[:1]),
+                "age": GatherMeta(gws_age, gws_idx, self.gws.last_step[:1]),
+                "touch": torch.zeros(B, K_gws, device=device, dtype=self.dtype),
+                "reward_abs": torch.zeros(B, K_gws, device=device, dtype=self.dtype),
+                "step": GatherMeta(self.gws.last_step[:1].float(), gws_idx, self.gws.last_step[:1]),}
 
         M_kv = int(self.memory_size)
         filled_kv = self.memory_filled  # [B]
-        K_kv = min(topk, M_kv, int(filled_kv.min().item()))
+        K_kv = min(perTypeBudget["kv"], M_kv, int(filled_kv.max().item()))
         if K_kv > 0:
             ar = torch.arange(M_kv, device=device).view(1, M_kv) # [1, M_kv]
             valid = ar < filled_kv.view(B, 1) # [B, M_kv]
-            scores = self.memory_importance.masked_fill(~valid, -1e9) # [B, M_kv]
+            age = (self.time_step.view(B, 1) - self.memory_steps).clamp(min=0).float()
+            scores = (self.memory_importance * (1.0 + 0.5 * torch.tanh(self.memory_reward_abs))).masked_fill(~valid, -1e9) # [B, M_kv]
             _, idx = StableTopk(scores, K_kv) # [B, K_kv]
             out["kv"] = GatherTopkLatestFirst(self.memory_values, idx, self.memory_steps) # [B, K_kv, D]
+            meta["kv"] = {
+                "score": GatherMeta(scores, idx, self.memory_steps),
+                "source": GatherMeta(self.memory_source.float(), idx, self.memory_steps),
+                "confidence": GatherMeta(SourceConfidence(self.memory_source, dtype=self.dtype), idx, self.memory_steps),
+                "age": GatherMeta(age, idx, self.memory_steps),
+                "touch": torch.zeros(B, K_kv, device=device, dtype=self.dtype),
+                "reward_abs": GatherMeta(self.memory_reward_abs, idx, self.memory_steps),
+                "step": GatherMeta(self.memory_steps.float(), idx, self.memory_steps),}
 
 
         sem = self.ltm.semantic
         M_sem = int(sem.capacity)
         filled_sem = sem.filled # [B]
-        K_sem = min(topk, M_sem, int(filled_sem.min().item()))
+        K_sem = min(perTypeBudget["ltm_sem"], M_sem, int(filled_sem.max().item()))
         if K_sem > 0:
             ar = torch.arange(M_sem, device=sem.prio.device).view(1, M_sem) # [1, M_sem]
             valid = ar < filled_sem.view(B, 1) # [B, M_sem]
-            scores = sem.prio.masked_fill(~valid, -1e9) # [B, M_sem]
+            age = (sem.global_step.view(B, 1) - sem.step).clamp(min=0).float()
+            scores = (sem.prio * SourceConfidence(sem.source, dtype=sem.prio.dtype)).masked_fill(~valid, -1e9) # [B, M_sem]
             _, idx = StableTopk(scores, K_sem) # [B, K_sem]
             out["ltm_sem"] = GatherTopkLatestFirst(sem.vals, idx, sem.step) # [B, K_sem, D]
+            meta["ltm_sem"] = {
+                "score": GatherMeta(scores, idx, sem.step),
+                "source": GatherMeta(sem.source.float(), idx, sem.step),
+                "confidence": GatherMeta(SourceConfidence(sem.source, dtype=sem.prio.dtype), idx, sem.step),
+                "age": GatherMeta(age, idx, sem.step),
+                "touch": GatherMeta(sem.touch.float(), idx, sem.step),
+                "reward_abs": torch.zeros(B, K_sem, device=device, dtype=self.dtype),
+                "step": GatherMeta(sem.step.float(), idx, sem.step),}
 
 
         epi = self.ltm.episodic
         M_epi = int(epi.capacity)
         filled_epi = epi.filled  # [B]
-        K_epi = min(topk, M_epi, int(filled_epi.min().item()))
+        K_epi = min(perTypeBudget["ltm_epi"], M_epi, int(filled_epi.max().item()))
         if K_epi > 0:
             ar = torch.arange(M_epi, device=epi.prio.device).view(1, M_epi) # [1, M_epi]
             valid = ar < filled_epi.view(B, 1) # [B, M_epi]
-            scores = epi.prio.masked_fill(~valid, -1e9) # [B, M_epi]
+            age = (epi.global_step.view(B, 1) - epi.step).clamp(min=0).float()
+            scores = (epi.prio * (1.0 + 0.5 * torch.tanh(epi.rew_abs)) * SourceConfidence(epi.source, dtype=epi.prio.dtype)).masked_fill(~valid, -1e9) # [B, M_epi]
             _, idx = StableTopk(scores, K_epi) # [B, K_epi]
             out["ltm_epi"] = GatherTopkLatestFirst(epi.vals, idx, epi.step) # [B, K_epi, D]
+            meta["ltm_epi"] = {
+                "score": GatherMeta(scores, idx, epi.step),
+                "source": GatherMeta(epi.source.float(), idx, epi.step),
+                "confidence": GatherMeta(SourceConfidence(epi.source, dtype=epi.prio.dtype), idx, epi.step),
+                "age": GatherMeta(age, idx, epi.step),
+                "touch": GatherMeta(epi.touch.float(), idx, epi.step),
+                "reward_abs": GatherMeta(epi.rew_abs, idx, epi.step),
+                "step": GatherMeta(epi.step.float(), idx, epi.step),}
 
 
         sym = self.sym_mem
         n_sym = int(sym.filled.item())
         nsK = int(sym.K)
 
-        K_sym = min(topk, n_sym)
+        K_sym = min(perTypeBudget["sym"], n_sym)
         if K_sym > 0:
             sym_scores = sym.prio[:n_sym] # [n_sym]
             _, sym_idx = StableTopk(sym_scores, K_sym) # [K_sym]
@@ -2097,7 +2479,20 @@ class MemoryExtractor(AGICoreModule):
             sym_idx = sym_idx.index_select(0, time_order)
             top_vals = sym.P_vals[:n_sym].index_select(0, sym_idx) # [K_sym, nsK]
             out["sym"] = top_vals.unsqueeze(0).expand(B, K_sym, nsK).contiguous() # [B, K_sym, nsK]
+            if includeMeta:
+                age = (sym.global_step - sym.step[:n_sym]).clamp(min=0).float().index_select(0, sym_idx)
+                src = sym.source[:n_sym].index_select(0, sym_idx)
+                meta["sym"] = {
+                    "score": sym.prio[:n_sym].index_select(0, sym_idx).view(1, K_sym).expand(B, K_sym).contiguous(),
+                    "source": src.float().view(1, K_sym).expand(B, K_sym).contiguous(),
+                    "confidence": SourceConfidence(src, dtype=self.dtype).view(1, K_sym).expand(B, K_sym).contiguous(),
+                    "age": age.view(1, K_sym).expand(B, K_sym).contiguous(),
+                    "touch": sym.touch[:n_sym].index_select(0, sym_idx).float().view(1, K_sym).expand(B, K_sym).contiguous(),
+                    "reward_abs": torch.zeros(B, K_sym, device=device, dtype=self.dtype),
+                    "step": sym.step[:n_sym].index_select(0, sym_idx).float().view(1, K_sym).expand(B, K_sym).contiguous(),}
 
+        if includeMeta and meta:
+            out["meta"] = meta
         return out
     
 
@@ -2122,7 +2517,8 @@ class MemoryExtractor(AGICoreModule):
             "gws_global_step": self.gws.global_step.clone(), # [B]
             "ltm_sem_global_step": sem.global_step.clone(), # [B]
             "ltm_epi_global_step": epi.global_step.clone(), # [B]
-            "sym_mem_global_step": sym.global_step.clone(),}
+            "sym_mem_global_step": sym.global_step.clone(),
+            "memory_version": self.memory_version.clone(),}
 
         state.update({
             "memory_keys": self.memory_keys.clone(), # [B, M, D]
@@ -2130,7 +2526,8 @@ class MemoryExtractor(AGICoreModule):
             "memory_importance": self.memory_importance.clone(), # [B, M]
             "memory_steps": self.memory_steps.clone(), # [B, M]
             "memory_emotion": self.memory_emotion.clone(), # [B, M, E]
-            "memory_source": self.memory_source.clone(),}) # [B, M]
+            "memory_source": self.memory_source.clone(),
+            "memory_reward_abs": self.memory_reward_abs.clone(),}) # [B, M]
         
         state.update({
             "gws_keys": gws_snap["keys"].clone(), # [B, S, D]
@@ -2155,6 +2552,7 @@ class MemoryExtractor(AGICoreModule):
             "ltm_epi_vals": epi.vals.clone(), # [B, Cap, D]
             "ltm_epi_prio": epi.prio.clone(), # [B, Cap]
             "ltm_epi_rew": epi.rew.clone(), # [B, Cap]
+            "ltm_epi_rew_abs": epi.rew_abs.clone(), # [B, Cap]
             "ltm_epi_step": epi.step.clone(), # [B, Cap]
             "ltm_epi_touch": epi.touch.clone(), # [B, Cap]
             "ltm_epi_filled": epi.filled.clone(), # [B]
@@ -2168,6 +2566,8 @@ class MemoryExtractor(AGICoreModule):
             "sym_mem_touch": sym.touch.clone(), # [Cap]
             "sym_mem_filled": sym.filled.clone(), 
             "sym_mem_source": sym.source.clone(),}) # [Cap]
+
+        state = self.CollapseExportStateBatch(state)
         
         if step is None:
             return state
@@ -2175,7 +2575,7 @@ class MemoryExtractor(AGICoreModule):
         s = int(step)
         device = self.device
 
-        B = int(self.memory_filled.size(0))
+        B = int(state["memory_filled"].size(0))
         M = int(self.memory_size)
         D = int(self.memory_dim)
         ar = torch.arange(M, device=device).view(1, M) # [1,M]
@@ -2200,6 +2600,7 @@ class MemoryExtractor(AGICoreModule):
         state["memory_importance"] = torch.gather(state["memory_importance"], 1, idx) * new_valid.float()
         state["memory_steps"] = (torch.gather(state["memory_steps"], 1, idx) * new_valid.long())
         state["memory_source"] = torch.where(new_valid,torch.gather(state["memory_source"], 1, idx),torch.zeros_like(state["memory_source"]),)
+        state["memory_reward_abs"] = torch.gather(state["memory_reward_abs"], 1, idx) * new_valid.float()
 
         state["memory_filled"] = keep_cnt # [B]
 
@@ -2243,6 +2644,7 @@ class MemoryExtractor(AGICoreModule):
         state["ltm_epi_vals"] = torch.gather(state["ltm_epi_vals"], 1, idxE3) * new_validE.unsqueeze(-1).float()
         state["ltm_epi_prio"] = torch.gather(state["ltm_epi_prio"], 1, idxEpi) * new_validE.float()
         state["ltm_epi_rew"] = torch.gather(state["ltm_epi_rew"], 1, idxEpi) * new_validE.float()
+        state["ltm_epi_rew_abs"] = torch.gather(state["ltm_epi_rew_abs"], 1, idxEpi) * new_validE.float()
         state["ltm_epi_touch"] = (torch.gather(state["ltm_epi_touch"], 1, idxEpi) * new_validE.long())
         state["ltm_epi_step"] = (torch.gather(state["ltm_epi_step"], 1, idxEpi) * new_validE.long())
         state["ltm_epi_source"] = torch.where(new_validE,torch.gather(state["ltm_epi_source"], 1, idxEpi),torch.zeros_like(state["ltm_epi_source"]),)
@@ -2336,6 +2738,7 @@ class MemoryExtractor(AGICoreModule):
                     emo_src = state["memory_emotion"].to(device=device, dtype=dtype)
 
                     src_src = state["memory_source"].to(device=device, dtype=torch.int8)
+                    rew_abs_src = state.get("memory_reward_abs", torch.zeros_like(imp_src)).to(device=device, dtype=dtype)
 
                     step_src = state["memory_steps"].to(device=device, dtype=torch.long)  # [B, M]
 
@@ -2362,6 +2765,7 @@ class MemoryExtractor(AGICoreModule):
                         imp_t = imp_src[:B, t]
                         emo_t = emo_src[:B, t]
                         src_t = src_src[:B, t]
+                        rew_abs_t = rew_abs_src[:B, t]
 
                         st_t = step_src[:B, t]
 
@@ -2370,6 +2774,7 @@ class MemoryExtractor(AGICoreModule):
                         self.memory_importance[b_sel, tgt_sel].copy_(imp_t[mask])
                         self.memory_emotion[b_sel, tgt_sel].copy_(emo_t[mask])
                         self.memory_source[b_sel, tgt_sel].copy_(src_t[mask])
+                        self.memory_reward_abs[b_sel, tgt_sel].copy_(rew_abs_t[mask])
                         self.memory_steps[b_sel, tgt_sel].copy_(st_t[mask])
 
                         filled_new = (filled_dst + (~is_full).long()).clamp(max=M_dst)
@@ -2443,6 +2848,7 @@ class MemoryExtractor(AGICoreModule):
                     pr_src = state["ltm_epi_prio"].to(device=epi.prio.device, dtype=epi.prio.dtype)
 
                     rw_src = state["ltm_epi_rew"].to(device=epi.rew.device, dtype=epi.rew.dtype)
+                    rw_abs_src = state.get("ltm_epi_rew_abs", state["ltm_epi_rew"].abs()).to(device=epi.rew_abs.device, dtype=epi.rew_abs.dtype)
 
                     src_src = state["ltm_epi_source"].to(device=epi.source.device, dtype=torch.int8)
 
@@ -2467,12 +2873,14 @@ class MemoryExtractor(AGICoreModule):
                         v_t = v_src[:B, t]
                         p_t = pr_src[:B, t]
                         r_t = rw_src[:B, t]
+                        ra_t = rw_abs_src[:B, t]
                         s_t = src_src[:B, t]
 
                         epi.keys[b_sel, tgt_sel].copy_(k_t[mask])
                         epi.vals[b_sel, tgt_sel].copy_(v_t[mask])
                         epi.prio[b_sel, tgt_sel].copy_(p_t[mask])
                         epi.rew[b_sel, tgt_sel].copy_(r_t[mask])
+                        epi.rew_abs[b_sel, tgt_sel].copy_(ra_t[mask])
                         epi.source[b_sel, tgt_sel].copy_(s_t[mask])
 
                         epi.touch[b_sel, tgt_sel].fill_(1)
@@ -2500,6 +2908,7 @@ class MemoryExtractor(AGICoreModule):
                     source=int(src[i].item()),)
 
         self.pending.clear()
+        self.memory_version.add_(1)
 
     @torch.no_grad()
     def ImportState(
@@ -2513,6 +2922,10 @@ class MemoryExtractor(AGICoreModule):
         dtype = self.dtype
 
         B = None
+        state_batch_first_only = bool(
+            ("batch_first_only" in state)
+            and isinstance(state["batch_first_only"], torch.Tensor)
+            and bool(state["batch_first_only"].detach().view(-1)[0].item()))
         for k in ("h_state", "memory_keys", "memory_values", "memory_importance", "time_step", "memory_filled"):
             if k in state and isinstance(state[k], torch.Tensor):
                 t = state[k]
@@ -2520,6 +2933,8 @@ class MemoryExtractor(AGICoreModule):
                     B = int(t.size(0))
                     break
         if B is None:
+            B = int(self.h_state.size(0))
+        if state_batch_first_only:
             B = int(self.h_state.size(0))
 
         self.EnsureB(B, device=dev, dtype=dtype)
@@ -2548,6 +2963,8 @@ class MemoryExtractor(AGICoreModule):
 
             if src.dim() == dst.dim() - 1:
                 src = src.unsqueeze(0).expand(dst.size(0), *src.shape)
+            elif src.dim() == dst.dim() and src.size(0) == 1 and dst.size(0) > 1:
+                src = src.expand(dst.size(0), *src.shape[1:])
 
             if src.dim() != dst.dim():
                 return 
@@ -2589,10 +3006,15 @@ class MemoryExtractor(AGICoreModule):
             copy_batch(self.memory_emotion, state["memory_emotion"], float_cast=True)
         if "memory_source" in state:
             copy_batch(self.memory_source, state["memory_source"].to(torch.int8), float_cast=False)
+        if "memory_reward_abs" in state:
+            copy_batch(self.memory_reward_abs, state["memory_reward_abs"], float_cast=True)
+        if "memory_version" in state and isinstance(state["memory_version"], torch.Tensor):
+            self.memory_version.copy_(state["memory_version"].to(self.memory_version.device).long().view(()))
 
         if importGws:
             if "gws_global_step" in state:
-                self.gws.global_step.copy_(as_B_vec(state["gws_global_step"], to_long=True))
+                ggs = state["gws_global_step"].to(self.gws.global_step.device).long().view(-1)
+                self.gws.global_step.copy_(ggs[:1])
 
             if "gws_keys" in state:
                 copy_batch(self.gws.keys, state["gws_keys"], float_cast=True)
@@ -2640,6 +3062,10 @@ class MemoryExtractor(AGICoreModule):
                 copy_batch(epi.prio, state["ltm_epi_prio"], float_cast=True)
             if "ltm_epi_rew" in state:
                 copy_batch(epi.rew, state["ltm_epi_rew"], float_cast=True)
+            if "ltm_epi_rew_abs" in state:
+                copy_batch(epi.rew_abs, state["ltm_epi_rew_abs"], float_cast=True)
+            elif "ltm_epi_rew" in state:
+                copy_batch(epi.rew_abs, state["ltm_epi_rew"].abs(), float_cast=True)
             if "ltm_epi_step" in state:
                 copy_batch(epi.step, state["ltm_epi_step"].long(), float_cast=False)
             if "ltm_epi_filled" in state:
@@ -3109,7 +3535,7 @@ class TestMemoryMTool:
             keys_after = epi.keys.clone()
 
             changed = (keys_after - keys_before).abs().sum(dim=-1).squeeze(0).argmax().item()
-            assert int(changed) == 0, f"expected evict slot0(rew=-10), but evicted slot{changed}"
+            assert int(changed) == 1, f"expected keep slot0(rew=-10) and evict slot1, but evicted slot{changed}"
             print("EpisodicLTM eviction negative-reward test passed.")
             return True
         except AssertionError as e:
@@ -3216,6 +3642,426 @@ class TestMemoryMTool:
             return False
         except Exception as e:
             print(f"ExportMemoryBank latest-first-order test error: {e}")
+            return False
+
+    def TestBatchFirstSaveLoadReplicates(self):
+        try:
+            cfg = dict(
+                inputDim=16, ssmStateDim=16, memoryDim=8, memorySize=6,
+                symSize=8, ltmSize=6, nsK=4, outputDim=8,
+                gwsSlots=3, gwsTtl=4, compressEvery=100, emotionDim=4)
+            cfg = self.FilterKwargs(MemoryExtractor, cfg)
+
+            mem = MemoryExtractor(**cfg).to(self.device).eval()
+            mem.EnsureB(3, device=self.device, dtype=torch.float32)
+            mem.ltm.semantic.EnsureB(3, device=self.device, dtype=torch.float32)
+            mem.ltm.episodic.EnsureB(3, device=self.device, dtype=torch.float32)
+
+            with torch.no_grad():
+                mem.memory_filled[:] = torch.tensor([2, 1, 1], device=self.device, dtype=torch.long)
+                mem.memory_keys.zero_()
+                mem.memory_values.zero_()
+                mem.memory_keys[0, 0, 0] = 11.0
+                mem.memory_keys[1, 0, 0] = 22.0
+                mem.memory_keys[2, 0, 0] = 33.0
+                mem.memory_values[0, 0, 1] = 12.0
+                mem.memory_values[1, 0, 1] = 23.0
+                mem.memory_values[2, 0, 1] = 34.0
+                mem.memory_importance[:, 0] = torch.tensor([0.9, 0.2, 0.1], device=self.device)
+                mem.memory_reward_abs[:, 0] = torch.tensor([3.0, 0.0, 0.0], device=self.device)
+
+                sem = mem.ltm.semantic
+                sem.filled[:] = torch.tensor([1, 1, 1], device=self.device, dtype=torch.long)
+                sem.keys.zero_()
+                sem.keys[0, 0, 0] = 41.0
+                sem.keys[1, 0, 0] = 42.0
+
+                epi = mem.ltm.episodic
+                epi.filled[:] = torch.tensor([1, 1, 1], device=self.device, dtype=torch.long)
+                epi.rew_abs.zero_()
+                epi.rew_abs[0, 0] = 9.0
+                epi.rew_abs[1, 0] = 1.0
+
+                sym = mem.sym_mem
+                sym.filled.fill_(1)
+                sym.P_vals.zero_()
+                sym.P_vals[0, 0] = 77.0
+
+            path = self.StatePath("memory_batch_first_test.pth")
+            mem.SaveState(str(path))
+
+            mem2 = MemoryExtractor(**cfg).to(self.device).eval()
+            mem2.EnsureB(4, device=self.device, dtype=torch.float32)
+            mem2.LoadState(str(path))
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+            assert int(mem2.memory_keys.size(0)) == 4
+            assert torch.all(mem2.memory_filled == 2), f"filled not replicated: {mem2.memory_filled.tolist()}"
+            for b in range(4):
+                self.AssertClose(mem2.memory_keys[b, 0], mem.memory_keys[0, 0], msg=f"kv key row{b}")
+                self.AssertClose(mem2.memory_values[b, 0], mem.memory_values[0, 0], msg=f"kv value row{b}")
+                assert float(mem2.memory_reward_abs[b, 0].item()) == 3.0
+                assert float(mem2.ltm.semantic.keys[b, 0, 0].item()) == 41.0
+                assert float(mem2.ltm.episodic.rew_abs[b, 0].item()) == 9.0
+            assert int(mem2.sym_mem.filled.item()) == 1
+            assert float(mem2.sym_mem.P_vals[0, 0].item()) == 77.0
+
+            print("Batch-first save/load replication test passed.")
+            return True
+        except AssertionError as e:
+            print(f"Batch-first save/load replication test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"Batch-first save/load replication test error: {e}")
+            return False
+
+    def TestGlobalWorkspaceSharedBatch(self):
+        try:
+            dim, slots = 8, 4
+            gws = GlobalWorkspace(dim=dim, slots=slots, defaultTtl=5).to(self.device)
+            gws.Reset()
+            gws.StepTick()
+
+            keys = torch.zeros(2, dim, device=self.device)
+            vals = torch.zeros(2, dim, device=self.device)
+            keys[0, 0] = 1.0
+            keys[1, 1] = 1.0
+            vals[0, 2] = 10.0
+            vals[1, 3] = 20.0
+            gws.Write(
+                keys,
+                vals,
+                priority=torch.tensor([1.0, 1.0], device=self.device),
+                ttl=torch.tensor([5, 5], device=self.device),
+                tagId=torch.tensor([MemoryType.SRC_REAL, MemoryType.SRC_REAL], device=self.device, dtype=torch.int8),)
+
+            assert int(gws.keys.size(0)) == 2, f"GWS EnsureB should use caller B, got B={gws.keys.size(0)}"
+            assert int((gws.priority[0] > 0).sum().item()) == 2
+
+            out = gws.Attend(keys, topk=1)
+            assert out.shape == (2, dim)
+            assert float(out[0, 2].item()) > 9.0, f"row0 recall mismatch: {out[0].tolist()}"
+            assert float(out[1, 3].item()) > 19.0, f"row1 recall mismatch: {out[1].tolist()}"
+
+            print("GlobalWorkspace shared-batch test passed.")
+            return True
+        except AssertionError as e:
+            print(f"GlobalWorkspace shared-batch test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"GlobalWorkspace shared-batch test error: {e}")
+            return False
+
+    def TestSourceConfidenceOrdering(self):
+        try:
+            dim = 8
+            q = F.normalize(torch.ones(1, dim, device=self.device), dim=-1)
+            keys = q.view(1, 1, dim).expand(1, 3, dim).contiguous()
+            src = torch.tensor(
+                [[MemoryType.SRC_REAL, MemoryType.SRC_MIXED, MemoryType.SRC_IMAGINE]],
+                device=self.device,
+                dtype=torch.int8,)
+            scores = UnifiedMemoryScore(
+                q,
+                keys,
+                age=torch.zeros(1, 3, device=self.device),
+                priority=torch.ones(1, 3, device=self.device),
+                source=src,)
+            assert scores[0, 0] > scores[0, 1] > scores[0, 2], f"source discount order broken: {scores.tolist()}"
+            conf = SourceConfidence(src)
+            assert conf[0, 0] > conf[0, 1] > conf[0, 2], f"confidence order broken: {conf.tolist()}"
+
+            print("Source confidence ordering test passed.")
+            return True
+        except AssertionError as e:
+            print(f"Source confidence ordering test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"Source confidence ordering test error: {e}")
+            return False
+
+    def TestExportMemoryBankMetaBudget(self):
+        try:
+            cfg = dict(
+                inputDim=16, ssmStateDim=16, memoryDim=8, memorySize=6,
+                symSize=8, ltmSize=6, nsK=4, outputDim=8,
+                gwsSlots=4, gwsTtl=6, compressEvery=100, emotionDim=4)
+            cfg = self.FilterKwargs(MemoryExtractor, cfg)
+            mem = MemoryExtractor(**cfg).to(self.device).eval()
+            mem.ResetAll()
+
+            with torch.no_grad():
+                mem.time_step.fill_(3)
+                mem.memory_filled.fill_(2)
+                mem.memory_importance[0, :2] = torch.tensor([0.8, 0.6], device=self.device)
+                mem.memory_steps[0, :2] = torch.tensor([2, 3], device=self.device, dtype=torch.long)
+                mem.memory_values[0, 0, 0] = 1.0
+                mem.memory_values[0, 1, 0] = 2.0
+                mem.memory_reward_abs[0, 1] = 5.0
+                mem.memory_source[0, :2] = torch.tensor([MemoryType.SRC_REAL, MemoryType.SRC_MIXED], device=self.device, dtype=torch.int8)
+
+                mem.gws.global_step.fill_(3)
+                mem.gws.priority[0, :2] = torch.tensor([0.7, 0.9], device=self.device)
+                mem.gws.ttl[0, :2] = 5
+                mem.gws.last_step[0, :2] = torch.tensor([2, 3], device=self.device, dtype=torch.long)
+                mem.gws.vals[0, 0, 0] = 3.0
+                mem.gws.vals[0, 1, 0] = 4.0
+
+                sem = mem.ltm.semantic
+                sem.filled.fill_(2)
+                sem.global_step.fill_(3)
+                sem.prio[0, :2] = torch.tensor([0.5, 0.9], device=self.device)
+                sem.step[0, :2] = torch.tensor([2, 3], device=self.device, dtype=torch.long)
+                sem.touch[0, :2] = 1
+                sem.vals[0, 0, 0] = 5.0
+                sem.vals[0, 1, 0] = 6.0
+
+                epi = mem.ltm.episodic
+                epi.filled.fill_(2)
+                epi.global_step.fill_(3)
+                epi.prio[0, :2] = torch.tensor([0.5, 0.9], device=self.device)
+                epi.rew_abs[0, 1] = 4.0
+                epi.step[0, :2] = torch.tensor([2, 3], device=self.device, dtype=torch.long)
+                epi.touch[0, :2] = 1
+                epi.vals[0, 0, 0] = 7.0
+                epi.vals[0, 1, 0] = 8.0
+
+                sym = mem.sym_mem
+                sym.filled.fill_(2)
+                sym.prio[:2] = torch.tensor([0.5, 0.9], device=self.device)
+                sym.step[:2] = torch.tensor([2, 3], device=self.device, dtype=torch.long)
+                sym.touch[:2] = 1
+                sym.P_vals[0, 0] = 9.0
+                sym.P_vals[1, 0] = 10.0
+
+            bank = mem.ExportMemoryBank(topk=3, totalBudget=5, includeMeta=True)
+            assert bank is not None
+            for key in ("gws", "kv", "ltm_sem", "ltm_epi", "sym"):
+                assert key in bank, f"missing legacy bank key: {key}"
+                assert int(bank[key].size(1)) <= 1, f"{key} budget not applied: {bank[key].shape}"
+            assert "meta" in bank
+            for key in ("gws", "kv", "ltm_sem", "ltm_epi", "sym"):
+                assert key in bank["meta"], f"missing meta for {key}"
+                assert "score" in bank["meta"][key] and "confidence" in bank["meta"][key]
+                assert int(bank["meta"][key]["score"].size(1)) <= 1
+
+            print("ExportMemoryBank meta/budget test passed.")
+            return True
+        except AssertionError as e:
+            print(f"ExportMemoryBank meta/budget test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"ExportMemoryBank meta/budget test error: {e}")
+            return False
+
+    def TestConsolidationWritesSemanticAndSymbolic(self):
+        try:
+            cfg = dict(
+                inputDim=16, ssmStateDim=16, memoryDim=8, memorySize=6,
+                symSize=8, ltmSize=6, nsK=4, outputDim=8,
+                gwsSlots=4, gwsTtl=6, compressEvery=100, emotionDim=4)
+            cfg = self.FilterKwargs(MemoryExtractor, cfg)
+            mem = MemoryExtractor(**cfg).to(self.device).eval()
+            mem.EnsureB(2, device=self.device, dtype=torch.float32)
+            mem.ltm.semantic.EnsureB(2, device=self.device, dtype=torch.float32)
+            mem.ltm.episodic.EnsureB(2, device=self.device, dtype=torch.float32)
+            mem.ltm.semantic.filled.zero_()
+            mem.sym_mem.filled.zero_()
+
+            with torch.no_grad():
+                epi = mem.ltm.episodic
+                epi.filled.fill_(2)
+                epi.global_step.fill_(5)
+                epi.keys.zero_()
+                epi.vals.zero_()
+                epi.prio.zero_()
+                epi.keys[:, 0, 0] = 1.0
+                epi.keys[:, 1, 1] = 1.0
+                epi.vals[:, 0] = torch.randn(2, int(mem.memory_dim), device=self.device)
+                epi.vals[:, 1] = torch.randn(2, int(mem.memory_dim), device=self.device)
+                epi.prio[:, :2] = torch.tensor([[1.0, 0.8], [0.7, 0.6]], device=self.device)
+                epi.rew_abs[:, :2] = torch.tensor([[5.0, 0.0], [3.0, 1.0]], device=self.device)
+                epi.step[:, :2] = torch.tensor([[4, 5], [4, 5]], device=self.device, dtype=torch.long)
+                epi.touch[:, :2] = 1
+                epi.source[:, :2] = MemoryType.SRC_REAL
+
+            sem_before = int(mem.ltm.semantic.filled.max().item())
+            sym_before = int(mem.sym_mem.filled.item())
+            mem.ConsolidateMemory(topk=2)
+            sem_after = int(mem.ltm.semantic.filled.max().item())
+            sym_after = int(mem.sym_mem.filled.item())
+            assert sem_after > sem_before, f"semantic not filled: {sem_before}->{sem_after}"
+            assert sym_after > sym_before, f"symbolic not filled: {sym_before}->{sym_after}"
+
+            print("Consolidation semantic/symbolic fill test passed.")
+            return True
+        except AssertionError as e:
+            print(f"Consolidation semantic/symbolic fill test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"Consolidation semantic/symbolic fill test error: {e}")
+            return False
+
+    def TestEventCodeSeparationCompletion(self):
+        try:
+            cfg = dict(
+                inputDim=16, ssmStateDim=16, memoryDim=16, memorySize=6,
+                symSize=8, ltmSize=6, nsK=4, outputDim=16,
+                gwsSlots=4, gwsTtl=6, compressEvery=100, emotionDim=4)
+            cfg = self.FilterKwargs(MemoryExtractor, cfg)
+            mem = MemoryExtractor(**cfg).to(self.device).eval()
+
+            B = 2
+            x0 = torch.randn(1, cfg["inputDim"], device=self.device)
+            x = x0.expand(B, -1).clone()
+            visual = SimpleNamespace(
+                LegacyFeat=torch.zeros(B, 1024, device=self.device),
+                MotionToken=torch.zeros(B, 512, device=self.device),
+                PredErrorToken=torch.zeros(B, 512, device=self.device),)
+            visual.LegacyFeat[1, 0] = 5.0
+            visual.MotionToken[1, 0] = -3.0
+            ocr = torch.zeros(B, 512, device=self.device)
+            intent = torch.zeros(B, 512, device=self.device)
+            ocr[1, 0] = 2.0
+            intent[1, 0] = -2.0
+            emotion = torch.zeros(B, cfg["emotionDim"], device=self.device)
+            emotion[1, 0] = 1.0
+            td = torch.tensor([0.0, 1.0], device=self.device)
+
+            dense, event_key = mem.BuildEventCode(
+                x,
+                visualState=visual,
+                ocrSemantic=ocr,
+                intentHint=intent,
+                emotion=emotion,
+                tdError=td,)
+            assert dense.shape == (B, cfg["memoryDim"])
+            assert event_key.shape == (B, cfg["memoryDim"])
+            assert torch.isfinite(dense).all() and torch.isfinite(event_key).all()
+            assert torch.linalg.norm(event_key[0] - event_key[1]).item() > 1e-4
+
+            gate = mem.event_completion_gate(torch.cat([dense, dense, dense, td.view(B, 1)], dim=-1))
+            assert torch.isfinite(gate).all()
+            assert bool(((gate >= 0.0) & (gate <= 1.0)).all().item())
+
+            print("Event-code separation/completion test passed.")
+            return True
+        except AssertionError as e:
+            print(f"Event-code separation/completion test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"Event-code separation/completion test error: {e}")
+            return False
+
+    def TestStoredKeyNormalizationContract(self):
+        try:
+            cfg = dict(
+                inputDim=16, ssmStateDim=16, memoryDim=16, memorySize=8,
+                symSize=8, ltmSize=8, nsK=8, outputDim=16,
+                gwsSlots=4, gwsTtl=6, compressEvery=100, emotionDim=4)
+            cfg = self.FilterKwargs(MemoryExtractor, cfg)
+            mem = MemoryExtractor(**cfg).to(self.device).eval()
+
+            B = 2
+            x = torch.randn(B, cfg["inputDim"], device=self.device)
+            td = torch.full((B,), 2.0, device=self.device)
+            reward = torch.full((B,), -3.0, device=self.device)
+            emotion = self.MakeEmotion(B, mem)
+            _ = self.CallMemForward(mem, x, tdError=td, reward=reward, emotion=emotion)
+            mem.FlushPendingWrites()
+
+            def assert_unit(name: str, keys: torch.Tensor, mask: torch.Tensor):
+                if not bool(mask.any().item()):
+                    raise AssertionError(f"{name} has no valid keys to check")
+                norms = torch.linalg.vector_norm(keys[mask], ord=2, dim=-1)
+                if not torch.allclose(norms, torch.ones_like(norms), atol=1e-4, rtol=1e-4):
+                    raise AssertionError(f"{name} key norms not unit: {norms.detach().cpu().tolist()}")
+
+            kv_mask = torch.arange(int(mem.memory_size), device=self.device).view(1, -1) < mem.memory_filled.view(-1, 1)
+            assert_unit("kv", mem.memory_keys, kv_mask)
+
+            gws_mask = (mem.gws.ttl > 0) & (mem.gws.priority > 0)
+            assert_unit("gws", mem.gws.keys, gws_mask)
+
+            sem = mem.ltm.semantic
+            sem_mask = torch.arange(int(sem.capacity), device=self.device).view(1, -1) < sem.filled.view(-1, 1)
+            assert_unit("ltm_sem", sem.keys, sem_mask)
+
+            epi = mem.ltm.episodic
+            epi_mask = torch.arange(int(epi.capacity), device=self.device).view(1, -1) < epi.filled.view(-1, 1)
+            assert_unit("ltm_epi", epi.keys, epi_mask)
+
+            sym_n = int(mem.sym_mem.filled.item())
+            if sym_n <= 0:
+                raise AssertionError("sym_mem has no valid keys to check")
+            sym_norms = torch.linalg.vector_norm(mem.sym_mem.P_keys[:sym_n], ord=2, dim=-1)
+            if not torch.allclose(sym_norms, torch.ones_like(sym_norms), atol=1e-4, rtol=1e-4):
+                raise AssertionError(f"sym key norms not unit: {sym_norms.detach().cpu().tolist()}")
+
+            print("Stored-key normalization contract test passed.")
+            return True
+        except AssertionError as e:
+            print(f"Stored-key normalization contract test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"Stored-key normalization contract test error: {e}")
+            return False
+
+    def TestEnsureBClearsOnResize(self):
+        try:
+            cfg = dict(
+                inputDim=16, ssmStateDim=16, memoryDim=8, memorySize=6,
+                symSize=8, ltmSize=6, nsK=4, outputDim=8,
+                gwsSlots=3, gwsTtl=4, compressEvery=100, emotionDim=4)
+            cfg = self.FilterKwargs(MemoryExtractor, cfg)
+            mem = MemoryExtractor(**cfg).to(self.device).eval()
+
+            with torch.no_grad():
+                mem.memory_keys[0, 0, 0] = 9.0
+                mem.memory_values[0, 0, 0] = 8.0
+                mem.memory_filled[0] = 1
+                mem.time_step[0] = 7
+                mem.ltm.semantic.keys[0, 0, 0] = 6.0
+                mem.ltm.semantic.filled[0] = 1
+                mem.ltm.episodic.keys[0, 0, 0] = 5.0
+                mem.ltm.episodic.filled[0] = 1
+
+            mem.EnsureB(3, device=self.device, dtype=torch.float32)
+            mem.ltm.semantic.EnsureB(3, device=self.device, dtype=torch.float32)
+            mem.ltm.episodic.EnsureB(3, device=self.device, dtype=torch.float32)
+
+            assert int(mem.memory_keys.size(0)) == 3
+            assert int(mem.memory_filled.sum().item()) == 0
+            assert int(mem.time_step.sum().item()) == 0
+            assert torch.count_nonzero(mem.memory_keys).item() == 0
+            assert torch.count_nonzero(mem.memory_values).item() == 0
+            assert int(mem.ltm.semantic.filled.sum().item()) == 0
+            assert torch.count_nonzero(mem.ltm.semantic.keys).item() == 0
+            assert int(mem.ltm.episodic.filled.sum().item()) == 0
+            assert torch.count_nonzero(mem.ltm.episodic.keys).item() == 0
+
+            gws = GlobalWorkspace(dim=8, slots=3, defaultTtl=4).to(self.device)
+            with torch.no_grad():
+                gws.keys[0, 0, 0] = 1.0
+                gws.priority[0, 0] = 1.0
+                gws.ttl[0, 0] = 4
+            gws.EnsureB(2, device=self.device, dtype=torch.float64)
+            assert int(gws.keys.size(0)) == 2
+            assert gws.keys.dtype == torch.float64
+            assert torch.count_nonzero(gws.keys).item() == 0
+            assert torch.count_nonzero(gws.priority).item() == 0
+            assert torch.count_nonzero(gws.ttl).item() == 0
+
+            print("EnsureB clears-on-resize test passed.")
+            return True
+        except AssertionError as e:
+            print(f"EnsureB clears-on-resize test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"EnsureB clears-on-resize test error: {e}")
             return False
 
     def TestReorderMemorySteps(self):
@@ -3468,6 +4314,7 @@ class TestMemoryMTool:
             rwd = torch.randn(B, device=self.device)
             emotion = self.MakeEmotion(B, mem)
 
+            torch.manual_seed(1234)
             y1 = self.CallMemForward(mem, x, tdError=td, reward=rwd, emotion=emotion)
 
             _ = self.CallMemForward(mem, x, tdError=td, reward=rwd, emotion=emotion)
@@ -3478,6 +4325,7 @@ class TestMemoryMTool:
             except OSError:
                 pass
 
+            torch.manual_seed(1234)
             y2 = self.CallMemForward(mem, x, tdError=td, reward=rwd, emotion=emotion)
 
             self.AssertClose(y1, y2, atol=5e-5, rtol=5e-4, msg="save/restore output")
@@ -3525,7 +4373,9 @@ class TestMemoryMTool:
             mem2.load_state_dict(mem1.state_dict(), strict=True)
             mem2.ImportState(state, importGws=True, importLtm=True, importSym=True)
 
+            torch.manual_seed(5678)
             y1 = self.CallMemForward(mem1, x, tdError=td, reward=rwd, emotion=emotion)
+            torch.manual_seed(5678)
             y2 = self.CallMemForward(mem2, x, tdError=td, reward=rwd, emotion=emotion)
 
             self.AssertClose(y1, y2, atol=1e-4, rtol=1e-3, msg="Export/Import output")
@@ -3923,6 +4773,14 @@ class TestMemoryMTool:
             "EpisodicEvictTouch": self.TestEpisodicEvictionTouchPrefersKeepHighTouch(),
             "EpisodicEvictAbsReward": self.TestEpisodicEvictionAbsRewardForNegative(),
             "ExportMemoryBankLatestFirst": self.TestExportMemoryBankLatestFirstOrder(),
+            "BatchFirstSaveLoadReplicates": self.TestBatchFirstSaveLoadReplicates(),
+            "GlobalWorkspaceSharedBatch": self.TestGlobalWorkspaceSharedBatch(),
+            "SourceConfidenceOrdering": self.TestSourceConfidenceOrdering(),
+            "ExportMemoryBankMetaBudget": self.TestExportMemoryBankMetaBudget(),
+            "ConsolidationWritesSemanticAndSymbolic": self.TestConsolidationWritesSemanticAndSymbolic(),
+            "EventCodeSeparationCompletion": self.TestEventCodeSeparationCompletion(),
+            "StoredKeyNormalizationContract": self.TestStoredKeyNormalizationContract(),
+            "EnsureBClearsOnResize": self.TestEnsureBClearsOnResize(),
             "ReorderMemorySteps": self.TestReorderMemorySteps(),
             "MemoryExtractorForward": self.TestMemoryExtractorForward(),
             "MemoryExtractorIOShapes": self.TestMemoryExtractorIOShapes(),

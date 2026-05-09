@@ -548,7 +548,9 @@ class BrainCore(nn.Module):
 
         def init_shadow_module_parms():
             mem_state = self.mem.ExportState()
+            self.mem_copy.EnsureB(B, device=dev, dtype=self.prev_mem.dtype)
             self.mem_copy.ImportState(mem_state)
+            self.mem_copy.pending = self.DetachRuntimeObject(self.mem.pending, clone=True)
             attn_state = self.attn.ExportState()
             self.attn_copy.ImportState(attn_state)
             critic_state = self.critic.ExportState()
@@ -1016,6 +1018,7 @@ class BrainCore(nn.Module):
             "done",
             torch.ones(self.prev_mem.size(0), device=device, dtype=torch.bool))
 
+        self.mem.EnsureB(int(self.prev_mem.size(0)), device=device, dtype=self.prev_mem.dtype)
         self.mem.ImportState(state["mem_state"], importGws=True, importLtm=True, importSym=True)
         self.mem.pending = state["mem_pending"]
         attn_mod.ImportState(state["attn_state"])
@@ -1205,7 +1208,13 @@ class BrainCore(nn.Module):
                         intentHint=intent_hint_list[i],
                         sourceLabel=MemoryType.SRC_IMAGINE)
 
-            self.extra_mem = memModule.ExportState(step=start)
+                memModule.FlushPendingWrites()
+
+            extra_state = memModule.ExportState(step=start)
+            extra_state["memory_delta_base_step"] = torch.tensor(start, device=lastRef.device, dtype=torch.long)
+            extra_state["memory_delta_new_step"] = memModule.time_step.detach().max().to(device=lastRef.device, dtype=torch.long)
+            extra_state["memory_delta_kind"] = torch.tensor(1 if signal == "Reward" else 2, device=lastRef.device, dtype=torch.long)
+            self.extra_mem = extra_state
 
         except Exception as e:
             print("[SmoothWork] error:", repr(e))
