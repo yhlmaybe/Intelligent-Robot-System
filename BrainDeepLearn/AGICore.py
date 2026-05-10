@@ -46,6 +46,10 @@ class BasicParameters:
 
     MEMORY_CALLBACK_LEN = 16
 
+    REWARD_MIN = -10.0
+
+    REWARD_MAX = 10.0
+
     CONSCIOUSNESSTEM = 1 * 1024
 
     SAVE_EVERY_SAMPLE_COUNT = 500
@@ -214,11 +218,13 @@ class BrainCore(nn.Module):
         prioritizeExtStr: bool = True,
         plasticOnlineLearning: bool = False,
         usePlanner: bool = True,
-        saveModuleMessagerOutput: bool = True,):
+        saveModuleMessagerOutput: bool = True,
+        needTrace: bool = True,):
         super().__init__()
         self.SEQ_LEN = seqLen
         self.is_online_learning = plasticOnlineLearning
         self.prioritize_ext_str = prioritizeExtStr
+        self.need_trace = bool(needTrace)
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.perc = PerceiveExtractor(
@@ -323,6 +329,9 @@ class BrainCore(nn.Module):
 
     def SetModuleMessagerEnabled(self, enabled: bool):
         self.save_module_messager_output = bool(enabled)
+
+    def SetTraceEnabled(self, enabled: bool):
+        self.need_trace = bool(enabled)
 
     def RuntimeModule(self, mod: nn.Module) -> nn.Module:
         return mod.base if hasattr(mod, "base") else mod
@@ -540,6 +549,24 @@ class BrainCore(nn.Module):
         B, dev = frame.size(0), frame.device
         if self.buf_B != B:
             self.ResetBuffers(B=B, isOnlineLearning=self.is_online_learning, device=dev)
+
+        signal_dtype = self.prev_mem.dtype
+
+        def normalize_external_signal(
+            x: Optional[torch.Tensor],
+            *,
+            clamp01: bool = False,
+            clampReward: bool = False) -> Optional[torch.Tensor]:
+            if x is None:
+                return None
+            out = x.detach().to(device=dev, dtype=signal_dtype).view(B)
+            out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+            if clampReward:
+                out = out.clamp(float(BasicParameters.REWARD_MIN), float(BasicParameters.REWARD_MAX))
+            return out.clamp(0.0, 1.0) if clamp01 else out
+
+        reward_ext = normalize_external_signal(rewardExt, clampReward=True)
+        done_ext = normalize_external_signal(doneFlag, clamp01=True)
         
         if self.extra_mem and self.thread_end:
             self.mem.MergeMemoryState(self.extra_mem)
@@ -556,7 +583,7 @@ class BrainCore(nn.Module):
             critic_state = self.critic.ExportState()
             self.critic_copy.ImportState(critic_state)   
 
-        if not isTrain and rewardExt is not None and self.history and self.thread_end:
+        if self.need_trace and not isTrain and reward_ext is not None and self.history and self.thread_end:
             self.thread_end = False
 
             init_shadow_module_parms()
@@ -565,11 +592,11 @@ class BrainCore(nn.Module):
             
             ex_thread = threading.Thread(
                 target=self.SmoothWork,
-                args=(historyRef_copy, rewardExt, "Reward", self.attn_copy, self.mem_copy, self.critic_copy),
+                args=(historyRef_copy, reward_ext, "Reward", self.attn_copy, self.mem_copy, self.critic_copy),
                 daemon=True)
             ex_thread.start()
         
-        if not isTrain and doneFlag is not None and self.history and self.thread_end:
+        if self.need_trace and not isTrain and done_ext is not None and self.history and self.thread_end:
             self.thread_end = False
 
             init_shadow_module_parms()               
@@ -578,7 +605,7 @@ class BrainCore(nn.Module):
             
             ex_thread = threading.Thread(
                 target=self.SmoothWork,
-                args=(historyRef_copy, doneFlag, "Done", self.attn_copy, self.mem_copy, self.critic_copy),
+                args=(historyRef_copy, done_ext, "Done", self.attn_copy, self.mem_copy, self.critic_copy),
                 daemon=True)
             ex_thread.start()
 
@@ -643,13 +670,13 @@ class BrainCore(nn.Module):
         if isTrain:
             if self.is_online_learning:
                 wm_kwargs = {"keysVec": self.prev_keys, "mouseClick": self.prev_clicks, "mouseSeq": self.prev_mouse,
-                             "reward": rewardExt, "done": doneFlag}
+                             "reward": reward_ext, "done": done_ext}
                 
                 w_out = self.world(world_vis_in, **wm_kwargs)
             else: 
                 w_out = self.world.ForwardTrain(visionIn=world_vis_in, keysVec=self.prev_keys,
                                                 mouseClick=self.prev_clicks, mouseSeq=self.prev_mouse,
-                                                reward=rewardExt, done=doneFlag)
+                                                reward=reward_ext, done=done_ext)
         else:
             a_enc_prev = self.world.action_encoder(self.prev_keys, self.prev_mouse, self.prev_clicks) # [B, D_act]
             w_out = self.world.StepPosterior(visionIn=world_vis_in, actionEnc=a_enc_prev, sample=False)
@@ -661,21 +688,12 @@ class BrainCore(nn.Module):
         d_tr = w_out["d_tr"] # Optional[[B, D_world]]
         d_ph = w_out["d_ph"] # Optional[[B, D_world]]
 
-        self.prev_world_h = w_out["h_next"].detach() # [B, D_world_h]
-        self.prev_world_z = w_out["z_next"].detach() # [B, D_world_z]
-
-        if isTrain:
-            _, _, x_next = self.world.ExportState()
-            self.prev_world_x = x_next.detach() # [B, D_world_x]
-        else:
-            self.prev_world_x = w_out["x_next"].detach() # [B, D_world_x]
-
         next_visual_prediction = w_out["reconstructed_visual_state"]
 
-        if doneFlag is not None:
-            done_now = doneFlag.detach().view(B) > 0.5
+        if done_ext is not None:
+            done_now = done_ext> 0.5
         else:
-            done_now = d_t.detach().view(B) > 0.5
+            done_now = d_t > 0.5
 
         if B == 1 and bool(done_now.item()):
             self.prev_predicted_visual = None
@@ -687,16 +705,17 @@ class BrainCore(nn.Module):
 
         if self.is_online_learning:
             value_kwargs = {
-                "rewardExt": r_t,
+                "rewardModel": r_t,
                 "policyEntropyPrev": self.prev_entropy,
-                "done": d_t,
+                "doneModel": d_t,
                 "worldDeltaTransport": d_tr,
                 "worldDeltaPhysics": d_ph}
             value_x = {"memory": self.prev_mem,"attn": self.prev_attn, "state": s_t} # memory:[B, D_mem], attn:[B, D_attn], state:[B, D_world]
             critic_out = self.critic(x=value_x, **value_kwargs)
         else:
-            critic_out = self.critic(memory=self.prev_mem,attn=self.prev_attn,state=s_t,rewardExt=r_t,
-                                     policyEntropyPrev=self.prev_entropy,done=d_t,
+            critic_out = self.critic(memory=self.prev_mem,attn=self.prev_attn,state=s_t,
+                                     rewardModel=r_t,
+                                     policyEntropyPrev=self.prev_entropy,doneModel=d_t,
                                      worldDeltaTransport=d_tr,worldDeltaPhysics=d_ph,)
         saveModuleOutput("ValueEstimation", critic_out)
 
@@ -704,6 +723,10 @@ class BrainCore(nn.Module):
         unc_sig = critic_out.uncertainty.detach() # [B]
         precision_sig = critic_out.precision.detach() # [B]
         emotion_sig = critic_out.emotion.detach() # [B, D_emotion]
+        value_comps = critic_out.rComps
+        risk_sig = value_comps["risk"].detach()
+        confidence_sig = value_comps["confidence"].detach()
+
         self.prev_precision = precision_sig.detach()
 
         atten_out = self.attn(
@@ -728,7 +751,10 @@ class BrainCore(nn.Module):
             reward=r_t,
             visualState=visual_state,
             ocrSemantic=ocr_semantic,
-            intentHint=intent_hint_for_memory) # [B, D_mem], [B, D_mem]
+            intentHint=intent_hint_for_memory,
+            uncertainty=unc_sig,
+            risk=risk_sig,
+            confidence=confidence_sig) # [B, D_mem], [B, D_mem]
         saveModuleOutput("Memory", mem_feat)
 
         memory_bank = self.mem.ExportMemoryBank(topk = BasicParameters.CONSCIOUSNESSTEM) # Optional[Dict[str, Tensor]]
@@ -801,6 +827,9 @@ class BrainCore(nn.Module):
 
         self.prev_mem = mem_feat.detach() # [B, D_mem]
         self.prev_attn = atten_out.detach() # [B, D_attn]
+        self.prev_world_h = w_out["h_next"].detach() # [B, D_world_h]
+        self.prev_world_z = w_out["z_next"].detach() # [B, D_world_z]
+        self.prev_world_x = w_out["x_next"].detach() # [B, D_world_x]
         self.prev_keys = keys_act.detach() # [B, K_key]
         self.prev_clicks = click_sample.detach() # [B, 2]
         self.prev_mouse = mouse_a.detach() # [B, 2]
@@ -809,7 +838,7 @@ class BrainCore(nn.Module):
         if bool(done_now.any().item()):
             self.ResetHebbianMemory(doneMask=done_now)
 
-        if not isTrain:
+        if self.need_trace and not isTrain:
             def trace_tensor(t: torch.Tensor) -> torch.Tensor:
                 return t.detach() if isinstance(t, torch.Tensor) else t
 
@@ -1139,6 +1168,36 @@ class BrainCore(nn.Module):
                 done_list.append(tr.Done)  
                 entropy_list.append(tr.ActionEntropy)
 
+            ref_seq = next((t for t in reward_list + done_list if isinstance(t, torch.Tensor)), None)
+            if ref_seq is None:
+                return
+
+            B = int(ref_seq.size(0))
+            ref_device = ref_seq.device
+            ref_dtype = ref_seq.dtype
+
+            def normalize_trace_signal(
+                x: Optional[torch.Tensor],
+                *,
+                clamp01: bool = False,
+                clampReward: bool = False) -> Optional[torch.Tensor]:
+                if x is None:
+                    return None
+                out = x.detach().to(device=ref_device, dtype=ref_dtype).view(B)
+                out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+                if clampReward:
+                    out = out.clamp(float(BasicParameters.REWARD_MIN), float(BasicParameters.REWARD_MAX))
+                return out.clamp(0.0, 1.0) if clamp01 else out
+
+            reward_list = [normalize_trace_signal(x, clampReward=True) for x in reward_list]
+            done_list = [normalize_trace_signal(x, clamp01=True) for x in done_list]
+            last_ref = normalize_trace_signal(
+                lastRef,
+                clamp01=(signal == "Done"),
+                clampReward=(signal == "Reward"))
+            if last_ref is None:
+                return
+
             if signal == "Reward":
                 seq_list = reward_list
             elif signal == "Done":
@@ -1151,7 +1210,7 @@ class BrainCore(nn.Module):
 
             wm_seq = torch.stack(seq_list, dim=1).contiguous()  # [B, T]
 
-            smoothed = self.SmoothCorrection(wmSeq=wm_seq, extLast=lastRef)
+            smoothed = self.SmoothCorrection(wmSeq=wm_seq, extLast=last_ref)
 
             smoothed_list = list(smoothed.unbind(dim=1))
 
@@ -1161,18 +1220,16 @@ class BrainCore(nn.Module):
                 for i in range(1, len(smoothed_list)):
                     if signal == "Reward":
                         reward_in = smoothed_list[i]
-                        done_in = done_list[i]
                     else: # Done
                         reward_in = reward_list[i]
-                        done_in = smoothed_list[i]
 
                     value = criticModule(
                         memory=mem_list[i-1],
                         attn=atten_list[i-1],
                         state=world_state_list[i],
-                        rewardExt=reward_in,
+                        rewardModel=reward_list[i],
                         policyEntropyPrev=entropy_list[i-1],
-                        done=done_in,
+                        doneModel=done_list[i],
                         worldDeltaTransport=world_dtr_list[i],
                         worldDeltaPhysics=world_dph_list[i],)
 
@@ -1180,6 +1237,9 @@ class BrainCore(nn.Module):
                     unc_sig = value.uncertainty.detach()
                     precision_sig = value.precision.detach()
                     emotion_sig = value.emotion.detach()
+                    value_comps = value.rComps
+                    risk_sig = value_comps["risk"].detach()
+                    confidence_sig = value_comps["confidence"].detach()
 
                     percs_seq, object_seq, motion_seq, quality_seq, pred_error_seq, key_padding_mask = self.BuildVisualSequenceTensors(
                         visual_buffer_list[i],
@@ -1206,14 +1266,17 @@ class BrainCore(nn.Module):
                         visualState=visual_state_list[i],
                         ocrSemantic=ocr_semantic_list[i],
                         intentHint=intent_hint_list[i],
+                        uncertainty=unc_sig,
+                        risk=risk_sig,
+                        confidence=confidence_sig,
                         sourceLabel=MemoryType.SRC_IMAGINE)
 
                 memModule.FlushPendingWrites()
 
             extra_state = memModule.ExportState(step=start)
-            extra_state["memory_delta_base_step"] = torch.tensor(start, device=lastRef.device, dtype=torch.long)
-            extra_state["memory_delta_new_step"] = memModule.time_step.detach().max().to(device=lastRef.device, dtype=torch.long)
-            extra_state["memory_delta_kind"] = torch.tensor(1 if signal == "Reward" else 2, device=lastRef.device, dtype=torch.long)
+            extra_state["memory_delta_base_step"] = torch.tensor(start, device=last_ref.device, dtype=torch.long)
+            extra_state["memory_delta_new_step"] = memModule.time_step.detach().max().to(device=last_ref.device, dtype=torch.long)
+            extra_state["memory_delta_kind"] = torch.tensor(1 if signal == "Reward" else 2, device=last_ref.device, dtype=torch.long)
             self.extra_mem = extra_state
 
         except Exception as e:
@@ -1381,6 +1444,35 @@ class Agent:
         self.brain.ResizeStateBuffersForLoad(brain_state)
         self.brain.load_state_dict(brain_state, strict=False)
 
+    def LoadBrainStateDictCompat(self, brainState: Dict[str, Any], strict: bool):
+        self.brain.ResizeStateBuffersForLoad(brainState)
+        if not strict:
+            self.brain.load_state_dict(brainState, strict=False)
+            return
+
+        value_prefixes = (
+            "critic.model_value_head.",
+            "critic.calibration_head.",
+            "critic.model_value_adapter.",
+            "critic.calibration_adapter.",
+            "critic.model_fusion_gate.",
+            "critic.graph_fusion_gate.",
+            "critic.base.model_value_head.",
+            "critic.base.calibration_head.",
+            "critic.base.model_value_adapter.",
+            "critic.base.calibration_adapter.",
+            "critic.base.model_fusion_gate.",
+            "critic.base.graph_fusion_gate.",)
+        incompatible = self.brain.load_state_dict(brainState, strict=False)
+        missing = list(getattr(incompatible, "missing_keys", []))
+        unexpected = list(getattr(incompatible, "unexpected_keys", []))
+        if len(unexpected) == 0 and all(any(k.startswith(p) for p in value_prefixes) for k in missing):
+            if len(missing) > 0:
+                print(f"Brain checkpoint loaded with value-module compatibility fallback, missing new keys: {len(missing)}")
+            return
+
+        self.brain.load_state_dict(brainState, strict=True)
+
     def ExportModuleMessagerData(self, nSteps: int = 0):
         return self.brain.moduleMessager.ExportDict(nSteps=nSteps)
 
@@ -1514,8 +1606,7 @@ class Agent:
         payload = torch.load(path, map_location=mapLocation or self.device, weights_only=False)
 
         if isinstance(payload, dict) and ("brain" in payload):
-            self.brain.ResizeStateBuffersForLoad(payload["brain"])
-            self.brain.load_state_dict(payload["brain"], strict=strict)
+            self.LoadBrainStateDictCompat(payload["brain"], strict=strict)
 
             if self.is_train:
                 if "opt_actor" in payload:
@@ -1540,8 +1631,7 @@ class Agent:
             except Exception:
                 traceback.print_exc()
         else:
-            self.brain.ResizeStateBuffersForLoad(payload)
-            self.brain.load_state_dict(payload, strict=strict)
+            self.LoadBrainStateDictCompat(payload, strict=strict)
 
         self.SaveRuntimeMemories()
 

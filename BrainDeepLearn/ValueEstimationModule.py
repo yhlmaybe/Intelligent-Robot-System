@@ -1215,12 +1215,18 @@ class ValueEstimationExtractor(AGICoreModule):
 
         self.hebb_value = HebbianLinearFW(H, 1, bias=True,useHebbian=useHebb)
         self.value_head = nn.Linear(H, 1)
+        self.model_value_head = nn.Linear(H, 1)
+        self.calibration_head = nn.Linear(H, 4)
 
         self.fc1_adapter = GrowableLoRALinear(self.fc1)
         self.fc2_adapter = GrowableLoRALinear(self.fc2)
         self.value_adapter = GrowableLoRALinear(self.value_head)
+        self.model_value_adapter = GrowableLoRALinear(self.model_value_head)
+        self.calibration_adapter = GrowableLoRALinear(self.calibration_head)
 
         self.mix_gate = nn.Linear(H, 1)
+        self.model_fusion_gate = nn.Linear(H, 1)
+        self.graph_fusion_gate = nn.Linear(H, 1)
 
         self.emotion_dim = emotionDim
         self.emotion_core = EmotionCore(stateDim=stateDim, memoryDim=memoryDim,attnDim=attnDim, emotionDim=emotionDim)
@@ -1250,6 +1256,13 @@ class ValueEstimationExtractor(AGICoreModule):
 
         nn.init.zeros_(self.mix_gate.weight)
         nn.init.constant_(self.mix_gate.bias, -2.0)  
+        nn.init.zeros_(self.model_fusion_gate.weight)
+        nn.init.constant_(self.model_fusion_gate.bias, -2.0)
+        nn.init.zeros_(self.graph_fusion_gate.weight)
+        nn.init.constant_(self.graph_fusion_gate.bias, -2.0)
+        nn.init.zeros_(self.calibration_head.weight)
+        with torch.no_grad():
+            self.calibration_head.bias.copy_(torch.tensor([-2.0, -2.0, -2.0, 2.0], dtype=self.calibration_head.bias.dtype))
 
         self.emotion_core.ResetParams()
 
@@ -1272,20 +1285,57 @@ class ValueEstimationExtractor(AGICoreModule):
             h = blk(h)
         return h
 
+    def BuildCalibration(
+        self,
+        calibRaw: torch.Tensor,
+        tdBounded: torch.Tensor,
+        uncPrior01: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        risk_logit, amb_logit, surprise_logit, conf_logit = calibRaw.split(1, dim=-1)
+        td_abs = tdBounded.detach().abs().view(-1, 1)
+        unc_prior = uncPrior01.detach().view(-1, 1)
+
+        risk = torch.sigmoid(risk_logit).squeeze(-1)
+        ambiguity = torch.sigmoid(amb_logit + unc_prior).squeeze(-1)
+        surprise = torch.sigmoid(surprise_logit + td_abs).squeeze(-1)
+        confidence = torch.sigmoid(conf_logit - 0.75 * ambiguity.view(-1, 1) - 0.50 * unc_prior).squeeze(-1)
+
+        learned_unc = (
+            0.35 * risk
+            + 0.30 * ambiguity
+            + 0.20 * surprise
+            + 0.15 * (1.0 - confidence)).clamp(0.0, 1.0)
+        return risk, ambiguity, surprise, confidence, learned_unc
+
     def forward(self,
         memory: torch.Tensor, # [B,memDim]
         attn: torch.Tensor, # [B,attnDim]
         state: torch.Tensor, # [B,stateDim]
         *,
-        rewardExt: torch.Tensor, # [B]
-        policyEntropyPrev: torch.Tensor, # [B]
-        done: torch.Tensor, # [B]
-        worldDeltaTransport: torch.Tensor, # [B,stateDim]
-        worldDeltaPhysics: torch.Tensor # [B,stateDim]
+        policyEntropyPrev: Optional[torch.Tensor] = None, # [B]
+        worldDeltaTransport: Optional[torch.Tensor] = None, # [B,stateDim]
+        worldDeltaPhysics: Optional[torch.Tensor] = None, # [B,stateDim]
+        rewardModel: Optional[torch.Tensor] = None,
+        doneModel: Optional[torch.Tensor] = None,
         )-> GeoTropicalOut: 
 
         B = state.size(0)
         self.EnsureB(B, self.device, self.dtype)
+
+        if policyEntropyPrev is None:
+            policyEntropyPrev = state.new_zeros(B)
+        else:
+            policyEntropyPrev = policyEntropyPrev.view(B)
+        if worldDeltaTransport is None:
+            worldDeltaTransport = state.new_zeros(B, self.unc_core.state_dim)
+        if worldDeltaPhysics is None:
+            worldDeltaPhysics = state.new_zeros(B, self.unc_core.state_dim)
+
+        if rewardModel is None:
+            raise ValueError("ValueEstimationExtractor requires rewardModel")
+        if doneModel is None:
+            raise ValueError("ValueEstimationExtractor requires doneModel")
+        reward_model = rewardModel
+        done_model = doneModel
 
         x = torch.cat([memory, attn, state], dim=-1)
         h = self.Trunk(x) # [B,H]
@@ -1293,15 +1343,30 @@ class ValueEstimationExtractor(AGICoreModule):
         emotion = self.emotion_core(memoryPrev=memory, attnPrev=attn, stateCurr=state) # [B,emotionDim]
 
         v_param = self.value_adapter(h) # [B,1]
+        value_model = self.model_value_adapter(h) # [B,1]
+        calib_raw = self.calibration_adapter(h) # [B,4]
 
         mix = torch.sigmoid(self.mix_gate(h)).clamp(1e-3, 1.0 - 1e-3) # [B,1]
 
         v_hebb, hebb_extras = self.hebb_value(h) # v_hebb:[B,1]
 
-        value = (1.0 - mix) * v_param + mix * v_hebb # [B,1]
+        value_base = (1.0 - mix) * v_param + mix * v_hebb # [B,1]
 
-        r_next_hat = self.reward_perdetic.PredictNext(rewardExt) # [B]
-        done_next_hat = self.done_perdetic.PredictNext(done) # [B]
+        g_now = (0.99 * (1.0 - done_model)).clamp(0.0, 0.99) # [B]
+        with torch.no_grad():
+            edges = self.micro.PreviewEdges(zNow=h, rNow=reward_model, gNow=g_now)
+            w = edges["w"] # [B,K]
+            denom = w.sum(dim=1) # [B]
+            v_bar = (w * (edges["R"] + edges["Gamma"] * edges["v_hist"])).sum(dim=1) / denom.clamp_min(1e-6) # [B]
+            v_bar_B1 = v_bar[:, None] # [B,1]
+            has_edge = edges["valid"].any(dim=1).float()[:, None] # [B,1]
+
+        model_gate = torch.sigmoid(self.model_fusion_gate(h)).clamp(1e-3, 1.0 - 1e-3)
+        graph_gate = torch.sigmoid(self.graph_fusion_gate(h)).clamp(1e-3, 1.0 - 1e-3) * has_edge
+        value = value_base + model_gate * (value_model - value_base) + graph_gate * (v_bar_B1.detach() - value_base)
+
+        r_next_hat = self.reward_perdetic.PredictNext(reward_model.detach()) # [B]
+        done_next_hat = self.done_perdetic.PredictNext(done_model.detach()).clamp(0.0, 1.0) # [B]
 
         v_next_hat, transp_extras = self.transport(h, value) # v_next_hat:[B,1]
 
@@ -1314,30 +1379,47 @@ class ValueEstimationExtractor(AGICoreModule):
         self.td_out_ema.Update(delta.abs().detach())
         td_scale = (self.td_out_ema.mean + 2.0 * (self.td_out_ema.var + 1e-6).sqrt()).clamp_min(self.td_scale_min)  # [B]
 
-        td_bounded = torch.tanh(delta / td_scale).detach()  # [-1,1], [B]
+        td_bounded = torch.tanh(delta / td_scale)  # [-1,1], [B]
 
         unc_total, unc_comps = self.unc_core(
             memoryPrev=memory,
             attnPrev=attn,
             stateCurr=state,
             entropyPrev=policyEntropyPrev,
-            tdCurr=td_bounded,
+            tdCurr=td_bounded.detach(),
             worldDeltaTransport=worldDeltaTransport,
             worldDeltaPhysics=worldDeltaPhysics,
-            donePrev=done) # unc_total:[B]
+            donePrev=done_model) # unc_total:[B]
         
         base = (math.log(2.0) + float(self.unc_core.eps_prior))  
         unc_adj = (unc_total - base).clamp_min(0.0) # [B]
-        unc01 = (1.0 - torch.exp(-unc_adj / max(self.unc_tau, 1e-6))).clamp(0.0, 1.0).detach() # [B]
-        precision = (1.0 - unc01).clamp(0.05, 1.0).detach() # [B]
+        unc_prior01 = (1.0 - torch.exp(-unc_adj / max(self.unc_tau, 1e-6))).clamp(0.0, 1.0) # [B]
+        risk, ambiguity, surprise, confidence, learned_unc = self.BuildCalibration(calib_raw, td_bounded, unc_prior01)
+        unc01 = (0.60 * unc_prior01 + 0.40 * learned_unc).clamp(0.0, 1.0) # [B]
+        precision = (confidence * (1.0 - unc01)).clamp(0.05, 1.0) # [B]
+
+        rComps = {
+            "value_base": value_base.detach(),
+            "value_model": value_model.detach(),
+            "v_micro": v_bar_B1.detach(),
+            "risk": risk.detach(),
+            "ambiguity": ambiguity.detach(),
+            "surprise": surprise.detach(),
+            "confidence": confidence.detach(),
+            "unc_total": unc_total.detach(),
+            "unc_prior": unc_prior01.detach(),
+            "model_gate": model_gate.detach().squeeze(-1),
+            "graph_gate": graph_gate.detach().squeeze(-1),
+            "reward_model": reward_model.detach(),
+            "done_model": done_model.detach(),}
 
         if not self.training:
             return GeoTropicalOut(
                 value=value,
-                tdError=td_bounded,
+                tdError=td_bounded.detach(),
                 loss=None,
                 emotion=emotion,
-                rComps=None,
+                rComps=rComps,
                 uncertainty=unc01,
                 precision=precision,
                 extras=None,)
@@ -1366,27 +1448,25 @@ class ValueEstimationExtractor(AGICoreModule):
             v_pred_prev, _ = self.transport(self._prev_h, self._prev_value) # [B,1]
             loss_trans = F.smooth_l1_loss(v_pred_prev, value.detach())
 
-        with torch.no_grad():
-            g_now = (0.99 * (1.0 - done)) # [B]
-
-            edges = self.micro.PreviewEdges(zNow=h, rNow=rewardExt, gNow=g_now)
-            w = edges["w"] # [B,K] 
-            denom = w.sum(dim=1) # [B]
-            v_bar = (w * (edges["R"] + edges["Gamma"] * edges["v_hist"])).sum(dim=1) / denom.clamp_min(1e-6) # [B]
-            v_bar_B1 = v_bar[:, None] # [B,1]
-            has_edge = edges["valid"].any(dim=1).float()[:, None] # [B,1]
-
         micro_err = F.smooth_l1_loss(value, v_bar_B1.detach(), reduction="none") * has_edge # [B,1]
         loss_micro = micro_err.sum() / has_edge.sum().clamp_min(1.0)
+
+        model_target = (
+            reward_model[:, None]
+            + 0.99 * (1.0 - done_model[:, None]) * v_next_hat.detach())
+        loss_model = F.smooth_l1_loss(value_model, model_target)
 
         loss_git = self.git(self.value_head, transp_extras, adapter=self.value_adapter)  
 
         loss_mix = value.new_tensor(self.wMixGateReg) * ((mix - 0.5) ** 2).mean()
+        loss_gate = value.new_tensor(self.wMixGateReg) * (
+            model_gate.pow(2).mean()
+            + graph_gate.pow(2).mean())
 
         loss_hebb_wd = value.new_tensor(1e-6) * (self.hebb_value.weight.pow(2).mean())
 
         td_sq_det = td_align_err.detach().squeeze(-1).pow(2) # [B]
-        unc_safe = unc_total.clamp_min(1e-6)
+        unc_safe = (unc_total.detach() + risk + ambiguity + surprise + (1.0 - confidence)).clamp_min(1e-6)
         if has_prev_pred:
             loss_unc_vec = 0.5 * ((td_sq_det / unc_safe) + torch.log(unc_safe))
             loss_unc = value.new_tensor(self.w_unc) * (
@@ -1398,8 +1478,10 @@ class ValueEstimationExtractor(AGICoreModule):
             loss_td
             + 0.10 * loss_trans
             + 0.10 * loss_micro
+            + 0.05 * loss_model
             + loss_git
             + loss_mix
+            + loss_gate
             + loss_hebb_wd
             + loss_unc)
 
@@ -1407,28 +1489,26 @@ class ValueEstimationExtractor(AGICoreModule):
             self._prev_h = h.detach() # [B, H]
             self._prev_value = value.detach() # [B, 1]
             self._prev_v_next_pred = v_next_hat.detach() # [B, 1]
-            self._prev_alive = (1.0 - done).detach() # [B]
+            self._prev_alive = (1.0 - done_model).detach() # [B]
             self._prev_unc = unc_total.detach() # [B]
-            self.micro.CommitStep(zNow=h, vNow=value, rNow=rewardExt, gNow=g_now)
+            self.micro.CommitStep(zNow=h, vNow=value, rNow=reward_model, gNow=g_now)
 
         extras = {
             "loss_td": loss_td.detach(),
             "loss_trans": loss_trans.detach(),
             "loss_micro": loss_micro.detach(),
+            "loss_model": loss_model.detach(),
             "loss_git": loss_git.detach(),
             "loss_mix": loss_mix.detach(),
+            "loss_gate": loss_gate.detach(),
             "loss_hebb_wd": loss_hebb_wd.detach(),
             "loss_unc": loss_unc.detach(),
             "mix_mean": mix.detach().mean(),
             "td_err_abs_mean": td_align_err.detach().abs().mean(),}
 
-        rComps = {
-            "v_micro": v_bar_B1.detach(),
-            "unc_total": unc_total.detach(),}
-
         return GeoTropicalOut(
             value=value,
-            tdError=td_bounded,
+            tdError=td_bounded.detach(),
             loss=loss,
             emotion=emotion,
             rComps=rComps,
@@ -1597,10 +1677,14 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         gradEma: float = 0.9,
         maxRankFc1: int = 128,
         maxRankFc2: int = 128,
-        maxRankVHead: int = 64,):
+        maxRankVHead: int = 64,
+        maxRankModelVHead: int = 64,
+        maxRankCalib: int = 32,):
         self.maxRankFc1 = int(maxRankFc1)
         self.maxRankFc2 = int(maxRankFc2)
         self.maxRankVHead = int(maxRankVHead)
+        self.maxRankModelVHead = int(maxRankModelVHead)
+        self.maxRankCalib = int(maxRankCalib)
         super().__init__(base, initRankEach=initRankEach, autoRank=autoRank, evThreshold=evThreshold, gradEma=gradEma)
 
     @staticmethod
@@ -1629,6 +1713,7 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
     def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
         base = self.base
         assert hasattr(base, "fc1") and hasattr(base, "fc2") and hasattr(base, "value_head")
+        assert hasattr(base, "model_value_head") and hasattr(base, "calibration_head")
 
         H = int(base.value_head.in_features)
         Din = int(base.fc1.in_features)
@@ -1647,7 +1732,9 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         return {
             "fc1": SiteSpec("fc1", L, Din, H, self.maxRankFc1, lambda r, dv, dt: alloc(r, Din, H, dv, dt), compose),
             "fc2": SiteSpec("fc2", L, H, H, self.maxRankFc2, lambda r, dv, dt: alloc(r, H, H, dv, dt), compose),
-            "vhead": SiteSpec("vhead", L, H, 1, self.maxRankVHead, lambda r, dv, dt: alloc(r, H, 1, dv, dt), compose),}
+            "vhead": SiteSpec("vhead", L, H, 1, self.maxRankVHead, lambda r, dv, dt: alloc(r, H, 1, dv, dt), compose),
+            "model_vhead": SiteSpec("model_vhead", L, H, 1, self.maxRankModelVHead, lambda r, dv, dt: alloc(r, H, 1, dv, dt), compose),
+            "calib": SiteSpec("calib", L, H, 4, self.maxRankCalib, lambda r, dv, dt: alloc(r, H, 4, dv, dt), compose),}
 
     def ForwardWithDeltas(
         self,
@@ -1659,23 +1746,23 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         **kwargs,):
         base: ValueEstimationExtractor = self.base 
 
-        rewardExt = kwargs.get("rewardExt", None)
+        rewardModel = kwargs.get("rewardModel", None)
+        doneModel = kwargs.get("doneModel", None)
         policyEntropyPrev = kwargs.get("policyEntropyPrev", None)
-        done = kwargs.get("done", None)
         worldDeltaTransport = kwargs.get("worldDeltaTransport", None)
         worldDeltaPhysics = kwargs.get("worldDeltaPhysics", None)
 
         miss = []
-        if rewardExt is None:
-            miss.append("rewardExt")
         if policyEntropyPrev is None:
             miss.append("policyEntropyPrev")
-        if done is None:
-            miss.append("done")
         if worldDeltaTransport is None:
             miss.append("worldDeltaTransport")
         if worldDeltaPhysics is None:
             miss.append("worldDeltaPhysics")
+        if rewardModel is None:
+            miss.append("rewardModel")
+        if doneModel is None:
+            miss.append("doneModel")
         if len(miss) > 0:
             raise ValueError(f"ValueEstimationOnlineWrapper missing required kwargs: {', '.join(miss)}")
 
@@ -1725,12 +1812,44 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
             delta_mat=d1.get("vhead", None),
             base_adapter=getattr(base, "value_adapter", None),) 
 
+        value_model = self.LinearWithDelta(
+            base.model_value_head,
+            h,
+            delta_mat=d1.get("model_vhead", None),
+            base_adapter=getattr(base, "model_value_adapter", None),)
+
+        calib_raw = self.LinearWithDelta(
+            base.calibration_head,
+            h,
+            delta_mat=d1.get("calib", None),
+            base_adapter=getattr(base, "calibration_adapter", None),)
+
+        if rewardModel is None:
+            raise ValueError("ValueEstimationOnlineWrapper requires rewardModel")
+        if doneModel is None:
+            raise ValueError("ValueEstimationOnlineWrapper requires doneModel")
+        reward_model = rewardModel
+        done_model = doneModel
+
         mix = torch.sigmoid(base.mix_gate(h)).clamp(1e-3, 1.0 - 1e-3) 
         v_hebb, _ = base.hebb_value(h)
-        value = (1.0 - mix) * v_param + mix * v_hebb
+        value_base = (1.0 - mix) * v_param + mix * v_hebb
 
-        r_next_hat = base.reward_perdetic.PredictNext(rewardExt)
-        done_next_hat = base.done_perdetic.PredictNext(done)
+        g_now = (0.99 * (1.0 - done_model)).clamp(0.0, 0.99)
+        with torch.no_grad():
+            edges = base.micro.PreviewEdges(zNow=h, rNow=reward_model, gNow=g_now)
+            w = edges["w"]
+            denom = w.sum(dim=1)
+            v_bar = (w * (edges["R"] + edges["Gamma"] * edges["v_hist"])).sum(dim=1) / denom.clamp_min(1e-6)
+            v_bar_B1 = v_bar[:, None]
+            has_edge = edges["valid"].any(dim=1).float()[:, None]
+
+        model_gate = torch.sigmoid(base.model_fusion_gate(h)).clamp(1e-3, 1.0 - 1e-3)
+        graph_gate = torch.sigmoid(base.graph_fusion_gate(h)).clamp(1e-3, 1.0 - 1e-3) * has_edge
+        value = value_base + model_gate * (value_model - value_base) + graph_gate * (v_bar_B1.detach() - value_base)
+
+        r_next_hat = base.reward_perdetic.PredictNext(reward_model.detach())
+        done_next_hat = base.done_perdetic.PredictNext(done_model.detach()).clamp(0.0, 1.0)
 
         v_next_hat, transp_extras = base.transport(h, value) 
         r_next_hat_B1 = r_next_hat[:, None]
@@ -1750,20 +1869,37 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
             tdCurr=td_bounded,
             worldDeltaTransport=worldDeltaTransport,
             worldDeltaPhysics=worldDeltaPhysics,
-            donePrev=done)
+            donePrev=done_model)
         
         unc_base = math.log(2.0) + float(base.unc_core.eps_prior)
         unc_adj = (unc_total - unc_base).clamp_min(0.0)
-        unc01 = (1.0 - torch.exp(-unc_adj / max(base.unc_tau, 1e-6))).clamp(0.0, 1.0)
-        precision = (1.0 - unc01).clamp(0.05, 1.0)
+        unc_prior01 = (1.0 - torch.exp(-unc_adj / max(base.unc_tau, 1e-6))).clamp(0.0, 1.0)
+        risk, ambiguity, surprise, confidence, learned_unc = base.BuildCalibration(calib_raw, td_bounded, unc_prior01)
+        unc01 = (0.60 * unc_prior01 + 0.40 * learned_unc).clamp(0.0, 1.0)
+        precision = (confidence * (1.0 - unc01)).clamp(0.05, 1.0)
+
+        rComps = {
+            "value_base": value_base.detach(),
+            "value_model": value_model.detach(),
+            "v_micro": v_bar_B1.detach(),
+            "risk": risk.detach(),
+            "ambiguity": ambiguity.detach(),
+            "surprise": surprise.detach(),
+            "confidence": confidence.detach(),
+            "unc_total": unc_total.detach(),
+            "unc_prior": unc_prior01.detach(),
+            "model_gate": model_gate.detach().squeeze(-1),
+            "graph_gate": graph_gate.detach().squeeze(-1),
+            "reward_model": reward_model.detach(),
+            "done_model": done_model.detach(),}
 
         if not self.training:
             return GeoTropicalOut(
                 value=value,
-                tdError=td_bounded,
+                tdError=td_bounded.detach(),
                 loss=None,
                 emotion=emotion,
-                rComps=None,
+                rComps=rComps,
                 uncertainty=unc01,
                 precision=precision,
                 extras=None,)
@@ -1788,17 +1924,13 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
             v_pred_prev, _ = base.transport(base._prev_h, base._prev_value)
             loss_trans = F.smooth_l1_loss(v_pred_prev, value.detach())
 
-        with torch.no_grad():
-            g_now = (0.99 * (1.0 - done))
-            edges = base.micro.PreviewEdges(zNow=h, rNow=rewardExt, gNow=g_now)
-            w = edges["w"]
-            denom = w.sum(dim=1)
-            v_bar = (w * (edges["R"] + edges["Gamma"] * edges["v_hist"])).sum(dim=1) / denom.clamp_min(1e-6)
-            v_bar_B1 = v_bar[:, None]
-            has_edge = edges["valid"].any(dim=1).float()[:, None]
-
         micro_err = F.smooth_l1_loss(value, v_bar_B1.detach(), reduction="none") * has_edge
         loss_micro = micro_err.sum() / has_edge.sum().clamp_min(1.0)
+
+        model_target = (
+            reward_model[:, None]
+            + 0.99 * (1.0 - done_model[:, None]) * v_next_hat.detach())
+        loss_model = F.smooth_l1_loss(value_model, model_target)
 
         def GitLossWithDelta(deltaMat: Optional[torch.Tensor]) -> torch.Tensor:
             W = base.value_head.weight
@@ -1830,10 +1962,11 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         loss_git = GitLossWithDelta(d1.get("vhead", None))
 
         loss_mix = value.new_tensor(base.wMixGateReg) * ((mix - 0.5) ** 2).mean()
+        loss_gate = value.new_tensor(base.wMixGateReg) * (model_gate.pow(2).mean() + graph_gate.pow(2).mean())
         loss_hebb_wd = value.new_tensor(1e-6) * (base.hebb_value.weight.pow(2).mean())
 
         td_sq_det = td_align_err.detach().squeeze(-1).pow(2)
-        unc_safe = unc_total.clamp_min(1e-6)
+        unc_safe = (unc_total.detach() + risk + ambiguity + surprise + (1.0 - confidence)).clamp_min(1e-6)
         if has_prev_pred:
             loss_unc_vec = 0.5 * ((td_sq_det / unc_safe) + torch.log(unc_safe))
             loss_unc = value.new_tensor(base.w_unc) * (
@@ -1845,37 +1978,37 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
             loss_td
             + 0.10 * loss_trans
             + 0.10 * loss_micro
+            + 0.05 * loss_model
             + loss_git
             + loss_mix
-            + loss_hebb_wd)
+            + loss_gate
+            + loss_hebb_wd
+            + loss_unc)
 
         with torch.no_grad():
-            g_now = (0.99 * (1.0 - done))
             base._prev_h = h.detach()
             base._prev_value = value.detach()
             base._prev_v_next_pred = v_next_hat.detach()
-            base._prev_alive = (1.0 - done).detach()
+            base._prev_alive = (1.0 - done_model).detach()
             base._prev_unc = unc_total.detach()
-            base.micro.CommitStep(zNow=h, vNow=value, rNow=rewardExt, gNow=g_now)
+            base.micro.CommitStep(zNow=h, vNow=value, rNow=reward_model, gNow=g_now)
 
         extras: Dict[str, torch.Tensor] = {
             "loss_td": loss_td.detach(),
             "loss_trans": loss_trans.detach(),
             "loss_micro": loss_micro.detach(),
+            "loss_model": loss_model.detach(),
             "loss_git": loss_git.detach(),
             "loss_mix": loss_mix.detach(),
+            "loss_gate": loss_gate.detach(),
             "loss_hebb_wd": loss_hebb_wd.detach(),
             "loss_unc": loss_unc.detach(),
             "mix_mean": mix.detach().mean(),
             "td_err_abs_mean": td_align_err.detach().abs().mean(),}
 
-        rComps = {
-            "v_micro": v_bar_B1.detach(),
-            "unc_total": unc_total.detach(),}
-
         return GeoTropicalOut(
             value=value,
-            tdError=td_bounded,
+            tdError=td_bounded.detach(),
             loss=total_loss,
             emotion=emotion,
             rComps=rComps,
@@ -1888,7 +2021,9 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
         mapping = {
             "fc1": ("fc1_adapter", "fc1", [0]),
             "fc2": ("fc2_adapter", "fc2", [1]),
-            "vhead": ("value_adapter", "value_head", [1]),}
+            "vhead": ("value_adapter", "value_head", [1]),
+            "model_vhead": ("model_value_adapter", "model_value_head", [1]),
+            "calib": ("calibration_adapter", "calibration_head", [1]),}
 
         if site not in mapping:
             return False
@@ -1963,9 +2098,9 @@ class TestValueEstimationMTool:
             memory=mem,
             attn=attn,
             state=state,
-            rewardExt=reward,
+            rewardModel=reward,
             policyEntropyPrev=entropy,
-            done=done,
+            doneModel=done,
             worldDeltaTransport=d_tr,
             worldDeltaPhysics=d_ph,)
 
@@ -1986,7 +2121,7 @@ class TestValueEstimationMTool:
             ok &= (out_eval.uncertainty.shape == (B,))
             ok &= (out_eval.precision.shape == (B,))
             ok &= (out_eval.emotion.shape[0] == B)
-            ok &= (out_eval.loss is None and out_eval.extras is None and out_eval.rComps is None)
+            ok &= (out_eval.loss is None and out_eval.extras is None and isinstance(out_eval.rComps, dict))
             ok &= torch.isfinite(out_eval.value).all().item()
             ok &= torch.isfinite(out_eval.tdError).all().item()
             ok &= torch.isfinite(out_eval.uncertainty).all().item()
@@ -2005,6 +2140,8 @@ class TestValueEstimationMTool:
             ok &= "loss_unc" in out_t2.extras
             ok &= "v_micro" in out_t2.rComps
             ok &= "unc_total" in out_t2.rComps
+            for name in ["value_base", "value_model", "risk", "ambiguity", "surprise", "confidence"]:
+                ok &= name in out_t2.rComps
 
             print(f"ExtractorFunctional {'pass' if ok else 'fail'}")
             return ok
@@ -2027,7 +2164,7 @@ class TestValueEstimationMTool:
             print_shape("input.memory", mem)
             print_shape("input.attn", attn)
             print_shape("input.state", state)
-            print_shape("input.rewardExt", reward)
+            print_shape("input.rewardModel", reward)
             print_shape("input.policyEntropyPrev", entropy)
             print_shape("input.done", done)
             print_shape("input.worldDeltaTransport", d_tr)
@@ -2053,6 +2190,10 @@ class TestValueEstimationMTool:
             ok &= (out.precision.shape == (B,))
             ok &= (out.rComps is not None and out.rComps["v_micro"].shape == (B, 1))
             ok &= (out.rComps is not None and out.rComps["unc_total"].shape == (B,))
+            for name in ["value_base", "value_model"]:
+                ok &= (out.rComps is not None and out.rComps[name].shape == (B, 1))
+            for name in ["risk", "ambiguity", "surprise", "confidence"]:
+                ok &= (out.rComps is not None and out.rComps[name].shape == (B,))
             ok &= (out.extras is not None and torch.is_tensor(out.extras["loss_td"]))
 
             print(f"ValueEstimator IO shapes {'pass' if ok else 'fail'}")
@@ -2080,11 +2221,70 @@ class TestValueEstimationMTool:
             ok &= (float(out.uncertainty.max().item()) <= 1.0 + 1e-6)
             ok &= (float(out.precision.min().item()) >= 0.05 - 1e-6)
             ok &= (float(out.precision.max().item()) <= 1.0 + 1e-6)
+            for name in ["risk", "ambiguity", "surprise", "confidence"]:
+                comp = out.rComps[name]
+                ok &= torch.isfinite(comp).all().item()
+                ok &= (float(comp.min().item()) >= -1e-6)
+                ok &= (float(comp.max().item()) <= 1.0 + 1e-6)
 
             print(f"TDUncertaintyBounds {'pass' if ok else 'fail'}")
             return ok
         except Exception as e:
             print(f"TDUncertaintyBounds error: {e}")
+            return False
+
+    def TestModelTargetOnly(self) -> bool:
+        try:
+            torch.manual_seed(432)
+            B = 5
+            mem, attn, state = self.RandBatch(B)
+            entropy = torch.rand(B, device=self.device)
+            d_tr = torch.randn(B, self.state_dim, device=self.device) * 0.2
+            d_ph = torch.randn(B, self.state_dim, device=self.device) * 0.2
+            reward_model = torch.full((B,), -0.5, device=self.device)
+            done_model = torch.full((B,), 0.25, device=self.device)
+
+            est = self.NewEstimator(useHebb=False).eval()
+            out_model = est(
+                memory=mem,
+                attn=attn,
+                state=state,
+                rewardModel=reward_model,
+                policyEntropyPrev=entropy,
+                doneModel=done_model,
+                worldDeltaTransport=d_tr,
+                worldDeltaPhysics=d_ph)
+
+            ok = True
+            ok &= torch.allclose(out_model.rComps["reward_model"], reward_model)
+            ok &= torch.allclose(out_model.rComps["done_model"], done_model)
+            print(f"ModelTargetOnly {'pass' if ok else 'fail'}")
+            return ok
+        except Exception as e:
+            print(f"ModelTargetOnly error: {e}")
+            return False
+
+    def TestCalibrationHeadGrad(self) -> bool:
+        try:
+            torch.manual_seed(433)
+            B = 6
+            est = self.NewEstimator(useHebb=False).train()
+            mem, attn, state = self.RandBatch(B)
+            reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
+            _ = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
+            out = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
+
+            est.zero_grad(set_to_none=True)
+            out.loss.backward()
+            grads = [
+                p.grad.detach().abs().max().item()
+                for p in est.calibration_head.parameters()
+                if p.grad is not None]
+            ok = bool(grads) and max(grads) > 0.0
+            print(f"CalibrationHeadGrad {'pass' if ok else 'fail'}")
+            return ok
+        except Exception as e:
+            print(f"CalibrationHeadGrad error: {e}")
             return False
 
     def TestStateMachineAndMicroGraph(self) -> bool:
@@ -2264,9 +2464,9 @@ class TestValueEstimationMTool:
             out_ref_eval = self.ForwardOnce(est_ref_eval, mem, attn, state, reward, entropy, done, d_tr, d_ph)
             out_wr_eval = wrapper_eval(
                 x={"memory": mem, "attn": attn, "state": state},
-                rewardExt=reward,
+                rewardModel=reward,
                 policyEntropyPrev=entropy,
-                done=done,
+                doneModel=done,
                 worldDeltaTransport=d_tr,
                 worldDeltaPhysics=d_ph,)
 
@@ -2283,18 +2483,18 @@ class TestValueEstimationMTool:
             out_ref_t1 = self.ForwardOnce(est_ref_train, mem, attn, state, reward, entropy, done, d_tr, d_ph)
             out_wr_t1 = wrapper_train(
                 x={"memory": mem, "attn": attn, "state": state},
-                rewardExt=reward,
+                rewardModel=reward,
                 policyEntropyPrev=entropy,
-                done=done,
+                doneModel=done,
                 worldDeltaTransport=d_tr,
                 worldDeltaPhysics=d_ph,)
 
             out_ref_t2 = self.ForwardOnce(est_ref_train, mem, attn, state, reward, entropy, done, d_tr, d_ph)
             out_wr_t2 = wrapper_train(
                 x={"memory": mem, "attn": attn, "state": state},
-                rewardExt=reward,
+                rewardModel=reward,
                 policyEntropyPrev=entropy,
-                done=done,
+                doneModel=done,
                 worldDeltaTransport=d_tr,
                 worldDeltaPhysics=d_ph,)
 
@@ -2349,9 +2549,9 @@ class TestValueEstimationMTool:
 
                 out = wrapper(
                     x={"memory": mem, "attn": attn, "state": state},
-                    rewardExt=reward,
+                    rewardModel=reward,
                     policyEntropyPrev=entropy,
-                    done=done,
+                    doneModel=done,
                     worldDeltaTransport=d_tr,
                     worldDeltaPhysics=d_ph,)
 
@@ -2416,9 +2616,9 @@ class TestValueEstimationMTool:
             snap = wrapper.base.ExportState()
             out_sim = wrapper(
                 x={"memory": mem, "attn": attn, "state": state},
-                rewardExt=reward,
+                rewardModel=reward,
                 policyEntropyPrev=entropy,
-                done=done,
+                doneModel=done,
                 worldDeltaTransport=d_tr,
                 worldDeltaPhysics=d_ph,)
 
@@ -2426,9 +2626,9 @@ class TestValueEstimationMTool:
             commit_info = wrapper.Update("commit")
             out_after = wrapper(
                 x={"memory": mem, "attn": attn, "state": state},
-                rewardExt=reward,
+                rewardModel=reward,
                 policyEntropyPrev=entropy,
-                done=done,
+                doneModel=done,
                 worldDeltaTransport=d_tr,
                 worldDeltaPhysics=d_ph,)
 
@@ -2464,9 +2664,9 @@ class TestValueEstimationMTool:
                 reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
                 out = wrapper(
                     x={"memory": mem, "attn": attn, "state": state},
-                    rewardExt=reward,
+                    rewardModel=reward,
                     policyEntropyPrev=entropy,
-                    done=done,
+                    doneModel=done,
                     worldDeltaTransport=d_tr,
                     worldDeltaPhysics=d_ph,)
                 opt.zero_grad(set_to_none=True)
@@ -2655,6 +2855,8 @@ class TestValueEstimationMTool:
             "ExtractorFunctional": self.TestExtractorFunctional(),
             "ValueEstimatorIOShapes": self.TestValueEstimatorIOShapes(),
             "TDUncertaintyBounds": self.TestTDUncertaintyBounds(),
+            "ModelTargetOnly": self.TestModelTargetOnly(),
+            "CalibrationHeadGrad": self.TestCalibrationHeadGrad(),
             "StateMachineAndMicroGraph": self.TestStateMachineAndMicroGraph(),
             "BatchResizeAndPredictorShapes": self.TestBatchResizeAndPredictorShapes(),
             "ResetFunctions": self.TestResetFunctions(),

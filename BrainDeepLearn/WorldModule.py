@@ -915,6 +915,8 @@ class RSSMWorldModel(AGICoreModule):
         self.state_dim = stateDim
         self.use_decoder = useDecoder
         self.ssm_dim = ssmDim
+        self.reward_min = -10.0
+        self.reward_max = 10.0
 
         self._mem_topk: int = int(memTopK)
         self._mem_temp: float = float(memTemp)
@@ -1263,6 +1265,10 @@ class RSSMWorldModel(AGICoreModule):
 
         return mem_h # [B,D]
 
+    def BoundReward(self, reward: torch.Tensor) -> torch.Tensor:
+        scale = max(abs(float(self.reward_min)), abs(float(self.reward_max)), 1e-6)
+        return scale * torch.tanh(reward / scale)
+
     def ResetState(self, batchSize: int = 1):
         device, dtype = self.device, self.dtype
         B = int(batchSize)
@@ -1384,7 +1390,7 @@ class RSSMWorldModel(AGICoreModule):
             "x_next": x_next,
             "s_next": s_next,
             "action_enc": actionEnc,
-            "r_pred": self.rew_head(trunk).squeeze(-1),
+            "r_pred": self.BoundReward(self.rew_head(trunk).squeeze(-1)),
             "d_prob": torch.sigmoid(self.done_head(trunk).squeeze(-1)),
             "d_tr": d_tr,
             "d_ph": d_ph,}
@@ -1496,7 +1502,7 @@ class RSSMWorldModel(AGICoreModule):
         inp = torch.cat([s_base, s_next, a_t], dim=-1) # [B, 2 * stateDim + stochDim]
         h = self.rdone_trunk(self.rdone_ln(inp))
 
-        r_pred = self.rew_head(h).squeeze(-1) # [B]
+        r_pred = self.BoundReward(self.rew_head(h).squeeze(-1)) # [B]
         d_logit = self.done_head(h).squeeze(-1) # [B]
         d_prob = torch.sigmoid(d_logit) # [B]
 
@@ -1566,7 +1572,7 @@ class RSSMWorldModel(AGICoreModule):
 
                 inp_rd = torch.cat([s_base, s_next, a_t], dim=-1)
                 h_rd = self.rdone_trunk(self.rdone_ln(inp_rd))
-                r_pred_tmp = self.rew_head(h_rd).squeeze(-1)
+                r_pred_tmp = self.BoundReward(self.rew_head(h_rd).squeeze(-1))
                 d_logit_tmp = self.done_head(h_rd).squeeze(-1)
                 d_prob_tmp = torch.sigmoid(d_logit_tmp)
 
@@ -1587,7 +1593,7 @@ class RSSMWorldModel(AGICoreModule):
 
         inp = torch.cat([s_base, s_next, a_t], dim=-1)
         h = self.rdone_trunk(self.rdone_ln(inp))
-        r_pred = self.rew_head(h).squeeze(-1) # [B]
+        r_pred = self.BoundReward(self.rew_head(h).squeeze(-1)) # [B]
         d_logit = self.done_head(h).squeeze(-1) # [B]
         d_prob = torch.sigmoid(d_logit) # [B]
 
@@ -1748,7 +1754,7 @@ class RSSMWorldModel(AGICoreModule):
 
                 inp_rd = torch.cat([s_base, s1, a_t], dim=-1)
                 h_rd = self.rdone_trunk(self.rdone_ln(inp_rd))
-                r_pred_tmp = self.rew_head(h_rd).squeeze(-1)
+                r_pred_tmp = self.BoundReward(self.rew_head(h_rd).squeeze(-1))
                 d_logit_tmp = self.done_head(h_rd).squeeze(-1)
                 d_prob_tmp = torch.sigmoid(d_logit_tmp)
 
@@ -1769,7 +1775,7 @@ class RSSMWorldModel(AGICoreModule):
 
         inp = torch.cat([s_base, s1, a_t], dim=-1) # [B,2S+stochDim]
         trunk = self.rdone_trunk(self.rdone_ln(inp)) # [B,256]
-        r_pred = self.rew_head(trunk).squeeze(-1) # [B]
+        r_pred = self.BoundReward(self.rew_head(trunk).squeeze(-1)) # [B]
         d_logit = self.done_head(trunk).squeeze(-1) # [B]
         d_prob = torch.sigmoid(d_logit) # [B]
 
@@ -1795,9 +1801,9 @@ class RSSMWorldModel(AGICoreModule):
         if self._ns_enabled:
             aux_moe = self.ns_head_prior.GetAuxLoss() + self.ns_head_post.GetAuxLoss()
 
-        loss_reward = F.mse_loss(r_pred, reward.to(device=device, dtype=dtype), reduction="mean")
-        loss_done = F.binary_cross_entropy_with_logits(
-            d_logit, done.to(device=device, dtype=dtype), reduction="mean")
+        reward_target = reward.view(B)
+        loss_reward = F.mse_loss(r_pred, reward_target, reduction="mean")
+        loss_done = F.binary_cross_entropy_with_logits(d_logit, done, reduction="mean")
 
         loss_kl = BalancedKL(mu_q, logstd_q, mu_p, logstd_p, alpha=alphaKl, freeNats=freeNats).mean()
 
@@ -1830,6 +1836,7 @@ class RSSMWorldModel(AGICoreModule):
 
             "h_next": h_pred,
             "z_next": z1,
+            "x_next": self.s4.x,
             "s_next": s1,
             "r_pred": r_pred,
             "d_prob": d_prob,
@@ -2076,7 +2083,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         return x  # [B,256]
 
     def Rew(self, h: torch.Tensor, d: Dict[str, Optional[torch.Tensor]]) -> torch.Tensor:
-        return self.Lin(h, self.base.rew_head[0], d.get("rew"))
+        return self.base.BoundReward(self.Lin(h, self.base.rew_head[0], d.get("rew")))
 
     def Done(self, h: torch.Tensor, d: Dict[str, Optional[torch.Tensor]]) -> torch.Tensor:
         return self.Lin(h, self.base.done_head[0], d.get("done"))
@@ -2545,8 +2552,9 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         if self.base._ns_enabled:
             aux_moe = self.base.ns_head_prior.GetAuxLoss() + self.base.ns_head_post.GetAuxLoss()
 
-        loss_reward = F.mse_loss(r_pred, reward.to(device=device, dtype=dtype), reduction="mean")
-        loss_done = F.binary_cross_entropy_with_logits(d_logit, done.to(device=device, dtype=dtype), reduction="mean")
+        reward_target = reward.view(B).clamp(float(self.base.reward_min), float(self.base.reward_max))
+        loss_reward = F.mse_loss(r_pred, reward_target, reduction="mean")
+        loss_done = F.binary_cross_entropy_with_logits(d_logit, done, reduction="mean")
         loss_kl = BalancedKL(mu_q, logstd_q, mu_p, logstd_p, alpha=alphaKl, freeNats=freeNats).mean()
 
         self.base._h = h_pred.detach()
@@ -2577,6 +2585,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
             "loss_conn_reg": reg_A,
             "h_next": h_pred,
             "z_next": z1,
+            "x_next": self.base.s4.x,
             "s_next": s1,
             "r_pred": r_pred,
             "d_prob": d_prob,

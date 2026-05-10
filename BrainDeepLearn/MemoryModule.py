@@ -1514,7 +1514,10 @@ class MemoryExtractor(AGICoreModule):
         intentHint: torch.Tensor,
         reset: bool = False,
         softReset: bool = False,
-        sourceLabel: Optional[torch.Tensor] = None) -> torch.Tensor:
+        sourceLabel: Optional[torch.Tensor] = None,
+        uncertainty: Optional[torch.Tensor] = None,
+        risk: Optional[torch.Tensor] = None,
+        confidence: Optional[torch.Tensor] = None) -> torch.Tensor:
 
         self.ResetInternalLoss()
 
@@ -1529,6 +1532,31 @@ class MemoryExtractor(AGICoreModule):
         emotion_eff = emotion
         tdError_eff = tdError
         reward_eff = reward
+        has_value_mod = (uncertainty is not None) or (risk is not None) or (confidence is not None)
+        if uncertainty is None:
+            uncertainty_eff = x.new_zeros(B)
+        else:
+            uncertainty_eff = uncertainty.to(device=self.device, dtype=self.dtype).view(B).clamp(0.0, 1.0)
+        if risk is None:
+            risk_eff = x.new_zeros(B)
+        else:
+            risk_eff = risk.to(device=self.device, dtype=self.dtype).view(B).clamp(0.0, 1.0)
+        if confidence is None:
+            confidence_eff = x.new_ones(B)
+        else:
+            confidence_eff = confidence.to(device=self.device, dtype=self.dtype).view(B).clamp(0.0, 1.0)
+
+        if has_value_mod:
+            write_strength = (
+                (0.65 + 0.55 * confidence_eff)
+                * (1.0 - 0.45 * uncertainty_eff).clamp(0.35, 1.0)
+                + 0.15 * risk_eff).clamp(0.25, 1.50)
+            td_memory = tdError_eff * (0.50 + 0.50 * confidence_eff)
+            reward_abs_eff = reward_eff.detach().abs() * (1.0 + 0.25 * risk_eff)
+        else:
+            write_strength = x.new_ones(B)
+            td_memory = tdError_eff
+            reward_abs_eff = reward_eff.detach().abs()
 
         if reset:
             self.ResetAll()
@@ -1565,7 +1593,7 @@ class MemoryExtractor(AGICoreModule):
             ocrSemantic=ocrSemantic,
             intentHint=intentHint,
             emotion=emotion_eff,
-            tdError=tdError_eff)
+            tdError=td_memory)
 
         emo_emb = self.emo_write_proj(emotion_eff) # [B, memoryDim]
 
@@ -1590,11 +1618,12 @@ class MemoryExtractor(AGICoreModule):
         self.h_state = h_mix.detach().clone()
 
         importance = self.importance_net(h_mix).squeeze(-1) # [B]
+        importance_eff = (importance * write_strength).clamp(0.0, 1.50) # [B]
         gate_local = self.local_gate(h_mix).squeeze(-1) # [B]
 
         kv_feat = self.KvStats(key) # [B, 3]
 
-        phi = torch.cat([self.ctrl_norm(h_mix), emo_emb, key, kv_feat, importance.unsqueeze(-1), gate_local.unsqueeze(-1), tdError_eff.unsqueeze(-1)], dim=-1)
+        phi = torch.cat([self.ctrl_norm(h_mix), emo_emb, key, kv_feat, importance_eff.unsqueeze(-1), gate_local.unsqueeze(-1), td_memory.unsqueeze(-1)], dim=-1)
 
         ctrl = self.ctrl_head(phi) # [B, 4]
         a_raw, b_raw, f_raw, bias_raw = ctrl.split(1, dim=-1) # [B, 1]
@@ -1604,9 +1633,9 @@ class MemoryExtractor(AGICoreModule):
         fusion_gate = torch.sigmoid(f_raw).squeeze(-1) # [B]
         gate_bias = 0.5 * torch.tanh(bias_raw).squeeze(-1) # [B]
 
-        self.HebbianUpdate(key, gate_local, tdError_eff, a, b)
+        self.HebbianUpdate(key, gate_local, td_memory, a, b)
 
-        mem_recall = self.Retrieve(key, fusion_gate, importance=importance, localGate=gate_local, emotion=emotion_eff, tdError=tdError_eff,) # [B, memoryDim]
+        mem_recall = self.Retrieve(key, fusion_gate, importance=importance_eff, localGate=gate_local, emotion=emotion_eff, tdError=td_memory,) # [B, memoryDim]
         
         g2, b2 = self.FilmParams(self.film_mem, val) 
         s2 = 1.0 + g2
@@ -1614,7 +1643,7 @@ class MemoryExtractor(AGICoreModule):
         mem_state = self.mem_film_norm(mem_recall * s2 + b2)
 
         self.pending.append(("kv",
-                             (key.detach(),val.detach(),importance.detach(),emotion_eff.detach(),reward_eff.detach().abs(),src_all.detach())))
+                             (key.detach(),val.detach(),importance_eff.detach(),emotion_eff.detach(),reward_abs_eff.detach(),src_all.detach())))
 
         msg = torch.cat([h_new, y_ssm, val], dim=-1) # [B, ssm+out+mem]
 
@@ -1622,8 +1651,8 @@ class MemoryExtractor(AGICoreModule):
 
         gws_recall = self.gws.Attend(key, topk=1) # [B, memoryDim]
 
-        affect_mag = tdError_eff.abs()
-        prio = importance * (1.0 + 0.5 * affect_mag).clamp(0.5, 2.0)
+        affect_mag = td_memory.abs()
+        prio = importance_eff * (1.0 + 0.5 * affect_mag + 0.25 * risk_eff).clamp(0.5, 2.0)
 
         g1, b1 = self.FilmParams(self.film_gws, gws_val) 
         s1 = 1.0 + g1
@@ -1640,7 +1669,7 @@ class MemoryExtractor(AGICoreModule):
 
         sem_recall, epi_event_recall = self.ltm.Retrieve(key, topkSem=self.ltm_topk_sem, topkEpi=self.ltm_topk_epi, epiQuery=event_key) # [B, memoryDim]
         epi_dense_recall = self.ltm.episodic.Retrieve(key, topk=self.ltm_topk_epi)
-        completion_gate = self.event_completion_gate(torch.cat([epi_event_recall, epi_dense_recall, event_dense, tdError_eff.view(B, 1)], dim=-1))
+        completion_gate = self.event_completion_gate(torch.cat([epi_event_recall, epi_dense_recall, event_dense, td_memory.view(B, 1)], dim=-1))
         epi_recall = completion_gate * epi_event_recall + (1.0 - completion_gate) * epi_dense_recall + 0.05 * completion_gate * event_dense
 
         g3, b3 = self.FilmParams(self.film_sem, sem_in)  
@@ -1653,7 +1682,7 @@ class MemoryExtractor(AGICoreModule):
         epi_state = self.epi_film_norm(epi_recall * s4 + b4) # [B, memoryDim]
 
         self.pending.append(("ltm",
-                              (key.detach(),event_key.detach(),sem_in.detach(),epi_in.detach(),importance.detach(),tdError_eff.detach(),reward_eff.detach(),src_all.detach())))
+                              (key.detach(),event_key.detach(),sem_in.detach(),epi_in.detach(),importance_eff.detach(),td_memory.detach(),reward_eff.detach(),src_all.detach(),uncertainty_eff.detach(),risk_eff.detach(),confidence_eff.detach())))
 
         ltm_fused = self.ltm.fuser(sem_state, epi_state)
 
@@ -1671,7 +1700,7 @@ class MemoryExtractor(AGICoreModule):
 
         fused_state = self.fusion(torch.cat([mem_state, gws_state, ltm_fused, sym_vec], dim=-1)) # [B, outputDim]
 
-        fused_state = self.ApplyOutputGate(fused_state, tdError_eff, gate_bias)
+        fused_state = self.ApplyOutputGate(fused_state, td_memory, gate_bias)
 
         if self.training:
             self.AddInternalLoss(self.fusion.GetAuxLoss())
@@ -1774,9 +1803,23 @@ class MemoryExtractor(AGICoreModule):
         importance: torch.Tensor, # [B]
         tdError: torch.Tensor, # [B]
         reward: torch.Tensor, # [B] [-10, 10]
-        sourceLabel: torch.Tensor):
+        sourceLabel: torch.Tensor,
+        uncertainty: Optional[torch.Tensor] = None,
+        risk: Optional[torch.Tensor] = None,
+        confidence: Optional[torch.Tensor] = None):
         source_conf = SourceConfidence(sourceLabel, dtype=importance.dtype)
-        salience = (importance + 0.35 * tdError.abs() + 0.15 * torch.tanh(reward.abs())) * source_conf
+        has_value_mod = (uncertainty is not None) or (risk is not None) or (confidence is not None)
+        if has_value_mod:
+            B = int(importance.size(0))
+            unc_eff = torch.zeros(B, device=importance.device, dtype=importance.dtype) if uncertainty is None else uncertainty.to(device=importance.device, dtype=importance.dtype).view(B).clamp(0.0, 1.0)
+            risk_eff = torch.zeros(B, device=importance.device, dtype=importance.dtype) if risk is None else risk.to(device=importance.device, dtype=importance.dtype).view(B).clamp(0.0, 1.0)
+            conf_eff = torch.ones(B, device=importance.device, dtype=importance.dtype) if confidence is None else confidence.to(device=importance.device, dtype=importance.dtype).view(B).clamp(0.0, 1.0)
+            value_gain = ((0.65 + 0.55 * conf_eff) * (1.0 - 0.45 * unc_eff).clamp(0.35, 1.0) + 0.15 * risk_eff).clamp(0.25, 1.50)
+        else:
+            risk_eff = torch.zeros_like(importance)
+            value_gain = torch.ones_like(importance)
+
+        salience = (importance + 0.35 * tdError.abs() + 0.15 * torch.tanh(reward.abs()) + 0.15 * risk_eff) * source_conf * value_gain
         mask_base = (salience > self.ltm_online_imp_thresh) | (tdError.abs() > self.ltm_online_td_thresh)
         is_imag = (sourceLabel == MemoryType.SRC_IMAGINE)
         is_mixed = (sourceLabel == MemoryType.SRC_MIXED)
@@ -2103,8 +2146,12 @@ class MemoryExtractor(AGICoreModule):
                 self.KvWrite(key=key,val=val,importance=imp,emotion=emo,rewardAbs=rew_abs,source=src,)
 
             elif kind == "ltm":
-                key_sem, key_epi, sem, epi, imp, td, rwd, src = payload
-                self.LtmOnlineStore(keySem=key_sem,keyEpi=key_epi,valSem=sem,valEpi=epi,importance=imp,tdError=td,reward=rwd,sourceLabel=src,)
+                if len(payload) == 8:
+                    key_sem, key_epi, sem, epi, imp, td, rwd, src = payload
+                    unc, risk, conf = None, None, None
+                else:
+                    key_sem, key_epi, sem, epi, imp, td, rwd, src, unc, risk, conf = payload
+                self.LtmOnlineStore(keySem=key_sem,keyEpi=key_epi,valSem=sem,valEpi=epi,importance=imp,tdError=td,reward=rwd,sourceLabel=src,uncertainty=unc,risk=risk,confidence=conf,)
                 
             elif kind == "ns":
                 key, P_post, importance, src = payload
@@ -3294,7 +3341,10 @@ class TestMemoryMTool:
         emotion: Optional[torch.Tensor] = None,
         reset: bool = False,
         softReset: bool = False,
-        sourceLabel: Optional[torch.Tensor] = None,) -> torch.Tensor:
+        sourceLabel: Optional[torch.Tensor] = None,
+        uncertainty: Optional[torch.Tensor] = None,
+        risk: Optional[torch.Tensor] = None,
+        confidence: Optional[torch.Tensor] = None,) -> torch.Tensor:
         B = int(x.size(0))
         device = x.device
         tdError = torch.zeros(B, device=device) if tdError is None else tdError.view(B).to(device=device)
@@ -3317,7 +3367,10 @@ class TestMemoryMTool:
             intentHint=intentHint,
             reset=reset,
             softReset=softReset,
-            sourceLabel=sourceLabel,)
+            sourceLabel=sourceLabel,
+            uncertainty=uncertainty,
+            risk=risk,
+            confidence=confidence,)
 
     def AssertClose(self, a: torch.Tensor, b: torch.Tensor, *, atol=1e-5, rtol=1e-4, msg=""):
         if not torch.allclose(a, b, atol=atol, rtol=rtol):
@@ -4226,6 +4279,58 @@ class TestMemoryMTool:
             print(f"MemoryExtractor forward test error: {e}")
             return False
 
+    def TestMemoryValueModulatedForward(self):
+        try:
+            cfg = dict(
+                inputDim=64,
+                ssmStateDim=64,
+                memoryDim=96,
+                memorySize=32,
+                symSize=64,
+                ltmSize=64,
+                nsK=32,
+                outputDim=96,
+                gwsSlots=8,
+                gwsTtl=6,
+                compressEvery=50,
+                emotionDim=32,)
+            cfg = self.FilterKwargs(MemoryExtractor, cfg)
+
+            mem = MemoryExtractor(**cfg).to(self.device)
+            mem.eval()
+
+            B = 4
+            x = torch.randn(B, cfg.get("inputDim", 64), device=self.device)
+            td = torch.randn(B, device=self.device).clamp(-1.0, 1.0)
+            rwd = torch.randn(B, device=self.device)
+            emotion = self.MakeEmotion(B, mem)
+            uncertainty = torch.linspace(0.0, 0.8, B, device=self.device)
+            risk = torch.linspace(0.1, 0.9, B, device=self.device)
+            confidence = torch.linspace(0.95, 0.35, B, device=self.device)
+
+            y = self.CallMemForward(
+                mem,
+                x,
+                tdError=td,
+                reward=rwd,
+                emotion=emotion,
+                uncertainty=uncertainty,
+                risk=risk,
+                confidence=confidence)
+            assert y.shape == (B, cfg.get("outputDim", int(mem.output_dim)))
+            assert torch.isfinite(y).all()
+            mem.FlushPendingWrites()
+            assert (mem.memory_filled >= 0).all()
+
+            print("Memory value-modulated forward test passed.")
+            return True
+        except AssertionError as e:
+            print(f"Memory value-modulated forward test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"Memory value-modulated forward test error: {e}")
+            return False
+
     def TestMemoryExtractorIOShapes(self):
         try:
             cfg = dict(
@@ -4783,6 +4888,7 @@ class TestMemoryMTool:
             "EnsureBClearsOnResize": self.TestEnsureBClearsOnResize(),
             "ReorderMemorySteps": self.TestReorderMemorySteps(),
             "MemoryExtractorForward": self.TestMemoryExtractorForward(),
+            "MemoryValueModulatedForward": self.TestMemoryValueModulatedForward(),
             "MemoryExtractorIOShapes": self.TestMemoryExtractorIOShapes(),
             "StateSaveRestore": self.TestStateSaveRestore(),
             "ExportImportRoundTrip": self.TestExportImportStateRoundTrip(),
