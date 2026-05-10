@@ -1323,8 +1323,6 @@ class ValueEstimationExtractor(AGICoreModule):
 
         if policyEntropyPrev is None:
             policyEntropyPrev = state.new_zeros(B)
-        else:
-            policyEntropyPrev = policyEntropyPrev.view(B)
         if worldDeltaTransport is None:
             worldDeltaTransport = state.new_zeros(B, self.unc_core.state_dim)
         if worldDeltaPhysics is None:
@@ -1458,7 +1456,7 @@ class ValueEstimationExtractor(AGICoreModule):
 
         loss_git = self.git(self.value_head, transp_extras, adapter=self.value_adapter)  
 
-        loss_mix = value.new_tensor(self.wMixGateReg) * ((mix - 0.5) ** 2).mean()
+        loss_mix = value.new_tensor(self.wMixGateReg) * (mix - 0.11920292202211755).pow(2).mean()
         loss_gate = value.new_tensor(self.wMixGateReg) * (
             model_gate.pow(2).mean()
             + graph_gate.pow(2).mean())
@@ -1961,7 +1959,7 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
 
         loss_git = GitLossWithDelta(d1.get("vhead", None))
 
-        loss_mix = value.new_tensor(base.wMixGateReg) * ((mix - 0.5) ** 2).mean()
+        loss_mix = value.new_tensor(base.wMixGateReg) * (mix - 0.11920292202211755).pow(2).mean()
         loss_gate = value.new_tensor(base.wMixGateReg) * (model_gate.pow(2).mean() + graph_gate.pow(2).mean())
         loss_hebb_wd = value.new_tensor(1e-6) * (base.hebb_value.weight.pow(2).mean())
 

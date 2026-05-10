@@ -712,6 +712,14 @@ class AttentionExtractor(AGICoreModule):
             nn.Linear(gate_hidden, numHeads + embedDim))
         nn.init.zeros_(self.mod_gate[-1].weight)
         nn.init.zeros_(self.mod_gate[-1].bias)
+
+        self.structured_gate = nn.Sequential(
+            nn.LayerNorm(gate_in_dim),
+            nn.Linear(gate_in_dim, gate_hidden),
+            nn.SiLU(),
+            nn.Linear(gate_hidden, 4))
+        nn.init.zeros_(self.structured_gate[-1].weight)
+        nn.init.zeros_(self.structured_gate[-1].bias)
             
 
     def ClipGrads(self):
@@ -763,6 +771,37 @@ class AttentionExtractor(AGICoreModule):
         weights = F.softmax(scores, dim=2)
         return (objectSeq * weights.unsqueeze(-1)).sum(dim=2)
 
+    def BuildStructuredFusion(
+        self,
+        objectSeq: torch.Tensor,
+        motionSeq: torch.Tensor,
+        qualitySeq: torch.Tensor,
+        predErrorSeq: torch.Tensor,
+        goalBias: torch.Tensor,
+        precision: torch.Tensor,
+        tdError: torch.Tensor,
+        uncertainty: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
+        def project_seq(sig: torch.Tensor, proj: nn.Module) -> torch.Tensor:
+            y = sig
+            if y.dim() == 4:
+                y = self.ObjectAttentionPool(y)
+            return proj(y)
+
+        terms = torch.stack([
+            project_seq(objectSeq, self.object_seq_proj),
+            project_seq(motionSeq, self.motion_seq_proj),
+            project_seq(qualitySeq, self.quality_seq_proj),
+            project_seq(predErrorSeq, self.pred_error_seq_proj)], dim=2) # [B,S,4,E]
+
+        gate_in = torch.cat([
+            goalBias,
+            precision[:, None],
+            tdError[:, None],
+            uncertainty[:, None]], dim=-1)
+        weights = torch.softmax(self.structured_gate(gate_in), dim=-1) # [B,4]
+        fused = (terms * weights[:, None, :, None]).sum(dim=2) * float(terms.size(2))
+        return fused, weights
+
     def forward(
         self,
         x: torch.Tensor, # [B,S,E]
@@ -785,19 +824,18 @@ class AttentionExtractor(AGICoreModule):
 
         extras: Dict[str, Any] = {}
 
-        def project_seq(sig: torch.Tensor, proj: nn.Module) -> torch.Tensor:
-            y = sig
-            if y.dim() == 4:
-                y = self.ObjectAttentionPool(y)
-            return proj(y)
-
-        structured_sum = (
-            project_seq(objectSeq, self.object_seq_proj)
-            + project_seq(motionSeq, self.motion_seq_proj)
-            + project_seq(qualitySeq, self.quality_seq_proj)
-            + project_seq(predErrorSeq, self.pred_error_seq_proj))
+        structured_sum, structured_weights = self.BuildStructuredFusion(
+            objectSeq,
+            motionSeq,
+            qualitySeq,
+            predErrorSeq,
+            goalBias,
+            precision,
+            tdError,
+            uncertainty)
         x = x + 0.0625 * structured_sum
         extras["structured_terms"] = x.new_tensor(4.0)
+        extras["structured_weights"] = structured_weights.detach()
 
         goal_term = self.goal_bias_proj(goalBias)
         x = x + 0.10 * goal_term.unsqueeze(1)
@@ -1023,19 +1061,18 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
 
         extras: Dict[str, Any] = {}
 
-        def project_seq(sig: torch.Tensor, proj: nn.Module) -> torch.Tensor:
-            y = sig
-            if y.dim() == 4:
-                y = self.base.ObjectAttentionPool(y)
-            return proj(y)
-
-        structured_sum = (
-            project_seq(objectSeq, self.base.object_seq_proj)
-            + project_seq(motionSeq, self.base.motion_seq_proj)
-            + project_seq(qualitySeq, self.base.quality_seq_proj)
-            + project_seq(predErrorSeq, self.base.pred_error_seq_proj))
+        structured_sum, structured_weights = self.base.BuildStructuredFusion(
+            objectSeq,
+            motionSeq,
+            qualitySeq,
+            predErrorSeq,
+            goalBias,
+            precision,
+            tdError,
+            uncertainty)
         x = x + 0.0625 * structured_sum
         extras["structured_terms"] = x.new_tensor(4.0)
+        extras["structured_weights"] = structured_weights.detach()
 
         goal_term = self.base.goal_bias_proj(goalBias)
         x = x + 0.10 * goal_term.unsqueeze(1)

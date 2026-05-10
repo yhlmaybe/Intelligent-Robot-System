@@ -885,8 +885,8 @@ class PerceiveExtractor(AGICoreModule):
         else:
             ventral_delta = torch.zeros_like(ventral_feat)
 
-        dorsal_feat = self.dorsal_proj(torch.cat([ventral_feat, ventral_delta], dim=-1))
-        motion_token = self.motion_proj(torch.cat([dorsal_feat, ventral_delta], dim=-1))
+        dorsal_feat = self.dorsal_proj(torch.cat([ventral_feat, ventral_delta], dim=-1)) # [B, embedDim]
+        motion_token = self.motion_proj(torch.cat([dorsal_feat, ventral_delta], dim=-1)) # [B, embedDim]
 
         object_tokens = self.BuildObjectTokens(patch_tokens)
 

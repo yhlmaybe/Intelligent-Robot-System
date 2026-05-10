@@ -104,7 +104,7 @@ def UnifiedMemoryScore(
     if confidence is None:
         conf = SourceConfidence(src, dtype=sim.dtype)
     else:
-        conf = confidence.float().clamp(0.0, 1.0)
+        conf = confidence.float()
 
     score = sim * freshness * salience * rehearsal * conf
     if validMask is not None:
@@ -783,6 +783,7 @@ class EpisodicLTM(AGICoreModule):
         self.capacity = capacity
         B0 = 1
         self.register_buffer("keys", torch.zeros(B0, capacity, dim))
+        self.register_buffer("state_keys", torch.zeros(B0, capacity, dim))
         self.register_buffer("vals", torch.zeros(B0, capacity, dim))
         self.register_buffer("rew", torch.zeros(B0, capacity))
         self.register_buffer("rew_abs", torch.zeros(B0, capacity))
@@ -804,6 +805,7 @@ class EpisodicLTM(AGICoreModule):
             return
 
         self.keys = torch.zeros(B, self.capacity, self.dim, device=device, dtype=dtype)
+        self.state_keys = torch.zeros(B, self.capacity, self.dim, device=device, dtype=dtype)
         self.vals = torch.zeros(B, self.capacity, self.dim, device=device, dtype=dtype)
         self.rew = torch.zeros(B, self.capacity, device=device, dtype=dtype)
         self.rew_abs = torch.zeros(B, self.capacity, device=device, dtype=dtype)
@@ -822,7 +824,8 @@ class EpisodicLTM(AGICoreModule):
         reward: torch.Tensor, # [B]
         score: torch.Tensor, # [B]
         source: Optional[torch.Tensor] = None,
-        writeMask: Optional[torch.Tensor] = None): #  [int = MemoryType.SRC_REAL]
+        writeMask: Optional[torch.Tensor] = None,
+        stateKey: Optional[torch.Tensor] = None): #  [int = MemoryType.SRC_REAL]
         B = int(key.size(0))
         self.EnsureB(B, self.device, self.dtype)
 
@@ -830,6 +833,8 @@ class EpisodicLTM(AGICoreModule):
             source = torch.full((B,), MemoryType.SRC_REAL, device=self.device, dtype=torch.int8)
         if writeMask is None:
             writeMask = torch.ones(B, device=self.device, dtype=torch.bool)
+        if stateKey is None:
+            stateKey = key
         if not bool(writeMask.any().item()):
             return
 
@@ -857,6 +862,7 @@ class EpisodicLTM(AGICoreModule):
         b_sel = b_idx[writeMask]
         idx_sel = idx[writeMask]
         self.keys[b_sel, idx_sel] = key[writeMask]
+        self.state_keys[b_sel, idx_sel] = stateKey[writeMask]
         self.vals[b_sel, idx_sel] = value[writeMask]
         self.rew[b_sel, idx_sel] = reward[writeMask]
         self.rew_abs[b_sel, idx_sel] = reward[writeMask].abs()
@@ -869,7 +875,7 @@ class EpisodicLTM(AGICoreModule):
         filled_new = torch.where(is_full, filled, filled + 1)
         self.filled = torch.where(writeMask, filled_new, filled)
 
-    def Retrieve(self, query: torch.Tensor, topk: int = 8, recentBias: float = 0.05):
+    def Retrieve(self, query: torch.Tensor, topk: int = 8, recentBias: float = 0.05, useStateKey: bool = False):
         B = int(query.size(0))
         self.EnsureB(B, self.device, self.dtype)
 
@@ -882,10 +888,11 @@ class EpisodicLTM(AGICoreModule):
         if not bool(any_valid.any().item()):
             return torch.zeros(B, self.dim, device=self.device, dtype=query.dtype)
 
+        keys = self.state_keys if bool(useStateKey) else self.keys
         age = (gstep.unsqueeze(1) - self.step).clamp(min=0).float()
         sim = UnifiedMemoryScore(
             query,
-            self.keys,
+            keys,
             age=age,
             priority=self.prio,
             touch=self.touch,
@@ -976,6 +983,7 @@ class LongTermMemory(AGICoreModule):
         self.semantic.global_step.zero_()
 
         self.episodic.keys.zero_()
+        self.episodic.state_keys.zero_()
         self.episodic.vals.zero_()
         self.episodic.rew.zero_()
         self.episodic.rew_abs.zero_()
@@ -1162,11 +1170,18 @@ class MemoryExtractor(AGICoreModule):
 
         self.emo_write_alpha = nn.Parameter(torch.tensor(0.3))
 
-        self.sem_gamma_emo = nn.Linear(self.memory_dim, self.memory_dim)
-        self.sem_beta_emo = nn.Linear(self.memory_dim, self.memory_dim)
+        self.sem_context_mod = nn.Sequential(
+            nn.LayerNorm(2048),
+            nn.Linear(2048, self.memory_dim),
+            nn.SiLU(),
+            nn.Linear(self.memory_dim, 2 * self.memory_dim),)
 
-        self.epi_gamma_emo = nn.Linear(self.memory_dim, self.memory_dim)
-        self.epi_beta_emo = nn.Linear(self.memory_dim, self.memory_dim)
+        epi_mod_in_dim = self.memory_dim + 1024 + 5
+        self.epi_event_mod = nn.Sequential(
+            nn.LayerNorm(epi_mod_in_dim),
+            nn.Linear(epi_mod_in_dim, self.memory_dim),
+            nn.SiLU(),
+            nn.Linear(self.memory_dim, 2 * self.memory_dim),)
 
         self.register_buffer("time_step", torch.zeros(B0, dtype=torch.long)) 
         self.register_buffer("memory_filled", torch.zeros(B0, dtype=torch.long)) 
@@ -1224,7 +1239,29 @@ class MemoryExtractor(AGICoreModule):
 
         self.gws = GlobalWorkspace(dim=memoryDim, slots=gwsSlots, defaultTtl=gwsTtl)
         self.ltm = LongTermMemory(dim=memoryDim, semCap=ltmSize, epiCap=ltmSize)
-        self.gws_summary = nn.Linear(ssmStateDim + outputDim + memoryDim, memoryDim,)
+        self.gws_h_proj = nn.Sequential(
+            nn.LayerNorm(ssmStateDim),
+            nn.Linear(ssmStateDim, memoryDim),
+            nn.SiLU(),
+            nn.Linear(memoryDim, memoryDim),)
+        self.gws_y_proj = nn.Sequential(
+            nn.LayerNorm(outputDim),
+            nn.Linear(outputDim, memoryDim),
+            nn.SiLU(),
+            nn.Linear(memoryDim, memoryDim),)
+        self.gws_val_proj = nn.Sequential(
+            nn.LayerNorm(memoryDim),
+            nn.Linear(memoryDim, memoryDim),
+            nn.SiLU(),
+            nn.Linear(memoryDim, memoryDim),)
+        self.gws_source_gate = nn.Sequential(
+            nn.LayerNorm(memoryDim * 3 + 3),
+            nn.Linear(memoryDim * 3 + 3, memoryDim),
+            nn.SiLU(),
+            nn.Linear(memoryDim, 3),)
+        nn.init.zeros_(self.gws_source_gate[-1].weight)
+        nn.init.zeros_(self.gws_source_gate[-1].bias)
+        self.gws_summary_norm = nn.LayerNorm(memoryDim)
 
         self.ns_lambda = 0.08
         self.ns_retrieve_boost = 0.3
@@ -1251,6 +1288,12 @@ class MemoryExtractor(AGICoreModule):
             seedDisjoint=True,)
 
         self.sym_query = QueryToSymbol(inDim=self.memory_dim, k=self.ns_K, hidden=512) 
+        self.sym_query_fusion = nn.Sequential(
+            nn.LayerNorm(self.ns_K * 2),
+            nn.Linear(self.ns_K * 2, self.ns_K),
+            nn.Sigmoid(),)
+        nn.init.zeros_(self.sym_query_fusion[1].weight)
+        nn.init.zeros_(self.sym_query_fusion[1].bias)
         self.sym_mem = SymbolicMemory(k=self.ns_K, capacity=self.sym_capacity)
 
         self.sym_embed = SymbolicEmbed(self.ns_K, outDim=self.memory_dim)
@@ -1279,6 +1322,11 @@ class MemoryExtractor(AGICoreModule):
         self.film_epi = make_film(self.memory_dim)
 
         self.film_clip = 0.5
+        self.film_context_proj = nn.Sequential(
+            nn.LayerNorm(self.memory_dim * 4 + 4),
+            nn.Linear(self.memory_dim * 4 + 4, self.memory_dim),
+            nn.SiLU(),
+            nn.Linear(self.memory_dim, self.memory_dim),)
 
         self.extra_losses: List[torch.Tensor] = []
 
@@ -1306,7 +1354,7 @@ class MemoryExtractor(AGICoreModule):
             nn.Linear(inputDim, inputDim),)
         self.context_fuse_scale = nn.Parameter(torch.tensor(0.1))
 
-        event_in_dim = inputDim + 2048 + 512 + 512 + self.emotion_dim + 1
+        event_in_dim = inputDim + 2048 + 512 + 512 + self.emotion_dim + 4
         self.event_context_proj = nn.Sequential(
             nn.LayerNorm(event_in_dim),
             nn.Linear(event_in_dim, memoryDim),
@@ -1459,6 +1507,51 @@ class MemoryExtractor(AGICoreModule):
         g = self.film_clip * torch.tanh(g)
         return g, b
 
+    def BuildFilmContext(
+        self,
+        writeValue: torch.Tensor,
+        recallValue: torch.Tensor,
+        modSignal: torch.Tensor,
+        tdMemory: torch.Tensor,
+        risk: torch.Tensor,
+        uncertainty: torch.Tensor,
+        confidence: torch.Tensor,) -> torch.Tensor:
+        ctx = torch.cat([
+            writeValue,
+            recallValue,
+            writeValue - recallValue,
+            modSignal,
+            tdMemory.unsqueeze(-1),
+            risk.unsqueeze(-1),
+            uncertainty.unsqueeze(-1),
+            confidence.unsqueeze(-1)], dim=-1)
+        return self.film_context_proj(ctx)
+
+    def BuildGwsValue(
+        self,
+        hNew: torch.Tensor,
+        ySsm: torch.Tensor,
+        val: torch.Tensor,
+        tdMemory: torch.Tensor,
+        risk: torch.Tensor,
+        confidence: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
+        h_part = self.gws_h_proj(hNew)
+        y_part = self.gws_y_proj(ySsm)
+        val_part = self.gws_val_proj(val)
+        gate_in = torch.cat([
+            h_part,
+            y_part,
+            val_part,
+            tdMemory.unsqueeze(-1),
+            risk.unsqueeze(-1),
+            confidence.unsqueeze(-1)], dim=-1)
+        weight = F.softmax(self.gws_source_gate(gate_in), dim=-1)
+        out = (
+            weight[:, 0:1] * h_part
+            + weight[:, 1:2] * y_part
+            + weight[:, 2:3] * val_part)
+        return self.gws_summary_norm(out + 0.1 * val), self.gws_summary_norm(out)
+
     def FuseExternalContext(
         self,
         x: torch.Tensor,
@@ -1490,7 +1583,10 @@ class MemoryExtractor(AGICoreModule):
         ocrSemantic: torch.Tensor,
         intentHint: torch.Tensor,
         emotion: torch.Tensor,
-        tdError: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
+        tdError: torch.Tensor,
+        uncertainty: torch.Tensor,
+        risk: torch.Tensor,
+        confidence: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
         vis = torch.cat([
             visualState.LegacyFeat,
             visualState.MotionToken,
@@ -1501,7 +1597,10 @@ class MemoryExtractor(AGICoreModule):
             ocrSemantic,
             intentHint,
             emotion,
-            tdError.view(-1, 1),], dim=-1))
+            tdError.view(-1, 1),
+            uncertainty.view(-1, 1),
+            risk.view(-1, 1),
+            confidence.view(-1, 1),], dim=-1))
         return raw, self.PatternSeparate(raw)
 
     def forward(self,
@@ -1512,14 +1611,16 @@ class MemoryExtractor(AGICoreModule):
         visualState: Any,
         ocrSemantic: torch.Tensor,
         intentHint: torch.Tensor,
+        uncertainty: torch.Tensor,
+        risk: torch.Tensor,
+        confidence: torch.Tensor,
+        *,
         reset: bool = False,
         softReset: bool = False,
-        sourceLabel: Optional[torch.Tensor] = None,
-        uncertainty: Optional[torch.Tensor] = None,
-        risk: Optional[torch.Tensor] = None,
-        confidence: Optional[torch.Tensor] = None) -> torch.Tensor:
+        sourceLabel: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-        self.ResetInternalLoss()
+        if self.training:
+            self.ResetInternalLoss()
 
         B = x.size(0)
 
@@ -1532,31 +1633,16 @@ class MemoryExtractor(AGICoreModule):
         emotion_eff = emotion
         tdError_eff = tdError
         reward_eff = reward
-        has_value_mod = (uncertainty is not None) or (risk is not None) or (confidence is not None)
-        if uncertainty is None:
-            uncertainty_eff = x.new_zeros(B)
-        else:
-            uncertainty_eff = uncertainty.to(device=self.device, dtype=self.dtype).view(B).clamp(0.0, 1.0)
-        if risk is None:
-            risk_eff = x.new_zeros(B)
-        else:
-            risk_eff = risk.to(device=self.device, dtype=self.dtype).view(B).clamp(0.0, 1.0)
-        if confidence is None:
-            confidence_eff = x.new_ones(B)
-        else:
-            confidence_eff = confidence.to(device=self.device, dtype=self.dtype).view(B).clamp(0.0, 1.0)
+        uncertainty_eff = uncertainty
+        risk_eff = risk
+        confidence_eff = confidence
 
-        if has_value_mod:
-            write_strength = (
-                (0.65 + 0.55 * confidence_eff)
-                * (1.0 - 0.45 * uncertainty_eff).clamp(0.35, 1.0)
-                + 0.15 * risk_eff).clamp(0.25, 1.50)
-            td_memory = tdError_eff * (0.50 + 0.50 * confidence_eff)
-            reward_abs_eff = reward_eff.detach().abs() * (1.0 + 0.25 * risk_eff)
-        else:
-            write_strength = x.new_ones(B)
-            td_memory = tdError_eff
-            reward_abs_eff = reward_eff.detach().abs()
+        write_strength = (
+            (0.65 + 0.55 * confidence_eff)
+            * (1.0 - 0.45 * uncertainty_eff).clamp(0.35, 1.0)
+            + 0.15 * risk_eff).clamp(0.25, 1.50)
+        td_memory = tdError_eff * (0.50 + 0.50 * confidence_eff)
+        reward_abs_eff = reward_eff.detach().abs() * (1.0 + 0.25 * risk_eff)
 
         if reset:
             self.ResetAll()
@@ -1593,7 +1679,10 @@ class MemoryExtractor(AGICoreModule):
             ocrSemantic=ocrSemantic,
             intentHint=intentHint,
             emotion=emotion_eff,
-            tdError=td_memory)
+            tdError=td_memory,
+            uncertainty=uncertainty_eff,
+            risk=risk_eff,
+            confidence=confidence_eff)
 
         emo_emb = self.emo_write_proj(emotion_eff) # [B, memoryDim]
 
@@ -1606,11 +1695,29 @@ class MemoryExtractor(AGICoreModule):
         alpha = 0.25 * torch.tanh(self.emo_write_alpha)
         val = val_mod + alpha * emo_emb # [B, memoryDim]
 
-        sem_scale = self.sem_gamma_emo(emo_emb) 
-        sem_shift = self.sem_beta_emo(emo_emb)
-    
-        epi_scale = self.epi_gamma_emo(emo_emb)
-        epi_shift = self.epi_beta_emo(emo_emb)
+        sem_context = torch.cat([
+            visualState.LegacyFeat,
+            ocrSemantic,
+            intentHint], dim=-1)
+
+        sem_mod = self.sem_context_mod(sem_context)
+        sem_scale, sem_shift = sem_mod.chunk(2, dim=-1)
+        sem_scale = torch.tanh(sem_scale)
+        sem_mod_signal = sem_shift + 0.1 * sem_scale
+
+        epi_mod_context = torch.cat([
+            event_dense,
+            visualState.MotionToken,
+            visualState.PredErrorToken,
+            td_memory.unsqueeze(-1),
+            reward_eff.unsqueeze(-1),
+            risk_eff.unsqueeze(-1),
+            uncertainty_eff.unsqueeze(-1),
+            confidence_eff.unsqueeze(-1)], dim=-1)
+        epi_mod = self.epi_event_mod(epi_mod_context)
+        epi_scale, epi_shift = epi_mod.chunk(2, dim=-1)
+        epi_scale = torch.tanh(epi_scale)
+        epi_mod_signal = epi_shift + 0.1 * epi_scale
 
         sem_in = val * (1 + sem_scale) + sem_shift # [B, memoryDim]
         epi_in = val * (1 + epi_scale) + epi_shift # [B, memoryDim]
@@ -1637,7 +1744,8 @@ class MemoryExtractor(AGICoreModule):
 
         mem_recall = self.Retrieve(key, fusion_gate, importance=importance_eff, localGate=gate_local, emotion=emotion_eff, tdError=td_memory,) # [B, memoryDim]
         
-        g2, b2 = self.FilmParams(self.film_mem, val) 
+        mem_film_ctx = self.BuildFilmContext(val, mem_recall, emo_emb, td_memory, risk_eff, uncertainty_eff, confidence_eff)
+        g2, b2 = self.FilmParams(self.film_mem, mem_film_ctx)
         s2 = 1.0 + g2
 
         mem_state = self.mem_film_norm(mem_recall * s2 + b2)
@@ -1645,16 +1753,15 @@ class MemoryExtractor(AGICoreModule):
         self.pending.append(("kv",
                              (key.detach(),val.detach(),importance_eff.detach(),emotion_eff.detach(),reward_abs_eff.detach(),src_all.detach())))
 
-        msg = torch.cat([h_new, y_ssm, val], dim=-1) # [B, ssm+out+mem]
-
-        gws_val = self.gws_summary(msg) # [B, memoryDim]
+        gws_val, gws_mod_signal = self.BuildGwsValue(h_new, y_ssm, val, td_memory, risk_eff, confidence_eff) # [B, memoryDim]
 
         gws_recall = self.gws.Attend(key, topk=1) # [B, memoryDim]
 
         affect_mag = td_memory.abs()
         prio = importance_eff * (1.0 + 0.5 * affect_mag + 0.25 * risk_eff).clamp(0.5, 2.0)
 
-        g1, b1 = self.FilmParams(self.film_gws, gws_val) 
+        gws_film_ctx = self.BuildFilmContext(gws_val, gws_recall, gws_mod_signal, td_memory, risk_eff, uncertainty_eff, confidence_eff)
+        g1, b1 = self.FilmParams(self.film_gws, gws_film_ctx)
         s1 = 1.0 + g1
 
         gws_state = self.gws_film_norm(gws_recall * s1 + b1) # [B, memoryDim]
@@ -1668,12 +1775,14 @@ class MemoryExtractor(AGICoreModule):
         
 
         sem_recall, epi_event_recall = self.ltm.Retrieve(key, topkSem=self.ltm_topk_sem, topkEpi=self.ltm_topk_epi, epiQuery=event_key) # [B, memoryDim]
-        epi_dense_recall = self.ltm.episodic.Retrieve(key, topk=self.ltm_topk_epi)
+        epi_dense_recall = self.ltm.episodic.Retrieve(key, topk=self.ltm_topk_epi, useStateKey=True)
         completion_gate = self.event_completion_gate(torch.cat([epi_event_recall, epi_dense_recall, event_dense, td_memory.view(B, 1)], dim=-1))
         epi_recall = completion_gate * epi_event_recall + (1.0 - completion_gate) * epi_dense_recall + 0.05 * completion_gate * event_dense
 
-        g3, b3 = self.FilmParams(self.film_sem, sem_in)  
-        g4, b4 = self.FilmParams(self.film_epi, epi_in) 
+        sem_film_ctx = self.BuildFilmContext(sem_in, sem_recall, sem_mod_signal, td_memory, risk_eff, uncertainty_eff, confidence_eff)
+        epi_film_ctx = self.BuildFilmContext(epi_in, epi_recall, epi_mod_signal, td_memory, risk_eff, uncertainty_eff, confidence_eff)
+        g3, b3 = self.FilmParams(self.film_sem, sem_film_ctx)
+        g4, b4 = self.FilmParams(self.film_epi, epi_film_ctx)
 
         s3 = 1.0 + g3
         s4 = 1.0 + g4
@@ -1682,17 +1791,22 @@ class MemoryExtractor(AGICoreModule):
         epi_state = self.epi_film_norm(epi_recall * s4 + b4) # [B, memoryDim]
 
         self.pending.append(("ltm",
-                              (key.detach(),event_key.detach(),sem_in.detach(),epi_in.detach(),importance_eff.detach(),td_memory.detach(),reward_eff.detach(),src_all.detach(),uncertainty_eff.detach(),risk_eff.detach(),confidence_eff.detach())))
+                              (key.detach(),event_key.detach(),key.detach(),
+                               sem_in.detach(),epi_in.detach(),
+                               importance_eff.detach(),td_memory.detach(),reward_eff.detach(),src_all.detach(),
+                               uncertainty_eff.detach(),risk_eff.detach(),confidence_eff.detach())))
 
         ltm_fused = self.ltm.fuser(sem_state, epi_state)
 
         P_post = self.NsPostRead(val)
 
-        Qsym = self.sym_query(key) # [B, nsK]
+        Qsym_key = self.sym_query(key) # [B, nsK]
+        qsym_mix = self.sym_query_fusion(torch.cat([Qsym_key, P_post], dim=-1)) # [B, nsK]
+        Qsym = qsym_mix * Qsym_key + (1.0 - qsym_mix) * P_post
         Qsym = F.normalize(Qsym, dim=-1)
 
         self.pending.append(("ns",
-                             (Qsym.detach(), P_post.detach(), importance.detach(), src_all.detach())))
+                             (Qsym.detach(), P_post.detach(), importance_eff.detach(), src_all.detach())))
 
         sym_recall = self.sym_mem.Retrieve(Qsym, topK=8) 
 
@@ -1716,8 +1830,8 @@ class MemoryExtractor(AGICoreModule):
 
     
     def ApplyOutputGate(self, memRecall: torch.Tensor, tdError: torch.Tensor, gateBias: torch.Tensor) -> torch.Tensor:
-        gate_out = (1.0 + torch.tanh(tdError + gateBias)) / 2.0
-        return gate_out.view(-1, 1) * memRecall
+        gate_delta = torch.tanh(tdError + gateBias).view(-1, 1)
+        return memRecall + 0.3 * gate_delta * memRecall
 
 
     @torch.no_grad()
@@ -1798,26 +1912,21 @@ class MemoryExtractor(AGICoreModule):
         self, 
         keySem: torch.Tensor, # [B, memory_dim]
         keyEpi: torch.Tensor, # [B, memory_dim]
+        keyEpiState: torch.Tensor, # [B, memory_dim]
         valSem: torch.Tensor, # [B, memory_dim]
         valEpi: torch.Tensor, # [B, memory_dim]
         importance: torch.Tensor, # [B]
         tdError: torch.Tensor, # [B]
         reward: torch.Tensor, # [B] [-10, 10]
         sourceLabel: torch.Tensor,
-        uncertainty: Optional[torch.Tensor] = None,
-        risk: Optional[torch.Tensor] = None,
-        confidence: Optional[torch.Tensor] = None):
+        uncertainty: torch.Tensor,
+        risk: torch.Tensor,
+        confidence: torch.Tensor):
         source_conf = SourceConfidence(sourceLabel, dtype=importance.dtype)
-        has_value_mod = (uncertainty is not None) or (risk is not None) or (confidence is not None)
-        if has_value_mod:
-            B = int(importance.size(0))
-            unc_eff = torch.zeros(B, device=importance.device, dtype=importance.dtype) if uncertainty is None else uncertainty.to(device=importance.device, dtype=importance.dtype).view(B).clamp(0.0, 1.0)
-            risk_eff = torch.zeros(B, device=importance.device, dtype=importance.dtype) if risk is None else risk.to(device=importance.device, dtype=importance.dtype).view(B).clamp(0.0, 1.0)
-            conf_eff = torch.ones(B, device=importance.device, dtype=importance.dtype) if confidence is None else confidence.to(device=importance.device, dtype=importance.dtype).view(B).clamp(0.0, 1.0)
-            value_gain = ((0.65 + 0.55 * conf_eff) * (1.0 - 0.45 * unc_eff).clamp(0.35, 1.0) + 0.15 * risk_eff).clamp(0.25, 1.50)
-        else:
-            risk_eff = torch.zeros_like(importance)
-            value_gain = torch.ones_like(importance)
+        unc_eff = uncertainty
+        risk_eff = risk
+        conf_eff = confidence
+        value_gain = ((0.65 + 0.55 * conf_eff) * (1.0 - 0.45 * unc_eff).clamp(0.35, 1.0) + 0.15 * risk_eff).clamp(0.25, 1.50)
 
         salience = (importance + 0.35 * tdError.abs() + 0.15 * torch.tanh(reward.abs()) + 0.15 * risk_eff) * source_conf * value_gain
         mask_base = (salience > self.ltm_online_imp_thresh) | (tdError.abs() > self.ltm_online_td_thresh)
@@ -1835,7 +1944,7 @@ class MemoryExtractor(AGICoreModule):
         epi = self.ltm.episodic
 
         sem.Store(key=keySem, value=valSem, score=salience, source=sourceLabel, writeMask=mask)
-        epi.Store(key=keyEpi, value=valEpi, reward=reward, score=salience, source=sourceLabel, writeMask=mask)
+        epi.Store(key=keyEpi, value=valEpi, reward=reward, score=salience, source=sourceLabel, writeMask=mask, stateKey=keyEpiState)
         self.memory_version.add_(1)
 
     def Retrieve(
@@ -2100,7 +2209,7 @@ class MemoryExtractor(AGICoreModule):
         top_score, top_idx = StableTopk(salience, k)
 
         idx3 = top_idx.unsqueeze(-1).expand(B, k, int(self.memory_dim))
-        keys = torch.gather(epi.keys, 1, idx3)
+        keys = torch.gather(epi.state_keys, 1, idx3)
         vals = torch.gather(epi.vals, 1, idx3)
         src = torch.gather(epi.source, 1, top_idx)
         score = top_score.to(dtype=dtype)
@@ -2146,12 +2255,8 @@ class MemoryExtractor(AGICoreModule):
                 self.KvWrite(key=key,val=val,importance=imp,emotion=emo,rewardAbs=rew_abs,source=src,)
 
             elif kind == "ltm":
-                if len(payload) == 8:
-                    key_sem, key_epi, sem, epi, imp, td, rwd, src = payload
-                    unc, risk, conf = None, None, None
-                else:
-                    key_sem, key_epi, sem, epi, imp, td, rwd, src, unc, risk, conf = payload
-                self.LtmOnlineStore(keySem=key_sem,keyEpi=key_epi,valSem=sem,valEpi=epi,importance=imp,tdError=td,reward=rwd,sourceLabel=src,uncertainty=unc,risk=risk,confidence=conf,)
+                key_sem, key_epi, key_epi_state, sem, epi, imp, td, rwd, src, unc, risk, conf = payload
+                self.LtmOnlineStore(keySem=key_sem,keyEpi=key_epi,keyEpiState=key_epi_state,valSem=sem,valEpi=epi,importance=imp,tdError=td,reward=rwd,sourceLabel=src,uncertainty=unc,risk=risk,confidence=conf,)
                 
             elif kind == "ns":
                 key, P_post, importance, src = payload
@@ -2256,6 +2361,7 @@ class MemoryExtractor(AGICoreModule):
             "ltm_sem_source": sem.source.clone().zero_().to(dev),
 
             "ltm_epi_keys": epi.keys.clone().zero_().to(dev),
+            "ltm_epi_state_keys": epi.state_keys.clone().zero_().to(dev),
             "ltm_epi_vals": epi.vals.clone().zero_().to(dev),
             "ltm_epi_prio": epi.prio.clone().zero_().to(dev),
             "ltm_epi_rew": epi.rew.clone().zero_().to(dev),
@@ -2371,7 +2477,7 @@ class MemoryExtractor(AGICoreModule):
             "gws_ttl", "gws_last_step", "gws_source", "ltm_sem_keys",
             "ltm_sem_vals", "ltm_sem_prio", "ltm_sem_touch",
             "ltm_sem_step", "ltm_sem_filled", "ltm_sem_source",
-            "ltm_epi_keys", "ltm_epi_vals", "ltm_epi_prio",
+            "ltm_epi_keys", "ltm_epi_state_keys", "ltm_epi_vals", "ltm_epi_prio",
             "ltm_epi_rew", "ltm_epi_rew_abs", "ltm_epi_step",
             "ltm_epi_touch", "ltm_epi_filled", "ltm_epi_source",}
 
@@ -2596,6 +2702,7 @@ class MemoryExtractor(AGICoreModule):
 
         state.update({
             "ltm_epi_keys": epi.keys.clone(), # [B, Cap, D]
+            "ltm_epi_state_keys": epi.state_keys.clone(), # [B, Cap, D]
             "ltm_epi_vals": epi.vals.clone(), # [B, Cap, D]
             "ltm_epi_prio": epi.prio.clone(), # [B, Cap]
             "ltm_epi_rew": epi.rew.clone(), # [B, Cap]
@@ -2688,6 +2795,7 @@ class MemoryExtractor(AGICoreModule):
         idxE3 = idxEpi.unsqueeze(-1).expand(B, CapE, D)
 
         state["ltm_epi_keys"] = torch.gather(state["ltm_epi_keys"], 1, idxE3) * new_validE.unsqueeze(-1).float()
+        state["ltm_epi_state_keys"] = torch.gather(state["ltm_epi_state_keys"], 1, idxE3) * new_validE.unsqueeze(-1).float()
         state["ltm_epi_vals"] = torch.gather(state["ltm_epi_vals"], 1, idxE3) * new_validE.unsqueeze(-1).float()
         state["ltm_epi_prio"] = torch.gather(state["ltm_epi_prio"], 1, idxEpi) * new_validE.float()
         state["ltm_epi_rew"] = torch.gather(state["ltm_epi_rew"], 1, idxEpi) * new_validE.float()
@@ -2881,6 +2989,7 @@ class MemoryExtractor(AGICoreModule):
         if ("ltm_epi_keys" in state) and ("ltm_epi_vals" in state):
             epi = self.ltm.episodic
             k_src = state["ltm_epi_keys"].to(device=epi.keys.device, dtype=epi.keys.dtype) # [B, C, D]
+            ks_src = state.get("ltm_epi_state_keys", state["ltm_epi_keys"]).to(device=epi.state_keys.device, dtype=epi.state_keys.dtype) # [B, C, D]
             v_src = state["ltm_epi_vals"].to(device=epi.vals.device, dtype=epi.vals.dtype) # [B, C, D]
 
             if k_src.dim() == 3 and v_src.dim() == 3:
@@ -2888,7 +2997,7 @@ class MemoryExtractor(AGICoreModule):
                 B = min(B_dst, B_src, int(epi.filled.size(0)))
                 C_dst = int(epi.capacity)
 
-                if D_src == int(self.memory_dim) and int(v_src.size(2)) == int(self.memory_dim):
+                if D_src == int(self.memory_dim) and int(v_src.size(2)) == int(self.memory_dim) and ks_src.dim() == 3 and int(ks_src.size(2)) == int(self.memory_dim):
                     filled_src = state["ltm_epi_filled"].to(device=epi.keys.device, dtype=torch.long)
                     filled_src = filled_src.clamp(min=0, max=C_src)
 
@@ -2917,6 +3026,7 @@ class MemoryExtractor(AGICoreModule):
                         tgt_sel = tgt[mask]
 
                         k_t = k_src[:B, t]
+                        ks_t = ks_src[:B, t]
                         v_t = v_src[:B, t]
                         p_t = pr_src[:B, t]
                         r_t = rw_src[:B, t]
@@ -2924,6 +3034,7 @@ class MemoryExtractor(AGICoreModule):
                         s_t = src_src[:B, t]
 
                         epi.keys[b_sel, tgt_sel].copy_(k_t[mask])
+                        epi.state_keys[b_sel, tgt_sel].copy_(ks_t[mask])
                         epi.vals[b_sel, tgt_sel].copy_(v_t[mask])
                         epi.prio[b_sel, tgt_sel].copy_(p_t[mask])
                         epi.rew[b_sel, tgt_sel].copy_(r_t[mask])
@@ -3103,6 +3214,10 @@ class MemoryExtractor(AGICoreModule):
 
             if "ltm_epi_keys" in state:
                 copy_batch(epi.keys, state["ltm_epi_keys"], float_cast=True)
+            if "ltm_epi_state_keys" in state:
+                copy_batch(epi.state_keys, state["ltm_epi_state_keys"], float_cast=True)
+            elif "ltm_epi_keys" in state:
+                copy_batch(epi.state_keys, state["ltm_epi_keys"], float_cast=True)
             if "ltm_epi_vals" in state:
                 copy_batch(epi.vals, state["ltm_epi_vals"], float_cast=True)
             if "ltm_epi_prio" in state:
@@ -3353,6 +3468,12 @@ class TestMemoryMTool:
             emotion = self.MakeEmotion(B, mem)
         else:
             emotion = emotion.to(device=device)
+        if uncertainty is None:
+            uncertainty = torch.zeros(B, device=device, dtype=x.dtype)
+        if risk is None:
+            risk = torch.zeros(B, device=device, dtype=x.dtype)
+        if confidence is None:
+            confidence = torch.ones(B, device=device, dtype=x.dtype)
 
         visualState = self.MakeVisualState(B, device, x.dtype)
         ocrSemantic = torch.randn(B, 512, device=device, dtype=x.dtype)
@@ -3489,19 +3610,40 @@ class TestMemoryMTool:
             ltm.Reset()
 
             B = 1
-            key = F.normalize(torch.randn(B, dim, device=self.device), dim=-1)
+            key = torch.zeros(B, dim, device=self.device)
+            key[0, 0] = 1.0
+            state_key = torch.zeros(B, dim, device=self.device)
+            state_key[0, 1] = 1.0
             val = torch.randn(B, dim, device=self.device)
+            key2 = torch.zeros(B, dim, device=self.device)
+            key2[0, 2] = 1.0
+            state_key2 = torch.zeros(B, dim, device=self.device)
+            state_key2[0, 3] = 1.0
+            val2 = torch.zeros(B, dim, device=self.device)
+            val2[0, 4] = 3.0
 
             ltm.semantic.Store(key=key, value=val, score=torch.tensor([0.9], device=self.device),
                               source=torch.tensor([MemoryType.SRC_REAL], device=self.device, dtype=torch.int8))
             ltm.episodic.Store(key=key, value=val, reward=torch.tensor([-1.0], device=self.device),
                                score=torch.tensor([0.8], device=self.device),
-                               source=torch.tensor([MemoryType.SRC_REAL], device=self.device, dtype=torch.int8))
+                               source=torch.tensor([MemoryType.SRC_REAL], device=self.device, dtype=torch.int8),
+                               stateKey=state_key)
+            ltm.episodic.Store(key=key2, value=val2, reward=torch.tensor([2.0], device=self.device),
+                               score=torch.tensor([1.0], device=self.device),
+                               source=torch.tensor([MemoryType.SRC_REAL], device=self.device, dtype=torch.int8),
+                               stateKey=state_key2)
 
             ltm.StepTick()
             sem_out, epi_out = ltm.Retrieve(key, topkSem=4, topkEpi=2)
+            epi_state_out = ltm.episodic.Retrieve(state_key, topk=2, useStateKey=True)
+            epi_event2 = ltm.episodic.Retrieve(key2, topk=1)
+            epi_state2 = ltm.episodic.Retrieve(state_key2, topk=1, useStateKey=True)
             assert sem_out.shape == (B, dim) and epi_out.shape == (B, dim)
+            assert epi_state_out.shape == (B, dim)
             assert torch.linalg.norm(sem_out).item() > 0 and torch.linalg.norm(epi_out).item() > 0
+            assert torch.linalg.norm(epi_state_out).item() > 0
+            assert torch.allclose(epi_event2, val2, atol=1e-6, rtol=1e-6)
+            assert torch.allclose(epi_state2, val2, atol=1e-6, rtol=1e-6)
 
             print("LongTermMemory test passed.")
             return True
@@ -3929,10 +4071,13 @@ class TestMemoryMTool:
                 epi.filled.fill_(2)
                 epi.global_step.fill_(5)
                 epi.keys.zero_()
+                epi.state_keys.zero_()
                 epi.vals.zero_()
                 epi.prio.zero_()
                 epi.keys[:, 0, 0] = 1.0
                 epi.keys[:, 1, 1] = 1.0
+                epi.state_keys[:, 0, 0] = 1.0
+                epi.state_keys[:, 1, 1] = 1.0
                 epi.vals[:, 0] = torch.randn(2, int(mem.memory_dim), device=self.device)
                 epi.vals[:, 1] = torch.randn(2, int(mem.memory_dim), device=self.device)
                 epi.prio[:, :2] = torch.tensor([[1.0, 0.8], [0.7, 0.6]], device=self.device)
@@ -3983,6 +4128,9 @@ class TestMemoryMTool:
             emotion = torch.zeros(B, cfg["emotionDim"], device=self.device)
             emotion[1, 0] = 1.0
             td = torch.tensor([0.0, 1.0], device=self.device)
+            uncertainty = torch.tensor([0.0, 0.2], device=self.device)
+            risk = torch.tensor([0.0, 0.4], device=self.device)
+            confidence = torch.tensor([1.0, 0.8], device=self.device)
 
             dense, event_key = mem.BuildEventCode(
                 x,
@@ -3990,7 +4138,10 @@ class TestMemoryMTool:
                 ocrSemantic=ocr,
                 intentHint=intent,
                 emotion=emotion,
-                tdError=td,)
+                tdError=td,
+                uncertainty=uncertainty,
+                risk=risk,
+                confidence=confidence,)
             assert dense.shape == (B, cfg["memoryDim"])
             assert event_key.shape == (B, cfg["memoryDim"])
             assert torch.isfinite(dense).all() and torch.isfinite(event_key).all()
@@ -4046,6 +4197,7 @@ class TestMemoryMTool:
             epi = mem.ltm.episodic
             epi_mask = torch.arange(int(epi.capacity), device=self.device).view(1, -1) < epi.filled.view(-1, 1)
             assert_unit("ltm_epi", epi.keys, epi_mask)
+            assert_unit("ltm_epi_state", epi.state_keys, epi_mask)
 
             sym_n = int(mem.sym_mem.filled.item())
             if sym_n <= 0:
@@ -4080,6 +4232,7 @@ class TestMemoryMTool:
                 mem.ltm.semantic.keys[0, 0, 0] = 6.0
                 mem.ltm.semantic.filled[0] = 1
                 mem.ltm.episodic.keys[0, 0, 0] = 5.0
+                mem.ltm.episodic.state_keys[0, 0, 0] = 4.0
                 mem.ltm.episodic.filled[0] = 1
 
             mem.EnsureB(3, device=self.device, dtype=torch.float32)
@@ -4095,6 +4248,7 @@ class TestMemoryMTool:
             assert torch.count_nonzero(mem.ltm.semantic.keys).item() == 0
             assert int(mem.ltm.episodic.filled.sum().item()) == 0
             assert torch.count_nonzero(mem.ltm.episodic.keys).item() == 0
+            assert torch.count_nonzero(mem.ltm.episodic.state_keys).item() == 0
 
             gws = GlobalWorkspace(dim=8, slots=3, defaultTtl=4).to(self.device)
             with torch.no_grad():

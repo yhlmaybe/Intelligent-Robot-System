@@ -714,8 +714,8 @@ class BrainCore(nn.Module):
             critic_out = self.critic(x=value_x, **value_kwargs)
         else:
             critic_out = self.critic(memory=self.prev_mem,attn=self.prev_attn,state=s_t,
-                                     rewardModel=r_t,
-                                     policyEntropyPrev=self.prev_entropy,doneModel=d_t,
+                                     rewardModel=r_t,doneModel=d_t,
+                                     policyEntropyPrev=self.prev_entropy,
                                      worldDeltaTransport=d_tr,worldDeltaPhysics=d_ph,)
         saveModuleOutput("ValueEstimation", critic_out)
 
@@ -1442,36 +1442,11 @@ class Agent:
             raise TypeError(f"checkpoint {path} has invalid brain weights payload")
 
         self.brain.ResizeStateBuffersForLoad(brain_state)
-        self.brain.load_state_dict(brain_state, strict=False)
+        self.brain.load_state_dict(brain_state, strict=True)
 
-    def LoadBrainStateDictCompat(self, brainState: Dict[str, Any], strict: bool):
+    def LoadBrainStateDict(self, brainState: Dict[str, Any], strict: bool):
         self.brain.ResizeStateBuffersForLoad(brainState)
-        if not strict:
-            self.brain.load_state_dict(brainState, strict=False)
-            return
-
-        value_prefixes = (
-            "critic.model_value_head.",
-            "critic.calibration_head.",
-            "critic.model_value_adapter.",
-            "critic.calibration_adapter.",
-            "critic.model_fusion_gate.",
-            "critic.graph_fusion_gate.",
-            "critic.base.model_value_head.",
-            "critic.base.calibration_head.",
-            "critic.base.model_value_adapter.",
-            "critic.base.calibration_adapter.",
-            "critic.base.model_fusion_gate.",
-            "critic.base.graph_fusion_gate.",)
-        incompatible = self.brain.load_state_dict(brainState, strict=False)
-        missing = list(getattr(incompatible, "missing_keys", []))
-        unexpected = list(getattr(incompatible, "unexpected_keys", []))
-        if len(unexpected) == 0 and all(any(k.startswith(p) for p in value_prefixes) for k in missing):
-            if len(missing) > 0:
-                print(f"Brain checkpoint loaded with value-module compatibility fallback, missing new keys: {len(missing)}")
-            return
-
-        self.brain.load_state_dict(brainState, strict=True)
+        self.brain.load_state_dict(brainState, strict=bool(strict))
 
     def ExportModuleMessagerData(self, nSteps: int = 0):
         return self.brain.moduleMessager.ExportDict(nSteps=nSteps)
@@ -1606,7 +1581,7 @@ class Agent:
         payload = torch.load(path, map_location=mapLocation or self.device, weights_only=False)
 
         if isinstance(payload, dict) and ("brain" in payload):
-            self.LoadBrainStateDictCompat(payload["brain"], strict=strict)
+            self.LoadBrainStateDict(payload["brain"], strict=strict)
 
             if self.is_train:
                 if "opt_actor" in payload:
@@ -1631,7 +1606,7 @@ class Agent:
             except Exception:
                 traceback.print_exc()
         else:
-            self.LoadBrainStateDictCompat(payload, strict=strict)
+            self.LoadBrainStateDict(payload, strict=strict)
 
         self.SaveRuntimeMemories()
 
