@@ -2367,6 +2367,7 @@ class MemoryExtractor(AGICoreModule):
             "ltm_epi_rew": epi.rew.clone().zero_().to(dev),
             "ltm_epi_rew_abs": epi.rew_abs.clone().zero_().to(dev),
             "ltm_epi_step": epi.step.clone().zero_().to(dev),
+            "ltm_epi_touch": epi.touch.clone().zero_().to(dev),
             "ltm_epi_filled": epi.filled.clone().zero_().to(dev),
             "ltm_epi_global_step": epi.global_step.clone().zero_(),
             "ltm_epi_source": epi.source.clone().zero_().to(dev),
@@ -2381,6 +2382,7 @@ class MemoryExtractor(AGICoreModule):
             "sym_mem_source": self.sym_mem.source.clone().zero_().to(dev),
 
             "ns_prev_P_post": self.ns_prev_P_post.clone().zero_(),
+            "ns_penalty_vec": self.ns_penalty_vec.clone().zero_(),
 
             "rng_cpu": torch.get_rng_state(),
             "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,}
@@ -3171,8 +3173,7 @@ class MemoryExtractor(AGICoreModule):
 
         if importGws:
             if "gws_global_step" in state:
-                ggs = state["gws_global_step"].to(self.gws.global_step.device).long().view(-1)
-                self.gws.global_step.copy_(ggs[:1])
+                self.gws.global_step.copy_(as_B_vec(state["gws_global_step"], to_long=True))
 
             if "gws_keys" in state:
                 copy_batch(self.gws.keys, state["gws_keys"], float_cast=True)
@@ -3230,6 +3231,8 @@ class MemoryExtractor(AGICoreModule):
                 copy_batch(epi.rew_abs, state["ltm_epi_rew"].abs(), float_cast=True)
             if "ltm_epi_step" in state:
                 copy_batch(epi.step, state["ltm_epi_step"].long(), float_cast=False)
+            if "ltm_epi_touch" in state:
+                copy_batch(epi.touch, state["ltm_epi_touch"].long(), float_cast=False)
             if "ltm_epi_filled" in state:
                 epi.filled.copy_(as_B_vec(state["ltm_epi_filled"], to_long=True).clamp(min=0, max=int(epi.capacity)))
             if "ltm_epi_source" in state:
@@ -4630,7 +4633,10 @@ class TestMemoryMTool:
 
             mem2 = MemoryExtractor(**cfg).to(self.device).eval()
             mem2.load_state_dict(mem1.state_dict(), strict=True)
+            mem2.ltm.episodic.touch.zero_()
             mem2.ImportState(state, importGws=True, importLtm=True, importSym=True)
+
+            self.AssertClose(mem1.ltm.episodic.touch.float(), mem2.ltm.episodic.touch.float(), msg="Episodic touch ImportState")
 
             torch.manual_seed(5678)
             y1 = self.CallMemForward(mem1, x, tdError=td, reward=rwd, emotion=emotion)

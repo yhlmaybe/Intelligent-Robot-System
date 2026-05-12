@@ -703,18 +703,21 @@ class BrainCore(nn.Module):
         self.prev_world_s = s_t.detach()
         self.prev_done_flag = done_now.detach()
 
+        value_reward = reward_ext if (isTrain and reward_ext is not None) else r_t
+        value_done = done_ext if (isTrain and done_ext is not None) else d_t
+
         if self.is_online_learning:
             value_kwargs = {
-                "rewardModel": r_t,
+                "rewardModel": value_reward,
                 "policyEntropyPrev": self.prev_entropy,
-                "doneModel": d_t,
+                "doneModel": value_done,
                 "worldDeltaTransport": d_tr,
                 "worldDeltaPhysics": d_ph}
-            value_x = {"memory": self.prev_mem,"attn": self.prev_attn, "state": s_t} # memory:[B, D_mem], attn:[B, D_attn], state:[B, D_world]
+            value_x = {"memoryPrev": self.prev_mem,"attnPrev": self.prev_attn, "state": s_t} # memoryPrev:[B, D_mem], attnPrev:[B, D_attn], state:[B, D_world]
             critic_out = self.critic(x=value_x, **value_kwargs)
         else:
-            critic_out = self.critic(memory=self.prev_mem,attn=self.prev_attn,state=s_t,
-                                     rewardModel=r_t,doneModel=d_t,
+            critic_out = self.critic(memoryPrev=self.prev_mem,attnPrev=self.prev_attn,state=s_t,
+                                     rewardModel=value_reward,doneModel=value_done,
                                      policyEntropyPrev=self.prev_entropy,
                                      worldDeltaTransport=d_tr,worldDeltaPhysics=d_ph,)
         saveModuleOutput("ValueEstimation", critic_out)
@@ -1224,8 +1227,8 @@ class BrainCore(nn.Module):
                         reward_in = reward_list[i]
 
                     value = criticModule(
-                        memory=mem_list[i-1],
-                        attn=atten_list[i-1],
+                        memoryPrev=mem_list[i-1],
+                        attnPrev=atten_list[i-1],
                         state=world_state_list[i],
                         rewardModel=reward_list[i],
                         policyEntropyPrev=entropy_list[i-1],
@@ -1329,6 +1332,8 @@ class Agent:
             self.opt_actor = torch.optim.Adam(actor_params, lr=3e-4)
 
             self.opt_critic = torch.optim.Adam(self.brain.critic.parameters(), lr=2e-4)
+            if hasattr(self.brain.critic, "SetDelayedGraphAfterOptimizerStep"):
+                self.brain.critic.SetDelayedGraphAfterOptimizerStep(True)
 
             self.opt_world = torch.optim.Adam(self.brain.world.parameters(), lr=2e-4)
 
@@ -1634,6 +1639,10 @@ class Agent:
 
     def ResetHebbianMemory(self):
         self.brain.ResetHebbianMemory()
+
+    def AfterOptimizerStep(self):
+        if hasattr(self.brain.critic, "BuildDelayedTransitionGraph"):
+            self.brain.critic.BuildDelayedTransitionGraph()
 
 
 

@@ -2164,6 +2164,7 @@ class ManagerFunction:
                     agent.opt_world.step()
                     agent.opt_critic.step()
                     agent.opt_actor.step()
+                    agent.AfterOptimizerStep()
 
                     previous_processed_sample_count_total = processed_sample_count_total
                     processed_sample_count_total += int(frames.size(0))
