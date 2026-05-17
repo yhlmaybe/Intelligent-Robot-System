@@ -2131,6 +2131,7 @@ class ManagerFunction:
                     click_pred = act_out["mouse_clicks"]
                     mouse_move_pred = act_out["mouse_move"]
                     model_loss = act_out["loss"]
+                    transport_delayed_loss = act_out.get("transport_delayed_loss", None)
                     ocr_items = act_out["OCR"]
                     bc_loss, _, _ = compute_supervised_loss_and_metrics(
                         key_pred,
@@ -2146,7 +2147,22 @@ class ManagerFunction:
                     agent.opt_critic.zero_grad(set_to_none=True)
                     agent.opt_actor.zero_grad(set_to_none=True)
 
-                    loss.backward()
+                    transport_capture_delayed = {"captured": 0.0, "grad_norm": 0.0, "accum_steps": 0.0}
+                    if transport_delayed_loss.requires_grad:
+                        transport_delayed_loss.backward(retain_graph=True)
+                        transport_capture_delayed = agent.CaptureCriticTransportGrad()
+
+                    loss.backward(retain_graph=True)
+                    transport_capture_current = agent.CaptureCriticTransportGrad()
+                    transport_capture = {
+                        "captured": transport_capture_delayed["captured"] + transport_capture_current["captured"],
+                        "grad_norm": (
+                            transport_capture_delayed["grad_norm"] ** 2
+                            + transport_capture_current["grad_norm"] ** 2) ** 0.5,
+                        "accum_steps": max(
+                            transport_capture_delayed["accum_steps"],
+                            transport_capture_current["accum_steps"]),}
+                    transport_apply = agent.ApplyCriticTransportManualGrad()
                     if onlineLearning:
                         agent.UpdateAllWrappers("accumulategrads")
                         agent.UpdateAllWrappers("autogrow")
@@ -2204,7 +2220,12 @@ class ManagerFunction:
                     if visual_payload is not None:
                         status_kwargs["visual"] = visual_payload
 
-                    self.controller.SetStatus("training", "Training...", **status_kwargs)
+                    transport_status = ""
+                    if transport_capture["captured"] > 0.0 or transport_apply["updated"] > 0.0:
+                        transport_status = (
+                            f" transport_grad={transport_capture['grad_norm']:.3e}"
+                            f" transport_update={int(transport_apply['updated'])}")
+                    self.controller.SetStatus("training", f"Training...{transport_status}", **status_kwargs)
 
                     if self.controller.ShouldStop():
                         break

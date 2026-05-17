@@ -365,6 +365,35 @@ class SwiGLUBlock(AGICoreModule):
         return x + self.drop(h * self.gamma) # [B, D]
 
 
+class ValueDynamicsRoPEBlock(AGICoreModule):
+    def __init__(
+        self,
+        dim: int,
+        numHeads: int,
+        ffDim: int,
+        drop: float = 0.05,):
+        super().__init__()
+        self.ln_attn = nn.LayerNorm(dim)
+        self.attn = RoPEMultiheadAttention(embedDim=dim, numHeads=numHeads, dropout=drop)
+        self.drop_attn = nn.Dropout(drop)
+        self.ln_ff = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, ffDim),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(ffDim, dim),)
+        self.drop_ff = nn.Dropout(drop)
+        self.gamma_attn = nn.Parameter(torch.ones(dim) * 0.1)
+        self.gamma_ff = nn.Parameter(torch.ones(dim) * 0.1)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        x = self.ln_attn(tokens)
+        attn, _ = self.attn(x, x, x, needWeights=False)
+        tokens = tokens + self.drop_attn(attn * self.gamma_attn)
+        ff = self.ff(self.ln_ff(tokens))
+        return tokens + self.drop_ff(ff * self.gamma_ff)
+
+
 class IntentFusion(AGICoreModule):
     def __init__(
         self,
@@ -484,12 +513,60 @@ class DecisionExtractor(AGICoreModule):
         intentDim: int = 1024,
         includeNoSkill: bool = True,
         *,
-        entropyWeights: Tuple[float, float, float] = (0.6, 0.2, 0.2),): # keys, click, mouse
+        entropyWeights: Tuple[float, float, float] = (0.6, 0.2, 0.2), # keys, click, mouse
+        valueTensorDim: int = 512,
+        vNextTensorDim: int = 512,): 
         super().__init__()
 
         self.stateDim = int(stateDim)
         self.intentDim = int(intentDim)
         self.includeNoSkill = bool(includeNoSkill)
+        self.value_tensor_dim = int(valueTensorDim)
+        self.v_next_tensor_dim = int(vNextTensorDim)
+        self.value_joint_dim = max(self.value_tensor_dim, self.v_next_tensor_dim)
+
+        value_hidden = max(64, min(self.stateDim, 32 * self.value_tensor_dim))
+        self.value_tensor_gate = nn.Sequential(
+            nn.LayerNorm(self.value_tensor_dim),
+            nn.Linear(self.value_tensor_dim, value_hidden),
+            nn.GELU(),
+            nn.Linear(value_hidden, self.stateDim),)
+        nn.init.zeros_(self.value_tensor_gate[-1].weight)
+        nn.init.zeros_(self.value_tensor_gate[-1].bias)
+
+        self.value_token_dim = max(64, min(256, self.stateDim // 4))
+        value_heads = 8
+        while value_heads > 1 and self.value_token_dim % value_heads != 0:
+            value_heads //= 2
+
+        self.value_token_proj = nn.Sequential(
+            nn.LayerNorm(self.value_joint_dim),
+            nn.Linear(self.value_joint_dim, self.value_token_dim),
+            nn.GELU(),
+            nn.Linear(self.value_token_dim, self.value_token_dim),)
+        
+        self.value_trend_proj = nn.Sequential(
+            nn.LayerNorm(self.value_joint_dim),
+            nn.Linear(self.value_joint_dim, self.value_token_dim),
+            nn.GELU(),
+            nn.Linear(self.value_token_dim, self.value_token_dim),)
+
+        self.value_dynamics_blocks = nn.ModuleList([
+                ValueDynamicsRoPEBlock(
+                dim=self.value_token_dim,
+                numHeads=value_heads,
+                ffDim=max(256, 4 * self.value_token_dim),
+                drop=0.05)
+            for _ in range(2)])
+        self.value_query_token = nn.Parameter(torch.zeros(1, 1, self.value_token_dim))
+        self.value_token_type = nn.Parameter(torch.zeros(1, 4, self.value_token_dim))
+        self.value_dynamics_gate = nn.Sequential(
+            nn.LayerNorm(self.value_token_dim * 2),
+            nn.Linear(self.value_token_dim * 2, max(128, self.value_token_dim * 2)),
+            nn.GELU(),
+            nn.Linear(max(128, self.value_token_dim * 2), self.stateDim),)
+        nn.init.zeros_(self.value_dynamics_gate[-1].weight)
+        nn.init.zeros_(self.value_dynamics_gate[-1].bias)
 
         self.fuser = IntentFusion(
             stateDim=self.stateDim,
@@ -625,6 +702,42 @@ class DecisionExtractor(AGICoreModule):
         w = self.entropy_w
         return w[0] * comps["keys_norm"] + w[1] * comps["click_norm"] + w[2] * comps["mouse_norm"]
 
+    def FormatValueTensor(self, valueTensor: torch.Tensor, dim: int, B: int) -> torch.Tensor:
+        x = valueTensor.view(B, -1)
+        if x.size(-1) >= dim:
+            return x[..., :dim]
+        return torch.cat([x, x.new_zeros(B, dim - x.size(-1))], dim=-1)
+
+    def BuildValueDynamicsFeature(
+        self,
+        valueTensor: torch.Tensor,
+        vNextTensor: torch.Tensor,
+        B: int,) -> torch.Tensor:
+        value_in = self.FormatValueTensor(valueTensor, self.value_joint_dim, B)
+        v_next_in = self.FormatValueTensor(vNextTensor, self.value_joint_dim, B)
+        delta_in = v_next_in - value_in
+        value_tokens = torch.stack([
+            self.value_token_proj(value_in),
+            self.value_token_proj(v_next_in),
+            self.value_trend_proj(delta_in),], dim=1)
+        query = self.value_query_token.expand(B, -1, -1)
+        tokens = torch.cat([query, value_tokens], dim=1) + self.value_token_type
+        for block in self.value_dynamics_blocks:
+            tokens = block(tokens)
+        return torch.cat([tokens[:, 0], tokens[:, 3]], dim=-1)
+
+    def FuseValueTensors(
+        self,
+        stateFeat: torch.Tensor,
+        valueTensor: torch.Tensor,
+        vNextTensor: torch.Tensor,
+    ) -> torch.Tensor:
+        B = stateFeat.size(0)
+        value_gate_in = self.FormatValueTensor(valueTensor, self.value_tensor_dim, B)
+        value_dyn = self.BuildValueDynamicsFeature(valueTensor, vNextTensor, B)
+        residual = self.value_tensor_gate(value_gate_in) + self.value_dynamics_gate(value_dyn)
+        return stateFeat + residual
+
     def forward(
         self,
         stateFeat: torch.Tensor,
@@ -634,9 +747,12 @@ class DecisionExtractor(AGICoreModule):
         deterministic: bool = False,
         prevOptionLogit: Optional[torch.Tensor] = None,
         prior: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
-        mixW: float = 0.3,) -> Dict[str, torch.Tensor]:
+        mixW: float = 0.3,
+        valueTensor: torch.Tensor,
+        vNextTensor: torch.Tensor,) -> Dict[str, torch.Tensor]:
 
         B = stateFeat.size(0)
+        stateFeat = self.FuseValueTensors(stateFeat, valueTensor, vNextTensor)
         z = self.Encode(stateFeat, intentFeat) # [B, hiddenDim]
 
         option_logits, psi_all = self.option(z, prevOptionLogit) # [B, optionNum], [B, optionNum, psiDim], [B, 1]
@@ -927,6 +1043,8 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         prior: Optional[Dict[str, Dict[str, torch.Tensor]]] = kwargs.get("prior", None)
         mixW: float = float(kwargs.get("mixW", 0.3))
         intentFeat: Optional[torch.Tensor] = kwargs.get("intentFeat", None)
+        valueTensor: torch.Tensor = kwargs["valueTensor"]
+        vNextTensor: torch.Tensor = kwargs["vNextTensor"]
 
         if intentFeat is None:
             raise ValueError("DecisionOnlineWrapper.ForwardWithDeltas requires intentFeat in kwargs")
@@ -934,16 +1052,16 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         D = deltasPerLayer[0] if (deltasPerLayer and len(deltasPerLayer) > 0) else {}
 
         B = x.size(0)
-        device = x.device
         K = self.base.option.K
 
         has_prev = prevOptionLogit is not None
 
         prev = (
-            prevOptionLogit.detach().to(dtype=x.dtype, device=device)
+            prevOptionLogit.detach()
             if has_prev
-            else torch.zeros(B, K, dtype=x.dtype, device=device))
+            else x.new_zeros(B, K))
 
+        x = self.base.FuseValueTensors(x, valueTensor, vNextTensor)
         h = self.base.fuser(x, intentFeat)
 
         for i, blk in enumerate(self.base.feature_net):
@@ -1255,7 +1373,9 @@ class CEMPlanner(AGICoreModule):
         h0: torch.Tensor,
         z0: torch.Tensor,
         x0: torch.Tensor,
-        returnTrajectories: bool = False,) -> Dict[str, Dict[str, torch.Tensor]]:
+        returnTrajectories: bool = False,
+        terminalValue: Optional[torch.Tensor] = None, # [B], critic V(s_0) for terminal bootstrap
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
 
         B = int(keysLogits.size(0))
         device = self.device
@@ -1309,6 +1429,10 @@ class CEMPlanner(AGICoreModule):
                 score = score + cont * ((self.gamma ** t) * r_t)
                 cont = cont * (1.0 - d_t)
 
+            if terminalValue is not None:
+                v_term = terminalValue.detach().view(B, 1)
+                score = score + cont * ((self.gamma ** H) * v_term)
+
             topk = torch.topk(score, k=E, dim=1).indices # [B,E]
             elite_scores = score.gather(1, topk) # [B,E]
 
@@ -1356,8 +1480,80 @@ class CEMPlanner(AGICoreModule):
                 "std_seq": std_t,
                 "keys_logits_seq": logits_k,
                 "click_logits_seq": logits_c,}
-            
+
         return out
+
+
+class PriorFusionNet(AGICoreModule):
+    """Zero-init residual fusion of CEM planner prior with V_next tensor."""
+
+    def __init__(
+        self,
+        stateDim: int,
+        intentDim: int,
+        vNextTensorDim: int,
+        keyDim: int,
+        hidden: int = 128,):
+        super().__init__()
+        in_dim = int(stateDim) + int(intentDim) + int(vNextTensorDim)
+        self.in_dim = in_dim
+        self.key_dim = int(keyDim)
+        self.v_next_tensor_dim = int(vNextTensorDim)
+
+        def head(outDim: int, hiddenDim: int = hidden) -> nn.Sequential:
+            net = nn.Sequential(
+                nn.LayerNorm(in_dim),
+                nn.Linear(in_dim, hiddenDim),
+                nn.GELU(),
+                nn.Linear(hiddenDim, outDim),)
+            nn.init.zeros_(net[-1].weight)
+            nn.init.zeros_(net[-1].bias)
+            return net
+
+        self.key_delta = head(self.key_dim, hiddenDim=max(hidden, 2 * self.key_dim))
+        self.click_delta = head(2)
+        self.mouse_mu_delta = head(2)
+        self.mouse_logvar_delta = head(2)
+        self.gate = head(1, hiddenDim=64)
+
+    def forward(
+        self,
+        stateFeat: torch.Tensor,
+        intentFeat: torch.Tensor,
+        vNextTensor: torch.Tensor,
+        plannerPrior: Dict[str, Dict[str, torch.Tensor]],
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
+        B = stateFeat.size(0)
+        v = vNextTensor.detach().view(B, -1)
+        if v.size(-1) > self.v_next_tensor_dim:
+            v = v[:, : self.v_next_tensor_dim]
+        elif v.size(-1) < self.v_next_tensor_dim:
+            pad = v.new_zeros(B, self.v_next_tensor_dim - v.size(-1))
+            v = torch.cat([v, pad], dim=-1)
+
+        feat = torch.cat([stateFeat.detach(), intentFeat.detach(), v], dim=-1)
+        beta = torch.sigmoid(self.gate(feat))
+
+        keys_logits = plannerPrior["keys"]["logits"] + beta * self.key_delta(feat)
+        click_logits = plannerPrior["click"]["logits"] + beta * self.click_delta(feat)
+
+        mu_plan = plannerPrior["mouse"]["mu"]
+        var_plan = plannerPrior["mouse"]["var"].clamp_min(1e-6)
+        mu_delta = self.mouse_mu_delta(feat)
+        logvar_delta = self.mouse_logvar_delta(feat)
+        mu_value = mu_plan + mu_delta
+        var_value = (var_plan.log() + logvar_delta).exp().clamp_min(1e-6)
+        mu_fused = (1.0 - beta) * mu_plan + beta * mu_value
+        var_fused = (
+            (1.0 - beta) * var_plan
+            + beta * var_value
+            + beta * (1.0 - beta) * (mu_plan - mu_value).square())
+
+        return {
+            "keys": {"logits": keys_logits},
+            "click": {"logits": click_logits},
+            "mouse": {"mu": mu_fused, "var": var_fused},
+            "gate": {"beta": beta.squeeze(-1)},}
 
 
 class DecisionPlannerExtractor:

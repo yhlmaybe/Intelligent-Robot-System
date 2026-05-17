@@ -22,7 +22,7 @@ from collections import deque
 from PerceptionModule import PerceiveExtractor, PerceptionOnlineWrapper, TopDownContext, VisualState
 from AttentionModule import AttentionExtractor, AttentionOnlineWrapper
 from MemoryModule import MemoryExtractor, MemoryType
-from DecisionModule import DecisionExtractor, DecisionOnlineWrapper, RAW_KEYBOARD_LAYOUT, DecisionPlannerExtractor, StableLogProbBernoulli
+from DecisionModule import DecisionExtractor, DecisionOnlineWrapper, RAW_KEYBOARD_LAYOUT, DecisionPlannerExtractor, StableLogProbBernoulli, PriorFusionNet
 from WorldModule import RSSMWorldModel, WorldOnlineWrapper
 from ValueEstimationModule import ValueEstimationExtractor,ValueEstimationOnlineWrapper
 from ConsciousnessModule import ConsciousnessExtractor
@@ -250,11 +250,14 @@ class BrainCore(nn.Module):
             useHebbian=plasticHebbian,
             emotionDim=ModuleDim.ValueEstimationOutEmotion)
         
+        self.value_tensor_dim = 512
         self.actor = DecisionExtractor(
-            stateDim=ModuleDim.MemoryFeat, 
+            stateDim=ModuleDim.MemoryFeat,
             intentDim=ModuleDim.IntentionFeat,
-            includeNoSkill=True, 
-            useHebb=plasticHebbian)
+            includeNoSkill=True,
+            useHebb=plasticHebbian,
+            valueTensorDim=self.value_tensor_dim,
+            vNextTensorDim=self.value_tensor_dim,)
         
         self.world = RSSMWorldModel(
             visionDim=ModuleDim.AttentionFeat, 
@@ -270,11 +273,12 @@ class BrainCore(nn.Module):
             legacyFeatDim=ModuleDim.PerceptionFeat)
 
         self.critic = ValueEstimationExtractor(
-            memoryDim=ModuleDim.MemoryFeat, 
-            attnDim=ModuleDim.AttentionFeat, 
+            memoryDim=ModuleDim.MemoryFeat,
+            attnDim=ModuleDim.AttentionFeat,
             stateDim=ModuleDim.WorldFeat,
             emotionDim=ModuleDim.ValueEstimationOutEmotion,
-            useHebb=plasticHebbian)
+            useHebb=plasticHebbian,
+            valueTensorDim=self.value_tensor_dim,)
         
         self.conscious = ConsciousnessExtractor(
             memItemDim=ModuleDim.MemoryItem,
@@ -302,6 +306,7 @@ class BrainCore(nn.Module):
         self.use_planner = usePlanner
 
         self.planner = None
+        self.prior_fuser = None
         if self.use_planner:
             planner_keyboard_layout = {"default": RAW_KEYBOARD_LAYOUT}
             self.planner = DecisionPlannerExtractor().BuildPlanner(
@@ -311,6 +316,11 @@ class BrainCore(nn.Module):
                 horizon=5, N=64, elite=8, iters=3,
                 gamma=0.99, temperature=1.0, momentum=0.15,
                 minVar=1e-4, epsBern=1e-4)
+            self.prior_fuser = PriorFusionNet(
+                stateDim=ModuleDim.MemoryFeat,
+                intentDim=ModuleDim.IntentionFeat,
+                vNextTensorDim=self.value_tensor_dim,
+                keyDim=int(max(RAW_KEYBOARD_LAYOUT.values())) + 1,)
 
         self.max_code = int(max(RAW_KEYBOARD_LAYOUT.values()))
         self.buf_B = 0
@@ -722,6 +732,9 @@ class BrainCore(nn.Module):
                                      worldDeltaTransport=d_tr,worldDeltaPhysics=d_ph,)
         saveModuleOutput("ValueEstimation", critic_out)
 
+        value_current = critic_out.value
+        value_next_current = critic_out.valueNext
+
         td_sig = critic_out.tdError.detach() # [B]
         unc_sig = critic_out.uncertainty.detach() # [B]
         precision_sig = critic_out.precision.detach() # [B]
@@ -792,12 +805,14 @@ class BrainCore(nn.Module):
         self.prev_goal_bias = intent_sem.detach()
 
         if self.is_online_learning:
-            actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionLogit": 
-                            self.prev_option_logit, "intentFeat":intent_sem}
+            actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionLogit":
+                            self.prev_option_logit, "intentFeat":intent_sem, "valueTensor": value_current,
+                            "vNextTensor": value_next_current}
             act_out = self.actor(x=mem_feat,**actor_kwargs)
-        else:    
+        else:
             act_out = self.actor(stateFeat=mem_feat,intentFeat=intent_sem,sample=sampleActions,
-                                deterministic=deterministicActor,prevOptionLogit=self.prev_option_logit)
+                                 deterministic=deterministicActor,prevOptionLogit=self.prev_option_logit,
+                                valueTensor=value_current, vNextTensor=value_next_current)
 
         if self.use_planner:
             prior = None
@@ -807,17 +822,26 @@ class BrainCore(nn.Module):
                 keysLogits = act_out["keyboard"]["keys_logits"].detach() # [B, K_key]
                 clickLogits = act_out["mouse"]["click_logits"].detach() # [B, 2]
 
-                prior = self.planner.Plan(keysLogits=keysLogits, mouseMu=mouseMu, mouseLogstd=mouseLogstd,
+                planner_prior = self.planner.Plan(keysLogits=keysLogits, mouseMu=mouseMu, mouseLogstd=mouseLogstd,
                                           clickLogits=clickLogits,
                                           h0=self.prev_world_h,z0=self.prev_world_z,x0=self.prev_world_x)
-        
+                prior = planner_prior
+                if self.prior_fuser is not None:
+                    prior = self.prior_fuser(
+                        stateFeat=mem_feat.detach(),
+                        intentFeat=intent_sem.detach(),
+                        vNextTensor=value_next_current.detach(),
+                        plannerPrior=planner_prior,)
+
             if self.is_online_learning:
-                actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionLogit": 
-                                    self.prev_option_logit, "intentFeat":intent_sem, "prior": prior}
+                actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionLogit":
+                                    self.prev_option_logit, "intentFeat":intent_sem, "prior": prior,
+                                    "valueTensor": value_current, "vNextTensor": value_next_current}
                 act_out = self.actor(x=mem_feat,**actor_kwargs)
             else:
                 act_out = self.actor(stateFeat=mem_feat,intentFeat=intent_sem,sample=sampleActions,
-                                    deterministic=deterministicActor,prevOptionLogit=self.prev_option_logit,prior=prior)
+                                    deterministic=deterministicActor,prevOptionLogit=self.prev_option_logit,
+                                    prior=prior, valueTensor=value_current, vNextTensor=value_next_current)
         saveModuleOutput("Decision", act_out)
 
         keys_act = act_out["keyboard"]["keys_act"] # [B, K_key]
@@ -882,6 +906,13 @@ class BrainCore(nn.Module):
             mem_loss = self.mem.GetInternalLoss()
 
             critic_loss = critic_out.loss if (critic_out.loss is not None) else world_loss.new_zeros(())
+            critic_current_loss = critic_loss
+            critic_transport_delayed_loss = world_loss.new_zeros(())
+            if critic_out.extras is not None:
+                critic_current_loss = critic_out.extras.get("loss_current_graph", critic_current_loss)
+                critic_transport_delayed_loss = critic_out.extras.get(
+                    "loss_transport_delayed_graph",
+                    critic_transport_delayed_loss)
 
             conscious_loss = world_loss.new_zeros(())
             if conscious_out.extras is not None:
@@ -910,24 +941,48 @@ class BrainCore(nn.Module):
                     precision=precision_sig,)
                 world_prediction_loss = world_prediction_losses.get("loss_pred_total", world_prediction_loss)
 
-            total_loss = (
+            actor_loss = world_loss.new_zeros(())
+            value_consistency_loss = world_loss.new_zeros(())
+            advantage = td_sig.detach()
+            logp_terms = []
+            if "logp_keys" in act_out.get("keyboard", {}):
+                logp_terms.append(act_out["keyboard"]["logp_keys"])
+            if "logp_click" in act_out.get("mouse", {}):
+                logp_terms.append(act_out["mouse"]["logp_click"])
+            if "logp_mouse" in act_out.get("mouse", {}):
+                logp_terms.append(act_out["mouse"]["logp_mouse"])
+            if "logp_option" in act_out.get("option", {}):
+                logp_terms.append(act_out["option"]["logp_option"])
+            if len(logp_terms) > 0:
+                logp_sum = torch.stack(logp_terms, dim=0).sum(dim=0)
+                actor_loss = -(advantage * logp_sum).mean()
+
+            total_current_loss = (
                 world_loss
                 + mem_loss
-                + critic_loss
+                + critic_current_loss
                 + conscious_loss
                 + intention_loss
                 + 0.05 * perception_loss
-                + 0.05 * world_prediction_loss)
-            
+                + 0.05 * world_prediction_loss
+                + 0.1 * actor_loss
+                + 0.05 * value_consistency_loss)
+            total_loss = total_current_loss
+
             losses["world_loss"] = world_loss
             losses["memory_loss"] = mem_loss
             losses["critic_loss"] = critic_loss
+            losses["critic_current_loss"] = critic_current_loss
+            losses["critic_transport_delayed_loss"] = critic_transport_delayed_loss
             losses["conscious_loss"] = conscious_loss
             losses["intention_loss"] = intention_loss
             losses["perception_loss"] = perception_loss
             losses["world_prediction_loss"] = world_prediction_loss
+            losses["actor_loss"] = actor_loss
+            losses["value_consistency_loss"] = value_consistency_loss
             for name, value in world_prediction_losses.items():
                 losses[f"world_{name}"] = value
+            losses["total_current_loss"] = total_current_loss
             losses["total_loss"] = total_loss
             saveModuleOutput("Losses", losses)
 
@@ -1332,8 +1387,9 @@ class Agent:
             self.opt_actor = torch.optim.Adam(actor_params, lr=3e-4)
 
             self.opt_critic = torch.optim.Adam(self.brain.critic.parameters(), lr=2e-4)
-            if hasattr(self.brain.critic, "SetDelayedGraphAfterOptimizerStep"):
-                self.brain.critic.SetDelayedGraphAfterOptimizerStep(True)
+            self.transport_manual_lr = 2e-4
+            self.transport_manual_max_norm = 1.0
+            self.transport_manual_weight_decay = 0.0
 
             self.opt_world = torch.optim.Adam(self.brain.world.parameters(), lr=2e-4)
 
@@ -1494,7 +1550,9 @@ class Agent:
             step_out = self.brain.Step(frame,textExt,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
             if step_out is None: return None
             act_out = build_action_output(step_out["decision"])
-            act_out["loss"] = step_out["losses"]["total_loss"]
+            act_out["loss"] = step_out["losses"]["total_current_loss"]
+            act_out["transport_delayed_loss"] = step_out["losses"]["critic_transport_delayed_loss"]
+            act_out["total_loss"] = step_out["losses"]["total_loss"]
             act_out["OCR"] = step_out["OCR"]
             act_out["intention_texts"] = step_out.get("intention_texts", [])
             return act_out
@@ -1640,9 +1698,25 @@ class Agent:
     def ResetHebbianMemory(self):
         self.brain.ResetHebbianMemory()
 
+    def CaptureCriticTransportGrad(self) -> Dict[str, float]:
+        critic = self.brain.critic
+        if hasattr(critic, "CaptureTransportGrad"):
+            return critic.CaptureTransportGrad(clearParamGrad=True)
+        return {"captured": 0.0, "grad_norm": 0.0, "accum_steps": 0.0}
+
+    def ApplyCriticTransportManualGrad(self) -> Dict[str, float]:
+        critic = self.brain.critic
+        if hasattr(critic, "ApplyTransportManualGrad"):
+            return critic.ApplyTransportManualGrad(
+                lr=self.transport_manual_lr,
+                maxNorm=self.transport_manual_max_norm,
+                weightDecay=self.transport_manual_weight_decay,
+                clear=True)
+        return {"updated": 0.0, "grad_norm": 0.0, "scale": 1.0}
+
     def AfterOptimizerStep(self):
-        if hasattr(self.brain.critic, "BuildDelayedTransitionGraph"):
-            self.brain.critic.BuildDelayedTransitionGraph()
+        if hasattr(self.brain.critic, "AfterOptimizerStep"):
+            self.brain.critic.AfterOptimizerStep()
 
 
 
