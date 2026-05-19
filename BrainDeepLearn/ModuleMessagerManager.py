@@ -36,6 +36,12 @@ class ModuleDim:
 
     ValueEstimationOutEmotion = 64
 
+    # Decision active-inference / continuous-time control extensions
+    LatentControlDim: int = 64
+    DecisionBeliefDim: int = 1024
+    DecisionDynDim: int = 256
+    MapperHiddenDim: int = 256
+
 
 class TensorVisualProcessor:
     def __init__(

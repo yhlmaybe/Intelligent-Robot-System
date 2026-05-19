@@ -22,7 +22,8 @@ from collections import deque
 from PerceptionModule import PerceiveExtractor, PerceptionOnlineWrapper, TopDownContext, VisualState
 from AttentionModule import AttentionExtractor, AttentionOnlineWrapper
 from MemoryModule import MemoryExtractor, MemoryType
-from DecisionModule import DecisionExtractor, DecisionOnlineWrapper, RAW_KEYBOARD_LAYOUT, DecisionPlannerExtractor, StableLogProbBernoulli, PriorFusionNet
+from DecisionModule import DecisionExtractor, LegacyDecisionExtractor, DecisionOnlineWrapper, RAW_KEYBOARD_LAYOUT, DecisionPlannerExtractor, StableLogProbBernoulli, PriorFusionNet
+from DecisionDecoupler import BinaryActionDecoderBase, NumericActionDecoderBase, MouseKeyboardActionDecoder
 from WorldModule import RSSMWorldModel, WorldOnlineWrapper
 from ValueEstimationModule import ValueEstimationExtractor,ValueEstimationOnlineWrapper
 from ConsciousnessModule import ConsciousnessExtractor
@@ -179,9 +180,8 @@ class BasicParameters:
 @dataclass
 class BrainStepTrace:
     ObsImg: Optional[torch.Tensor] = None
-    Keys: Optional[torch.Tensor] = None
-    MouseClick: Optional[torch.Tensor] = None
-    MouseDelta: Optional[torch.Tensor] = None
+    ActionSample: Optional[Dict[str, torch.Tensor]] = None
+    ActionEmbed: Optional[torch.Tensor] = None
 
     PercBuffer: Optional[list[torch.Tensor]] = None
     VisualBuffer: Optional[List[VisualState]] = None
@@ -218,6 +218,8 @@ class BrainCore(nn.Module):
         prioritizeExtStr: bool = True,
         plasticOnlineLearning: bool = False,
         usePlanner: bool = True,
+        plannerTeacherMode: bool = True,
+        decisionMode: str = "predictive",
         saveModuleMessagerOutput: bool = True,
         needTrace: bool = True,):
         super().__init__()
@@ -225,6 +227,10 @@ class BrainCore(nn.Module):
         self.is_online_learning = plasticOnlineLearning
         self.prioritize_ext_str = prioritizeExtStr
         self.need_trace = bool(needTrace)
+        self.decision_mode = str(decisionMode)
+        if self.decision_mode not in ("predictive", "legacy"):
+            raise ValueError("decisionMode must be 'predictive' or 'legacy'")
+        self.planner_teacher_mode = bool(plannerTeacherMode)
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.perc = PerceiveExtractor(
@@ -251,13 +257,18 @@ class BrainCore(nn.Module):
             emotionDim=ModuleDim.ValueEstimationOutEmotion)
         
         self.value_tensor_dim = 512
-        self.actor = DecisionExtractor(
+        actor_cls = DecisionExtractor if self.decision_mode == "predictive" else LegacyDecisionExtractor
+        self.actor = actor_cls(
             stateDim=ModuleDim.MemoryFeat,
             intentDim=ModuleDim.IntentionFeat,
             includeNoSkill=True,
             useHebb=plasticHebbian,
             valueTensorDim=self.value_tensor_dim,
-            vNextTensorDim=self.value_tensor_dim,)
+            vNextTensorDim=self.value_tensor_dim,
+            beliefDim=ModuleDim.DecisionBeliefDim,
+            decisionDynDim=ModuleDim.DecisionDynDim,
+            latentControlDim=ModuleDim.LatentControlDim,
+            mapperEmbedDim=ModuleDim.MapperHiddenDim,)
         
         self.world = RSSMWorldModel(
             visionDim=ModuleDim.AttentionFeat, 
@@ -298,7 +309,8 @@ class BrainCore(nn.Module):
         if plasticOnlineLearning:
             self.perc = PerceptionOnlineWrapper(self.perc)
             self.attn = AttentionOnlineWrapper(self.attn)
-            self.actor = DecisionOnlineWrapper(self.actor)
+            if self.decision_mode == "legacy":
+                self.actor = DecisionOnlineWrapper(self.actor)
             self.world = WorldOnlineWrapper(self.world)
             self.critic =ValueEstimationOnlineWrapper(self.critic)
             self.intention = IntentionOnlineWrapper(self.intention)
@@ -307,7 +319,7 @@ class BrainCore(nn.Module):
 
         self.planner = None
         self.prior_fuser = None
-        if self.use_planner:
+        if self.decision_mode == "legacy" and (self.use_planner or self.planner_teacher_mode):
             planner_keyboard_layout = {"default": RAW_KEYBOARD_LAYOUT}
             self.planner = DecisionPlannerExtractor().BuildPlanner(
                 worldModel=self.world,
@@ -316,11 +328,12 @@ class BrainCore(nn.Module):
                 horizon=5, N=64, elite=8, iters=3,
                 gamma=0.99, temperature=1.0, momentum=0.15,
                 minVar=1e-4, epsBern=1e-4)
-            self.prior_fuser = PriorFusionNet(
-                stateDim=ModuleDim.MemoryFeat,
-                intentDim=ModuleDim.IntentionFeat,
-                vNextTensorDim=self.value_tensor_dim,
-                keyDim=int(max(RAW_KEYBOARD_LAYOUT.values())) + 1,)
+            if self.decision_mode == "legacy" and self.use_planner:
+                self.prior_fuser = PriorFusionNet(
+                    stateDim=ModuleDim.MemoryFeat,
+                    intentDim=ModuleDim.IntentionFeat,
+                    vNextTensorDim=self.value_tensor_dim,
+                    keyDim=int(max(RAW_KEYBOARD_LAYOUT.values())) + 1,)
 
         self.max_code = int(max(RAW_KEYBOARD_LAYOUT.values()))
         self.buf_B = 0
@@ -507,16 +520,22 @@ class BrainCore(nn.Module):
         self.prev_world_s = z(ModuleDim.WorldFeat)
         self.prev_done_flag = torch.ones(B, device=device, dtype=torch.bool)
 
-        self.prev_keys = z(self.max_code + 1)
-        self.prev_clicks = z(2)
-        self.prev_mouse = z(2)
-
-        if isOnlineLearning:
+        if isOnlineLearning and hasattr(self.actor, "base"):
             self.prev_option_logit = z(self.actor.base.num_options)
+            actor_runtime = self.actor.base
         else:
             self.prev_option_logit = z(self.actor.num_options)
+            actor_runtime = self.actor
 
-        self.prev_entropy = z() 
+        self.prev_decision_state = z(int(actor_runtime.dyn_dim))
+        self.prev_latent_control = z(int(actor_runtime.u_dim))
+        self.prev_action_embed = z(int(actor_runtime.action_embed_dim))
+        self.prev_executed_action_embed = z(int(actor_runtime.action_embed_dim))
+        self.prev_mapper_hidden = z(int(actor_runtime.mapper_hidden_dim))
+        self.prev_action_sample: Optional[Dict[str, torch.Tensor]] = None
+        self.prev_td_error = torch.zeros(B, device=device, dtype=torch.float32)
+
+        self.prev_entropy = z()
 
         self.prev_visual_state = None
         self.prev_predicted_visual = None
@@ -679,17 +698,17 @@ class BrainCore(nn.Module):
         
         if isTrain:
             if self.is_online_learning:
-                wm_kwargs = {"keysVec": self.prev_keys, "mouseClick": self.prev_clicks, "mouseSeq": self.prev_mouse,
+                wm_kwargs = {"actionEnc": self.prev_executed_action_embed,
                              "reward": reward_ext, "done": done_ext}
-                
                 w_out = self.world(world_vis_in, **wm_kwargs)
-            else: 
-                w_out = self.world.ForwardTrain(visionIn=world_vis_in, keysVec=self.prev_keys,
-                                                mouseClick=self.prev_clicks, mouseSeq=self.prev_mouse,
+            else:
+                w_out = self.world.ForwardTrain(visionIn=world_vis_in,
+                                                actionEnc=self.prev_executed_action_embed,
                                                 reward=reward_ext, done=done_ext)
         else:
-            a_enc_prev = self.world.action_encoder(self.prev_keys, self.prev_mouse, self.prev_clicks) # [B, D_act]
-            w_out = self.world.StepPosterior(visionIn=world_vis_in, actionEnc=a_enc_prev, sample=False)
+            w_out = self.world.StepPosterior(visionIn=world_vis_in,
+                                             actionEnc=self.prev_executed_action_embed,
+                                             sample=False)
         saveModuleOutput("World", w_out)
 
         s_t = w_out["s_next"] # [B, D_world]
@@ -804,49 +823,71 @@ class BrainCore(nn.Module):
         self.prev_intent_sem = intent_sem.detach()
         self.prev_goal_bias = intent_sem.detach()
 
-        if self.is_online_learning:
+        world_hzx_now = torch.cat([
+            w_out["h_next"].detach(),
+            w_out["z_next"].detach(),
+            w_out["x_next"].detach(),], dim=-1)
+        if self.decision_mode == "predictive":
+            aug_actor_kwargs = {
+                "uncertainty": unc_sig,
+                "confidence": confidence_sig,
+                "worldHzx": world_hzx_now,
+                "prevDecisionState": self.prev_decision_state,
+                "prevLatentControl": self.prev_latent_control,
+                "prevActionEmbed": self.prev_action_embed,
+                "prevMapperHidden": self.prev_mapper_hidden,
+                "prevTdError": self.prev_td_error,}
+        else:
+            aug_actor_kwargs = {}
+
+        if self.is_online_learning and self.decision_mode == "legacy":
             actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionLogit":
                             self.prev_option_logit, "intentFeat":intent_sem, "valueTensor": value_current,
-                            "vNextTensor": value_next_current}
+                            "vNextTensor": value_next_current, **aug_actor_kwargs}
             act_out = self.actor(x=mem_feat,**actor_kwargs)
         else:
             act_out = self.actor(stateFeat=mem_feat,intentFeat=intent_sem,sample=sampleActions,
                                  deterministic=deterministicActor,prevOptionLogit=self.prev_option_logit,
-                                valueTensor=value_current, vNextTensor=value_next_current)
+                                valueTensor=value_current, vNextTensor=value_next_current,
+                                **aug_actor_kwargs)
 
-        if self.use_planner:
+        if self.planner is not None and self.decision_mode == "legacy":
+            planner_prior = None
             prior = None
             with torch.no_grad():
-                mouseMu = act_out["mouse"]["mu"].detach() # [B, 2]
-                mouseLogstd = act_out["mouse"]["logstd"].detach() # [B, 2]
-                keysLogits = act_out["keyboard"]["keys_logits"].detach() # [B, K_key]
-                clickLogits = act_out["mouse"]["click_logits"].detach() # [B, 2]
-
-                planner_prior = self.planner.Plan(keysLogits=keysLogits, mouseMu=mouseMu, mouseLogstd=mouseLogstd,
-                                          clickLogits=clickLogits,
-                                          h0=self.prev_world_h,z0=self.prev_world_z,x0=self.prev_world_x)
+                planner_prior = self.planner.Plan(
+                    keysLogits=act_out["keyboard"]["keys_logits"].detach(),
+                    mouseMu=act_out["mouse"]["mu"].detach(),
+                    mouseLogstd=act_out["mouse"]["logstd"].detach(),
+                    clickLogits=act_out["mouse"]["click_logits"].detach(),
+                    h0=self.prev_world_h, z0=self.prev_world_z, x0=self.prev_world_x)
                 prior = planner_prior
-                if self.prior_fuser is not None:
+                if self.decision_mode == "legacy" and self.use_planner and self.prior_fuser is not None:
                     prior = self.prior_fuser(
                         stateFeat=mem_feat.detach(),
                         intentFeat=intent_sem.detach(),
                         vNextTensor=value_next_current.detach(),
                         plannerPrior=planner_prior,)
 
-            if self.is_online_learning:
-                actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionLogit":
-                                    self.prev_option_logit, "intentFeat":intent_sem, "prior": prior,
-                                    "valueTensor": value_current, "vNextTensor": value_next_current}
-                act_out = self.actor(x=mem_feat,**actor_kwargs)
-            else:
-                act_out = self.actor(stateFeat=mem_feat,intentFeat=intent_sem,sample=sampleActions,
-                                    deterministic=deterministicActor,prevOptionLogit=self.prev_option_logit,
-                                    prior=prior, valueTensor=value_current, vNextTensor=value_next_current)
+            if self.decision_mode == "legacy" and self.use_planner:
+                if self.is_online_learning:
+                    actor_kwargs = {"sample": sampleActions, "deterministic": deterministicActor, "prevOptionLogit":
+                                        self.prev_option_logit, "intentFeat":intent_sem, "prior": prior,
+                                        "valueTensor": value_current, "vNextTensor": value_next_current,
+                                        **aug_actor_kwargs}
+                    act_out = self.actor(x=mem_feat,**actor_kwargs)
+                else:
+                    act_out = self.actor(stateFeat=mem_feat,intentFeat=intent_sem,sample=sampleActions,
+                                        deterministic=deterministicActor,prevOptionLogit=self.prev_option_logit,
+                                        prior=prior, valueTensor=value_current, vNextTensor=value_next_current,
+                                        **aug_actor_kwargs)
+
+            if planner_prior is not None:
+                act_out["planner_prior"] = planner_prior
         saveModuleOutput("Decision", act_out)
 
-        keys_act = act_out["keyboard"]["keys_act"] # [B, K_key]
-        click_sample = act_out["mouse"]["click_sample"] # [B, 2]
-        mouse_a = act_out["mouse"]["a"] # [B,2]
+        action_sample = act_out.get("action_sample", None)
+        action_encode = act_out.get("action_encode", None)
         entropy_actor = act_out["entropy"] # [B]
         next_option_logit = act_out["prevOptionLogit_next"].detach() # [B, K_option]
 
@@ -857,11 +898,21 @@ class BrainCore(nn.Module):
         self.prev_world_h = w_out["h_next"].detach() # [B, D_world_h]
         self.prev_world_z = w_out["z_next"].detach() # [B, D_world_z]
         self.prev_world_x = w_out["x_next"].detach() # [B, D_world_x]
-        self.prev_keys = keys_act.detach() # [B, K_key]
-        self.prev_clicks = click_sample.detach() # [B, 2]
-        self.prev_mouse = mouse_a.detach() # [B, 2]
 
         self.prev_entropy = entropy_actor.detach() # [B]
+        if "decision_state_next" in act_out:
+            self.prev_decision_state = act_out["decision_state_next"]
+        if "latent_control_next" in act_out:
+            self.prev_latent_control = act_out["latent_control_next"]
+        if "action_encode_next" in act_out:
+            self.prev_action_embed = act_out["action_encode_next"]
+        if "executed_action_embed_next" in act_out:
+            self.prev_executed_action_embed = act_out["executed_action_embed_next"]
+        if action_sample is not None:
+            self.prev_action_sample = {k: (v.detach() if torch.is_tensor(v) else v) for k, v in action_sample.items()}
+        if "mapper" in act_out and "hidden_next" in act_out["mapper"]:
+            self.prev_mapper_hidden = act_out["mapper"]["hidden_next"]
+        self.prev_td_error = td_sig
         if bool(done_now.any().item()):
             self.ResetHebbianMemory(doneMask=done_now)
 
@@ -869,6 +920,10 @@ class BrainCore(nn.Module):
             def trace_tensor(t: torch.Tensor) -> torch.Tensor:
                 return t.detach() if isinstance(t, torch.Tensor) else t
 
+            traced_sample = (
+                {k: trace_tensor(v) for k, v in action_sample.items()}
+                if action_sample is not None
+                else None)
             trace = BrainStepTrace(
                 PercBuffer=copy.deepcopy(self.perc_buffer), # List[[B, D_perc]]
                 VisualBuffer=[
@@ -878,9 +933,8 @@ class BrainCore(nn.Module):
                 OcrSemantic=trace_tensor(ocr_semantic),
                 IntentHint=trace_tensor(intent_hint_for_memory),
                 ObsImg=fuse_ocr, # List[List[str]]
-                Keys=trace_tensor(keys_act), # [B, K_key]
-                MouseClick=trace_tensor(click_sample), # [B, 2]
-                MouseDelta=trace_tensor(mouse_a), # [B, 2]
+                ActionSample=traced_sample,
+                ActionEmbed=trace_tensor(action_encode),
 
                 PercFeat=trace_tensor(perc_feats), # [B, D_perc]
                 AttnFeat=trace_tensor(atten_out), # [B, D_attn]
@@ -945,12 +999,6 @@ class BrainCore(nn.Module):
             value_consistency_loss = world_loss.new_zeros(())
             advantage = td_sig.detach()
             logp_terms = []
-            if "logp_keys" in act_out.get("keyboard", {}):
-                logp_terms.append(act_out["keyboard"]["logp_keys"])
-            if "logp_click" in act_out.get("mouse", {}):
-                logp_terms.append(act_out["mouse"]["logp_click"])
-            if "logp_mouse" in act_out.get("mouse", {}):
-                logp_terms.append(act_out["mouse"]["logp_mouse"])
             if "logp_option" in act_out.get("option", {}):
                 logp_terms.append(act_out["option"]["logp_option"])
             if len(logp_terms) > 0:
@@ -1018,11 +1066,18 @@ class BrainCore(nn.Module):
         return {
             "prev_mem": self.prev_mem.detach().clone(),
             "prev_attn": self.prev_attn.detach().clone(),
-            "prev_keys": self.prev_keys.detach().clone(),
-            "prev_clicks": self.prev_clicks.detach().clone(),
-            "prev_mouse": self.prev_mouse.detach().clone(),
             "prev_option_logit": self.prev_option_logit.detach().clone(),
             "prev_entropy": self.prev_entropy.detach().clone(),
+            "prev_decision_state": self.prev_decision_state.detach().clone(),
+            "prev_latent_control": self.prev_latent_control.detach().clone(),
+            "prev_action_embed": self.prev_action_embed.detach().clone(),
+            "prev_executed_action_embed": self.prev_executed_action_embed.detach().clone(),
+            "prev_action_sample": (
+                None if self.prev_action_sample is None
+                else {k: (v.detach().clone() if torch.is_tensor(v) else v)
+                      for k, v in self.prev_action_sample.items()}),
+            "prev_mapper_hidden": self.prev_mapper_hidden.detach().clone(),
+            "prev_td_error": self.prev_td_error.detach().clone(),
             "world_state": {
                 "h": h.detach().clone(),
                 "z": z.detach().clone(),
@@ -1083,14 +1138,19 @@ class BrainCore(nn.Module):
 
         self.prev_mem = state["prev_mem"]
         self.prev_attn = state["prev_attn"]
-        self.prev_keys = state["prev_keys"]
-        self.prev_clicks = state["prev_clicks"]
-        self.prev_mouse = state["prev_mouse"]
         self.prev_option_logit = state["prev_option_logit"]
         prev_entropy = state["prev_entropy"]
         if isinstance(prev_entropy, torch.Tensor) and (prev_entropy.dim() > 1) and (prev_entropy.size(-1) == 1):
             prev_entropy = prev_entropy.squeeze(-1)
         self.prev_entropy = prev_entropy
+
+        self.prev_decision_state = state["prev_decision_state"]
+        self.prev_latent_control = state["prev_latent_control"]
+        self.prev_action_embed = state["prev_action_embed"]
+        self.prev_executed_action_embed = state["prev_executed_action_embed"]
+        self.prev_action_sample = state.get("prev_action_sample", None)
+        self.prev_mapper_hidden = state["prev_mapper_hidden"]
+        self.prev_td_error = state["prev_td_error"]
 
         world_state = state["world_state"]
         world_mod.ImportState(world_state["h"], world_state["z"], world_state["x"])
@@ -1351,7 +1411,8 @@ class Agent:
         device: Union[str, torch.device] = "cpu",
         *,
         worldMemoryPath: str = None,
-        memMemoryPath: str = None):
+        memMemoryPath: str = None,
+        actionDecoder: Optional[Union[BinaryActionDecoderBase, NumericActionDecoderBase]] = None):
 
         self.device = torch.device(device)
 
@@ -1372,6 +1433,12 @@ class Agent:
             print(f"{self.mem_mem_path} is None")
 
         self.brain.to(self.device)
+        actor_runtime = self.brain.actor.base if hasattr(self.brain.actor, "base") else self.brain.actor
+        action_encode_dim = int(getattr(actor_runtime, "action_embed_dim", ModuleDim.MapperHiddenDim))
+        self.action_decoder = actionDecoder or MouseKeyboardActionDecoder(
+            actionEncodeDim=action_encode_dim,
+            keyDim=int(max(RAW_KEYBOARD_LAYOUT.values())) + 1,)
+        self.action_decoder.to(self.device)
 
         self.ResetHebbianMemory()
 
@@ -1382,7 +1449,8 @@ class Agent:
                 self.brain.mem,
                 self.brain.actor,
                 self.brain.conscious,
-                self.brain.intention)
+                self.brain.intention,
+                self.action_decoder)
         
             self.opt_actor = torch.optim.Adam(actor_params, lr=3e-4)
 
@@ -1419,6 +1487,31 @@ class Agent:
 
     def GetRuntimeWorld(self):
         return self.brain.world.base if self.brain.is_online_learning else self.brain.world
+
+    def ActionDecoderRequiresDeterministicDecision(self) -> bool:
+        return bool(self.action_decoder.requires_deterministic_decision)
+
+    def CommitActionDecode(self, decisionOut: Dict[str, Any], decoded: Dict[str, Any]) -> None:
+        decisionOut["action_decode"] = decoded
+        decisionOut["action_dist"] = decoded["action_dist"]
+        decisionOut["action_sample"] = decoded["action_sample"]
+        decisionOut["interface_kind"] = decoded["interface_kind"]
+
+        entropy = decoded["entropy"]
+        decisionOut["action_entropy"] = entropy
+        self.brain.prev_entropy = entropy.detach()
+
+        action_sample = decoded["action_sample"]
+        self.brain.prev_action_sample = {
+            k: (v.detach() if torch.is_tensor(v) else v)
+            for k, v in action_sample.items()}
+
+        executed_action_embed = self.action_decoder.Encode(action_sample)
+        executed_next = executed_action_embed.detach()
+        decoded["executed_action_embed"] = executed_action_embed
+        decisionOut["executed_action_embed"] = executed_action_embed
+        decisionOut["executed_action_embed_next"] = executed_next
+        self.brain.prev_executed_action_embed = executed_next
 
     def LoadWorldMemory(self, path: str):
         self.EnsureFile(path)
@@ -1529,27 +1622,35 @@ class Agent:
             done = done.to(self.device)
 
         def build_action_output(decision_out: Dict[str, Any]) -> Dict[str, Any]:
-            mouse_head = decision_out["mouse"]
-            kb_head = decision_out["keyboard"]
+            decoded = self.action_decoder.Decode(
+                decision_out["action_encode"],
+                sample=sampleActions,
+                deterministic=deterministicActor,)
+            self.CommitActionDecode(decision_out, decoded)
+            action_sample = decoded["action_sample"]
+            action_out = {
+                "interface_kind": decision_out["interface_kind"],
+                "action_decode": decoded,
+                "action_sample": action_sample,
+                "action_command": None,}
 
-            if sampleActions:
-                keys = kb_head["keys_act"] # [B, K_key]
-                clicks = mouse_head["click_sample"] # [B, 2]
-                mouse = mouse_head["a"] # [B, 2]
+            if decision_out["interface_kind"] == "binary":
+                action_out.update({
+                    "keys": action_sample["keys"],
+                    "mouse_clicks": action_sample["click"],
+                    "mouse_move": action_sample["mouse"],})
             else:
-                keys = (torch.sigmoid(kb_head["keys_logits"]) > 0.5).float() # [B, K_key]
-                clicks = (torch.sigmoid(mouse_head["click_logits"]) > 0.5).float() # [B, 2]
-                mouse = mouse_head["mu"] # [B, 2]
+                action_out["action_command"] = decoded["action_command"]
+            return action_out
 
-            return {
-                "keys": keys,
-                "mouse_clicks": clicks,
-                "mouse_move": mouse,}
+        actor_sample_actions = bool(sampleActions) and (not self.ActionDecoderRequiresDeterministicDecision())
+        actor_deterministic = bool(deterministicActor) or self.ActionDecoderRequiresDeterministicDecision()
 
         if self.is_train:
-            step_out = self.brain.Step(frame,textExt,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
+            step_out = self.brain.Step(frame,textExt,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=actor_sample_actions,deterministicActor=actor_deterministic,)
             if step_out is None: return None
             act_out = build_action_output(step_out["decision"])
+            act_out["decision"] = step_out["decision"]
             act_out["loss"] = step_out["losses"]["total_current_loss"]
             act_out["transport_delayed_loss"] = step_out["losses"]["critic_transport_delayed_loss"]
             act_out["total_loss"] = step_out["losses"]["total_loss"]
@@ -1558,9 +1659,10 @@ class Agent:
             return act_out
         else:  
             with torch.no_grad():  
-                step_out = self.brain.Step(frame,textExt,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=sampleActions,deterministicActor=deterministicActor,)
+                step_out = self.brain.Step(frame,textExt,rewardExt=reward,doneFlag=done,isTrain=self.is_train,sampleActions=actor_sample_actions,deterministicActor=actor_deterministic,)
                 if step_out is None: return None
                 act_out = build_action_output(step_out["decision"])
+                act_out["decision"] = step_out["decision"]
                 act_out["loss"] = None
                 act_out["OCR"] = step_out["OCR"]
                 act_out["intention_texts"] = step_out.get("intention_texts", [])
@@ -1572,17 +1674,20 @@ class Agent:
         mouse_clicks: List[str] = []
         mouse_move: Optional[Dict[str, float]] = None
         intention_texts: List[str] = []
+        action_command: Optional[Dict[str, Any]] = None
 
         if actOut is None:
             return json.dumps({
                 "key_names": key_names,
                 "mouse_clicks": mouse_clicks,
                 "mouse_move": mouse_move,
+                "action_command": action_command,
                 "intention_texts": intention_texts,}, ensure_ascii=False)
 
         keys_tensor = actOut.get("keys")
         clicks_tensor = actOut.get("mouse_clicks")
         mouse_tensor = actOut.get("mouse_move")
+        action_command_value = actOut.get("action_command", None)
         intention_texts_value = actOut.get("intention_texts")
 
         keys_tensor = keys_tensor.detach().float().cpu() if keys_tensor is not None else None
@@ -1611,10 +1716,30 @@ class Agent:
                 "x": float(mouse_tensor[0, 0].item()),
                 "y": float(mouse_tensor[0, 1].item()),}
 
+        def to_json_scalar_or_list(value: Any) -> Any:
+            if torch.is_tensor(value):
+                tensor = value.detach().float().cpu()
+                if tensor.dim() > 0:
+                    tensor = tensor[0]
+                if tensor.numel() == 1:
+                    return float(tensor.reshape(-1)[0].item())
+                return tensor.tolist()
+            if isinstance(value, dict):
+                return {str(k): to_json_scalar_or_list(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [to_json_scalar_or_list(v) for v in value]
+            return value
+
+        if isinstance(action_command_value, dict):
+            action_command = {
+                str(name): to_json_scalar_or_list(value)
+                for name, value in action_command_value.items()}
+
         return json.dumps({
             "key_names": key_names,
             "mouse_clicks": mouse_clicks,
             "mouse_move": mouse_move,
+            "action_command": action_command,
             "intention_texts": intention_texts,}, ensure_ascii=False)
 
 
@@ -1624,6 +1749,7 @@ class Agent:
 
         payload = {
             "brain": self.brain.state_dict(),
+            "action_decoder": self.action_decoder.state_dict(),
             "buffers": self.brain.ExportBuffers(),
             "rng_py": random.getstate(),
             "rng_np": np.random.get_state(),
@@ -1648,11 +1774,17 @@ class Agent:
 
             if self.is_train:
                 if "opt_actor" in payload:
-                    self.opt_actor.load_state_dict(payload["opt_actor"])
+                    try:
+                        self.opt_actor.load_state_dict(payload["opt_actor"])
+                    except ValueError:
+                        print("[Agent.Load] opt_actor state skipped because parameter groups changed")
                 if "opt_critic" in payload:
                     self.opt_critic.load_state_dict(payload["opt_critic"])
                 if "opt_world" in payload:
                     self.opt_world.load_state_dict(payload["opt_world"])
+
+            if "action_decoder" in payload:
+                self.action_decoder.load_state_dict(payload["action_decoder"], strict=False)
 
             if "buffers" in payload:
                 self.brain.ImportBuffers(payload["buffers"])
@@ -1725,6 +1857,8 @@ class Agent:
     def UpdateWrappers(self, wrappers, action: str, **kwargs):
         results = []
         for w in wrappers:
+            if not hasattr(w, "Update"):
+                continue
             out = w.Update(action, **kwargs)
             results.append(out)
         return results
@@ -1733,6 +1867,8 @@ class Agent:
         wrappers = [self.brain.perc, self.brain.attn, self.brain.actor, self.brain.world, self.brain.critic, self.brain.intention]
         results = []
         for w in wrappers:
+            if not hasattr(w, "Update"):
+                continue
             out = w.Update(action, **kwargs)
             results.append(out)
         return results

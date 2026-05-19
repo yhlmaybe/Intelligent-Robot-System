@@ -502,7 +502,314 @@ class IntentFusion(AGICoreModule):
         return out
 
 
-class DecisionExtractor(AGICoreModule):
+class BeliefAssembler(AGICoreModule):
+    def __init__(
+        self,
+        memDim: int,
+        intentDim: int,
+        valueDim: int,
+        vNextDim: int,
+        worldHzxDim: int,
+        beliefDim: int = 1024,
+        hidden: int = 1024,
+        drop: float = 0.05,):
+        super().__init__()
+        self.belief_dim = int(beliefDim)
+        self.world_hzx_dim = int(worldHzxDim)
+
+        self.ln_mem = nn.LayerNorm(memDim)
+        self.ln_intent = nn.LayerNorm(intentDim)
+        self.ln_value = nn.LayerNorm(valueDim)
+        self.ln_vnext = nn.LayerNorm(vNextDim)
+        self.ln_world = nn.LayerNorm(worldHzxDim)
+
+        self.p_mem = nn.Linear(memDim, beliefDim)
+        self.p_intent = nn.Linear(intentDim, beliefDim)
+        self.p_value = nn.Linear(valueDim, beliefDim)
+        self.p_vnext = nn.Linear(vNextDim, beliefDim)
+        self.p_world = nn.Linear(worldHzxDim, beliefDim)
+        self.p_scalar = nn.Linear(2, beliefDim)
+
+        fuse_in = beliefDim * 6
+        self.fuse = nn.Sequential(
+            nn.LayerNorm(fuse_in),
+            nn.Linear(fuse_in, hidden),
+            nn.SiLU(),
+            nn.Dropout(drop),
+            nn.Linear(hidden, beliefDim),)
+        self.gate = nn.Sequential(
+            nn.Linear(fuse_in, beliefDim),
+            nn.Sigmoid(),)
+        self.ln_out = nn.LayerNorm(beliefDim)
+        self.layerscale = nn.Parameter(torch.ones(beliefDim) * 1e-2)
+
+        nn.init.zeros_(self.fuse[-1].weight)
+        nn.init.zeros_(self.fuse[-1].bias)
+
+    def forward(
+        self,
+        memFeat: torch.Tensor,
+        intentFeat: torch.Tensor,
+        valueTensor: torch.Tensor,
+        vNextTensor: torch.Tensor,
+        uncertainty: torch.Tensor,
+        confidence: torch.Tensor,
+        worldHzx: torch.Tensor,) -> torch.Tensor:
+        scalars = torch.cat([uncertainty.view(-1, 1), confidence.view(-1, 1)], dim=-1)
+
+        m = self.p_mem(self.ln_mem(memFeat))
+        i = self.p_intent(self.ln_intent(intentFeat))
+        v = self.p_value(self.ln_value(valueTensor))
+        vn = self.p_vnext(self.ln_vnext(vNextTensor))
+        w = self.p_world(self.ln_world(worldHzx))
+        s = self.p_scalar(scalars)
+
+        fused_in = torch.cat([m, i, v, vn, w, s], dim=-1)
+        delta = self.fuse(fused_in)
+        gate = self.gate(fused_in)
+        return self.ln_out(m + i + v + vn + w + s + gate * self.layerscale * delta)
+
+
+class LatentControlInferer(AGICoreModule):
+    def __init__(
+        self,
+        beliefDim: int,
+        dynDim: int,
+        uDim: int,
+        hidden: int = 256,
+        drop: float = 0.05,):
+        super().__init__()
+        self.u_dim = int(uDim)
+        in_dim = int(beliefDim) + int(dynDim)
+        self.trunk = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden),
+            nn.SiLU(),
+            nn.Dropout(drop),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),)
+        self.mu_head = nn.Linear(hidden, uDim)
+        self.logvar_head = nn.Linear(hidden, uDim)
+        nn.init.zeros_(self.mu_head.weight)
+        nn.init.zeros_(self.mu_head.bias)
+        nn.init.zeros_(self.logvar_head.weight)
+        with torch.no_grad():
+            self.logvar_head.bias.fill_(-1.0)
+
+    def forward(self, belief: torch.Tensor, decisionState: torch.Tensor):
+        h = self.trunk(torch.cat([belief, decisionState], dim=-1))
+        return self.mu_head(h), self.logvar_head(h).clamp(-8.0, 4.0)
+
+
+class PredictiveDecisionCore(AGICoreModule):
+    def __init__(
+        self,
+        beliefDim: int,
+        uDim: int,
+        dynDim: int,
+        nSteps: int = 2,
+        hidden: int = 256,
+        drop: float = 0.05,):
+        super().__init__()
+        self.n_steps = int(nSteps)
+        self.dyn_dim = int(dynDim)
+        in_dim = int(dynDim) + int(beliefDim) + int(uDim) + 1
+
+        self.f = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden),
+            nn.SiLU(),
+            nn.Dropout(drop),
+            nn.Linear(hidden, dynDim),
+            nn.Tanh(),)
+        self.belief_to_dyn = nn.Linear(beliefDim, dynDim, bias=False)
+        self.dt = nn.Parameter(torch.tensor(0.5))
+        self.pull_gain = nn.Parameter(torch.tensor(0.1))
+        self.jacobian_norm = nn.Parameter(torch.tensor(1.0))
+
+        nn.init.zeros_(self.f[-2].weight)
+        nn.init.zeros_(self.f[-2].bias)
+
+    def Field(
+        self,
+        h: torch.Tensor,
+        belief: torch.Tensor,
+        u: torch.Tensor,
+        precision: torch.Tensor,) -> torch.Tensor:
+        x = torch.cat([h, belief, u, precision], dim=-1)
+        drift = self.f(x)
+        belief_pull = (self.belief_to_dyn(belief) - h) * torch.sigmoid(self.pull_gain) * precision
+        return torch.tanh(self.jacobian_norm) * (drift + belief_pull)
+
+    def forward(
+        self,
+        prevState: torch.Tensor,
+        belief: torch.Tensor,
+        u: torch.Tensor,
+        precision: torch.Tensor,) -> torch.Tensor:
+        h = prevState
+        dt = torch.sigmoid(self.dt) / float(self.n_steps)
+        for _ in range(self.n_steps):
+            k1 = self.Field(h, belief, u, precision)
+            k2 = self.Field(h + dt * k1, belief, u, precision)
+            h = h + 0.5 * dt * (k1 + k2)
+        return h
+
+
+class PredictionErrorHead(AGICoreModule):
+    def __init__(self, dynDim: int, beliefDim: int, hidden: int = 256, drop: float = 0.05):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dynDim),
+            nn.Linear(dynDim, hidden),
+            nn.SiLU(),
+            nn.Dropout(drop),
+            nn.Linear(hidden, beliefDim),)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, decisionState: torch.Tensor) -> torch.Tensor:
+        return self.net(decisionState)
+
+
+class ExpectedFreeEnergyHead(AGICoreModule):
+    def __init__(
+        self,
+        beliefDim: int,
+        uDim: int,
+        vDim: int,
+        hidden: int = 128,
+        controlCost: float = 1e-3,):
+        super().__init__()
+        self.control_cost = float(controlCost)
+        self.risk_head = nn.Sequential(
+            nn.LayerNorm(beliefDim + uDim + vDim),
+            nn.Linear(beliefDim + uDim + vDim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),)
+        self.amb_head = nn.Sequential(
+            nn.LayerNorm(beliefDim + 2),
+            nn.Linear(beliefDim + 2, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),)
+        nn.init.zeros_(self.risk_head[-1].weight)
+        nn.init.zeros_(self.risk_head[-1].bias)
+        nn.init.zeros_(self.amb_head[-1].weight)
+        nn.init.zeros_(self.amb_head[-1].bias)
+
+    def forward(
+        self,
+        belief: torch.Tensor,
+        u: torch.Tensor,
+        uMu: torch.Tensor,
+        uLogvar: torch.Tensor,
+        vNext: torch.Tensor,
+        uncertainty: torch.Tensor,
+        confidence: torch.Tensor,) -> Dict[str, torch.Tensor]:
+        risk = F.softplus(self.risk_head(torch.cat([belief, u, vNext], dim=-1)).squeeze(-1))
+        ambiguity = F.softplus(
+            self.amb_head(torch.cat([belief, uncertainty.view(-1, 1), confidence.view(-1, 1)], dim=-1)).squeeze(-1)
+        ) + uncertainty.view(-1)
+        epistemic = 0.5 * uLogvar.sum(dim=-1)
+        control_cost = self.control_cost * u.square().sum(dim=-1)
+        efe = risk + ambiguity - epistemic + control_cost
+        return {
+            "efe": efe,
+            "risk": risk,
+            "ambiguity": ambiguity,
+            "epistemic": epistemic,
+            "control_cost": control_cost,}
+
+
+class EligibilityTracePlasticityLayer(AGICoreModule):
+    def __init__(
+        self,
+        inDim: int,
+        outDim: int,
+        lam: float = 0.9,
+        eta: float = 1e-3,
+        gamma: float = 1e-2,
+        applyScale: float = 0.25,
+        maxRowNorm: float = 2.0,):
+        super().__init__()
+        self.in_dim = int(inDim)
+        self.out_dim = int(outDim)
+        self.lam = float(lam)
+        self.eta = float(eta)
+        self.gamma = float(gamma)
+        self.apply_scale = float(applyScale)
+        self.max_row_norm = float(maxRowNorm)
+
+        self.base = nn.Parameter(torch.randn(outDim, inDim, device=self.device, dtype=self.dtype) * 0.02)
+        self.register_buffer("trace", torch.empty(0), persistent=True)
+        self.register_buffer("fast", torch.empty(0), persistent=True)
+
+    def EnsureBatch(self, B: int, device: torch.device, dtype: torch.dtype):
+        if int(self.trace.size(0)) != B:
+            self.trace = torch.zeros(B, self.out_dim, self.in_dim, device=device, dtype=dtype)
+            self.fast = torch.zeros(B, self.out_dim, self.in_dim, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor, neuromod: torch.Tensor) -> torch.Tensor:
+        B = int(x.size(0))
+        self.EnsureBatch(B, self.device, self.dtype)
+
+        w_eff = self.base.unsqueeze(0) + self.apply_scale * self.fast.detach()
+        out = torch.einsum("bi,boi->bo", x, w_eff)
+
+        with torch.no_grad():
+            pre = x.detach()
+            post = out.detach()
+            outer = torch.einsum("bo,bi->boi", post, pre)
+            self.trace = self.lam * self.trace + (1.0 - self.lam) * outer
+
+            mod = neuromod.detach().view(B, 1, 1)
+            decay = post.square().unsqueeze(-1) * self.fast
+            self.fast = self.fast + self.eta * mod * self.trace - self.gamma * decay
+
+            if self.max_row_norm > 0.0:
+                flat = self.fast.reshape(B, -1)
+                nrm = flat.norm(p=2, dim=1, keepdim=True).clamp_min(1e-8)
+                scale = (self.max_row_norm / nrm).clamp_max(1.0)
+                self.fast = self.fast * scale.view(B, 1, 1)
+
+        return out
+
+    def Reset(self, doneMask: Optional[torch.Tensor] = None):
+        with torch.no_grad():
+            if doneMask is None:
+                self.trace.zero_()
+                self.fast.zero_()
+                return
+            keep = (1.0 - doneMask.view(-1).to(self.trace.dtype)).view(-1, 1, 1)
+            self.trace.mul_(keep)
+            self.fast.mul_(keep)
+
+
+def ActiveInferenceLoss(
+    decisionOut: Dict[str, Any],
+    *,
+    wEfe: float = 1.0,
+    wPredErr: float = 1.0,
+    wKl: float = 1e-2,
+    wDyn: float = 1e-3,) -> Dict[str, torch.Tensor]:
+    efe = decisionOut["efe"]["efe"].mean()
+    pred_err = decisionOut["prediction_error"].square().mean()
+    mu = decisionOut["latent_control"]["mu"]
+    logvar = decisionOut["latent_control"]["logvar"]
+    kl = 0.5 * (mu.square() + logvar.exp() - 1.0 - logvar).sum(dim=-1).mean()
+    dyn = decisionOut["decision_state"].square().mean()
+    total = float(wEfe) * efe + float(wPredErr) * pred_err + float(wKl) * kl + float(wDyn) * dyn
+    return {
+        "total": total,
+        "efe": efe,
+        "prediction_error": pred_err,
+        "kl_latent": kl,
+        "dyn_reg": dyn,}
+
+
+
+
+class LegacyDecisionExtractor(AGICoreModule):
     def __init__(
         self,
         stateDim: int = 1024,
@@ -515,7 +822,14 @@ class DecisionExtractor(AGICoreModule):
         *,
         entropyWeights: Tuple[float, float, float] = (0.6, 0.2, 0.2), # keys, click, mouse
         valueTensorDim: int = 512,
-        vNextTensorDim: int = 512,): 
+        vNextTensorDim: int = 512,
+        worldHDim: int = 512,
+        worldZDim: int = 64,
+        worldXDim: int = 64,
+        beliefDim: int = 1024,
+        decisionDynDim: int = 256,
+        latentControlDim: int = 64,
+        mapperEmbedDim: int = 256,):
         super().__init__()
 
         self.stateDim = int(stateDim)
@@ -626,6 +940,16 @@ class DecisionExtractor(AGICoreModule):
                 nn.SiLU(),
                 nn.Linear(512, self.dim_click),),})
 
+        self.world_h_dim = int(worldHDim)
+        self.world_z_dim = int(worldZDim)
+        self.world_x_dim = int(worldXDim)
+        self.world_hzx_dim = self.world_h_dim + self.world_z_dim + self.world_x_dim
+        self.belief_dim = int(beliefDim)
+        self.dyn_dim = int(decisionDynDim)
+        self.u_dim = int(latentControlDim)
+        self.action_embed_dim = int(mapperEmbedDim)
+        self.mapper_hidden_dim = int(mapperEmbedDim)
+
     def InstallAdaptersMandatory(self):
         def wrap_linear(parent: nn.Module, name: str):
             lin = getattr(parent, name)
@@ -662,7 +986,7 @@ class DecisionExtractor(AGICoreModule):
 
     @staticmethod
     def SafeSoftmax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        return torch.softmax(DecisionExtractor.Safe(logits, 60.0), dim=dim)
+        return torch.softmax(LegacyDecisionExtractor.Safe(logits, 60.0), dim=dim)
 
 
     def Encode(self, stateFeat: torch.Tensor, intentFeat: torch.Tensor) -> torch.Tensor:
@@ -748,10 +1072,14 @@ class DecisionExtractor(AGICoreModule):
         prevOptionLogit: Optional[torch.Tensor] = None,
         prior: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
         mixW: float = 0.3,
-        valueTensor: torch.Tensor,
-        vNextTensor: torch.Tensor,) -> Dict[str, torch.Tensor]:
+        valueTensor: Optional[torch.Tensor] = None,
+        vNextTensor: Optional[torch.Tensor] = None,) -> Dict[str, torch.Tensor]:
 
         B = stateFeat.size(0)
+        if valueTensor is None:
+            valueTensor = stateFeat.new_zeros(B, self.value_tensor_dim)
+        if vNextTensor is None:
+            vNextTensor = stateFeat.new_zeros(B, self.v_next_tensor_dim)
         stateFeat = self.FuseValueTensors(stateFeat, valueTensor, vNextTensor)
         z = self.Encode(stateFeat, intentFeat) # [B, hiddenDim]
 
@@ -881,18 +1209,253 @@ class DecisionExtractor(AGICoreModule):
 
         return out
 
-    def ResetHebbianMemory(self, value: float = 0.0):
+    def ResetHebbianMemory(self, value: float = 0.0, doneMask: Optional[torch.Tensor] = None):
         with torch.no_grad():
+            if doneMask is None:
+                for m in self.modules():
+                    if isinstance(m, HebbianPlasticityLayer):
+                        m.hebb.fill_(value)
+                return
+
+            mask = doneMask.view(-1).to(self.entropy_w.dtype)
+            keep = (1.0 - mask)
             for m in self.modules():
                 if isinstance(m, HebbianPlasticityLayer):
-                    m.hebb.fill_(value)
+                    if int(m.hebb.numel()) == 0:
+                        continue
+                    m.hebb.mul_(keep.view(-1, 1, 1))
+
+
+class DecisionExtractor(AGICoreModule):
+    def __init__(
+        self,
+        stateDim: int = 1024,
+        useHebb: bool = True,
+        optionNum: int = 80,
+        hiddenDim: int = 1024,
+        psiDim: int = 1024,
+        intentDim: int = 1024,
+        includeNoSkill: bool = True,
+        *,
+        valueTensorDim: int = 512,
+        vNextTensorDim: int = 512,
+        worldHDim: int = 512,
+        worldZDim: int = 64,
+        worldXDim: int = 64,
+        beliefDim: int = 1024,
+        decisionDynDim: int = 256,
+        latentControlDim: int = 64,
+        mapperEmbedDim: int = 256,):
+        super().__init__()
+        self.stateDim = int(stateDim)
+        self.intentDim = int(intentDim)
+        self.includeNoSkill = bool(includeNoSkill)
+        self.value_tensor_dim = int(valueTensorDim)
+        self.v_next_tensor_dim = int(vNextTensorDim)
+        self.world_h_dim = int(worldHDim)
+        self.world_z_dim = int(worldZDim)
+        self.world_x_dim = int(worldXDim)
+        self.world_hzx_dim = self.world_h_dim + self.world_z_dim + self.world_x_dim
+        self.belief_dim = int(beliefDim)
+        self.dyn_dim = int(decisionDynDim)
+        self.u_dim = int(latentControlDim)
+        self.action_embed_dim = int(mapperEmbedDim)
+        self.mapper_hidden_dim = int(mapperEmbedDim)
+        self.num_options = int(optionNum)
+        self.key_dim = int(KEY_DIM)
+        self.act_dim = 2
+        self.psi_dim = int(psiDim)
+
+        self.belief_assembler = BeliefAssembler(
+            memDim=self.stateDim,
+            intentDim=self.intentDim,
+            valueDim=self.value_tensor_dim,
+            vNextDim=self.v_next_tensor_dim,
+            worldHzxDim=self.world_hzx_dim,
+            beliefDim=self.belief_dim,)
+        self.latent_inferer = LatentControlInferer(
+            beliefDim=self.belief_dim,
+            dynDim=self.dyn_dim,
+            uDim=self.u_dim,)
+        self.predictive_core = PredictiveDecisionCore(
+            beliefDim=self.belief_dim,
+            uDim=self.u_dim,
+            dynDim=self.dyn_dim,
+            nSteps=2,)
+        self.belief_predictor = PredictionErrorHead(
+            dynDim=self.dyn_dim,
+            beliefDim=self.belief_dim,)
+        self.efe_head = ExpectedFreeEnergyHead(
+            beliefDim=self.belief_dim,
+            uDim=self.u_dim,
+            vDim=self.v_next_tensor_dim,)
+        self.elig_plasticity = EligibilityTracePlasticityLayer(
+            inDim=self.u_dim,
+            outDim=self.u_dim,)
+        action_ctx_dim = self.u_dim + self.dyn_dim + 2 + self.action_embed_dim
+        self.action_context = nn.Sequential(
+            nn.LayerNorm(action_ctx_dim),
+            nn.Linear(action_ctx_dim, self.mapper_hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(0.05),
+            nn.Linear(self.mapper_hidden_dim, self.mapper_hidden_dim),
+            nn.SiLU(),)
+        self.action_encode_head = nn.Sequential(
+            nn.LayerNorm(self.mapper_hidden_dim),
+            nn.Linear(self.mapper_hidden_dim, self.mapper_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.mapper_hidden_dim, self.action_embed_dim),
+            nn.LayerNorm(self.action_embed_dim),)
+
+        option_in_dim = self.dyn_dim + self.u_dim + self.mapper_hidden_dim
+        self.option_head = nn.Sequential(
+            nn.LayerNorm(option_in_dim),
+            nn.Linear(option_in_dim, hiddenDim),
+            nn.SiLU(),
+            nn.Linear(hiddenDim, self.num_options),)
+        self.option_psi_head = nn.Sequential(
+            nn.LayerNorm(option_in_dim),
+            nn.Linear(option_in_dim, hiddenDim),
+            nn.SiLU(),
+            nn.Linear(hiddenDim, self.num_options * self.psi_dim),)
+
+    @staticmethod
+    def FormatValueTensor(valueTensor: torch.Tensor, dim: int, B: int) -> torch.Tensor:
+        x = valueTensor.view(B, -1)
+        if x.size(-1) >= dim:
+            return x[..., :dim]
+        return torch.cat([x, x.new_zeros(B, dim - x.size(-1))], dim=-1)
+
+    @staticmethod
+    def Safe(x: torch.Tensor, clip: float = 60.0) -> torch.Tensor:
+        return torch.nan_to_num(x, nan=0.0, posinf=clip, neginf=-clip).clamp(-clip, clip)
+
+    @staticmethod
+    def SafeSoftmax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        return torch.softmax(DecisionExtractor.Safe(logits, 60.0), dim=dim)
+
+    def forward(
+        self,
+        stateFeat: torch.Tensor,
+        intentFeat: torch.Tensor,
+        *,
+        valueTensor: torch.Tensor,
+        vNextTensor: torch.Tensor,
+        uncertainty: torch.Tensor,
+        confidence: torch.Tensor,
+        worldHzx: torch.Tensor,
+        prevDecisionState: torch.Tensor,
+        prevLatentControl: torch.Tensor,
+        prevActionEmbed: torch.Tensor,
+        prevMapperHidden: torch.Tensor,
+        prevTdError: torch.Tensor,
+        sample: bool = True,
+        deterministic: bool = False,
+        prevOptionLogit: Optional[torch.Tensor] = None,
+        prior: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+        mixW: float = 0.3,) -> Dict[str, Any]:
+
+        B = stateFeat.size(0)
+        value_in = self.FormatValueTensor(valueTensor, self.value_tensor_dim, B)
+        v_next_in = self.FormatValueTensor(vNextTensor, self.v_next_tensor_dim, B)
+        belief = self.belief_assembler(
+            memFeat=stateFeat,
+            intentFeat=intentFeat,
+            valueTensor=value_in,
+            vNextTensor=v_next_in,
+            uncertainty=uncertainty,
+            confidence=confidence,
+            worldHzx=worldHzx,)
+
+        u_mu, u_logvar = self.latent_inferer(belief, prevDecisionState)
+        if sample and not deterministic:
+            u_t = u_mu + torch.exp(0.5 * u_logvar) * torch.randn_like(u_mu)
+        else:
+            u_t = u_mu
+        u_t = 0.8 * u_t + 0.2 * prevLatentControl
+
+        neuromod = prevTdError + 0.5 * (confidence - uncertainty)
+        u_t = u_t + 0.1 * self.elig_plasticity(u_t, neuromod)
+
+        precision = (1.0 / (uncertainty.view(-1, 1) + 1e-3)).clamp_max(20.0)
+        decision_state = self.predictive_core(prevDecisionState, belief, u_t, precision)
+        belief_pred = self.belief_predictor(decision_state)
+        prediction_error = belief - belief_pred
+        efe = self.efe_head(
+            belief=belief,
+            u=u_t,
+            uMu=u_mu,
+            uLogvar=u_logvar,
+            vNext=v_next_in,
+            uncertainty=uncertainty,
+            confidence=confidence,)
+
+        scalars = torch.cat([uncertainty.view(-1, 1), confidence.view(-1, 1)], dim=-1)
+        mapper_hidden = self.action_context(torch.cat([
+            u_t,
+            decision_state,
+            scalars,
+            prevActionEmbed,], dim=-1))
+        mapper_hidden_next = 0.5 * prevMapperHidden + 0.5 * mapper_hidden
+        action_encode = self.action_encode_head(mapper_hidden_next)
+
+        option_in = torch.cat([decision_state, u_t, mapper_hidden_next], dim=-1)
+        option_logits = self.option_head(option_in)
+        if prevOptionLogit is not None:
+            option_logits = option_logits + 0.05 * prevOptionLogit.detach()
+        w_t = self.SafeSoftmax(option_logits, dim=-1)
+        psi_all = self.option_psi_head(option_in).view(B, self.num_options, self.psi_dim)
+        psi_mix = (w_t.unsqueeze(-1) * psi_all).sum(dim=1)
+
+        entropy_scalar = (0.5 * (1.0 + math.log(2.0 * math.pi)) + 0.5 * u_logvar).sum(dim=-1)
+
+        out: Dict[str, Any] = {
+            "z": decision_state,
+            "entropy": entropy_scalar,
+            "option": {
+                "logits": option_logits,
+                "psi_all": psi_all,
+                "w_t": w_t,
+                "psi_mix": psi_mix,},
+            "prevOptionLogit_next": option_logits.detach(),
+            "belief": belief,
+            "decision_state": decision_state,
+            "decision_state_next": decision_state.detach(),
+            "prediction_error": prediction_error,
+            "latent_control": {
+                "u": u_t,
+                "mu": u_mu,
+                "logvar": u_logvar,},
+            "latent_control_next": u_t.detach(),
+            "efe": efe,
+            "mapper": {
+                "hidden": mapper_hidden,
+                "hidden_next": mapper_hidden_next.detach(),},
+            "action_encode": action_encode,
+            "action_encode_next": action_encode.detach(),}
+
+        if sample:
+            if deterministic:
+                opt_idx = torch.argmax(option_logits, dim=-1)
+            else:
+                opt_idx = torch.distributions.Categorical(probs=w_t).sample()
+            logp_option = F.log_softmax(option_logits, dim=-1).gather(1, opt_idx.view(-1, 1)).squeeze(1)
+
+            out["option"].update({"opt_idx": opt_idx, "logp_option": logp_option})
+
+        return out
+
+    def ResetHebbianMemory(self, value: float = 0.0, doneMask: Optional[torch.Tensor] = None):
+        for m in self.modules():
+            if isinstance(m, EligibilityTracePlasticityLayer):
+                m.Reset(doneMask=doneMask)
 
 
 
 class DecisionOnlineWrapper(BaseOnlineWrapper):
     def __init__(
         self,
-        base: DecisionExtractor,
+        base: LegacyDecisionExtractor,
         *,
         initRankEach: int = 0,
         autoRank: bool = True,
@@ -1043,8 +1606,8 @@ class DecisionOnlineWrapper(BaseOnlineWrapper):
         prior: Optional[Dict[str, Dict[str, torch.Tensor]]] = kwargs.get("prior", None)
         mixW: float = float(kwargs.get("mixW", 0.3))
         intentFeat: Optional[torch.Tensor] = kwargs.get("intentFeat", None)
-        valueTensor: torch.Tensor = kwargs["valueTensor"]
-        vNextTensor: torch.Tensor = kwargs["vNextTensor"]
+        valueTensor: torch.Tensor = kwargs.get("valueTensor", x.new_zeros(x.size(0), self.base.value_tensor_dim))
+        vNextTensor: torch.Tensor = kwargs.get("vNextTensor", x.new_zeros(x.size(0), self.base.v_next_tensor_dim))
 
         if intentFeat is None:
             raise ValueError("DecisionOnlineWrapper.ForwardWithDeltas requires intentFeat in kwargs")
@@ -1587,6 +2150,21 @@ class TestDecisionMTool:
         self.key_dim = int(KEY_DIM)  
         self.keyvec_dim = int(KEY_DIM + 2)    
 
+    def PredictiveInputs(self, model: DecisionExtractor, B: int, stateDim: int, intentDim: int):
+        return {
+            "stateFeat": torch.randn(B, stateDim, device=self.device),
+            "intentFeat": torch.randn(B, intentDim, device=self.device),
+            "valueTensor": torch.randn(B, model.value_tensor_dim, device=self.device),
+            "vNextTensor": torch.randn(B, model.v_next_tensor_dim, device=self.device),
+            "uncertainty": torch.rand(B, device=self.device),
+            "confidence": torch.rand(B, device=self.device),
+            "worldHzx": torch.randn(B, model.world_hzx_dim, device=self.device),
+            "prevDecisionState": torch.zeros(B, model.dyn_dim, device=self.device),
+            "prevLatentControl": torch.zeros(B, model.u_dim, device=self.device),
+            "prevActionEmbed": torch.zeros(B, model.action_embed_dim, device=self.device),
+            "prevMapperHidden": torch.zeros(B, model.mapper_hidden_dim, device=self.device),
+            "prevTdError": torch.zeros(B, device=self.device),}
+
 
     class MockActionEncoder(nn.Module):
         def __init__(self, keyVecDim: int, outDim: int):
@@ -1882,46 +2460,34 @@ class TestDecisionMTool:
             model.eval()
 
             B = 3
-            x = torch.randn(B, 256, device=self.device)
-            intent = torch.randn(B, 256, device=self.device)
+            inputs = self.PredictiveInputs(model, B, 256, 256)
 
-            out = model(x, intent, sample=False, prior=None)
-            kb, ms, opt = out["keyboard"], out["mouse"], out["option"]
+            out = model(**inputs, sample=False, prior=None)
+            opt = out["option"]
 
             checks = [
-                kb["keys_logits"].shape == (B, self.key_dim),
-                ms["mu"].shape == (B, 2),
-                ms["logstd"].shape == (B, 2),
-                ms["click_logits"].shape == (B, 2),
                 opt["logits"].shape == (B, model.num_options),
-                opt["psi_all"].shape == (B, model.num_options, model.option.psiDim),
+                opt["psi_all"].shape == (B, model.num_options, model.psi_dim),
                 opt["w_t"].shape == (B, model.num_options),
                 out["entropy"].shape == (B,),
-                out["prevOptionLogit_next"].shape == (B, model.num_options),]
+                out["prevOptionLogit_next"].shape == (B, model.num_options),
+                out["latent_control"]["u"].shape == (B, model.u_dim),
+                out["decision_state"].shape == (B, model.dyn_dim),
+                out["action_encode"].shape == (B, model.action_embed_dim),]
             
             if not all(checks):
                 print("DecisionExtractor forward output dimension mismatch")
                 return False
 
-            out2 = model(x, intent, sample=True, deterministic=False, prior=None)
-            allowed_top_keys = {"z", "entropy", "option", "keyboard", "mouse", "entropy_components", "prevOptionLogit_next"}
-            if any(k not in allowed_top_keys for k in out2.keys()):
-                print("Unexpected legacy action fields in sampled output")
+            out2 = model(**inputs, sample=True, deterministic=False, prior=None)
+            if out2["action_encode"].shape != (B, model.action_embed_dim):
+                print("Sampled action_encode shape mismatch")
+                return False
+            if not torch.isfinite(out2["action_encode"]).all():
+                print("Non-finite action_encode")
                 return False
 
-            keys_act = out2["keyboard"]["keys_act"]
-            clicks = out2["mouse"]["click_sample"]
-            if (keys_act.shape != (B, self.key_dim)) or (clicks.shape != (B, 2)):
-                print("Sampled action shape mismatch")
-                return False
-            if not torch.isfinite(keys_act).all() or not torch.isfinite(clicks).all():
-                print("Non-finite sampled actions")
-                return False
-            if not (((keys_act == 0) | (keys_act == 1)).all() and ((clicks == 0) | (clicks == 1)).all()):
-                print("keys_act/click_sample not binary")
-                return False
-
-            print("DecisionExtractor Forward/Sampling shapes pass")
+            print("DecisionExtractor action_encode Forward/Sampling shapes pass")
             return True
         except Exception as e:
             print("DecisionExtractor forward error:", type(e).__name__, e)
@@ -1967,19 +2533,28 @@ class TestDecisionMTool:
                 print_nested("input.prior", prior)
 
                 out = model(
-                    state_feat,
-                    intent_feat,
-                    sample=True,
-                    deterministic=False,
-                    prevOptionLogit=prev_option_logit,
+                stateFeat=state_feat,
+                intentFeat=intent_feat,
+                valueTensor=torch.randn(B, model.value_tensor_dim, device=self.device),
+                vNextTensor=torch.randn(B, model.v_next_tensor_dim, device=self.device),
+                uncertainty=torch.rand(B, device=self.device),
+                confidence=torch.rand(B, device=self.device),
+                worldHzx=torch.randn(B, model.world_hzx_dim, device=self.device),
+                prevDecisionState=torch.zeros(B, model.dyn_dim, device=self.device),
+                prevLatentControl=torch.zeros(B, model.u_dim, device=self.device),
+                prevActionEmbed=torch.zeros(B, model.action_embed_dim, device=self.device),
+                prevMapperHidden=torch.zeros(B, model.mapper_hidden_dim, device=self.device),
+                prevTdError=torch.zeros(B, device=self.device),
+                sample=True,
+                deterministic=False,
+                prevOptionLogit=prev_option_logit,
                     prior=prior,
                     mixW=0.3,)
 
                 print_nested("output", out)
 
-            assert out["z"].shape == (B, 1024)
-            assert out["keyboard"]["keys_logits"].shape == (B, self.key_dim)
-            assert out["mouse"]["mu"].shape == (B, 2)
+            assert out["z"].shape == (B, model.dyn_dim)
+            assert out["action_encode"].shape == (B, model.action_embed_dim)
             assert out["option"]["logits"].shape == (B, model.num_options)
             return True
         except Exception as e:
@@ -1988,7 +2563,7 @@ class TestDecisionMTool:
 
     def TestOptionPrevAndTrans(self) -> bool:
         try:
-            model = DecisionExtractor(
+            model = LegacyDecisionExtractor(
                 stateDim=128, intentDim=128,
                 hiddenDim=128, psiDim=64,
                 optionNum=16, useHebb=False).to(self.device)
@@ -2061,7 +2636,7 @@ class TestDecisionMTool:
 
     def TestForwardWithDeltasInjection(self) -> bool:
         try:
-            model = DecisionExtractor(
+            model = LegacyDecisionExtractor(
                 stateDim=128, intentDim=128,
                 hiddenDim=128, psiDim=64,
                 optionNum=16, useHebb=False).to(self.device)
@@ -2108,7 +2683,7 @@ class TestDecisionMTool:
 
     def TestCommitOneGrowsLora(self) -> bool:
         try:
-            model = DecisionExtractor(
+            model = LegacyDecisionExtractor(
                 stateDim=128, intentDim=128,
                 hiddenDim=128, psiDim=64,
                 optionNum=16, useHebb=False).to(self.device)
@@ -2159,7 +2734,7 @@ class TestDecisionMTool:
 
     def TestTrainStepSmoke(self) -> bool:
         try:
-            model = DecisionExtractor(
+            model = LegacyDecisionExtractor(
                 stateDim=256, intentDim=256,
                 hiddenDim=128, psiDim=64,
                 optionNum=16, useHebb=False).to(self.device)
@@ -2195,7 +2770,7 @@ class TestDecisionMTool:
 
     def TestNoNanManySteps(self, steps: int = 40) -> bool:
         try:
-            model = DecisionExtractor(
+            model = LegacyDecisionExtractor(
                 stateDim=256, intentDim=256,
                 hiddenDim=128, psiDim=64,
                 optionNum=16, useHebb=False).to(self.device)
@@ -2232,7 +2807,7 @@ class TestDecisionMTool:
 
     def TestParamsChange(self, steps: int = 20) -> bool:
         try:
-            model = DecisionExtractor(
+            model = LegacyDecisionExtractor(
                 stateDim=256, intentDim=256,
                 hiddenDim=128, psiDim=64,
                 optionNum=16, useHebb=False).to(self.device)
@@ -2277,7 +2852,7 @@ class TestDecisionMTool:
     def TestGradRoutingLora(self, mode: str = "lora_only") -> bool:
         try:
             in_dim, B = 256, 32
-            model = DecisionExtractor(
+            model = LegacyDecisionExtractor(
                 stateDim=in_dim, intentDim=in_dim,
                 hiddenDim=128, psiDim=64,
                 optionNum=16, useHebb=False).to(self.device)
@@ -2395,7 +2970,7 @@ class TestDecisionMTool:
                 "click": {"logits": plan_out["click"]["logits"]},
                 "mouse": {"mu": plan_out["mouse"]["mu"], "var": plan_out["mouse"]["var"]},}
 
-            model = DecisionExtractor(
+            model = LegacyDecisionExtractor(
                 stateDim=256, intentDim=256,
                 hiddenDim=128, psiDim=64,
                 optionNum=16, useHebb=True).to(self.device)
@@ -2570,7 +3145,7 @@ class TestDecisionMTool:
 
     def TestLossDecreaseSupervised(self, steps: int = 160) -> bool:
         try:
-            model = DecisionExtractor(
+            model = LegacyDecisionExtractor(
                 stateDim=256, intentDim=256,
                 hiddenDim=128, psiDim=64,
                 optionNum=16, useHebb=False).to(self.device)
@@ -2642,7 +3217,7 @@ class TestDecisionMTool:
 
     def TestAllParamsHaveGrad(self) -> bool:
         try:
-            model = DecisionExtractor(
+            model = LegacyDecisionExtractor(
                 stateDim=256, intentDim=256,
                 hiddenDim=128, psiDim=64,
                 optionNum=16, useHebb=True).to(self.device)

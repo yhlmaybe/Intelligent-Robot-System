@@ -17,7 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 from PerceptionModule import TestPerceptionMTool
 from AttentionModule import  TestAttentionMTool
 from MemoryModule import  TestMemoryMTool
-from DecisionModule import RAW_KEYBOARD_LAYOUT, TestDecisionMTool
+from DecisionModule import RAW_KEYBOARD_LAYOUT, TestDecisionMTool, ActiveInferenceLoss
 from WorldModule import  TestWorldMTool
 from ValueEstimationModule import  TestValueEstimationMTool
 from ConsciousnessModule import TestConsciousMTool
@@ -25,6 +25,7 @@ from IntentionModule import TestIntentionMTool
 from OCRModule import TestOCRMTool, OCREngineExtractor, IouXyxy
 from DataPreprocess import DataPreprocessor, DataResizeMeta, OfflineGameDataset, OfflineOCRDataset, OfflineOCRRecognitionDataset
 from AGICore import Agent, BrainCore, BasicParameters
+from DecisionDecoupler import DecisionLosses
 
 try:
     import imageio.v3 as iio
@@ -1947,7 +1948,13 @@ class ManagerFunction:
     
             ds = OfflineGameDataset(isTest=isTest)
 
-            brain = BrainCore(device=self.device, plasticHebbian=True, plasticOnlineLearning=onlineLearning, usePlanner=False,)
+            brain = BrainCore(
+                device=self.device,
+                plasticHebbian=True,
+                plasticOnlineLearning=onlineLearning,
+                usePlanner=False,
+                plannerTeacherMode=True,
+                decisionMode="predictive",)
 
             agent = Agent(brain, isTrain=True, device=self.device, worldMemoryPath=worldMemPath, memMemoryPath=memMemPath,)
 
@@ -1994,8 +2001,6 @@ class ManagerFunction:
                 shuffle=False,
                 pinMemory=False)
 
-            mse = nn.MSELoss()
-
             patience = 5 
             min_delta = 1e-4 
             no_improve = 0
@@ -2020,33 +2025,40 @@ class ManagerFunction:
                 return img_b, key_b, mouse_click_b, mouse_move_b, reward_b, done_b, ext_text_b
 
             def compute_supervised_loss_and_metrics(
-                key_pred: Optional[torch.Tensor],
-                click_pred: Optional[torch.Tensor],
-                mouse_move_pred: Optional[torch.Tensor],
+                decision_out: Dict[str, Any],
+                key_pred: torch.Tensor,
+                click_pred: torch.Tensor,
                 keys_t: Optional[torch.Tensor],
                 mouse_click_t: Optional[torch.Tensor],
                 mouse_move_t: Optional[torch.Tensor],):
 
                 key_targets = keys_t.float()
                 click_targets = mouse_click_t.float()
-                move_targets = mouse_move_t.float()
 
-                cur_loss = (
-                    mse(key_pred.float(), key_targets)
-                    + mse(click_pred.float(), click_targets)
-                    + 0.05 * mse(mouse_move_pred.float(), move_targets))
+                action_encode_loss = DecisionLosses.ActionEncodeLoss(
+                    agent.action_decoder,
+                    decision_out,
+                    {
+                        "keys": key_targets,
+                        "click": click_targets,
+                        "mouse": mouse_move_t.float(),})
+                active = ActiveInferenceLoss(decision_out)
+                cur_loss = action_encode_loss["total"] + 0.05 * active["total"]
 
                 total_correct = float((key_pred.float() == key_targets).float().sum().item())
                 total_correct += float((click_pred.float() == click_targets).float().sum().item())
                 total_elems = int(key_targets.numel() + click_targets.numel())
 
-                return cur_loss, total_correct, total_elems
+                return cur_loss, total_correct, total_elems, {
+                    "action_encode": action_encode_loss,
+                    "active_inference": active,}
 
             def BuildTrainCheckpointPayload(epochValue: int) -> Dict[str, Any]:
                 return {
                     "epoch": int(epochValue),
                     "best_val": best_val,
                     "brain": brain.state_dict(),
+                    "action_decoder": agent.action_decoder.state_dict(),
                     "opt_actor": agent.opt_actor.state_dict(),
                     "opt_critic": agent.opt_critic.state_dict(),
                     "opt_world": agent.opt_world.state_dict(),
@@ -2129,14 +2141,14 @@ class ManagerFunction:
 
                     key_pred = act_out["keys"]
                     click_pred = act_out["mouse_clicks"]
-                    mouse_move_pred = act_out["mouse_move"]
+                    decision_out = act_out["decision"]
                     model_loss = act_out["loss"]
                     transport_delayed_loss = act_out.get("transport_delayed_loss", None)
                     ocr_items = act_out["OCR"]
-                    bc_loss, _, _ = compute_supervised_loss_and_metrics(
+                    bc_loss, _, _, decision_losses = compute_supervised_loss_and_metrics(
+                        decision_out,
                         key_pred,
                         click_pred,
-                        mouse_move_pred,
                         keys_t,
                         mouse_click_t,
                         mouse_move_t,)
@@ -2167,7 +2179,9 @@ class ManagerFunction:
                         agent.UpdateAllWrappers("accumulategrads")
                         agent.UpdateAllWrappers("autogrow")
 
-                    torch.nn.utils.clip_grad_norm_(brain.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(
+                        list(brain.parameters()) + list(agent.action_decoder.parameters()),
+                        1.0)
 
                     for name, p in brain.named_parameters():
                         if not p.requires_grad:
@@ -2280,13 +2294,13 @@ class ManagerFunction:
 
                             v_key_pred = act_out["keys"]
                             v_click_pred = act_out["mouse_clicks"]
-                            v_mouse_move_pred = act_out["mouse_move"]
+                            v_decision_out = act_out["decision"]
                             v_model_loss = act_out["loss"]
                             ocr_items = act_out["OCR"]
-                            bc_loss, correct, elems = compute_supervised_loss_and_metrics(
+                            bc_loss, correct, elems, _ = compute_supervised_loss_and_metrics(
+                                v_decision_out,
                                 v_key_pred,
                                 v_click_pred,
-                                v_mouse_move_pred,
                                 v_keys_t,
                                 v_mouse_click_t,
                                 v_mouse_move_t,)
@@ -2381,7 +2395,12 @@ class ManagerFunction:
     def LoadCheckpoint(self, brain: BrainCore, agent: Agent, dataset: Dataset, path: str = None):
         ckpt = torch.load(path,  map_location=self.device)
         brain.load_state_dict(ckpt["brain"])
-        agent.opt_actor.load_state_dict(ckpt["opt_actor"])
+        if "action_decoder" in ckpt:
+            agent.action_decoder.load_state_dict(ckpt["action_decoder"], strict=False)
+        try:
+            agent.opt_actor.load_state_dict(ckpt["opt_actor"])
+        except ValueError:
+            print("[LoadCheckpoint] opt_actor state skipped because parameter groups changed")
         agent.opt_critic.load_state_dict(ckpt["opt_critic"])
         agent.opt_world.load_state_dict(ckpt["opt_world"])
 
@@ -2416,7 +2435,13 @@ class ManagerFunction:
         try:
             self.ResetControllerFlags()
 
-            brain = BrainCore(device=self.device,plasticHebbian=useHebbian,plasticOnlineLearning=False,usePlanner=usePlanner,)
+            brain = BrainCore(
+                device=self.device,
+                plasticHebbian=useHebbian,
+                plasticOnlineLearning=False,
+                usePlanner=usePlanner,
+                plannerTeacherMode=False,
+                decisionMode="predictive",)
 
             model_path = BasicParameters.MODULEPARAMETER_PATH
 
@@ -3157,6 +3182,8 @@ class AgentHandle:
             prioritizeExtStr=prioritizeExtStr,
             plasticOnlineLearning=False,
             usePlanner=usePlanner,
+            plannerTeacherMode=False,
+            decisionMode="predictive",
             saveModuleMessagerOutput=saveModuleMessagerOutput,)
 
         self.agent = Agent(

@@ -1634,12 +1634,13 @@ class RSSMWorldModel(AGICoreModule):
     def ForwardTrain(
         self,
         visionIn: torch.Tensor, # [B, visionDim]
-        keysVec: torch.Tensor, # [B, K]
-        mouseClick: torch.Tensor, # [B, 2]
-        mouseSeq: torch.Tensor, # [B, 2]
-        reward: torch.Tensor, # [B]  
-        done: torch.Tensor, # [B]   
+        keysVec: Optional[torch.Tensor] = None, # [B, K]
+        mouseClick: Optional[torch.Tensor] = None, # [B, 2]
+        mouseSeq: Optional[torch.Tensor] = None, # [B, 2]
+        reward: Optional[torch.Tensor] = None, # [B]
+        done: Optional[torch.Tensor] = None, # [B]
         *,
+        actionEnc: Optional[torch.Tensor] = None,
         sample: bool = True,
         alphaKl: float = 0.8,
         freeNats: float = 1.0,
@@ -1658,7 +1659,10 @@ class RSSMWorldModel(AGICoreModule):
         h0 = self._h
         z0 = self._z
 
-        a_enc = self.action_encoder(keysVec, mouseSeq, mouseClick) # [B, actionDim]
+        if actionEnc is None:
+            a_enc = self.action_encoder(keysVec, mouseSeq, mouseClick) # [B, actionDim]
+        else:
+            a_enc = actionEnc
         a_t = self.act_proj(a_enc) # [B, stochDim]
 
         h_pred = self.s4.Step(z0, a_t) # [B,D]
@@ -1846,7 +1850,8 @@ class RSSMWorldModel(AGICoreModule):
             "mu_p": mu_p,
             "logstd_p": logstd_p,
             "mu_q": mu_q,
-            "logstd_q": logstd_q,}
+            "logstd_q": logstd_q,
+            "action_enc": a_enc,}
 
         if self.use_decoder and recon is not None:
             out["recon"] = recon
@@ -2381,9 +2386,10 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         **kwargs,) -> Dict[str, torch.Tensor]:
 
         visionIn = x
-        keysVec = kwargs["keysVec"]
-        mouseClick = kwargs["mouseClick"]
-        mouseSeq = kwargs["mouseSeq"]
+        actionEnc = kwargs.get("actionEnc", None)
+        keysVec = kwargs.get("keysVec", None)
+        mouseClick = kwargs.get("mouseClick", None)
+        mouseSeq = kwargs.get("mouseSeq", None)
         reward = kwargs["reward"]
         done = kwargs["done"]
 
@@ -2407,7 +2413,10 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         h0 = self.base._h
         z0 = self.base._z
 
-        a_enc = self.base.action_encoder(keysVec, mouseSeq, mouseClick) # [B, actionDim]
+        if actionEnc is None:
+            a_enc = self.base.action_encoder(keysVec, mouseSeq, mouseClick) # [B, actionDim]
+        else:
+            a_enc = actionEnc
         a_t = self.ActProj(a_enc, d) # [B, stochDim]
 
         h_pred = self.S4_Step(z0, a_t, updateState=True, d=d) # [B, deterDim]
@@ -2595,7 +2604,8 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
             "mu_p": mu_p,
             "logstd_p": logstd_p,
             "mu_q": mu_q,
-            "logstd_q": logstd_q,}
+            "logstd_q": logstd_q,
+            "action_enc": a_enc,}
         
         if self.base.use_decoder and recon is not None:
             out["recon"] = recon
