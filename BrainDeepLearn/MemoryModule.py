@@ -3,6 +3,7 @@ from typing import Any, Optional, Tuple, Dict, List, Union
 from pathlib import Path
 from types import SimpleNamespace
 from FunctionTools import AGICoreModule
+from ModuleMessagerManager import ModuleDim
 import numpy as np
 import torch
 import torch.nn as nn
@@ -1073,6 +1074,116 @@ class FusionMoE(AGICoreModule):
         return out # [B, outDim]
     
 
+class ObjectUsageBank(AGICoreModule):
+    """Per-instance tensorized affordance table (Part 6, Option C + Gaussian residual).
+
+    Indexed by integer object/skill ids. Stores applicability, default parameters,
+    expected slot-tensor deltas, Beta-distributed success priors, and a per-(skill,
+    instance) Gaussian over the continuous parameter vector for online refinement.
+    Novel objects are bootstrapped by Robo-ABC cosine retrieval over identity
+    descriptors. No knowledge graph, no language tokens.
+    """
+
+    def __init__(
+        self,
+        numObjects: int = ModuleDim.UsageNumObjects,
+        numSkills: int = ModuleDim.UsageNumSkills,
+        paramDim: int = ModuleDim.UsageParamDim,
+        idDim: int = ModuleDim.PstIdDim,
+        slotDeltaDim: int = ModuleDim.PstSlotDim,
+        usageDim: int = ModuleDim.PstUsageDim,
+        attrDim: int = ModuleDim.PstAttrDim,):
+        super().__init__()
+        self.num_objects = int(numObjects)
+        self.num_skills = int(numSkills)
+        self.param_dim = int(paramDim)
+        self.attr_dim = int(attrDim)
+        self.usage_dim = int(usageDim)
+
+        self.register_buffer("applicable", torch.zeros(self.num_objects, self.num_skills))
+        self.register_buffer("default_params", torch.zeros(self.num_objects, self.num_skills, self.param_dim))
+        self.register_buffer("expected_dx", torch.zeros(self.num_objects, self.num_skills, int(slotDeltaDim)))
+        self.register_buffer("success_alpha", torch.ones(self.num_objects, self.num_skills))
+        self.register_buffer("success_beta", torch.ones(self.num_objects, self.num_skills))
+        self.register_buffer("param_mu", torch.zeros(self.num_objects, self.num_skills, self.param_dim))
+        self.register_buffer("param_logvar", torch.zeros(self.num_objects, self.num_skills, self.param_dim))
+        self.register_buffer("instance_descriptors", F.normalize(torch.randn(self.num_objects, int(idDim)), dim=-1))
+        # Per-(object, skill) attribute centroid: lets attribute deltas refine the readout
+        # so we don't reduce to identity-only lookup.
+        self.register_buffer("attribute_centroid", torch.zeros(self.num_objects, self.num_skills, self.attr_dim))
+
+        self.readout_proj = nn.Linear(self.param_dim + self.attr_dim + 3, self.usage_dim)
+        self.needs_lookup = nn.Linear(4, 1)
+
+    def SuccessRate(self) -> torch.Tensor:
+        return self.success_alpha / (self.success_alpha + self.success_beta)
+
+    def Confidence(self) -> torch.Tensor:
+        total = self.success_alpha + self.success_beta
+        return self.applicable * total / (total + 10.0)
+
+    def NearestObject(self, descriptor: torch.Tensor) -> torch.Tensor:
+        """Robo-ABC retrieval: cosine NN over identity descriptors. descriptor [..., D_c]."""
+        sim = torch.matmul(F.normalize(descriptor, dim=-1), self.instance_descriptors.t())
+        return sim.argmax(dim=-1)
+
+    def BestObjectsForSkill(self, skillId: int) -> torch.Tensor:
+        return self.applicable[:, int(skillId)].argmax()
+
+    def SlotReadout(self, identity: torch.Tensor, attribute: torch.Tensor) -> torch.Tensor:
+        """Per-slot top-1 skill summary cached into PST.U. identity [B,K,D_c] -> [B,K,D_u].
+        Attribute residuals against the bank's centroid let attribute deltas refine the readout."""
+        B, K, _ = identity.shape
+        obj_idx = self.NearestObject(identity)                       # [B,K]
+        applicable_rows = self.applicable[obj_idx]                   # [B,K,N_skills]
+        best_skill = applicable_rows.argmax(dim=-1)                  # [B,K]
+        gather = lambda t: t[obj_idx.reshape(-1), best_skill.reshape(-1)].view(B, K, -1)
+        params = gather(self.default_params)                        # [B,K,P]
+        attribute_centroid = gather(self.attribute_centroid)        # [B,K,A]
+        attribute_residual = attribute - attribute_centroid
+        success = self.SuccessRate()[obj_idx, best_skill].unsqueeze(-1)
+        confidence = self.Confidence()[obj_idx, best_skill].unsqueeze(-1)
+        best_applicable = applicable_rows.gather(-1, best_skill.unsqueeze(-1))
+        summary = torch.cat([params, attribute_residual, success, confidence, best_applicable], dim=-1)
+        return self.readout_proj(summary)
+
+    def NeedsLookupScore(
+        self,
+        applicability: torch.Tensor,
+        confidence: torch.Tensor,
+        successRate: torch.Tensor,
+        intentAttention: torch.Tensor,) -> torch.Tensor:
+        feats = torch.stack([applicability, confidence, successRate, intentAttention], dim=-1)
+        return torch.sigmoid(self.needs_lookup(feats)).squeeze(-1)
+
+    @torch.no_grad()
+    def ExecutionOutcome(
+        self,
+        objId: torch.Tensor,
+        skillId: torch.Tensor,
+        success: torch.Tensor,
+        observedParams: torch.Tensor,
+        observedAttributes: Optional[torch.Tensor] = None,
+        momentum: float = 0.9,) -> None:
+        """Online update: Beta posterior on success and Bayesian moment matching on params.
+        Also tracks attribute centroid per (object, skill) when attributes are supplied."""
+        obj = objId.reshape(-1).long()
+        skill = skillId.reshape(-1).long()
+        succ = success.reshape(-1).to(self.success_alpha.dtype)
+        self.success_alpha[obj, skill] += succ
+        self.success_beta[obj, skill] += (1.0 - succ)
+        mu = self.param_mu[obj, skill]
+        new_mu = momentum * mu + (1.0 - momentum) * observedParams.view(mu.shape)
+        var = self.param_logvar[obj, skill].exp()
+        new_var = momentum * var + (1.0 - momentum) * (observedParams.view(mu.shape) - new_mu).square()
+        self.param_mu[obj, skill] = new_mu
+        self.param_logvar[obj, skill] = new_var.clamp_min(1e-6).log()
+        if observedAttributes is not None:
+            centroid = self.attribute_centroid[obj, skill]
+            self.attribute_centroid[obj, skill] = (
+                momentum * centroid + (1.0 - momentum) * observedAttributes.view(centroid.shape))
+
+
 class MemoryExtractor(AGICoreModule):
     def __init__(
         self,
@@ -1366,6 +1477,9 @@ class MemoryExtractor(AGICoreModule):
             nn.Linear(memoryDim, 1),
             nn.Sigmoid(),)
 
+        # Object usage knowledge bank, alongside working/episodic/semantic/spatial/skill banks.
+        self.usage_bank = ObjectUsageBank()
+
     @torch.no_grad()
     def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype) -> None:
         B0 = int(self.h_state.size(0))
@@ -1559,7 +1673,7 @@ class MemoryExtractor(AGICoreModule):
         ocrSemantic: torch.Tensor,
         intentHint: torch.Tensor,) -> torch.Tensor:
         vis = torch.cat([
-            visualState.LegacyFeat,
+            visualState.IntegratedFeat,
             visualState.MotionToken,
             visualState.PredErrorToken], dim=-1)
         visual_ctx = self.visual_context_proj(vis)
@@ -1588,7 +1702,7 @@ class MemoryExtractor(AGICoreModule):
         risk: torch.Tensor,
         confidence: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
         vis = torch.cat([
-            visualState.LegacyFeat,
+            visualState.IntegratedFeat,
             visualState.MotionToken,
             visualState.PredErrorToken], dim=-1)
         raw = self.event_context_proj(torch.cat([
@@ -1696,7 +1810,7 @@ class MemoryExtractor(AGICoreModule):
         val = val_mod + alpha * emo_emb # [B, memoryDim]
 
         sem_context = torch.cat([
-            visualState.LegacyFeat,
+            visualState.IntegratedFeat,
             ocrSemantic,
             intentHint], dim=-1)
 
@@ -3445,7 +3559,7 @@ class TestMemoryMTool:
 
     def MakeVisualState(self, B: int, device: torch.device, dtype: torch.dtype = torch.float32):
         return SimpleNamespace(
-            LegacyFeat=torch.randn(B, 1024, device=device, dtype=dtype),
+            IntegratedFeat=torch.randn(B, 1024, device=device, dtype=dtype),
             MotionToken=torch.randn(B, 512, device=device, dtype=dtype),
             PredErrorToken=torch.randn(B, 512, device=device, dtype=dtype),)
 
@@ -4119,10 +4233,10 @@ class TestMemoryMTool:
             x0 = torch.randn(1, cfg["inputDim"], device=self.device)
             x = x0.expand(B, -1).clone()
             visual = SimpleNamespace(
-                LegacyFeat=torch.zeros(B, 1024, device=self.device),
+                IntegratedFeat=torch.zeros(B, 1024, device=self.device),
                 MotionToken=torch.zeros(B, 512, device=self.device),
                 PredErrorToken=torch.zeros(B, 512, device=self.device),)
-            visual.LegacyFeat[1, 0] = 5.0
+            visual.IntegratedFeat[1, 0] = 5.0
             visual.MotionToken[1, 0] = -3.0
             ocr = torch.zeros(B, 512, device=self.device)
             intent = torch.zeros(B, 512, device=self.device)

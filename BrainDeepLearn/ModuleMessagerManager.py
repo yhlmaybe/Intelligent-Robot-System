@@ -4,7 +4,7 @@ from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Tuple, Union
 import json
 import math
 import threading
@@ -41,6 +41,91 @@ class ModuleDim:
     DecisionBeliefDim: int = 1024
     DecisionDynDim: int = 256
     MapperHiddenDim: int = 256
+
+    # Embodied-AGI v2 extensions ------------------------------------------------
+    # Physical State Tensor (slot-structured object-centric scene state)
+    PstSlots: int = 256         # K  : flattened object/part node candidates
+    PstSlotDim: int = 128       # D_s: per-node physical latent
+    PstPoseDim: int = 7         #      camera/world SE(3): xyz plus quaternion
+    PstObjectClasses: int = 256
+    PstPartClasses: int = 128
+    PstRelationClasses: int = 32
+    PstStateDim: int = 16
+    PstAttrDim: int = 32        # object material/mechanical attributes
+    PstAffordanceDim: int = 8
+    PstIdentityDim: int = 128
+    PstTextDim: int = 4
+    PstSymbolClasses: int = 16
+    PstRobotContextDim: int = 30   # base pose, end-effector pose/state, joints and velocities
+    PstActionTypes: int = 16
+    PstInteractionDim: int = 23    # one-hot action type plus observed action delta pose
+    PstSceneClasses: int = 32
+    PstGlobalLabels: int = 8
+    PstSemanticDim: int = 387   # level (3) + object class (256) + part class (128)
+    PstIdDim: int = 515         # tracked identity (128) + supervised semantic descriptor (387)
+    PstRelDim: int = 36         # relative xyz/distance (4) + relation probabilities (32)
+    PstUsageDim: int = 64       # D_u: per-slot usage-bank readout
+
+    # Four-level hierarchical goal stack (mission -> long -> mid -> short)
+    GoalUltimateDim: int = 256
+    GoalLongDim: int = 256
+    GoalMidDim: int = 128
+    GoalShortDim: int = 64
+    GoalUltimateCodebookGroups: int = 16
+    GoalUltimateCodebookCodes: int = 16
+    GoalLongCodebookGroups: int = 16   # 16 groups x 16 codes = 256
+    GoalLongCodebookCodes: int = 16
+    GoalMidCodebookGroups: int = 8     # 8 groups x 8 codes = 64
+    GoalMidCodebookCodes: int = 8
+
+    # Gather-vs-act decoder
+    DecisionGateDim: int = 2           # {gather, act}
+    GatherTypeDim: int = 8
+    ActTypeDim: int = 8
+    ArmCount: int = 2                  # per-arm wrist SE(3) targets
+    DecisionEndpointCount: int = 13
+    DecisionEndpointPoseDim: int = 7
+    DecisionActionDim: int = 6
+    DecisionEndpointPoseFeatDim: int = 128
+    DecisionFeedbackEmbedDim: int = 256
+    TemporalPrimitiveCount: int = 6
+    TemporalContextDim: int = 22
+    TemporalReasonDim: int = 8
+    TemporalPrimitiveNames: Tuple[str, ...] = (
+        "OBSERVE",
+        "DISPATCH",
+        "CONTINUE",
+        "CANCEL",
+        "FAILSAFE_STOP",
+        "REDISPATCH",)
+    DecisionEndpointNames: Tuple[str, ...] = (
+        "left_thumb_tip",
+        "left_index_tip",
+        "left_middle_tip",
+        "left_ring_tip",
+        "left_little_tip",
+        "right_thumb_tip",
+        "right_index_tip",
+        "right_middle_tip",
+        "right_ring_tip",
+        "right_little_tip",
+        "left_wrist",
+        "right_wrist",
+        "camera",)
+    # Endpoints the policy may reorient but never translate (3 rotation axes, no
+    # position control): their translation action deltas are masked to zero so no
+    # code path can realize an end-effector position change. The camera head pans
+    # and tilts but is mounted at a fixed position.
+    DecisionRotationOnlyEndpoints: Tuple[int, ...] = (DecisionEndpointNames.index("camera"),)
+    GatherParamDim: int = 32
+
+    # Object usage knowledge bank
+    UsageNumObjects: int = 1024        # N_obj
+    UsageNumSkills: int = 64           # N_skills
+    UsageParamDim: int = 8             # P
+
+    # Satisfaction-check / coarse-to-fine refinement
+    RefinementDim: int = 6             # wrist-frame correction (translation + axis-angle)
 
 
 class TensorVisualProcessor:

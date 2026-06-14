@@ -17,7 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 from PerceptionModule import TestPerceptionMTool
 from AttentionModule import  TestAttentionMTool
 from MemoryModule import  TestMemoryMTool
-from DecisionModule import RAW_KEYBOARD_LAYOUT, TestDecisionMTool, ActiveInferenceLoss
+from DecisionModule import TestDecisionMTool
 from WorldModule import  TestWorldMTool
 from ValueEstimationModule import  TestValueEstimationMTool
 from ConsciousnessModule import TestConsciousMTool
@@ -25,12 +25,32 @@ from IntentionModule import TestIntentionMTool
 from OCRModule import TestOCRMTool, OCREngineExtractor, IouXyxy
 from DataPreprocess import DataPreprocessor, DataResizeMeta, OfflineGameDataset, OfflineOCRDataset, OfflineOCRRecognitionDataset
 from AGICore import Agent, BrainCore, BasicParameters
-from DecisionDecoupler import DecisionLosses
+from ModuleMessagerManager import ModuleDim
 
 try:
     import imageio.v3 as iio
 except Exception:
-    iio = None  
+    iio = None
+
+
+class SequentialTrajectoryLoader:
+    """Splits one chronological frame stream into batchSize contiguous segments so
+    each batch slot stays temporally continuous across iterations: slot j yields
+    frames j*steps .. j*steps+steps-1 in order, matching the recurrent state's
+    batch-as-parallel-streams semantics."""
+
+    def __init__(self, dataset: Dataset, *, batchSize: int):
+        self.dataset = dataset
+        self.batch_size = int(batchSize)
+        self.steps = len(dataset) // self.batch_size
+
+    def __len__(self) -> int:
+        return self.steps
+
+    def __iter__(self):
+        for t in range(self.steps):
+            items = [self.dataset[j * self.steps + t] for j in range(self.batch_size)]
+            yield torch.utils.data.default_collate(items)
 
 
 class ModuleController:
@@ -177,6 +197,17 @@ class ManagerFunction:
         self.controller.SetParameterReceiver(reward=reward, done=done, textExt=textExt)
         return True
 
+    def SetCameraIntrinsics(
+        self,
+        cameraIntrinsics: Union[np.ndarray, torch.Tensor],
+        sourceSize: Tuple[int, int]) -> None:
+        """One-shot calibration: scales K from (cameraResH, cameraResW) to the
+        perception input grid and writes it into the perception's K buffer.
+        Subsequent AgentHandleForward() calls no longer take cameraIntrinsics."""
+        if self.agent_handle is None:
+            raise RuntimeError("agent_handle has not been initialized")
+        self.agent_handle.SetCameraIntrinsics(cameraIntrinsics, sourceSize=sourceSize)
+
     def AgentHandleForward(
         self,
         cameraIndex: int = 0,
@@ -184,7 +215,14 @@ class ManagerFunction:
         done: Optional[float] = None,
         textExt: Optional[List[Optional[str]]] = None,
         sampleActions: bool = True,
-        deterministicActor: bool = False,):
+        deterministicActor: bool = False,
+        *,
+        depthBitmap: Union[List[Any], np.ndarray, torch.Tensor],
+        depthValid: Optional[Union[List[Any], np.ndarray, torch.Tensor]] = None,
+        depthScaleMeters: float = 1.0,
+        robotPhysicalContext: torch.Tensor,
+        interactionContext: torch.Tensor,
+        robotState: Dict[str, torch.Tensor],):
         if self.agent_handle is None:
             raise RuntimeError("agent_handle has not been initialized")
         if iio is None:
@@ -198,6 +236,9 @@ class ManagerFunction:
             bitmap=frame_np,
             reward=reward,
             done=done,
+            depthBitmap=depthBitmap,
+            depthValid=depthValid,
+            depthScaleMeters=depthScaleMeters,
             device=self.device,
             needVisualState=False,)
 
@@ -207,7 +248,12 @@ class ManagerFunction:
             reward=converted["rewards"],
             done=converted["dones"],
             sampleActions=sampleActions,
-            deterministicActor=deterministicActor,)
+            deterministicActor=deterministicActor,
+            depth=converted["depths"],
+            depthValid=converted["depth_valid"],
+            robotPhysicalContext=robotPhysicalContext,
+            interactionContext=interactionContext,
+            robotState=robotState,)
         return self.agent_handle.agent.UnpackActPacked(act_out)
 
     def ResteAgentHandleHebbian(self):
@@ -444,36 +490,52 @@ class ManagerFunction:
 
         return trainDataset, valDataset, testDataset
 
+    def SplitDatasetSequential(
+        self,
+        dataset: Dataset,
+        *,
+        valSplit: float,
+        testSplit: float = 0.1,
+        trainDataset: Optional[Dataset] = None,
+        valDataset: Optional[Dataset] = None,
+        testDataset: Optional[Dataset] = None,):
+        """Contiguous time-range split (train | val | test) so frame order survives;
+        random_split would shuffle the stream and destroy the recurrent state's
+        temporal continuity."""
+        if trainDataset is None:
+            n_total = len(dataset)
+            n_test = int(n_total * testSplit)
+            n_val = int(n_total * valSplit)
+            n_train = n_total - n_val - n_test
+            trainDataset = torch.utils.data.Subset(dataset, list(range(0, n_train)))
+            valDataset = torch.utils.data.Subset(dataset, list(range(n_train, n_train + n_val)))
+            testDataset = torch.utils.data.Subset(dataset, list(range(n_train + n_val, n_total)))
+        return trainDataset, valDataset, testDataset
+
     def HasGameDataset(self, dataRoot: Optional[Union[str, Path]] = None) -> bool:
         if dataRoot is None:
             frames_dir = Path(BasicParameters.DATA_FRAMES_PATH)
-            keys_dir = Path(BasicParameters.DATA_KEYS_PATH)
-            mouse_click_dir = Path(BasicParameters.DATA_MOUSE_CLICK_PATH)
-            mouse_move_dir = Path(BasicParameters.DATA_MOUSE_MOVE_PATH)
             reward_dir = Path(BasicParameters.DATA_REWARD_PATH)
             done_dir = Path(BasicParameters.DATA_DONE_PATH)
+            depth_dir = Path(BasicParameters.DATA_DEPTH_PATH)
             texts_dir = Path(BasicParameters.DATA_TEXTS_PATH)
         else:
             root = Path(dataRoot)
             frames_dir = root / "frames"
-            keys_dir = root / "keys"
-            mouse_click_dir = root / "mouse_click"
-            mouse_move_dir = root / "mouse_move"
             reward_dir = root / "reward"
             done_dir = root / "done"
+            depth_dir = root / "depth"
             texts_dir = root / "texts"
 
-        required_dirs = [frames_dir, keys_dir, mouse_click_dir, mouse_move_dir, reward_dir, done_dir]
+        required_dirs = [frames_dir, reward_dir, done_dir, depth_dir]
         if not all(p.exists() for p in required_dirs):
             return False
 
         counts = [
             len(sorted(frames_dir.glob("*.png"))),
-            len(sorted(keys_dir.glob("*.npy"))),
-            len(sorted(mouse_click_dir.glob("*.npy"))),
-            len(sorted(mouse_move_dir.glob("*.npy"))),
             len(sorted(reward_dir.glob("*.npy"))),
-            len(sorted(done_dir.glob("*.npy"))),]
+            len(sorted(done_dir.glob("*.npy"))),
+            len(DataPreprocessor.ListDepthFiles(depth_dir)),]
         if counts[0] == 0 or len(set(counts)) != 1:
             return False
 
@@ -482,6 +544,51 @@ class ManagerFunction:
             if text_count not in (0, counts[0]):
                 return False
         return True
+
+    def BuildDefaultPhysicalContexts(
+        self,
+        batchSize: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        robot_context = torch.zeros(
+            int(batchSize),
+            ModuleDim.PstRobotContextDim,
+            device=device,
+            dtype=dtype)
+        interaction_context = torch.zeros(
+            int(batchSize),
+            ModuleDim.PstInteractionDim,
+            device=device,
+            dtype=dtype)
+        return robot_context, interaction_context
+
+    def BuildDefaultRobotState(
+        self,
+        batchSize: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype) -> Dict[str, torch.Tensor]:
+        endpoint_pose = torch.zeros(
+            int(batchSize),
+            ModuleDim.DecisionEndpointCount,
+            ModuleDim.DecisionEndpointPoseDim,
+            device=device,
+            dtype=dtype)
+        endpoint_pose[..., 6] = 1.0
+        camera_pose_world = torch.zeros(int(batchSize), ModuleDim.PstPoseDim, device=device, dtype=dtype)
+        camera_pose_world[:, 6] = 1.0
+        planner_scalar = torch.zeros(int(batchSize), device=device, dtype=dtype)
+        return {
+            "endpoint_pose": endpoint_pose,
+            "camera_pose_world": camera_pose_world,
+            "planner_expected_endpoint_pose": endpoint_pose.clone(),
+            "planner_progress": planner_scalar,
+            "planner_tracking_error": planner_scalar,
+            "planner_executing": torch.ones_like(planner_scalar),
+            "planner_reached": planner_scalar,
+            "planner_failed": planner_scalar,
+            "planner_canceled": planner_scalar,}
 
     def SummarizeImageDirectory(self, path: Union[str, Path]) -> str:
         img_dir = Path(path)
@@ -1089,7 +1196,6 @@ class ManagerFunction:
         recognizerInitPath: Optional[str] = None,
         overrideCheckpointWithModuleParams: bool = True,):
         try:
-            torch.autograd.set_detect_anomaly(True)
 
             self.ResetControllerFlags()
     
@@ -1625,7 +1731,6 @@ class ManagerFunction:
         outPath: str,
         overrideCheckpointWithModuleParams: bool = False,):
         try:
-            torch.autograd.set_detect_anomaly(True)
 
             self.ResetControllerFlags()
     
@@ -1936,11 +2041,11 @@ class ManagerFunction:
         isTest: bool = False, 
         worldMemPath: str = None, 
         memMemPath: str = None, 
-        ckptPath: str = None, 
+        ckptPath: str = None,
         outPath: str = None,
-        overrideCheckpointWithModuleParams: bool = False,):
+        overrideCheckpointWithModuleParams: bool = False,
+        trainStage: str = "full",):
         try:
-            torch.autograd.set_detect_anomaly(True)
             ckptPath = ckptPath or BasicParameters.CKPT_PATH_TRAIN
             outPath = outPath or (BasicParameters.MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.MODULEPARAMETER_PATH)
 
@@ -1952,9 +2057,7 @@ class ManagerFunction:
                 device=self.device,
                 plasticHebbian=True,
                 plasticOnlineLearning=onlineLearning,
-                usePlanner=False,
-                plannerTeacherMode=True,
-                decisionMode="predictive",)
+                enablePerceptionSupervision=False)
 
             agent = Agent(brain, isTrain=True, device=self.device, worldMemoryPath=worldMemPath, memMemoryPath=memMemPath,)
 
@@ -1977,7 +2080,7 @@ class ManagerFunction:
                 loadFn=lambda path: self.LoadBrainWeights(brain, path),
                 logPrefix="Train")
 
-            train_ds, val_ds, test_ds = self.SplitDataset(
+            train_ds, val_ds, test_ds = self.SplitDatasetSequential(
                 ds,
                 valSplit=valSplit,
                 testSplit=testSplit,
@@ -1985,80 +2088,28 @@ class ManagerFunction:
                 valDataset=val_ds,
                 testDataset=test_ds)
 
-            train_dl = self.CreateDataLoader(
-                train_ds,
-                batchSize=batchSize,
-                shuffle=False,
-                pinMemory=True)
-            val_dl = self.CreateDataLoader(
-                val_ds,
-                batchSize=batchSize,
-                shuffle=False,
-                pinMemory=False)
-            test_dl = self.CreateDataLoader(
-                test_ds,
-                batchSize=batchSize,
-                shuffle=False,
-                pinMemory=False)
+            train_dl = SequentialTrajectoryLoader(train_ds, batchSize=batchSize)
+            val_dl = SequentialTrajectoryLoader(val_ds, batchSize=batchSize)
+            test_dl = SequentialTrajectoryLoader(test_ds, batchSize=batchSize)
 
             patience = 5 
             min_delta = 1e-4 
             no_improve = 0
-            target_acc = 0.90 
-            max_gap = 0.1
 
             def unpack_batch(batch):
-                img_b, key_b, mouse_click_b, mouse_move_b, reward_b, done_b, ext_text_b = batch
+                img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b = batch
 
-                if ext_text_b is not None:
-                    if isinstance(ext_text_b, tuple):
-                        ext_text_b = list(ext_text_b)
-                    elif isinstance(ext_text_b, list):
-                        ext_text_b = ext_text_b
-                    else:
-                        ext_text_b = [ext_text_b]
+                ext_text_b = [
+                    None if (t is None or str(t).strip() == "") else str(t)
+                    for t in ext_text_b]
 
-                    ext_text_b = [
-                        None if (t is None or str(t).strip() == "") else str(t)
-                        for t in ext_text_b]
-
-                return img_b, key_b, mouse_click_b, mouse_move_b, reward_b, done_b, ext_text_b
-
-            def compute_supervised_loss_and_metrics(
-                decision_out: Dict[str, Any],
-                key_pred: torch.Tensor,
-                click_pred: torch.Tensor,
-                keys_t: Optional[torch.Tensor],
-                mouse_click_t: Optional[torch.Tensor],
-                mouse_move_t: Optional[torch.Tensor],):
-
-                key_targets = keys_t.float()
-                click_targets = mouse_click_t.float()
-
-                action_encode_loss = DecisionLosses.ActionEncodeLoss(
-                    agent.action_decoder,
-                    decision_out,
-                    {
-                        "keys": key_targets,
-                        "click": click_targets,
-                        "mouse": mouse_move_t.float(),})
-                active = ActiveInferenceLoss(decision_out)
-                cur_loss = action_encode_loss["total"] + 0.05 * active["total"]
-
-                total_correct = float((key_pred.float() == key_targets).float().sum().item())
-                total_correct += float((click_pred.float() == click_targets).float().sum().item())
-                total_elems = int(key_targets.numel() + click_targets.numel())
-
-                return cur_loss, total_correct, total_elems, {
-                    "action_encode": action_encode_loss,
-                    "active_inference": active,}
+                return img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b
 
             def BuildTrainCheckpointPayload(epochValue: int) -> Dict[str, Any]:
                 return {
                     "epoch": int(epochValue),
                     "best_val": best_val,
                     "brain": brain.state_dict(),
-                    "action_decoder": agent.action_decoder.state_dict(),
                     "opt_actor": agent.opt_actor.state_dict(),
                     "opt_critic": agent.opt_critic.state_dict(),
                     "opt_world": agent.opt_world.state_dict(),
@@ -2102,27 +2153,39 @@ class ManagerFunction:
                 agent.ResetBrainState(B=batchSize, isOnlineLearning=onlineLearning)
 
                 for bi, batch in enumerate(train_dl, start=1):
-                    img_b, key_b, mouse_click_b, mouse_move_b, reward_b, done_b, ext_text_b = unpack_batch(batch)
+                    img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b = unpack_batch(batch)
 
                     visual_enabled = self.controller.IsVisualStateEnabled()
-                    pack = DataPreprocessor.ConvertNpImagesKeysMouses(
+                    pack = DataPreprocessor.ConvertRobotInputs(
                         imgs=img_b,
-                        keys=key_b,
-                        mouseClick=mouse_click_b,
-                        mouseMove=mouse_move_b,
                         reward=reward_b,
                         done=done_b,
+                        depths=depth_b,
+                        depthValids=depth_valid_b,
                         device=self.device,
                         needVisualState=visual_enabled,)
                     
                     frames = pack["frames"]
                     original_images = pack["original_images"]
                     resize_meta = pack["resize_meta"]
-                    keys_t = pack["keys"]
-                    mouse_click_t = pack["mouse_clicks"]
-                    mouse_move_t = pack["mouse_moves"]
+                    depth_t = pack["depths"]
+                    depth_valid_t = pack["depth_valid"]
                     reward_t = pack["rewards"]
                     done_t = pack["dones"]
+                    robot_context_t, interaction_context_t = self.BuildDefaultPhysicalContexts(
+                        int(frames.size(0)),
+                        device=self.device,
+                        dtype=frames.dtype)
+                    robot_state_t = self.BuildDefaultRobotState(
+                        int(frames.size(0)),
+                        device=self.device,
+                        dtype=frames.dtype)
+                    robot_state_t["endpoint_pose"] = action_b
+                    robot_state_t["planner_expected_endpoint_pose"] = robot_state_t["endpoint_pose"]
+                    perception_targets = {
+                        "depth": depth_t,
+                        "depth_valid": depth_valid_t,
+                        "interaction_success": (reward_t.view(-1) > 0).float(),}
 
                     if self.controller.ShouldResetHebbian():
                         agent.ResetHebbianMemory()
@@ -2134,26 +2197,22 @@ class ManagerFunction:
                         reward=reward_t,
                         done=done_t,
                         sampleActions=True,
-                        deterministicActor=False,)
-                    
+                        deterministicActor=False,
+                        depth=depth_t,
+                        depthValid=depth_valid_t,
+                        robotPhysicalContext=robot_context_t,
+                        interactionContext=interaction_context_t,
+                        perceptionTargets=perception_targets,
+                        robotState=robot_state_t,)
+
                     if act_out is None:
                         continue
 
-                    key_pred = act_out["keys"]
-                    click_pred = act_out["mouse_clicks"]
-                    decision_out = act_out["decision"]
                     model_loss = act_out["loss"]
                     transport_delayed_loss = act_out.get("transport_delayed_loss", None)
                     ocr_items = act_out["OCR"]
-                    bc_loss, _, _, decision_losses = compute_supervised_loss_and_metrics(
-                        decision_out,
-                        key_pred,
-                        click_pred,
-                        keys_t,
-                        mouse_click_t,
-                        mouse_move_t,)
 
-                    loss = model_loss + bc_loss
+                    loss = model_loss
 
                     agent.opt_world.zero_grad(set_to_none=True)
                     agent.opt_critic.zero_grad(set_to_none=True)
@@ -2164,7 +2223,7 @@ class ManagerFunction:
                         transport_delayed_loss.backward(retain_graph=True)
                         transport_capture_delayed = agent.CaptureCriticTransportGrad()
 
-                    loss.backward(retain_graph=True)
+                    loss.backward()
                     transport_capture_current = agent.CaptureCriticTransportGrad()
                     transport_capture = {
                         "captured": transport_capture_delayed["captured"] + transport_capture_current["captured"],
@@ -2180,20 +2239,16 @@ class ManagerFunction:
                         agent.UpdateAllWrappers("autogrow")
 
                     torch.nn.utils.clip_grad_norm_(
-                        list(brain.parameters()) + list(agent.action_decoder.parameters()),
+                        list(brain.parameters()),
                         1.0)
 
-                    for name, p in brain.named_parameters():
-                        if not p.requires_grad:
-                            continue
-                        if p.grad is None:
-                            print("NO GRAD:", name)
-                        elif not torch.isfinite(p.grad).all():
-                            print("BAD GRAD:", name, p.grad.min(), p.grad.max(),)
-
-                    agent.opt_world.step()
-                    agent.opt_critic.step()
-                    agent.opt_actor.step()
+                    # Phased curriculum: "world" trains the world model only,
+                    # "policy" trains critic+actor on a frozen world model, "full" trains all.
+                    if trainStage in ("full", "world"):
+                        agent.opt_world.step()
+                    if trainStage in ("full", "policy"):
+                        agent.opt_critic.step()
+                        agent.opt_actor.step()
                     agent.AfterOptimizerStep()
 
                     previous_processed_sample_count_total = processed_sample_count_total
@@ -2257,29 +2312,39 @@ class ManagerFunction:
                     agent.ResetBrainState(B=batchSize, isOnlineLearning=onlineLearning)
                     split_loss = 0.0
                     split_batches = 0
-                    total_correct = 0
-                    total_elems = 0
 
                     with torch.no_grad():
                         for batch in dl:
-                            img_b, key_b, mouse_click_b, mouse_move_b, reward_b, done_b, ext_text_b = unpack_batch(batch)
+                            img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b = unpack_batch(batch)
 
-                            v_pack = DataPreprocessor.ConvertNpImagesKeysMouses(
+                            v_pack = DataPreprocessor.ConvertRobotInputs(
                                 imgs=img_b,
-                                keys=key_b,
-                                mouseClick=mouse_click_b,
-                                mouseMove=mouse_move_b,
                                 reward=reward_b,
                                 done=done_b,
+                                depths=depth_b,
+                                depthValids=depth_valid_b,
                                 device=self.device,
                                 needVisualState=False,)
                             
                             v_frames = v_pack["frames"]
-                            v_keys_t = v_pack["keys"]
-                            v_mouse_click_t = v_pack["mouse_clicks"]
-                            v_mouse_move_t = v_pack["mouse_moves"]
+                            v_depth_t = v_pack["depths"]
+                            v_depth_valid_t = v_pack["depth_valid"]
                             v_reward_t = v_pack["rewards"]
                             v_done_t = v_pack["dones"]
+                            v_robot_context_t, v_interaction_context_t = self.BuildDefaultPhysicalContexts(
+                                int(v_frames.size(0)),
+                                device=self.device,
+                                dtype=v_frames.dtype)
+                            v_robot_state_t = self.BuildDefaultRobotState(
+                                int(v_frames.size(0)),
+                                device=self.device,
+                                dtype=v_frames.dtype)
+                            v_robot_state_t["endpoint_pose"] = action_b
+                            v_robot_state_t["planner_expected_endpoint_pose"] = v_robot_state_t["endpoint_pose"]
+                            v_perception_targets = {
+                                "depth": v_depth_t,
+                                "depth_valid": v_depth_valid_t,
+                                "interaction_success": (v_reward_t.view(-1) > 0).float(),}
 
                             act_out = agent.Act(
                                 v_frames,
@@ -2287,37 +2352,27 @@ class ManagerFunction:
                                 reward=v_reward_t,
                                 done=v_done_t,
                                 sampleActions=True,
-                                deterministicActor=True,)
+                                deterministicActor=True,
+                                depth=v_depth_t,
+                                depthValid=v_depth_valid_t,
+                                robotPhysicalContext=v_robot_context_t,
+                                interactionContext=v_interaction_context_t,
+                                perceptionTargets=v_perception_targets,
+                                robotState=v_robot_state_t,)
                             
                             if act_out is None:
                                 continue
 
-                            v_key_pred = act_out["keys"]
-                            v_click_pred = act_out["mouse_clicks"]
-                            v_decision_out = act_out["decision"]
                             v_model_loss = act_out["loss"]
-                            ocr_items = act_out["OCR"]
-                            bc_loss, correct, elems, _ = compute_supervised_loss_and_metrics(
-                                v_decision_out,
-                                v_key_pred,
-                                v_click_pred,
-                                v_keys_t,
-                                v_mouse_click_t,
-                                v_mouse_move_t,)
-                            cur_loss = v_model_loss + bc_loss
-                            
-                            total_correct += correct
-                            total_elems += elems
 
-                            split_loss += float(cur_loss.item())
+                            split_loss += float(v_model_loss.item())
                             split_batches += 1
 
                     avg_split_loss = split_loss / max(1, split_batches)
-                    split_acc = (total_correct / total_elems if total_elems > 0 else 0.0)
-                    return avg_split_loss, split_acc
+                    return avg_split_loss
 
-                avg_val, val_acc = eval_split(val_dl)
-                test_loss, test_acc = eval_split(test_dl)
+                avg_val = eval_split(val_dl)
+                test_loss = eval_split(test_dl)
 
                 improved = (best_val - avg_val) > min_delta
                 if improved:
@@ -2329,13 +2384,7 @@ class ManagerFunction:
 
                 self.controller.SetStatus(
                     "training",
-                    (f"Epoch {ep+1}/{epochs} done | " f"train {avg_train:.4f} | " f"val {avg_val:.4f}, acc={val_acc:.3f} | " f"test {test_loss:.4f}, acc={test_acc:.3f}"), val_loss=avg_val,)
-
-                if (val_acc >= target_acc and test_acc >= target_acc and abs(val_acc - test_acc) <= max_gap):
-                    self.controller.SetStatus("completed", f"Val/Test accuracies high & close: val={val_acc:.3f}, test={test_acc:.3f}",)
-                    if onlineLearning:
-                        agent.UpdateAllWrappers("commit")
-                    break
+                    (f"Epoch {ep+1}/{epochs} done | " f"train {avg_train:.4f} | " f"val {avg_val:.4f} | " f"test {test_loss:.4f}"), val_loss=avg_val,)
 
                 if no_improve >= patience:
                     self.controller.SetStatus("completed", "Validation stabilized, early stop.")
@@ -2395,8 +2444,6 @@ class ManagerFunction:
     def LoadCheckpoint(self, brain: BrainCore, agent: Agent, dataset: Dataset, path: str = None):
         ckpt = torch.load(path,  map_location=self.device)
         brain.load_state_dict(ckpt["brain"])
-        if "action_decoder" in ckpt:
-            agent.action_decoder.load_state_dict(ckpt["action_decoder"], strict=False)
         try:
             agent.opt_actor.load_state_dict(ckpt["opt_actor"])
         except ValueError:
@@ -2424,24 +2471,21 @@ class ManagerFunction:
         processed_sample_count_total = int(ckpt.get("processed_sample_count_total", 0))
         return start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds
 
-    def StartDeployment(self, cameraIndex: int = 0, useHebbian: bool = True, usePlanner: bool = True):
+    def StartDeployment(self, cameraIndex: int = 0, useHebbian: bool = True):
         return self.StartBackgroundTask(
             self.DeployLoop,
             args=(cameraIndex,),
-            kwargs={"useHebbian": useHebbian, "usePlanner": usePlanner,})
+            kwargs={"useHebbian": useHebbian,})
 
 
-    def DeployLoop(self, cameraIndex: int,* ,useHebbian: bool = True, usePlanner: bool = True,):
+    def DeployLoop(self, cameraIndex: int,* ,useHebbian: bool = True,):
         try:
             self.ResetControllerFlags()
 
             brain = BrainCore(
                 device=self.device,
                 plasticHebbian=useHebbian,
-                plasticOnlineLearning=False,
-                usePlanner=usePlanner,
-                plannerTeacherMode=False,
-                decisionMode="predictive",)
+                plasticOnlineLearning=False,)
 
             model_path = BasicParameters.MODULEPARAMETER_PATH
 
@@ -2470,19 +2514,31 @@ class ManagerFunction:
                     raise RuntimeError(f"cannot read frame from camera {int(cameraIndex)}")
 
                 visual_enabled = self.controller.IsVisualStateEnabled()
-                pack = DataPreprocessor.ConvertNpImagesKeysMouses(
+                frame_arr = np.asarray(frame_np)
+                depth_np = np.ones(frame_arr.shape[:2], dtype=np.float32)
+                depth_valid_np = np.ones(frame_arr.shape[:2], dtype=bool)
+                pack = DataPreprocessor.ConvertRobotInputs(
                     imgs=frame_np,
-                    keys=None,
-                    mouseClick=None,
-                    mouseMove=None,
                     reward=None,
                     done=None,
+                    depths=depth_np,
+                    depthValids=depth_valid_np,
                     device=self.device,
                     needVisualState=visual_enabled,)
 
                 frames = pack["frames"]
                 original_images = pack["original_images"]
                 resize_meta = pack["resize_meta"]
+                depth_t = pack["depths"]
+                depth_valid_t = pack["depth_valid"]
+                robot_context_t, interaction_context_t = self.BuildDefaultPhysicalContexts(
+                    int(frames.size(0)),
+                    device=self.device,
+                    dtype=frames.dtype)
+                robot_state_t = self.BuildDefaultRobotState(
+                    int(frames.size(0)),
+                    device=self.device,
+                    dtype=frames.dtype)
 
                 if self.controller.ShouldResetHebbian():
                     agent.ResetHebbianMemory()
@@ -2516,7 +2572,12 @@ class ManagerFunction:
                     reward=reward_tensor,
                     done=done_tensor,
                     sampleActions=True,
-                    deterministicActor=True,)
+                    deterministicActor=True,
+                    depth=depth_t,
+                    depthValid=depth_valid_t,
+                    robotPhysicalContext=robot_context_t,
+                    interactionContext=interaction_context_t,
+                    robotState=robot_state_t,)
                 if act_out is None:
                     continue
 
@@ -2633,16 +2694,10 @@ class ManagerFunction:
                 if root.exists():
                     shutil.rmtree(root)
                 (root / "frames").mkdir(parents=True, exist_ok=True)
-                (root / "keys").mkdir(parents=True, exist_ok=True)
-                (root / "mouse_click").mkdir(parents=True, exist_ok=True)
-                (root / "mouse_move").mkdir(parents=True, exist_ok=True)
                 (root / "reward").mkdir(parents=True, exist_ok=True)
                 (root / "done").mkdir(parents=True, exist_ok=True)
+                (root / "depth").mkdir(parents=True, exist_ok=True)
                 (root / "texts").mkdir(parents=True, exist_ok=True)
-
-                all_codes = list(RAW_KEYBOARD_LAYOUT.values())
-                max_code = max(all_codes)
-                keys_dim = max_code + 1
 
                 H, W = BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE
 
@@ -2654,19 +2709,8 @@ class ManagerFunction:
                     img = rng.integers(0, 256, size=(H, W, 3), dtype=np.uint8)
                     iio.imwrite(str(root / "frames" / f"{i:05d}.png"), img)
 
-                    keys = np.zeros((keys_dim,), dtype=np.float32)
-                    for code in all_codes:
-                        keys[code] = 1.0 if rng.random() < 0.05 else 0.0
-
-                    np.save(str(root / "keys" / f"{i:05d}.npy"), keys)
-
-                    mouse_click = np.zeros((2,), dtype=np.float32)
-                    mouse_click[0] = 1.0 if rng.random() < 0.15 else 0.0
-                    mouse_click[1] = 1.0 if rng.random() < 0.05 else 0.0
-                    np.save(str(root / "mouse_click" / f"{i:05d}.npy"), mouse_click)
-
-                    mouse_move = rng.normal(loc=0.0, scale=2.0, size=(2,)).astype(np.float32)
-                    np.save(str(root / "mouse_move" / f"{i:05d}.npy"), mouse_move)
+                    depth = rng.uniform(0.1, 2.0, size=(H, W)).astype(np.float32)
+                    np.save(str(root / "depth" / f"{i:05d}.npy"), depth)
 
                     reward = rng.normal(loc=0.0, scale=2.0, size=(1,)).astype(np.float32)
                     np.save(str(root / "reward" / f"{i:05d}.npy"), reward)
@@ -3090,21 +3134,17 @@ class ManagerFunction:
                 print(
                     "[Train] no dataset found, please prepare these folders first: "
                     f"{BasicParameters.DATA_FRAMES_PATH}, "
-                    f"{BasicParameters.DATA_KEYS_PATH}, "
-                    f"{BasicParameters.DATA_MOUSE_CLICK_PATH}, "
-                    f"{BasicParameters.DATA_MOUSE_MOVE_PATH}, "
                     f"{BasicParameters.DATA_REWARD_PATH}, "
-                    f"{BasicParameters.DATA_DONE_PATH}.")
+                    f"{BasicParameters.DATA_DONE_PATH}, "
+                    f"{BasicParameters.DATA_DEPTH_PATH}.")
                 return {"ok": False, "msg": "no dataset"}
 
             print(
                 "[Train] use configured dataset folders: "
                 f"{BasicParameters.DATA_FRAMES_PATH}, "
-                f"{BasicParameters.DATA_KEYS_PATH}, "
-                f"{BasicParameters.DATA_MOUSE_CLICK_PATH}, "
-                f"{BasicParameters.DATA_MOUSE_MOVE_PATH}, "
                 f"{BasicParameters.DATA_REWARD_PATH}, "
-                f"{BasicParameters.DATA_DONE_PATH}.")
+                f"{BasicParameters.DATA_DONE_PATH}, "
+                f"{BasicParameters.DATA_DEPTH_PATH}.")
 
             ok = self.StartTraining(
                 epochs=epochs, 
@@ -3133,10 +3173,9 @@ class ManagerFunction:
     def DeployModule(
         self,
         cameraIndex: int = 0,
-        useHebbian: bool = True,
-        usePlanner: bool = True,) -> Dict[str, Any]:
+        useHebbian: bool = True,) -> Dict[str, Any]:
         try:
-            ok = self.StartDeployment(cameraIndex=cameraIndex, useHebbian=useHebbian, usePlanner=usePlanner,)
+            ok = self.StartDeployment(cameraIndex=cameraIndex, useHebbian=useHebbian,)
 
             if not ok:
                 print("StartDeployment returns False (deployment may already be running)")
@@ -3163,7 +3202,6 @@ class AgentHandle:
         seqLen: int = BasicParameters.IMAGE_SEQ_LEN,
         plasticHebbian: bool = True,
         prioritizeExtStr: bool = True,
-        usePlanner: bool = True,
         saveModuleMessagerOutput: bool = True,):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -3181,9 +3219,6 @@ class AgentHandle:
             plasticHebbian=plasticHebbian,
             prioritizeExtStr=prioritizeExtStr,
             plasticOnlineLearning=False,
-            usePlanner=usePlanner,
-            plannerTeacherMode=False,
-            decisionMode="predictive",
             saveModuleMessagerOutput=saveModuleMessagerOutput,)
 
         self.agent = Agent(
@@ -3196,6 +3231,13 @@ class AgentHandle:
         self.agent.LoadBrainWeights(str(resolved_path))
         self.brain.eval()
 
+    def SetCameraIntrinsics(
+        self,
+        cameraIntrinsics: Union[np.ndarray, torch.Tensor],
+        sourceSize: Optional[Tuple[int, int]] = None) -> None:
+        k = torch.as_tensor(cameraIntrinsics)
+        self.agent.SetCameraIntrinsics(k, sourceSize=sourceSize)
+
     def ForwardStep(
         self,
         frame: torch.Tensor,
@@ -3204,11 +3246,23 @@ class AgentHandle:
         reward: Optional[int] = None,
         done: Optional[int] = None,
         sampleActions: bool = True,
-        deterministicActor: bool = False,):
+        deterministicActor: bool = False,
+        depth: torch.Tensor,
+        depthValid: torch.Tensor,
+        robotPhysicalContext: torch.Tensor,
+        interactionContext: torch.Tensor,
+        perceptionTargets: Optional[Dict[str, torch.Tensor]] = None,
+        robotState: Dict[str, torch.Tensor],):
         return self.agent.Act(
             frame,
             textExt=textExt,
             reward=reward,
             done=done,
             sampleActions=sampleActions,
-            deterministicActor=deterministicActor,)
+            deterministicActor=deterministicActor,
+            depth=depth,
+            depthValid=depthValid,
+            robotPhysicalContext=robotPhysicalContext,
+            interactionContext=interactionContext,
+            perceptionTargets=perceptionTargets,
+            robotState=robotState,)

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from torch.utils.data import Dataset
 from AGICore import BasicParameters
+from ModuleMessagerManager import ModuleDim
 
 try:
     import imageio.v3 as iio
@@ -28,44 +29,83 @@ def LoadImageFirstFrame(path: Union[str, Path]) -> np.ndarray:
         raise ValueError(f"failed to read image {path}: {e}") from e
 
 
+DEPTH_FILE_SUFFIXES = (".npy", ".npz", ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
+
+def ListDepthFiles(path: Union[str, Path]) -> List[Path]:
+    depth_dir = Path(path)
+    if not depth_dir.exists():
+        return []
+    return sorted([
+        item for item in depth_dir.iterdir()
+        if item.is_file() and item.suffix.lower() in DEPTH_FILE_SUFFIXES],
+        key=lambda item: item.name)
+
+
+def LoadDepthArray(path: Union[str, Path]) -> np.ndarray:
+    depth_path = Path(path)
+    suffix = depth_path.suffix.lower()
+    if suffix == ".npy":
+        return np.asarray(np.load(depth_path))
+    if suffix == ".npz":
+        payload = np.load(depth_path)
+        if len(payload.files) == 0:
+            raise ValueError(f"depth npz has no arrays: {depth_path}")
+        return np.asarray(payload[payload.files[0]])
+    return LoadImageFirstFrame(depth_path)
+
+
 class OfflineGameDataset(Dataset):
     def __init__(self, isTest: bool = False) -> None:
         if isTest:
             p = Path(BasicParameters.DATA_ROOT_PATH_TEST)
             self.imgs = sorted((p / "frames").glob("*.png"))
-            self.keys = sorted((p / "keys").glob("*.npy"))
-            self.mouse_click = sorted((p / "mouse_click").glob("*.npy"))
-            self.mouse_move = sorted((p / "mouse_move").glob("*.npy"))
             self.reward = sorted((p / "reward").glob("*.npy"))
             self.done = sorted((p / "done").glob("*.npy"))
+            self.depths = ListDepthFiles(getattr(BasicParameters, "DATA_DEPTH_PATH_TEST", p / "depth"))
+            self.depth_valids = ListDepthFiles(getattr(BasicParameters, "DATA_DEPTH_VALID_PATH_TEST", p / "depth_valid"))
             self.texts = sorted((p / "texts").glob("*.txt"))
+            self.actions = sorted((p / "actions").glob("*.npy"))
         else:
             self.imgs = sorted(Path(BasicParameters.DATA_FRAMES_PATH).glob("*.png"))
-            self.keys = sorted(Path(BasicParameters.DATA_KEYS_PATH).glob("*.npy"))
-            self.mouse_click = sorted(Path(BasicParameters.DATA_MOUSE_CLICK_PATH).glob("*.npy"))
-            self.mouse_move = sorted(Path(BasicParameters.DATA_MOUSE_MOVE_PATH).glob("*.npy"))
             self.reward = sorted(Path(BasicParameters.DATA_REWARD_PATH).glob("*.npy"))
             self.done = sorted(Path(BasicParameters.DATA_DONE_PATH).glob("*.npy"))
+            self.depths = ListDepthFiles(BasicParameters.DATA_DEPTH_PATH)
+            self.depth_valids = ListDepthFiles(BasicParameters.DATA_DEPTH_VALID_PATH)
             self.texts = sorted(Path(BasicParameters.DATA_TEXTS_PATH).glob("*.txt"))
+            self.actions = sorted(Path(BasicParameters.DATA_ACTIONS_PATH).glob("*.npy"))
 
-        assert len(self.imgs) == len(self.keys) == len(self.mouse_click) == len(self.mouse_move) == len(self.reward) == len(self.done), "frames/keys/mouse_click/mouse_move/reward/done The number of files is inconsistent."
+        assert len(self.imgs) == len(self.reward) == len(self.done) == len(self.depths), "frames/reward/done/depth The number of files is inconsistent."
+        if self.depth_valids:
+            assert len(self.depth_valids) == len(self.imgs), "depth_valid The number of files is inconsistent."
         if self.texts:
             assert len(self.texts) == len(self.imgs), "texts The number of files is inconsistent."
+        if self.actions:
+            assert len(self.actions) == len(self.imgs), "actions The number of files is inconsistent."
 
     def __len__(self) -> int:
         return len(self.imgs)
 
     def __getitem__(self, idx: int):
         imgs = LoadImageFirstFrame(self.imgs[idx])
-        keys = np.load(self.keys[idx]).astype(np.float32)
-        mouse_click = np.load(self.mouse_click[idx]).astype(np.float32)
-        mouse_move = np.load(self.mouse_move[idx]).astype(np.float32)
         reward = np.load(self.reward[idx]).astype(np.float32)
         done = np.load(self.done[idx]).astype(np.float32)
+        depth = LoadDepthArray(self.depths[idx])
+        if self.depth_valids:
+            depth_valid = LoadDepthArray(self.depth_valids[idx]).astype(bool)
+        else:
+            depth_valid = np.isfinite(depth) & (depth > 0)
         ext_text = None
         if self.texts:
             ext_text = self.texts[idx].read_text(encoding="utf-8").strip()
-        return imgs, keys, mouse_click, mouse_move, reward, done, ext_text
+        # Per-frame executed endpoint poses [endpoint_count, 7] (xyz + xyzw quaternion);
+        # identity poses until the recording pipeline supplies real actions.
+        if self.actions:
+            action = np.load(self.actions[idx]).astype(np.float32)
+        else:
+            action = np.zeros((ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim), dtype=np.float32)
+            action[:, 6] = 1.0
+        return imgs, reward, done, depth, depth_valid, ext_text, action
 
 
 class OfflineOCRDataset(Dataset):
@@ -172,6 +212,10 @@ class DataResizeMeta:
 
 class DataPreprocessor:
     SUPPORTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+
+    @staticmethod
+    def ListDepthFiles(path: Union[str, Path]) -> List[Path]:
+        return ListDepthFiles(path)
 
     @staticmethod
     def ListImageFiles(path: Union[str, Path]) -> List[Path]:
@@ -350,6 +394,272 @@ class DataPreprocessor:
         return resized, meta
 
     @staticmethod
+    def ToDepthTensor(
+        depth: Union[np.ndarray, torch.Tensor],
+        valid: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        *,
+        depthScaleMeters: float = 1.0,) -> Tuple[torch.Tensor, torch.Tensor]:
+        depth_t = torch.as_tensor(depth).float()
+        if depth_t.ndim == 2:
+            depth_t = depth_t.unsqueeze(0)
+        elif depth_t.ndim == 3 and depth_t.shape[-1] == 1:
+            depth_t = depth_t.permute(2, 0, 1)
+        if depth_t.ndim != 3 or depth_t.size(0) != 1:
+            raise ValueError(f"depth sample must have shape [H, W] or [1, H, W], got {tuple(depth_t.shape)}")
+        depth_t = depth_t * float(depthScaleMeters)
+        depth_valid = torch.isfinite(depth_t) & (depth_t > 0.0)
+
+        if valid is not None:
+            valid_t = torch.as_tensor(valid)
+            if valid_t.ndim == 2:
+                valid_t = valid_t.unsqueeze(0)
+            elif valid_t.ndim == 3 and valid_t.shape[-1] == 1:
+                valid_t = valid_t.permute(2, 0, 1)
+            if valid_t.shape != depth_t.shape:
+                raise ValueError(f"depth valid mask must match depth sample shape, got {tuple(valid_t.shape)}")
+            depth_valid = depth_valid & valid_t.bool()
+
+        depth_t = torch.where(depth_valid, depth_t, torch.zeros_like(depth_t))
+        return depth_t, depth_valid
+
+    @staticmethod
+    def ResizeDepth(
+        depthTensor: torch.Tensor,
+        validTensor: torch.Tensor,
+        size: Union[int, Tuple[int, int]],) -> Tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(size, int):
+            dst_size = (int(size), int(size))
+        else:
+            dst_size = (int(size[0]), int(size[1]))
+        valid_float = validTensor.float()
+        inverse = torch.where(validTensor, depthTensor.clamp_min(1e-6).reciprocal(), torch.zeros_like(depthTensor))
+        valid_weight = F.interpolate(valid_float.unsqueeze(0), size=dst_size, mode="area").squeeze(0)
+        inverse_sum = F.interpolate(inverse.unsqueeze(0), size=dst_size, mode="area").squeeze(0)
+        valid = valid_weight > 1e-6
+        resized_inverse = inverse_sum / valid_weight.clamp_min(1e-6)
+        depth = resized_inverse.clamp_min(1e-6).reciprocal()
+        return torch.where(valid, depth, torch.zeros_like(depth)), valid
+
+    @staticmethod
+    def ResizeCameraIntrinsics(
+        cameraIntrinsics: Union[np.ndarray, torch.Tensor],
+        sourceSize: Tuple[int, int],
+        targetSize: Tuple[int, int],
+        *,
+        device: Optional[torch.device] = None,) -> torch.Tensor:
+        intrinsics = torch.as_tensor(cameraIntrinsics).float().clone()
+        src_h, src_w = int(sourceSize[0]), int(sourceSize[1])
+        dst_h, dst_w = int(targetSize[0]), int(targetSize[1])
+        sx = float(dst_w) / float(max(1, src_w))
+        sy = float(dst_h) / float(max(1, src_h))
+        intrinsics[..., 0, 0] *= sx
+        intrinsics[..., 1, 1] *= sy
+        intrinsics[..., 0, 2] *= sx
+        intrinsics[..., 1, 2] *= sy
+        return intrinsics.to(device) if device is not None else intrinsics
+
+    @staticmethod
+    def TensorizeSyntheticSupervision(
+        annotation: Dict[str, Any],
+        rgb: torch.Tensor,
+        depth: torch.Tensor,
+        depthValid: torch.Tensor,
+        normal: torch.Tensor,
+        semanticSegmentation: torch.Tensor,
+        instanceSegmentation: torch.Tensor,
+        *,
+        maxNodes: int = 256,
+        numGlobalLabels: int = 8,
+        textDim: int = 4,
+        stateDim: int = 16,
+        attrDim: int = 32,
+        affordanceDim: int = 8,
+        relationClasses: int = 32,) -> Dict[str, torch.Tensor]:
+        dtype = rgb.dtype
+        device = rgb.device
+        height, width = rgb.shape[-2:]
+        nodes: List[Tuple[Dict[str, Any], int]] = []
+
+        def flatten(node: Dict[str, Any], parentIndex: int) -> None:
+            index = len(nodes)
+            nodes.append((node, parentIndex))
+            for child in node["parts"]:
+                flatten(child, index)
+
+        for obj in annotation["objects"]:
+            flatten(obj, -1)
+
+        N = int(maxNodes)
+        node_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        node_id = torch.full((N,), -1, device=device, dtype=torch.long)
+        node_level = torch.zeros(N, device=device, dtype=torch.long)
+        parent_index = torch.full((N,), -1, device=device, dtype=torch.long)
+        object_classes = torch.zeros(N, device=device, dtype=torch.long)
+        part_classes = torch.zeros(N, device=device, dtype=torch.long)
+        track_id = torch.zeros(N, device=device, dtype=torch.long)
+        pose_camera = torch.zeros(N, 7, device=device, dtype=dtype)
+        pose_world = torch.zeros(N, 7, device=device, dtype=dtype)
+        size_3d = torch.zeros(N, 3, device=device, dtype=dtype)
+        bbox_2d = torch.zeros(N, 4, device=device, dtype=dtype)
+        node_instance_masks = torch.zeros(N, height, width, device=device, dtype=torch.bool)
+        visible_ratio = torch.zeros(N, device=device, dtype=dtype)
+        occlusion_ratio = torch.zeros(N, device=device, dtype=dtype)
+        node_state = torch.zeros(N, stateDim, device=device, dtype=dtype)
+        node_state_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        node_attributes = torch.zeros(N, attrDim, device=device, dtype=dtype)
+        node_attributes_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        has_text = torch.zeros(N, device=device, dtype=torch.long)
+        text_embed = torch.zeros(N, textDim, device=device, dtype=dtype)
+        symbol_type = torch.zeros(N, device=device, dtype=torch.long)
+        node_lookup: Dict[int, int] = {}
+
+        for index, (node, parent) in enumerate(nodes):
+            level = int(node["level"])
+            node_valid[index] = True
+            node_id[index] = int(node["node_id"])
+            node_level[index] = level
+            parent_index[index] = int(parent)
+            track_id[index] = int(annotation["episode_id"]) * 1000000 + int(node["identity_id"])
+            pose_camera[index] = torch.tensor(node["pose_camera"], device=device, dtype=dtype)
+            pose_world[index] = torch.tensor(node["pose_world"], device=device, dtype=dtype)
+            size_3d[index] = torch.tensor(node["size_3d"], device=device, dtype=dtype)
+            xyxy = torch.tensor(node["bbox_2d"], device=device, dtype=dtype)
+            bbox_2d[index] = xyxy / xyxy.new_tensor([width, height, width, height])
+            node_instance_masks[index] = instanceSegmentation.eq(int(node["instance_id"]))
+            visible_ratio[index] = float(node["visible_ratio"])
+            occlusion_ratio[index] = float(node["occlusion_ratio"])
+            if level == 0:
+                object_classes[index] = int(node["object_class"])
+                node_state[index] = torch.tensor(node["object_state"], device=device, dtype=dtype)
+                node_state_valid[index] = True
+                node_attributes[index] = torch.tensor(node["object_attributes"], device=device, dtype=dtype)
+                node_attributes_valid[index] = True
+            else:
+                part_classes[index] = int(node["part_class"])
+                node_state[index] = torch.tensor(node["part_state"], device=device, dtype=dtype)
+                node_state_valid[index] = True
+                has_text[index] = int(node["has_text"])
+                symbol_type[index] = int(node["symbol_type"])
+                if int(node["has_text"]) == 1:
+                    text_embed[index] = torch.tensor(node["text_embed"], device=device, dtype=dtype)
+            node_lookup[int(node["node_id"])] = index
+
+        relation_type = torch.zeros(N, N, device=device, dtype=torch.long)
+        relation_valid = node_valid.unsqueeze(1) & node_valid.unsqueeze(0)
+        relation_valid = relation_valid & ~torch.eye(N, device=device, dtype=torch.bool)
+        external_relation = torch.zeros(N, relationClasses, device=device, dtype=dtype)
+        external_relation_valid = node_valid.clone()
+        for relation in annotation["relations"]:
+            subject = int(relation["subject_node_id"])
+            obj = int(relation["object_node_id"])
+            if subject in node_lookup and obj in node_lookup:
+                relation_type[node_lookup[subject], node_lookup[obj]] = int(relation["relation_type"])
+            elif subject in node_lookup:
+                external_relation[node_lookup[subject], int(relation["relation_type"])] = 1.0
+
+        motion = torch.zeros(N, 7, device=device, dtype=dtype)
+        motion[:, 6] = 1.0
+        motion_valid = node_valid.clone()
+        is_moving = torch.zeros(N, device=device, dtype=dtype)
+        for entry in annotation["motion"]["object_motions_from_prev"]:
+            index = node_lookup[int(entry["node_id"])]
+            motion[index] = torch.tensor(entry["motion"], device=device, dtype=dtype)
+            is_moving[index] = float(entry["is_moving"])
+
+        affordance = torch.zeros(N, affordanceDim, device=device, dtype=dtype)
+        affordance_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        affordance_keys = (
+            "graspable", "pushable", "pressable", "pullable",
+            "rotatable", "openable", "container", "support_surface")
+        for entry in annotation["interaction"]["affordance_targets"]:
+            index = node_lookup[int(entry["node_id"])]
+            affordance[index] = torch.tensor([entry[name] for name in affordance_keys], device=device, dtype=dtype)
+            affordance_valid[index] = True
+
+        contact = torch.zeros(N, device=device, dtype=dtype)
+        contact_valid = node_valid.clone()
+        contact_force = torch.zeros(N, 2, device=device, dtype=dtype)
+        contact_point_camera = torch.zeros(N, 3, device=device, dtype=dtype)
+        for event in annotation["interaction"]["contact_events"]:
+            index = node_lookup[int(event["actor_b_node_id"])]
+            contact[index] = 1.0
+            contact_force[index] = torch.tensor(
+                [event["normal_force_n"], event["tangential_force_n"]],
+                device=device,
+                dtype=dtype)
+            contact_point_camera[index] = torch.tensor(event["contact_point_camera"], device=device, dtype=dtype)
+
+        robot = annotation["robot"]
+        robot_context = torch.cat([
+            torch.tensor(robot["base_pose_world"], device=device, dtype=dtype),
+            torch.tensor(robot["end_effector"]["pose_camera"], device=device, dtype=dtype),
+            torch.tensor(robot["end_effector"]["state"], device=device, dtype=dtype),
+            torch.tensor(robot["joint_positions"], device=device, dtype=dtype),
+            torch.tensor(robot["joint_velocities"], device=device, dtype=dtype)])
+        interaction = annotation["interaction"]
+        action_type = F.one_hot(
+            torch.tensor(interaction["action_type"], device=device, dtype=torch.long),
+            num_classes=16).to(dtype)
+        interaction_context = torch.cat([
+            action_type,
+            torch.tensor(interaction["action_delta_pose"], device=device, dtype=dtype)])
+
+        return {
+            "rgb": rgb,
+            "depth": depth,
+            "depth_valid": depthValid,
+            "normal": normal,
+            "semantic_segmentation": semanticSegmentation.long(),
+            "instance_segmentation": instanceSegmentation.long(),
+            "scene_class": torch.tensor(annotation["scene"]["scene_class"], device=device, dtype=torch.long),
+            "global_labels": torch.tensor(annotation["scene"]["global_labels"][:numGlobalLabels], device=device, dtype=dtype),
+            "node_valid": node_valid,
+            "node_id": node_id,
+            "node_level": node_level,
+            "parent_index": parent_index,
+            "object_classes": object_classes,
+            "part_classes": part_classes,
+            "track_id": track_id,
+            "pose_camera": pose_camera,
+            "pose_world": pose_world,
+            "size_3d": size_3d,
+            "bbox_2d": bbox_2d,
+            "node_instance_masks": node_instance_masks,
+            "visible_ratio": visible_ratio,
+            "occlusion_ratio": occlusion_ratio,
+            "node_state": node_state,
+            "node_state_valid": node_state_valid,
+            "node_attributes": node_attributes,
+            "node_attributes_valid": node_attributes_valid,
+            "has_text": has_text,
+            "text_embed": text_embed,
+            "symbol_type": symbol_type,
+            "relation_type": relation_type,
+            "relation_valid": relation_valid,
+            "external_relation": external_relation,
+            "external_relation_valid": external_relation_valid,
+            "motion": motion,
+            "motion_valid": motion_valid,
+            "is_moving": is_moving,
+            "affordance": affordance,
+            "affordance_valid": affordance_valid,
+            "contact": contact,
+            "contact_valid": contact_valid,
+            "contact_force": contact_force,
+            "contact_point_camera": contact_point_camera,
+            "robot_context": robot_context,
+            "interaction_context": interaction_context,
+            # Per-frame absolute camera pose (camera->world, xyz + xyzw quaternion). The
+            # inter-frame camera_motion is derived from consecutive poses in BrainCore.Step,
+            # so the dataset only stores each frame's own pose, never a relative transform.
+            "camera_pose_world": torch.tensor(annotation["camera"]["pose_world"], device=device, dtype=dtype),
+            "interaction_success": torch.tensor(annotation["interaction"]["action_success"], device=device, dtype=dtype)}
+
+    @staticmethod
+    def CollateSyntheticSupervision(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        return {name: torch.stack([sample[name] for sample in batch], dim=0) for name in batch[0]}
+
+    @staticmethod
     def ScaleBoxesXYXY(
         boxes: Union[np.ndarray, torch.Tensor],
         resizeMeta: DataResizeMeta,
@@ -399,20 +709,25 @@ class DataPreprocessor:
         return resized_image_t, scaled_boxes, resize_meta
 
     @staticmethod
-    def ConvertNpImagesKeysMouses(
+    def ConvertRobotInputs(
         imgs: Optional[Union[np.ndarray, torch.Tensor]],
-        keys: Optional[Union[np.ndarray, torch.Tensor]],
-        mouseClick: Optional[Union[np.ndarray, torch.Tensor]],
-        mouseMove: Optional[Union[np.ndarray, torch.Tensor]],
         reward: Optional[Union[np.ndarray, torch.Tensor]],
         done: Optional[Union[np.ndarray, torch.Tensor]],
         *,
         size: Optional[Tuple[int, int]] = (BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE),
         device: Optional[torch.device] = None,
-        needVisualState: bool = True,) -> Dict[str, Any]:
+        needVisualState: bool = True,
+        depths: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        depthValids: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        depthScaleMeters: float = 1.0,
+        cameraIntrinsics: Optional[Union[np.ndarray, torch.Tensor]] = None,) -> Dict[str, Any]:
 
         original_images: List[np.ndarray] = []
         resize_meta: List[DataResizeMeta] = []
+        # Source image size, captured regardless of needVisualState, so the camera
+        # intrinsics can be rescaled to the same target grid as RGB/depth.
+        image_source_size: Optional[Tuple[int, int]] = None
+        image_target_size: Optional[Tuple[int, int]] = None
 
         if imgs is not None:
             img_tensor = torch.as_tensor(imgs)
@@ -450,6 +765,10 @@ class DataPreprocessor:
                         size=size,
                         antialias=True,)
 
+                if image_source_size is None:
+                    image_source_size = (int(meta.src_h), int(meta.src_w))
+                    image_target_size = (int(meta.dst_h), int(meta.dst_w))
+
                 resized_samples.append(resized_tensor)
                 if needVisualState:
                     resize_meta.append(meta)
@@ -459,6 +778,73 @@ class DataPreprocessor:
                 img_tensor = img_tensor.to(device)
         else:
             img_tensor = None
+
+        depth_tensor = None
+        depth_valid_tensor = None
+        if depths is not None:
+            depth_batch = torch.as_tensor(depths)
+            expected_batch = None if img_tensor is None else int(img_tensor.size(0))
+            if depth_batch.ndim == 2:
+                depth_samples = [depth_batch]
+            elif depth_batch.ndim == 3:
+                if expected_batch is not None and expected_batch > 1 and int(depth_batch.size(0)) == expected_batch:
+                    depth_samples = [depth_batch[i] for i in range(expected_batch)]
+                else:
+                    depth_samples = [depth_batch]
+            elif depth_batch.ndim == 4:
+                depth_samples = [depth_batch[i] for i in range(int(depth_batch.size(0)))]
+            else:
+                raise ValueError(f"Unexpected depth batch shape: {tuple(depth_batch.shape)}")
+            if expected_batch is not None and len(depth_samples) != expected_batch:
+                raise ValueError(f"RGB/depth batch mismatch: {expected_batch} vs {len(depth_samples)}")
+
+            valid_samples: List[Optional[torch.Tensor]] = [None] * len(depth_samples)
+            if depthValids is not None:
+                valid_batch = torch.as_tensor(depthValids)
+                if valid_batch.ndim == 2:
+                    valid_samples = [valid_batch]
+                elif valid_batch.ndim == 3 and len(depth_samples) > 1 and int(valid_batch.size(0)) == len(depth_samples):
+                    valid_samples = [valid_batch[i] for i in range(len(depth_samples))]
+                elif valid_batch.ndim == 3:
+                    valid_samples = [valid_batch]
+                elif valid_batch.ndim == 4:
+                    valid_samples = [valid_batch[i] for i in range(int(valid_batch.size(0)))]
+                else:
+                    raise ValueError(f"Unexpected depth valid batch shape: {tuple(valid_batch.shape)}")
+                if len(valid_samples) != len(depth_samples):
+                    raise ValueError("depth/depth valid batch mismatch")
+
+            resized_depth: List[torch.Tensor] = []
+            resized_valid: List[torch.Tensor] = []
+            for sample, sample_valid in zip(depth_samples, valid_samples):
+                one_depth, one_valid = DataPreprocessor.ToDepthTensor(
+                    sample,
+                    sample_valid,
+                    depthScaleMeters=depthScaleMeters)
+                if size is not None:
+                    one_depth, one_valid = DataPreprocessor.ResizeDepth(one_depth, one_valid, size)
+                resized_depth.append(one_depth)
+                resized_valid.append(one_valid)
+            depth_tensor = torch.stack(resized_depth, dim=0)
+            depth_valid_tensor = torch.stack(resized_valid, dim=0)
+            if device is not None:
+                depth_tensor = depth_tensor.to(device)
+                depth_valid_tensor = depth_valid_tensor.to(device)
+
+        # Camera intrinsics: rescale to the same target grid as RGB/depth when supplied.
+        # If not passed, leave as None; if passed but no resize happened, return as-is.
+        camera_intrinsics_tensor = None
+        if cameraIntrinsics is not None:
+            if image_source_size is not None and image_target_size is not None and size is not None:
+                camera_intrinsics_tensor = DataPreprocessor.ResizeCameraIntrinsics(
+                    cameraIntrinsics,
+                    sourceSize=image_source_size,
+                    targetSize=image_target_size,
+                    device=device)
+            else:
+                camera_intrinsics_tensor = torch.as_tensor(cameraIntrinsics).float()
+                if device is not None:
+                    camera_intrinsics_tensor = camera_intrinsics_tensor.to(device)
 
         def convert_tensor(value: Optional[Union[np.ndarray, torch.Tensor]]):
             if value is None:
@@ -472,9 +858,9 @@ class DataPreprocessor:
             "frames": img_tensor,
             "original_images": original_images,
             "resize_meta": resize_meta,
-            "keys": convert_tensor(keys),
-            "mouse_clicks": convert_tensor(mouseClick),
-            "mouse_moves": convert_tensor(mouseMove),
+            "depths": depth_tensor,
+            "depth_valid": depth_valid_tensor,
+            "camera_intrinsics": camera_intrinsics_tensor,
             "rewards": convert_tensor(reward),
             "dones": convert_tensor(done),}
 
@@ -484,6 +870,10 @@ class DataPreprocessor:
         reward: Optional[float],
         done: Optional[float],
         *,
+        depthBitmap: Optional[Union[List[Any], np.ndarray, torch.Tensor]] = None,
+        depthValid: Optional[Union[List[Any], np.ndarray, torch.Tensor]] = None,
+        depthScaleMeters: float = 1.0,
+        cameraIntrinsics: Optional[Union[np.ndarray, torch.Tensor]] = None,
         device: Optional[torch.device] = None,
         needVisualState: bool = False,) -> Dict[str, Any]:
         if isinstance(bitmap, torch.Tensor):
@@ -494,16 +884,17 @@ class DataPreprocessor:
         reward_value = None if reward is None else np.asarray([float(reward)], dtype=np.float32)
         done_value = None if done is None else np.asarray([float(done)], dtype=np.float32)
 
-        return DataPreprocessor.ConvertNpImagesKeysMouses(
+        return DataPreprocessor.ConvertRobotInputs(
             imgs=bitmap_value,
-            keys=None,
-            mouseClick=None,
-            mouseMove=None,
             reward=reward_value,
             done=done_value,
             size=(BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE),
             device=device,
-            needVisualState=needVisualState,)
+            needVisualState=needVisualState,
+            depths=depthBitmap,
+            depthValids=depthValid,
+            depthScaleMeters=depthScaleMeters,
+            cameraIntrinsics=cameraIntrinsics,)
 
     @staticmethod
     def CropAndResizeLineImagesWithMeta(

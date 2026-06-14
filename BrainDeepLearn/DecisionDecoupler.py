@@ -1,380 +1,520 @@
 from __future__ import annotations
-import math
-from typing import Any, Dict, List, Optional, Union
+
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from FunctionTools import AGICoreModule
+from ModuleMessagerManager import ModuleDim
 
 
-LOG_TWO_PI = math.log(2.0 * math.pi)
+@dataclass
+class EndpointPoseEncoding:
+    endpoint_pose_tokens: torch.Tensor
+    endpoint_pose_feat: torch.Tensor
 
 
-class BinaryActionDecoderBase(AGICoreModule):
-    interface_kind = "binary"
-    requires_deterministic_decision = False
-
-    def __init__(self, actionEncodeDim: int = 256):
-        super().__init__()
-        self.action_encode_dim = int(actionEncodeDim)
-
-    def Decode(
-        self,
-        actionEncode: torch.Tensor,
-        *,
-        sample: bool = True,
-        deterministic: bool = False,) -> Dict[str, Any]:
-        dist = self.Distribution(actionEncode)
-        action = self.Sample(dist, deterministic=(deterministic or not sample))
-        return {
-            "action_dist": dist,
-            "action_sample": action,
-            "entropy": self.Entropy(dist),
-            "interface_kind": self.interface_kind,}
-
-    def Encode(self, action: Dict[str, torch.Tensor]) -> torch.Tensor:
-        raise NotImplementedError
-
-    def Distribution(self, actionEncode: torch.Tensor) -> Dict[str, torch.Tensor]:
-        raise NotImplementedError
-
-    def Sample(self, dist: Dict[str, torch.Tensor], *, deterministic: bool = False) -> Dict[str, torch.Tensor]:
-        raise NotImplementedError
-
-    def Entropy(self, dist: Dict[str, torch.Tensor]) -> torch.Tensor:
-        raise NotImplementedError
-
-    def ImitationLoss(
-        self,
-        dist: Dict[str, torch.Tensor],
-        target: Dict[str, torch.Tensor],) -> Dict[str, torch.Tensor]:
-        raise NotImplementedError
+@dataclass
+class MotionCommand:
+    decision_tensor: torch.Tensor
+    target_endpoint_pose: torch.Tensor
+    endpoint_names: Tuple[str, ...]
+    gripper_cmd: torch.Tensor
+    mode_logits: torch.Tensor
+    safety_scores: torch.Tensor
 
 
-class NumericActionDecoderBase(AGICoreModule):
-    interface_kind = "numeric"
-    requires_deterministic_decision = True
-
-    def __init__(self, actionEncodeDim: int = 256):
-        super().__init__()
-        self.action_encode_dim = int(actionEncodeDim)
-
-    def Decode(
-        self,
-        actionEncode: torch.Tensor,
-        *,
-        sample: bool = True,
-        deterministic: bool = False,) -> Dict[str, Any]:
-        command = self.Command(actionEncode)
-        return {
-            "action_command": command,
-            "action_sample": command,
-            "action_dist": {},
-            "entropy": actionEncode.new_zeros(actionEncode.size(0)),
-            "interface_kind": self.interface_kind,}
-
-    def Encode(self, action: Dict[str, torch.Tensor]) -> torch.Tensor:
-        raise NotImplementedError
-
-    def Command(self, actionEncode: torch.Tensor) -> Dict[str, torch.Tensor]:
-        raise NotImplementedError
-
-    def CommandLoss(
-        self,
-        command: Dict[str, torch.Tensor],
-        target: Dict[str, torch.Tensor],) -> Dict[str, torch.Tensor]:
-        losses = []
-        out: Dict[str, torch.Tensor] = {}
-        for name, pred in command.items():
-            target_value = target[name].to(device=pred.device, dtype=pred.dtype)
-            if target_value.shape != pred.shape:
-                target_value = target_value.view_as(pred)
-            cur = F.smooth_l1_loss(pred, target_value)
-            out[name] = cur
-            losses.append(cur)
-        total = torch.stack(losses).sum()
-        out["total"] = total
-        return out
+@dataclass
+class DecoupledDecision:
+    z_task: torch.Tensor
+    z_motion: torch.Tensor
+    z_dyn: torch.Tensor
+    z_constraint: torch.Tensor
+    z_uncertainty: torch.Tensor
+    decision_tensor: torch.Tensor
+    target_endpoint_pose: torch.Tensor
+    decision_feedback_embed: torch.Tensor
+    gripper_cmd: torch.Tensor
+    mode_logits: torch.Tensor
+    safety_scores: torch.Tensor
+    explanation_tokens: torch.Tensor
 
 
-class MouseKeyboardActionDecoder(BinaryActionDecoderBase):
+def NormalizePose(pose: torch.Tensor) -> torch.Tensor:
+    quat = F.normalize(pose[..., 3:7], dim=-1, eps=1e-6)
+    return torch.cat([pose[..., :3], quat], dim=-1)
+
+
+def AxisAngleToQuat(axisAngle: torch.Tensor) -> torch.Tensor:
+    angle = axisAngle.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    half = 0.5 * angle
+    quat_xyz = axisAngle / angle * torch.sin(half)
+    quat_w = torch.cos(half)
+    return F.normalize(torch.cat([quat_xyz, quat_w], dim=-1), dim=-1, eps=1e-6)
+
+
+def QuatMultiply(qA: torch.Tensor, qB: torch.Tensor) -> torch.Tensor:
+    ax, ay, az, aw = qA.unbind(dim=-1)
+    bx, by, bz, bw = qB.unbind(dim=-1)
+    return torch.stack([
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ], dim=-1)
+
+
+def ApplyPoseDelta(basePose: torch.Tensor, delta6: torch.Tensor) -> torch.Tensor:
+    pos = basePose[..., :3] + delta6[..., :3]
+    quat = QuatMultiply(basePose[..., 3:7], AxisAngleToQuat(delta6[..., 3:6]))
+    return NormalizePose(torch.cat([pos, quat], dim=-1))
+
+
+def QuatConjugate(quat: torch.Tensor) -> torch.Tensor:
+    return torch.cat([-quat[..., :3], quat[..., 3:4]], dim=-1)
+
+
+def QuatToAxisAngle(quat: torch.Tensor) -> torch.Tensor:
+    quat = F.normalize(quat, dim=-1, eps=1e-6)
+    quat = quat * (1.0 - 2.0 * (quat[..., 3:4] < 0.0).to(quat.dtype))  # w >= 0: shortest-path
+    sin_half = quat[..., :3].norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    angle = 2.0 * torch.atan2(sin_half, quat[..., 3:4].clamp(-1.0, 1.0))
+    return quat[..., :3] / sin_half * angle
+
+
+def RelativePoseError(commandedPose: torch.Tensor, measuredPose: torch.Tensor) -> torch.Tensor:
+    """Tracking error of an achieved (measured) pose against the pose that was commanded:
+    the translation residual plus the body-frame axis-angle rotation carrying the command
+    onto the measurement. This is how actuator drift, joint limits and unreached setpoints
+    (a commanded 30 deg that only reached 29 deg) enter the model as an explicit signal."""
+    translation = measuredPose[..., :3] - commandedPose[..., :3]
+    relative_quat = QuatMultiply(QuatConjugate(commandedPose[..., 3:7]), measuredPose[..., 3:7])
+    return torch.cat([translation, QuatToAxisAngle(relative_quat)], dim=-1)
+
+
+class EndpointPoseEncoder(AGICoreModule):
     def __init__(
         self,
-        actionEncodeDim: int,
-        keyDim: int,
-        actDim: int = 2,
+        endpointCount: int = ModuleDim.DecisionEndpointCount,
+        poseDim: int = ModuleDim.DecisionEndpointPoseDim,
+        embedDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        actionDim: int = ModuleDim.DecisionActionDim,
         hidden: int = 256,
-        drop: float = 0.05,
-        mouseWeight: float = 0.05,
-        logstdRange: tuple = (-6.0, 2.0),
     ):
-        super().__init__(actionEncodeDim=actionEncodeDim)
-        self.key_dim = int(keyDim)
-        self.act_dim = int(actDim)
-        self.hidden = int(hidden)
-        self.drop = float(drop)
-        self.mouse_weight = float(mouseWeight)
-        self.logstd_lo, self.logstd_hi = float(logstdRange[0]), float(logstdRange[1])
-
-        self.trunk = nn.Sequential(
-            nn.LayerNorm(self.action_encode_dim),
-            nn.Linear(self.action_encode_dim, hidden),
+        super().__init__()
+        self.endpoint_count = int(endpointCount)
+        self.pose_dim = int(poseDim)
+        self.embed_dim = int(embedDim)
+        self.action_dim = int(actionDim)
+        self.endpoint_embed = nn.Parameter(torch.zeros(1, self.endpoint_count, self.embed_dim))
+        # Each endpoint token carries both where it is (measured pose) and how well it tracked
+        # its last command (tracking error), so the whole decision/temporal stack downstream
+        # perceives actuator drift / limits, not just the current pose.
+        self.token_net = nn.Sequential(
+            nn.LayerNorm(self.pose_dim + self.action_dim * 2),
+            nn.Linear(self.pose_dim + self.action_dim * 2, hidden),
             nn.SiLU(),
-            nn.Dropout(drop),
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
+            nn.Linear(hidden, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
         )
-        self.keys_head = nn.Sequential(
-            nn.Linear(hidden, hidden),
+        self.summary_net = nn.Sequential(
+            nn.LayerNorm(self.embed_dim),
+            nn.Linear(self.embed_dim, hidden),
             nn.SiLU(),
-            nn.Linear(hidden, self.key_dim),
+            nn.Linear(hidden, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
         )
-        self.click_head = nn.Sequential(
-            nn.Linear(hidden, hidden // 2),
-            nn.SiLU(),
-            nn.Linear(hidden // 2, 2),
-        )
-        self.mouse_mu_head = nn.Sequential(
-            nn.Linear(hidden, hidden // 2),
-            nn.SiLU(),
-            nn.Linear(hidden // 2, self.act_dim),
-        )
-        self.mouse_logstd_head = nn.Sequential(
-            nn.Linear(hidden, hidden // 2),
-            nn.SiLU(),
-            nn.Linear(hidden // 2, self.act_dim),
-        )
-        action_input_dim = self.key_dim + 2 + self.act_dim
-        self.action_encoder = nn.Sequential(
-            nn.LayerNorm(action_input_dim),
-            nn.Linear(action_input_dim, hidden),
-            nn.SiLU(),
-            nn.Dropout(drop),
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, self.action_encode_dim),
-            nn.LayerNorm(self.action_encode_dim),)
 
-    def Encode(self, action: Dict[str, torch.Tensor]) -> torch.Tensor:
-        keys = action["keys"].float()
-        mouse = action["mouse"].float()
-        click = action["click"].float()
-        return self.action_encoder(torch.cat([keys, mouse, click], dim=-1))
-
-    def Distribution(self, actionEncode: torch.Tensor) -> Dict[str, torch.Tensor]:
-        h = self.trunk(actionEncode)
-        return {
-            "keys_logits": self.keys_head(h),
-            "click_logits": self.click_head(h),
-            "mouse_mu": self.mouse_mu_head(h),
-            "mouse_logstd": self.mouse_logstd_head(h).clamp(self.logstd_lo, self.logstd_hi),
-        }
-
-    def Sample(self, dist: Dict[str, torch.Tensor], *, deterministic: bool = False) -> Dict[str, torch.Tensor]:
-        keys_logits = dist["keys_logits"]
-        click_logits = dist["click_logits"]
-        mu = dist["mouse_mu"]
-        logstd = dist["mouse_logstd"]
-
-        if deterministic:
-            keys = (torch.sigmoid(keys_logits) > 0.5).float()
-            click = (torch.sigmoid(click_logits) > 0.5).float()
-            mouse = mu
-            logp_mouse = (-logstd - 0.5 * LOG_TWO_PI).sum(dim=-1)
-        else:
-            keys_prob = torch.sigmoid(keys_logits).clamp(1e-6, 1.0 - 1e-6)
-            keys = torch.bernoulli(keys_prob)
-            click_prob = torch.sigmoid(click_logits).clamp(1e-6, 1.0 - 1e-6)
-            click = torch.bernoulli(click_prob)
-            std = torch.exp(logstd).clamp_min(1e-6)
-            mouse = mu + torch.randn_like(std) * std
-            zn = (mouse - mu) / std
-            logp_mouse = (-0.5 * (zn.square() + 2.0 * logstd + LOG_TWO_PI)).sum(dim=-1)
-
-        logp_keys = (keys * (-F.softplus(-keys_logits)) + (1.0 - keys) * (-F.softplus(keys_logits))).sum(-1)
-        logp_click = (click * (-F.softplus(-click_logits)) + (1.0 - click) * (-F.softplus(click_logits))).sum(-1)
-        return {
-            "keys": keys,
-            "click": click,
-            "mouse": mouse,
-            "logp_keys": logp_keys,
-            "logp_click": logp_click,
-            "logp_mouse": logp_mouse,
-            "logp_total": logp_keys + logp_click + logp_mouse,
-        }
-
-    def Entropy(self, dist: Dict[str, torch.Tensor]) -> torch.Tensor:
-        keys_prob = torch.sigmoid(dist["keys_logits"]).clamp(1e-6, 1.0 - 1e-6)
-        click_prob = torch.sigmoid(dist["click_logits"]).clamp(1e-6, 1.0 - 1e-6)
-        keys = -(keys_prob * keys_prob.log() + (1.0 - keys_prob) * (1.0 - keys_prob).log()).sum(-1)
-        click = -(click_prob * click_prob.log() + (1.0 - click_prob) * (1.0 - click_prob).log()).sum(-1)
-        mouse = (0.5 * (1.0 + LOG_TWO_PI) + dist["mouse_logstd"]).sum(-1)
-        return keys + click + mouse
-
-    def GaussianNll(self, mu: torch.Tensor, logstd: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        zn = (target - mu) * torch.exp(-logstd)
-        return 0.5 * (zn.square() + 2.0 * logstd + LOG_TWO_PI).sum(dim=-1).mean()
-
-    def ImitationLoss(
+    def forward(
         self,
-        dist: Dict[str, torch.Tensor],
-        target: Dict[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        keys = F.binary_cross_entropy_with_logits(dist["keys_logits"], target["keys"].float())
-        click = F.binary_cross_entropy_with_logits(dist["click_logits"], target["click"].float())
-        mouse = self.GaussianNll(dist["mouse_mu"], dist["mouse_logstd"], target["mouse"].float())
-        total = keys + click + self.mouse_weight * mouse
-        return {"total": total, "keys": keys, "click": click, "mouse": mouse}
+        endpointPose: torch.Tensor,
+        targetTrackingError: torch.Tensor,
+        plannerTrackingError: torch.Tensor,) -> EndpointPoseEncoding:
+        tokens = self.token_net(torch.cat([endpointPose, targetTrackingError, plannerTrackingError], dim=-1)) + self.endpoint_embed
+        feat = self.summary_net(tokens.mean(dim=1))
+        return EndpointPoseEncoding(endpoint_pose_tokens=tokens, endpoint_pose_feat=feat)
 
-class JointActionCommandBase(NumericActionDecoderBase):
-    """
-    Base for deterministic robot-joint command heads.
 
-    A concrete robot can subclass this and map DecisionModule output to fields
-    such as joint_angles, joint_velocities, torque, or gripper.
-    """
-
+class EndpointPoseDecoder(AGICoreModule):
     def __init__(
         self,
-        actionEncodeDim: int,
-        jointDim: Optional[int] = None,
-        jointDefinition: Optional[Dict[str, Dict[str, Any]]] = None,):
-        super().__init__(actionEncodeDim=actionEncodeDim)
-        self.joint_dim = int(jointDim or 0)
-        self.joint_definition: Dict[str, Any] = {}
-        self.joint_names: List[str] = []
-        self.joint_index: Dict[str, int] = {}
-        self.register_buffer("joint_min", torch.empty(0), persistent=False)
-        self.register_buffer("joint_max", torch.empty(0), persistent=False)
-        if jointDefinition is not None:
-            self.InitializeJointDefinition(jointDefinition)
+        endpointCount: int = ModuleDim.DecisionEndpointCount,
+        actionDim: int = ModuleDim.DecisionActionDim,
+    ):
+        super().__init__()
+        action_mask = torch.ones(int(endpointCount), int(actionDim))
+        for idx in ModuleDim.DecisionRotationOnlyEndpoints:
+            action_mask[idx, :3] = 0.0
+        self.register_buffer(
+            "action_mask",
+            action_mask.view(1, int(endpointCount), int(actionDim)),
+            persistent=False,
+        )
 
-    def InitializeJointDefinition(self, jointDefinition: Dict[str, Dict[str, Any]]):
-        """Register external robot joint definitions keyed by joint name."""
-        names = [str(name) for name in jointDefinition.keys()]
-        definition = {str(name): dict(spec) for name, spec in jointDefinition.items()}
-        self.joint_names = names
-        self.joint_definition = definition
-        self.joint_index = {name: i for i, name in enumerate(names)}
-        self.joint_dim = len(names)
-        self.RefreshJointLimitBuffers()
-        return self
-
-    @staticmethod
-    def SpecFloat(spec: Dict[str, Any], keys, default: float) -> float:
-        for key in keys:
-            if key in spec and spec[key] is not None:
-                return float(spec[key])
-        limits = spec.get("limit", spec.get("limits", None))
-        if isinstance(limits, dict):
-            return JointActionCommandBase.SpecFloat(limits, keys, default)
-        return float(default)
-
-    def RefreshJointLimitBuffers(self):
-        mins: List[float] = []
-        maxs: List[float] = []
-        for name in self.joint_names:
-            spec = self.joint_definition.get(name, {})
-            mins.append(self.SpecFloat(
-                spec,
-                ("min", "lower", "angle_min", "min_angle", "lower_limit", "limit_min"),
-                -float("inf")))
-            maxs.append(self.SpecFloat(
-                spec,
-                ("max", "upper", "angle_max", "max_angle", "upper_limit", "limit_max"),
-                float("inf")))
-        self.joint_min = torch.tensor(mins, device=self.device, dtype=self.dtype)
-        self.joint_max = torch.tensor(maxs, device=self.device, dtype=self.dtype)
-
-    def ApplyJointLimits(self, jointAngles: torch.Tensor) -> torch.Tensor:
-        joint_min = self.joint_min.to(device=jointAngles.device, dtype=jointAngles.dtype).view(1, -1)
-        joint_max = self.joint_max.to(device=jointAngles.device, dtype=jointAngles.dtype).view(1, -1)
-        bounded = torch.isfinite(joint_min) & torch.isfinite(joint_max)
-        safe_min = torch.where(bounded, joint_min, torch.zeros_like(joint_min))
-        safe_max = torch.where(bounded, joint_max, torch.ones_like(joint_max))
-        center = 0.5 * (safe_min + safe_max)
-        radius = 0.5 * (safe_max - safe_min).clamp_min(1e-6)
-        limited = center + radius * torch.tanh(jointAngles)
-        jointAngles = torch.where(bounded, limited, jointAngles)
-        has_min = torch.isfinite(joint_min)
-        has_max = torch.isfinite(joint_max)
-        jointAngles = torch.where(has_min, torch.maximum(jointAngles, joint_min), jointAngles)
-        jointAngles = torch.where(has_max, torch.minimum(jointAngles, joint_max), jointAngles)
-        return jointAngles
-
-    def JointAngles(self, actionEncode: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
-
-    def JointCommandTensor(self, action: Any) -> torch.Tensor:
-        vals = [action[name].view(action[name].size(0), -1)[:, 0].float() for name in self.joint_names]
-        return torch.stack(vals, dim=-1)
-
-    def FormatJointCommand(self, jointAngles: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return {name: jointAngles[:, idx] for name, idx in self.joint_index.items()}
-
-    def Command(self, actionEncode: torch.Tensor) -> Dict[str, torch.Tensor]:
-        joint_angles = self.ApplyJointLimits(self.JointAngles(actionEncode))
-        return self.FormatJointCommand(joint_angles)
+    def forward(self, baseEndpointPose: torch.Tensor, decisionTensor: torch.Tensor) -> torch.Tensor:
+        return ApplyPoseDelta(baseEndpointPose, decisionTensor)
 
 
-class JointActionDecoder(JointActionCommandBase):
+class DecisionFeedbackEncoder(AGICoreModule):
     def __init__(
         self,
-        actionEncodeDim: int,
-        jointDefinition: Dict[str, Dict[str, Any]],
-        *,
-        hidden: int = 256,
-        drop: float = 0.05,
-        outputScale: float = 1.0,):
-        super().__init__(actionEncodeDim=actionEncodeDim, jointDefinition=jointDefinition)
-        self.hidden = int(hidden)
-        self.drop = float(drop)
-        self.output_scale = float(outputScale)
+        endpointCount: int = ModuleDim.DecisionEndpointCount,
+        poseDim: int = ModuleDim.DecisionEndpointPoseDim,
+        actionDim: int = ModuleDim.DecisionActionDim,
+        poseFeatDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        outDim: int = ModuleDim.DecisionFeedbackEmbedDim,
+        hidden: int = 512,
+    ):
+        super().__init__()
+        self.endpoint_count = int(endpointCount)
+        self.pose_dim = int(poseDim)
+        self.action_dim = int(actionDim)
+        self.pose_feat_dim = int(poseFeatDim)
+        self.out_dim = int(outDim)
+        in_dim = self.endpoint_count * self.action_dim + self.endpoint_count * self.pose_dim + self.pose_feat_dim
         self.net = nn.Sequential(
-            nn.LayerNorm(self.action_encode_dim),
-            nn.Linear(self.action_encode_dim, self.hidden),
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden),
             nn.SiLU(),
-            nn.Dropout(self.drop),
-            nn.Linear(self.hidden, self.hidden),
+            nn.Linear(hidden, hidden),
             nn.SiLU(),
-            nn.Linear(self.hidden, self.joint_dim),)
-        self.action_encoder = nn.Sequential(
-            nn.LayerNorm(self.joint_dim),
-            nn.Linear(self.joint_dim, self.hidden),
+            nn.Linear(hidden, self.out_dim),
+            nn.LayerNorm(self.out_dim),
+        )
+
+    def forward(
+        self,
+        decisionTensor: torch.Tensor,
+        targetEndpointPose: torch.Tensor,
+        endpointPoseFeat: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([
+            decisionTensor.reshape(decisionTensor.size(0), self.endpoint_count * self.action_dim),
+            targetEndpointPose.reshape(targetEndpointPose.size(0), self.endpoint_count * self.pose_dim),
+            endpointPoseFeat,
+        ], dim=-1)
+        return self.net(x)
+
+
+class LatentFactorProjector(AGICoreModule):
+    def __init__(
+        self,
+        inputDim: int,
+        hidden: int = 512,
+        taskDim: int = 256,
+        motionDim: int = 256,
+        dynDim: int = 128,
+        constraintDim: int = 128,
+        uncertaintyDim: int = 64,
+    ):
+        super().__init__()
+        self.task_dim = int(taskDim)
+        self.motion_dim = int(motionDim)
+        self.dyn_dim = int(dynDim)
+        self.constraint_dim = int(constraintDim)
+        self.uncertainty_dim = int(uncertaintyDim)
+        self.total_dim = self.task_dim + self.motion_dim + self.dyn_dim + self.constraint_dim + self.uncertainty_dim
+        self.net = nn.Sequential(
+            nn.LayerNorm(inputDim),
+            nn.Linear(inputDim, hidden),
             nn.SiLU(),
-            nn.Dropout(self.drop),
-            nn.Linear(self.hidden, self.hidden),
+            nn.Linear(hidden, hidden),
             nn.SiLU(),
-            nn.Linear(self.hidden, self.action_encode_dim),
-            nn.LayerNorm(self.action_encode_dim),)
+            nn.Linear(hidden, self.total_dim),
+        )
 
-    def JointAngles(self, actionEncode: torch.Tensor) -> torch.Tensor:
-        return self.net(actionEncode) * self.output_scale
-
-    def Encode(self, action: Any) -> torch.Tensor:
-        return self.action_encoder(self.JointCommandTensor(action))
-
-
-class DecisionLosses:
-    @staticmethod
-    def ActionEncodeLoss(
-        actionDecoder: Union[BinaryActionDecoderBase, NumericActionDecoderBase],
-        decisionOut: Dict[str, Any],
-        target: Dict[str, torch.Tensor],
-        *,
-        reconstructWeight: float = 1.0,) -> Dict[str, torch.Tensor]:
-        action_encode = decisionOut["action_encode"]
-        target_encode = actionDecoder.Encode(target)
-        align = F.smooth_l1_loss(action_encode, target_encode.detach())
-
-        decoded_target = actionDecoder.Decode(target_encode, sample=False, deterministic=True)
-        if isinstance(actionDecoder, BinaryActionDecoderBase):
-            reconstruct = actionDecoder.ImitationLoss(decoded_target["action_dist"], target)["total"]
-        else:
-            reconstruct = actionDecoder.CommandLoss(decoded_target["action_command"], target)["total"]
-        total = align + float(reconstructWeight) * reconstruct
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        factors = self.net(x)
+        z_task, z_motion, z_dyn, z_constraint, z_uncertainty = torch.split(
+            factors,
+            [self.task_dim, self.motion_dim, self.dyn_dim, self.constraint_dim, self.uncertainty_dim],
+            dim=-1,
+        )
         return {
-            "total": total,
-            "align": align,
-            "reconstruct": reconstruct,
-            "target_action_encode": target_encode,}
+            "z_task": z_task,
+            "z_motion": z_motion,
+            "z_dyn": z_dyn,
+            "z_constraint": z_constraint,
+            "z_uncertainty": z_uncertainty,
+        }
+
+
+class TaskMotionCrossAttention(AGICoreModule):
+    def __init__(
+        self,
+        queryDim: int = 256,
+        tokenDim: int = 128,
+        numHeads: int = 4,
+    ):
+        super().__init__()
+        self.token_proj = nn.Linear(tokenDim, queryDim)
+        self.attn = nn.MultiheadAttention(queryDim, int(numHeads), batch_first=True)
+        self.norm_q = nn.LayerNorm(queryDim)
+        self.norm_kv = nn.LayerNorm(queryDim)
+
+    def forward(
+        self,
+        zTask: torch.Tensor,
+        zMotion: torch.Tensor,
+        constraintTokens: torch.Tensor,
+    ) -> torch.Tensor:
+        query = self.norm_q(torch.stack([zTask, zMotion], dim=1))
+        tokens = self.norm_kv(self.token_proj(constraintTokens))
+        out, _ = self.attn(query, tokens, tokens, need_weights=False)
+        return out.reshape(out.size(0), -1)
+
+
+class SE3ActionHead(AGICoreModule):
+    def __init__(
+        self,
+        inputDim: int,
+        endpointCount: int = ModuleDim.DecisionEndpointCount,
+        actionDim: int = ModuleDim.DecisionActionDim,
+        hidden: int = 512,
+    ):
+        super().__init__()
+        self.endpoint_count = int(endpointCount)
+        self.action_dim = int(actionDim)
+        self.net = nn.Sequential(
+            nn.LayerNorm(inputDim),
+            nn.Linear(inputDim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, self.endpoint_count * self.action_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).view(x.size(0), self.endpoint_count, self.action_dim)
+
+
+class ChunkDynamicsHead(SE3ActionHead):
+    def __init__(
+        self,
+        inputDim: int,
+        endpointCount: int = ModuleDim.DecisionEndpointCount,
+        actionDim: int = ModuleDim.DecisionActionDim,
+        hidden: int = 256,
+    ):
+        super().__init__(
+            inputDim=inputDim,
+            endpointCount=endpointCount,
+            actionDim=actionDim,
+            hidden=hidden,
+        )
+
+
+class ResidualErrorCompensator(SE3ActionHead):
+    def __init__(
+        self,
+        inputDim: int,
+        endpointCount: int = ModuleDim.DecisionEndpointCount,
+        actionDim: int = ModuleDim.DecisionActionDim,
+        hidden: int = 256,
+    ):
+        super().__init__(
+            inputDim=inputDim,
+            endpointCount=endpointCount,
+            actionDim=actionDim,
+            hidden=hidden,
+        )
+
+
+class ConstraintHead(AGICoreModule):
+    def __init__(
+        self,
+        inputDim: int,
+        gripperCount: int = ModuleDim.ArmCount,
+        modeDim: int = ModuleDim.ActTypeDim,
+        safetyDim: int = 5,
+        hidden: int = 256,
+    ):
+        super().__init__()
+        self.gripper_count = int(gripperCount)
+        self.trunk = nn.Sequential(
+            nn.LayerNorm(inputDim),
+            nn.Linear(inputDim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+        )
+        self.mode_head = nn.Linear(hidden, int(modeDim))
+        self.safety_head = nn.Linear(hidden, int(safetyDim))
+        self.gripper_head = nn.Linear(hidden, self.gripper_count)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        h = self.trunk(x)
+        return {
+            "mode_logits": self.mode_head(h),
+            "safety_scores": torch.sigmoid(self.safety_head(h)),
+            "gripper_cmd": torch.sigmoid(self.gripper_head(h)).unsqueeze(-1),
+        }
+
+
+class DecisionDecouplerV2(AGICoreModule):
+    def __init__(
+        self,
+        decisionDim: int = ModuleDim.DecisionBeliefDim,
+        planDim: int = 256,
+        subgoalFeatureDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        constraintTokenDim: int = 128,
+        endpointPoseFeatDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        feedbackEmbedDim: int = ModuleDim.DecisionFeedbackEmbedDim,
+        endpointCount: int = ModuleDim.DecisionEndpointCount,
+        poseDim: int = ModuleDim.DecisionEndpointPoseDim,
+        actionDim: int = ModuleDim.DecisionActionDim,
+    ):
+        super().__init__()
+        self.decision_dim = int(decisionDim)
+        self.plan_dim = int(planDim)
+        self.subgoal_feature_dim = int(subgoalFeatureDim)
+        self.constraint_token_dim = int(constraintTokenDim)
+        self.endpoint_pose_feat_dim = int(endpointPoseFeatDim)
+        self.feedback_embed_dim = int(feedbackEmbedDim)
+        self.endpoint_count = int(endpointCount)
+        self.pose_dim = int(poseDim)
+        self.action_dim = int(actionDim)
+        self.endpoint_names = tuple(ModuleDim.DecisionEndpointNames)
+
+        self.endpoint_pose_encoder = EndpointPoseEncoder(
+            endpointCount=self.endpoint_count,
+            poseDim=self.pose_dim,
+            embedDim=self.endpoint_pose_feat_dim,
+        )
+        self.endpoint_pose_decoder = EndpointPoseDecoder()
+        self.decision_feedback_encoder = DecisionFeedbackEncoder(
+            endpointCount=self.endpoint_count,
+            poseDim=self.pose_dim,
+            actionDim=self.action_dim,
+            poseFeatDim=self.endpoint_pose_feat_dim,
+            outDim=self.feedback_embed_dim,
+        )
+
+        factor_input = self.decision_dim + self.plan_dim + self.subgoal_feature_dim + self.endpoint_pose_feat_dim
+        self.factor_projector = LatentFactorProjector(factor_input)
+        self.cross_attention = TaskMotionCrossAttention(tokenDim=self.constraint_token_dim)
+
+        z_total = 256 + 256 + 128 + 128 + 64
+        cross_dim = 256 * 2
+        action_input = z_total + self.endpoint_pose_feat_dim + self.plan_dim + self.subgoal_feature_dim + cross_dim
+        dyn_input = 128 + self.endpoint_pose_feat_dim + cross_dim
+        constraint_input = 128 + 64 + self.endpoint_pose_feat_dim + cross_dim
+        residual_input = 64 + self.endpoint_pose_feat_dim + self.subgoal_feature_dim
+
+        self.action_head = SE3ActionHead(
+            action_input,
+            endpointCount=self.endpoint_count,
+            actionDim=self.action_dim,
+        )
+        self.dynamics_head = ChunkDynamicsHead(
+            dyn_input,
+            endpointCount=self.endpoint_count,
+            actionDim=self.action_dim,
+        )
+        self.constraint_head = ConstraintHead(constraint_input)
+        self.residual_compensator = ResidualErrorCompensator(
+            residual_input,
+            endpointCount=self.endpoint_count,
+            actionDim=self.action_dim,
+        )
+        self.explanation_head = nn.Sequential(
+            nn.LayerNorm(z_total + cross_dim),
+            nn.Linear(z_total + cross_dim, 256),
+            nn.SiLU(),
+            nn.Linear(256, self.constraint_token_dim),
+        )
+
+    def EncodeEndpointPose(
+        self,
+        endpointPose: torch.Tensor,
+        targetTrackingError: torch.Tensor,
+        plannerTrackingError: torch.Tensor,) -> EndpointPoseEncoding:
+        return self.endpoint_pose_encoder(endpointPose, targetTrackingError, plannerTrackingError)
+
+    def MaskDecisionTensor(self, decisionTensor: torch.Tensor) -> torch.Tensor:
+        mask = self.endpoint_pose_decoder.action_mask.reshape(
+            *([1] * (decisionTensor.dim() - 2)),
+            self.endpoint_count,
+            self.action_dim)
+        return decisionTensor * mask
+
+    def DecodeEndpointPose(self, baseEndpointPose: torch.Tensor, decisionTensor: torch.Tensor) -> torch.Tensor:
+        return self.endpoint_pose_decoder(baseEndpointPose, self.MaskDecisionTensor(decisionTensor))
+
+    def EncodeDecisionFeedback(
+        self,
+        decisionTensor: torch.Tensor,
+        targetEndpointPose: torch.Tensor,
+        endpointPoseEncoding: EndpointPoseEncoding,
+    ) -> torch.Tensor:
+        return self.decision_feedback_encoder(
+            decisionTensor,
+            targetEndpointPose,
+            endpointPoseEncoding.endpoint_pose_feat,
+        )
+
+    def ToMotionCommand(self, decision: DecoupledDecision) -> MotionCommand:
+        return MotionCommand(
+            decision_tensor=decision.decision_tensor,
+            target_endpoint_pose=decision.target_endpoint_pose,
+            endpoint_names=self.endpoint_names,
+            gripper_cmd=decision.gripper_cmd,
+            mode_logits=decision.mode_logits,
+            safety_scores=decision.safety_scores,
+        )
+
+    def forward(
+        self,
+        decisionBackbone: torch.Tensor,
+        planLatent: torch.Tensor,
+        subgoalFeature: torch.Tensor,
+        constraintTokens: torch.Tensor,
+        endpointPoseEncoding: EndpointPoseEncoding,
+        baseEndpointPose: torch.Tensor,
+    ) -> DecoupledDecision:
+        endpoint_feat = endpointPoseEncoding.endpoint_pose_feat
+        factors = self.factor_projector(torch.cat([decisionBackbone, planLatent, subgoalFeature, endpoint_feat], dim=-1))
+        cross = self.cross_attention(factors["z_task"], factors["z_motion"], constraintTokens)
+        z_cat = torch.cat([
+            factors["z_task"],
+            factors["z_motion"],
+            factors["z_dyn"],
+            factors["z_constraint"],
+            factors["z_uncertainty"],
+        ], dim=-1)
+
+        action_in = torch.cat([z_cat, endpoint_feat, planLatent, subgoalFeature, cross], dim=-1)
+        dyn_in = torch.cat([factors["z_dyn"], endpoint_feat, cross], dim=-1)
+        constraint_in = torch.cat([factors["z_constraint"], factors["z_uncertainty"], endpoint_feat, cross], dim=-1)
+        residual_in = torch.cat([factors["z_uncertainty"], endpoint_feat, subgoalFeature], dim=-1)
+
+        decision_tensor = self.MaskDecisionTensor(
+            self.action_head(action_in)
+            + 0.1 * self.dynamics_head(dyn_in)
+            + 0.1 * self.residual_compensator(residual_in))
+        target_endpoint_pose = self.DecodeEndpointPose(baseEndpointPose, decision_tensor)
+        decision_feedback_embed = self.EncodeDecisionFeedback(
+            decision_tensor,
+            target_endpoint_pose,
+            endpointPoseEncoding,
+        )
+        constraint_out = self.constraint_head(constraint_in)
+        explanation_tokens = self.explanation_head(torch.cat([z_cat, cross], dim=-1))
+
+        return DecoupledDecision(
+            z_task=factors["z_task"],
+            z_motion=factors["z_motion"],
+            z_dyn=factors["z_dyn"],
+            z_constraint=factors["z_constraint"],
+            z_uncertainty=factors["z_uncertainty"],
+            decision_tensor=decision_tensor,
+            target_endpoint_pose=target_endpoint_pose,
+            decision_feedback_embed=decision_feedback_embed,
+            gripper_cmd=constraint_out["gripper_cmd"],
+            mode_logits=constraint_out["mode_logits"],
+            safety_scores=constraint_out["safety_scores"],
+            explanation_tokens=explanation_tokens,
+        )

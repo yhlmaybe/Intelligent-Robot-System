@@ -650,3 +650,68 @@ class BaseOnlineWrapper(nn.Module):
         return {
             "committed_rank": float(committed_rank),
             "committed_triples": float(committed_triples),}
+
+
+def _HungarianRowsToCols(costRows: List[List[float]]) -> List[int]:
+    n = len(costRows)
+    m = len(costRows[0])
+    u = [0.0] * (n + 1)
+    v = [0.0] * (m + 1)
+    p = [0] * (m + 1)
+    way = [0] * (m + 1)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [float("inf")] * (m + 1)
+        used = [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = float("inf")
+            j1 = 0
+            for j in range(1, m + 1):
+                if used[j]:
+                    continue
+                cur = costRows[i0 - 1][j - 1] - u[i0] - v[j]
+                if cur < minv[j]:
+                    minv[j] = cur
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+            for j in range(0, m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    assignment = [-1] * n
+    for j in range(1, m + 1):
+        if p[j] != 0:
+            assignment[p[j] - 1] = j - 1
+    return assignment
+
+
+def HungarianAssignment(cost: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Jonker-Volgenant rectangular assignment. Returns (row_idx, col_idx) on cost's device.
+    Transposes when rows > cols so the underlying solver always sees rows <= cols."""
+    cost_cpu = cost.detach().float().cpu()
+    rows, cols = int(cost_cpu.size(0)), int(cost_cpu.size(1))
+    if rows <= cols:
+        assignment = _HungarianRowsToCols(cost_cpu.tolist())
+        return (
+            torch.arange(rows, device=cost.device, dtype=torch.long),
+            torch.tensor(assignment, device=cost.device, dtype=torch.long))
+    assignment = _HungarianRowsToCols(cost_cpu.t().tolist())
+    return (
+        torch.tensor(assignment, device=cost.device, dtype=torch.long),
+        torch.arange(cols, device=cost.device, dtype=torch.long))
