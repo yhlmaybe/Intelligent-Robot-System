@@ -592,19 +592,79 @@ bool BrainDeepLearnInterface::SetParameterReceiver(std::optional<double> reward,
     return ok;
 }
 
-bool BrainDeepLearnInterface::InitAgentHnandle()
+bool BrainDeepLearnInterface::InitAgentHandle()
 {
-    return CALL_METHOD_NOARG("InitAgentHnandle");
+    return CALL_METHOD_NOARG("InitAgentHandle");
 }
 
-bool BrainDeepLearnInterface::AgentHandleForward(StatusValue& result, int cameraIndex, double reward, double done)
+bool BrainDeepLearnInterface::AgentHandleForward(
+    StatusValue& result,
+    const std::string& sensorPacketJson,
+    const std::string& robotStateJson,
+    int cameraIndex,
+    std::optional<double> reward,
+    std::optional<double> done)
 {
-    return CALL_METHOD_RET_STATUSVALUE(result, "AgentHandleForward", "idd", cameraIndex, reward, done);
+    if (!pManagerObj)
+    {
+        return false;
+    }
+
+    PyGILState_STATE gil = PyGILState_Ensure();
+    PyObject* rewardObj = nullptr;
+    if (reward.has_value())
+    {
+        rewardObj = PyFloat_FromDouble(reward.value());
+    }
+    else
+    {
+        rewardObj = Py_None;
+        Py_INCREF(rewardObj);
+    }
+    PyObject* doneObj = nullptr;
+    if (done.has_value())
+    {
+        doneObj = PyFloat_FromDouble(done.value());
+    }
+    else
+    {
+        doneObj = Py_None;
+        Py_INCREF(doneObj);
+    }
+    PyObject* response = PyObject_CallMethod(
+        pManagerObj,
+        "AgentHandleForwardJson",
+        "iOOss",
+        cameraIndex,
+        rewardObj,
+        doneObj,
+        sensorPacketJson.c_str(),
+        robotStateJson.c_str());
+    Py_DECREF(rewardObj);
+    Py_DECREF(doneObj);
+
+    bool ok = false;
+    if (response && PyUnicode_Check(response))
+    {
+        const char* text = PyUnicode_AsUTF8(response);
+        if (text)
+        {
+            result = std::string(text);
+            ok = true;
+        }
+    }
+    else if (!response)
+    {
+        PyErr_Print();
+    }
+    Py_XDECREF(response);
+    PyGILState_Release(gil);
+    return ok;
 }
 
-bool BrainDeepLearnInterface::ResteAgentHandleHebbian()
+bool BrainDeepLearnInterface::ResetAgentHandleHebbian()
 {
-    return CALL_METHOD_NOARG("ResteAgentHandleHebbian");
+    return CALL_METHOD_NOARG("ResetAgentHandleHebbian");
 }
 
 bool BrainDeepLearnInterface::RunPythonAsync(PyTask task)

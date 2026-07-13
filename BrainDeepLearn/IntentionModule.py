@@ -1,5 +1,7 @@
 from __future__ import annotations
 from typing import Any, List, Tuple, Dict, Optional
+from Config import BasicParameters
+from CoreTypes import TEXT_TRUST_OPERATOR_COMMAND, TEXT_TRUST_UNSAFE_EXTERNAL
 from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear, RoPEMultiheadAttention
 
 import copy
@@ -555,12 +557,13 @@ class IntentionExtractor(AGICoreModule):
         lossLambdaRecallAlign: float = 0.05,
         nTextSlots: int = 4,
         chunkOverlapRatio: float = 0.5,
-        ocrDictPath: Optional[str] = "/home/yhl/Documents/Intelligent-Robot-System/BrainDeepLearn/ModuleSetting/OCRKeys.txt",):
+        ocrDictPath: Optional[str] = None,):
         super().__init__()
 
         self.pad_idx = int(paddingIdx)
         self.max_seq_len = int(maxSeqLen)
         self.n_text_slots = max(1, int(nTextSlots))
+        self.ocr_observed_control_weight = 0.25
         overlap = float(chunkOverlapRatio)
         overlap = min(max(overlap, 0.0), 0.95)
         self.chunk_overlap_ratio = overlap
@@ -569,12 +572,9 @@ class IntentionExtractor(AGICoreModule):
         self.ch2id: Dict[str, int] = {}
         self.id2ch: List[str] = []
 
-        if ocrDictPath is not None:
-            try:
-                self.LoadOcrDict(ocrDictPath)
-            except FileNotFoundError:
-                self.ch2id = {}
-                self.id2ch = []
+        if ocrDictPath is None:
+            ocrDictPath = BasicParameters.OCR_DICT_PATH
+        self.LoadOcrDict(ocrDictPath)
 
         if self.id2ch:
             self.vocab_size = len(self.id2ch) + 2
@@ -1526,6 +1526,26 @@ class IntentionExtractor(AGICoreModule):
 
         return cons_sem, self_sem, intent_sem, extras
 
+    def BuildTextTrustMasks(
+        self,
+        batchSize: int,
+        textTrust: Optional[List[str]],
+        device: torch.device,) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+        trust = (
+            [TEXT_TRUST_UNSAFE_EXTERNAL for _ in range(batchSize)]
+            if textTrust is None
+            else [str(item) for item in textTrust])
+        ext_control = torch.tensor(
+            [1.0 if item == TEXT_TRUST_OPERATOR_COMMAND else 0.0 for item in trust],
+            device=device,
+            dtype=torch.float32)
+        ocr_control = torch.full(
+            (batchSize,),
+            float(self.ocr_observed_control_weight),
+            device=device,
+            dtype=torch.float32)
+        return trust, ext_control, ocr_control
+
     def forward(
         self,
         selfState: Optional[torch.Tensor],
@@ -1533,7 +1553,8 @@ class IntentionExtractor(AGICoreModule):
         ocrTexts: Optional[List[List[str]]] = None,
         extTexts: Optional[List[Optional[str]]] = None,
         *,
-        prioritizeExt: bool = False,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, Any]]:
+        prioritizeExt: bool = False,
+        textTrust: Optional[List[str]] = None,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, Any]]:
 
         device = self.device
         batch_size = self.InferBatchSize(selfState, intentState, ocrTexts, extTexts)
@@ -1551,6 +1572,12 @@ class IntentionExtractor(AGICoreModule):
         extras: Dict[str, Any] = dict(cons_extras)
         if cons_sem is not None:
             extras["cons_sem"] = cons_sem.detach()
+
+        text_trust, ext_control, ocr_control = self.BuildTextTrustMasks(batch_size, textTrust, device)
+        ext_control_mask = ext_control > 0.0
+        extras["text_trust"] = list(text_trust)
+        extras["ext_control_mask"] = ext_control_mask.detach()
+        extras["ocr_control_weight"] = ocr_control.detach()
 
         if ocrTexts is not None:
             merged = self.MergeOcrTexts(ocrTexts)
@@ -1580,7 +1607,15 @@ class IntentionExtractor(AGICoreModule):
         else:
             base = torch.zeros(batch_size, self.dimSem, device=device)
 
-        ext_for_ocr = sem_ext 
+        ext_control_float = ext_control.unsqueeze(-1)
+        ext_slot_control = ext_control.view(batch_size, 1, 1)
+        has_ext_control_mask = has_ext_mask & ext_control_mask
+        sem_ext_control = sem_ext * ext_control_float
+        ext_slots_control = ext_slots * ext_slot_control
+        ext_slot_mask_control = ext_slot_mask & ext_control_mask.view(batch_size, 1)
+        ocr_control_float = ocr_control.unsqueeze(-1)
+
+        ext_for_ocr = sem_ext_control
 
         feat_ocr = torch.cat([
                 base,
@@ -1596,7 +1631,7 @@ class IntentionExtractor(AGICoreModule):
         sem_ocr_fused = gate_ocr * sem_ocr # [B, D]
 
         ocr_mask_float = has_ocr_mask.unsqueeze(-1).float() # [B, 1]
-        base = base + self.beta_ocr * (sem_ocr_fused * ocr_mask_float) # [B, D]
+        base = base + self.beta_ocr * (sem_ocr_fused * ocr_mask_float * ocr_control_float) # [B, D]
 
         extras["sem_ocr_raw"] = sem_ocr.detach()
         extras["sem_ocr_fused"] = sem_ocr_fused.detach()
@@ -1607,18 +1642,18 @@ class IntentionExtractor(AGICoreModule):
 
         feat_ext = torch.cat([
                 base,
-                sem_ext,
-                torch.abs(base - sem_ext),
-                base * sem_ext,],dim=-1,) # [B, 4D]
+                sem_ext_control,
+                torch.abs(base - sem_ext_control),
+                base * sem_ext_control,],dim=-1,) # [B, 4D]
 
         gate_ext = self.fuse_ext_gate(feat_ext) # [B, 1]
 
-        has_ext_mask_float = has_ext_mask.unsqueeze(-1).float()
-        has_ext_mask_exp = has_ext_mask.unsqueeze(-1) 
+        has_ext_mask_float = has_ext_control_mask.unsqueeze(-1).float()
+        has_ext_mask_exp = has_ext_control_mask.unsqueeze(-1)
 
         if prioritizeExt:
             gamma = 0.5 + 0.5 * gate_ext # [B, 1]
-            candidate = (1.0 - gamma) * base + gamma * sem_ext # [B, D]
+            candidate = (1.0 - gamma) * base + gamma * sem_ext_control # [B, D]
             intentSem = torch.where(has_ext_mask_exp, candidate, base)
 
             extras["gamma_ext"] = gamma.detach()
@@ -1638,13 +1673,13 @@ class IntentionExtractor(AGICoreModule):
         tokens = torch.cat([
             self_sem.unsqueeze(1),
             intent_sem_cons.unsqueeze(1),
-            ocr_slots,
-            ext_slots,], dim=1)
+            ocr_slots * ocr_control.view(batch_size, 1, 1),
+            ext_slots_control,], dim=1)
         token_mask = torch.cat([
             self_token_mask,
             intent_token_mask,
             ocr_slot_mask,
-            ext_slot_mask,], dim=1)
+            ext_slot_mask_control,], dim=1)
 
         def safe_token_mask(token_mask_: torch.Tensor) -> torch.Tensor:
             safe = token_mask_.clone()
@@ -1670,7 +1705,7 @@ class IntentionExtractor(AGICoreModule):
             extras["intent_trans_mask_sum"] = mask_float.sum(dim=1).detach()
 
         abs_ext_ocr = torch.abs(sem_ext - sem_ocr)
-        mul_ext_ocr = sem_ext * sem_ocr
+        mul_ext_ocr = sem_ext_control * sem_ocr
 
         self._last_reason_support = None
         for t in range(self.reason_steps):
@@ -1690,30 +1725,32 @@ class IntentionExtractor(AGICoreModule):
                 sem_ocr,
                 torch.abs(base_ctx - sem_ocr),
                 base_ctx * sem_ocr,
-                sem_ext,
+                sem_ext_control,
                 abs_ext_ocr,
                 mul_ext_ocr,], dim=-1)
 
             gate_ocr = self.fuse_ocr_gate(feat_ocr)
             sem_ocr_fused = gate_ocr * sem_ocr
-            base2 = base_ctx + torch.tanh(self.beta_ocr) * ctrl["g_ocr"] * (sem_ocr_fused * has_ocr_mask.unsqueeze(-1).float())
+            base2 = base_ctx + torch.tanh(self.beta_ocr) * ctrl["g_ocr"] * (
+                sem_ocr_fused * has_ocr_mask.unsqueeze(-1).float() * ocr_control_float)
 
             feat_ext = torch.cat([
                 base2,
-                sem_ext,
-                torch.abs(base2 - sem_ext),
-                base2 * sem_ext,], dim=-1)
+                sem_ext_control,
+                torch.abs(base2 - sem_ext_control),
+                base2 * sem_ext_control,], dim=-1)
 
             gate_ext = self.fuse_ext_gate(feat_ext)
 
             if prioritizeExt:
                 gamma0 = 0.5 + 0.5 * gate_ext
                 gamma_eff = gamma0 * ctrl["g_ext"]
-                candidate = (1.0 - gamma_eff) * base2 + gamma_eff * sem_ext
-                intent2 = torch.where(has_ext_mask.unsqueeze(-1), candidate, base2)
+                candidate = (1.0 - gamma_eff) * base2 + gamma_eff * sem_ext_control
+                intent2 = torch.where(has_ext_control_mask.unsqueeze(-1), candidate, base2)
             else:
-                sem_ext_fused = gate_ext * sem_ext
-                intent2 = base2 + torch.tanh(self.beta_ext) * ctrl["g_ext"] * (sem_ext_fused * has_ext_mask.unsqueeze(-1).float())
+                sem_ext_fused = gate_ext * sem_ext_control
+                intent2 = base2 + torch.tanh(self.beta_ext) * ctrl["g_ext"] * (
+                    sem_ext_fused * has_ext_control_mask.unsqueeze(-1).float())
 
             if (trans_tokens is not None) and token_mask.any():
                 w = ctrl["tok_w"] * token_mask.float() 
@@ -2195,6 +2232,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         ocrTexts: Optional[List[List[str]]] = kwargs.get("ocrTexts", None)
         extTexts: Optional[List[Optional[str]]] = kwargs.get("extTexts", None)
         prioritizeExt: bool = bool(kwargs.get("prioritizeExt", False))
+        textTrust: Optional[List[str]] = kwargs.get("textTrust", None)
 
         row = deltasPerLayer[0] if (deltasPerLayer is not None and len(deltasPerLayer) > 0) else {}
 
@@ -2231,6 +2269,11 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         extras: Dict[str, torch.Tensor] = dict(cons_extras)
         if cons_sem is not None:
             extras["cons_sem"] = cons_sem.detach()
+        text_trust, ext_control, ocr_control = base.BuildTextTrustMasks(batch_size, textTrust, device)
+        ext_control_mask = ext_control > 0.0
+        extras["text_trust"] = list(text_trust)
+        extras["ext_control_mask"] = ext_control_mask.detach()
+        extras["ocr_control_weight"] = ocr_control.detach()
 
         if ocrTexts is not None:
             merged = base.MergeOcrTexts(ocrTexts)
@@ -2254,6 +2297,14 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
             ext_slot_mask = torch.zeros(batch_size, base.n_text_slots, dtype=torch.bool, device=device)
             has_ext_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
+        ext_control_float = ext_control.unsqueeze(-1)
+        ext_slot_control = ext_control.view(batch_size, 1, 1)
+        has_ext_control_mask = has_ext_mask & ext_control_mask
+        sem_ext_control = sem_ext * ext_control_float
+        ext_slots_control = ext_slots * ext_slot_control
+        ext_slot_mask_control = ext_slot_mask & ext_control_mask.view(batch_size, 1)
+        ocr_control_float = ocr_control.unsqueeze(-1)
+
         if (cons_sem is None) and (not has_ocr_mask.any()) and (not has_ext_mask.any()):
             return None, None, extras
 
@@ -2262,7 +2313,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         else:
             base_vec = torch.zeros(batch_size, dimSem, device=device)
 
-        ext_for_ocr = sem_ext
+        ext_for_ocr = sem_ext_control
 
         feat_ocr = torch.cat([
                 base_vec,
@@ -2277,7 +2328,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         sem_ocr_fused = gate_ocr * sem_ocr
 
         ocr_mask_float = has_ocr_mask.unsqueeze(-1).float()
-        base_vec = base_vec + base.beta_ocr * (sem_ocr_fused * ocr_mask_float)
+        base_vec = base_vec + base.beta_ocr * (sem_ocr_fused * ocr_mask_float * ocr_control_float)
 
         extras["sem_ocr_raw"] = sem_ocr.detach()
         extras["sem_ocr_fused"] = sem_ocr_fused.detach()
@@ -2288,22 +2339,22 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
 
         feat_ext = torch.cat([
                 base_vec,
-                sem_ext,
-                torch.abs(base_vec - sem_ext),
-                base_vec * sem_ext,],dim=-1,)
+                sem_ext_control,
+                torch.abs(base_vec - sem_ext_control),
+                base_vec * sem_ext_control,],dim=-1,)
 
         gate_ext = self.GateWithDelta(base.fuse_ext_gate, feat_ext, delta_ext)
 
-        has_ext_mask_float = has_ext_mask.unsqueeze(-1).float()
-        has_ext_mask_exp = has_ext_mask.unsqueeze(-1)
+        has_ext_mask_float = has_ext_control_mask.unsqueeze(-1).float()
+        has_ext_mask_exp = has_ext_control_mask.unsqueeze(-1)
 
         if prioritizeExt:
             gamma = 0.5 + 0.5 * gate_ext
-            candidate = (1.0 - gamma) * base_vec + gamma * sem_ext
+            candidate = (1.0 - gamma) * base_vec + gamma * sem_ext_control
             intentSem = torch.where(has_ext_mask_exp, candidate, base_vec)
             extras["gamma_ext"] = gamma.detach()
         else:
-            sem_ext_fused = gate_ext * sem_ext
+            sem_ext_fused = gate_ext * sem_ext_control
             intentSem = base_vec + base.beta_ext * (sem_ext_fused * has_ext_mask_float)
             extras["sem_ext_fused"] = sem_ext_fused.detach()
 
@@ -2318,13 +2369,13 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         tokens = torch.cat([
             self_sem.unsqueeze(1),
             intent_sem_cons.unsqueeze(1),
-            ocr_slots,
-            ext_slots,], dim=1)
+            ocr_slots * ocr_control.view(batch_size, 1, 1),
+            ext_slots_control,], dim=1)
         token_mask = torch.cat([
             self_token_mask,
             intent_token_mask,
             ocr_slot_mask,
-            ext_slot_mask,], dim=1)
+            ext_slot_mask_control,], dim=1)
 
         def safe_token_mask(token_mask: torch.Tensor) -> torch.Tensor:
             safe = token_mask.clone()
@@ -2374,26 +2425,32 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
 
             feat_ocr2 = torch.cat([
                 base_ctx, sem_ocr, torch.abs(base_ctx - sem_ocr), base_ctx * sem_ocr,
-                sem_ext, torch.abs(sem_ext - sem_ocr), sem_ext * sem_ocr], dim=-1)
+                sem_ext_control,
+                torch.abs(sem_ext_control - sem_ocr),
+                sem_ext_control * sem_ocr], dim=-1)
 
             gate_ocr2 = self.GateWithDelta(base.fuse_ocr_gate, feat_ocr2, delta_ocr)
             sem_ocr_fused2 = gate_ocr2 * sem_ocr
             base2 = base_ctx + torch.tanh(base.beta_ocr) * ctrl["g_ocr"] * (
-                sem_ocr_fused2 * has_ocr_mask.unsqueeze(-1).float())
+                sem_ocr_fused2 * has_ocr_mask.unsqueeze(-1).float() * ocr_control_float)
 
-            feat_ext2 = torch.cat([base2, sem_ext, torch.abs(base2 - sem_ext), base2 * sem_ext], dim=-1)
+            feat_ext2 = torch.cat([
+                base2,
+                sem_ext_control,
+                torch.abs(base2 - sem_ext_control),
+                base2 * sem_ext_control], dim=-1)
 
             gate_ext2 = self.GateWithDelta(base.fuse_ext_gate, feat_ext2, delta_ext)
 
             if prioritizeExt:
                 gamma0 = 0.5 + 0.5 * gate_ext2
                 gamma_eff = gamma0 * ctrl["g_ext"]
-                cand = (1.0 - gamma_eff) * base2 + gamma_eff * sem_ext
-                intent2 = torch.where(has_ext_mask.unsqueeze(-1), cand, base2)
+                cand = (1.0 - gamma_eff) * base2 + gamma_eff * sem_ext_control
+                intent2 = torch.where(has_ext_control_mask.unsqueeze(-1), cand, base2)
             else:
-                sem_ext_fused2 = gate_ext2 * sem_ext
+                sem_ext_fused2 = gate_ext2 * sem_ext_control
                 intent2 = base2 + torch.tanh(base.beta_ext) * ctrl["g_ext"] * (
-                    sem_ext_fused2 * has_ext_mask.unsqueeze(-1).float())
+                    sem_ext_fused2 * has_ext_control_mask.unsqueeze(-1).float())
 
             if (trans_out is not None) and token_mask.any():
                 w = ctrl["tok_w"] * token_mask.float()
@@ -2783,7 +2840,12 @@ class TestIntentionMTool:
             assert symProbs2.shape == (B, nSymbols)
 
             extTexts = [f"world {i}" for i in range(B)]
-            intentSem3, symProbs3, extras3 = model(None, None, ocrTexts=None, extTexts=extTexts)
+            intentSem3, symProbs3, extras3 = model(
+                None,
+                None,
+                ocrTexts=None,
+                extTexts=extTexts,
+                textTrust=[TEXT_TRUST_OPERATOR_COMMAND for _ in range(B)])
             assert intentSem3 is not None and symProbs3 is not None
             assert intentSem3.shape == (B, dimSem)
             assert symProbs3.shape == (B, nSymbols)
@@ -2793,7 +2855,13 @@ class TestIntentionMTool:
             ocr_full = [[f"ocr {i} text"] for i in range(B)]
             ext_full = [f"ext {i} text" for i in range(B)]
 
-            intentSem4, symProbs4, extras4 = model(cons_full_self, cons_full_intent, ocrTexts=ocr_full, extTexts=ext_full, prioritizeExt=True)
+            intentSem4, symProbs4, extras4 = model(
+                cons_full_self,
+                cons_full_intent,
+                ocrTexts=ocr_full,
+                extTexts=ext_full,
+                prioritizeExt=True,
+                textTrust=[TEXT_TRUST_OPERATOR_COMMAND for _ in range(B)])
             assert intentSem4 is not None and symProbs4 is not None
             assert intentSem4.shape == (B, dimSem)
             assert symProbs4.shape == (B, nSymbols)
@@ -3397,6 +3465,63 @@ class TestIntentionMTool:
             print("WrapperManualGrowTrainAndCommit error:", e)
             return False
 
+    def TextTrustPolicy(self) -> bool:
+        try:
+            model = self.MakeTestModel()
+            model.eval()
+            selfState, intentState, ocrTexts, extTexts, _ = self.MakeDummyBatch(
+                model,
+                batch_size=2,
+                with_ocr=True,
+                with_ext=True,
+                with_cons=True,
+                compact_text=True)
+            with torch.no_grad():
+                base_intent, _, _ = model(
+                    selfState,
+                    intentState,
+                    ocrTexts=None,
+                    extTexts=None,
+                    prioritizeExt=True)
+                unsafe_intent, _, unsafe_extras = model(
+                    selfState,
+                    intentState,
+                    ocrTexts=None,
+                    extTexts=extTexts,
+                    prioritizeExt=True,
+                    textTrust=[TEXT_TRUST_UNSAFE_EXTERNAL for _ in range(2)])
+                default_intent, _, default_extras = model(
+                    selfState,
+                    intentState,
+                    ocrTexts=None,
+                    extTexts=extTexts,
+                    prioritizeExt=True)
+                operator_intent, _, operator_extras = model(
+                    selfState,
+                    intentState,
+                    ocrTexts=ocrTexts,
+                    extTexts=extTexts,
+                    prioritizeExt=True,
+                    textTrust=[TEXT_TRUST_OPERATOR_COMMAND for _ in range(2)])
+
+            unsafe_delta = float((unsafe_intent - base_intent).abs().max().item())
+            operator_delta = float((operator_intent - base_intent).abs().max().item())
+            assert unsafe_delta < 1e-6, f"unsafe external changed control branch by {unsafe_delta:.3e}"
+            assert torch.allclose(default_intent, unsafe_intent)
+            assert operator_delta > 1e-7, "operator_command did not affect intent"
+            assert bool(operator_extras["ext_control_mask"].all().item())
+            assert not bool(unsafe_extras["ext_control_mask"].any().item())
+            assert not bool(default_extras["ext_control_mask"].any().item())
+            assert float(operator_extras["ocr_control_weight"].max().item()) < 1.0
+            print("TextTrustPolicy passed.")
+            return True
+        except AssertionError as e:
+            print("TextTrustPolicy failed:", e)
+            return False
+        except Exception as e:
+            print("TextTrustPolicy error:", e)
+            return False
+
 
     def RunAll(self) -> Dict[str, bool]:
         results = {
@@ -3412,7 +3537,8 @@ class TestIntentionMTool:
             "WrapperKeepsBaseEval": self.WrapperKeepsBaseEval(),
             "WrapperCandGradSmoke": self.WrapperCandGradSmoke(),
             "WrapperCandidateConvergence": self.WrapperCandidateConvergence(),
-            "WrapperManualGrowTrainAndCommit": self.WrapperManualGrowTrainAndCommit(),}
+            "WrapperManualGrowTrainAndCommit": self.WrapperManualGrowTrainAndCommit(),
+            "TextTrustPolicy": self.TextTrustPolicy(),}
         
         passed = sum(1 for v in results.values() if v)
         print(f"\nIntention module tests (with wrapper): {passed}/{len(results)} passed.")

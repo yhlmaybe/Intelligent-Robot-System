@@ -44,7 +44,8 @@ class ModuleDim:
 
     # Embodied-AGI v2 extensions ------------------------------------------------
     # Physical State Tensor (slot-structured object-centric scene state)
-    PstSlots: int = 256         # K  : flattened object/part node candidates
+    PstObservedSlots: int = 128 # K_o: current-frame observed object/part candidates
+    PstSlots: int = 256         # K_w: persistent world physical memory slots
     PstSlotDim: int = 128       # D_s: per-node physical latent
     PstPoseDim: int = 7         #      camera/world SE(3): xyz plus quaternion
     PstObjectClasses: int = 256
@@ -56,9 +57,7 @@ class ModuleDim:
     PstIdentityDim: int = 128
     PstTextDim: int = 4
     PstSymbolClasses: int = 16
-    PstRobotContextDim: int = 30   # base pose, end-effector pose/state, joints and velocities
     PstActionTypes: int = 16
-    PstInteractionDim: int = 23    # one-hot action type plus observed action delta pose
     PstSceneClasses: int = 32
     PstGlobalLabels: int = 8
     PstSemanticDim: int = 387   # level (3) + object class (256) + part class (128)
@@ -89,7 +88,7 @@ class ModuleDim:
     DecisionEndpointPoseFeatDim: int = 128
     DecisionFeedbackEmbedDim: int = 256
     TemporalPrimitiveCount: int = 6
-    TemporalContextDim: int = 22
+    TemporalContextDim: int = 20
     TemporalReasonDim: int = 8
     TemporalPrimitiveNames: Tuple[str, ...] = (
         "OBSERVE",
@@ -112,10 +111,9 @@ class ModuleDim:
         "left_wrist",
         "right_wrist",
         "camera",)
-    # Endpoints the policy may reorient but never translate (3 rotation axes, no
-    # position control): their translation action deltas are masked to zero so no
-    # code path can realize an end-effector position change. The camera head pans
-    # and tilts but is mounted at a fixed position.
+    # Endpoints with restricted rotational control and no translation. The fixed
+    # camera mount exposes pan/tilt only, so translation and roll are absent from
+    # both the policy parameterization and the proposed action tensor.
     DecisionRotationOnlyEndpoints: Tuple[int, ...] = (DecisionEndpointNames.index("camera"),)
     GatherParamDim: int = 32
 
@@ -123,9 +121,6 @@ class ModuleDim:
     UsageNumObjects: int = 1024        # N_obj
     UsageNumSkills: int = 64           # N_skills
     UsageParamDim: int = 8             # P
-
-    # Satisfaction-check / coarse-to-fine refinement
-    RefinementDim: int = 6             # wrist-frame correction (translation + axis-angle)
 
 
 class TensorVisualProcessor:

@@ -4,10 +4,9 @@ from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-from DecisionDecoupler import MotionCommand
+from DecisionDecoupler import MotionCommand, SAFETY_MARGIN_NAMES
 from FunctionTools import AGICoreModule
 from ModuleMessagerManager import ModuleDim
 
@@ -19,17 +18,28 @@ CANCEL = 3
 FAILSAFE_STOP = 4
 REDISPATCH = 5
 
+TEMPORAL_REASON_NAMES = (
+    "no_slot_probability",
+    "reference_uncertainty",
+    "goal_satisfaction",
+    "active_command_safety_risk",
+    "interrupt_risk",
+    "observation_staleness",
+    "planner_tracking_error",
+    "planner_failure",
+)
+
 
 @dataclass
 class TemporalContext:
     feat: torch.Tensor
     active_mask: torch.Tensor
-    action_age: torch.Tensor
-    feedback_age: torch.Tensor
+    action_age_steps: torch.Tensor
     no_slot_prob: torch.Tensor
     reference_confidence: torch.Tensor
     satisfaction_prob: torch.Tensor
     safety_risk: torch.Tensor
+    candidate_safety_risk: torch.Tensor
     interrupt_risk: torch.Tensor
     observation_freshness: torch.Tensor
     can_interrupt: torch.Tensor
@@ -39,17 +49,21 @@ class TemporalContext:
     planner_executing: torch.Tensor
     planner_reached: torch.Tensor
     planner_failed: torch.Tensor
-    planner_canceled: torch.Tensor
 
 
 @dataclass
 class TemporalDecisionEnvelope:
+    """Learned execution proposal; FAILSAFE_STOP is a software stop request."""
+
     kind_logits: torch.Tensor
+    execution_kind_scores: torch.Tensor
     kind_id: torch.Tensor
     kind_names: Tuple[str, ...]
+    override_applied: torch.Tensor
     action_id: torch.Tensor
     action_epoch: torch.Tensor
-    reason_logits: torch.Tensor
+    reason_scores: torch.Tensor
+    reason_names: Tuple[str, ...]
     duration_ms: torch.Tensor
     soft_timeout_ms: torch.Tensor
     hard_timeout_ms: torch.Tensor
@@ -64,15 +78,10 @@ class TemporalDecisionEnvelope:
     invoke_drift: torch.Tensor
     motion_command: MotionCommand
 
-
-@dataclass
-class TemporalExecutionState:
-    active_mask: torch.Tensor
-    action_age: torch.Tensor
-    feedback_age: torch.Tensor
-    action_epoch: torch.Tensor
-    active_kind: torch.Tensor
-    active_feedback_embed: torch.Tensor
+    @property
+    def reason_logits(self) -> torch.Tensor:
+        """Compatibility alias; these values are named evidence scores, not logits."""
+        return self.reason_scores
 
 
 class TemporalExecutionGateExtractor(AGICoreModule):
@@ -84,7 +93,7 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         endpointCount: int = ModuleDim.DecisionEndpointCount,
         actionDim: int = ModuleDim.DecisionActionDim,
         poseDim: int = ModuleDim.DecisionEndpointPoseDim,
-        ageNorm: float = 128.0,):
+        ageNormSteps: float = 128.0,):
         super().__init__()
         self.primitive_count = int(primitiveCount)
         self.context_dim = int(contextDim)
@@ -92,41 +101,30 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         self.endpoint_count = int(endpointCount)
         self.action_dim = int(actionDim)
         self.pose_dim = int(poseDim)
-        self.age_norm = float(ageNorm)
+        self.age_norm_steps = float(ageNormSteps)
  
-        self.rule_gain_max = 16.0
-        rule_gain_init = torch.tensor([2.0, 2.0, 2.0, 3.0, 8.0, 3.0])
-        self.rule_gain_raw = nn.Parameter((rule_gain_init / (self.rule_gain_max - rule_gain_init)).log())
- 
-        self.inactive_penalty_raw = nn.Parameter(torch.tensor([4.0, 4.0, 4.0]).expm1().log())
-        self.continue_base = nn.Parameter(torch.tensor(3.0))
-        continue_penalty_init = torch.tensor([
+        self.register_buffer(
+            "rule_gain",
+            torch.tensor([2.0, 2.0, 2.0, 3.0, 8.0, 3.0]),
+            persistent=True)
+        self.register_buffer(
+            "inactive_penalty",
+            torch.tensor([4.0, 4.0, 4.0]),
+            persistent=True)
+        self.register_buffer("continue_base", torch.tensor(3.0), persistent=True)
+        self.register_buffer("continue_penalty", torch.tensor([
             1.4,  # invoke_delta
             1.6,  # reference_drift
             2.0,  # planner_tracking_error
             2.0,  # safety_risk
             1.6,  # satisfaction_prob
             4.0,  # planner_failed
-            4.0,  # planner_canceled
             2.0,  # planner_reached
             1.2,  # stale observation
             1.5,  # interrupt_risk
-        ])
-        self.continue_penalty_raw = nn.Parameter(continue_penalty_init.expm1().log())
- 
+        ]), persistent=True)
+
         self.register_buffer("drift_threshold", torch.tensor(4.0), persistent=True)
-        
-        self.context_refiner = nn.Sequential(
-            nn.LayerNorm(self.context_dim),
-            nn.Linear(self.context_dim, 64),
-            nn.SiLU(),
-            nn.Linear(64, self.primitive_count),)
-        
-        self.reason_head = nn.Sequential(
-            nn.LayerNorm(self.context_dim + self.primitive_count),
-            nn.Linear(self.context_dim + self.primitive_count, 64),
-            nn.SiLU(),
-            nn.Linear(64, self.reason_dim),)
 
     @torch.no_grad()
     def CalibrateDriftThreshold(self, driftSamples: torch.Tensor, quantile: float = 0.95):
@@ -135,12 +133,12 @@ class TemporalExecutionGateExtractor(AGICoreModule):
     def BuildContext(
         self,
         activeMask: torch.Tensor,
-        actionAge: torch.Tensor,
-        feedbackAge: torch.Tensor,
+        actionAgeSteps: torch.Tensor,
         noSlotProb: torch.Tensor,
         referenceConfidence: torch.Tensor,
         satisfactionProb: torch.Tensor,
         safetyRisk: torch.Tensor,
+        candidateSafetyRisk: torch.Tensor,
         interruptRisk: torch.Tensor,
         observationFreshness: torch.Tensor,
         canInterrupt: torch.Tensor,
@@ -149,15 +147,14 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         plannerTrackingError: torch.Tensor,
         plannerExecuting: torch.Tensor,
         plannerReached: torch.Tensor,
-        plannerFailed: torch.Tensor,
-        plannerCanceled: torch.Tensor,) -> TemporalContext:
+        plannerFailed: torch.Tensor,) -> TemporalContext:
         active = activeMask.view(-1)
-        age = actionAge.view(-1)
-        feedback_age = feedbackAge.view(-1)
+        action_age_steps = actionAgeSteps.view(-1)
         no_slot = noSlotProb.view(-1)
         ref_conf = referenceConfidence.view(-1)
         satisfied = satisfactionProb.view(-1)
         safety = safetyRisk.view(-1)
+        candidate_safety = candidateSafetyRisk.view(-1)
         interrupt = interruptRisk.view(-1)
         freshness = observationFreshness.view(-1)
         can_interrupt = canInterrupt.view(-1)
@@ -167,12 +164,10 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         planner_executing = plannerExecuting.view(-1)
         planner_reached = plannerReached.view(-1)
         planner_failed = plannerFailed.view(-1)
-        planner_canceled = plannerCanceled.view(-1)
 
         feat = torch.stack([
             active,
-            age / self.age_norm,
-            feedback_age / self.age_norm,
+            action_age_steps / self.age_norm_steps,
             no_slot,
             ref_conf,
             satisfied,
@@ -190,18 +185,17 @@ class TemporalExecutionGateExtractor(AGICoreModule):
             planner_tracking_error,
             planner_executing,
             planner_reached,
-            planner_failed,
-            planner_canceled,], dim=-1)
+            planner_failed,], dim=-1)
         
         return TemporalContext(
             feat=feat,
             active_mask=active,
-            action_age=age,
-            feedback_age=feedback_age,
+            action_age_steps=action_age_steps,
             no_slot_prob=no_slot,
             reference_confidence=ref_conf,
             satisfaction_prob=satisfied,
             safety_risk=safety,
+            candidate_safety_risk=candidate_safety,
             interrupt_risk=interrupt,
             observation_freshness=freshness,
             can_interrupt=can_interrupt,
@@ -210,19 +204,24 @@ class TemporalExecutionGateExtractor(AGICoreModule):
             planner_tracking_error=planner_tracking_error,
             planner_executing=planner_executing,
             planner_reached=planner_reached,
-            planner_failed=planner_failed,
-            planner_canceled=planner_canceled,)
+            planner_failed=planner_failed,)
 
     def HoldCommand(self, endpointPose: torch.Tensor, template: MotionCommand) -> MotionCommand:
         B = endpointPose.size(0)
         decision_tensor = endpointPose.new_zeros(B, self.endpoint_count, self.action_dim)
+        safety_scores = template.safety_scores.clone()
+        safety_scores[:, :2] = 1.0
         return MotionCommand(
             decision_tensor=decision_tensor,
             target_endpoint_pose=endpointPose,
             endpoint_names=template.endpoint_names,
+            decision_dof_mask=template.decision_dof_mask,
             gripper_cmd=template.gripper_cmd,
+            gripper_valid=torch.zeros(B, device=endpointPose.device, dtype=torch.bool),
             mode_logits=template.mode_logits,
-            safety_scores=template.safety_scores,)
+            mode_valid=torch.zeros(B, device=endpointPose.device, dtype=torch.bool),
+            safety_scores=safety_scores,
+            safety_names=template.safety_names,)
 
     def SelectCommand(
         self,
@@ -257,14 +256,27 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         gripper_candidate = flat_candidate.unsqueeze(-1)
         gripper_active = flat_active.unsqueeze(-1)
         gripper_hold = flat_hold.unsqueeze(-1)
+        select_candidate = w_candidate.detach() > 0.5
+        select_active = w_active.detach() > 0.5
+        select_hold = w_hold.detach() > 0.5
         
         return MotionCommand(
             decision_tensor=decision_tensor,
             target_endpoint_pose=target_pose,
             endpoint_names=candidate.endpoint_names,
+            decision_dof_mask=candidate.decision_dof_mask,
             gripper_cmd=candidate.gripper_cmd * gripper_candidate + active.gripper_cmd * gripper_active + hold.gripper_cmd * gripper_hold,
+            gripper_valid=(
+                (candidate.gripper_valid & select_candidate)
+                | (active.gripper_valid & select_active)
+                | (hold.gripper_valid & select_hold)),
             mode_logits=candidate.mode_logits * flat_candidate + active.mode_logits * flat_active + hold.mode_logits * flat_hold,
-            safety_scores=candidate.safety_scores * flat_candidate + active.safety_scores * flat_active + hold.safety_scores * flat_hold,)
+            mode_valid=(
+                (candidate.mode_valid & select_candidate)
+                | (active.mode_valid & select_active)
+                | (hold.mode_valid & select_hold)),
+            safety_scores=candidate.safety_scores * flat_candidate + active.safety_scores * flat_active + hold.safety_scores * flat_hold,
+            safety_names=candidate.safety_names,)
 
     def forward(
         self,
@@ -275,7 +287,7 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         endpointPose: torch.Tensor,
         actionEpoch: torch.Tensor,
         invokeDrift: torch.Tensor,) -> TemporalDecisionEnvelope:
-        logits = decisionTemporal["kind_logits"] + self.context_refiner(temporalContext.feat)
+        logits = decisionTemporal["kind_logits"]
         active = temporalContext.active_mask
         same_operator = decisionTemporal["same_operator"].view(-1)
         operator_changed = decisionTemporal["operator_changed"].view(-1)
@@ -289,7 +301,6 @@ class TemporalExecutionGateExtractor(AGICoreModule):
             * same_operator
             * temporalContext.planner_executing
             * (1.0 - temporalContext.planner_failed)
-            * (1.0 - temporalContext.planner_canceled)
             * (1.0 - temporalContext.hard_stop))
         
         continue_penalty_terms = torch.stack([
@@ -299,20 +310,19 @@ class TemporalExecutionGateExtractor(AGICoreModule):
             temporalContext.safety_risk,
             temporalContext.satisfaction_prob,
             temporalContext.planner_failed,
-            temporalContext.planner_canceled,
             temporalContext.planner_reached,
             1.0 - temporalContext.observation_freshness,
             temporalContext.interrupt_risk,], dim=-1)
         
         continue_penalty = (
             continue_penalty_terms
-            * F.softplus(self.continue_penalty_raw).view(1, -1)).sum(dim=-1)
+            * self.continue_penalty.view(1, -1)).sum(dim=-1)
         
         continue_ok = continue_gate * torch.sigmoid(self.continue_base - continue_penalty)
         
         cancel_need = active * temporalContext.can_interrupt * torch.maximum(
-            torch.maximum(temporalContext.interrupt_risk, temporalContext.safety_risk),
-            temporalContext.planner_canceled)
+            temporalContext.interrupt_risk,
+            temporalContext.safety_risk)
         
         redispatch_signal = torch.maximum(
             decisionTemporal["redispatch_score"],
@@ -324,10 +334,12 @@ class TemporalExecutionGateExtractor(AGICoreModule):
                         torch.maximum(temporalContext.planner_tracking_error, temporalContext.planner_failed),
                         temporalContext.planner_reached * (1.0 - temporalContext.satisfaction_prob)))))
         
-        redispatch_need = active * redispatch_signal * (1.0 - temporalContext.safety_risk)
-        dispatch_need = (1.0 - active) * temporalContext.reference_confidence + active * temporalContext.satisfaction_prob
-        gain = self.rule_gain_max * torch.sigmoid(self.rule_gain_raw)
-        inactive_penalty = F.softplus(self.inactive_penalty_raw) * (1.0 - active).unsqueeze(-1)
+        redispatch_need = active * redispatch_signal * (1.0 - temporalContext.candidate_safety_risk)
+        dispatch_need = (
+            (1.0 - active) * temporalContext.reference_confidence
+            + active * temporalContext.satisfaction_prob) * (1.0 - temporalContext.candidate_safety_risk)
+        gain = self.rule_gain
+        inactive_penalty = self.inactive_penalty * (1.0 - active).unsqueeze(-1)
         
         rule_bias = torch.stack([
             gain[0] * observe_needed,
@@ -338,12 +350,40 @@ class TemporalExecutionGateExtractor(AGICoreModule):
             gain[5] * redispatch_need - inactive_penalty[:, 2],], dim=-1)
         
         kind_logits = logits + rule_bias
-        kind_id = kind_logits.argmax(dim=-1)
+        execution_kind_scores = kind_logits.clone()
+        continue_legal = active > 0.5
+        execution_kind_scores[:, CONTINUE] = execution_kind_scores[:, CONTINUE].masked_fill(
+            ~continue_legal,
+            -torch.inf)
+        execution_kind_scores[:, CANCEL] = execution_kind_scores[:, CANCEL].masked_fill(
+            active <= 0.5,
+            -torch.inf)
+        execution_kind_scores[:, REDISPATCH] = execution_kind_scores[:, REDISPATCH].masked_fill(
+            active <= 0.5,
+            -torch.inf)
+        kind_id = execution_kind_scores.argmax(dim=-1)
+        selects_candidate = (kind_id == DISPATCH) | (kind_id == REDISPATCH)
+        selects_active = kind_id == CONTINUE
+        selected_safety_risk = torch.where(
+            selects_candidate,
+            temporalContext.candidate_safety_risk,
+            torch.where(
+                selects_active,
+                temporalContext.safety_risk,
+                torch.zeros_like(temporalContext.safety_risk)))
         hard_id = kind_id.new_full(kind_id.shape, FAILSAFE_STOP)
-        kind_id = torch.where(temporalContext.hard_stop > 0.5, hard_id, kind_id)
+        override_applied = (
+            (temporalContext.hard_stop > 0.5)
+            | (selected_safety_risk > 0.98))
+        kind_id = torch.where(
+            override_applied,
+            hard_id,
+            kind_id)
+        start_mask = ((kind_id == DISPATCH) | (kind_id == REDISPATCH)).to(actionEpoch.dtype)
+        action_id = actionEpoch + start_mask
  
         if self.training:
-            kind_soft = F.softmax(kind_logits, dim=-1)
+            kind_soft = F.softmax(execution_kind_scores, dim=-1)
             kind_hard = torch.zeros_like(kind_soft).scatter_(-1, kind_id.unsqueeze(-1), 1.0)
             kind_weight = kind_hard + kind_soft - kind_soft.detach()
         else:
@@ -356,15 +396,26 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         publish_stop_command = kind_weight[:, CANCEL] + kind_weight[:, FAILSAFE_STOP]
  
         publish_hold_command = kind_weight[:, OBSERVE]
-        reason_logits = self.reason_head(torch.cat([temporalContext.feat, kind_logits], dim=-1))
+        reason_scores = torch.stack([
+            temporalContext.no_slot_prob,
+            1.0 - temporalContext.reference_confidence,
+            temporalContext.satisfaction_prob,
+            temporalContext.safety_risk,
+            temporalContext.interrupt_risk,
+            1.0 - temporalContext.observation_freshness,
+            temporalContext.planner_tracking_error,
+            temporalContext.planner_failed,], dim=-1)
         
         return TemporalDecisionEnvelope(
             kind_logits=kind_logits,
+            execution_kind_scores=execution_kind_scores,
             kind_id=kind_id,
             kind_names=ModuleDim.TemporalPrimitiveNames,
-            action_id=actionEpoch,
-            action_epoch=actionEpoch,
-            reason_logits=reason_logits,
+            override_applied=override_applied,
+            action_id=action_id,
+            action_epoch=action_id,
+            reason_scores=reason_scores,
+            reason_names=TEMPORAL_REASON_NAMES,
             duration_ms=decisionTemporal["duration_ms"],
             soft_timeout_ms=decisionTemporal["soft_timeout_ms"],
             hard_timeout_ms=decisionTemporal["hard_timeout_ms"],
@@ -406,9 +457,18 @@ class TestTemporalExecutionGateExtractorMTool:
                 device=self.device),
             target_endpoint_pose=endpoint_pose + float(value) * 0.01,
             endpoint_names=ModuleDim.DecisionEndpointNames,
+            decision_dof_mask=torch.ones(
+                B,
+                ModuleDim.DecisionEndpointCount,
+                ModuleDim.DecisionActionDim,
+                device=self.device,
+                dtype=torch.bool),
             gripper_cmd=torch.full((B, ModuleDim.ArmCount, 1), float(value), device=self.device),
+            gripper_valid=torch.ones(B, device=self.device, dtype=torch.bool),
             mode_logits=torch.full((B, ModuleDim.ActTypeDim), float(value), device=self.device),
-            safety_scores=torch.full((B, 5), float(value), device=self.device),)
+            mode_valid=torch.ones(B, device=self.device, dtype=torch.bool),
+            safety_scores=torch.full((B, 5), float(value), device=self.device),
+            safety_names=SAFETY_MARGIN_NAMES,)
 
     def MakeContext(
         self,
@@ -419,15 +479,16 @@ class TestTemporalExecutionGateExtractorMTool:
         satisfied: float = 0.0,
         trackingError: float = 0.0,
         safetyRisk: float = 0.0,
+        candidateSafetyRisk: float = 0.0,
         hardStop: float = 0.0,) -> TemporalContext:
         return gate.BuildContext(
             activeMask=torch.full((B,), float(active), device=self.device),
-            actionAge=torch.ones(B, device=self.device),
-            feedbackAge=torch.zeros(B, device=self.device),
+            actionAgeSteps=torch.ones(B, device=self.device, dtype=torch.long),
             noSlotProb=torch.zeros(B, device=self.device),
             referenceConfidence=torch.ones(B, device=self.device),
             satisfactionProb=torch.full((B,), float(satisfied), device=self.device),
             safetyRisk=torch.full((B,), float(safetyRisk), device=self.device),
+            candidateSafetyRisk=torch.full((B,), float(candidateSafetyRisk), device=self.device),
             interruptRisk=torch.zeros(B, device=self.device),
             observationFreshness=torch.ones(B, device=self.device),
             canInterrupt=torch.ones(B, device=self.device),
@@ -436,8 +497,7 @@ class TestTemporalExecutionGateExtractorMTool:
             plannerTrackingError=torch.full((B,), float(trackingError), device=self.device),
             plannerExecuting=torch.ones(B, device=self.device),
             plannerReached=torch.zeros(B, device=self.device),
-            plannerFailed=torch.zeros(B, device=self.device),
-            plannerCanceled=torch.zeros(B, device=self.device),)
+            plannerFailed=torch.zeros(B, device=self.device),)
 
     def MakeDecisionTemporal(
         self,
@@ -488,6 +548,8 @@ class TestTemporalExecutionGateExtractorMTool:
             assert tuple(hold.target_endpoint_pose.shape) == (B, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim)
             assert torch.allclose(hold.decision_tensor, torch.zeros_like(hold.decision_tensor))
             assert torch.allclose(hold.target_endpoint_pose, endpoint_pose)
+            assert torch.all(hold.safety_scores[:, :2] == 1.0)
+            assert torch.equal(hold.safety_scores[:, 2:], template.safety_scores[:, 2:])
             print("TemporalExecutionGateExtractor HoldCommand shape test passed.")
             return True
         except Exception as e:
@@ -539,8 +601,11 @@ class TestTemporalExecutionGateExtractorMTool:
                     torch.zeros(B, dtype=torch.long, device=self.device),
                     torch.zeros(B, device=self.device),)
             assert tuple(out.kind_logits.shape) == (B, ModuleDim.TemporalPrimitiveCount)
+            assert tuple(out.execution_kind_scores.shape) == (B, ModuleDim.TemporalPrimitiveCount)
             assert tuple(out.kind_id.shape) == (B,)
-            assert tuple(out.reason_logits.shape) == (B, ModuleDim.TemporalReasonDim)
+            assert out.action_id.dtype == torch.long
+            assert tuple(out.reason_scores.shape) == (B, ModuleDim.TemporalReasonDim)
+            assert len(out.reason_names) == ModuleDim.TemporalReasonDim
             assert tuple(out.motion_command.decision_tensor.shape) == (B, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionActionDim)
             flag_sum = (
                 out.publish_motion_command
@@ -572,11 +637,46 @@ class TestTemporalExecutionGateExtractorMTool:
                     torch.zeros(B, dtype=torch.long, device=self.device),
                     torch.zeros(B, device=self.device),)
             assert bool((out.kind_id == FAILSAFE_STOP).all().item())
+            assert bool(out.override_applied.all().item())
             assert bool((out.publish_stop_command == 1.0).all().item())
             print("TemporalExecutionGateExtractor hard stop override test passed.")
             return True
         except Exception as e:
             print(f"TemporalExecutionGateExtractor hard stop override test failed: {type(e).__name__}: {e}")
+            return False
+
+    def TestActionIdStableAcrossContinue(self) -> bool:
+        try:
+            B = 1
+            gate = self.MakeGate().eval()
+            endpoint_pose = self.MakeEndpointPose(B)
+            candidate = self.MakeMotionCommand(B, 1.0)
+            temporal = self.MakeDecisionTemporal(B, sameOperator=1.0)
+            first = gate(
+                self.MakeContext(gate, B, active=0.0),
+                temporal,
+                candidate,
+                candidate,
+                endpoint_pose,
+                torch.zeros(B, device=self.device),
+                torch.zeros(B, device=self.device))
+            second = gate(
+                self.MakeContext(gate, B, active=1.0),
+                temporal,
+                candidate,
+                first.motion_command,
+                endpoint_pose,
+                first.action_epoch,
+                torch.zeros(B, device=self.device))
+            ok = (
+                int(first.kind_id.item()) == DISPATCH
+                and int(second.kind_id.item()) == CONTINUE
+                and float(first.action_id.item()) == 1.0
+                and torch.equal(first.action_id, second.action_id))
+            print(f"TemporalExecutionGateExtractor stable action id {'passed' if ok else 'failed'}.")
+            return bool(ok)
+        except Exception as e:
+            print(f"TemporalExecutionGateExtractor stable action id failed: {type(e).__name__}: {e}")
             return False
 
     def TestContinuePenaltyResponse(self) -> bool:
@@ -596,6 +696,103 @@ class TestTemporalExecutionGateExtractorMTool:
             return True
         except Exception as e:
             print(f"TemporalExecutionGateExtractor continue penalty response test failed: {type(e).__name__}: {e}")
+            return False
+
+    def TestInactiveCannotContinue(self) -> bool:
+        try:
+            B = 1
+            gate = self.MakeGate().eval()
+            endpoint_pose = self.MakeEndpointPose(B)
+            command = self.MakeMotionCommand(B, 1.0)
+            temporal = self.MakeDecisionTemporal(B)
+            temporal["kind_logits"][:, CONTINUE] = 100.0
+            out = gate(
+                self.MakeContext(gate, B, active=0.0),
+                temporal,
+                command,
+                command,
+                endpoint_pose,
+                torch.zeros(B, device=self.device),
+                torch.zeros(B, device=self.device))
+            ok = (
+                int(out.kind_id.item()) != CONTINUE
+                and float(out.reuse_active_motion_command.item()) == 0.0)
+            print(f"TemporalExecutionGateExtractor inactive legality {'passed' if ok else 'failed'}.")
+            return bool(ok)
+        except Exception as e:
+            print(f"TemporalExecutionGateExtractor inactive legality failed: {type(e).__name__}: {e}")
+            return False
+
+    def TestBranchSpecificSafety(self) -> bool:
+        try:
+            B = 1
+            gate = self.MakeGate().eval()
+            endpoint_pose = self.MakeEndpointPose(B)
+            candidate = self.MakeMotionCommand(B, 1.0)
+            active = self.MakeMotionCommand(B, 2.0)
+
+            continue_temporal = self.MakeDecisionTemporal(B)
+            continue_temporal["kind_logits"][:, CONTINUE] = 20.0
+            safe_active = gate(
+                self.MakeContext(
+                    gate,
+                    B,
+                    safetyRisk=0.0,
+                    candidateSafetyRisk=0.99),
+                continue_temporal,
+                candidate,
+                active,
+                endpoint_pose,
+                torch.zeros(B, device=self.device),
+                torch.zeros(B, device=self.device))
+            unsafe_active = gate(
+                self.MakeContext(
+                    gate,
+                    B,
+                    safetyRisk=0.99,
+                    candidateSafetyRisk=0.0),
+                continue_temporal,
+                candidate,
+                active,
+                endpoint_pose,
+                torch.zeros(B, device=self.device),
+                torch.zeros(B, device=self.device))
+
+            redispatch_temporal = self.MakeDecisionTemporal(B)
+            redispatch_temporal["kind_logits"][:, REDISPATCH] = 20.0
+            safe_redispatch = gate(
+                self.MakeContext(
+                    gate,
+                    B,
+                    safetyRisk=0.99,
+                    candidateSafetyRisk=0.0),
+                redispatch_temporal,
+                candidate,
+                active,
+                endpoint_pose,
+                torch.zeros(B, device=self.device),
+                torch.zeros(B, device=self.device))
+            unsafe_redispatch = gate(
+                self.MakeContext(
+                    gate,
+                    B,
+                    safetyRisk=0.0,
+                    candidateSafetyRisk=0.99),
+                redispatch_temporal,
+                candidate,
+                active,
+                endpoint_pose,
+                torch.zeros(B, device=self.device),
+                torch.zeros(B, device=self.device))
+            ok = (
+                int(safe_active.kind_id.item()) == CONTINUE
+                and int(unsafe_active.kind_id.item()) == FAILSAFE_STOP
+                and int(safe_redispatch.kind_id.item()) == REDISPATCH
+                and int(unsafe_redispatch.kind_id.item()) == FAILSAFE_STOP)
+            print(f"TemporalExecutionGateExtractor branch safety {'passed' if ok else 'failed'}.")
+            return bool(ok)
+        except Exception as e:
+            print(f"TemporalExecutionGateExtractor branch safety failed: {type(e).__name__}: {e}")
             return False
 
     def TestTrainEvalSelectionConsistency(self) -> bool:
@@ -655,7 +852,10 @@ class TestTemporalExecutionGateExtractorMTool:
             "SelectCommandRoutes": self.TestSelectCommandRoutes(),
             "ForwardShapesAndPublishFlags": self.TestForwardShapesAndPublishFlags(),
             "HardStopOverride": self.TestHardStopOverride(),
+            "ActionIdStableAcrossContinue": self.TestActionIdStableAcrossContinue(),
             "ContinuePenaltyResponse": self.TestContinuePenaltyResponse(),
+            "InactiveCannotContinue": self.TestInactiveCannotContinue(),
+            "BranchSpecificSafety": self.TestBranchSpecificSafety(),
             "TrainEvalSelectionConsistency": self.TestTrainEvalSelectionConsistency(),
             "TrainingGradient": self.TestTrainingGradient(),}
         passed = sum(1 for ok in results.values() if ok)

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from FunctionTools import AGICoreModule
+from FunctionTools import AGICoreModule, BuildReferenceWeights, BuildReferenceScaleContext
 from ModuleMessagerManager import ModuleDim
 
 
@@ -180,7 +180,7 @@ class PredicateGrounder(AGICoreModule):
             + self.endpoint_pose_feat_dim
             + self.pose_dim
             + 6)
-        
+
         self.feature_dim = (
             self.slot_dim
             + int(goalDim)
@@ -198,13 +198,19 @@ class PredicateGrounder(AGICoreModule):
             nn.SiLU(),
             nn.Linear(hidden, self.slot_dim),
             nn.LayerNorm(self.slot_dim),)
-        
+
         self.summary_query = nn.Sequential(
             nn.LayerNorm(self.summary_context_dim),
             nn.Linear(self.summary_context_dim, hidden),
             nn.SiLU(),
             nn.Linear(hidden, self.slot_dim),)
-        
+
+        self.reference_memory_scale_head = nn.Sequential(
+            nn.LayerNorm(self.summary_context_dim + 8),
+            nn.Linear(self.summary_context_dim + 8, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),)
+
         self.summary_key = nn.Linear(self.slot_dim, self.slot_dim, bias=False)
 
         self.summary_value = nn.Linear(self.slot_dim, self.slot_dim, bias=False)
@@ -215,7 +221,7 @@ class PredicateGrounder(AGICoreModule):
             nn.SiLU(),
             nn.Linear(hidden, self.slot_dim),
             nn.LayerNorm(self.slot_dim),)
-        
+
         self.net = nn.Sequential(
             nn.LayerNorm(self.feature_dim),
             nn.Linear(self.feature_dim, hidden),
@@ -230,21 +236,24 @@ class PredicateGrounder(AGICoreModule):
         summaryContext: torch.Tensor,
         referenced: torch.Tensor,
         referenceSlotIndex: torch.Tensor,
-        referenceConfidence: torch.Tensor,) -> torch.Tensor:
+        referenceConfidence: torch.Tensor,
+        memoryScale: torch.Tensor,) -> torch.Tensor:
         m = pst["MphysRaw"]
-        observed = pst["Observed"].float()
-        last_seen = pst["LastSeen"].float()
-        current_step = last_seen.amax(dim=1, keepdim=True)
-        memory_age = (current_step - last_seen).clamp_min(0.0)
-        memory_recency = torch.exp(-memory_age / 32.0)
-        observed_weight = m * observed
-        memory_weight = 0.5 * m * pst["M"] * (1.0 - observed) * memory_recency
-        slot_context_weight = observed_weight + memory_weight
+        current_step = pst["Step"].view(-1, 1).float()
+        reference_weights = BuildReferenceWeights(
+            pst,
+            current_step,
+            memoryScale=memoryScale,
+            memoryDecayHorizon=32.0)
+        observed_weight = reference_weights.observed_weight
+        memory_weight = reference_weights.memory_weight
+        memory_recency = reference_weights.memory_recency
+        slot_context_weight = reference_weights.slot_weight
         target_weight = m * referenced
 
         slot_input = torch.cat([
-            pst["SRaw"],
-            pst["P"],
+            pst["SlotState"],
+            pst["PoseWorld"],
             m.unsqueeze(-1),
             observed_weight.unsqueeze(-1),
             memory_weight.unsqueeze(-1),
@@ -269,7 +278,7 @@ class PredicateGrounder(AGICoreModule):
         batch_idx = torch.arange(slot_embed.size(0), device=slot_embed.device)
         target_summary = slot_embed[batch_idx, referenceSlotIndex] * referenceConfidence.unsqueeze(-1)
         valid_summary = (slot_embed * slot_context_weight.unsqueeze(-1)).sum(dim=1) / slot_context_weight.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        
+
         return self.summary_refiner(torch.cat([
             attended_summary,
             target_summary,
@@ -284,7 +293,7 @@ class PredicateGrounder(AGICoreModule):
         pst: Dict[str, torch.Tensor],
         referenceSlotIndex: torch.Tensor,
         referenceConfidence: torch.Tensor,) -> torch.Tensor:
-        pose = pst["P"]
+        pose = pst["PoseWorld"]
         B = pose.size(0)
         batch_idx = torch.arange(B, device=pose.device)
         return pose[batch_idx, referenceSlotIndex] * referenceConfidence.unsqueeze(-1)
@@ -292,6 +301,7 @@ class PredicateGrounder(AGICoreModule):
     def forward(
         self,
         pst: Dict[str, torch.Tensor],
+        observedPst: Dict[str, torch.Tensor],
         goalEmbed: torch.Tensor,
         worldBelief: torch.Tensor,
         decisionBelief: torch.Tensor,
@@ -314,7 +324,7 @@ class PredicateGrounder(AGICoreModule):
             intentNovelty,
             satisfactionProb.view(-1),
             noSlotProb,], dim=-1)
-        
+
         summary_context = torch.cat([
             goalEmbed,
             worldBelief,
@@ -322,9 +332,19 @@ class PredicateGrounder(AGICoreModule):
             endpointPoseFeat,
             ref_pose,
             scalar,], dim=-1)
-        
-        slot_summary = self.SlotSummary(pst, summary_context, referenced, reference_slot_idx, referenceConfidence)
-        
+        reference_context = BuildReferenceScaleContext(
+            observedPst,
+            self.summary_query(summary_context))
+        memory_scale = torch.sigmoid(self.reference_memory_scale_head(torch.cat([summary_context, reference_context], dim=-1)))
+
+        slot_summary = self.SlotSummary(
+            pst,
+            summary_context,
+            referenced,
+            reference_slot_idx,
+            referenceConfidence,
+            memory_scale)
+
         x = torch.cat([
             slot_summary,
             goalEmbed,
@@ -333,9 +353,9 @@ class PredicateGrounder(AGICoreModule):
             endpointPoseFeat,
             ref_pose,
             scalar,], dim=-1)
-        
+
         logits = self.net(x)
-        
+
         return {
             "features": x,
             "predicate_logits": logits,
@@ -344,6 +364,7 @@ class PredicateGrounder(AGICoreModule):
             "reference_slot_idx": reference_slot_idx,
             "reference_confidence": referenceConfidence,
             "no_slot_prob": noSlotProb,
+            "memory_reference_scale": memory_scale.squeeze(-1),
             "slot_summary": slot_summary,}
 
 
@@ -457,7 +478,7 @@ class OperatorLibrary(AGICoreModule):
         redundancy_penalty = redundant_effect.sum(dim=-1) / effect_count.view(1, -1)
 
         symbolic_score = 1.50 * precond_score + 2.00 * effect_score - 0.50 * redundancy_penalty
-        
+
         return {
             "precond_score": precond_score,
             "effect_score": effect_score,
@@ -486,7 +507,7 @@ class PlanRanker(AGICoreModule):
                 nn.SiLU(),
                 nn.Linear(2 * hidden, hidden),)
             for _ in range(3)])
-        
+
         self.state_norm = nn.LayerNorm(hidden)
 
         self.operator_embedding = nn.Embedding(len(OPERATORS), hidden)
@@ -497,13 +518,13 @@ class PlanRanker(AGICoreModule):
             nn.SiLU(),
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),)
-        
+
         self.operator_direct_head = nn.Sequential(
             nn.LayerNorm(hidden),
             nn.Linear(hidden, hidden // 2),
             nn.SiLU(),
             nn.Linear(hidden // 2, len(OPERATORS)),)
-        
+
         self.operator_bias = nn.Parameter(torch.zeros(len(OPERATORS)))
 
         self.plan_seed_head = nn.Sequential(
@@ -512,7 +533,7 @@ class PlanRanker(AGICoreModule):
             nn.SiLU(),
             nn.Linear(hidden, planDim),
             nn.LayerNorm(planDim),)
-        
+
         self.plan_refiner = nn.Sequential(
             nn.LayerNorm(planDim + hidden),
             nn.Linear(planDim + hidden, hidden),
@@ -535,7 +556,7 @@ class PlanRanker(AGICoreModule):
         match_logits = operator_query @ self.operator_embedding.weight.t() / (float(self.hidden) ** 0.5)
         operator_logits = self.operator_direct_head(h) + match_logits + self.operator_bias.view(1, -1)
         plan_seed = self.plan_seed_head(h)
-        
+
         return {
             "plan_seed": plan_seed,
             "operator_logits": operator_logits,
@@ -559,7 +580,7 @@ class FailureExplainer(AGICoreModule):
                 nn.SiLU(),
                 nn.Linear(2 * hidden, hidden),)
             for _ in range(2)])
-        
+
         self.state_norm = nn.LayerNorm(hidden)
 
         self.failure_embedding = nn.Embedding(len(FAILURE_CAUSES), hidden)
@@ -570,13 +591,13 @@ class FailureExplainer(AGICoreModule):
             nn.SiLU(),
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),)
-        
+
         self.direct_head = nn.Sequential(
             nn.LayerNorm(hidden),
             nn.Linear(hidden, hidden // 2),
             nn.SiLU(),
             nn.Linear(hidden // 2, len(FAILURE_CAUSES)),)
-        
+
         self.failure_bias = nn.Parameter(torch.zeros(len(FAILURE_CAUSES)))
 
         p = {name: i for i, name in enumerate(PREDICATES)}
@@ -641,7 +662,7 @@ class FailureExplainer(AGICoreModule):
             predicateProb,
             operator_prob,
             goalGap,], dim=-1)))
-        
+
         for block in self.blocks:
             h = h + block(h)
         h = self.state_norm(h)
@@ -649,7 +670,7 @@ class FailureExplainer(AGICoreModule):
         failure_query = self.failure_query(h)
         match_logits = failure_query @ self.failure_embedding.weight.t() / (float(self.hidden) ** 0.5)
         evidence_logits = self.PredicateEvidence(predicateProb)
-        
+
         return self.direct_head(h) + match_logits + evidence_logits + self.failure_bias.view(1, -1)
 
 
@@ -674,29 +695,39 @@ class TemporalSymbolicHead(AGICoreModule):
                 nn.SiLU(),
                 nn.Linear(2 * hidden, hidden),)
             for _ in range(2)])
-        
+
         self.state_norm = nn.LayerNorm(hidden)
 
         self.primitive_embedding = nn.Embedding(ModuleDim.TemporalPrimitiveCount, hidden)
-        
+
         self.primitive_query = nn.Sequential(
             nn.LayerNorm(hidden),
             nn.Linear(hidden, hidden),
             nn.SiLU(),
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),)
-        
+
         self.temporal_direct_head = nn.Sequential(
             nn.LayerNorm(hidden),
             nn.Linear(hidden, hidden // 2),
             nn.SiLU(),
             nn.Linear(hidden // 2, ModuleDim.TemporalPrimitiveCount),)
-        
+
         self.temporal_bias = nn.Parameter(torch.zeros(ModuleDim.TemporalPrimitiveCount))
-        self.reason_head = nn.Linear(hidden, ModuleDim.TemporalReasonDim)
-        self.continue_head = nn.Linear(hidden, 1)
-        self.interrupt_head = nn.Linear(hidden, 1)
-        self.redispatch_head = nn.Linear(hidden, 1)
+        nn.init.zeros_(self.primitive_query[-2].weight)
+        nn.init.zeros_(self.primitive_query[-2].bias)
+        nn.init.zeros_(self.temporal_direct_head[-1].weight)
+        nn.init.zeros_(self.temporal_direct_head[-1].bias)
+        self.reason_predicate_indices = tuple(PREDICATES.index(name) for name in (
+            "observation_needed",
+            "feedback_stale",
+            "goal_satisfied",
+            "timeout_risk",
+            "recovery_needed",
+            "redispatch_needed",
+            "safe_to_continue",
+            "collision_free",
+        ))
 
         p = {name: i for i, name in enumerate(PREDICATES)}
         primitive = {name: i for i, name in enumerate(ModuleDim.TemporalPrimitiveNames)}
@@ -751,7 +782,7 @@ class TemporalSymbolicHead(AGICoreModule):
             failure_prob,
             failureGate.unsqueeze(-1),
             goalGap,], dim=-1)))
-        
+
         for block in self.blocks:
             h = h + block(h)
         h = self.state_norm(h)
@@ -766,12 +797,12 @@ class TemporalSymbolicHead(AGICoreModule):
             - 0.5 * temporal_logits[:, self.cancel_idx]
             - 0.5 * temporal_logits[:, self.failsafe_idx]
             - 0.25 * temporal_logits[:, self.redispatch_idx])
-        
+
         interrupt_support = (
             0.5 * temporal_logits[:, self.cancel_idx]
             + 0.5 * temporal_logits[:, self.failsafe_idx]
             - 0.5 * temporal_logits[:, self.continue_idx])
-        
+
         redispatch_support = (
             temporal_logits[:, self.redispatch_idx]
             - 0.5 * temporal_logits[:, self.cancel_idx]
@@ -779,10 +810,10 @@ class TemporalSymbolicHead(AGICoreModule):
 
         return {
             "temporal_logits": temporal_logits,
-            "temporal_reason_logits": self.reason_head(h),
-            "continue_guard_score": torch.sigmoid(self.continue_head(h).squeeze(-1) + continue_support),
-            "interrupt_guard_score": torch.sigmoid(self.interrupt_head(h).squeeze(-1) + interrupt_support),
-            "redispatch_guard_score": torch.sigmoid(self.redispatch_head(h).squeeze(-1) + redispatch_support),}
+            "temporal_reason_logits": predicateProb[:, self.reason_predicate_indices],
+            "continue_guard_score": torch.sigmoid(continue_support),
+            "interrupt_guard_score": torch.sigmoid(interrupt_support),
+            "redispatch_guard_score": torch.sigmoid(redispatch_support),}
 
 
 class SymbolicFeatureMixer(AGICoreModule):
@@ -823,11 +854,11 @@ class SymbolicFeatureMixer(AGICoreModule):
             + 1
             + self.pose_dim
             + self.constraint_token_dim)
-        
+
         self.constraint_summary_query = nn.Parameter(torch.zeros(self.constraint_token_dim))
-        
+
         self.context_input_norm = nn.LayerNorm(context_dim)
-        
+
         self.context_input_proj = nn.Linear(context_dim, hidden)
 
         self.context_blocks = nn.ModuleList([
@@ -837,7 +868,7 @@ class SymbolicFeatureMixer(AGICoreModule):
                 nn.SiLU(),
                 nn.Linear(2 * hidden, hidden),)
             for _ in range(2)])
-        
+
         self.context_head = nn.Sequential(
             nn.LayerNorm(hidden),
             nn.Linear(hidden, self.plan_dim),
@@ -849,25 +880,25 @@ class SymbolicFeatureMixer(AGICoreModule):
             nn.SiLU(),
             nn.Linear(hidden, self.plan_dim),
             nn.Sigmoid(),)
-        
+
         self.plan_refiner = nn.Sequential(
             nn.LayerNorm(2 * self.plan_dim),
             nn.Linear(2 * self.plan_dim, hidden),
             nn.SiLU(),
             nn.Linear(hidden, self.plan_dim),
             nn.LayerNorm(self.plan_dim),)
-        
+
         self.plan_out_norm = nn.LayerNorm(self.plan_dim)
-        
+
         self.subgoal_refiner = nn.Sequential(
             nn.LayerNorm(self.plan_dim + self.subgoal_feature_dim),
             nn.Linear(self.plan_dim + self.subgoal_feature_dim, hidden),
             nn.SiLU(),
             nn.Linear(hidden, self.subgoal_feature_dim),
             nn.LayerNorm(self.subgoal_feature_dim),)
-        
+
         self.constraint_context = nn.Linear(2 * self.plan_dim, self.constraint_token_dim)
-        
+
         self.constraint_refiner = nn.Sequential(
             nn.LayerNorm(2 * self.constraint_token_dim),
             nn.Linear(2 * self.constraint_token_dim, hidden),
@@ -901,13 +932,13 @@ class SymbolicFeatureMixer(AGICoreModule):
             continueGuardScore,
             interruptGuardScore,
             redispatchGuardScore,], dim=-1)
-        
+
         constraint_summary_logits = torch.einsum("btd,d->bt", constraintTokens, self.constraint_summary_query)
         constraint_summary_weight = F.softmax(constraint_summary_logits, dim=-1)
         constraint_summary = (constraintTokens * constraint_summary_weight.unsqueeze(-1)).sum(dim=1)
-        
+
         ref_pose = referencedPose
-        
+
         context_input = torch.cat([
             planLatent,
             predicateProb,
@@ -920,30 +951,30 @@ class SymbolicFeatureMixer(AGICoreModule):
             failureGate.unsqueeze(-1),
             ref_pose,
             constraint_summary,], dim=-1)
-        
+
         h = self.context_input_proj(self.context_input_norm(context_input))
-        
+
         for block in self.context_blocks:
             h = h + block(h)
 
         context = self.context_head(h)
 
         context_gate = self.context_gate(context_input)
-        
+
         plan_delta = self.plan_refiner(torch.cat([planLatent, context], dim=-1))
         plan_latent = self.plan_out_norm(planLatent + context_gate * plan_delta)
-        
+
         subgoal_feature = self.subgoal_refiner(torch.cat([plan_latent, subgoalFeature], dim=-1))
-        
+
         token_context = self.constraint_context(torch.cat([plan_latent, context], dim=-1)).unsqueeze(1).expand(
             B,
             self.constraint_tokens,
             self.constraint_token_dim,)
-        
+
         constraint_tokens = self.constraint_refiner(torch.cat([
             constraintTokens,
             token_context,], dim=-1))
-        
+
         return {
             "plan_latent": plan_latent,
             "subgoal_feature": subgoal_feature,
@@ -976,9 +1007,9 @@ class NeuroSymbolicExtractor(AGICoreModule):
             decisionDim=decisionDim,
             endpointPoseFeatDim=self.endpoint_pose_feat_dim,
             poseDim=self.pose_dim,)
-        
+
         base_feature_dim = self.predicate_grounder.feature_dim + len(PREDICATES)
-        
+
         self.operator_library = OperatorLibrary()
 
         self.plan_ranker = PlanRanker(base_feature_dim, planDim=self.plan_dim)
@@ -988,7 +1019,7 @@ class NeuroSymbolicExtractor(AGICoreModule):
             nn.Linear(base_feature_dim, 256),
             nn.SiLU(),
             nn.Linear(256, len(PREDICATES)),)
-        
+
         self.failure_explainer = FailureExplainer(base_feature_dim)
 
         self.failure_gate_head = nn.Sequential(
@@ -996,13 +1027,13 @@ class NeuroSymbolicExtractor(AGICoreModule):
             nn.Linear(base_feature_dim + ModuleDim.TemporalContextDim + len(FAILURE_CAUSES), 256),
             nn.SiLU(),
             nn.Linear(256, 1),)
-        
+
         self.temporal_predicate_head = nn.Sequential(
             nn.LayerNorm(ModuleDim.TemporalContextDim),
             nn.Linear(ModuleDim.TemporalContextDim, 128),
             nn.SiLU(),
             nn.Linear(128, len(TEMPORAL_PREDICATES)),)
-        
+
         self.temporal_symbolic_head = TemporalSymbolicHead(base_feature_dim + ModuleDim.TemporalContextDim)
 
         self.invoke_head = nn.Sequential(
@@ -1010,22 +1041,22 @@ class NeuroSymbolicExtractor(AGICoreModule):
             nn.Linear(6, 32),
             nn.SiLU(),
             nn.Linear(32, 1),)
-        
+
         sampler_in = self.plan_dim + self.pose_dim + self.endpoint_pose_feat_dim
-        
+
         self.subgoal_feature_head = nn.Sequential(
             nn.LayerNorm(sampler_in),
             nn.Linear(sampler_in, 256),
             nn.SiLU(),
             nn.Linear(256, self.endpoint_pose_feat_dim),
             nn.LayerNorm(self.endpoint_pose_feat_dim),)
-        
+
         self.constraint_head = nn.Sequential(
             nn.LayerNorm(self.plan_dim + len(PREDICATES) + len(OPERATORS)),
             nn.Linear(self.plan_dim + len(PREDICATES) + len(OPERATORS), 512),
             nn.SiLU(),
             nn.Linear(512, self.constraint_tokens * self.constraint_token_dim),)
-        
+
         self.symbolic_mixer = SymbolicFeatureMixer(
             planDim=self.plan_dim,
             subgoalFeatureDim=self.endpoint_pose_feat_dim,
@@ -1123,7 +1154,7 @@ class NeuroSymbolicExtractor(AGICoreModule):
                 effect_score=effectScore[b, op_id],
                 sampler_latent=planLatent[b],
                 explanation=[op_name],))
-            
+
         return steps
 
     def BuildOperatorRationales(
@@ -1154,25 +1185,25 @@ class NeuroSymbolicExtractor(AGICoreModule):
                 PREDICATES[int(i.item())]
                 for i in precond_idx
                 if float(pred_prob_b[i].detach().item()) >= 0.5]
-            
+
             weak_preconditions = [
                 PREDICATES[int(i.item())]
                 for i in precond_idx
                 if float(pred_prob_b[i].detach().item()) < 0.5]
             expected_effects = [PREDICATES[int(i.item())] for i in effect_idx]
-            
+
             missing_goal_predicates = self.NamesAbove(
                 goalGap[b],
                 PREDICATES,
                 threshold=0.20,
                 maxItems=4)
-            
+
             risk_causes = self.NamesAbove(
                 risk_prob[b],
                 FAILURE_CAUSES,
                 threshold=0.50,
                 maxItems=3)
-            
+
             temporal_reasons = self.TopNames(
                 temporal_prob[b],
                 ModuleDim.TemporalPrimitiveNames,
@@ -1208,6 +1239,7 @@ class NeuroSymbolicExtractor(AGICoreModule):
     def forward(
         self,
         pst: Dict[str, torch.Tensor],
+        observedPst: Dict[str, torch.Tensor],
         goalEmbed: torch.Tensor,
         worldBelief: torch.Tensor,
         decisionBelief: torch.Tensor,
@@ -1229,9 +1261,10 @@ class NeuroSymbolicExtractor(AGICoreModule):
             intentNovelty,
             satisfactionProb.view(-1),
             noSlotProb,], dim=-1)
-        
+
         grounded = self.predicate_grounder(
             pst=pst,
+            observedPst=observedPst,
             goalEmbed=goalEmbed,
             worldBelief=worldBelief,
             decisionBelief=decisionBelief,
@@ -1244,52 +1277,52 @@ class NeuroSymbolicExtractor(AGICoreModule):
             satisfactionProb=satisfactionProb,
             referenceConfidence=referenceConfidence,
             noSlotProb=noSlotProb,)
-        
+
         predicate_logits = grounded["predicate_logits"]
-        
+
         temporal_predicate_logits = self.temporal_predicate_head(temporalContextFeat)
-        
+
         temporal_start = len(PREDICATES) - len(TEMPORAL_PREDICATES)
-        
+
         predicate_logits = torch.cat([
             predicate_logits[:, :temporal_start],
             predicate_logits[:, temporal_start:] + temporal_predicate_logits,], dim=-1)
-        
+
         predicate_prob = torch.sigmoid(predicate_logits)
-        
+
         ranker_in = torch.cat([grounded["features"], predicate_prob], dim=-1)
         ranked = self.plan_ranker(ranker_in, temporalContextFeat)
-        
+
         goal_predicate_need = torch.sigmoid(self.goal_predicate_head(ranker_in))
         operator_scores = self.operator_library.Scores(predicate_prob, goal_predicate_need)
         operator_logits = ranked["operator_logits"] + operator_scores["symbolic_score"]
         plan_latent = self.plan_ranker.RefinePlan(ranked["plan_seed"], operator_logits)
         subgoal_feature = self.BuildSubgoalFeature(plan_latent, grounded["referenced_pose"], endpointPoseFeat)
         operator_prob = F.softmax(operator_logits, dim=-1)
-        
+
         constraint_tokens = self.constraint_head(torch.cat([
             plan_latent,
             predicate_prob,
             operator_prob,], dim=-1)).view(plan_latent.size(0), self.constraint_tokens, self.constraint_token_dim)
-        
+
         risk_cause_raw_logits = self.failure_explainer(
             ranker_in,
             temporalContextFeat,
             predicate_prob,
             operator_logits,
             operator_scores["goal_gap"],)
-        
+
         failure_gate_logits = self.failure_gate_head(torch.cat([
             ranker_in,
             temporalContextFeat,
             torch.sigmoid(risk_cause_raw_logits),], dim=-1)).squeeze(-1)
-        
+
         failure_gate = torch.sigmoid(failure_gate_logits)
-        
+
         risk_cause_logits = risk_cause_raw_logits + failure_gate_logits.unsqueeze(-1)
-        
+
         invoke_mask = torch.sigmoid(self.invoke_head(scalar)).squeeze(-1)
-        
+
         temporal_out = self.temporal_symbolic_head(
             torch.cat([ranker_in, temporalContextFeat], dim=-1),
             predicate_prob,
@@ -1297,7 +1330,7 @@ class NeuroSymbolicExtractor(AGICoreModule):
             risk_cause_logits,
             failure_gate,
             operator_scores["goal_gap"],)
-        
+
         mixed = self.symbolic_mixer(
             plan_latent,
             predicate_prob,
@@ -1313,7 +1346,7 @@ class NeuroSymbolicExtractor(AGICoreModule):
             subgoal_feature,
             constraint_tokens,
             grounded["referenced_pose"],)
-        
+
         plan_latent = mixed["plan_latent"]
         subgoal_feature = mixed["subgoal_feature"]
         constraint_tokens = mixed["constraint_tokens"]
@@ -1415,14 +1448,18 @@ class TestNeuroSymbolicMTool:
             "MphysRaw": mask.clone(),
             "Observed": torch.ones(B, K, device=self.device, dtype=torch.bool),
             "LastSeen": torch.arange(K, device=self.device, dtype=torch.float32).unsqueeze(0).expand(B, -1),
-            "M": mask.clone(),
-            "SRaw": torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
-            "P": pose,}
+            "Step": torch.full((B,), K, device=self.device, dtype=torch.long),
+            "SlotPresence": mask.clone(),
+            "ObservedSlotMask": mask.clone(),
+            "SlotState": torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
+            "PoseCamera": pose,
+            "PoseWorld": pose,}
 
     def MakeExtractorInputs(self, B: int = 2, K: int = 4) -> Dict[str, torch.Tensor]:
         referenced = F.softmax(torch.randn(B, K, device=self.device), dim=-1)
         return {
             "pst": self.MakePst(B=B, K=K),
+            "observedPst": self.MakePst(B=B, K=K),
             "goalEmbed": torch.randn(B, ModuleDim.GoalShortDim, device=self.device),
             "worldBelief": torch.randn(
                 B,
@@ -1447,6 +1484,7 @@ class TestNeuroSymbolicMTool:
             inputs = self.MakeExtractorInputs(B=B, K=K)
             out = model(
                 pst=inputs["pst"],
+                observedPst=inputs["observedPst"],
                 goalEmbed=inputs["goalEmbed"],
                 worldBelief=inputs["worldBelief"],
                 decisionBelief=inputs["decisionBelief"],
@@ -1463,6 +1501,7 @@ class TestNeuroSymbolicMTool:
             assert tuple(out["predicate_logits"].shape) == (B, len(PREDICATES))
             assert tuple(out["predicate_prob"].shape) == (B, len(PREDICATES))
             assert tuple(out["referenced_pose"].shape) == (B, ModuleDim.PstPoseDim)
+            assert tuple(out["memory_reference_scale"].shape) == (B,)
             assert tuple(out["reference_slot_idx"].shape) == (B,)
             assert tuple(out["slot_summary"].shape) == (B, ModuleDim.PstSlotDim)
             for name, value in out.items():

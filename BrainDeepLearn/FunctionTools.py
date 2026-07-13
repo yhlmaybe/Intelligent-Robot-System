@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Callable, Tuple
+import math
+from typing import Any, Dict, List, Optional, Callable, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +12,74 @@ def GetParametersScale(like: Optional[torch.Tensor] = None):
     if like is None:
         return val
     return torch.as_tensor(val, device=like.device, dtype=like.dtype)
+
+
+@dataclass
+class ReferenceWeights:
+    memory_recency: torch.Tensor
+    observed_weight: torch.Tensor
+    memory_weight: torch.Tensor
+    slot_weight: torch.Tensor
+
+
+def BuildReferenceWeights(
+    physicalState: Dict[str, torch.Tensor],
+    currentStep: torch.Tensor,
+    *,
+    memoryScale,
+    memoryDecayHorizon: float,) -> ReferenceWeights:
+    m_phys = physicalState["MphysRaw"]
+    observed = physicalState["Observed"].float() # [B, K_world]
+    memory_age = (currentStep - physicalState["LastSeen"].float()).clamp_min(0.0)
+    memory_recency = torch.exp(-memory_age / float(memoryDecayHorizon))
+    observed_weight = m_phys * observed
+
+    memory_weight = (
+        memoryScale
+        * m_phys
+        * physicalState["SlotPresence"]
+        * (1.0 - observed)
+        * memory_recency)
+
+    return ReferenceWeights(
+        memory_recency=memory_recency,
+        observed_weight=observed_weight,
+        memory_weight=memory_weight,
+        slot_weight=observed_weight + memory_weight)
+
+
+def BuildReferenceScaleContext(
+    observedPst: Dict[str, torch.Tensor],
+    demandQuery: torch.Tensor) -> torch.Tensor:
+    observed_strength = observedPst["ObservedSlotMask"] * observedPst["MphysRaw"]
+
+    demand = F.normalize(demandQuery, dim=-1, eps=1e-6) # [B, D]
+    slot = F.normalize(observedPst["SlotState"], dim=-1, eps=1e-6) # [B, K_obs, D]
+
+    demand_match = torch.einsum("bkd,bd->bk", slot, demand).add(1.0).mul(0.5)
+    matched_strength = observed_strength * demand_match
+    unmatched_strength = observed_strength * (1.0 - demand_match)
+
+    top_match = torch.topk(matched_strength, k=2, dim=1).values
+
+    observed_total = observed_strength.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+    best_match = top_match[:, :1]
+    second_match = top_match[:, 1:2]
+
+    mean_match = matched_strength.sum(dim=1, keepdim=True) / observed_total
+    ambiguity = second_match / best_match.clamp_min(1e-6)
+    unresolved = unmatched_strength.sum(dim=1, keepdim=True) / observed_total
+
+    return torch.cat([
+        observed_strength.mean(dim=1, keepdim=True),
+        observed_strength.amax(dim=1, keepdim=True),
+        best_match,
+        mean_match,
+        1.0 - best_match,
+        1.0 - observed_strength.amax(dim=1, keepdim=True),
+        ambiguity,
+        unresolved], dim=-1)
 
 
 class GrowableLoRALinear(nn.Module):
@@ -24,6 +93,74 @@ class GrowableLoRALinear(nn.Module):
         self.A_list = nn.ParameterList()
         self.B_list = nn.ParameterList()
         self.alpha = nn.ParameterList()
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,):
+        def saved_indices(name: str):
+            key_prefix = f"{prefix}{name}."
+            return {
+                int(key[len(key_prefix):])
+                for key in state_dict
+                if key.startswith(key_prefix) and key[len(key_prefix):].isdigit()}
+
+        a_indices = saved_indices("A_list")
+        b_indices = saved_indices("B_list")
+        s_indices = saved_indices("alpha")
+        if a_indices or b_indices or s_indices:
+            expected = set(range(len(a_indices)))
+            if a_indices != expected or b_indices != expected or s_indices != expected:
+                error_msgs.append(
+                    f"{prefix[:-1]} has inconsistent dynamic LoRA topology: "
+                    f"A={sorted(a_indices)}, B={sorted(b_indices)}, alpha={sorted(s_indices)}")
+            else:
+                saved_shapes = []
+                for index in sorted(expected):
+                    a_value = state_dict[f"{prefix}A_list.{index}"]
+                    b_value = state_dict[f"{prefix}B_list.{index}"]
+                    s_value = state_dict[f"{prefix}alpha.{index}"]
+                    rank = int(a_value.size(0)) if a_value.dim() == 2 else -1
+                    valid = (
+                        tuple(a_value.shape) == (rank, self.in_f)
+                        and tuple(b_value.shape) == (self.out_f, rank)
+                        and s_value.numel() == 1)
+                    if not valid:
+                        error_msgs.append(
+                            f"{prefix[:-1]} dynamic LoRA entry {index} has invalid shapes: "
+                            f"A={tuple(a_value.shape)}, B={tuple(b_value.shape)}, "
+                            f"alpha={tuple(s_value.shape)}")
+                        saved_shapes = []
+                        break
+                    saved_shapes.append((rank, tuple(s_value.shape)))
+
+                current_shapes = [
+                    (int(a_value.size(0)), tuple(s_value.shape))
+                    for a_value, s_value in zip(self.A_list, self.alpha)]
+                if saved_shapes and current_shapes != saved_shapes:
+                    self.A_list = nn.ParameterList()
+                    self.B_list = nn.ParameterList()
+                    self.alpha = nn.ParameterList()
+                    for rank, scale_shape in saved_shapes:
+                        scale = torch.zeros(
+                            scale_shape,
+                            device=self.target.weight.device,
+                            dtype=self.target.weight.dtype)
+                        self.Grow(rank, init={"scale": scale}, freezeOld=True)
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs)
 
     @torch.no_grad()
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
@@ -63,6 +200,40 @@ class GrowableLoRALinear(nn.Module):
         if delta is not None:
             W = W + delta
         return F.linear(x, W, self.target.bias)
+
+
+@torch.no_grad()
+def SynchronizeGrowableLoRATopologyForFullLoad(
+    root: nn.Module,
+    stateDict: Dict[str, Any],
+    ) -> int:
+    """Make an explicit full-state load authoritative over empty LoRA topology.
+
+    Generic ``load_state_dict(strict=False)`` remains suitable for partial updates and does
+    not remove omitted adapters. Full checkpoint/parameter loaders call this helper first;
+    when a layer's durable target weight is present but no committed LoRA entries are, the
+    incoming state explicitly represents an empty committed topology.
+    """
+    cleared = 0
+    for module_name, module in root.named_modules():
+        if not isinstance(module, GrowableLoRALinear):
+            continue
+        prefix = f"{module_name}." if module_name else ""
+        if f"{prefix}target.weight" not in stateDict:
+            continue
+        dynamic_prefixes = (
+            f"{prefix}A_list.",
+            f"{prefix}B_list.",
+            f"{prefix}alpha.")
+        if any(str(key).startswith(dynamic_prefixes) for key in stateDict):
+            continue
+        if not (module.A_list or module.B_list or module.alpha):
+            continue
+        cleared += len(module.A_list)
+        module.A_list = nn.ParameterList()
+        module.B_list = nn.ParameterList()
+        module.alpha = nn.ParameterList()
+    return cleared
 
 
 @dataclass
@@ -250,6 +421,13 @@ class RoPEMultiheadAttention(AGICoreModule):
         return out, weights
 
 
+def _RestoreOnlineWrapperTrainabilityAfterLoad(
+    module: nn.Module,
+    incompatibleKeys: Any,) -> None:
+    del incompatibleKeys
+    module.RestoreBaseTrainabilityAfterCommit()
+
+
 class BaseOnlineWrapper(nn.Module):
     def __init__(
         self,
@@ -279,6 +457,38 @@ class BaseOnlineWrapper(nn.Module):
         self.InitCandidates(initRankEach)
 
         self.freezeOldPar = True
+        # Dynamic committed LoRA parameters are materialized while state_dict is loading.
+        # They therefore do not inherit the base's pre-load requires_grad flags. Re-apply the
+        # wrapper contract after all descendants have loaded, including when this wrapper is a
+        # child of a larger BrainCore load rather than the direct load_state_dict target.
+        self.register_load_state_dict_post_hook(
+            _RestoreOnlineWrapperTrainabilityAfterLoad)
+
+    def _apply(self, fn, recurse: bool = True):
+        # Candidates are deliberately unregistered/ephemeral, so nn.Module._apply cannot move
+        # them. Keep their identity (and therefore optimizer references) while moving data.
+        super()._apply(fn, recurse=recurse)
+        for parameter in self.CandParameters():
+            with torch.no_grad():
+                parameter.data = fn(parameter.data)
+                if parameter.grad is not None:
+                    parameter.grad.data = fn(parameter.grad.data)
+        return self
+
+    def zero_grad(self, set_to_none: bool = True):
+        super().zero_grad(set_to_none=set_to_none)
+        for name in self.sites:
+            for layerIdx in range(self.layerCount):
+                slot = self.cand[name][layerIdx]
+                for parameter_list in (slot["A"], slot["B"], slot["s"]):
+                    for parameter in parameter_list:
+                        if parameter.grad is None:
+                            continue
+                        if set_to_none:
+                            parameter.grad = None
+                        else:
+                            parameter.grad.detach_()
+                            parameter.grad.zero_()
 
     @property
     def deviceRef(self):
@@ -411,6 +621,12 @@ class BaseOnlineWrapper(nn.Module):
     
     def SetFreezeOldPar(self, isfreezeOld: bool):
         self.freezeOldPar = isfreezeOld
+
+    def RestoreBaseTrainabilityAfterCommit(self) -> None:
+        if not self.freezeOldPar:
+            return
+        for parameter in self.base.parameters():
+            parameter.requires_grad_(False)
 
     def EmptyLayerSlot(self):
         return {"A": nn.ParameterList(), "B": nn.ParameterList(), "s": nn.ParameterList()}
@@ -581,9 +797,13 @@ class BaseOnlineWrapper(nn.Module):
                     U, S, Vh = torch.linalg.svd(delta, full_matrices=False)
                     r = int(rTarget)
                     if r <= 0:
-                        for sParam in self.cand[name][layerIdx]["s"]:
-                            if isinstance(sParam, nn.Parameter):
-                                sParam.data.zero_()
+                        slot = self.cand[name][layerIdx]
+                        slot["A"] = nn.ParameterList()
+                        slot["B"] = nn.ParameterList()
+                        slot["s"] = nn.ParameterList()
+                        if self.gradEmaBuf is not None:
+                            self.gradEmaBuf[name][layerIdx]["A"] = []
+                            self.gradEmaBuf[name][layerIdx]["B"] = []
                     else:
                         s_set = torch.tensor(1.0, device=self.deviceRef, dtype=self.dtypeRef)
                         c = torch.tanh(s_set) * float(GetParametersScale(s_set))
@@ -647,12 +867,16 @@ class BaseOnlineWrapper(nn.Module):
                         committed_rank += int(aParam.size(0))
                         committed_triples += 1
 
+        self.RestoreBaseTrainabilityAfterCommit()
+
         return {
             "committed_rank": float(committed_rank),
             "committed_triples": float(committed_triples),}
 
 
-def _HungarianRowsToCols(costRows: List[List[float]]) -> List[int]:
+def HungarianRowsToCols(costRows: List[List[float]]) -> List[int]:
+    if any(not math.isfinite(float(value)) for row in costRows for value in row):
+        raise ValueError("HungarianRowsToCols requires finite costs")
     n = len(costRows)
     m = len(costRows[0])
     u = [0.0] * (n + 1)
@@ -702,16 +926,224 @@ def _HungarianRowsToCols(costRows: List[List[float]]) -> List[int]:
 
 
 def HungarianAssignment(cost: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Jonker-Volgenant rectangular assignment. Returns (row_idx, col_idx) on cost's device.
-    Transposes when rows > cols so the underlying solver always sees rows <= cols."""
+    if not bool(torch.isfinite(cost).all().item()):
+        raise ValueError("HungarianAssignment requires finite costs")
     cost_cpu = cost.detach().float().cpu()
     rows, cols = int(cost_cpu.size(0)), int(cost_cpu.size(1))
     if rows <= cols:
-        assignment = _HungarianRowsToCols(cost_cpu.tolist())
+        assignment = HungarianRowsToCols(cost_cpu.tolist())
         return (
             torch.arange(rows, device=cost.device, dtype=torch.long),
             torch.tensor(assignment, device=cost.device, dtype=torch.long))
-    assignment = _HungarianRowsToCols(cost_cpu.t().tolist())
+    assignment = HungarianRowsToCols(cost_cpu.t().tolist())
     return (
         torch.tensor(assignment, device=cost.device, dtype=torch.long),
         torch.arange(cols, device=cost.device, dtype=torch.long))
+
+
+class _TestOnlineBase(AGICoreModule):
+    def __init__(self):
+        super().__init__()
+        self.adapter = GrowableLoRALinear(nn.Linear(3, 2, bias=True))
+
+
+class _TestOnlineWrapper(BaseOnlineWrapper):
+    def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
+        def alloc(rank: int, device: torch.device, dtype: torch.dtype):
+            return (
+                nn.Parameter(torch.randn(rank, 3, device=device, dtype=dtype) * 0.1),
+                nn.Parameter(torch.randn(2, rank, device=device, dtype=dtype) * 0.1),
+                nn.Parameter(torch.tensor(0.3, device=device, dtype=dtype)))
+
+        def compose(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor):
+            return torch.tanh(s) * GetParametersScale(s) * (b @ a)
+
+        return {"adapter": SiteSpec("adapter", 1, 3, 2, 4, alloc, compose)}
+
+    def ForwardWithDeltas(
+        self,
+        x,
+        keyPaddingMask=None,
+        tdError=None,
+        uncertainty=None,
+        deltasPerLayer=None,
+        **kwargs,):
+        adapter = self.base.adapter
+        weight = adapter.target.weight
+        committed = adapter.DeltaWeight()
+        if committed is not None:
+            weight = weight + committed
+        candidate = deltasPerLayer[0]["adapter"]
+        if candidate is not None:
+            weight = weight + candidate
+        return F.linear(x, weight, adapter.target.bias)
+
+    @torch.no_grad()
+    def CommitOne(self, site, layerIdx, a, b, scale):
+        if site != "adapter" or layerIdx != 0:
+            return False
+        self.base.adapter.Grow(
+            int(a.size(0)),
+            init={"A": a, "B": b, "scale": scale},
+            freezeOld=self.freezeOldPar)
+        return True
+
+
+class TestFunctionToolsMTool:
+    def TestFullStateLoadClearsAbsentCommittedTopology(self) -> bool:
+        try:
+            torch.manual_seed(19)
+            source = _TestOnlineBase()
+            saved = source.state_dict()
+
+            restored = _TestOnlineBase()
+            restored.adapter.Grow(1)
+            assert len(restored.adapter.A_list) == 1
+            SynchronizeGrowableLoRATopologyForFullLoad(restored, saved)
+            restored.load_state_dict(saved, strict=True)
+
+            x = torch.randn(4, 3)
+            assert len(restored.adapter.A_list) == 0
+            assert len(restored.adapter.B_list) == 0
+            assert len(restored.adapter.alpha) == 0
+            assert torch.equal(restored.adapter(x), source.adapter(x))
+            print("Full state load clears absent committed LoRA topology test passed.")
+            return True
+        except Exception as e:
+            print(
+                "Full state load clears absent committed LoRA topology test failed: "
+                f"{type(e).__name__}: {e}")
+            return False
+
+    def TestOnlineWrapperStrictLoadRestoresBaseTrainability(self) -> bool:
+        try:
+            torch.manual_seed(13)
+            source = _TestOnlineWrapper(_TestOnlineBase(), initRankEach=1)
+            commit = source.Update("commit")
+            assert commit["commit_stats"]["committed_triples"] == 1.0
+            source_parent = nn.Module()
+            source_parent.wrapper = source
+            saved = source_parent.state_dict()
+
+            restored = _TestOnlineWrapper(_TestOnlineBase(), initRankEach=0)
+            restored_parent = nn.Module()
+            restored_parent.wrapper = restored
+            restored_parent.load_state_dict(saved, strict=True)
+            committed = list(restored.base.adapter.A_list)
+            assert committed, "committed LoRA topology was not restored"
+            assert not any(
+                parameter.requires_grad
+                for parameter in restored.base.parameters()), (
+                "strict load reactivated durable parameters in a frozen online base")
+            print("Online wrapper strict-load trainability test passed.")
+            return True
+        except Exception as e:
+            print(
+                "Online wrapper strict-load trainability test failed: "
+                f"{type(e).__name__}: {e}")
+            return False
+
+    def TestOnlineWrapperZeroGradIncludesCandidates(self) -> bool:
+        try:
+            wrapper = _TestOnlineWrapper(_TestOnlineBase(), initRankEach=1)
+            candidate = list(wrapper.CandParameters())
+            for parameter in candidate:
+                parameter.grad = torch.ones_like(parameter)
+            wrapper.zero_grad(set_to_none=True)
+            assert all(parameter.grad is None for parameter in candidate)
+
+            for parameter in candidate:
+                parameter.grad = torch.ones_like(parameter)
+            wrapper.zero_grad(set_to_none=False)
+            assert all(
+                parameter.grad is not None and int(torch.count_nonzero(parameter.grad).item()) == 0
+                for parameter in candidate)
+            print("Online wrapper candidate zero-grad test passed.")
+            return True
+        except Exception as e:
+            print(f"Online wrapper candidate zero-grad test failed: {type(e).__name__}: {e}")
+            return False
+
+    def TestOnlineWrapperRankZeroSurvivesNextOptimizerStep(self) -> bool:
+        try:
+            torch.manual_seed(11)
+            wrapper = _TestOnlineWrapper(_TestOnlineBase(), initRankEach=1)
+            optimizer = torch.optim.Adam(list(wrapper.CandParameters()), lr=0.05)
+
+            first_loss = wrapper(torch.randn(4, 3)).square().mean()
+            first_loss.backward()
+            optimizer.step()
+
+            wrapper.zero_grad(set_to_none=True)
+            slot = wrapper.cand["adapter"][0]
+            slot["s"][0].grad = torch.ones_like(slot["s"][0])
+            wrapper.Update("accumulategrads")
+            wrapper.Update("autogrow")
+
+            assert len(slot["A"]) == 0 and len(slot["B"]) == 0 and len(slot["s"]) == 0
+            assert wrapper.gradEmaBuf["adapter"][0]["A"] == []
+            assert wrapper.gradEmaBuf["adapter"][0]["B"] == []
+
+            optimizer.step()
+            assert wrapper.CurrentRanks()["sum"]["adapter"] == 0
+            assert wrapper.ComposeLayerDelta(0)["adapter"] is None
+            print("Online wrapper rank-zero optimizer-step test passed.")
+            return True
+        except Exception as e:
+            print(f"Online wrapper rank-zero optimizer-step test failed: {type(e).__name__}: {e}")
+            return False
+
+    def TestGrowableLoRACommitSaveStrictLoad(self) -> bool:
+        try:
+            torch.manual_seed(7)
+            source_base = _TestOnlineBase()
+            source_wrapper = _TestOnlineWrapper(source_base, initRankEach=2)
+            first_commit = source_wrapper.Update("commit")["commit_stats"]
+            source_wrapper.Update("grow", addEach=1)
+            second_commit = source_wrapper.Update("commit")["commit_stats"]
+            assert first_commit["committed_rank"] == 2.0
+            assert second_commit["committed_rank"] == 1.0
+
+            sample = torch.randn(5, 3)
+            expected = source_base.adapter(sample).detach()
+            saved = source_base.state_dict()
+
+            restored_base = _TestOnlineBase()
+            restored_base.load_state_dict(saved, strict=True)
+            actual = restored_base.adapter(sample).detach()
+
+            assert len(restored_base.adapter.A_list) == 2
+            assert [int(value.size(0)) for value in restored_base.adapter.A_list] == [2, 1]
+            assert torch.allclose(actual, expected, atol=1e-7, rtol=1e-6)
+            print("GrowableLoRA commit/save/strict-load test passed.")
+            return True
+        except Exception as e:
+            print(f"GrowableLoRA commit/save/strict-load test failed: {type(e).__name__}: {e}")
+            return False
+
+    def TestHungarianRejectsNonFiniteCost(self) -> bool:
+        try:
+            for value in (float("nan"), float("inf"), -float("inf")):
+                cost = torch.tensor([[value, value], [0.0, 1.0]])
+                try:
+                    HungarianAssignment(cost)
+                except ValueError:
+                    continue
+                raise AssertionError(f"HungarianAssignment accepted non-finite cost {value}")
+            print("Hungarian non-finite validation test passed.")
+            return True
+        except Exception as e:
+            print(f"Hungarian non-finite validation test failed: {type(e).__name__}: {e}")
+            return False
+
+    def RunAll(self) -> Dict[str, bool]:
+        results = {
+            "FullStateLoadClearsAbsentCommittedTopology": self.TestFullStateLoadClearsAbsentCommittedTopology(),
+            "GrowableLoRACommitSaveStrictLoad": self.TestGrowableLoRACommitSaveStrictLoad(),
+            "OnlineWrapperStrictLoadRestoresBaseTrainability": self.TestOnlineWrapperStrictLoadRestoresBaseTrainability(),
+            "OnlineWrapperZeroGradIncludesCandidates": self.TestOnlineWrapperZeroGradIncludesCandidates(),
+            "OnlineWrapperRankZeroSurvivesNextOptimizerStep": self.TestOnlineWrapperRankZeroSurvivesNextOptimizerStep(),
+            "HungarianRejectsNonFiniteCost": self.TestHungarianRejectsNonFiniteCost(),}
+        passed = sum(1 for value in results.values() if value)
+        print(f"\n[FunctionTools Tests] {passed}/{len(results)} passed.")
+        return results

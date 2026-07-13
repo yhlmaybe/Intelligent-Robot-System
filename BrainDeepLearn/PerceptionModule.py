@@ -896,7 +896,7 @@ class PerceiveExtractor(AGICoreModule):
         baseChannels: int = 64,
         dropout: float = 0.1,
         posDrop: float = 0.1,
-        objectTokenCount: int = 256,
+        objectTokenCount: int = ModuleDim.PstObservedSlots,
         enableRecallAuxiliary: bool = False,
         recallKwargs: Optional[Dict[str, Any]] = None):
         super().__init__()
@@ -1155,7 +1155,8 @@ class PerceiveExtractor(AGICoreModule):
 
     @staticmethod
     def MaskedMean(value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        return (value * weight).sum() / weight.sum().clamp_min(1.0)
+        safe_value = torch.where(weight > 0.0, value, torch.zeros_like(value))
+        return (safe_value * weight).sum() / weight.sum().clamp_min(1.0)
 
     def ComputeDepthGeometryLoss(
         self,
@@ -1163,7 +1164,8 @@ class PerceiveExtractor(AGICoreModule):
         depthTarget: torch.Tensor,
         depthTargetValid: torch.Tensor,
         prevVisualState: Optional[VisualState] = None,
-        cameraMotion: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        cameraMotion: Optional[torch.Tensor] = None,
+        prevVisualValid: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         target_inverse, target_weight = self.depth_fusion.ResampleSensorDepth(
             depthTarget,
             depthTargetValid,
@@ -1223,6 +1225,12 @@ class PerceiveExtractor(AGICoreModule):
             expected_prev, sampled_prev, warp_valid = self.depth_fusion.WarpPrevDepth(
                 cur_depth, prev_depth, camera_intrinsics,
                 (self.img_size, self.img_size), cameraMotion)
+            if prevVisualValid is not None:
+                temporal_valid = prevVisualValid.to(
+                    device=warp_valid.device,
+                    dtype=torch.bool).view(-1, 1, 1, 1)
+                warp_valid = torch.where(
+                    temporal_valid, warp_valid, torch.zeros_like(warp_valid))
             residual = (expected_prev.clamp_min(1e-6).log() - sampled_prev.clamp_min(1e-6).log()).abs()
             cur_gx, cur_gy = self.depth_fusion.SpatialGradient(cur_depth.clamp_min(1e-6).log())
             reliability = (-(cur_gx.abs() + cur_gy.abs()) * 5.0).exp()
@@ -1441,7 +1449,8 @@ class PerceiveExtractor(AGICoreModule):
         patchWidth: int,
         topDownContext: TopDownContext,
         prevVisualState: Optional[VisualState],
-        cameraMotion: Optional[torch.Tensor],) -> VisualState:
+        cameraMotion: Optional[torch.Tensor],
+        prevVisualValid: Optional[torch.Tensor] = None,) -> VisualState:
         x = self.encoder_norm(tokens)
         cls_rep = x[:, 0, :]
         mlp_out = self.mlp(cls_rep)
@@ -1458,6 +1467,7 @@ class PerceiveExtractor(AGICoreModule):
 
         predicted = topDownContext.PredictedVisual
         if predicted is not None:
+            precision_streams = precision_streams * predicted["PriorConfidence"].detach().view(-1, 1)
             integrated_err = (preliminary_integrated - predicted["IntegratedFeat"].detach()) * precision_streams[:, 0:1]
             corrected_integrated = preliminary_integrated - torch.sigmoid(self.correction_gain) * self.error_to_state(integrated_err)
         else:
@@ -1476,6 +1486,11 @@ class PerceiveExtractor(AGICoreModule):
         ventral_feat = self.ventral_proj(shared)
 
         if prevVisualState is not None:
+            previous_valid = (
+                torch.ones(patch_tokens.size(0), device=patch_tokens.device, dtype=torch.bool)
+                if prevVisualValid is None
+                else prevVisualValid.to(device=patch_tokens.device, dtype=torch.bool).view(-1))
+            previous_mask = previous_valid.view(-1, 1, 1)
             if cameraMotion is not None:
                 camera_motion_from_prev = cameraMotion
                 warped_prev_tokens, warp_valid, warp_depth_residual = self.WarpPrevPatchTokens(
@@ -1493,6 +1508,22 @@ class PerceiveExtractor(AGICoreModule):
                 warped_prev_tokens = prevVisualState.PatchTokens.detach()
                 warp_valid = patch_tokens.new_zeros(patch_tokens.size(0), patch_tokens.size(1), 1)
                 warp_depth_residual = patch_tokens.new_zeros(patch_tokens.size(0), patch_tokens.size(1), 1)
+            warped_prev_tokens = torch.where(
+                previous_mask,
+                warped_prev_tokens,
+                patch_tokens.detach())
+            warp_valid = torch.where(
+                previous_mask, warp_valid, torch.zeros_like(warp_valid))
+            warp_depth_residual = torch.where(
+                previous_mask,
+                warp_depth_residual,
+                torch.zeros_like(warp_depth_residual))
+            identity_motion = camera_motion_from_prev.new_zeros(camera_motion_from_prev.shape)
+            identity_motion[:, 6] = 1.0
+            camera_motion_from_prev = torch.where(
+                previous_valid.view(-1, 1),
+                camera_motion_from_prev,
+                identity_motion)
             patch_motion = patch_tokens - warped_prev_tokens
         else:
             camera_motion_from_prev = patch_tokens.new_zeros(patch_tokens.size(0), ModuleDim.PstPoseDim)
@@ -1513,7 +1544,10 @@ class PerceiveExtractor(AGICoreModule):
         motion_token = self.motion_proj(torch.cat([magno_summary, dorsal_feat], dim=-1))
 
         if prevVisualState is not None:
-            h_prev = prevVisualState.Auxiliary["TemporalState"]
+            h_prev = torch.where(
+                previous_valid.view(-1, 1),
+                prevVisualState.Auxiliary["TemporalState"],
+                torch.zeros_like(prevVisualState.Auxiliary["TemporalState"]))
         else:
             h_prev = corrected_integrated.new_zeros(corrected_integrated.shape)
         h_next = self.temporal_state(corrected_integrated, h_prev.detach())
@@ -1567,7 +1601,8 @@ class PerceiveExtractor(AGICoreModule):
         depth: torch.Tensor,
         depthValid: torch.Tensor,
         prevVisualState: Optional[VisualState] = None,
-        cameraMotion: Optional[torch.Tensor] = None,) -> VisualState:
+        cameraMotion: Optional[torch.Tensor] = None,
+        prevVisualValid: Optional[torch.Tensor] = None,) -> VisualState:
         # x: [B, 3, H, W]
         frame = x
         pyramid = self.cnn_extractor(frame)
@@ -1601,7 +1636,8 @@ class PerceiveExtractor(AGICoreModule):
             x = self.token_adapters[i](x)
 
         return self.AssembleVisualState(
-            frame, x, depth_state, camera_intrinsics, Ph, Pw, topDownContext, prevVisualState, cameraMotion)
+            frame, x, depth_state, camera_intrinsics, Ph, Pw, topDownContext,
+            prevVisualState, cameraMotion, prevVisualValid)
 
     def ComputePerceptionLoss(
         self,
@@ -1610,6 +1646,7 @@ class PerceiveExtractor(AGICoreModule):
         depthTargetValid: torch.Tensor,
         prevVisualState: Optional[VisualState] = None,
         cameraMotion: Optional[torch.Tensor] = None,
+        prevVisualValid: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         loss = visualState.IntegratedFeat.new_zeros(())
 
@@ -1623,14 +1660,22 @@ class PerceiveExtractor(AGICoreModule):
         if prevVisualState is not None:
             motion_target = (visualState.VentralFeat - prevVisualState.VentralFeat.detach()).detach()
             motion_pred = self.motion_decoder(visualState.MotionToken)
-            loss = loss + 0.05 * F.smooth_l1_loss(motion_pred, motion_target)
+            motion_loss = F.smooth_l1_loss(
+                motion_pred, motion_target, reduction="none").flatten(1).mean(dim=1)
+            motion_valid = (
+                torch.ones_like(motion_loss)
+                if prevVisualValid is None
+                else prevVisualValid.to(device=motion_loss.device, dtype=motion_loss.dtype).view(-1))
+            loss = loss + 0.05 * (
+                motion_loss * motion_valid).sum() / motion_valid.sum().clamp_min(1.0)
 
         depth_losses = self.ComputeDepthGeometryLoss(
             visualState,
             depthTarget=depthTarget,
             depthTargetValid=depthTargetValid,
             prevVisualState=prevVisualState,
-            cameraMotion=cameraMotion)
+            cameraMotion=cameraMotion,
+            prevVisualValid=prevVisualValid)
         loss = loss + depth_losses["loss"]
 
         return loss
@@ -1707,11 +1752,13 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         depth: torch.Tensor,
         depthValid: torch.Tensor,
         prevVisualState: Optional[VisualState] = None,
-        cameraMotion: Optional[torch.Tensor] = None,) -> VisualState:
+        cameraMotion: Optional[torch.Tensor] = None,
+        prevVisualValid: Optional[torch.Tensor] = None,) -> VisualState:
         return super().forward(
             x,
             topDownContext=topDownContext,
             prevVisualState=prevVisualState,
+            prevVisualValid=prevVisualValid,
             depth=depth,
             depthValid=depthValid,
             cameraMotion=cameraMotion)
@@ -1722,12 +1769,14 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         depthTarget: torch.Tensor,
         depthTargetValid: torch.Tensor,
         prevVisualState: Optional[VisualState] = None,
-        cameraMotion: Optional[torch.Tensor] = None,) -> torch.Tensor:
+        cameraMotion: Optional[torch.Tensor] = None,
+        prevVisualValid: Optional[torch.Tensor] = None,) -> torch.Tensor:
         return self.base.ComputePerceptionLoss(
             visualState,
             depthTarget=depthTarget,
             depthTargetValid=depthTargetValid,
             prevVisualState=prevVisualState,
+            prevVisualValid=prevVisualValid,
             cameraMotion=cameraMotion,)
 
     def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
@@ -1785,6 +1834,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         frame = x
         topDownContext = kwargs["topDownContext"]
         prevVisualState = kwargs.get("prevVisualState", None)
+        prevVisualValid = kwargs.get("prevVisualValid", None)
         cameraMotion = kwargs.get("cameraMotion", None)
         depth = kwargs["depth"]
         depth_valid = kwargs["depthValid"]
@@ -1855,7 +1905,8 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
                 xTok = xTok + (xTok @ deltaTok2D.t())
 
         return self.base.AssembleVisualState(
-            frame, xTok, depth_state, camera_intrinsics, Ph, Pw, topDownContext, prevVisualState, cameraMotion)
+            frame, xTok, depth_state, camera_intrinsics, Ph, Pw, topDownContext,
+            prevVisualState, cameraMotion, prevVisualValid)
 
     @torch.no_grad()
     def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
@@ -1981,6 +2032,9 @@ class PerceptionRecallHeads(nn.Module):
             self.parent_k(node_h).transpose(1, 2)) * self.parent_scale
         eye = torch.eye(parent_logits.size(1), device=parent_logits.device, dtype=torch.bool)
         parent_logits = parent_logits.masked_fill(eye.unsqueeze(0), torch.finfo(parent_logits.dtype).min)
+        bbox_raw = torch.sigmoid(self.bbox_2d_head(node_h))
+        bbox_min = torch.minimum(bbox_raw[..., :2], bbox_raw[..., 2:4])
+        bbox_max = torch.maximum(bbox_raw[..., :2], bbox_raw[..., 2:4])
         return {
             "node_logits": self.node_logits(node_h),
             "level_logits": self.level_logits(node_h),
@@ -1989,7 +2043,7 @@ class PerceptionRecallHeads(nn.Module):
             "parent_logits": parent_logits,
             "pose_camera": self.Pose(self.pose_camera_head(node_h)),
             "size_3d": F.softplus(self.size_3d_head(node_h)),
-            "bbox_2d": torch.sigmoid(self.bbox_2d_head(node_h)),
+            "bbox_2d": torch.cat([bbox_min, bbox_max], dim=-1),
             "visible_ratio": torch.sigmoid(self.visible_ratio_head(node_h).squeeze(-1)),
             "occlusion_ratio": torch.sigmoid(self.occlusion_ratio_head(node_h).squeeze(-1)),
             "has_text_logits": self.has_text_logits(node_h),
@@ -2488,9 +2542,6 @@ class TestPerceptionMTool:
             "contact_valid": valid,
             "contact_force": torch.zeros(B, nodes, 2, device=self.device),
             "contact_point_camera": torch.zeros(B, nodes, 3, device=self.device),
-            "robot_context": torch.zeros(B, ModuleDim.PstRobotContextDim, device=self.device),
-            "interaction_context": torch.zeros(B, ModuleDim.PstInteractionDim, device=self.device),
-            "interaction_success": torch.zeros(B, device=self.device),
             "camera_pose_world": camera_pose_world}
 
     def AdapterRankAndParams(self, adapter) -> Tuple[int, int]:
@@ -2636,6 +2687,7 @@ class TestPerceptionMTool:
                     "GlobalFeat": torch.randn(B, 1024, device=self.device),
                     "ObjectTokens": torch.randn(B, model.object_token_count, 512, device=self.device),
                     "MotionPred": torch.randn(B, 512, device=self.device),
+                    "PriorConfidence": torch.ones(B, device=self.device),
                     "PredErrorBasis": torch.randn(B, 1024, device=self.device),}
                 ctx = TopDownContext(
                     PredictedVisual=pred_visual,
@@ -2666,6 +2718,8 @@ class TestPerceptionMTool:
             assert tuple(state1.SemanticNodes["node_logits"].shape) == (B, model.object_token_count, 2)
             assert tuple(state1.SemanticNodes["pose_camera"].shape) == (B, model.object_token_count, 7)
             assert tuple(state1.SemanticNodes["parent_logits"].shape) == (B, model.object_token_count, model.object_token_count)
+            bbox = state1.SemanticNodes["bbox_2d"]
+            assert bool((bbox[..., :2] <= bbox[..., 2:4]).all().item())
             assert tuple(state1.SemanticNodes["scene_logits"].shape) == (B, ModuleDim.PstSceneClasses)
             assert not model.recall_heads.enable_auxiliary and not hasattr(model.recall_heads, "reconstruction_head")
             assert "TemporalState" in state1.Auxiliary
@@ -3438,6 +3492,56 @@ class TestPerceptionMTool:
             print(f"SmallBatchSafety error: {e}")
             return False
 
+    def PartialPreviousVisualMask(self):
+        try:
+            B, H = 2, 32
+            model = PerceiveExtractor(
+                imgSize=H,
+                patchSize=1,
+                embedDim=32,
+                numHeads=4,
+                numLayers=1,
+                baseChannels=8,
+                objectTokenCount=4,
+                useHebbian=False).to(self.device).eval()
+            model.SetCameraIntrinsics(torch.tensor(
+                [[24.0, 0.0, 15.5], [0.0, 24.0, 15.5], [0.0, 0.0, 1.0]],
+                device=self.device))
+            depth = torch.ones(B, 1, H, H, device=self.device)
+            depth_valid = torch.ones_like(depth, dtype=torch.bool)
+            top_down = self.MakeTopDownContext(model, B)
+            previous = model(
+                torch.rand(B, 3, H, H, device=self.device),
+                topDownContext=top_down,
+                depth=depth,
+                depthValid=depth_valid)
+            camera_motion = torch.zeros(B, 7, device=self.device)
+            camera_motion[:, 6] = 1.0
+            current = model(
+                torch.rand(B, 3, H, H, device=self.device),
+                topDownContext=top_down,
+                depth=depth,
+                depthValid=depth_valid,
+                prevVisualState=previous,
+                cameraMotion=camera_motion,
+                prevVisualValid=torch.tensor([False, True], device=self.device))
+            expected_identity = torch.tensor(
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                device=self.device)
+            ok = (
+                torch.equal(
+                    current.Auxiliary["WarpedPrevPatchTokens"][0],
+                    current.PatchTokens[0].detach())
+                and bool(torch.isfinite(current.Auxiliary["WarpPrevPatchValid"][0]).all().item())
+                and float(current.Auxiliary["WarpPrevPatchValid"][0].abs().sum().item()) == 0.0
+                and float(current.Auxiliary["PatchMotionDepthResidual"][0].abs().sum().item()) == 0.0
+                and torch.equal(current.Auxiliary["CameraMotionFromPrev"][0], expected_identity))
+            print(f"PartialPreviousVisualMask {'passed' if ok else 'failed'}.")
+            return bool(ok)
+        except Exception as e:
+            print(f"PartialPreviousVisualMask error: {e}")
+            return False
+
     def RunAll(self):
         results = {
             "HebbianConv2d": self.TestHebbianConv2d(),
@@ -3461,7 +3565,8 @@ class TestPerceptionMTool:
             "LossDecreasesWithHebbToggle": self.LossDecreasesWithHebbToggle(),
             "HebbianMemoryLifecycle": self.HebbianMemoryLifecycle(),
             "WrapperKeepsBaseEval": self.WrapperKeepsBaseEval(),
-            "SmallBatchSafety": self.SmallBatchSafety(),}
+            "SmallBatchSafety": self.SmallBatchSafety(),
+            "PartialPreviousVisualMask": self.PartialPreviousVisualMask(),}
         passed = sum(1 for v in results.values() if v)
         print(f"\nPerception module tests (with wrapper): {passed}/{len(results)} passed.")
         return results

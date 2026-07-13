@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -10,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from torch.utils.data import Dataset
-from AGICore import BasicParameters
+from Config import BasicParameters
 from ModuleMessagerManager import ModuleDim
 
 try:
@@ -30,6 +31,7 @@ def LoadImageFirstFrame(path: Union[str, Path]) -> np.ndarray:
 
 
 DEPTH_FILE_SUFFIXES = (".npy", ".npz", ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+ARRAY_FILE_SUFFIXES = DEPTH_FILE_SUFFIXES
 
 
 def ListDepthFiles(path: Union[str, Path]) -> List[Path]:
@@ -55,6 +57,26 @@ def LoadDepthArray(path: Union[str, Path]) -> np.ndarray:
     return LoadImageFirstFrame(depth_path)
 
 
+def ListArrayFiles(path: Union[str, Path]) -> List[Path]:
+    array_dir = Path(path)
+    if not array_dir.exists():
+        return []
+    return sorted([
+        item for item in array_dir.iterdir()
+        if item.is_file() and item.suffix.lower() in ARRAY_FILE_SUFFIXES],
+        key=lambda item: item.name)
+
+
+def ListJsonFiles(path: Union[str, Path]) -> List[Path]:
+    json_dir = Path(path)
+    if not json_dir.exists():
+        return []
+    return sorted([
+        item for item in json_dir.iterdir()
+        if item.is_file() and item.suffix.lower() == ".json"],
+        key=lambda item: item.name)
+
+
 class OfflineGameDataset(Dataset):
     def __init__(self, isTest: bool = False) -> None:
         if isTest:
@@ -66,6 +88,10 @@ class OfflineGameDataset(Dataset):
             self.depth_valids = ListDepthFiles(getattr(BasicParameters, "DATA_DEPTH_VALID_PATH_TEST", p / "depth_valid"))
             self.texts = sorted((p / "texts").glob("*.txt"))
             self.actions = sorted((p / "actions").glob("*.npy"))
+            self.normals = ListArrayFiles(getattr(BasicParameters, "DATA_NORMAL_PATH_TEST", p / "normal"))
+            self.semantic_segmentations = ListArrayFiles(getattr(BasicParameters, "DATA_SEMANTIC_SEGMENTATION_PATH_TEST", p / "semantic_segmentation"))
+            self.instance_segmentations = ListArrayFiles(getattr(BasicParameters, "DATA_INSTANCE_SEGMENTATION_PATH_TEST", p / "instance_segmentation"))
+            self.synthetic_annotations = ListJsonFiles(getattr(BasicParameters, "DATA_SYNTHETIC_SUPERVISION_PATH_TEST", p / "synthetic_supervision"))
         else:
             self.imgs = sorted(Path(BasicParameters.DATA_FRAMES_PATH).glob("*.png"))
             self.reward = sorted(Path(BasicParameters.DATA_REWARD_PATH).glob("*.npy"))
@@ -74,6 +100,10 @@ class OfflineGameDataset(Dataset):
             self.depth_valids = ListDepthFiles(BasicParameters.DATA_DEPTH_VALID_PATH)
             self.texts = sorted(Path(BasicParameters.DATA_TEXTS_PATH).glob("*.txt"))
             self.actions = sorted(Path(BasicParameters.DATA_ACTIONS_PATH).glob("*.npy"))
+            self.normals = ListArrayFiles(BasicParameters.DATA_NORMAL_PATH)
+            self.semantic_segmentations = ListArrayFiles(BasicParameters.DATA_SEMANTIC_SEGMENTATION_PATH)
+            self.instance_segmentations = ListArrayFiles(BasicParameters.DATA_INSTANCE_SEGMENTATION_PATH)
+            self.synthetic_annotations = ListJsonFiles(BasicParameters.DATA_SYNTHETIC_SUPERVISION_PATH)
 
         assert len(self.imgs) == len(self.reward) == len(self.done) == len(self.depths), "frames/reward/done/depth The number of files is inconsistent."
         if self.depth_valids:
@@ -82,6 +112,11 @@ class OfflineGameDataset(Dataset):
             assert len(self.texts) == len(self.imgs), "texts The number of files is inconsistent."
         if self.actions:
             assert len(self.actions) == len(self.imgs), "actions The number of files is inconsistent."
+        if self.synthetic_annotations:
+            assert len(self.synthetic_annotations) == len(self.imgs), "synthetic_supervision The number of files is inconsistent."
+            assert len(self.normals) == len(self.imgs), "normal The number of files is inconsistent."
+            assert len(self.semantic_segmentations) == len(self.imgs), "semantic_segmentation The number of files is inconsistent."
+            assert len(self.instance_segmentations) == len(self.imgs), "instance_segmentation The number of files is inconsistent."
 
     def __len__(self) -> int:
         return len(self.imgs)
@@ -95,7 +130,7 @@ class OfflineGameDataset(Dataset):
             depth_valid = LoadDepthArray(self.depth_valids[idx]).astype(bool)
         else:
             depth_valid = np.isfinite(depth) & (depth > 0)
-        ext_text = None
+        ext_text = ""
         if self.texts:
             ext_text = self.texts[idx].read_text(encoding="utf-8").strip()
         # Per-frame executed endpoint poses [endpoint_count, 7] (xyz + xyzw quaternion);
@@ -105,7 +140,32 @@ class OfflineGameDataset(Dataset):
         else:
             action = np.zeros((ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim), dtype=np.float32)
             action[:, 6] = 1.0
-        return imgs, reward, done, depth, depth_valid, ext_text, action
+        synthetic_targets: Dict[str, torch.Tensor] = {}
+        if self.synthetic_annotations:
+            annotation = json.loads(self.synthetic_annotations[idx].read_text(encoding="utf-8"))
+            rgb_tensor = DataPreprocessor.ToImageTensor(imgs)
+            depth_tensor, depth_valid_tensor = DataPreprocessor.ToDepthTensor(
+                depth,
+                depth_valid,
+                depthScaleMeters=BasicParameters.DATA_DEPTH_SCALE_METERS)
+            normal_tensor = DataPreprocessor.ToNormalTensor(LoadDepthArray(self.normals[idx]))
+            semantic_segmentation = DataPreprocessor.ToSegmentationTensor(LoadDepthArray(self.semantic_segmentations[idx]))
+            instance_segmentation = DataPreprocessor.ToSegmentationTensor(LoadDepthArray(self.instance_segmentations[idx]))
+            synthetic_targets = DataPreprocessor.TensorizeSyntheticSupervision(
+                annotation,
+                rgb_tensor,
+                depth_tensor,
+                depth_valid_tensor,
+                normal_tensor,
+                semantic_segmentation,
+                instance_segmentation,
+                maxNodes=ModuleDim.PstObservedSlots,
+                textDim=ModuleDim.PstTextDim,
+                stateDim=ModuleDim.PstStateDim,
+                attrDim=ModuleDim.PstAttrDim,
+                affordanceDim=ModuleDim.PstAffordanceDim,
+                relationClasses=ModuleDim.PstRelationClasses)
+        return imgs, reward, done, depth, depth_valid, ext_text, action, synthetic_targets
 
 
 class OfflineOCRDataset(Dataset):
@@ -364,6 +424,26 @@ class DataPreprocessor:
         return img_t
 
     @staticmethod
+    def ToNormalTensor(normal: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+        normal_t = torch.as_tensor(normal).float()
+        if normal_t.ndim == 3 and normal_t.shape[-1] == 3:
+            normal_t = normal_t.permute(2, 0, 1)
+        if normal_t.ndim != 3 or normal_t.size(0) != 3:
+            raise ValueError(f"normal sample must have shape [3, H, W] or [H, W, 3], got {tuple(normal_t.shape)}")
+        return F.normalize(normal_t, dim=0, eps=1e-6)
+
+    @staticmethod
+    def ToSegmentationTensor(segmentation: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
+        seg_t = torch.as_tensor(segmentation)
+        if seg_t.ndim == 3 and seg_t.size(-1) == 1:
+            seg_t = seg_t[..., 0]
+        if seg_t.ndim == 3 and seg_t.size(0) == 1:
+            seg_t = seg_t[0]
+        if seg_t.ndim != 2:
+            raise ValueError(f"segmentation sample must have shape [H, W], got {tuple(seg_t.shape)}")
+        return seg_t.long()
+
+    @staticmethod
     def ResizeImage(
         imageTensor: torch.Tensor,
         size: Union[int, Tuple[int, int]],
@@ -589,21 +669,6 @@ class DataPreprocessor:
                 dtype=dtype)
             contact_point_camera[index] = torch.tensor(event["contact_point_camera"], device=device, dtype=dtype)
 
-        robot = annotation["robot"]
-        robot_context = torch.cat([
-            torch.tensor(robot["base_pose_world"], device=device, dtype=dtype),
-            torch.tensor(robot["end_effector"]["pose_camera"], device=device, dtype=dtype),
-            torch.tensor(robot["end_effector"]["state"], device=device, dtype=dtype),
-            torch.tensor(robot["joint_positions"], device=device, dtype=dtype),
-            torch.tensor(robot["joint_velocities"], device=device, dtype=dtype)])
-        interaction = annotation["interaction"]
-        action_type = F.one_hot(
-            torch.tensor(interaction["action_type"], device=device, dtype=torch.long),
-            num_classes=16).to(dtype)
-        interaction_context = torch.cat([
-            action_type,
-            torch.tensor(interaction["action_delta_pose"], device=device, dtype=dtype)])
-
         return {
             "rgb": rgb,
             "depth": depth,
@@ -647,13 +712,10 @@ class DataPreprocessor:
             "contact_valid": contact_valid,
             "contact_force": contact_force,
             "contact_point_camera": contact_point_camera,
-            "robot_context": robot_context,
-            "interaction_context": interaction_context,
             # Per-frame absolute camera pose (camera->world, xyz + xyzw quaternion). The
             # inter-frame camera_motion is derived from consecutive poses in BrainCore.Step,
             # so the dataset only stores each frame's own pose, never a relative transform.
-            "camera_pose_world": torch.tensor(annotation["camera"]["pose_world"], device=device, dtype=dtype),
-            "interaction_success": torch.tensor(annotation["interaction"]["action_success"], device=device, dtype=dtype)}
+            "camera_pose_world": torch.tensor(annotation["camera"]["pose_world"], device=device, dtype=dtype)}
 
     @staticmethod
     def CollateSyntheticSupervision(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:

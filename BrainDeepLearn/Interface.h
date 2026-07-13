@@ -150,11 +150,20 @@ public:
 
     bool SetParameterReceiver(std::optional<double> reward = std::nullopt, std::optional<double> done = std::nullopt, std::optional<std::string> textExt = std::nullopt);
 
-    bool InitAgentHnandle();
+    bool InitAgentHandle();
 
-    bool AgentHandleForward(StatusValue& result, int cameraIndex = 0, double reward = 0.0, double done = 0.0);
+    // Returns a learned motion proposal. This transport layer does not perform
+    // IK, collision/actuator validation, timeout enforcement, or a certified
+    // emergency stop; a downstream executor must validate before actuation.
+    bool AgentHandleForward(
+        StatusValue& result,
+        const std::string& sensorPacketJson,
+        const std::string& robotStateJson,
+        int cameraIndex = 0,
+        std::optional<double> reward = std::nullopt,
+        std::optional<double> done = std::nullopt);
 
-    bool ResteAgentHandleHebbian();
+    bool ResetAgentHandleHebbian();
 
     bool RunPythonAsync(PyTask task);
 

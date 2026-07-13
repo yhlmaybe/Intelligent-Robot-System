@@ -4,6 +4,7 @@ from pathlib import Path
 import threading
 import random
 import time
+import json
 
 import numpy as np
 import torch
@@ -24,8 +25,21 @@ from ConsciousnessModule import TestConsciousMTool
 from IntentionModule import TestIntentionMTool
 from OCRModule import TestOCRMTool, OCREngineExtractor, IouXyxy
 from DataPreprocess import DataPreprocessor, DataResizeMeta, OfflineGameDataset, OfflineOCRDataset, OfflineOCRRecognitionDataset
-from AGICore import Agent, BrainCore, BasicParameters
+from AGICore import Agent, BRAIN_RUNTIME_SCHEMA_VERSION, BrainCore, TestAGICoreMTool
+from Config import BasicParameters
+from CoreTypes import (
+    AgentActInput,
+    ROBOT_STATE_WIRE_SCHEMA_VERSION,
+    SENSOR_PACKET_WIRE_SCHEMA_VERSION,
+    RobotState,
+    TEXT_TRUST_OCR_OBSERVED,
+    TEXT_TRUST_OPERATOR_COMMAND,
+    TEXT_TRUST_UNSAFE_EXTERNAL)
 from ModuleMessagerManager import ModuleDim
+from FunctionTools import SynchronizeGrowableLoRATopologyForFullLoad
+
+
+TRAIN_CHECKPOINT_SCHEMA_VERSION = BRAIN_RUNTIME_SCHEMA_VERSION
 
 try:
     import imageio.v3 as iio
@@ -108,7 +122,7 @@ class ModuleController:
             self.parameter_receiver = self.EmptyParameterReceiver()
             return current
         
-    def ResteStatus(self):
+    def ResetStatus(self):
         self.status: Dict[str, Any] = {
             "state": "idle",
             "epoch": 0, "total_epochs": 0,
@@ -121,6 +135,7 @@ class ModuleController:
     def RequestStop(self):
         with self._lock:
             self.stop_requested = True
+            self.pause_requested = False
 
     def RequestPause(self):
         with self._lock:
@@ -183,9 +198,66 @@ class ManagerFunction:
             "value": TestValueEstimationMTool(),
             "consciousness": TestConsciousMTool(),
             "OCR": TestOCRMTool(),
-            "intention": TestIntentionMTool(),}
+            "intention": TestIntentionMTool(),
+            "AGICore": TestAGICoreMTool(),
+            "manager": TestManagerMTool(),}
+
+    @staticmethod
+    def NormalizeTrainStage(trainStage: str) -> str:
+        stage = str(trainStage).strip().lower()
+        if stage not in ("full", "world", "policy"):
+            raise ValueError("trainStage must be one of: full/world/policy")
+        return stage
+
+    @staticmethod
+    def TrainStageOnlineWrappers(brain: BrainCore, trainStage: str) -> List[nn.Module]:
+        stage = ManagerFunction.NormalizeTrainStage(trainStage)
+        if stage == "world":
+            return [brain.world]
+        policy_wrappers = [brain.perc, brain.attn, brain.critic, brain.intention]
+        if stage == "policy":
+            return policy_wrappers
+        return [brain.perc, brain.attn, brain.world, brain.critic, brain.intention]
+
+    def EvaluateWithRestoredBrainBuffers(
+        self,
+        brain: BrainCore,
+        evaluate: Callable[[], Any],) -> Any:
+        """Run evaluation without changing the following training trajectory."""
+        training_runtime = brain.ExportBuffers()
+        training_rng = self.CaptureRngState()
+        training_modes = [
+            (module, bool(module.training))
+            for module in brain.modules()]
+        training_graph = brain.SuspendTransientTrainingGraph()
+        try:
+            return evaluate()
+        finally:
+            try:
+                brain.ImportBuffers(training_runtime)
+            finally:
+                try:
+                    brain.RestoreTransientTrainingGraph(training_graph)
+                finally:
+                    try:
+                        # Assign directly so intentionally mixed train/eval subtrees are preserved.
+                        for module, was_training in training_modes:
+                            module.training = was_training
+                    finally:
+                        self.RestoreRngState(training_rng)
+
+    def EvaluateValidationAndTestWithRestoredBrainBuffers(
+        self,
+        brain: BrainCore,
+        evaluateValidation: Callable[[], Any],
+        evaluateTest: Callable[[], Any],) -> Tuple[Any, Any]:
+        validation_result = self.EvaluateWithRestoredBrainBuffers(
+            brain, evaluateValidation)
+        test_result = self.EvaluateWithRestoredBrainBuffers(
+            brain, evaluateTest)
+        return validation_result, test_result
         
-    def InitAgentHnandle(self):
+    def InitAgentHandle(self):
         self.agent_handle = AgentHandle()
         return True
 
@@ -214,15 +286,14 @@ class ManagerFunction:
         reward: Optional[float] = None,
         done: Optional[float] = None,
         textExt: Optional[List[Optional[str]]] = None,
+        textTrust: Optional[List[str]] = None,
         sampleActions: bool = True,
         deterministicActor: bool = False,
         *,
         depthBitmap: Union[List[Any], np.ndarray, torch.Tensor],
         depthValid: Optional[Union[List[Any], np.ndarray, torch.Tensor]] = None,
         depthScaleMeters: float = 1.0,
-        robotPhysicalContext: torch.Tensor,
-        interactionContext: torch.Tensor,
-        robotState: Dict[str, torch.Tensor],):
+        robotState: RobotState,):
         if self.agent_handle is None:
             raise RuntimeError("agent_handle has not been initialized")
         if iio is None:
@@ -245,18 +316,113 @@ class ManagerFunction:
         act_out = self.agent_handle.ForwardStep(
             converted["frames"],
             textExt=textExt,
+            textTrust=textTrust,
             reward=converted["rewards"],
             done=converted["dones"],
             sampleActions=sampleActions,
             deterministicActor=deterministicActor,
             depth=converted["depths"],
             depthValid=converted["depth_valid"],
-            robotPhysicalContext=robotPhysicalContext,
-            interactionContext=interactionContext,
             robotState=robotState,)
         return self.agent_handle.agent.UnpackActPacked(act_out)
 
-    def ResteAgentHandleHebbian(self):
+    def AgentHandleForwardJson(
+        self,
+        cameraIndex: int,
+        reward: Optional[float],
+        done: Optional[float],
+        sensorPacketJson: str,
+        robotStateJson: str,) -> str:
+        """C++ single-frame wire protocol.
+
+        ``sensorPacketJson`` contains explicit text trust, action sampling mode,
+        unbatched ``depth``, ``depth_valid`` and ``depth_scale_meters``.
+        ``robotStateJson`` contains the unbatched fields defined by
+        :class:`CoreTypes.RobotState`; this adapter adds the one-frame batch axis.
+        The returned command is a proposal: this adapter neither validates
+        hardware feasibility nor enforces its timeout budget.
+        """
+        sensor_packet = json.loads(sensorPacketJson)
+        robot_packet = json.loads(robotStateJson)
+        if int(sensor_packet["schema_version"]) != SENSOR_PACKET_WIRE_SCHEMA_VERSION:
+            raise ValueError("unsupported sensor packet schema")
+        if int(robot_packet["schema_version"]) != ROBOT_STATE_WIRE_SCHEMA_VERSION:
+            raise ValueError("unsupported robot state packet schema")
+        if tuple(robot_packet["endpoint_names"]) != ModuleDim.DecisionEndpointNames:
+            raise ValueError("robot endpoint order does not match DecisionEndpointNames")
+        if robot_packet["pose_frame"] != "world":
+            raise ValueError("robot poses must use the world frame")
+        if robot_packet["pose_unit"] != "meter":
+            raise ValueError("robot poses must use metres")
+        if robot_packet["quaternion_order"] != "xyzw":
+            raise ValueError("robot pose quaternions must use XYZW order")
+        text_ext = sensor_packet["text_ext"]
+        text_trust = sensor_packet["text_trust"]
+        if len(text_ext) != 1 or len(text_trust) != 1:
+            raise ValueError("single-frame sensor text_ext/text_trust must have length 1")
+        if text_trust[0] not in (
+            TEXT_TRUST_OCR_OBSERVED,
+            TEXT_TRUST_OPERATOR_COMMAND,
+            TEXT_TRUST_UNSAFE_EXTERNAL,
+        ):
+            raise ValueError("unsupported text_trust value")
+
+        def batched_tensor(name: str) -> torch.Tensor:
+            return torch.as_tensor(
+                robot_packet[name],
+                device=self.device,
+                dtype=torch.float32).unsqueeze(0)
+
+        robot_state: RobotState = {
+            "endpoint_pose": batched_tensor("endpoint_pose"),
+            "camera_pose_world": batched_tensor("camera_pose_world"),
+            "planner_expected_endpoint_pose": batched_tensor(
+                "planner_expected_endpoint_pose"),
+            "planner_progress": batched_tensor("planner_progress"),
+            "planner_tracking_error": batched_tensor("planner_tracking_error"),
+            "planner_executing": batched_tensor("planner_executing"),
+            "planner_reached": batched_tensor("planner_reached"),
+            "planner_failed": batched_tensor("planner_failed"),
+            "model_command_executed": batched_tensor(
+                "model_command_executed"),}
+        if tuple(robot_state["endpoint_pose"].shape) != (
+            1,
+            ModuleDim.DecisionEndpointCount,
+            ModuleDim.DecisionEndpointPoseDim,
+        ):
+            raise ValueError("endpoint_pose must have wire shape [13, 7]")
+        if tuple(robot_state["planner_expected_endpoint_pose"].shape) != (
+            1,
+            ModuleDim.DecisionEndpointCount,
+            ModuleDim.DecisionEndpointPoseDim,
+        ):
+            raise ValueError(
+                "planner_expected_endpoint_pose must have wire shape [13, 7]")
+        if tuple(robot_state["camera_pose_world"].shape) != (1, ModuleDim.PstPoseDim):
+            raise ValueError("camera_pose_world must have wire shape [7]")
+        scalar_fields = (
+            "planner_progress",
+            "planner_tracking_error",
+            "planner_executing",
+            "planner_reached",
+            "planner_failed",
+            "model_command_executed")
+        if any(tuple(robot_state[name].shape) != (1,) for name in scalar_fields):
+            raise ValueError("planner and provenance fields must be wire scalars")
+        return self.AgentHandleForward(
+            cameraIndex,
+            reward,
+            done,
+            textExt=text_ext,
+            textTrust=text_trust,
+            sampleActions=bool(sensor_packet["sample_actions"]),
+            deterministicActor=bool(sensor_packet["deterministic_actor"]),
+            depthBitmap=sensor_packet["depth"],
+            depthValid=sensor_packet["depth_valid"],
+            depthScaleMeters=float(sensor_packet["depth_scale_meters"]),
+            robotState=robot_state)
+
+    def ResetAgentHandleHebbian(self):
         if self.agent_handle is None:
             raise RuntimeError("agent_handle has not been initialized")
         
@@ -283,6 +449,14 @@ class ManagerFunction:
         self.overrideCheckpointWithModuleParams = bool(enabled)
         return True
 
+    def RunBackgroundTask(self, target: Callable[..., Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        try:
+            target(*args, **kwargs)
+        except Exception as e:
+            self.controller.SetStatus("error", f"Background task error: {e}", trace=traceback.format_exc())
+        finally:
+            self.is_begin = False
+
     def StartBackgroundTask(
         self,
         target: Callable[..., Any],
@@ -295,9 +469,8 @@ class ManagerFunction:
 
         self.is_begin = True
         self.br_thread = threading.Thread(
-            target=target,
-            args=args,
-            kwargs=(kwargs or {}),
+            target=self.RunBackgroundTask,
+            args=(target, args, kwargs or {}),
             daemon=False)
         self.br_thread.start()
         return True
@@ -432,10 +605,13 @@ class ManagerFunction:
             self.controller.pause_requested = False
             self.controller.reset_hebbian = False
 
-    def WaitWhilePaused(self, pausedMessage: str) -> None:
+    def WaitWhilePaused(self, pausedMessage: str) -> bool:
         while self.controller.ShouldPause():
+            if self.controller.ShouldStop():
+                return False
             self.controller.SetStatus("paused", pausedMessage)
-            time.sleep(2)
+            time.sleep(0.2)
+        return not self.controller.ShouldStop()
 
     def StartMessageMonitor(self, monitorFn: Callable[[], None]) -> None:
         self.message_thread = threading.Thread(target=monitorFn, args=(), daemon=False)
@@ -545,30 +721,12 @@ class ManagerFunction:
                 return False
         return True
 
-    def BuildDefaultPhysicalContexts(
-        self,
-        batchSize: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-        robot_context = torch.zeros(
-            int(batchSize),
-            ModuleDim.PstRobotContextDim,
-            device=device,
-            dtype=dtype)
-        interaction_context = torch.zeros(
-            int(batchSize),
-            ModuleDim.PstInteractionDim,
-            device=device,
-            dtype=dtype)
-        return robot_context, interaction_context
-
     def BuildDefaultRobotState(
         self,
         batchSize: int,
         *,
         device: torch.device,
-        dtype: torch.dtype) -> Dict[str, torch.Tensor]:
+        dtype: torch.dtype) -> RobotState:
         endpoint_pose = torch.zeros(
             int(batchSize),
             ModuleDim.DecisionEndpointCount,
@@ -585,10 +743,10 @@ class ManagerFunction:
             "planner_expected_endpoint_pose": endpoint_pose.clone(),
             "planner_progress": planner_scalar,
             "planner_tracking_error": planner_scalar,
-            "planner_executing": torch.ones_like(planner_scalar),
+            "planner_executing": planner_scalar,
             "planner_reached": planner_scalar,
             "planner_failed": planner_scalar,
-            "planner_canceled": planner_scalar,}
+            "model_command_executed": torch.zeros_like(planner_scalar),}
 
     def SummarizeImageDirectory(self, path: Union[str, Path]) -> str:
         img_dir = Path(path)
@@ -669,7 +827,7 @@ class ManagerFunction:
                         print("====================================\n")
 
                 if st["state"] in terminalStates:
-                    self.controller.ResteStatus()
+                    self.controller.ResetStatus()
                     break
 
                 time.sleep(sleepSeconds)
@@ -837,6 +995,7 @@ class ManagerFunction:
             for k, v in brain.state_dict().items()}
 
         torch.save({
+            "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
             "brain": brain_state,}, str(out_path))
 
     def SaveOCRParameters(self, engine: OCREngineExtractor, path: str) -> None:
@@ -873,10 +1032,20 @@ class ManagerFunction:
             "addon_cfg": ocr_meta["addon_cfg"],}, str(out_path))
 
     def CaptureRngState(self) -> Dict[str, Any]:
-        return {
+        state = {
             "python": random.getstate(),
             "torch": torch.get_rng_state(),
             "numpy": np.random.get_state(),}
+        if torch.cuda.is_available():
+            state["cuda_all"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def RestoreRngState(self, state: Dict[str, Any]) -> None:
+        random.setstate(state["python"])
+        torch.set_rng_state(state["torch"].cpu())
+        np.random.set_state(state["numpy"])
+        if torch.cuda.is_available() and "cuda_all" in state:
+            torch.cuda.set_rng_state_all(state["cuda_all"])
 
     def ShouldTriggerPeriodicSave(
         self,
@@ -955,17 +1124,32 @@ class ManagerFunction:
             print(f"Safe mode loading failed: {e}, try the normal mode")
             return torch.load(path, map_location=self.device)
 
-    def LoadBrainWeights(self, brain: BrainCore, path: str) -> None:
+    def LoadBrainWeights(
+        self,
+        brain: BrainCore,
+        path: str,
+        *,
+        agent: Optional[Agent] = None,) -> None:
         payload = self.LoadTorchPayload(path)
 
         if isinstance(payload, dict) and "brain" in payload:
+            checkpoint_version = int(payload.get("schema_version", 1))
+            if checkpoint_version not in (1, 2, 3, TRAIN_CHECKPOINT_SCHEMA_VERSION):
+                raise ValueError(
+                    f"unsupported brain parameter schema {checkpoint_version}")
             brain_state = payload["brain"]
         elif isinstance(payload, dict):
             brain_state = payload
         else:
             raise TypeError(f"checkpoint {path} has invalid brain weights payload")
 
+        SynchronizeGrowableLoRATopologyForFullLoad(brain, brain_state)
+        brain_state = brain.UpgradeDecisionStateDict(brain_state)
+        brain.ResizeStateBuffersForLoad(brain_state)
         brain.load_state_dict(brain_state, strict=False)
+        if agent is not None:
+            agent.SyncTrainableOptimizers()
+            agent.ClearTrainableOptimizerState()
 
     def ApplyParameterOverrideAfterResume(
         self,
@@ -1109,9 +1293,7 @@ class ManagerFunction:
                 print("[LoadOCRCkpt] optimizer state skipped because parameter groups changed")
 
         if "rng" in ckpt:
-            random.setstate(ckpt["rng"]["python"])
-            torch.set_rng_state(ckpt["rng"]["torch"].cpu())
-            np.random.set_state(ckpt["rng"]["numpy"])
+            self.RestoreRngState(ckpt["rng"])
 
         train_ds = val_ds = test_ds = None
         if ckpt.get("train_indices") is not None:
@@ -1164,9 +1346,7 @@ class ManagerFunction:
                 print("[LoadOCRRecCkpt] optimizer state skipped because parameter groups changed")
 
         if "rng" in ckpt:
-            random.setstate(ckpt["rng"]["python"])
-            torch.set_rng_state(ckpt["rng"]["torch"].cpu())
-            np.random.set_state(ckpt["rng"]["numpy"])
+            self.RestoreRngState(ckpt["rng"])
 
         train_ds = val_ds = test_ds = None
         if ckpt.get("train_indices") is not None:
@@ -1395,6 +1575,7 @@ class ManagerFunction:
             def BuildOCRCheckpointPayload(epochValue: int) -> Dict[str, Any]:
                 ocr_meta = engine.OcrMetadata()
                 return {
+                    "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                     "epoch": int(epochValue),
                     "best_val": best_val,
                     "ocr": engine.state_dict(),
@@ -1437,7 +1618,8 @@ class ManagerFunction:
                     self.controller.SetStatus("stopped", "OCR training stopped")
                     break
 
-                self.WaitWhilePaused("OCR training paused")
+                if not self.WaitWhilePaused("OCR training paused"):
+                    break
 
                 engine.train()
                 epoch_loss = 0.0
@@ -1638,7 +1820,8 @@ class ManagerFunction:
                     if self.controller.ShouldStop():
                         break
 
-                    self.WaitWhilePaused("OCR training paused")
+                    if not self.WaitWhilePaused("OCR training paused"):
+                        break
 
                 avg_train = epoch_loss / max(1, nb)
                 avg_train_box_loss = epoch_det_loss / max(1, nb)
@@ -1888,7 +2071,8 @@ class ManagerFunction:
                     self.controller.SetStatus("stopped", "OCR recognizer training stopped")
                     break
 
-                self.WaitWhilePaused("OCR recognizer training paused")
+                if not self.WaitWhilePaused("OCR recognizer training paused"):
+                    break
 
                 engine.train()
                 epoch_loss = 0.0
@@ -1986,7 +2170,8 @@ class ManagerFunction:
                     if self.controller.ShouldStop():
                         break
 
-                    self.WaitWhilePaused("OCR recognizer training paused")
+                    if not self.WaitWhilePaused("OCR recognizer training paused"):
+                        break
 
                 avg_train = epoch_loss / max(1, nb)
                 avg_val, val_acc = eval_split(val_dl)
@@ -2046,6 +2231,8 @@ class ManagerFunction:
         overrideCheckpointWithModuleParams: bool = False,
         trainStage: str = "full",):
         try:
+            trainStage = self.NormalizeTrainStage(trainStage)
+            critic_stage_enabled = trainStage in ("full", "policy")
             ckptPath = ckptPath or BasicParameters.CKPT_PATH_TRAIN
             outPath = outPath or (BasicParameters.MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.MODULEPARAMETER_PATH)
 
@@ -2057,12 +2244,14 @@ class ManagerFunction:
                 device=self.device,
                 plasticHebbian=True,
                 plasticOnlineLearning=onlineLearning,
-                enablePerceptionSupervision=False)
+                enablePerceptionSupervision=True)
 
             agent = Agent(brain, isTrain=True, device=self.device, worldMemoryPath=worldMemPath, memMemoryPath=memMemPath,)
 
             if onlineLearning:
-                agent.UpdateAllWrappers("autogrow")
+                agent.UpdateWrappers(
+                    self.TrainStageOnlineWrappers(brain, trainStage),
+                    "autogrow")
 
             start_epoch = 0
             best_val = float("inf")
@@ -2077,7 +2266,7 @@ class ManagerFunction:
             self.ApplyParameterOverrideAfterResume(
                 enabled=overrideCheckpointWithModuleParams,
                 parameterPath=outPath,
-                loadFn=lambda path: self.LoadBrainWeights(brain, path),
+                loadFn=lambda path: self.LoadBrainWeights(brain, path, agent=agent),
                 logPrefix="Train")
 
             train_ds, val_ds, test_ds = self.SplitDatasetSequential(
@@ -2097,16 +2286,22 @@ class ManagerFunction:
             no_improve = 0
 
             def unpack_batch(batch):
-                img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b = batch
+                img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b, synthetic_targets = batch
 
                 ext_text_b = [
                     None if (t is None or str(t).strip() == "") else str(t)
                     for t in ext_text_b]
 
-                return img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b
+                return img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b, synthetic_targets
+
+            def move_target_batch(targets: Dict[str, Any]) -> Dict[str, Any]:
+                return {
+                    name: value.to(self.device) if torch.is_tensor(value) else value
+                    for name, value in targets.items()}
 
             def BuildTrainCheckpointPayload(epochValue: int) -> Dict[str, Any]:
                 return {
+                    "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                     "epoch": int(epochValue),
                     "best_val": best_val,
                     "brain": brain.state_dict(),
@@ -2144,7 +2339,8 @@ class ManagerFunction:
                     self.controller.SetStatus("stopped", "Training stopped")
                     break
 
-                self.WaitWhilePaused("Training paused")
+                if not self.WaitWhilePaused("Training paused"):
+                    break
 
                 brain.train()
                 epoch_loss = 0.0
@@ -2153,7 +2349,7 @@ class ManagerFunction:
                 agent.ResetBrainState(B=batchSize, isOnlineLearning=onlineLearning)
 
                 for bi, batch in enumerate(train_dl, start=1):
-                    img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b = unpack_batch(batch)
+                    img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b, synthetic_targets_b = unpack_batch(batch)
 
                     visual_enabled = self.controller.IsVisualStateEnabled()
                     pack = DataPreprocessor.ConvertRobotInputs(
@@ -2172,45 +2368,47 @@ class ManagerFunction:
                     depth_valid_t = pack["depth_valid"]
                     reward_t = pack["rewards"]
                     done_t = pack["dones"]
-                    robot_context_t, interaction_context_t = self.BuildDefaultPhysicalContexts(
-                        int(frames.size(0)),
-                        device=self.device,
-                        dtype=frames.dtype)
                     robot_state_t = self.BuildDefaultRobotState(
                         int(frames.size(0)),
                         device=self.device,
                         dtype=frames.dtype)
-                    robot_state_t["endpoint_pose"] = action_b
+                    synthetic_targets_t = move_target_batch(synthetic_targets_b)
+                    action_t = action_b.to(self.device)
+                    robot_state_t["endpoint_pose"] = action_t
                     robot_state_t["planner_expected_endpoint_pose"] = robot_state_t["endpoint_pose"]
+                    if "camera_pose_world" in synthetic_targets_t:
+                        robot_state_t["camera_pose_world"] = synthetic_targets_t["camera_pose_world"]
                     perception_targets = {
                         "depth": depth_t,
-                        "depth_valid": depth_valid_t,
-                        "interaction_success": (reward_t.view(-1) > 0).float(),}
+                        "depth_valid": depth_valid_t,}
+                    perception_targets.update(synthetic_targets_t)
+                    perception_targets["rgb"] = frames
+                    perception_targets["depth"] = depth_t
+                    perception_targets["depth_valid"] = depth_valid_t
 
                     if self.controller.ShouldResetHebbian():
                         agent.ResetHebbianMemory()
                         self.controller.RequestCancelResetHebbian()
 
-                    act_out = agent.Act(
-                        frames,
-                        textExt=ext_text_b,
+                    act_out = agent.Act(AgentActInput(
+                        frame=frames,
+                        text_ext=ext_text_b,
                         reward=reward_t,
                         done=done_t,
-                        sampleActions=True,
-                        deterministicActor=False,
+                        sample_actions=True,
+                        deterministic_actor=False,
                         depth=depth_t,
-                        depthValid=depth_valid_t,
-                        robotPhysicalContext=robot_context_t,
-                        interactionContext=interaction_context_t,
-                        perceptionTargets=perception_targets,
-                        robotState=robot_state_t,)
+                        depth_valid=depth_valid_t,
+                        perception_targets=perception_targets,
+                        robot_state=robot_state_t,
+                        text_trust=[TEXT_TRUST_OPERATOR_COMMAND for _ in range(len(ext_text_b))]))
 
                     if act_out is None:
                         continue
 
-                    model_loss = act_out["loss"]
-                    transport_delayed_loss = act_out.get("transport_delayed_loss", None)
-                    ocr_items = act_out["OCR"]
+                    model_loss = act_out.loss
+                    transport_delayed_loss = act_out.transport_delayed_loss
+                    ocr_items = act_out.ocr
 
                     loss = model_loss
 
@@ -2219,12 +2417,16 @@ class ManagerFunction:
                     agent.opt_actor.zero_grad(set_to_none=True)
 
                     transport_capture_delayed = {"captured": 0.0, "grad_norm": 0.0, "accum_steps": 0.0}
-                    if transport_delayed_loss.requires_grad:
-                        transport_delayed_loss.backward(retain_graph=True)
+                    if critic_stage_enabled and transport_delayed_loss.requires_grad:
+                        transport_delayed_loss.backward()
                         transport_capture_delayed = agent.CaptureCriticTransportGrad()
 
                     loss.backward()
-                    transport_capture_current = agent.CaptureCriticTransportGrad()
+                    transport_capture_current = {"captured": 0.0, "grad_norm": 0.0, "accum_steps": 0.0}
+                    if critic_stage_enabled:
+                        transport_capture_current = agent.CaptureCriticTransportGrad()
+                    else:
+                        agent.ClearCriticTransportGradAccumulator()
                     transport_capture = {
                         "captured": transport_capture_delayed["captured"] + transport_capture_current["captured"],
                         "grad_norm": (
@@ -2233,13 +2435,18 @@ class ManagerFunction:
                         "accum_steps": max(
                             transport_capture_delayed["accum_steps"],
                             transport_capture_current["accum_steps"]),}
-                    transport_apply = agent.ApplyCriticTransportManualGrad()
-                    if onlineLearning:
-                        agent.UpdateAllWrappers("accumulategrads")
-                        agent.UpdateAllWrappers("autogrow")
+                    transport_apply = {"updated": 0.0, "grad_norm": 0.0, "scale": 0.0}
+                    if critic_stage_enabled:
+                        transport_apply = agent.ApplyCriticTransportManualGrad()
 
+                    if trainStage == "world":
+                        stage_optimizers = [agent.opt_world]
+                    elif trainStage == "policy":
+                        stage_optimizers = [agent.opt_critic, agent.opt_actor]
+                    else:
+                        stage_optimizers = [agent.opt_world, agent.opt_critic, agent.opt_actor]
                     torch.nn.utils.clip_grad_norm_(
-                        list(brain.parameters()),
+                        agent.OptimizerParameters(stage_optimizers),
                         1.0)
 
                     # Phased curriculum: "world" trains the world model only,
@@ -2249,7 +2456,12 @@ class ManagerFunction:
                     if trainStage in ("full", "policy"):
                         agent.opt_critic.step()
                         agent.opt_actor.step()
-                    agent.AfterOptimizerStep()
+                    if critic_stage_enabled:
+                        agent.AfterOptimizerStep()
+                    if onlineLearning:
+                        stage_wrappers = self.TrainStageOnlineWrappers(brain, trainStage)
+                        agent.UpdateWrappers(stage_wrappers, "accumulategrads")
+                        agent.UpdateWrappers(stage_wrappers, "autogrow")
 
                     previous_processed_sample_count_total = processed_sample_count_total
                     processed_sample_count_total += int(frames.size(0))
@@ -2298,7 +2510,8 @@ class ManagerFunction:
 
                     if self.controller.ShouldStop():
                         break
-                    self.WaitWhilePaused("Training paused")
+                    if not self.WaitWhilePaused("Training paused"):
+                        break
 
                 avg_train = epoch_loss / max(1, nb)
 
@@ -2315,7 +2528,7 @@ class ManagerFunction:
 
                     with torch.no_grad():
                         for batch in dl:
-                            img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b = unpack_batch(batch)
+                            img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b, synthetic_targets_b = unpack_batch(batch)
 
                             v_pack = DataPreprocessor.ConvertRobotInputs(
                                 imgs=img_b,
@@ -2331,39 +2544,41 @@ class ManagerFunction:
                             v_depth_valid_t = v_pack["depth_valid"]
                             v_reward_t = v_pack["rewards"]
                             v_done_t = v_pack["dones"]
-                            v_robot_context_t, v_interaction_context_t = self.BuildDefaultPhysicalContexts(
-                                int(v_frames.size(0)),
-                                device=self.device,
-                                dtype=v_frames.dtype)
                             v_robot_state_t = self.BuildDefaultRobotState(
                                 int(v_frames.size(0)),
                                 device=self.device,
                                 dtype=v_frames.dtype)
-                            v_robot_state_t["endpoint_pose"] = action_b
+                            v_synthetic_targets_t = move_target_batch(synthetic_targets_b)
+                            v_action_t = action_b.to(self.device)
+                            v_robot_state_t["endpoint_pose"] = v_action_t
                             v_robot_state_t["planner_expected_endpoint_pose"] = v_robot_state_t["endpoint_pose"]
+                            if "camera_pose_world" in v_synthetic_targets_t:
+                                v_robot_state_t["camera_pose_world"] = v_synthetic_targets_t["camera_pose_world"]
                             v_perception_targets = {
                                 "depth": v_depth_t,
-                                "depth_valid": v_depth_valid_t,
-                                "interaction_success": (v_reward_t.view(-1) > 0).float(),}
+                                "depth_valid": v_depth_valid_t,}
+                            v_perception_targets.update(v_synthetic_targets_t)
+                            v_perception_targets["rgb"] = v_frames
+                            v_perception_targets["depth"] = v_depth_t
+                            v_perception_targets["depth_valid"] = v_depth_valid_t
 
-                            act_out = agent.Act(
-                                v_frames,
-                                textExt=ext_text_b,
+                            act_out = agent.Act(AgentActInput(
+                                frame=v_frames,
+                                text_ext=ext_text_b,
                                 reward=v_reward_t,
                                 done=v_done_t,
-                                sampleActions=True,
-                                deterministicActor=True,
+                                sample_actions=True,
+                                deterministic_actor=True,
                                 depth=v_depth_t,
-                                depthValid=v_depth_valid_t,
-                                robotPhysicalContext=v_robot_context_t,
-                                interactionContext=v_interaction_context_t,
-                                perceptionTargets=v_perception_targets,
-                                robotState=v_robot_state_t,)
+                                depth_valid=v_depth_valid_t,
+                                perception_targets=v_perception_targets,
+                                robot_state=v_robot_state_t,
+                                text_trust=[TEXT_TRUST_OPERATOR_COMMAND for _ in range(len(ext_text_b))]))
                             
                             if act_out is None:
                                 continue
 
-                            v_model_loss = act_out["loss"]
+                            v_model_loss = act_out.loss
 
                             split_loss += float(v_model_loss.item())
                             split_batches += 1
@@ -2371,8 +2586,10 @@ class ManagerFunction:
                     avg_split_loss = split_loss / max(1, split_batches)
                     return avg_split_loss
 
-                avg_val = eval_split(val_dl)
-                test_loss = eval_split(test_dl)
+                avg_val, test_loss = self.EvaluateValidationAndTestWithRestoredBrainBuffers(
+                    brain,
+                    lambda: eval_split(val_dl),
+                    lambda: eval_split(test_dl))
 
                 improved = (best_val - avg_val) > min_delta
                 if improved:
@@ -2421,7 +2638,9 @@ class ManagerFunction:
         if "brain" not in raw:
             raise KeyError(f"checkpoint {ckpt_path} has no 'brain' field")
 
-        params = {"brain": raw["brain"],}
+        params = {
+            "schema_version": int(raw.get("schema_version", 1)),
+            "brain": raw["brain"],}
 
         if out_path.exists() and not overwrite:
             stem = out_path.stem
@@ -2443,21 +2662,40 @@ class ManagerFunction:
 
     def LoadCheckpoint(self, brain: BrainCore, agent: Agent, dataset: Dataset, path: str = None):
         ckpt = torch.load(path,  map_location=self.device)
-        brain.load_state_dict(ckpt["brain"])
-        try:
-            agent.opt_actor.load_state_dict(ckpt["opt_actor"])
-        except ValueError:
-            print("[LoadCheckpoint] opt_actor state skipped because parameter groups changed")
-        agent.opt_critic.load_state_dict(ckpt["opt_critic"])
-        agent.opt_world.load_state_dict(ckpt["opt_world"])
+        checkpoint_version = int(ckpt.get("schema_version", 1))
+        if checkpoint_version not in (1, 2, 3, TRAIN_CHECKPOINT_SCHEMA_VERSION):
+            raise ValueError(
+                f"unsupported training checkpoint schema {checkpoint_version}")
+        brain_state = ckpt["brain"]
+        SynchronizeGrowableLoRATopologyForFullLoad(brain, brain_state)
+        brain_state = brain.UpgradeDecisionStateDict(brain_state)
+        brain.ResizeStateBuffersForLoad(brain_state)
+        brain.load_state_dict(
+            brain_state,
+            strict=checkpoint_version == TRAIN_CHECKPOINT_SCHEMA_VERSION)
+        agent.SyncTrainableOptimizers()
+        if checkpoint_version == TRAIN_CHECKPOINT_SCHEMA_VERSION:
+            try:
+                agent.opt_actor.load_state_dict(ckpt["opt_actor"])
+            except ValueError:
+                print("[LoadCheckpoint] opt_actor state skipped because parameter groups changed")
+            try:
+                agent.opt_critic.load_state_dict(ckpt["opt_critic"])
+            except ValueError:
+                print("[LoadCheckpoint] opt_critic state skipped because parameter groups changed")
+            try:
+                agent.opt_world.load_state_dict(ckpt["opt_world"])
+            except ValueError:
+                print("[LoadCheckpoint] opt_world state skipped because parameter groups changed")
+        else:
+            print("[LoadCheckpoint] legacy optimizer states skipped after schema migration")
+        agent.ClearTransientCandidateOptimizerState()
 
         if "buffers" in ckpt:
             brain.ImportBuffers(ckpt["buffers"])
 
         if "rng" in ckpt:
-            random.setstate(ckpt["rng"]["python"])
-            torch.set_rng_state(ckpt["rng"]["torch"].cpu())
-            np.random.set_state(ckpt["rng"]["numpy"])
+            self.RestoreRngState(ckpt["rng"])
 
         train_ds = val_ds = test_ds = None
         if ckpt.get("train_indices") is not None:
@@ -2531,10 +2769,6 @@ class ManagerFunction:
                 resize_meta = pack["resize_meta"]
                 depth_t = pack["depths"]
                 depth_valid_t = pack["depth_valid"]
-                robot_context_t, interaction_context_t = self.BuildDefaultPhysicalContexts(
-                    int(frames.size(0)),
-                    device=self.device,
-                    dtype=frames.dtype)
                 robot_state_t = self.BuildDefaultRobotState(
                     int(frames.size(0)),
                     device=self.device,
@@ -2566,18 +2800,19 @@ class ManagerFunction:
                         text_value = str(text_param).strip()
                         text_ext = [None if text_value == "" else text_value]
 
-                act_out = agent.Act(
-                    frames,
-                    textExt=text_ext,
+                act_out = agent.Act(AgentActInput(
+                    frame=frames,
+                    text_ext=text_ext,
                     reward=reward_tensor,
                     done=done_tensor,
-                    sampleActions=True,
-                    deterministicActor=True,
+                    sample_actions=True,
+                    deterministic_actor=True,
                     depth=depth_t,
-                    depthValid=depth_valid_t,
-                    robotPhysicalContext=robot_context_t,
-                    interactionContext=interaction_context_t,
-                    robotState=robot_state_t,)
+                    depth_valid=depth_valid_t,
+                    robot_state=robot_state_t,
+                    text_trust=(
+                        [TEXT_TRUST_OPERATOR_COMMAND for _ in range(len(text_ext))]
+                        if text_ext is not None else None)))
                 if act_out is None:
                     continue
 
@@ -2588,7 +2823,7 @@ class ManagerFunction:
                 status_kwargs = {}
 
                 if visual_enabled and original_images:
-                    ocr_items = act_out["OCR"]
+                    ocr_items = act_out.ocr
                     deploy_items = (ocr_items[0] if (ocr_items is not None and len(ocr_items) > 0) else [])
                     deploy_texts = [
                         str(item.get("text", "")).strip()
@@ -2643,6 +2878,12 @@ class ManagerFunction:
     
     def TestIntentionModule(self):
         return self.RunNamedTest("intention")
+
+    def TestAGICoreModule(self):
+        return self.RunNamedTest("AGICore")
+
+    def TestManagerModule(self):
+        return self.RunNamedTest("manager")
     
     def TestOCRModule(self):
         return self.RunNamedTest("OCR")
@@ -2781,7 +3022,7 @@ class ManagerFunction:
                 frames_dir.mkdir(parents=True, exist_ok=True)
                 ocr_texts_dir.mkdir(parents=True, exist_ok=True)
 
-                vocab_path = Path("BrainDeepLearn/ModuleSetting/OCRKeys.txt")
+                vocab_path = Path(BasicParameters.OCR_DICT_PATH)
                 if not vocab_path.exists():
                     raise FileNotFoundError(f"OCR vocab file not found: {vocab_path}")
 
@@ -2912,7 +3153,7 @@ class ManagerFunction:
                 frames_dir.mkdir(parents=True, exist_ok=True)
                 texts_dir.mkdir(parents=True, exist_ok=True)
 
-                vocab_path = Path("BrainDeepLearn/ModuleSetting/OCRKeys.txt")
+                vocab_path = Path(BasicParameters.OCR_DICT_PATH)
                 if not vocab_path.exists():
                     raise FileNotFoundError(f"OCR vocab file not found: {vocab_path}")
 
@@ -3190,6 +3431,377 @@ class ManagerFunction:
             print(f"Traceback: {traceback.format_exc()}")
             raise
 
+class TestManagerMTool:
+    def TestPauseStopImmediateExit(self) -> bool:
+        try:
+            manager = ManagerFunction.__new__(ManagerFunction)
+            manager.controller = ModuleController()
+            manager.controller.RequestPause()
+            manager.controller.RequestStop()
+            ok = (not manager.controller.ShouldPause()) and (not manager.WaitWhilePaused("paused"))
+            print(f"Manager pause-stop {'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager pause-stop error: {e}")
+            return False
+
+    def TestBackgroundExceptionStatus(self) -> bool:
+        try:
+            manager = ManagerFunction.__new__(ManagerFunction)
+            manager.controller = ModuleController()
+            manager.is_begin = False
+            manager.br_thread = None
+
+            def boom():
+                raise RuntimeError("background smoke failure")
+
+            started = manager.StartBackgroundTask(boom)
+            manager.br_thread.join(timeout=2.0)
+            status = manager.controller.GetStatus()
+            ok = started and status["state"] == "error" and "background smoke failure" in status["message"]
+            print(f"Manager background exception status {'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager background exception status error: {e}")
+            return False
+
+    def TestEvaluationRuntimeRestoredBeforeSave(self) -> bool:
+        caller_rng = None
+        try:
+            class FakeBrain(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.runtime = torch.tensor([3.0])
+                    self.training_graph = {"pending": object()}
+                    self.child = nn.Linear(1, 1)
+                    self.train()
+                    self.child.eval()
+
+                def ExportBuffers(self):
+                    return {"runtime": self.runtime.detach().clone()}
+
+                def ImportBuffers(self, state):
+                    self.runtime = state["runtime"].detach().clone()
+
+                def SuspendTransientTrainingGraph(self):
+                    state = self.training_graph
+                    self.training_graph = {}
+                    return state
+
+                def RestoreTransientTrainingGraph(self, state):
+                    self.training_graph = state
+
+            manager = ManagerFunction.__new__(ManagerFunction)
+            brain = FakeBrain()
+            split_entries: List[float] = []
+            split_random: List[Tuple[float, float, float]] = []
+
+            caller_rng = manager.CaptureRngState()
+            random.seed(17)
+            np.random.seed(17)
+            torch.manual_seed(17)
+            evaluation_start_rng = manager.CaptureRngState()
+
+            def draw_random() -> Tuple[float, float, float]:
+                return (
+                    random.random(),
+                    float(np.random.random()),
+                    float(torch.rand(()).item()))
+
+            def evaluate_validation():
+                split_entries.append(float(brain.runtime.item()))
+                split_random.append(draw_random())
+                brain.eval()
+                brain.runtime.fill_(11.0)
+                return 1.25
+
+            def evaluate_test():
+                split_entries.append(float(brain.runtime.item()))
+                split_random.append(draw_random())
+                brain.eval()
+                brain.runtime.fill_(99.0)
+                return 2.5
+
+            result = manager.EvaluateValidationAndTestWithRestoredBrainBuffers(
+                brain,
+                evaluate_validation,
+                evaluate_test)
+            saved_buffers = brain.ExportBuffers()
+            random_after_evaluation = draw_random()
+            manager.RestoreRngState(evaluation_start_rng)
+            expected_random = draw_random()
+            ok = (
+                result == (1.25, 2.5)
+                and split_entries == [3.0, 3.0]
+                and split_random == [expected_random, expected_random]
+                and random_after_evaluation == expected_random
+                and brain.training
+                and not brain.child.training
+                and "pending" in brain.training_graph
+                and torch.equal(saved_buffers["runtime"], torch.tensor([3.0])))
+            print(f"Manager evaluation runtime/RNG restore {'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager evaluation runtime restore error: {e}")
+            return False
+        finally:
+            if caller_rng is not None:
+                manager.RestoreRngState(caller_rng)
+
+    def TestLoadCheckpointRestoresTopologyBeforeOptimizers(self) -> bool:
+        try:
+            import io
+
+            events: List[str] = []
+
+            class FakeBrain(nn.Module):
+                def __init__(self):
+                    super().__init__()
+
+                def ResizeStateBuffersForLoad(self, state):
+                    events.append("resize")
+
+                def UpgradeDecisionStateDict(self, state):
+                    events.append("migrate")
+                    return state
+
+                def load_state_dict(self, state, strict):
+                    events.append(f"brain_load:{strict}")
+
+                def ImportBuffers(self, state):
+                    events.append("buffers")
+
+            class FakeOptimizer:
+                def __init__(self, name):
+                    self.name = name
+
+                def load_state_dict(self, state):
+                    events.append(self.name)
+
+            class FakeAgent:
+                def __init__(self):
+                    self.opt_actor = FakeOptimizer("opt_actor")
+                    self.opt_critic = FakeOptimizer("opt_critic")
+                    self.opt_world = FakeOptimizer("opt_world")
+
+                def SyncTrainableOptimizers(self):
+                    events.append("sync")
+
+                def ClearTransientCandidateOptimizerState(self):
+                    events.append("clear_candidates")
+
+            checkpoint = {
+                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                "brain": {"buffer": torch.zeros(2)},
+                "opt_actor": {},
+                "opt_critic": {},
+                "opt_world": {},
+                "buffers": {},}
+            payload = io.BytesIO()
+            torch.save(checkpoint, payload)
+            payload.seek(0)
+            manager = ManagerFunction.__new__(ManagerFunction)
+            manager.device = torch.device("cpu")
+            manager.LoadCheckpoint(FakeBrain(), FakeAgent(), [], payload)
+            ok = events == [
+                "migrate",
+                "resize",
+                "brain_load:True",
+                "sync",
+                "opt_actor",
+                "opt_critic",
+                "opt_world",
+                "clear_candidates",
+                "buffers",]
+            print(f"Manager checkpoint restore order {'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager checkpoint restore order error: {e}")
+            return False
+
+    def TestLoadBrainWeightsResizesAndSyncsOverride(self) -> bool:
+        try:
+            events: List[str] = []
+
+            from FunctionTools import GrowableLoRALinear
+
+            class FakeBrain(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.adapter = GrowableLoRALinear(nn.Linear(2, 2))
+                    self.adapter.Grow(1)
+
+                def ResizeStateBuffersForLoad(self, state):
+                    events.append("resize")
+
+                def UpgradeDecisionStateDict(self, state):
+                    events.append("migrate")
+                    return state
+
+                def load_state_dict(self, state, strict):
+                    events.append(f"load:{strict}")
+
+            class FakeAgent:
+                def SyncTrainableOptimizers(self):
+                    events.append("sync")
+
+                def ClearTrainableOptimizerState(self):
+                    events.append("clear_optimizer_state")
+
+            brain = FakeBrain()
+            manager = ManagerFunction.__new__(ManagerFunction)
+            manager.LoadTorchPayload = lambda path: {
+                "brain": {
+                    "adapter.target.weight": torch.randn_like(brain.adapter.target.weight),
+                    "adapter.target.bias": torch.randn_like(brain.adapter.target.bias)}}
+            manager.LoadBrainWeights(
+                brain,
+                "unused.pth",
+                agent=FakeAgent())
+            ok = events == [
+                "migrate",
+                "resize",
+                "load:False",
+                "sync",
+                "clear_optimizer_state"] and len(brain.adapter.A_list) == 0
+            print(f"Manager parameter override restore order {'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager parameter override restore order error: {e}")
+            return False
+
+    def TestTrainStageIsolationContract(self) -> bool:
+        try:
+            class FakeBrain:
+                def __init__(self):
+                    self.perc = nn.Identity()
+                    self.attn = nn.Identity()
+                    self.actor = nn.Identity()
+                    self.world = nn.Identity()
+                    self.critic = nn.Identity()
+                    self.intention = nn.Identity()
+
+            brain = FakeBrain()
+            world = ManagerFunction.TrainStageOnlineWrappers(brain, "world")
+            policy = ManagerFunction.TrainStageOnlineWrappers(brain, "policy")
+            full = ManagerFunction.TrainStageOnlineWrappers(brain, "full")
+            invalid_rejected = False
+            try:
+                ManagerFunction.NormalizeTrainStage("invalid")
+            except ValueError:
+                invalid_rejected = True
+
+            ok = True
+            ok &= world == [brain.world]
+            ok &= brain.world not in policy
+            ok &= brain.critic in policy and brain.actor not in policy
+            ok &= brain.world in full and brain.critic in full
+            ok &= brain.actor not in full
+            ok &= invalid_rejected
+
+            world_param = nn.Parameter(torch.tensor(0.0))
+            policy_param = nn.Parameter(torch.tensor(0.0))
+            world_opt = torch.optim.SGD([world_param], lr=1.0)
+            critic_opt = torch.optim.SGD([policy_param], lr=1.0)
+            fake_agent = Agent.__new__(Agent)
+            fake_agent.is_train = True
+            fake_agent.opt_world = world_opt
+            fake_agent.opt_critic = critic_opt
+            fake_agent.opt_actor = critic_opt
+            world_param.grad = torch.tensor(1.0)
+            policy_param.grad = torch.tensor(100.0)
+            torch.nn.utils.clip_grad_norm_(
+                fake_agent.OptimizerParameters([world_opt]),
+                1.0)
+            ok &= float(world_param.grad.abs().item()) > 0.99
+            ok &= float(policy_param.grad.abs().item()) == 100.0
+            print(f"Manager train-stage isolation contract {'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager train-stage isolation contract error: {e}")
+            return False
+
+    def TestCppDecisionWireContract(self) -> bool:
+        try:
+            manager = object.__new__(ManagerFunction)
+            manager.device = torch.device("cpu")
+            captured: Dict[str, Any] = {}
+
+            def capture_forward(*args, **kwargs):
+                captured["args"] = args
+                captured["kwargs"] = kwargs
+                return "ok"
+
+            manager.AgentHandleForward = capture_forward
+            endpoint_pose = torch.zeros(
+                ModuleDim.DecisionEndpointCount,
+                ModuleDim.DecisionEndpointPoseDim)
+            endpoint_pose[..., 6] = 1.0
+            robot_packet = {
+                "schema_version": ROBOT_STATE_WIRE_SCHEMA_VERSION,
+                "endpoint_names": list(ModuleDim.DecisionEndpointNames),
+                "pose_frame": "world",
+                "pose_unit": "meter",
+                "quaternion_order": "xyzw",
+                "endpoint_pose": endpoint_pose.tolist(),
+                "camera_pose_world": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                "planner_expected_endpoint_pose": endpoint_pose.tolist(),
+                "planner_progress": 0.2,
+                "planner_tracking_error": 0.1,
+                "planner_executing": 1.0,
+                "planner_reached": 0.0,
+                "planner_failed": 0.0,
+                "model_command_executed": 1.0,}
+            sensor_packet = {
+                "schema_version": SENSOR_PACKET_WIRE_SCHEMA_VERSION,
+                "text_ext": ["pick up the cup"],
+                "text_trust": [TEXT_TRUST_OPERATOR_COMMAND],
+                "sample_actions": False,
+                "deterministic_actor": True,
+                "depth": [[1.0, 2.0], [3.0, 4.0]],
+                "depth_valid": [[True, True], [True, False]],
+                "depth_scale_meters": 0.001,}
+            result = ManagerFunction.AgentHandleForwardJson(
+                manager,
+                2,
+                0.5,
+                0.0,
+                json.dumps(sensor_packet),
+                json.dumps(robot_packet))
+            robot_state = captured["kwargs"]["robotState"]
+            ok = (
+                result == "ok"
+                and captured["args"] == (2, 0.5, 0.0)
+                and tuple(robot_state["endpoint_pose"].shape)
+                == (1, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim)
+                and tuple(robot_state["camera_pose_world"].shape) == (1, ModuleDim.PstPoseDim)
+                and tuple(robot_state["model_command_executed"].shape) == (1,)
+                and captured["kwargs"]["textExt"] == sensor_packet["text_ext"]
+                and captured["kwargs"]["textTrust"] == sensor_packet["text_trust"]
+                and captured["kwargs"]["sampleActions"] is False
+                and captured["kwargs"]["deterministicActor"] is True
+                and captured["kwargs"]["depthBitmap"] == sensor_packet["depth"]
+                and captured["kwargs"]["depthValid"] == sensor_packet["depth_valid"]
+                and captured["kwargs"]["depthScaleMeters"] == 0.001)
+            print(f"Manager C++ decision wire contract {'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager C++ decision wire contract error: {e}")
+            return False
+
+    def RunAll(self) -> Dict[str, bool]:
+        results = {
+            "PauseStopImmediateExit": self.TestPauseStopImmediateExit(),
+            "BackgroundExceptionStatus": self.TestBackgroundExceptionStatus(),
+            "EvaluationRuntimeRestoredBeforeSave": self.TestEvaluationRuntimeRestoredBeforeSave(),
+            "LoadCheckpointRestoresTopologyBeforeOptimizers": self.TestLoadCheckpointRestoresTopologyBeforeOptimizers(),
+            "LoadBrainWeightsResizesAndSyncsOverride": self.TestLoadBrainWeightsResizesAndSyncsOverride(),
+            "TrainStageIsolationContract": self.TestTrainStageIsolationContract(),
+            "CppDecisionWireContract": self.TestCppDecisionWireContract(),}
+        passed = sum(1 for v in results.values() if v)
+        print(f"\nManager tests: {passed}/{len(results)} passed.")
+        return results
+
 
 class AgentHandle:
     def __init__(
@@ -3243,26 +3855,24 @@ class AgentHandle:
         frame: torch.Tensor,
         *,
         textExt: Optional[List[Optional[str]]] = None,
+        textTrust: Optional[List[str]] = None,
         reward: Optional[int] = None,
         done: Optional[int] = None,
         sampleActions: bool = True,
         deterministicActor: bool = False,
         depth: torch.Tensor,
         depthValid: torch.Tensor,
-        robotPhysicalContext: torch.Tensor,
-        interactionContext: torch.Tensor,
         perceptionTargets: Optional[Dict[str, torch.Tensor]] = None,
-        robotState: Dict[str, torch.Tensor],):
-        return self.agent.Act(
-            frame,
-            textExt=textExt,
+        robotState: RobotState,):
+        return self.agent.Act(AgentActInput(
+            frame=frame,
+            text_ext=textExt,
             reward=reward,
             done=done,
-            sampleActions=sampleActions,
-            deterministicActor=deterministicActor,
+            sample_actions=sampleActions,
+            deterministic_actor=deterministicActor,
             depth=depth,
-            depthValid=depthValid,
-            robotPhysicalContext=robotPhysicalContext,
-            interactionContext=interactionContext,
-            perceptionTargets=perceptionTargets,
-            robotState=robotState,)
+            depth_valid=depthValid,
+            perception_targets=perceptionTargets,
+            robot_state=robotState,
+            text_trust=textTrust))

@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from FunctionTools import AGICoreModule
+from FunctionTools import AGICoreModule, BuildReferenceWeights, BuildReferenceScaleContext
 from ModuleMessagerManager import ModuleDim
 
 
@@ -20,26 +20,28 @@ class CodebookGoalHead(AGICoreModule):
             nn.Linear(contextDim, hidden),
             nn.SiLU(),
             nn.Linear(hidden, self.code_dim),)
-        
+
         self.decoder = nn.Sequential(
             nn.Linear(self.code_dim, hidden),
             nn.SiLU(),
             nn.Linear(hidden, goalDim),)
-        
+
         self.register_buffer("code_usage", torch.full((self.groups, self.codes), 1.0 / self.codes), persistent=True)
 
     @staticmethod
     def StraightThroughOneHot(logits: torch.Tensor) -> torch.Tensor:
         soft = F.softmax(logits, dim=-1)
         idx = soft.argmax(dim=-1, keepdim=True)
-        hard = torch.zeros_like(soft).scatter_(-1, idx, 1.0)
+        hard = torch.zeros_like(soft).scatter_(-1, idx, 1.0) # [B, groups, codes]
         return hard + soft - soft.detach()
 
     def forward(self, context: torch.Tensor) -> Dict[str, torch.Tensor]:
         logits = self.manager(context).view(context.size(0), self.groups, self.codes)
         onehot = self.StraightThroughOneHot(logits)
+
         with torch.no_grad():
             self.code_usage.mul_(0.99).add_(0.01 * onehot.detach().mean(dim=0))
+
         code = onehot.view(context.size(0), self.code_dim)
         goal = self.decoder(code)
         return {"goal": goal, "logits": logits, "code": code, "index": logits.argmax(dim=-1), "usage": self.code_usage}
@@ -62,8 +64,6 @@ class CodebookGoalHead(AGICoreModule):
 
 
 class GoalGrounding(AGICoreModule):
-    """Ground the current short-term goal onto physical slots and candidate subgoals."""
-
     def __init__(
         self,
         goalDim: int = ModuleDim.GoalShortDim,
@@ -76,19 +76,31 @@ class GoalGrounding(AGICoreModule):
         super().__init__()
         self.slot_dim = int(slotDim)
         self.subgoal_steps = int(subgoalSteps)
+
         self.goal_intent_proj = nn.Sequential(
             nn.LayerNorm(int(goalDim) + int(intentDim)),
             nn.Linear(int(goalDim) + int(intentDim), self.slot_dim),
             nn.SiLU(),
             nn.Linear(self.slot_dim, self.slot_dim),)
+
+        reference_context_dim = int(goalDim) + int(intentDim) + 8
+        self.reference_memory_scale_head = nn.Sequential(
+            nn.LayerNorm(reference_context_dim),
+            nn.Linear(reference_context_dim, self.slot_dim),
+            nn.SiLU(),
+            nn.Linear(self.slot_dim, 1),)
+
         self.slot_ground_encoder = nn.Sequential(
             nn.LayerNorm(self.slot_dim + 4),
             nn.Linear(self.slot_dim + 4, self.slot_dim),
             nn.SiLU(),
             nn.Linear(self.slot_dim, self.slot_dim),
             nn.LayerNorm(self.slot_dim),)
+
         self.ground_attn = nn.MultiheadAttention(self.slot_dim, int(numHeads), batch_first=True)
+        self.grounded_query_norm = nn.LayerNorm(self.slot_dim)
         self.no_slot_token = nn.Parameter(torch.randn(1, 1, self.slot_dim) * 0.02)
+
         self.no_slot_head = nn.Sequential(
             nn.LayerNorm(self.slot_dim),
             nn.Linear(self.slot_dim, 1),)
@@ -110,69 +122,99 @@ class GoalGrounding(AGICoreModule):
         self,
         goalEmbed: torch.Tensor,
         intentEmbed: torch.Tensor,
-        physicalState: Dict[str, torch.Tensor],) -> Dict[str, torch.Tensor]:
-        slot_tensor = physicalState["SRaw"]
-        m = physicalState["MphysRaw"]
-        observed = physicalState["Observed"].float()
-        last_seen = physicalState["LastSeen"].float()
-        current_step = last_seen.amax(dim=1, keepdim=True)
-        memory_age = (current_step - last_seen).clamp_min(0.0)
-        memory_recency = torch.exp(-memory_age / 32.0)
-        observed_weight = m * observed
-        memory_weight = 0.5 * m * physicalState["M"] * (1.0 - observed) * memory_recency
-        slot_weight = observed_weight + memory_weight
+        physicalState: Dict[str, torch.Tensor],
+        observedPhysicalState: Dict[str, torch.Tensor],) -> Dict[str, torch.Tensor]:
+        slot_tensor = physicalState["SlotState"]
+        current_step = physicalState["Step"].view(-1, 1).float()
+        goal_intent = torch.cat([goalEmbed, intentEmbed], dim=-1)
+        query_vec = self.goal_intent_proj(goal_intent)
+        reference_context = BuildReferenceScaleContext(
+            observedPhysicalState,
+            query_vec) # [B, 8]
 
-        B, _, _ = slot_tensor.shape
+        memory_scale = torch.sigmoid(self.reference_memory_scale_head(torch.cat([goal_intent, reference_context], dim=-1)))
+
+        reference_weights = BuildReferenceWeights(
+            physicalState,
+            current_step,
+            memoryScale=memory_scale,
+            memoryDecayHorizon=32.0)
+
+        observed_weight = reference_weights.observed_weight
+        memory_weight = reference_weights.memory_weight
+        memory_recency = reference_weights.memory_recency
+        slot_weight = reference_weights.slot_weight
+
         slot_input = torch.cat([
             slot_tensor,
             observed_weight.unsqueeze(-1),
             memory_weight.unsqueeze(-1),
             slot_weight.unsqueeze(-1),
             memory_recency.unsqueeze(-1),], dim=-1)
-        slot_embed = self.slot_ground_encoder(slot_input)
-        masked_slots = slot_embed * slot_weight.unsqueeze(-1)
+
+        slot_embed = self.slot_ground_encoder(slot_input) # [B, K, D]
+        B, _, _ = slot_embed.shape
         no_slot_token = self.no_slot_token.expand(B, 1, self.slot_dim)
-        memory_tokens = torch.cat([masked_slots, no_slot_token], dim=1)
+        memory_tokens = torch.cat([slot_embed, no_slot_token], dim=1) # [B, K + 1, D]
         key_padding = torch.cat([
             slot_weight <= 0.0,
             torch.zeros(B, 1, device=slot_weight.device, dtype=torch.bool),], dim=1)
-        query_vec = self.goal_intent_proj(torch.cat([goalEmbed, intentEmbed], dim=-1))
-        query = query_vec.unsqueeze(1)
-        grounded, attn_weights = self.ground_attn(
-            query,
+
+        grounded, _ = self.ground_attn(
+            query_vec.unsqueeze(1),
             memory_tokens,
             memory_tokens,
             key_padding_mask=key_padding)
-        slot_logits = torch.einsum("bd,bkd->bk", query_vec, slot_embed) / (float(self.slot_dim) ** 0.5)
+        grounded_query = self.grounded_query_norm(query_vec + grounded.squeeze(1))
+
+        subgoal_q = self.subgoal_query.unsqueeze(0).expand(B, self.subgoal_steps, self.slot_dim) # [B, S, D]
+        decoded = self.decomposer(subgoal_q, memory_tokens, memory_key_padding_mask=key_padding)
+        subgoal_skill_logits = self.skill_head(decoded)
+
+        subgoal_step_logits = (
+            self.slot_head(decoded).squeeze(-1)
+            + torch.logsumexp(subgoal_skill_logits, dim=-1)
+            + self.param_head(decoded).tanh().mean(dim=-1))
+
+        subgoal_step_weight = F.softmax(subgoal_step_logits, dim=-1)
+        subgoal_query = (decoded * subgoal_step_weight.unsqueeze(-1)).sum(dim=1)
+
+        slot_logits = torch.einsum("bd,bkd->bk", grounded_query, slot_embed) / (float(self.slot_dim) ** 0.5)
+        slot_logits = slot_logits + torch.einsum("bd,bkd->bk", subgoal_query, slot_embed) / (float(self.slot_dim) ** 0.5)
         slot_logits = slot_logits + slot_weight.clamp_min(1e-6).log()
         slot_logits = slot_logits.masked_fill(slot_weight <= 0.0, -1e9)
-        no_slot_logit = self.no_slot_head(query_vec).squeeze(-1)
+
+        no_slot_logit = self.no_slot_head(grounded_query + subgoal_query).squeeze(-1)
         reference_distribution = F.softmax(torch.cat([slot_logits, no_slot_logit.unsqueeze(-1)], dim=-1), dim=-1)
         referenced = reference_distribution[:, :-1]
         no_slot_prob = reference_distribution[:, -1]
+        referenced_slot_summary = (slot_embed * referenced.unsqueeze(-1)).sum(dim=1)
+
         reference_confidence = referenced.sum(dim=-1)
 
-        subgoal_q = self.subgoal_query.unsqueeze(0).expand(B, self.subgoal_steps, self.slot_dim)
-        decoded = self.decomposer(subgoal_q, memory_tokens, memory_key_padding_mask=key_padding)
         return {
-            "grounded_intention": grounded.squeeze(1),
             "referenced_object_probs": referenced,
             "reference_distribution": reference_distribution,
+            "referenced_slot_summary": referenced_slot_summary,
             "reference_confidence": reference_confidence,
-            "no_slot_prob": no_slot_prob,
-            "observed_reference_weight": observed_weight,
-            "memory_reference_weight": memory_weight,
-            "subgoal_skill_logits": self.skill_head(decoded),
-            "subgoal_slot_logits": self.slot_head(decoded).squeeze(-1),
-            "subgoal_param_delta": self.param_head(decoded),}
+            "no_slot_prob": no_slot_prob,}
 
 
 class TemporalGoalHead(AGICoreModule):
+    """Predict nominal/soft duration and derive a policy hard-deadline grace.
+
+    The existing ``temporal_duration_ms`` label supervises the soft duration.
+    There is no independent hard-timeout label, so the hard deadline is not
+    represented as a learned head.
+    """
+
     def __init__(
         self,
         shortGoalDim: int = ModuleDim.GoalShortDim,
         temporalContextDim: int = ModuleDim.TemporalContextDim,
-        hidden: int = 128,):
+        hidden: int = 128,
+        defaultSoftTimeoutMs: float = 1000.0,
+        defaultHardTimeoutMs: float = 5000.0,):
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(int(shortGoalDim) + int(temporalContextDim)),
@@ -180,32 +222,87 @@ class TemporalGoalHead(AGICoreModule):
             nn.SiLU(),
             nn.Linear(hidden, hidden),
             nn.SiLU(),)
-        self.mode_head = nn.Linear(hidden, ModuleDim.TemporalPrimitiveCount)
-        self.hold_head = nn.Linear(hidden, 1)
-        self.replan_head = nn.Linear(hidden, 1)
-        self.soft_timeout_head = nn.Linear(hidden, 1)
-        self.hard_timeout_head = nn.Linear(hidden, 1)
 
-    def forward(self, gShort: torch.Tensor, temporalContextFeat: torch.Tensor) -> Dict[str, torch.Tensor]:
-        h = self.net(torch.cat([gShort, temporalContextFeat], dim=-1))
+        self.mode_head = nn.Linear(hidden, ModuleDim.TemporalPrimitiveCount)
+        self.soft_timeout_head = nn.Linear(hidden, 1)
+        self.hard_timeout_grace_ms = (
+            float(defaultHardTimeoutMs) - float(defaultSoftTimeoutMs))
+        nn.init.zeros_(self.mode_head.weight)
+        nn.init.zeros_(self.mode_head.bias)
+        nn.init.zeros_(self.soft_timeout_head.weight)
+        with torch.no_grad():
+            soft_seconds = float(defaultSoftTimeoutMs) / 1000.0
+            self.soft_timeout_head.bias.fill_(math.log(math.expm1(soft_seconds)))
+
+    def forward(self, goalTemporal: torch.Tensor, temporalContextFeat: torch.Tensor) -> Dict[str, torch.Tensor]:
+        h = self.net(torch.cat([goalTemporal, temporalContextFeat], dim=-1))
         soft = F.softplus(self.soft_timeout_head(h)).squeeze(-1) * 1000.0
-        hard = soft + F.softplus(self.hard_timeout_head(h)).squeeze(-1) * 1000.0
+        hard = soft + self.hard_timeout_grace_ms
         return {
             "goal_mode_logits": self.mode_head(h),
-            "goal_hold_score": torch.sigmoid(self.hold_head(h)).squeeze(-1),
-            "goal_replan_score": torch.sigmoid(self.replan_head(h)).squeeze(-1),
             "goal_timeout_soft_ms": soft,
             "goal_timeout_hard_ms": hard,}
 
 
+class HierarchicalGoalFusion(AGICoreModule):
+    def __init__(
+        self,
+        ultimateDim: int = ModuleDim.GoalUltimateDim,
+        longDim: int = ModuleDim.GoalLongDim,
+        midDim: int = ModuleDim.GoalMidDim,
+        shortDim: int = ModuleDim.GoalShortDim,
+        fusionDim: int = ModuleDim.GoalShortDim,
+        decisionDim: int = ModuleDim.DecisionBeliefDim,
+        numHeads: int = 4,):
+        super().__init__()
+        self.fusion_dim = int(fusionDim)
+        self.ultimate_proj = nn.Sequential(nn.LayerNorm(int(ultimateDim)), nn.Linear(int(ultimateDim), self.fusion_dim))
+        self.long_proj = nn.Sequential(nn.LayerNorm(int(longDim)), nn.Linear(int(longDim), self.fusion_dim))
+        self.mid_proj = nn.Sequential(nn.LayerNorm(int(midDim)), nn.Linear(int(midDim), self.fusion_dim))
+        self.short_proj = nn.Sequential(nn.LayerNorm(int(shortDim)), nn.Linear(int(shortDim), self.fusion_dim))
+        self.distill_norm = nn.LayerNorm(self.fusion_dim)
+        self.register_buffer("level_decay", torch.tensor([0.125, 0.25, 0.5, 1.0]).view(1, 4, 1), persistent=False)
+        self.role_query = nn.Parameter(torch.randn(3, self.fusion_dim) * 0.02)
+        self.role_attn = nn.MultiheadAttention(self.fusion_dim, int(numHeads), batch_first=True)
+        self.role_norm = nn.LayerNorm(self.fusion_dim)
+        self.symbolic_head = nn.Sequential(
+            nn.LayerNorm(self.fusion_dim),
+            nn.Linear(self.fusion_dim, self.fusion_dim),
+            nn.SiLU(),
+            nn.Linear(self.fusion_dim, int(shortDim)),)
+        self.temporal_head = nn.Sequential(
+            nn.LayerNorm(self.fusion_dim),
+            nn.Linear(self.fusion_dim, self.fusion_dim),
+            nn.SiLU(),
+            nn.Linear(self.fusion_dim, int(shortDim)),)
+        self.decision_head = nn.Sequential(
+            nn.LayerNorm(self.fusion_dim),
+            nn.Linear(self.fusion_dim, int(decisionDim)),
+            nn.SiLU(),
+            nn.Linear(int(decisionDim), int(decisionDim)),
+            nn.LayerNorm(int(decisionDim)),)
+
+    def forward(
+        self,
+        gUltimate: torch.Tensor,
+        gLong: torch.Tensor,
+        gMid: torch.Tensor,
+        gShort: torch.Tensor,) -> Dict[str, torch.Tensor]:
+        ultimate = self.ultimate_proj(gUltimate)
+        long = self.distill_norm(self.long_proj(gLong) + 0.5 * ultimate)
+        mid = self.distill_norm(self.mid_proj(gMid) + 0.5 * long + 0.25 * ultimate)
+        short = self.distill_norm(self.short_proj(gShort) + 0.5 * mid + 0.25 * long + 0.125 * ultimate)
+        tokens = torch.stack([ultimate, long, mid, short], dim=1) * self.level_decay
+        query = self.role_query.unsqueeze(0).expand(gShort.size(0), 3, self.fusion_dim)
+        role, _ = self.role_attn(query, tokens, tokens)
+        role = self.role_norm(role + query)
+        return {
+            "goal_symbolic": self.symbolic_head(role[:, 0] + short),
+            "goal_temporal": self.temporal_head(role[:, 1] + 0.5 * (mid + short)),
+            "goal_decision": self.decision_head(role[:, 2]),}
+
+
 class FourLevelGoalManager(AGICoreModule):
-    """Ultimate / long / mid / short hierarchical goal stack.
-
-    g_U is the stable mission/ultimate objective. g_L and g_M decompose that mission
-    into current task and phase goals. g_S is continuous and drives the immediate
-    action-level objective.
-    """
-
     def __init__(
         self,
         worldLatentDim: int,
@@ -214,8 +311,7 @@ class FourLevelGoalManager(AGICoreModule):
         ultimateDim: int = ModuleDim.GoalUltimateDim,
         longDim: int = ModuleDim.GoalLongDim,
         midDim: int = ModuleDim.GoalMidDim,
-        shortDim: int = ModuleDim.GoalShortDim,
-        refinementDim: int = ModuleDim.RefinementDim,):
+        shortDim: int = ModuleDim.GoalShortDim,):
         super().__init__()
         self.ultimate_dim = int(ultimateDim)
         self.long_dim = int(longDim)
@@ -228,159 +324,82 @@ class FourLevelGoalManager(AGICoreModule):
             ModuleDim.GoalUltimateCodebookGroups,
             ModuleDim.GoalUltimateCodebookCodes,
             self.ultimate_dim)
+
         self.long_head = CodebookGoalHead(
             ctx_dim + self.ultimate_dim,
             ModuleDim.GoalLongCodebookGroups,
             ModuleDim.GoalLongCodebookCodes,
             self.long_dim)
+
         self.mid_head = CodebookGoalHead(
             ctx_dim + self.ultimate_dim + self.long_dim,
             ModuleDim.GoalMidCodebookGroups,
             ModuleDim.GoalMidCodebookCodes,
             self.mid_dim)
 
-        short_in = self.ultimate_dim + self.mid_dim + pstSummaryDim + refinementDim
+        short_in = self.ultimate_dim + self.long_dim + self.mid_dim + pstSummaryDim
         self.short_head = nn.Sequential(
             nn.LayerNorm(short_in),
             nn.Linear(short_in, 256),
             nn.SiLU(),
             nn.Linear(256, self.short_dim),)
 
-        # decode goals back into world-model latent space for cosine-progress reward
         self.mid_to_world = nn.Linear(self.mid_dim, worldLatentDim)
-        # Anchor language intent onto the mission goal, so user/task text can shape
-        # the stable objective above the task/phase decomposition.
-        self.intent_to_ultimate = nn.Linear(intentDim, self.ultimate_dim)
+        self.goal_fusion = HierarchicalGoalFusion(
+            ultimateDim=self.ultimate_dim,
+            longDim=self.long_dim,
+            midDim=self.mid_dim,
+            shortDim=self.short_dim)
         self.temporal_goal_head = TemporalGoalHead(shortGoalDim=self.short_dim)
 
     def forward(
         self,
-        worldLatent: torch.Tensor,
-        pstSummary: torch.Tensor,
-        intentEmbed: torch.Tensor,
-        refinementDir: torch.Tensor,) -> Dict[str, torch.Tensor]:
+        worldLatent: torch.Tensor, # [B, WorldFeat]
+        pstSummary: torch.Tensor, # [B, PstSlotDim]
+        intentEmbed: torch.Tensor, # [B, IntentionFeat]
+        ) -> Dict[str, torch.Tensor]:
         ctx = torch.cat([worldLatent, pstSummary, intentEmbed], dim=-1)
         ultimate_out = self.ultimate_head(ctx)
+
         long_out = self.long_head(torch.cat([ctx, ultimate_out["goal"]], dim=-1))
         mid_out = self.mid_head(torch.cat([ctx, ultimate_out["goal"], long_out["goal"]], dim=-1))
-        g_short = self.short_head(torch.cat([ultimate_out["goal"], mid_out["goal"], pstSummary, refinementDir], dim=-1))
+        g_short = self.short_head(torch.cat([ultimate_out["goal"], long_out["goal"], mid_out["goal"], pstSummary], dim=-1))
+        fused = self.FuseGoals(ultimate_out["goal"], long_out["goal"], mid_out["goal"], g_short)
 
         return {
             "g_ultimate": ultimate_out["goal"],
             "g_long": long_out["goal"],
             "g_mid": mid_out["goal"],
             "g_short": g_short,
+            "goal_symbolic": fused["goal_symbolic"],
+            "goal_temporal": fused["goal_temporal"],
+            "goal_decision": fused["goal_decision"],
             "ultimate_logits": ultimate_out["logits"],
             "long_logits": long_out["logits"],
-            "mid_logits": mid_out["logits"],
-            "ultimate_index": ultimate_out["index"],
-            "long_index": long_out["index"],
-            "mid_index": mid_out["index"],
-            "mid_world_goal": self.mid_to_world(mid_out["goal"]),
-            "intent_ultimate_anchor": self.intent_to_ultimate(intentEmbed),}
+            "mid_logits": mid_out["logits"],}
 
-    def TemporalGoal(self, gShort: torch.Tensor, temporalContextFeat: torch.Tensor) -> Dict[str, torch.Tensor]:
-        return self.temporal_goal_head(gShort, temporalContextFeat)
+    def TemporalGoal(self, goalTemporal: torch.Tensor, temporalContextFeat: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return self.temporal_goal_head(goalTemporal, temporalContextFeat)
 
     def ShortGoal(
         self,
         gUltimate: torch.Tensor,
+        gLong: torch.Tensor,
         gMid: torch.Tensor,
-        pstSummary: torch.Tensor,
-        refinementDir: torch.Tensor,) -> torch.Tensor:
-        return self.short_head(torch.cat([gUltimate, gMid, pstSummary, refinementDir], dim=-1))
+        pstSummary: torch.Tensor,) -> torch.Tensor:
+        return self.short_head(torch.cat([gUltimate, gLong, gMid, pstSummary], dim=-1))
 
-    def AlignmentLoss(self, gUltimate: torch.Tensor, intentEmbed: torch.Tensor) -> torch.Tensor:
-        # 10% of the gradient flows into g_ultimate so language can reshape the mission space.
-        anchored = 0.9 * gUltimate.detach() + 0.1 * gUltimate
-        return F.mse_loss(self.intent_to_ultimate(intentEmbed), anchored)
-
-    def CosineProgress(self, worldDelta: torch.Tensor, gMid: torch.Tensor) -> torch.Tensor:
-        return F.cosine_similarity(worldDelta, self.mid_to_world(gMid), dim=-1)
+    def FuseGoals(
+        self,
+        gUltimate: torch.Tensor,
+        gLong: torch.Tensor,
+        gMid: torch.Tensor,
+        gShort: torch.Tensor,) -> Dict[str, torch.Tensor]:
+        return self.goal_fusion(gUltimate, gLong, gMid, gShort)
 
     def ProjectedProgress(self, worldDelta: torch.Tensor, gMid: torch.Tensor) -> torch.Tensor:
-        """Magnitude-aware progress: length of the world delta projected on the
-        decoded mid-goal direction."""
         direction = F.normalize(self.mid_to_world(gMid), dim=-1, eps=1e-6)
         return (worldDelta * direction).sum(dim=-1)
-
-
-class SatisfactionCheckModule(AGICoreModule):
-    """Check whether the short-term goal is satisfied and emit the next refinement direction."""
-
-    def __init__(
-        self,
-        shortGoalDim: int = ModuleDim.GoalShortDim,
-        slotDim: int = ModuleDim.PstSlotDim,
-        endpointPoseFeatDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
-        refinementDim: int = ModuleDim.RefinementDim,
-        hidden: int = 128,
-        numHeads: int = 4,
-        numLayers: int = 2,
-        satisfactionThreshold: float = 0.85,):
-        super().__init__()
-        self.hidden = int(hidden)
-        self.endpoint_pose_feat_dim = int(endpointPoseFeatDim)
-        self.satisfaction_threshold = float(satisfactionThreshold)
-        self.slot_proj = nn.Linear(slotDim, self.hidden)
-        self.goal_token = nn.Linear(shortGoalDim, self.hidden)
-        self.endpoint_token = nn.Linear(self.endpoint_pose_feat_dim, self.hidden)
-        self.endpoint_summary_token = nn.Linear(self.endpoint_pose_feat_dim, self.hidden)
-
-        layer = nn.TransformerEncoderLayer(
-            d_model=self.hidden,
-            nhead=int(numHeads),
-            dim_feedforward=self.hidden * 4,
-            dropout=0.05,
-            batch_first=True,
-            norm_first=True,)
-        self.encoder = nn.TransformerEncoder(layer, num_layers=int(numLayers))
-
-        self.sat_head = nn.Linear(self.hidden, 1)
-        self.refine_head = nn.Linear(self.hidden, int(refinementDim))
-        # Calibration temperature trained jointly with the BCE success loss.
-        self.sat_log_temperature = nn.Parameter(torch.zeros(()))
-
-    def forward(
-        self,
-        gShort: torch.Tensor,
-        slotTensor: torch.Tensor,
-        slotMask: torch.Tensor,
-        endpointPoseTokens: torch.Tensor,
-        endpointPoseFeat: torch.Tensor,) -> Dict[str, torch.Tensor]:
-        B, _, _ = slotTensor.shape
-        slots = self.slot_proj(slotTensor)
-        goal = self.goal_token(gShort).unsqueeze(1)
-        endpoint_summary = self.endpoint_summary_token(endpointPoseFeat).unsqueeze(1)
-        endpoint_tokens = self.endpoint_token(endpointPoseTokens)
-        tokens = torch.cat([goal, endpoint_summary, endpoint_tokens, slots], dim=1)
-
-        pad = torch.zeros(B, 2 + endpoint_tokens.size(1), device=slotMask.device, dtype=torch.bool)
-        key_padding = torch.cat([pad, slotMask <= 0.5], dim=1)
-        encoded = self.encoder(tokens, src_key_padding_mask=key_padding)
-
-        summary = encoded[:, 0]
-        sat_logits = self.sat_head(summary).squeeze(-1) * torch.exp(-self.sat_log_temperature)
-        return {
-            "sat_logits": sat_logits,
-            "p_satisfied": torch.sigmoid(sat_logits),
-            "refinement_dir": self.refine_head(summary),}
-
-    def IsNotSatisfied(self, pSatisfied: torch.Tensor) -> torch.Tensor:
-        return pSatisfied < self.satisfaction_threshold
-
-    def SuccessLoss(self, satLogits: torch.Tensor, successLabel: torch.Tensor) -> torch.Tensor:
-        return F.binary_cross_entropy_with_logits(satLogits, successLabel)
-
-    def SatisfactionLoss(
-        self,
-        satLogits: torch.Tensor,
-        successLabel: torch.Tensor,) -> Dict[str, torch.Tensor]:
-        loss = self.SuccessLoss(satLogits, successLabel)
-        return {
-            "total": loss,
-            "sat_success_loss": loss,
-            "sat_target": successLabel,}
 
 
 class TestGoalMTool:
@@ -400,8 +419,7 @@ class TestGoalMTool:
         return {
             "worldLatent": torch.randn(B, self.WorldLatentDim(), device=self.device),
             "pstSummary": torch.randn(B, ModuleDim.PstSlotDim, device=self.device),
-            "intentEmbed": torch.randn(B, ModuleDim.IntentionFeat, device=self.device),
-            "refinementDir": torch.randn(B, ModuleDim.RefinementDim, device=self.device),}
+            "intentEmbed": torch.randn(B, ModuleDim.IntentionFeat, device=self.device),}
 
     def AssertFinite(self, value: torch.Tensor, name: str) -> None:
         assert torch.isfinite(value).all(), f"{name} contains non-finite values"
@@ -417,6 +435,9 @@ class TestGoalMTool:
             assert tuple(out["g_long"].shape) == (B, ModuleDim.GoalLongDim)
             assert tuple(out["g_mid"].shape) == (B, ModuleDim.GoalMidDim)
             assert tuple(out["g_short"].shape) == (B, ModuleDim.GoalShortDim)
+            assert tuple(out["goal_symbolic"].shape) == (B, ModuleDim.GoalShortDim)
+            assert tuple(out["goal_temporal"].shape) == (B, ModuleDim.GoalShortDim)
+            assert tuple(out["goal_decision"].shape) == (B, ModuleDim.DecisionBeliefDim)
             assert tuple(out["ultimate_logits"].shape) == (
                 B,
                 ModuleDim.GoalUltimateCodebookGroups,
@@ -429,11 +450,6 @@ class TestGoalMTool:
                 B,
                 ModuleDim.GoalMidCodebookGroups,
                 ModuleDim.GoalMidCodebookCodes)
-            assert tuple(out["ultimate_index"].shape) == (B, ModuleDim.GoalUltimateCodebookGroups)
-            assert tuple(out["long_index"].shape) == (B, ModuleDim.GoalLongCodebookGroups)
-            assert tuple(out["mid_index"].shape) == (B, ModuleDim.GoalMidCodebookGroups)
-            assert tuple(out["mid_world_goal"].shape) == (B, self.WorldLatentDim())
-            assert tuple(out["intent_ultimate_anchor"].shape) == (B, ModuleDim.GoalUltimateDim)
             for name, value in out.items():
                 self.AssertFinite(value.float(), f"FourLevelGoalManager {name}")
             print("FourLevelGoalManager forward shape test passed.")
@@ -451,9 +467,9 @@ class TestGoalMTool:
                 out = manager(**inputs)
                 fast = manager.ShortGoal(
                     out["g_ultimate"],
+                    out["g_long"],
                     out["g_mid"],
-                    inputs["pstSummary"],
-                    inputs["refinementDir"])
+                    inputs["pstSummary"])
             assert torch.allclose(fast, out["g_short"], atol=1e-6)
             print("FourLevelGoalManager ShortGoal fast-path test passed.")
             return True
@@ -469,18 +485,50 @@ class TestGoalMTool:
             temporal_context = torch.randn(B, ModuleDim.TemporalContextDim, device=self.device)
             with torch.no_grad():
                 goals = manager(**inputs)
-                out = manager.TemporalGoal(goals["g_short"], temporal_context)
+                out = manager.TemporalGoal(goals["goal_temporal"], temporal_context)
             assert tuple(out["goal_mode_logits"].shape) == (B, ModuleDim.TemporalPrimitiveCount)
-            assert tuple(out["goal_hold_score"].shape) == (B,)
-            assert tuple(out["goal_replan_score"].shape) == (B,)
             assert tuple(out["goal_timeout_soft_ms"].shape) == (B,)
             assert tuple(out["goal_timeout_hard_ms"].shape) == (B,)
+            assert torch.count_nonzero(out["goal_mode_logits"]).item() == 0
+            assert not hasattr(manager.temporal_goal_head, "hard_timeout_head")
+            assert manager.temporal_goal_head.hard_timeout_grace_ms == 4000.0
+            assert torch.allclose(
+                out["goal_timeout_soft_ms"],
+                torch.full_like(out["goal_timeout_soft_ms"], 1000.0),
+                atol=1e-4)
+            assert torch.allclose(
+                out["goal_timeout_hard_ms"],
+                torch.full_like(out["goal_timeout_hard_ms"], 5000.0),
+                atol=1e-4)
             for name, value in out.items():
                 self.AssertFinite(value, f"TemporalGoal {name}")
             print("TemporalGoal shape test passed.")
             return True
         except Exception as e:
             print(f"TemporalGoal shape test failed: {type(e).__name__}: {e}")
+            return False
+
+    def TestTemporalTimeoutGradientSemantics(self) -> bool:
+        try:
+            B = 2
+            head = TemporalGoalHead(
+                shortGoalDim=8,
+                temporalContextDim=ModuleDim.TemporalContextDim,
+                hidden=16).to(self.device)
+            out = head(
+                torch.randn(B, 8, device=self.device),
+                torch.randn(B, ModuleDim.TemporalContextDim, device=self.device))
+            out["goal_timeout_soft_ms"].mean().backward()
+            assert head.soft_timeout_head.weight.grad is not None
+            assert head.soft_timeout_head.bias.grad is not None
+            assert not hasattr(head, "hard_timeout_head")
+            assert torch.allclose(
+                out["goal_timeout_hard_ms"] - out["goal_timeout_soft_ms"],
+                torch.full_like(out["goal_timeout_soft_ms"], 4000.0))
+            print("TemporalGoal timeout gradient semantics passed.")
+            return True
+        except Exception as e:
+            print(f"TemporalGoal timeout gradient semantics failed: {type(e).__name__}: {e}")
             return False
 
     def TestGoalGroundingShapes(self) -> bool:
@@ -490,51 +538,26 @@ class TestGoalMTool:
             goal = torch.randn(B, ModuleDim.GoalShortDim, device=self.device)
             intent = torch.randn(B, ModuleDim.IntentionFeat, device=self.device)
             physical_state = {
-                "SRaw": torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
+                "SlotState": torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
                 "MphysRaw": torch.ones(B, K, device=self.device),
                 "Observed": torch.tensor([[1, 1, 0, 0], [1, 0, 1, 0]], device=self.device),
                 "LastSeen": torch.tensor([[8, 8, 4, 0], [8, 3, 8, 0]], device=self.device),
-                "M": torch.ones(B, K, device=self.device),}
+                "Step": torch.full((B,), 8, device=self.device, dtype=torch.long),
+                "SlotPresence": torch.ones(B, K, device=self.device),
+                "ObservedSlotMask": torch.ones(B, K, device=self.device),}
             with torch.no_grad():
-                out = grounding(goal, intent, physical_state)
-            assert tuple(out["grounded_intention"].shape) == (B, ModuleDim.PstSlotDim)
+                out = grounding(goal, intent, physical_state, physical_state)
             assert tuple(out["referenced_object_probs"].shape) == (B, K)
             assert tuple(out["reference_distribution"].shape) == (B, K + 1)
-            assert tuple(out["subgoal_skill_logits"].shape) == (B, grounding.subgoal_steps, ModuleDim.UsageNumSkills)
-            assert tuple(out["subgoal_slot_logits"].shape) == (B, grounding.subgoal_steps)
-            assert tuple(out["subgoal_param_delta"].shape) == (B, grounding.subgoal_steps, ModuleDim.UsageParamDim)
+            assert tuple(out["referenced_slot_summary"].shape) == (B, ModuleDim.PstSlotDim)
+            assert tuple(out["reference_confidence"].shape) == (B,)
+            assert tuple(out["no_slot_prob"].shape) == (B,)
             for name, value in out.items():
                 self.AssertFinite(value, f"GoalGrounding {name}")
             print("GoalGrounding shape test passed.")
             return True
         except Exception as e:
             print(f"GoalGrounding shape test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestSatisfactionCheckShapesAndLoss(self) -> bool:
-        try:
-            B, K = 2, 4
-            model = SatisfactionCheckModule().to(self.device)
-            out = model(
-                torch.randn(B, ModuleDim.GoalShortDim, device=self.device),
-                torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
-                torch.ones(B, K, device=self.device),
-                torch.randn(B, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseFeatDim, device=self.device),
-                torch.randn(B, ModuleDim.DecisionEndpointPoseFeatDim, device=self.device))
-            assert tuple(out["sat_logits"].shape) == (B,)
-            assert tuple(out["p_satisfied"].shape) == (B,)
-            assert tuple(out["refinement_dir"].shape) == (B, ModuleDim.RefinementDim)
-            losses = model.SatisfactionLoss(out["sat_logits"], torch.rand(B, device=self.device))
-            losses["total"].backward()
-            grad_norm = sum(
-                float(p.grad.detach().abs().sum().item())
-                for p in model.parameters()
-                if p.grad is not None)
-            assert grad_norm > 0.0
-            print("SatisfactionCheckModule shape/loss test passed.")
-            return True
-        except Exception as e:
-            print(f"SatisfactionCheckModule shape/loss test failed: {type(e).__name__}: {e}")
             return False
 
     def TestGoalManagerBackward(self) -> bool:
@@ -547,7 +570,9 @@ class TestGoalMTool:
                 out["g_mid"])
             loss = (
                 out["g_short"].square().mean()
-                + manager.AlignmentLoss(out["g_ultimate"], inputs["intentEmbed"])
+                + 0.01 * out["goal_symbolic"].square().mean()
+                + 0.01 * out["goal_temporal"].square().mean()
+                + 0.01 * out["goal_decision"].square().mean()
                 + 0.01 * manager.ultimate_head.UtilizationLoss(out["ultimate_logits"])
                 + 0.01 * manager.long_head.UtilizationLoss(out["long_logits"])
                 + 0.01 * manager.mid_head.UtilizationLoss(out["mid_logits"])
@@ -569,8 +594,8 @@ class TestGoalMTool:
             "FourLevelForwardShapes": self.TestFourLevelForwardShapes(),
             "ShortGoalFastPathMatchesForward": self.TestShortGoalFastPathMatchesForward(),
             "TemporalGoalShapes": self.TestTemporalGoalShapes(),
+            "TemporalTimeoutGradientSemantics": self.TestTemporalTimeoutGradientSemantics(),
             "GoalGroundingShapes": self.TestGoalGroundingShapes(),
-            "SatisfactionCheckShapesAndLoss": self.TestSatisfactionCheckShapesAndLoss(),
             "GoalManagerBackward": self.TestGoalManagerBackward(),}
         passed = sum(1 for value in results.values() if value)
         print(f"\n[GoalModule Tests] {passed}/{len(results)} passed.")
