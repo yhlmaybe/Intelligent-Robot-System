@@ -241,21 +241,14 @@ class TemporalExecutionGateExtractor(AGICoreModule):
             + active.decision_tensor * use_active
             + hold.decision_tensor * use_hold)
         
-        pose_candidate = w_candidate.view(-1, 1, 1)
-        pose_active = w_active.view(-1, 1, 1)
-        pose_hold = w_hold.view(-1, 1, 1)
-        
         target_pose = (
-            candidate.target_endpoint_pose * pose_candidate
-            + active.target_endpoint_pose * pose_active
-            + hold.target_endpoint_pose * pose_hold)
+            candidate.target_endpoint_pose * use_candidate
+            + active.target_endpoint_pose * use_active
+            + hold.target_endpoint_pose * use_hold)
         
         flat_candidate = w_candidate.view(-1, 1)
         flat_active = w_active.view(-1, 1)
         flat_hold = w_hold.view(-1, 1)
-        gripper_candidate = flat_candidate.unsqueeze(-1)
-        gripper_active = flat_active.unsqueeze(-1)
-        gripper_hold = flat_hold.unsqueeze(-1)
         select_candidate = w_candidate.detach() > 0.5
         select_active = w_active.detach() > 0.5
         select_hold = w_hold.detach() > 0.5
@@ -265,7 +258,7 @@ class TemporalExecutionGateExtractor(AGICoreModule):
             target_endpoint_pose=target_pose,
             endpoint_names=candidate.endpoint_names,
             decision_dof_mask=candidate.decision_dof_mask,
-            gripper_cmd=candidate.gripper_cmd * gripper_candidate + active.gripper_cmd * gripper_active + hold.gripper_cmd * gripper_hold,
+            gripper_cmd=candidate.gripper_cmd * use_candidate + active.gripper_cmd * use_active + hold.gripper_cmd * use_hold,
             gripper_valid=(
                 (candidate.gripper_valid & select_candidate)
                 | (active.gripper_valid & select_active)
@@ -294,7 +287,8 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         invoke_delta = decisionTemporal["invoke_delta"].view(-1)
         reference_drift = decisionTemporal["reference_drift"].view(-1)
  
-        drift_signal = (invokeDrift.view(-1) / self.drift_threshold).clamp(0.0, 1.0)
+        invoke_drift = invokeDrift.view(-1)
+        drift_signal = (invoke_drift / self.drift_threshold).clamp(0.0, 1.0)
         observe_needed = temporalContext.no_slot_prob * (1.0 - temporalContext.reference_confidence)
         continue_gate = (
             active
@@ -355,11 +349,12 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         execution_kind_scores[:, CONTINUE] = execution_kind_scores[:, CONTINUE].masked_fill(
             ~continue_legal,
             -torch.inf)
+        inactive_mask = active <= 0.5
         execution_kind_scores[:, CANCEL] = execution_kind_scores[:, CANCEL].masked_fill(
-            active <= 0.5,
+            inactive_mask,
             -torch.inf)
         execution_kind_scores[:, REDISPATCH] = execution_kind_scores[:, REDISPATCH].masked_fill(
-            active <= 0.5,
+            inactive_mask,
             -torch.inf)
         kind_id = execution_kind_scores.argmax(dim=-1)
         selects_candidate = (kind_id == DISPATCH) | (kind_id == REDISPATCH)
@@ -427,7 +422,7 @@ class TemporalExecutionGateExtractor(AGICoreModule):
             operator_changed=operator_changed,
             invoke_delta=invoke_delta,
             reference_drift=reference_drift,
-            invoke_drift=invokeDrift.view(-1),
+            invoke_drift=invoke_drift,
             motion_command=motion_command,)
 
 

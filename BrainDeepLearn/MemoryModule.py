@@ -1063,7 +1063,7 @@ class FusionMoE(AGICoreModule):
         a = F.softmax((logits / t).float(), dim=-1) # [B, numExperts]
 
         if self.training:
-            importance = a.float().mean(dim=0) 
+            importance = a.mean(dim=0)
             self.aux_loss  = float(self.numExperts) * (importance.pow(2).sum())
         else:
             self.aux_loss = x.new_zeros(())

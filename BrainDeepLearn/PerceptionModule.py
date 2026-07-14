@@ -55,6 +55,98 @@ def FrobeniusCapPerSample(mem: torch.Tensor, cap: Optional[float]):
         mem.mul_(scale.view(B, *([1] * (mem.dim() - 1))))
 
 
+def SynchronizeDynamicAdapterTopology(
+    module: nn.Module,
+    stateDict: Dict[str, torch.Tensor],
+    prefix: str,
+    errorMessages: List[str],
+    shapeValidator,) -> None:
+    """Restore the ParameterList topology before PyTorch copies adapter tensors."""
+    names = ("A_list", "B_list", "alpha")
+    topology_key = f"{prefix}topology_count"
+
+    def saved_indices(name: str) -> set:
+        key_prefix = f"{prefix}{name}."
+        return {
+            int(key[len(key_prefix):])
+            for key in stateDict
+            if key.startswith(key_prefix) and key[len(key_prefix):].isdigit()}
+
+    index_sets = [saved_indices(name) for name in names]
+    marker_present = topology_key in stateDict
+    saved_count = (
+        int(torch.as_tensor(stateDict[topology_key]).item())
+        if marker_present
+        else None)
+    if not any(index_sets):
+        if marker_present:
+            if saved_count != 0:
+                errorMessages.append(
+                    f"{prefix[:-1]} topology_count={saved_count} has no adapter entries")
+                return
+            module.A_list = nn.ParameterList()
+            module.B_list = nn.ParameterList()
+            module.alpha = nn.ParameterList()
+            module.topology_count.zero_()
+        else:
+            # A marker-free state may be a deliberate partial update or an old
+            # checkpoint. Preserve committed ranks and inject the local marker
+            # so strict legacy loads do not fail on this newly added buffer.
+            stateDict[topology_key] = module.topology_count.new_tensor(
+                len(module.A_list))
+        return
+
+    expected = set(range(len(index_sets[0])))
+    if any(indices != expected for indices in index_sets):
+        errorMessages.append(
+            f"{prefix[:-1]} has inconsistent dynamic adapter topology: "
+            f"A={sorted(index_sets[0])}, B={sorted(index_sets[1])}, "
+            f"alpha={sorted(index_sets[2])}")
+        return
+    if marker_present and saved_count != len(expected):
+        errorMessages.append(
+            f"{prefix[:-1]} topology_count={saved_count} does not match "
+            f"{len(expected)} saved adapter entries")
+        return
+    if not marker_present:
+        stateDict[topology_key] = module.topology_count.new_tensor(len(expected))
+
+    saved_shapes = []
+    for index in sorted(expected):
+        a_value = stateDict[f"{prefix}A_list.{index}"]
+        b_value = stateDict[f"{prefix}B_list.{index}"]
+        scale = stateDict[f"{prefix}alpha.{index}"]
+        if not shapeValidator(a_value, b_value, scale):
+            errorMessages.append(
+                f"{prefix[:-1]} dynamic adapter entry {index} has invalid shapes: "
+                f"A={tuple(a_value.shape)}, B={tuple(b_value.shape)}, "
+                f"alpha={tuple(scale.shape)}")
+            return
+        saved_shapes.append((int(a_value.size(0)), tuple(scale.shape)))
+
+    current_shapes = [
+        (int(a_value.size(0)), tuple(scale.shape))
+        for a_value, scale in zip(module.A_list, module.alpha)]
+    if current_shapes == saved_shapes:
+        module.topology_count.fill_(len(saved_shapes))
+        return
+
+    module.A_list = nn.ParameterList()
+    module.B_list = nn.ParameterList()
+    module.alpha = nn.ParameterList()
+    reference = (
+        module.target.weight
+        if hasattr(module, "target")
+        else module.anchor_)
+    for rank, scale_shape in saved_shapes:
+        scale = torch.zeros(
+            scale_shape,
+            device=reference.device,
+            dtype=reference.dtype)
+        module.Grow(rank, init={"scale": scale}, freezeOld=True)
+    module.topology_count.fill_(len(saved_shapes))
+
+
 class GrowableLoRAConv2d(nn.Module):
     def __init__(self, targetConv: nn.Conv2d):
         super().__init__()
@@ -62,9 +154,41 @@ class GrowableLoRAConv2d(nn.Module):
         self.A_list = nn.ParameterList() 
         self.B_list = nn.ParameterList() 
         self.alpha = nn.ParameterList()
+        self.register_buffer(
+            "topology_count",
+            torch.zeros((), dtype=torch.int64),
+            persistent=True)
 
         w = self.target.weight # [cout, cin, kh, kw]
         self.cout, self.cin, self.kh, self.kw = w.shape
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,):
+        SynchronizeDynamicAdapterTopology(
+            self,
+            state_dict,
+            prefix,
+            error_msgs,
+            lambda a, b, s: (
+                a.dim() == 2
+                and tuple(a.shape[1:]) == (self.cin * self.kh * self.kw,)
+                and tuple(b.shape) == (self.cout, int(a.size(0)))
+                and s.numel() == 1))
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs)
 
     @torch.no_grad()
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
@@ -88,6 +212,7 @@ class GrowableLoRAConv2d(nn.Module):
         self.A_list.append(A)
         self.B_list.append(B)
         self.alpha.append(s)
+        self.topology_count.fill_(len(self.A_list))
 
     def DeltaWeight(self):
         if len(self.A_list) == 0:
@@ -118,6 +243,38 @@ class GrowableConv1x1Adapter(AGICoreModule):
         self.A_list = nn.ParameterList() 
         self.B_list = nn.ParameterList() 
         self.alpha = nn.ParameterList()
+        self.register_buffer(
+            "topology_count",
+            torch.zeros((), dtype=torch.int64),
+            persistent=True)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,):
+        SynchronizeDynamicAdapterTopology(
+            self,
+            state_dict,
+            prefix,
+            error_msgs,
+            lambda a, b, s: (
+                a.dim() == 4
+                and tuple(a.shape[1:]) == (self.C, 1, 1)
+                and tuple(b.shape) == (self.C, int(a.size(0)), 1, 1)
+                and s.numel() == 1))
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs)
 
     @torch.no_grad()
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
@@ -139,6 +296,7 @@ class GrowableConv1x1Adapter(AGICoreModule):
         self.A_list.append(A)
         self.B_list.append(B)
         self.alpha.append(s)
+        self.topology_count.fill_(len(self.A_list))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if len(self.A_list) == 0:
@@ -158,6 +316,38 @@ class GrowableTokenAdapter(AGICoreModule):
         self.A_list = nn.ParameterList()
         self.B_list = nn.ParameterList()
         self.alpha = nn.ParameterList()
+        self.register_buffer(
+            "topology_count",
+            torch.zeros((), dtype=torch.int64),
+            persistent=True)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,):
+        SynchronizeDynamicAdapterTopology(
+            self,
+            state_dict,
+            prefix,
+            error_msgs,
+            lambda a, b, s: (
+                a.dim() == 2
+                and tuple(a.shape[1:]) == (self.D,)
+                and tuple(b.shape) == (self.D, int(a.size(0)))
+                and s.numel() == 1))
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs)
 
     @torch.no_grad()
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
@@ -179,6 +369,7 @@ class GrowableTokenAdapter(AGICoreModule):
         self.A_list.append(A)
         self.B_list.append(B)
         self.alpha.append(s)
+        self.topology_count.fill_(len(self.A_list))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if len(self.A_list) == 0:
@@ -231,6 +422,34 @@ class SheafGaugeConv2d(nn.Conv2d):
 
         self.gauge_scale = float(gauge_scale)
         self.gauge_bias_scale = float(gauge_bias_scale)
+        self._gauge_eval_active = False
+        self.RefreshGaugeExecutionFlag()
+        self.register_load_state_dict_post_hook(
+            self.RefreshGaugeExecutionAfterLoad)
+
+    @torch.no_grad()
+    def RefreshGaugeExecutionFlag(self) -> None:
+        self._gauge_eval_active = any(
+            bool(torch.count_nonzero(parameter.detach()).item())
+            for parameter in (
+                self.gauge_gamma.weight,
+                self.gauge_gamma.bias,
+                self.gauge_beta.weight,
+                self.gauge_beta.bias))
+
+    def RefreshGaugeExecutionAfterLoad(
+        self,
+        module: nn.Module,
+        incompatibleKeys: Any,
+        ) -> None:
+        del module, incompatibleKeys
+        self.RefreshGaugeExecutionFlag()
+
+    def train(self, mode: bool = True):
+        result = super().train(mode)
+        if not mode:
+            self.RefreshGaugeExecutionFlag()
+        return result
 
     def Shift(self, x: torch.Tensor, dim: int, step: int) -> torch.Tensor:
         if step == 0:
@@ -249,8 +468,13 @@ class SheafGaugeConv2d(nn.Conv2d):
     def SheafStep(self, x: torch.Tensor) -> torch.Tensor:
         if self.sheaf_iters <= 0:
             return x
-        g_h = self.sheaf_gain_h.view(1, -1, 1, 1)
-        g_v = self.sheaf_gain_v.view(1, -1, 1, 1)
+        g_h = F.softplus(self.sheaf_gain_h).view(1, -1, 1, 1)
+        g_v = F.softplus(self.sheaf_gain_v).view(1, -1, 1, 1)
+        gain_sum = (g_h + g_v).clamp_min(self.eps)
+        gain_scale = gain_sum.clamp_min(1.0)
+        g_h = g_h / gain_scale
+        g_v = g_v / gain_scale
+        alpha = 0.24 * torch.sigmoid(self.sheaf_alpha)
 
         x_cur = x
         for _ in range(self.sheaf_iters):
@@ -263,10 +487,12 @@ class SheafGaugeConv2d(nn.Conv2d):
             v_mean = 0.5 * (up + down)
 
             msg = g_h * (h_mean - x_cur) + g_v * (v_mean - x_cur)
-            x_cur = x_cur + self.sheaf_alpha * msg
+            x_cur = x_cur + alpha * msg
         return x_cur
 
     def GaugeStep(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training and not self._gauge_eval_active:
+            return x
         mean = x.mean(dim=(-2, -1), keepdim=True)
         var = x.var(dim=(-2, -1), keepdim=True, unbiased=False)
         x_norm = (x - mean) / (var + self.eps).sqrt()
@@ -308,7 +534,8 @@ class HebbianConv2d(AGICoreModule):
         applyScale: float = 0.25,
         memNormCap: Optional[float] = 1.0,
         bias: bool = False,
-        useHebbian: bool = True,):
+        useHebbian: bool = True,
+        finiteDiagnostics: bool = False,):
         super().__init__()
         self.kernel_size = kernelSize if isinstance(kernelSize, tuple) else (kernelSize, kernelSize)
         self.stride = int(stride)
@@ -330,61 +557,119 @@ class HebbianConv2d(AGICoreModule):
         self.apply_scale = float(applyScale)
         self.mem_norm_cap = memNormCap
         self.use_hebbian = bool(useHebbian)
+        self.hebbian_capable = bool(useHebbian)
+        self.hebbian_update_period = 1
+        self._hebbian_update_step = 0
+        self.finite_diagnostics = bool(finiteDiagnostics)
 
-        self.register_buffer("hebb_memory", torch.empty(0), persistent=True)
+        # Per-batch plasticity is transient runtime state. Keeping it out of
+        # state_dict prevents deployment artifacts from scaling with batch and
+        # spatial kernel size while leaving learned convolution weights intact.
+        self.register_buffer("hebb_memory", torch.empty(0), persistent=False)
 
-    def ResetHebbianMemory(self):
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,):
+        state_dict.pop(f"{prefix}hebb_memory", None)
+        self.ResetHebbianMemory()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs)
+
+    def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
         with torch.no_grad():
+            if doneMask is not None and self.hebb_memory.numel() > 0:
+                mask = torch.as_tensor(
+                    doneMask,
+                    device=self.hebb_memory.device,
+                    dtype=torch.bool).view(-1)
+                if int(mask.numel()) != int(self.hebb_memory.size(0)):
+                    raise ValueError("doneMask batch size must match Hebbian convolution memory")
+                self.hebb_memory[mask] = 0
+                return
             self.hebb_memory = torch.empty(0, device=self.device, dtype=self.dtype)
+            self._hebbian_update_step = 0
+
+    def SetHebbianUpdatePeriod(self, period: int) -> None:
+        self.hebbian_update_period = max(1, int(period))
+        self._hebbian_update_step = 0
 
     def EnsureB(self, B: int, device, dtype):
         w = self.conv.weight
         target_shape = (B, w.size(0), w.size(1), w.size(2), w.size(3)) 
-        if (self.hebb_memory.numel() == 0) or (self.hebb_memory.shape != target_shape):
+        if (
+            self.hebb_memory.numel() == 0
+            or tuple(self.hebb_memory.shape) != target_shape
+            or self.hebb_memory.device != device
+            or self.hebb_memory.dtype != dtype
+        ):
             self.hebb_memory = torch.zeros(*target_shape, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.use_hebbian:
+            return self.conv(x)
+
         B, inC, H, W = x.shape
         w = self.conv.weight
         outC = w.size(0)
         g = self.groups
         in_per_g = inC // g
 
-        if self.use_hebbian:
-            self.EnsureB(B, self.device, self.dtype)
+        memory_shape = (B, w.size(0), w.size(1), w.size(2), w.size(3))
+        has_compatible_memory = (
+            self.hebb_memory.numel() > 0
+            and tuple(self.hebb_memory.shape) == memory_shape
+            and self.hebb_memory.device == x.device
+            and self.hebb_memory.dtype == x.dtype)
+        if not has_compatible_memory:
+            # A zero Hebbian correction is exactly the native convolution.  Keep
+            # the first/reset frame on the vendor-optimized kernel, then update
+            # the newly allocated memory from that result below.
+            out = self.conv(x)
+            self.EnsureB(B, x.device, x.dtype)
+        else:
             w_eff = w.unsqueeze(0) + self.apply_scale * self.hebb_memory.detach()
-        else:
-            w_eff = w.unsqueeze(0).expand(B, -1, -1, -1, -1).contiguous()
-
-        x_big = x.reshape(1, B * inC, H, W)
-
-        w_big = w_eff.reshape(B * outC, w.size(1), w.size(2), w.size(3)).clone()
-
-        groups_total = B * g
-
-        if self.conv.bias is None:
-            b_big = None
-        else:
-            b_big = self.conv.bias.repeat(B)
-
-        out_big = F.conv2d(
-            x_big, w_big, b_big,
-            stride=self.stride,
-            padding=self.padding,
-            dilation=self.dilation,
-            groups=groups_total,)
-        if not torch.isfinite(out_big).all():
+            x_big = x.reshape(1, B * inC, H, W)
+            w_big = w_eff.reshape(
+                B * outC,
+                w.size(1),
+                w.size(2),
+                w.size(3))
+            groups_total = B * g
+            b_big = (
+                None
+                if self.conv.bias is None
+                else self.conv.bias.repeat(B))
             out_big = F.conv2d(
-                x_big.clone(), w_big.clone(), b_big,
+                x_big,
+                w_big,
+                b_big,
                 stride=self.stride,
                 padding=self.padding,
                 dilation=self.dilation,
                 groups=groups_total,)
-        
-        Hout, Wout = out_big.shape[-2], out_big.shape[-1]
-        out = out_big.reshape(B, outC, Hout, Wout)
+            Hout, Wout = out_big.shape[-2], out_big.shape[-1]
+            out = out_big.reshape(B, outC, Hout, Wout)
+        if self.finite_diagnostics and not bool(torch.isfinite(out).all().item()):
+            raise FloatingPointError("Hebbian convolution produced non-finite output")
 
-        if self.use_hebbian:
+        # ``use_hebbian`` is the online-plasticity contract.  Deployment calls
+        # eval() for dropout/norm semantics but still expects this state update.
+        should_update = (
+            self._hebbian_update_step % self.hebbian_update_period == 0)
+        self._hebbian_update_step += 1
+        if should_update:
             with torch.no_grad():
                 x_unfold = F.unfold(
                     x.detach(),
@@ -395,26 +680,28 @@ class HebbianConv2d(AGICoreModule):
 
                 out_unfold = out.detach().reshape(B, outC, -1)
                 L = out_unfold.size(-1)
-                N = float(L) if L > 0 else 1.0 
+                N = float(L) if L > 0 else 1.0
 
-                x_unfold_g = x_unfold.reshape(B, g, in_per_g * (self.kernel_size[0] * self.kernel_size[1]), L)
+                x_unfold_g = x_unfold.reshape(
+                    B,
+                    g,
+                    in_per_g * (self.kernel_size[0] * self.kernel_size[1]),
+                    L)
                 out_unfold_g = out_unfold.reshape(B, g, outC // g, L)
 
-                xu = x_unfold_g
-                yu = out_unfold_g
-
-                hebb_term = torch.einsum("bgol,bgil->bgoi", yu, xu) / N
-
-                y2_mean = yu.square().sum(dim=-1) / N
-
+                hebb_term = torch.einsum(
+                    "bgol,bgil->bgoi",
+                    out_unfold_g,
+                    x_unfold_g) / N
+                y2_mean = out_unfold_g.square().sum(dim=-1) / N
                 mem = self.hebb_memory.reshape(B, g, outC // g, -1)
                 decay = y2_mean.unsqueeze(-1) * mem
-
-                delta = self.hebb_rate * (hebb_term - decay) 
+                delta = self.hebb_rate * (hebb_term - decay)
                 delta = delta.reshape_as(self.hebb_memory)
 
-                self.hebb_memory.mul_(self.ema_alpha).add_(delta, alpha=(1.0 - self.ema_alpha))
-
+                self.hebb_memory.mul_(self.ema_alpha).add_(
+                    delta,
+                    alpha=(1.0 - self.ema_alpha))
                 FrobeniusCapPerSample(self.hebb_memory, self.mem_norm_cap)
 
         return out
@@ -449,31 +736,88 @@ class HebbianLinear(AGICoreModule):
         self.normalize = bool(normalize)
         self.weight_constraint = weightConstraint
         self.use_hebbian = bool(useHebbian)
+        self.hebbian_capable = bool(useHebbian)
+        self.hebbian_update_period = 1
+        self._hebbian_update_step = 0
 
-        self.register_buffer("hebb_memory", torch.empty(0), persistent=True)
+        self.register_buffer("hebb_memory", torch.empty(0), persistent=False)
 
-    def ResetHebbianMemory(self):
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,):
+        state_dict.pop(f"{prefix}hebb_memory", None)
+        self.ResetHebbianMemory()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs)
+
+    def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
         with torch.no_grad():
+            if doneMask is not None and self.hebb_memory.numel() > 0:
+                mask = torch.as_tensor(
+                    doneMask,
+                    device=self.hebb_memory.device,
+                    dtype=torch.bool).view(-1)
+                if int(mask.numel()) != int(self.hebb_memory.size(0)):
+                    raise ValueError("doneMask batch size must match Hebbian linear memory")
+                self.hebb_memory[mask] = 0
+                return
             self.hebb_memory = torch.empty(0, device=self.device, dtype=self.dtype)
+            self._hebbian_update_step = 0
+
+    def SetHebbianUpdatePeriod(self, period: int) -> None:
+        self.hebbian_update_period = max(1, int(period))
+        self._hebbian_update_step = 0
 
     def EnsureB(self, B: int, device, dtype):
-        if (self.hebb_memory.numel() == 0) or (self.hebb_memory.shape != (B, self.outFeatures, self.inFeatures)):
+        if (
+            self.hebb_memory.numel() == 0
+            or tuple(self.hebb_memory.shape) != (B, self.outFeatures, self.inFeatures)
+            or self.hebb_memory.device != device
+            or self.hebb_memory.dtype != dtype
+        ):
             self.hebb_memory = torch.zeros(B, self.outFeatures, self.inFeatures, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.size(0)
 
-        if self.use_hebbian:
-            self.EnsureB(B, self.device, self.dtype)
-            w_eff = self.weight.unsqueeze(0) + self.apply_scale * self.hebb_memory.detach() 
-        else:
-            w_eff = self.weight.unsqueeze(0) 
+        if not self.use_hebbian:
+            y = F.linear(x, self.weight, self.bias if self.use_bias else None)
+            if not self.normalize:
+                return y
+            mean = y.mean(dim=-1, keepdim=True)
+            var = y.var(dim=-1, keepdim=True, unbiased=False)
+            return (y - mean) / torch.sqrt(var + 1e-5)
 
         x2 = x.reshape(B, -1, self.inFeatures)  
-        y2 = torch.einsum("bni,boi->bno", x2, w_eff)
-        if self.use_bias:
-            y2 = y2 + self.bias.view(1, 1, -1)
-        y = y2.view(*x.shape[:-1], self.outFeatures) 
+        memory_shape = (B, self.outFeatures, self.inFeatures)
+        has_compatible_memory = (
+            self.hebb_memory.numel() > 0
+            and tuple(self.hebb_memory.shape) == memory_shape
+            and self.hebb_memory.device == x.device
+            and self.hebb_memory.dtype == x.dtype)
+        if not has_compatible_memory:
+            y = F.linear(x, self.weight, self.bias if self.use_bias else None)
+            self.EnsureB(B, x.device, x.dtype)
+        else:
+            w_eff = (
+                self.weight.unsqueeze(0)
+                + self.apply_scale * self.hebb_memory.detach())
+            y2 = torch.einsum("bni,boi->bno", x2, w_eff)
+            if self.use_bias:
+                y2 = y2 + self.bias.view(1, 1, -1)
+            y = y2.view(*x.shape[:-1], self.outFeatures)
 
         if self.normalize:
             mean = y.mean(dim=-1, keepdim=True)
@@ -482,22 +826,21 @@ class HebbianLinear(AGICoreModule):
         else:
             y_hat = y
 
-        if self.use_hebbian:
+        should_update = (
+            self._hebbian_update_step % self.hebbian_update_period == 0)
+        self._hebbian_update_step += 1
+        if should_update:
             with torch.no_grad():
-                yh2 = y_hat.reshape(B, -1, self.outFeatures) 
+                yh2 = y_hat.reshape(B, -1, self.outFeatures)
                 N = float(yh2.size(1)) if yh2.size(1) > 0 else 1.0
-
-                x32 = x2
-                y32 = yh2
-
-                hebb_term = torch.einsum("bno,bni->boi", y32, x32) / N
-
-                y_sq_mean = y32.square().mean(dim=1)
-
+                hebb_term = torch.einsum("bno,bni->boi", yh2, x2) / N
+                y_sq_mean = yh2.square().mean(dim=1)
                 decay = y_sq_mean.unsqueeze(-1) * self.hebb_memory
                 delta = self.hebb_rate * (hebb_term - decay)
 
-                self.hebb_memory.mul_(self.ema_alpha).add_(delta, alpha=(1.0 - self.ema_alpha))
+                self.hebb_memory.mul_(self.ema_alpha).add_(
+                    delta,
+                    alpha=(1.0 - self.ema_alpha))
 
                 if self.weight_constraint == "clip":
                     self.hebb_memory.clamp_(-1.0, 1.0)
@@ -512,10 +855,171 @@ class HebbianLinear(AGICoreModule):
 
 
 
+class PerceptionRoPEMultiheadAttention(RoPEMultiheadAttention):
+    """Perception-local 2-D rotary attention; no shared module API changes."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Exact 1-D RoPE compatibility at initialization/legacy load; training
+        # can continuously introduce the 2-D spatial rotation.
+        self.rotary_2d_gain = nn.Parameter(torch.tensor(0.0))
+        self._rotary_2d_eval_active = False
+
+    @torch.no_grad()
+    def RefreshRotaryExecutionFlag(self) -> None:
+        self._rotary_2d_eval_active = bool(
+            torch.count_nonzero(self.rotary_2d_gain.detach()).item())
+
+    def train(self, mode: bool = True):
+        result = super().train(mode)
+        if not mode:
+            self.RefreshRotaryExecutionFlag()
+        return result
+
+    def Apply2DRotary(
+        self,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+        spatialGain: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+        if positions.dim() != 2 or positions.size(-1) != 2:
+            raise ValueError("rotaryPositions2D must have shape [T,2]")
+        if int(positions.size(0)) != int(value.size(-2)):
+            raise ValueError("rotaryPositions2D length must match the token sequence")
+
+        rotary_dim = int(self.rope.dim)
+        if rotary_dim <= 0:
+            return value
+        row_dim = 2 * ((rotary_dim // 2) // 2)
+        column_dim = rotary_dim - row_dim
+        angle_dtype = torch.float32
+
+        def axis_angle(
+            dim: int,
+            coordinate: torch.Tensor,
+            ) -> torch.Tensor:
+            if dim <= 0:
+                return torch.empty(
+                    int(value.size(-2)),
+                    0,
+                    device=value.device,
+                    dtype=angle_dtype)
+            inverse_frequency = 1.0 / (
+                self.rope.base ** (
+                    torch.arange(
+                        0,
+                        dim,
+                        2,
+                        device=value.device,
+                        dtype=angle_dtype) / float(dim)))
+            angle = coordinate.to(
+                device=value.device,
+                dtype=angle_dtype).unsqueeze(1) * inverse_frequency.unsqueeze(0)
+            return torch.repeat_interleave(angle, repeats=2, dim=-1)
+
+        spatial_angle = torch.cat([
+            axis_angle(row_dim, positions[:, 0]),
+            axis_angle(column_dim, positions[:, 1]),
+        ], dim=-1)
+        if spatialGain is not None:
+            sequence_coordinate = torch.arange(
+                int(value.size(-2)),
+                device=value.device,
+                dtype=angle_dtype)
+            legacy_frequency = self.rope.inv_freq.to(
+                device=value.device,
+                dtype=angle_dtype)
+            legacy_angle = torch.repeat_interleave(
+                torch.outer(sequence_coordinate, legacy_frequency),
+                repeats=2,
+                dim=-1)
+            gain = spatialGain.to(device=value.device, dtype=angle_dtype)
+            angle = legacy_angle + gain * (spatial_angle - legacy_angle)
+        else:
+            angle = spatial_angle
+
+        cosine = angle.cos().to(value.dtype).view(1, 1, -1, rotary_dim)
+        sine = angle.sin().to(value.dtype).view(1, 1, -1, rotary_dim)
+        rotary = value[..., :rotary_dim]
+        rotated = rotary * cosine + self.rope.RotateHalf(rotary) * sine
+        passthrough = value[..., rotary_dim:]
+        return (
+            rotated
+            if passthrough.numel() == 0
+            else torch.cat([rotated, passthrough], dim=-1))
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        needWeights: bool = True,
+        attnMask: Optional[torch.Tensor] = None,
+        rotaryPositions2D: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if (
+            rotaryPositions2D is None
+            or (not self.training and not self._rotary_2d_eval_active)
+        ):
+            return super().forward(
+                query,
+                key,
+                value,
+                keyPaddingMask=keyPaddingMask,
+                needWeights=needWeights,
+                attnMask=attnMask)
+
+        batch, query_length, _ = query.shape
+        key_length = int(key.size(1))
+        if query_length != key_length:
+            raise ValueError("2-D rotary positions require self-attention")
+
+        q_raw = self.ReshapeHeads(self.q_proj(query))
+        k_raw = self.ReshapeHeads(self.k_proj(key))
+        v = self.ReshapeHeads(self.v_proj(value))
+        rotary_gain = torch.tanh(self.rotary_2d_gain)
+        q = self.Apply2DRotary(
+            q_raw,
+            rotaryPositions2D,
+            spatialGain=rotary_gain)
+        k = self.Apply2DRotary(
+            k_raw,
+            rotaryPositions2D,
+            spatialGain=rotary_gain)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        negative_large = torch.finfo(scores.dtype).min
+        if attnMask is not None:
+            mask = self.PrepareMask(
+                attnMask,
+                batch,
+                query_length,
+                key_length)
+            scores = (
+                scores.masked_fill(mask, negative_large)
+                if mask.dtype == torch.bool
+                else scores + mask)
+        if keyPaddingMask is not None:
+            padding = keyPaddingMask.reshape(batch, 1, 1, key_length)
+            scores = scores.masked_fill(padding, negative_large)
+
+        attention = F.softmax(scores, dim=-1)
+        attention = torch.nan_to_num(
+            attention,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0)
+        attention = self.attn_drop(attention)
+        output = self.out_proj(self.MergeHeads(torch.matmul(attention, v)))
+        weights = attention.mean(dim=1) if needWeights else None
+        return output, weights
+
+
 class TransformerEncode(AGICoreModule):
     def __init__(self, modelDim: int, headNum: int, dimFeedforward: int = 2048, dropout: float = 0.1):
         super().__init__()
-        self.self_atten = RoPEMultiheadAttention(
+        self.self_atten = PerceptionRoPEMultiheadAttention(
             embedDim=modelDim,
             numHeads=headNum,
             dropout=dropout,)
@@ -528,12 +1032,19 @@ class TransformerEncode(AGICoreModule):
         self.dropout2 = nn.Dropout(dropout)
         self.activation = nn.GELU()
 
-    def forward(self, src: torch.Tensor, srcMask: Optional[torch.Tensor] = None, srcKeyPaddingMask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        src: torch.Tensor,
+        srcMask: Optional[torch.Tensor] = None,
+        srcKeyPaddingMask: Optional[torch.Tensor] = None,
+        rotaryPositions2D: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
         src_norm1 = self.norm1(src)
         src2, _ = self.self_atten(
             src_norm1, src_norm1, src_norm1,
             attnMask=srcMask,
             keyPaddingMask=srcKeyPaddingMask,
+            rotaryPositions2D=rotaryPositions2D,
             needWeights=False)
         
         src = src + self.dropout1(src2)
@@ -566,6 +1077,546 @@ class ResidualBlock(AGICoreModule):
         out = self.relu(out)
         return out
 
+class StableAnisotropicDiffusion(AGICoreModule):
+    def __init__(self, iterations: int = 1, eps: float = 1e-6):
+        super().__init__()
+        self.iterations = max(0, int(iterations))
+        self.eps = float(eps)
+        self.raw_step = nn.Parameter(torch.tensor(0.0))
+        self.raw_kappa = nn.Parameter(torch.tensor(0.0))
+
+    def StepSize(self) -> torch.Tensor:
+        return 0.24 * torch.sigmoid(self.raw_step)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        if self.iterations == 0:
+            return value
+        step = self.StepSize().to(value.dtype)
+        kappa = (F.softplus(self.raw_kappa) + self.eps).to(value.dtype)
+        current = value
+        for _ in range(self.iterations):
+            value_pad = F.pad(current, (1, 1, 1, 1), mode="replicate")
+            guidance = current.mean(dim=1, keepdim=True)
+            guidance_pad = F.pad(guidance, (1, 1, 1, 1), mode="replicate")
+            neighbors = (
+                value_pad[..., 1:-1, :-2],
+                value_pad[..., 1:-1, 2:],
+                value_pad[..., :-2, 1:-1],
+                value_pad[..., 2:, 1:-1],)
+            guidance_neighbors = (
+                guidance_pad[..., 1:-1, :-2],
+                guidance_pad[..., 1:-1, 2:],
+                guidance_pad[..., :-2, 1:-1],
+                guidance_pad[..., 2:, 1:-1],)
+            update = torch.zeros_like(current)
+            for neighbor, neighbor_guidance in zip(neighbors, guidance_neighbors):
+                gradient = neighbor_guidance - guidance
+                conductance = torch.exp(-torch.square(gradient / kappa))
+                update = update + conductance * (neighbor - current)
+            current = current + step * update
+        return current
+
+
+class CorticalEarlyVision(AGICoreModule):
+    def __init__(
+        self,
+        outChannels: int,
+        orientations: int = 6,
+        kernelSize: int = 13,
+        wavelength: float = 4.0,
+        sigma: float = 2.0,
+        aspectRatio: float = 0.7,):
+        super().__init__()
+        self.orientations = int(orientations)
+        self.kernel_size = int(kernelSize)
+        self.eps = 1e-6
+
+        even, odd = self.BuildGaborBank(
+            self.orientations,
+            self.kernel_size,
+            float(wavelength),
+            float(sigma),
+            float(aspectRatio))
+        self.register_buffer("gabor_even", even, persistent=True)
+        self.register_buffer("gabor_odd", odd, persistent=True)
+        self.register_buffer(
+            "gabor_quadrature",
+            torch.cat([even, odd], dim=0),
+            persistent=False)
+        self.register_buffer(
+            "anti_alias_kernel",
+            self.BinomialKernel(),
+            persistent=True)
+        collinear, surround = self.BuildContourKernels(
+            self.orientations,
+            kernelSize=7)
+        self.register_buffer("collinear_kernel", collinear, persistent=True)
+        self.register_buffer("surround_kernel", surround, persistent=True)
+
+        self.divisive_bias_raw = nn.Parameter(torch.tensor(-2.0))
+        self.collinear_gain_raw = nn.Parameter(torch.tensor(-1.0))
+        self.surround_gain_raw = nn.Parameter(torch.tensor(-1.0))
+        self.diffusion = StableAnisotropicDiffusion(iterations=1)
+        self.feature_projection = nn.Sequential(
+            nn.Conv2d(self.orientations * 2, int(outChannels), kernel_size=1, bias=False),
+            Norm2d(int(outChannels)),
+            nn.SiLU())
+        self.register_load_state_dict_post_hook(
+            self.RefreshGaborQuadratureAfterLoad)
+
+    @torch.no_grad()
+    def RefreshGaborQuadratureAfterLoad(
+        self,
+        module: nn.Module,
+        incompatibleKeys: Any,
+        ) -> None:
+        del module, incompatibleKeys
+        combined = torch.cat([self.gabor_even, self.gabor_odd], dim=0)
+        self.gabor_quadrature.copy_(combined)
+
+    @staticmethod
+    def BinomialKernel() -> torch.Tensor:
+        vector = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0])
+        kernel = torch.outer(vector, vector)
+        kernel = kernel / kernel.sum()
+        return kernel.view(1, 1, 5, 5)
+
+    @staticmethod
+    def BuildGaborBank(
+        orientations: int,
+        kernelSize: int,
+        wavelength: float,
+        sigma: float,
+        aspectRatio: float,) -> Tuple[torch.Tensor, torch.Tensor]:
+        radius = kernelSize // 2
+        yy, xx = torch.meshgrid(
+            torch.arange(-radius, radius + 1, dtype=torch.float32),
+            torch.arange(-radius, radius + 1, dtype=torch.float32),
+            indexing="ij")
+        even_bank = []
+        odd_bank = []
+        for index in range(orientations):
+            theta = math.pi * float(index) / float(orientations)
+            x_theta = xx * math.cos(theta) + yy * math.sin(theta)
+            y_theta = -xx * math.sin(theta) + yy * math.cos(theta)
+            envelope = torch.exp(-(
+                x_theta.square() + (aspectRatio * y_theta).square()
+            ) / (2.0 * sigma * sigma))
+            phase = 2.0 * math.pi * x_theta / wavelength
+            even = envelope * torch.cos(phase)
+            odd = envelope * torch.sin(phase)
+            even = even - even.mean()
+            odd = odd - odd.mean()
+            even_bank.append(even / even.norm().clamp_min(1e-8))
+            odd_bank.append(odd / odd.norm().clamp_min(1e-8))
+        return (
+            torch.stack(even_bank).unsqueeze(1),
+            torch.stack(odd_bank).unsqueeze(1))
+
+    @staticmethod
+    def BuildContourKernels(
+        orientations: int,
+        kernelSize: int,) -> Tuple[torch.Tensor, torch.Tensor]:
+        radius = kernelSize // 2
+        yy, xx = torch.meshgrid(
+            torch.arange(-radius, radius + 1, dtype=torch.float32),
+            torch.arange(-radius, radius + 1, dtype=torch.float32),
+            indexing="ij")
+        collinear_bank = []
+        surround_bank = []
+        for index in range(orientations):
+            theta = math.pi * float(index) / float(orientations)
+            x_theta = xx * math.cos(theta) + yy * math.sin(theta)
+            y_theta = -xx * math.sin(theta) + yy * math.cos(theta)
+            # The carrier varies along x_theta, so the perceived contour is
+            # tangent to y_theta.  Facilitation follows that tangent; the
+            # orthogonal elongated field supplies cross-contour inhibition.
+            collinear = torch.exp(-0.5 * (
+                x_theta.square() / 0.64 + y_theta.square() / 6.25))
+            surround = torch.exp(-0.5 * (
+                x_theta.square() / 6.25 + y_theta.square() / 0.64))
+            collinear = collinear / collinear.sum().clamp_min(1e-8)
+            surround = surround / surround.sum().clamp_min(1e-8)
+            collinear_bank.append(collinear)
+            surround_bank.append(surround)
+        return (
+            torch.stack(collinear_bank).unsqueeze(1),
+            torch.stack(surround_bank).unsqueeze(1))
+
+    def AntiAliasDownsample(self, value: torch.Tensor, groups: int = 1) -> torch.Tensor:
+        kernel = self.anti_alias_kernel.to(value.dtype).expand(groups, 1, -1, -1)
+        value = F.pad(value, (2, 2, 2, 2), mode="replicate")
+        return F.conv2d(value, kernel, stride=2, groups=groups)
+
+    def forward(
+        self,
+        frame: torch.Tensor,
+        previousFast: Optional[torch.Tensor],
+        previousSlow: Optional[torch.Tensor],
+        previousValid: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        luminance = (
+            0.2126 * frame[:, 0:1]
+            + 0.7152 * frame[:, 1:2]
+            + 0.0722 * frame[:, 2:3])
+        luminance = self.AntiAliasDownsample(luminance)
+        padding = self.kernel_size // 2
+        luminance_pad = F.pad(
+            luminance,
+            (padding, padding, padding, padding),
+            mode="replicate")
+        quadrature = F.conv2d(
+            luminance_pad,
+            self.gabor_quadrature.to(frame.dtype))
+        even, odd = quadrature.chunk(2, dim=1)
+        energy = torch.sqrt(even.square() + odd.square() + self.eps)
+        orientation_pool = F.avg_pool2d(
+            F.pad(
+                energy.mean(dim=1, keepdim=True),
+                (2, 2, 2, 2),
+                mode="replicate"),
+            kernel_size=5,
+            stride=1)
+        divisive_bias = F.softplus(self.divisive_bias_raw).to(frame.dtype) + self.eps
+        normalized = energy / (divisive_bias + orientation_pool)
+        normalized = self.diffusion(normalized)
+
+        normalized_pad = F.pad(normalized, (3, 3, 3, 3), mode="replicate")
+        collinear = F.conv2d(
+            normalized_pad,
+            self.collinear_kernel.to(frame.dtype),
+            groups=self.orientations)
+        surround = F.conv2d(
+            normalized_pad,
+            self.surround_kernel.to(frame.dtype),
+            groups=self.orientations)
+        v2_response = F.silu(
+            normalized
+            + torch.sigmoid(self.collinear_gain_raw).to(frame.dtype) * collinear
+            - torch.sigmoid(self.surround_gain_raw).to(frame.dtype) * surround)
+        current = self.AntiAliasDownsample(
+            v2_response,
+            groups=self.orientations)
+
+        state_compatible = (
+            previousFast is not None
+            and previousSlow is not None
+            and tuple(previousFast.shape) == tuple(current.shape)
+            and tuple(previousSlow.shape) == tuple(current.shape))
+        if state_compatible:
+            previous_fast = previousFast.detach().to(current)
+            previous_slow = previousSlow.detach().to(current)
+            valid = (
+                torch.ones(current.size(0), device=current.device, dtype=torch.bool)
+                if previousValid is None
+                else previousValid.to(device=current.device, dtype=torch.bool).view(-1))
+            valid = valid.view(-1, 1, 1, 1)
+            fast = torch.where(
+                valid,
+                0.5 * previous_fast + 0.5 * current,
+                current)
+            slow = torch.where(
+                valid,
+                0.9 * previous_slow + 0.1 * current,
+                current)
+        else:
+            fast = current
+            slow = current
+        temporal_response = fast - slow
+        feature = self.feature_projection(torch.cat([current, temporal_response], dim=1))
+        raw_energy = self.AntiAliasDownsample(
+            energy.mean(dim=1, keepdim=True))
+        return feature, {
+            "CorticalFastState": fast.detach(),
+            "CorticalSlowState": slow.detach(),
+            "CorticalEnergy": raw_energy.detach(),
+            "CorticalContextResponse": current.mean(
+                dim=1,
+                keepdim=True).detach(),
+            "CorticalTemporalResponse": temporal_response.mean(
+                dim=1,
+                keepdim=True).detach()}
+
+
+class PerceptionEnhancementBlock(AGICoreModule):
+    def __init__(self, stemChannels: int):
+        super().__init__()
+        self.early_vision = CorticalEarlyVision(outChannels=int(stemChannels))
+        self.residual_gain = nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        frame: torch.Tensor,
+        previousVisualState: Optional[VisualState],
+        previousValid: Optional[torch.Tensor],
+        ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        previous_fast = None
+        previous_slow = None
+        if previousVisualState is not None:
+            previous_fast = previousVisualState.Auxiliary.get("CorticalFastState")
+            previous_slow = previousVisualState.Auxiliary.get("CorticalSlowState")
+        feature, auxiliary = self.early_vision(
+            frame,
+            previous_fast,
+            previous_slow,
+            previousValid)
+        return torch.tanh(self.residual_gain) * feature, auxiliary
+
+
+class SPPContextAdapter(AGICoreModule):
+    def __init__(
+        self,
+        inChannels: int,
+        embedDim: int,
+        reducedChannels: int = 32,
+        bins: Tuple[int, ...] = (1, 2, 4),):
+        super().__init__()
+        self.bins = tuple(int(value) for value in bins)
+        reduced = int(reducedChannels)
+        pooled_dim = reduced * sum(value * value for value in self.bins)
+        self.reduce = nn.Sequential(
+            nn.Conv2d(int(inChannels), reduced, kernel_size=1, bias=False),
+            Norm2d(reduced),
+            nn.SiLU())
+        self.project = nn.Sequential(
+            nn.LayerNorm(pooled_dim),
+            nn.Linear(pooled_dim, int(embedDim)))
+        self.residual_gain = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, feature: torch.Tensor) -> torch.Tensor:
+        reduced = self.reduce(feature)
+        height, width = reduced.shape[-2:]
+        if (
+            self.bins == (1, 2, 4)
+            and height >= 4
+            and width >= 4
+            and height % 4 == 0
+            and width % 4 == 0
+        ):
+            fine = F.adaptive_avg_pool2d(reduced, (4, 4))
+            pooled_maps = {
+                1: F.avg_pool2d(fine, kernel_size=4),
+                2: F.avg_pool2d(fine, kernel_size=2, stride=2),
+                4: fine,}
+            pooled = [pooled_maps[size].flatten(1) for size in self.bins]
+        else:
+            pooled = [
+                F.adaptive_avg_pool2d(reduced, (size, size)).flatten(1)
+                for size in self.bins]
+        context = self.project(torch.cat(pooled, dim=1))
+        return torch.tanh(self.residual_gain) * context
+
+
+class AxialPositionEncoding2D(nn.Module):
+    def __init__(self, embedDim: int, temperature: float = 10000.0):
+        super().__init__()
+        self.embed_dim = int(embedDim)
+        self.temperature = float(temperature)
+
+    def AxisEncoding(
+        self,
+        length: int,
+        dim: int,
+        device: torch.device,) -> torch.Tensor:
+        if dim <= 0:
+            return torch.empty(int(length), 0, device=device)
+        frequency_count = max(1, (dim + 1) // 2)
+        exponent = torch.arange(
+            frequency_count,
+            device=device,
+            dtype=torch.float32) / max(frequency_count - 1, 1)
+        inverse_frequency = torch.exp(-math.log(self.temperature) * exponent)
+        position = torch.arange(int(length), device=device, dtype=torch.float32)
+        angle = position.unsqueeze(1) * inverse_frequency.unsqueeze(0)
+        encoding = torch.cat([torch.sin(angle), torch.cos(angle)], dim=1)
+        return encoding[:, :dim]
+
+    def forward(
+        self,
+        height: int,
+        width: int,
+        device: torch.device,
+        dtype: torch.dtype,) -> torch.Tensor:
+        row_dim = self.embed_dim // 2
+        column_dim = self.embed_dim - row_dim
+        row = self.AxisEncoding(height, row_dim, device)
+        column = self.AxisEncoding(width, column_dim, device)
+        row = row[:, None, :].expand(height, width, row_dim)
+        column = column[None, :, :].expand(height, width, column_dim)
+        return torch.cat([row, column], dim=-1).reshape(
+            1,
+            height * width,
+            self.embed_dim).to(dtype=dtype)
+
+
+class DenseDepthRefiner(AGICoreModule):
+    def __init__(
+        self,
+        hiddenChannels: int = 16,
+        minDepthMeters: float = 0.05,
+        maxDepthMeters: float = 20.0,):
+        super().__init__()
+        hidden = int(hiddenChannels)
+        self.min_depth = float(minDepthMeters)
+        self.max_depth = float(maxDepthMeters)
+        self.trunk = nn.Sequential(
+            nn.Conv2d(4, hidden, kernel_size=3, padding=1, bias=False),
+            Norm2d(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden, bias=False),
+            nn.SiLU())
+        self.output = nn.Conv2d(hidden, 2, kernel_size=1, bias=True)
+
+    def forward(
+        self,
+        frame: torch.Tensor,
+        metricDepth: torch.Tensor,
+        metricLogVariance: torch.Tensor,
+        applyCorrection: bool = True,
+        ) -> Dict[str, torch.Tensor]:
+        size = tuple(frame.shape[-2:])
+        inverse = F.interpolate(
+            metricDepth.clamp_min(self.min_depth).reciprocal(),
+            size=size,
+            mode="bilinear",
+            align_corners=False)
+        log_variance = F.interpolate(
+            metricLogVariance,
+            size=size,
+            mode="bilinear",
+            align_corners=False)
+        if not applyCorrection:
+            return {
+                "MetricDepthFullRes": inverse.reciprocal(),
+                "MetricDepthFullResLogVariance": log_variance.clamp(-8.0, 8.0)}
+        correction_size = (
+            max(1, int(size[0]) // 2),
+            max(1, int(size[1]) // 2))
+        if correction_size == size:
+            correction_input = torch.cat([frame, inverse], dim=1)
+        else:
+            correction_input = torch.cat([
+                F.interpolate(frame, size=correction_size, mode="area"),
+                F.interpolate(inverse, size=correction_size, mode="area"),
+            ], dim=1)
+        raw = self.output(self.trunk(correction_input))
+        if tuple(raw.shape[-2:]) != size:
+            raw = F.interpolate(
+                raw,
+                size=size,
+                mode="bilinear",
+                align_corners=False)
+        correction = 0.1 * inverse * torch.tanh(raw[:, :1])
+        refined_inverse = (inverse + correction).clamp(
+            1.0 / self.max_depth,
+            1.0 / self.min_depth)
+        return {
+            "MetricDepthFullRes": refined_inverse.reciprocal(),
+            "MetricDepthFullResLogVariance": (
+                log_variance + raw[:, 1:2].clamp(-2.0, 2.0)).clamp(-8.0, 8.0)}
+
+
+class ProjectiveTopologyDiagnostics(AGICoreModule):
+    @staticmethod
+    def DifferenceX(value: torch.Tensor, identityValue: float) -> torch.Tensor:
+        if value.size(-1) == 1:
+            return torch.full_like(value, float(identityValue))
+        difference = value[..., 1:] - value[..., :-1]
+        return torch.cat([difference, difference[..., -1:]], dim=-1)
+
+    @staticmethod
+    def DifferenceY(value: torch.Tensor, identityValue: float) -> torch.Tensor:
+        if value.size(-2) == 1:
+            return torch.full_like(value, float(identityValue))
+        difference = value[..., 1:, :] - value[..., :-1, :]
+        return torch.cat([difference, difference[..., -1:, :]], dim=-2)
+
+    def forward(
+        self,
+        grid: torch.Tensor,
+        domainMask: Optional[torch.Tensor] = None,
+        ) -> Dict[str, torch.Tensor]:
+        batch, height, width, _ = grid.shape
+        # Determinants and singular values are especially cancellation-prone in
+        # AMP.  Diagnostics and the topology loss therefore stay in FP32.
+        grid32 = grid.float()
+        pixel_x = ((grid32[..., 0] + 1.0) * float(width) - 1.0) * 0.5
+        pixel_y = ((grid32[..., 1] + 1.0) * float(height) - 1.0) * 0.5
+        dxx = self.DifferenceX(pixel_x, 1.0)
+        dxy = self.DifferenceY(pixel_x, 0.0)
+        dyx = self.DifferenceX(pixel_y, 0.0)
+        dyy = self.DifferenceY(pixel_y, 1.0)
+        determinant = dxx * dyy - dxy * dyx
+        frobenius_squared = dxx.square() + dxy.square() + dyx.square() + dyy.square()
+        discriminant = (
+            frobenius_squared.square() - 4.0 * determinant.square()).clamp_min(0.0).sqrt()
+        sigma_max = torch.sqrt(
+            0.5 * (frobenius_squared + discriminant).clamp_min(0.0))
+        # |det(J)| = sigma_min * sigma_max avoids subtractive cancellation in
+        # the smaller singular value.
+        sigma_min = determinant.abs() / sigma_max.clamp_min(1e-12)
+        finite = (
+            torch.isfinite(pixel_x)
+            & torch.isfinite(pixel_y)
+            & torch.isfinite(determinant)
+            & torch.isfinite(sigma_min)
+            & torch.isfinite(sigma_max))
+        if domainMask is None:
+            domain = torch.ones(
+                batch,
+                height,
+                width,
+                device=grid.device,
+                dtype=torch.bool)
+        else:
+            domain = domainMask.to(device=grid.device, dtype=torch.bool)
+            if domain.dim() == 4 and domain.size(1) == 1:
+                domain = domain[:, 0]
+            if tuple(domain.shape) != (batch, height, width):
+                raise ValueError(
+                    "domainMask must have shape [B,H,W] or [B,1,H,W]")
+        # A singleton spatial axis has no observable derivative; do not invent
+        # an identity Jacobian and label it topology-preserving.
+        if height <= 1 or width <= 1:
+            domain = torch.zeros_like(domain)
+        valid_domain = domain & finite
+        topology_valid = (
+            valid_domain
+            & (determinant > 1e-3)
+            & (sigma_min > 1e-3)
+            & (sigma_max < 100.0))
+        safe_determinant = torch.where(finite, determinant, torch.zeros_like(determinant))
+        safe_sigma_min = torch.where(finite, sigma_min, torch.zeros_like(sigma_min))
+        safe_sigma_max = torch.where(finite, sigma_max, torch.zeros_like(sigma_max))
+        yy, xx = torch.meshgrid(
+            torch.arange(height, device=grid.device, dtype=torch.float32),
+            torch.arange(width, device=grid.device, dtype=torch.float32),
+            indexing="ij")
+        safe_pixel_x = torch.where(
+            torch.isfinite(pixel_x),
+            pixel_x,
+            xx.view(1, height, width))
+        safe_pixel_y = torch.where(
+            torch.isfinite(pixel_y),
+            pixel_y,
+            yy.view(1, height, width))
+        rigid_flow = torch.stack([
+            safe_pixel_x - xx.view(1, height, width),
+            safe_pixel_y - yy.view(1, height, width)], dim=1)
+        fold_error = F.relu(1e-3 - safe_determinant).square()
+        fold_penalty = torch.where(
+            valid_domain,
+            fold_error,
+            torch.zeros_like(fold_error)).sum() / valid_domain.sum().clamp_min(1)
+        return {
+            "RigidPatchFlow": rigid_flow,
+            "WarpJacobianDet": safe_determinant.unsqueeze(1),
+            "WarpJacobianSigmaMin": safe_sigma_min.unsqueeze(1),
+            "WarpJacobianSigmaMax": safe_sigma_max.unsqueeze(1),
+            "WarpTopologyValid": topology_valid.unsqueeze(1).to(torch.float32),
+            "WarpFoldPenalty": fold_penalty}
+
+
 class CNNFeatureExtractor(AGICoreModule):
     def __init__(self, inChannels: int = 3, baseChannels: int = 64, useHebbian: bool = True):
         super().__init__()
@@ -589,9 +1640,20 @@ class CNNFeatureExtractor(AGICoreModule):
             layers.append(ResidualBlock(outC, outC, stride=1, useHebbian=useHebbian))
         return nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        stemResidual: Optional[torch.Tensor] = None,) -> Dict[str, torch.Tensor]:
         x = self.relu(self.bn1(self.conv1(x)))
         x = self.maxpool(x)
+        if stemResidual is not None:
+            if tuple(stemResidual.shape[-2:]) != tuple(x.shape[-2:]):
+                stemResidual = F.interpolate(
+                    stemResidual,
+                    size=tuple(x.shape[-2:]),
+                    mode="bilinear",
+                    align_corners=False)
+            x = x + stemResidual.to(x)
         layer1 = self.layer1(x)
         layer2 = self.layer2(layer1)
         layer3 = self.layer3(layer2)
@@ -684,6 +1746,23 @@ class DepthGeometryFusion(AGICoreModule):
         grad_y = F.pad(value[..., 1:, :] - value[..., :-1, :], (0, 0, 0, 1))
         return grad_x, grad_y
 
+    @staticmethod
+    def ScaleIntrinsics(
+        cameraIntrinsics: torch.Tensor,
+        sourceSize: Tuple[int, int],
+        targetSize: Tuple[int, int],
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Scale a pixel-center camera lattice consistently with align_corners=False."""
+        source_h, source_w = sourceSize
+        target_h, target_w = targetSize
+        sx = float(target_w) / float(source_w)
+        sy = float(target_h) / float(source_h)
+        fx = cameraIntrinsics[:, 0, 0] * sx
+        fy = cameraIntrinsics[:, 1, 1] * sy
+        cx = (cameraIntrinsics[:, 0, 2] + 0.5) * sx - 0.5
+        cy = (cameraIntrinsics[:, 1, 2] + 0.5) * sy - 0.5
+        return fx, fy, cx, cy
+
     def LocalStd(self, value: torch.Tensor, window: int) -> torch.Tensor:
         pad = int(window) // 2
         mean = F.avg_pool2d(value, int(window), stride=1, padding=pad)
@@ -695,7 +1774,7 @@ class DepthGeometryFusion(AGICoreModule):
         depth: torch.Tensor,
         depthValid: torch.Tensor,
         size: Tuple[int, int],) -> Tuple[torch.Tensor, torch.Tensor]:
-        valid = depthValid.bool()
+        valid = depthValid.bool() & torch.isfinite(depth) & (depth > 0.0)
         valid_float = valid.to(depth.dtype)
         clean_depth = torch.where(valid, depth, torch.ones_like(depth))
         inverse = clean_depth.reciprocal() * valid_float
@@ -704,6 +1783,30 @@ class DepthGeometryFusion(AGICoreModule):
         inverse_resized = inverse_sum / valid_weight.clamp_min(1e-6)
         inverse_resized = inverse_resized * (valid_weight > 1e-6).to(inverse_resized.dtype)
         return inverse_resized, valid_weight.clamp(0.0, 1.0)
+
+    def ResampleSensorLogDepth(
+        self,
+        depth: torch.Tensor,
+        depthValid: torch.Tensor,
+        size: Tuple[int, int],
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Area-resample sufficient statistics in the fusion's log-depth domain."""
+        valid = depthValid.bool() & torch.isfinite(depth) & (depth > 0.0)
+        valid_float = valid.to(depth.dtype)
+        clean_depth = torch.where(valid, depth, torch.ones_like(depth)).clamp(
+            self.min_depth_meters,
+            self.max_depth_meters)
+        log_sum = F.interpolate(
+            clean_depth.log() * valid_float,
+            size=size,
+            mode="area")
+        valid_weight = F.interpolate(valid_float, size=size, mode="area")
+        log_depth = log_sum / valid_weight.clamp_min(1e-6)
+        log_depth = torch.where(
+            valid_weight > 1e-6,
+            log_depth,
+            torch.zeros_like(log_depth))
+        return log_depth, valid_weight.clamp(0.0, 1.0)
 
     def DecodeMonocularDepth(
         self,
@@ -733,13 +1836,10 @@ class DepthGeometryFusion(AGICoreModule):
         cameraIntrinsics: torch.Tensor,
         sourceSize: Tuple[int, int],) -> torch.Tensor:
         B, _, H, W = depth.shape
-        fx, fy = cameraIntrinsics[:, 0, 0], cameraIntrinsics[:, 1, 1]
-        cx, cy = cameraIntrinsics[:, 0, 2], cameraIntrinsics[:, 1, 2]
-        src_h, src_w = sourceSize
-        fx = fx * (float(W) / float(src_w))
-        fy = fy * (float(H) / float(src_h))
-        cx = cx * (float(W) / float(src_w))
-        cy = cy * (float(H) / float(src_h))
+        fx, fy, cx, cy = self.ScaleIntrinsics(
+            cameraIntrinsics,
+            sourceSize,
+            (H, W))
         yy, xx = torch.meshgrid(
             torch.arange(H, device=depth.device, dtype=depth.dtype),
             torch.arange(W, device=depth.device, dtype=depth.dtype),
@@ -751,6 +1851,7 @@ class DepthGeometryFusion(AGICoreModule):
 
     @staticmethod
     def QuaternionRotate(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+        quat = F.normalize(quat.float(), dim=1, eps=1e-8).to(vec.dtype)
         q_vec = quat[:, :3].view(quat.size(0), 3, 1, 1).expand_as(vec)
         q_w = quat[:, 3].view(quat.size(0), 1, 1, 1)
         cross1 = torch.cross(q_vec, vec, dim=1)
@@ -764,12 +1865,27 @@ class DepthGeometryFusion(AGICoreModule):
         sourceSize: Tuple[int, int],
         cameraMotion: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B, _, H, W = curDepth.shape
-        sx = float(W) / float(sourceSize[1])
-        sy = float(H) / float(sourceSize[0])
-        fx = (cameraIntrinsics[:, 0, 0] * sx).view(B, 1, 1, 1).clamp_min(1e-6)
-        fy = (cameraIntrinsics[:, 1, 1] * sy).view(B, 1, 1, 1).clamp_min(1e-6)
-        cx = (cameraIntrinsics[:, 0, 2] * sx).view(B, 1, 1, 1)
-        cy = (cameraIntrinsics[:, 1, 2] * sy).view(B, 1, 1, 1)
+        if tuple(cameraMotion.shape) != (B, ModuleDim.PstPoseDim):
+            raise ValueError(
+                f"cameraMotion must have shape {(B, ModuleDim.PstPoseDim)}")
+        candidate_motion = cameraMotion.to(curDepth)
+        motion_valid = (
+            torch.isfinite(candidate_motion).all(dim=1)
+            & (candidate_motion[:, 3:7].norm(dim=1) > 1e-8))
+        identity_motion = torch.zeros_like(candidate_motion)
+        identity_motion[:, 6] = 1.0
+        safe_motion = torch.where(
+            motion_valid.view(-1, 1),
+            candidate_motion,
+            identity_motion)
+        fx, fy, cx, cy = self.ScaleIntrinsics(
+            cameraIntrinsics,
+            sourceSize,
+            (H, W))
+        fx = fx.view(B, 1, 1, 1).clamp_min(1e-6)
+        fy = fy.view(B, 1, 1, 1).clamp_min(1e-6)
+        cx = cx.view(B, 1, 1, 1)
+        cy = cy.view(B, 1, 1, 1)
         yy, xx = torch.meshgrid(
             torch.arange(H, device=curDepth.device, dtype=curDepth.dtype),
             torch.arange(W, device=curDepth.device, dtype=curDepth.dtype),
@@ -781,18 +1897,27 @@ class DepthGeometryFusion(AGICoreModule):
             (yy - cy) * curDepth / fy,
             curDepth], dim=1)
 
-        translation = cameraMotion[:, :3].view(B, 3, 1, 1)
-        rotation = cameraMotion[:, 3:7]
+        translation = safe_motion[:, :3].view(B, 3, 1, 1)
+        rotation = safe_motion[:, 3:7]
         point_prev = self.QuaternionRotate(rotation, point_cur) + translation
         expected_prev = point_prev[:, 2:3]
         inv_z = expected_prev.clamp_min(1e-3).reciprocal()
-        grid_x = 2.0 * (fx * point_prev[:, 0:1] * inv_z + cx) / float(max(W - 1, 1)) - 1.0
-        grid_y = 2.0 * (fy * point_prev[:, 1:2] * inv_z + cy) / float(max(H - 1, 1)) - 1.0
+        projected_x = fx * point_prev[:, 0:1] * inv_z + cx
+        projected_y = fy * point_prev[:, 1:2] * inv_z + cy
+        grid_x = 2.0 * (projected_x + 0.5) / float(W) - 1.0
+        grid_y = 2.0 * (projected_y + 0.5) / float(H) - 1.0
         grid = torch.cat([grid_x, grid_y], dim=1).permute(0, 2, 3, 1)
         sampled_prev = F.grid_sample(
-            prevDepth, grid, mode="bilinear", padding_mode="border", align_corners=True)
-        in_bounds = (grid_x.abs() <= 1.0) & (grid_y.abs() <= 1.0)
-        valid = (in_bounds & (expected_prev > 1e-3)).to(curDepth.dtype)
+            prevDepth, grid, mode="bilinear", padding_mode="border", align_corners=False)
+        in_bounds = (
+            (projected_x >= 0.0)
+            & (projected_x <= float(W - 1))
+            & (projected_y >= 0.0)
+            & (projected_y <= float(H - 1)))
+        valid = (
+            in_bounds
+            & (expected_prev > 1e-3)
+            & motion_valid.view(-1, 1, 1, 1)).to(curDepth.dtype)
         return expected_prev, sampled_prev, valid
 
     def forward(
@@ -807,9 +1932,16 @@ class DepthGeometryFusion(AGICoreModule):
         mono_inverse, mono_log_variance, trunk_features = self.DecodeMonocularDepth(
             rgbFeatures, midFeatures, shallowFeatures, fineFeatures)
         visual_precision = torch.exp(-mono_log_variance).clamp_max(1e4)
+        mono_log_depth = -mono_inverse.clamp_min(1.0 / self.max_depth_meters).log()
 
-        sensor_inverse, sensor_valid = self.ResampleSensorDepth(
+        sensor_inverse, inverse_valid = self.ResampleSensorDepth(
             depth, depthValid, tuple(mono_inverse.shape[-2:]))
+        sensor_log_depth, sensor_valid = self.ResampleSensorLogDepth(
+            depth, depthValid, tuple(mono_inverse.shape[-2:]))
+        # Both sufficient statistics use the same validity rule.  Keep the
+        # conservative intersection if a backend ever rounds their area pools
+        # differently.
+        sensor_valid = torch.minimum(sensor_valid, inverse_valid)
         sensor_observed_valid = sensor_valid
         if self.training and self.sensor_dropout > 0.0:
             keep = (torch.rand(B, 1, 1, 1, device=rgbFeatures.device) >= self.sensor_dropout).to(rgbFeatures.dtype)
@@ -821,21 +1953,29 @@ class DepthGeometryFusion(AGICoreModule):
         sensor_log_var_delta = self.sensor_var_head(torch.cat([trunk_features, sensor_var_cue], dim=1))
         sensor_log_var_spatial = (
             self.sensor_log_variance + sensor_log_var_delta).clamp(-8.0, 8.0)
-        sensor_precision_scale = torch.exp(-sensor_log_var_spatial)
+        sensor_precision_scale = torch.exp(-sensor_log_var_spatial).clamp_max(1e4)
         sensor_precision = sensor_valid * sensor_precision_scale
-
         virtual_logits = self.virtual_head(trunk_features)
         p_virtual = torch.sigmoid(virtual_logits)
 
         mono_precision_physical = visual_precision * (1.0 - p_virtual)
+        mono_precision_physical = torch.where(
+            sensor_valid > 1e-6,
+            mono_precision_physical,
+            visual_precision)
         total_precision_physical = mono_precision_physical + sensor_precision
-        fused_inverse = (
-            mono_precision_physical * mono_inverse
-            + sensor_precision * sensor_inverse) / total_precision_physical.clamp_min(1e-6)
-        physical_depth = fused_inverse.clamp_min(1.0 / self.max_depth_meters).reciprocal()
+        fused_log_depth = (
+            mono_precision_physical * mono_log_depth
+            + sensor_precision * sensor_log_depth) / total_precision_physical.clamp_min(1e-6)
+        physical_depth = fused_log_depth.exp().clamp(
+            self.min_depth_meters,
+            self.max_depth_meters)
+        fused_inverse = physical_depth.reciprocal()
         physical_log_variance = -torch.log(total_precision_physical.clamp_min(1e-6))
         sensor_reliability = sensor_precision / total_precision_physical.clamp_min(1e-6)
-        content_depth = mono_inverse.clamp_min(1.0 / self.max_depth_meters).reciprocal()
+        content_depth = mono_log_depth.exp().clamp(
+            self.min_depth_meters,
+            self.max_depth_meters)
 
         log_content = content_depth.clamp_min(self.min_depth_meters).log()
         log_physical = physical_depth.clamp_min(self.min_depth_meters).log()
@@ -859,31 +1999,45 @@ class DepthGeometryFusion(AGICoreModule):
             "MonocularDepthLogVariance": mono_log_variance,
             "MetricDepth": physical_depth,
             "MetricDepthLogVariance": physical_log_variance,
+            "MetricInverseDepth": fused_inverse,
             "SensorDepthReliability": sensor_reliability,
             "SensorDepthValid": sensor_observed_valid,
+            "SensorDepthValidMask": sensor_observed_valid > 1e-6,
             "SensorDepthUsed": sensor_valid,
             "ContentDepth": content_depth,
             "VirtualMask": p_virtual,
             "VirtualMaskLogits": virtual_logits,
             "SensorLogVarianceSpatial": sensor_log_var_spatial,}
 
-        if self.training:
-            sensor_local_std = self.LocalStd(sensor_inverse * sensor_valid, self.virtual_planarity_window)
-            mono_local_std = self.LocalStd(mono_inverse, self.virtual_planarity_window)
-            depth_state["VirtualTarget"] = (
-                (sensor_valid > 0.5)
-                & (disagreement > self.virtual_disagree_threshold)
-                & (mono_local_std > sensor_local_std + self.virtual_content_margin)).to(p_virtual.dtype)
-            feat_grad_x, feat_grad_y = self.SpatialGradient(fineFeatures.mean(dim=1, keepdim=True))
-            edge_w_x = (-feat_grad_x.abs() * 5.0).exp()
-            edge_w_y = (-feat_grad_y.abs() * 5.0).exp()
-            depth_state["EdgeAwareSmoothness"] = (
-                (d_grad_x.abs() * edge_w_x).mean() + (d_grad_y.abs() * edge_w_y).mean())
+        sensor_local_std = self.LocalStd(sensor_inverse * sensor_valid, self.virtual_planarity_window)
+        mono_local_std = self.LocalStd(mono_inverse, self.virtual_planarity_window)
+        depth_state["VirtualTarget"] = (
+            (sensor_valid > 0.5)
+            & (disagreement > self.virtual_disagree_threshold)
+            & (mono_local_std > sensor_local_std + self.virtual_content_margin)).to(p_virtual.dtype)
+        feat_grad_x, feat_grad_y = self.SpatialGradient(fineFeatures.mean(dim=1, keepdim=True))
+        edge_w_x = (-feat_grad_x.abs() * 5.0).exp()
+        edge_w_y = (-feat_grad_y.abs() * 5.0).exp()
+        depth_state["EdgeAwareSmoothness"] = (
+            (d_grad_x.abs() * edge_w_x).mean() + (d_grad_y.abs() * edge_w_y).mean())
 
         return fused_features, depth_state
 
 
 class PerceiveExtractor(AGICoreModule):
+    ENHANCEMENT_STATE_PREFIXES = (
+        "perception_enhancement.",
+        "dense_depth_refiner.",
+        "patch_content_projection.",
+        "projective_topology.",
+        "spp_context.",)
+    ENHANCEMENT_STATE_NAMES = frozenset({
+        "_enhancement_schema",
+        "patch_content_gain",
+        "axial_position_gain",})
+    ENHANCEMENT_STATE_SUFFIXES = (
+        ".self_atten.rotary_2d_gain",)
+
     def __init__(
         self,
         imgSize: int = 512,
@@ -901,9 +2055,15 @@ class PerceiveExtractor(AGICoreModule):
         recallKwargs: Optional[Dict[str, Any]] = None):
         super().__init__()
 
+        self.register_buffer(
+            "_enhancement_schema",
+            torch.ones((), dtype=torch.int64),
+            persistent=True)
+
         assert embedDim % numHeads == 0, "embed_dim must be divisible by num_heads"
 
         self.img_size = imgSize
+        self.intrinsics_reference_size = (int(imgSize), int(imgSize))
         self.patch_size = patchSize
         self.embed_dim = int(embedDim)
         self.integrated_dim = int(embedDim * 2)
@@ -915,18 +2075,8 @@ class PerceiveExtractor(AGICoreModule):
             inChannels=3,
             baseChannels=baseChannels,
             useHebbian=useHebbian)
-
-        with torch.no_grad():
-            mods = [m for m in self.cnn_extractor.modules() if hasattr(m, "use_hebbian")]
-            old = [bool(m.use_hebbian) for m in mods]
-            for m in mods: m.use_hebbian = False
-
-            dummy = torch.zeros(1, 3, imgSize, imgSize)
-            fmap = self.cnn_extractor(dummy)["Deep"]
-            Hf, Wf = fmap.shape[-2], fmap.shape[-1]
-
-            for m, v in zip(mods, old):
-                m.use_hebbian = v
+        self.perception_enhancement = PerceptionEnhancementBlock(
+            stemChannels=baseChannels)
 
         cnn_feat_dim = baseChannels * 16
 
@@ -935,13 +2085,16 @@ class PerceiveExtractor(AGICoreModule):
             midChannels=baseChannels * 4,
             shallowChannels=baseChannels * 2,
             fineChannels=baseChannels)
+        self.dense_depth_refiner = DenseDepthRefiner(
+            minDepthMeters=self.depth_fusion.min_depth_meters,
+            maxDepthMeters=self.depth_fusion.max_depth_meters)
         self.depth_attention_strength = nn.Parameter(torch.tensor(-4.0))
 
         default_intrinsics = torch.eye(3)
         default_intrinsics[0, 0] = float(imgSize)
         default_intrinsics[1, 1] = float(imgSize)
-        default_intrinsics[0, 2] = float(imgSize) * 0.5
-        default_intrinsics[1, 2] = float(imgSize) * 0.5
+        default_intrinsics[0, 2] = (float(imgSize) - 1.0) * 0.5
+        default_intrinsics[1, 2] = (float(imgSize) - 1.0) * 0.5
         self.register_buffer("camera_intrinsics", default_intrinsics, persistent=False)
 
         self.patch_embed = SheafGaugeConv2d(
@@ -957,10 +2110,25 @@ class PerceiveExtractor(AGICoreModule):
             gauge_groups=1, 
             gauge_scale=0.1,
             gauge_bias_scale=0.1)
+        self.patch_content_projection = nn.Conv2d(
+            cnn_feat_dim,
+            embedDim,
+            kernel_size=patchSize,
+            stride=patchSize,
+            bias=False)
+        # Additive branch stays an exact no-op for old checkpoints until trained.
+        self.patch_content_gain = nn.Parameter(torch.tensor(0.0))
         
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embedDim))
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         self.pos_drop = nn.Dropout(p=posDrop)
+        self.spp_context = SPPContextAdapter(
+            inChannels=baseChannels,
+            embedDim=embedDim,
+            reducedChannels=min(32, max(8, baseChannels)))
+        self.axial_position = AxialPositionEncoding2D(embedDim)
+        self.axial_position_gain = nn.Parameter(torch.tensor(0.0))
+        self.projective_topology = ProjectiveTopologyDiagnostics()
 
         self.cnn_feat_adapter = GrowableConv1x1Adapter(channels=cnn_feat_dim)
         self.patch_adapter = GrowableLoRAConv2d(self.patch_embed)
@@ -1113,6 +2281,230 @@ class PerceiveExtractor(AGICoreModule):
         nn.init.zeros_(self.error_to_state.bias)
         nn.init.zeros_(self.precision_head[1].weight)
         nn.init.constant_(self.precision_head[1].bias, 0.5413)
+        nn.init.zeros_(self.dense_depth_refiner.output.weight)
+        nn.init.zeros_(self.dense_depth_refiner.output.bias)
+        self._jetson_edge_policy_checked = False
+        self._jetson_auto_edge_policy = False
+        self._cortical_eval_active = False
+        self._patch_content_eval_active = False
+        self._spp_eval_active = False
+        self._dense_refiner_eval_active = False
+        self.RefreshInferenceExecutionFlags()
+        self.register_load_state_dict_post_hook(
+            self.RefreshInferenceExecutionFlagsAfterLoad)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,):
+        marker_key = f"{prefix}_enhancement_schema"
+        if marker_key not in state_dict:
+            legacy_full_signature = (
+                "cls_token",
+                "patch_embed.weight",
+                "cnn_feat_adapter.anchor_",
+                "patch_adapter.target.weight",
+                "output_norm.weight",)
+            if all(
+                f"{prefix}{name}" in state_dict
+                for name in legacy_full_signature
+            ):
+                adapter_names = [
+                    "cnn_feat_adapter",
+                    "patch_adapter",
+                    *[
+                        f"token_adapters.{index}"
+                        for index in range(len(self.token_adapters))],]
+                for adapter_name in adapter_names:
+                    dynamic_prefix = f"{prefix}{adapter_name}.A_list."
+                    saved_indices = {
+                        int(name[len(dynamic_prefix):])
+                        for name in state_dict
+                        if (
+                            name.startswith(dynamic_prefix)
+                            and name[len(dynamic_prefix):].isdigit())}
+                    state_dict[
+                        f"{prefix}{adapter_name}.topology_count"
+                    ] = self._enhancement_schema.new_tensor(
+                        len(saved_indices))
+            # Local, enumerated compatibility path for checkpoints created
+            # before the additive enhancement branches existed. Do not hide
+            # unrelated missing parameters.
+            for local_name, value in self.state_dict().items():
+                if (
+                    local_name in self.ENHANCEMENT_STATE_NAMES
+                    or local_name.startswith(self.ENHANCEMENT_STATE_PREFIXES)
+                    or local_name.endswith(self.ENHANCEMENT_STATE_SUFFIXES)
+                ):
+                    full_name = f"{prefix}{local_name}"
+                    if full_name not in state_dict:
+                        state_dict[full_name] = value.detach().clone()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs)
+
+    @torch.no_grad()
+    def RefreshInferenceExecutionFlags(self) -> None:
+        self._cortical_eval_active = bool(
+            torch.count_nonzero(
+                self.perception_enhancement.residual_gain.detach()).item())
+        self._patch_content_eval_active = bool(
+            torch.count_nonzero(self.patch_content_gain.detach()).item())
+        self._spp_eval_active = bool(
+            torch.count_nonzero(self.spp_context.residual_gain.detach()).item())
+        self._dense_refiner_eval_active = bool(
+            torch.count_nonzero(self.dense_depth_refiner.output.weight.detach()).item()
+            or torch.count_nonzero(self.dense_depth_refiner.output.bias.detach()).item())
+        for layer in self.transformer_layers:
+            layer.self_atten.RefreshRotaryExecutionFlag()
+
+    def RefreshInferenceExecutionFlagsAfterLoad(
+        self,
+        module: nn.Module,
+        incompatibleKeys: Any,
+        ) -> None:
+        del module, incompatibleKeys
+        self.RefreshInferenceExecutionFlags()
+
+    def train(self, mode: bool = True):
+        result = super().train(mode)
+        if mode and self._jetson_auto_edge_policy:
+            self.ConfigureHebbianRuntime(
+                updatePeriod=1,
+                enabledLayerNames=None)
+            self._jetson_auto_edge_policy = False
+            self._jetson_edge_policy_checked = False
+        if not mode:
+            self.RefreshInferenceExecutionFlags()
+        return result
+
+    @staticmethod
+    def IsJetsonOrinExecution(frame: torch.Tensor) -> bool:
+        if frame.device.type != "cuda" or not torch.cuda.is_available():
+            return False
+        try:
+            device_index = (
+                torch.cuda.current_device()
+                if frame.device.index is None
+                else int(frame.device.index))
+            device_name = torch.cuda.get_device_name(device_index).lower()
+            return "orin" in device_name or "tegra" in device_name
+        except Exception:
+            return False
+
+    def MaybeConfigureJetsonEdgeHebbian(self, frame: torch.Tensor) -> None:
+        if (
+            self.training
+            or not self.use_hebbian
+            or self._jetson_edge_policy_checked
+        ):
+            return
+        is_jetson = self.IsJetsonOrinExecution(frame)
+        if frame.device.type == "cuda" or is_jetson:
+            self._jetson_edge_policy_checked = True
+        if is_jetson:
+            self.ConfigureEdgeDeploymentHebbian(updatePeriod=4)
+            self._jetson_auto_edge_policy = True
+
+    def BuildAugmentedPyramid(
+        self,
+        frame: torch.Tensor,
+        prevVisualState: Optional[VisualState],
+        prevVisualValid: Optional[torch.Tensor],
+        ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        if not self.training and not self._cortical_eval_active:
+            return self.cnn_extractor(frame), {}
+        stem_residual, enhancement_auxiliary = self.perception_enhancement(
+            frame,
+            prevVisualState,
+            prevVisualValid)
+        if self._jetson_auto_edge_policy and not self.training:
+            enhancement_auxiliary = {
+                key: (
+                    value.to(torch.float16)
+                    if value.is_floating_point()
+                    else value)
+                for key, value in enhancement_auxiliary.items()}
+            enhancement_auxiliary = {
+                key: value
+                for key, value in enhancement_auxiliary.items()
+                if key in {"CorticalFastState", "CorticalSlowState"}}
+        return (
+            self.cnn_extractor(frame, stemResidual=stem_residual),
+            enhancement_auxiliary)
+
+    def EnhanceDepthState(
+        self,
+        frame: torch.Tensor,
+        depthState: Dict[str, torch.Tensor],) -> Dict[str, torch.Tensor]:
+        dense_state = self.dense_depth_refiner(
+            frame,
+            depthState["MetricDepth"],
+            depthState["MetricDepthLogVariance"],
+            applyCorrection=(
+                self.training
+                or self._dense_refiner_eval_active))
+        if self._jetson_auto_edge_policy and not self.training:
+            dense_state = {
+                key: value.to(torch.float16)
+                for key, value in dense_state.items()}
+        depthState.update(dense_state)
+        return depthState
+
+    def BuildTransformerInput(
+        self,
+        pyramid: Dict[str, torch.Tensor],
+        patchMap: torch.Tensor,
+        ) -> Tuple[torch.Tensor, int, int]:
+        batch, _, patch_height, patch_width = patchMap.shape
+        patch_tokens = rearrange(patchMap, "b c h w -> b (h w) c")
+        position = self.axial_position(
+            patch_height,
+            patch_width,
+            patchMap.device,
+            patchMap.dtype)
+        patch_tokens = patch_tokens + torch.tanh(
+            self.axial_position_gain).to(patchMap.dtype) * position
+        class_tokens = repeat(self.cls_token, "1 1 d -> b 1 d", b=batch)
+        if self.training or self._spp_eval_active:
+            class_tokens = class_tokens + self.spp_context(
+                pyramid["Layer1"]).unsqueeze(1)
+        tokens = self.pos_drop(torch.cat([class_tokens, patch_tokens], dim=1))
+        return tokens, int(patch_height), int(patch_width)
+
+    @staticmethod
+    def BuildRotaryPositions2D(
+        patchHeight: int,
+        patchWidth: int,
+        device: torch.device,
+        ) -> torch.Tensor:
+        rows, columns = torch.meshgrid(
+            torch.arange(patchHeight, device=device, dtype=torch.float32) + 1.0,
+            torch.arange(patchWidth, device=device, dtype=torch.float32) + 1.0,
+            indexing="ij")
+        patches = torch.stack([rows, columns], dim=-1).reshape(-1, 2)
+        # CLS is invariant under both rotations.
+        return torch.cat([torch.zeros(1, 2, device=device), patches], dim=0)
+
+    def AddPatchContentProjection(
+        self,
+        feature: torch.Tensor,
+        patchMap: torch.Tensor,) -> torch.Tensor:
+        if not self.training and not self._patch_content_eval_active:
+            return patchMap
+        content = self.patch_content_projection(feature)
+        return patchMap + torch.tanh(
+            self.patch_content_gain).to(patchMap.dtype) * content
 
     def QualityStats(self, x: torch.Tensor) -> torch.Tensor:
         x_det = x.detach()
@@ -1121,7 +2513,7 @@ class PerceiveExtractor(AGICoreModule):
         gx = (x_det[..., :, 1:] - x_det[..., :, :-1]).abs().mean(dim=(1, 2, 3))
         gy = (x_det[..., 1:, :] - x_det[..., :-1, :]).abs().mean(dim=(1, 2, 3))
         grad = 0.5 * (gx + gy)
-        clipped = ((x_det <= 0.01) | (x_det >= 0.99)).float().mean(dim=(1, 2, 3))
+        clipped = ((x_det <= 0.01) | (x_det >= 0.99)).to(x_det.dtype).mean(dim=(1, 2, 3))
         return torch.stack([mean, std, grad, clipped], dim=-1)
 
     def BuildDepthAttentionBias(
@@ -1166,11 +2558,13 @@ class PerceiveExtractor(AGICoreModule):
         prevVisualState: Optional[VisualState] = None,
         cameraMotion: Optional[torch.Tensor] = None,
         prevVisualValid: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        target_inverse, target_weight = self.depth_fusion.ResampleSensorDepth(
+        target_log_depth, target_weight = self.depth_fusion.ResampleSensorLogDepth(
             depthTarget,
             depthTargetValid,
             tuple(visualState.Auxiliary["MonocularDepth"].shape[-2:]),)
-        target_depth = target_inverse.clamp_min(1.0 / self.depth_fusion.max_depth_meters).reciprocal()
+        target_depth = target_log_depth.exp().clamp(
+            self.depth_fusion.min_depth_meters,
+            self.depth_fusion.max_depth_meters)
         valid = (target_weight > 1e-6).to(target_depth.dtype)
         mono_depth = visualState.Auxiliary["MonocularDepth"]
         residual = mono_depth.clamp_min(1e-6).log() - target_depth.clamp_min(1e-6).log()
@@ -1204,6 +2598,35 @@ class PerceiveExtractor(AGICoreModule):
         losses["loss_depth_fused"] = loss_fused
         total = total + 0.25 * loss_fused
 
+        if "MetricDepthFullRes" in visualState.Auxiliary:
+            full_log_depth, full_weight = self.depth_fusion.ResampleSensorLogDepth(
+                depthTarget,
+                depthTargetValid,
+                tuple(visualState.Auxiliary["MetricDepthFullRes"].shape[-2:]))
+            full_target = full_log_depth.exp().clamp(
+                self.depth_fusion.min_depth_meters,
+                self.depth_fusion.max_depth_meters)
+            full_valid = (full_weight > 1e-6).to(full_target.dtype)
+            full_residual = (
+                visualState.Auxiliary["MetricDepthFullRes"].clamp_min(1e-6).log()
+                - full_target.clamp_min(1e-6).log())
+            loss_full = self.MaskedMean(
+                F.smooth_l1_loss(
+                    full_residual,
+                    torch.zeros_like(full_residual),
+                    reduction="none"),
+                full_valid)
+            losses["loss_depth_full_res"] = loss_full
+            total = total + 0.1 * loss_full
+            full_log_variance = visualState.Auxiliary[
+                "MetricDepthFullResLogVariance"]
+            full_nll = (
+                0.5 * torch.exp(-full_log_variance) * full_residual.square()
+                + 0.5 * full_log_variance)
+            loss_full_uncertainty = self.MaskedMean(full_nll, full_valid)
+            losses["loss_depth_full_res_uncertainty"] = loss_full_uncertainty
+            total = total + 0.02 * loss_full_uncertainty
+
         edge_smoothness = visualState.Auxiliary["EdgeAwareSmoothness"]
         losses["loss_depth_smoothness"] = edge_smoothness
         total = total + 0.05 * edge_smoothness
@@ -1219,22 +2642,35 @@ class PerceiveExtractor(AGICoreModule):
         total = total + 0.1 * loss_virtual + 0.005 * sparsity
 
         if prevVisualState is not None and cameraMotion is not None:
-            prev_depth = prevVisualState.Auxiliary["MetricDepth"].detach()
-            cur_depth = visualState.Auxiliary["MetricDepth"]
-            camera_intrinsics = self.CameraIntrinsicsBatch(cur_depth.size(0))
-            expected_prev, sampled_prev, warp_valid = self.depth_fusion.WarpPrevDepth(
-                cur_depth, prev_depth, camera_intrinsics,
-                (self.img_size, self.img_size), cameraMotion)
-            if prevVisualValid is not None:
-                temporal_valid = prevVisualValid.to(
-                    device=warp_valid.device,
-                    dtype=torch.bool).view(-1, 1, 1, 1)
-                warp_valid = torch.where(
-                    temporal_valid, warp_valid, torch.zeros_like(warp_valid))
-            residual = (expected_prev.clamp_min(1e-6).log() - sampled_prev.clamp_min(1e-6).log()).abs()
-            cur_gx, cur_gy = self.depth_fusion.SpatialGradient(cur_depth.clamp_min(1e-6).log())
-            reliability = (-(cur_gx.abs() + cur_gy.abs()) * 5.0).exp()
-            temporal = self.MaskedMean(residual, warp_valid * reliability)
+            temporal = total.new_zeros(())
+            if self.VisualStatesShareLattice(visualState, prevVisualState):
+                prev_depth = prevVisualState.Auxiliary["MetricDepth"].detach()
+                cur_depth = visualState.Auxiliary["MetricDepth"]
+                camera_intrinsics = self.CameraIntrinsicsBatch(cur_depth.size(0))
+                expected_prev, sampled_prev, warp_valid = self.depth_fusion.WarpPrevDepth(
+                    cur_depth,
+                    prev_depth,
+                    camera_intrinsics,
+                    self.CameraIntrinsicsReferenceSize(),
+                    cameraMotion)
+                if prevVisualValid is not None:
+                    temporal_valid = prevVisualValid.to(
+                        device=warp_valid.device,
+                        dtype=torch.bool).view(-1, 1, 1, 1)
+                    if temporal_valid.size(0) != warp_valid.size(0):
+                        raise ValueError(
+                            "prevVisualValid batch size must match the current frame")
+                    warp_valid = torch.where(
+                        temporal_valid,
+                        warp_valid,
+                        torch.zeros_like(warp_valid))
+                residual = (
+                    expected_prev.clamp_min(1e-6).log()
+                    - sampled_prev.clamp_min(1e-6).log()).abs()
+                cur_gx, cur_gy = self.depth_fusion.SpatialGradient(
+                    cur_depth.clamp_min(1e-6).log())
+                reliability = (-(cur_gx.abs() + cur_gy.abs()) * 5.0).exp()
+                temporal = self.MaskedMean(residual, warp_valid * reliability)
             losses["loss_depth_temporal"] = temporal
             total = total + 0.02 * temporal
 
@@ -1302,7 +2738,9 @@ class PerceiveExtractor(AGICoreModule):
         D = int(patchMotion.size(-1))
         motion_tokens = self.magno_proj(F.layer_norm(patchMotion, (D,)))
         motion_weight = patchWeights * patchReliability.squeeze(-1).detach()
-        motion_weight = motion_weight / motion_weight.sum(dim=1, keepdim=True)
+        motion_weight = motion_weight / motion_weight.sum(
+            dim=1,
+            keepdim=True).clamp_min(1e-6)
         motion_summary = (motion_tokens * motion_weight.unsqueeze(-1)).sum(dim=1)
         return motion_summary, motion_tokens, motion_weight
 
@@ -1315,7 +2753,11 @@ class PerceiveExtractor(AGICoreModule):
         cameraIntrinsics: torch.Tensor,
         frameSize: Tuple[int, int],
         cameraMotion: torch.Tensor,
-        currentPatchTokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        currentPatchTokens: torch.Tensor) -> Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor]:
         B = currentPatchTokens.size(0)
         cur_depth = F.interpolate(
             depthState["MetricDepth"],
@@ -1328,12 +2770,14 @@ class PerceiveExtractor(AGICoreModule):
             mode="bilinear",
             align_corners=False)
 
-        sx = float(patchWidth) / float(frameSize[1])
-        sy = float(patchHeight) / float(frameSize[0])
-        fx = (cameraIntrinsics[:, 0, 0] * sx).view(B, 1, 1, 1)
-        fy = (cameraIntrinsics[:, 1, 1] * sy).view(B, 1, 1, 1)
-        cx = (cameraIntrinsics[:, 0, 2] * sx).view(B, 1, 1, 1)
-        cy = (cameraIntrinsics[:, 1, 2] * sy).view(B, 1, 1, 1)
+        fx, fy, cx, cy = self.depth_fusion.ScaleIntrinsics(
+            cameraIntrinsics,
+            frameSize,
+            (patchHeight, patchWidth))
+        fx = fx.view(B, 1, 1, 1).clamp_min(1e-6)
+        fy = fy.view(B, 1, 1, 1).clamp_min(1e-6)
+        cx = cx.view(B, 1, 1, 1)
+        cy = cy.view(B, 1, 1, 1)
 
         yy, xx = torch.meshgrid(
             torch.arange(patchHeight, device=cur_depth.device, dtype=cur_depth.dtype),
@@ -1351,8 +2795,10 @@ class PerceiveExtractor(AGICoreModule):
         point_prev = self.depth_fusion.QuaternionRotate(rotation, point_cur) + motion[:, :3].view(B, 3, 1, 1)
         expected_prev = point_prev[:, 2:3]
         inv_z = expected_prev.clamp_min(1e-3).reciprocal()
-        grid_x = 2.0 * (fx * point_prev[:, 0:1] * inv_z + cx) / float(patchWidth - 1) - 1.0
-        grid_y = 2.0 * (fy * point_prev[:, 1:2] * inv_z + cy) / float(patchHeight - 1) - 1.0
+        projected_x = fx * point_prev[:, 0:1] * inv_z + cx
+        projected_y = fy * point_prev[:, 1:2] * inv_z + cy
+        grid_x = 2.0 * (projected_x + 0.5) / float(patchWidth) - 1.0
+        grid_y = 2.0 * (projected_y + 0.5) / float(patchHeight) - 1.0
         grid = torch.cat([grid_x, grid_y], dim=1).permute(0, 2, 3, 1)
 
         prev_tokens = rearrange(prevVisualState.PatchTokens.detach(), "b (h w) d -> b d h w", h=patchHeight, w=patchWidth)
@@ -1361,26 +2807,48 @@ class PerceiveExtractor(AGICoreModule):
             grid,
             mode="bilinear",
             padding_mode="zeros",
-            align_corners=True)
+            align_corners=False)
         sampled_prev_depth = F.grid_sample(
             prev_depth,
             grid,
             mode="bilinear",
             padding_mode="zeros",
-            align_corners=True)
-        in_bounds = (grid_x.abs() <= 1.0) & (grid_y.abs() <= 1.0)
+            align_corners=False)
+        in_bounds = (
+            (projected_x >= 0.0)
+            & (projected_x <= float(patchWidth - 1))
+            & (projected_y >= 0.0)
+            & (projected_y <= float(patchHeight - 1)))
         depth_residual = (
             expected_prev.clamp_min(1e-6).log()
             - sampled_prev_depth.clamp_min(1e-6).log()).abs()
-        valid = (
+        valid_support = (
             in_bounds
             & (expected_prev > 1e-3)
-            & (sampled_prev_depth > 1e-3))
-        valid = valid * (-depth_residual * 3.0).exp()
+            & (sampled_prev_depth > 1e-3)
+            & torch.isfinite(depth_residual))
+        current_token_map = rearrange(
+            currentPatchTokens.detach(),
+            "b (h w) d -> b d h w",
+            h=patchHeight,
+            w=patchWidth)
+        warped_tokens = torch.where(
+            valid_support.expand(-1, warped_tokens.size(1), -1, -1),
+            warped_tokens,
+            current_token_map)
+        depth_residual = torch.where(
+            torch.isfinite(depth_residual),
+            depth_residual,
+            torch.zeros_like(depth_residual))
+        valid = torch.where(
+            valid_support,
+            (-depth_residual * 3.0).exp(),
+            torch.zeros_like(depth_residual))
         return (
             rearrange(warped_tokens, "b d h w -> b (h w) d"),
             rearrange(valid, "b c h w -> b (h w) c"),
-            rearrange(depth_residual, "b c h w -> b (h w) c"),)
+            rearrange(depth_residual, "b c h w -> b (h w) c"),
+            grid,)
 
     def ObjectAttentionError(self, currentObjects: torch.Tensor, predictedObjects: torch.Tensor) -> torch.Tensor:
         D = int(currentObjects.size(-1))
@@ -1432,12 +2900,66 @@ class PerceiveExtractor(AGICoreModule):
             k = k.clone()
             k[0, 0] *= sx
             k[1, 1] *= sy
-            k[0, 2] *= sx
-            k[1, 2] *= sy
+            k[0, 2] = (k[0, 2] + 0.5) * sx - 0.5
+            k[1, 2] = (k[1, 2] + 0.5) * sy - 0.5
         self.camera_intrinsics.copy_(k)
 
     def CameraIntrinsicsBatch(self, batchSize: int) -> torch.Tensor:
         return self.camera_intrinsics.unsqueeze(0).expand(int(batchSize), -1, -1)
+
+    def CameraIntrinsicsReferenceSize(self) -> Tuple[int, int]:
+        return self.intrinsics_reference_size
+
+    @staticmethod
+    def EncodeShapeMetadata(height: int, width: int) -> torch.Tensor:
+        code = (int(height) << 32) | int(width)
+        return torch.tensor(code, dtype=torch.int64)
+
+    @staticmethod
+    def DecodeShapeMetadata(value: Any) -> Optional[Tuple[int, int]]:
+        if not isinstance(value, torch.Tensor) or value.numel() != 1:
+            return None
+        code = int(value.detach().cpu().item())
+        if code <= 0:
+            return None
+        return (code >> 32, code & 0xFFFFFFFF)
+
+    @staticmethod
+    def VisualStateShapeMetadata(
+        visualState: VisualState,
+        key: str,
+        ) -> Optional[Tuple[int, int]]:
+        code_key = {
+            "PatchGridShape": "PatchGridShapeCode",
+            "InputFrameShape": "InputFrameShapeCode",
+        }.get(key)
+        if code_key is not None:
+            decoded = PerceiveExtractor.DecodeShapeMetadata(
+                visualState.Auxiliary.get(code_key))
+            if decoded is not None:
+                return decoded
+        value = visualState.Auxiliary.get(key)
+        if not isinstance(value, torch.Tensor) or value.numel() != 2:
+            return None
+        return tuple(
+            int(item)
+            for item in value.detach().cpu().reshape(-1).tolist())
+
+    @classmethod
+    def VisualStatesShareLattice(
+        cls,
+        current: VisualState,
+        previous: VisualState,
+        ) -> bool:
+        current_patch = cls.VisualStateShapeMetadata(current, "PatchGridShape")
+        previous_patch = cls.VisualStateShapeMetadata(previous, "PatchGridShape")
+        current_frame = cls.VisualStateShapeMetadata(current, "InputFrameShape")
+        previous_frame = cls.VisualStateShapeMetadata(previous, "InputFrameShape")
+        return (
+            current_patch is not None
+            and current_patch == previous_patch
+            and current_frame is not None
+            and current_frame == previous_frame)
 
     def AssembleVisualState(
         self,
@@ -1450,7 +2972,8 @@ class PerceiveExtractor(AGICoreModule):
         topDownContext: TopDownContext,
         prevVisualState: Optional[VisualState],
         cameraMotion: Optional[torch.Tensor],
-        prevVisualValid: Optional[torch.Tensor] = None,) -> VisualState:
+        prevVisualValid: Optional[torch.Tensor] = None,
+        enhancementAuxiliary: Optional[Dict[str, torch.Tensor]] = None,) -> VisualState:
         x = self.encoder_norm(tokens)
         cls_rep = x[:, 0, :]
         mlp_out = self.mlp(cls_rep)
@@ -1474,7 +2997,11 @@ class PerceiveExtractor(AGICoreModule):
             corrected_integrated = preliminary_integrated
 
         patch_geometry, patch_coordinate_valid = self.BuildPatchGeometry(
-            depthState, patchHeight, patchWidth, cameraIntrinsics=cameraIntrinsics, frameSize=tuple(frame.shape[-2:]))
+            depthState,
+            patchHeight,
+            patchWidth,
+            cameraIntrinsics=cameraIntrinsics,
+            frameSize=self.CameraIntrinsicsReferenceSize())
         object_tokens, object_geometry, object_coordinate_valid, object_patch_weights = self.BuildObjectTokens(
             patch_tokens, patchGeometry=patch_geometry, patchCoordinateValid=patch_coordinate_valid)
 
@@ -1485,45 +3012,119 @@ class PerceiveExtractor(AGICoreModule):
         shared = self.cortical_proj(corrected_integrated)
         ventral_feat = self.ventral_proj(shared)
 
+        diagnostic_factory = {
+            "device": patch_tokens.device,
+            "dtype": torch.float32}
+        topology_auxiliary = {
+            "RigidPatchFlow": torch.zeros(
+                patch_tokens.size(0), 2, patchHeight, patchWidth,
+                **diagnostic_factory),
+            "WarpJacobianDet": torch.ones(
+                patch_tokens.size(0), 1, patchHeight, patchWidth,
+                **diagnostic_factory),
+            "WarpJacobianSigmaMin": torch.ones(
+                patch_tokens.size(0), 1, patchHeight, patchWidth,
+                **diagnostic_factory),
+            "WarpJacobianSigmaMax": torch.ones(
+                patch_tokens.size(0), 1, patchHeight, patchWidth,
+                **diagnostic_factory),
+            "WarpTopologyValid": torch.zeros(
+                patch_tokens.size(0), 1, patchHeight, patchWidth,
+                **diagnostic_factory),
+            "WarpFoldPenalty": torch.zeros((), **diagnostic_factory)}
+
         if prevVisualState is not None:
             previous_valid = (
                 torch.ones(patch_tokens.size(0), device=patch_tokens.device, dtype=torch.bool)
                 if prevVisualValid is None
                 else prevVisualValid.to(device=patch_tokens.device, dtype=torch.bool).view(-1))
-            previous_mask = previous_valid.view(-1, 1, 1)
+            if previous_valid.numel() != patch_tokens.size(0):
+                raise ValueError("prevVisualValid batch size must match the current frame")
+            identity_motion = patch_tokens.new_zeros(
+                patch_tokens.size(0),
+                ModuleDim.PstPoseDim)
+            identity_motion[:, 6] = 1.0
             if cameraMotion is not None:
-                camera_motion_from_prev = cameraMotion
-                warped_prev_tokens, warp_valid, warp_depth_residual = self.WarpPrevPatchTokens(
+                if tuple(cameraMotion.shape) != tuple(identity_motion.shape):
+                    raise ValueError(
+                        f"cameraMotion must have shape {tuple(identity_motion.shape)}")
+                candidate_motion = cameraMotion.to(patch_tokens)
+                motion_finite = torch.isfinite(candidate_motion).all(dim=1)
+                quaternion_valid = candidate_motion[:, 3:7].norm(dim=1) > 1e-8
+                motion_valid = motion_finite & quaternion_valid
+                safe_motion = torch.where(
+                    motion_valid.view(-1, 1),
+                    candidate_motion,
+                    identity_motion)
+            else:
+                motion_valid = torch.zeros_like(previous_valid)
+                safe_motion = identity_motion
+            warp_row_valid = previous_valid & motion_valid
+            warp_row_mask = warp_row_valid.view(-1, 1, 1)
+            previous_grid = self.VisualStateShapeMetadata(
+                prevVisualState,
+                "PatchGridShape")
+            previous_frame = self.VisualStateShapeMetadata(
+                prevVisualState,
+                "InputFrameShape")
+            same_patch_grid = (
+                int(prevVisualState.PatchTokens.size(1)) == int(patch_tokens.size(1))
+                and previous_grid == (int(patchHeight), int(patchWidth))
+                and previous_frame == tuple(int(v) for v in frame.shape[-2:]))
+            if cameraMotion is not None and same_patch_grid:
+                camera_motion_from_prev = safe_motion
+                warped_prev_tokens, warp_valid, warp_depth_residual, warp_grid = self.WarpPrevPatchTokens(
                     prevVisualState,
                     depthState,
                     patchHeight,
                     patchWidth,
                     cameraIntrinsics,
-                    tuple(frame.shape[-2:]),
+                    self.CameraIntrinsicsReferenceSize(),
                     camera_motion_from_prev,
                     patch_tokens)
+                topology_domain = rearrange(
+                    warp_valid > 0.0,
+                    "b (h w) c -> b c h w",
+                    h=patchHeight,
+                    w=patchWidth)
+                topology_domain = (
+                    topology_domain
+                    & warp_row_valid.view(-1, 1, 1, 1))
+                topology_auxiliary = self.projective_topology(
+                    warp_grid,
+                    domainMask=topology_domain)
+                topology_valid = rearrange(
+                    topology_auxiliary["WarpTopologyValid"],
+                    "b c h w -> b (h w) c").to(warp_valid.dtype)
+                warp_valid = warp_valid * topology_valid
+                warp_valid = warp_valid.to(patch_tokens.dtype)
             else:
                 camera_motion_from_prev = patch_tokens.new_zeros(patch_tokens.size(0), ModuleDim.PstPoseDim)
                 camera_motion_from_prev[:, 6] = 1.0
-                warped_prev_tokens = prevVisualState.PatchTokens.detach()
+                warped_prev_tokens = (
+                    prevVisualState.PatchTokens.detach()
+                    if same_patch_grid
+                    else patch_tokens.detach())
                 warp_valid = patch_tokens.new_zeros(patch_tokens.size(0), patch_tokens.size(1), 1)
                 warp_depth_residual = patch_tokens.new_zeros(patch_tokens.size(0), patch_tokens.size(1), 1)
             warped_prev_tokens = torch.where(
-                previous_mask,
+                warp_row_mask,
                 warped_prev_tokens,
                 patch_tokens.detach())
             warp_valid = torch.where(
-                previous_mask, warp_valid, torch.zeros_like(warp_valid))
+                warp_row_mask, warp_valid, torch.zeros_like(warp_valid))
             warp_depth_residual = torch.where(
-                previous_mask,
+                warp_row_mask,
                 warp_depth_residual,
                 torch.zeros_like(warp_depth_residual))
-            identity_motion = camera_motion_from_prev.new_zeros(camera_motion_from_prev.shape)
-            identity_motion[:, 6] = 1.0
             camera_motion_from_prev = torch.where(
-                previous_valid.view(-1, 1),
+                warp_row_valid.view(-1, 1),
                 camera_motion_from_prev,
                 identity_motion)
+            topology_auxiliary["WarpTopologyValid"] = torch.where(
+                warp_row_valid.view(-1, 1, 1, 1),
+                topology_auxiliary["WarpTopologyValid"],
+                torch.zeros_like(topology_auxiliary["WarpTopologyValid"]))
             patch_motion = patch_tokens - warped_prev_tokens
         else:
             camera_motion_from_prev = patch_tokens.new_zeros(patch_tokens.size(0), ModuleDim.PstPoseDim)
@@ -1533,11 +3134,15 @@ class PerceiveExtractor(AGICoreModule):
             warp_depth_residual = patch_tokens.new_zeros(patch_tokens.size(0), patch_tokens.size(1), 1)
             patch_motion = torch.zeros_like(patch_tokens)
 
+        motion_reliability = geometry_reliability * warp_valid
         magno_summary, patch_motion_tokens, motion_weights = self.BuildMotionSummary(
             patch_motion,
             patch_weights,
-            geometry_reliability)
-        object_motion = torch.einsum("bkn,bnd->bkd", object_patch_weights, patch_motion_tokens)
+            motion_reliability)
+        object_motion = torch.einsum(
+            "bkn,bnd->bkd",
+            object_patch_weights,
+            patch_motion_tokens * motion_reliability)
         dorsal_candidate = self.dorsal_proj(torch.cat([shared, geometry_summary, magno_summary], dim=-1))
         geometry_confidence = (patch_weights * geometry_reliability.squeeze(-1)).sum(dim=1, keepdim=True)
         dorsal_feat = geometry_confidence * dorsal_candidate + (1.0 - geometry_confidence) * shared
@@ -1567,6 +3172,9 @@ class PerceiveExtractor(AGICoreModule):
         semantic_nodes = {
             **self.recall_heads.ForwardNodes(object_tokens),
             **self.recall_heads.ForwardScene(integrated_feat, ventral_feat, dorsal_feat)}
+        topology_auxiliary = {
+            name: value if name == "WarpFoldPenalty" else value.detach()
+            for name, value in topology_auxiliary.items()}
         return VisualState(
             IntegratedFeat=integrated_feat,
             GlobalFeat=global_feat,
@@ -1586,13 +3194,27 @@ class PerceiveExtractor(AGICoreModule):
                 "ObjectGeometry": object_geometry,
                 "ObjectGeometryValid": object_coordinate_valid,
                 "PatchMotionTokens": patch_motion_tokens.detach(),
-                "PatchMotionReliability": geometry_reliability.detach(),
+                "PatchMotionReliability": motion_reliability.detach(),
                 "PatchMotionWeights": motion_weights.detach(),
                 "PatchMotionDepthResidual": warp_depth_residual.detach(),
                 "WarpedPrevPatchTokens": warped_prev_tokens.detach(),
                 "WarpPrevPatchValid": warp_valid.detach(),
                 "CameraMotionFromPrev": camera_motion_from_prev.detach(),
-                "DorsalReliabilityGate": geometry_confidence.detach()},)
+                "PatchGridShape": torch.tensor(
+                    [patchHeight, patchWidth],
+                    dtype=torch.long),
+                "PatchGridShapeCode": self.EncodeShapeMetadata(
+                    patchHeight,
+                    patchWidth),
+                "InputFrameShape": torch.tensor(
+                    [int(frame.size(-2)), int(frame.size(-1))],
+                    dtype=torch.long),
+                "InputFrameShapeCode": self.EncodeShapeMetadata(
+                    int(frame.size(-2)),
+                    int(frame.size(-1))),
+                "DorsalReliabilityGate": geometry_confidence.detach(),
+                **topology_auxiliary,
+                **({} if enhancementAuxiliary is None else enhancementAuxiliary)},)
 
     def forward(
         self,
@@ -1605,7 +3227,11 @@ class PerceiveExtractor(AGICoreModule):
         prevVisualValid: Optional[torch.Tensor] = None,) -> VisualState:
         # x: [B, 3, H, W]
         frame = x
-        pyramid = self.cnn_extractor(frame)
+        self.MaybeConfigureJetsonEdgeHebbian(frame)
+        pyramid, enhancement_auxiliary = self.BuildAugmentedPyramid(
+            frame,
+            prevVisualState,
+            prevVisualValid)
         feat, depth_state = self.depth_fusion(
             pyramid["Deep"],
             pyramid["Layer3"],
@@ -1613,31 +3239,38 @@ class PerceiveExtractor(AGICoreModule):
             pyramid["Layer1"],
             depth=depth,
             depthValid=depthValid)
+        depth_state = self.EnhanceDepthState(frame, depth_state)
 
         feat = self.cnn_feat_adapter(feat)
 
-        patches = self.patch_adapter(feat)  # [B, embed_dim, Ph, Pw]
-        B, C, Ph, Pw = patches.shape
-        patches = rearrange(patches, 'b c h w -> b (h w) c')  # [B, num_patches, embed_dim]
-
-        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=B)
-        x = torch.cat([cls_tokens, patches], dim=1)  # [B, num_patches+1, embed_dim]
-        x = self.pos_drop(x)
+        patch_map = self.AddPatchContentProjection(
+            feat,
+            self.patch_adapter(feat))  # [B, embed_dim, Ph, Pw]
+        x, Ph, Pw = self.BuildTransformerInput(pyramid, patch_map)
+        B = int(frame.size(0))
         camera_intrinsics = self.CameraIntrinsicsBatch(B)
         depth_attention_bias = self.BuildDepthAttentionBias(
             depth_state,
             Ph,
             Pw,
             cameraIntrinsics=camera_intrinsics,
-            frameSize=tuple(frame.shape[-2:]))
+            frameSize=self.CameraIntrinsicsReferenceSize())
+        rotary_positions = self.BuildRotaryPositions2D(
+            Ph,
+            Pw,
+            x.device)
 
         for i, layer in enumerate(self.transformer_layers):
-            x = layer(x, srcMask=depth_attention_bias)
+            x = layer(
+                x,
+                srcMask=depth_attention_bias,
+                rotaryPositions2D=rotary_positions)
             x = self.token_adapters[i](x)
 
         return self.AssembleVisualState(
             frame, x, depth_state, camera_intrinsics, Ph, Pw, topDownContext,
-            prevVisualState, cameraMotion, prevVisualValid)
+            prevVisualState, cameraMotion, prevVisualValid,
+            enhancementAuxiliary=enhancement_auxiliary)
 
     def ComputePerceptionLoss(
         self,
@@ -1677,13 +3310,16 @@ class PerceiveExtractor(AGICoreModule):
             cameraMotion=cameraMotion,
             prevVisualValid=prevVisualValid)
         loss = loss + depth_losses["loss"]
+        loss = loss + 0.001 * visualState.Auxiliary.get(
+            "WarpFoldPenalty",
+            loss.new_zeros(()))
 
         return loss
 
     def InitWeights(self):
         for name, m in self.named_modules():
             if isinstance(m, SheafGaugeConv2d):
-                nn.init.zeros_(m.weight)
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
@@ -1713,13 +3349,59 @@ class PerceiveExtractor(AGICoreModule):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def ResetHebbianMemory(self): 
+    def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
         for m in self.modules(): 
             if m is self:
                 continue
             
             if hasattr(m, "ResetHebbianMemory"): 
-                m.ResetHebbianMemory()
+                m.ResetHebbianMemory(doneMask=doneMask)
+
+    def ConfigureHebbianRuntime(
+        self,
+        *,
+        updatePeriod: int = 1,
+        enabledLayerNames: Optional[Iterable[str]] = None,
+        ) -> Dict[str, bool]:
+        """Configure online plasticity without removing any trained layer."""
+        selected = (
+            None
+            if enabledLayerNames is None
+            else frozenset(str(name) for name in enabledLayerNames))
+        available = {
+            name
+            for name, module in self.named_modules()
+            if isinstance(module, (HebbianConv2d, HebbianLinear))
+            and module.hebbian_capable}
+        if selected is not None:
+            unknown = selected - available
+            if unknown:
+                raise ValueError(
+                    f"unknown or non-plastic Hebbian layers: {sorted(unknown)}")
+
+        enabled = {}
+        for name, module in self.named_modules():
+            if not isinstance(module, (HebbianConv2d, HebbianLinear)):
+                continue
+            active = bool(
+                module.hebbian_capable
+                and (selected is None or name in selected))
+            module.use_hebbian = active
+            module.SetHebbianUpdatePeriod(updatePeriod)
+            if not active:
+                module.ResetHebbianMemory()
+            enabled[name] = active
+        return enabled
+
+    def ConfigureEdgeDeploymentHebbian(
+        self,
+        updatePeriod: int = 4,
+        ) -> Dict[str, bool]:
+        # Preserve online adaptation in high-level cortical integration while
+        # avoiding all convolutional per-sample memories/unfolds on Jetson.
+        return self.ConfigureHebbianRuntime(
+            updatePeriod=updatePeriod,
+            enabledLayerNames=("mlp.2", "mlp.6"))
 
 
 
@@ -1840,7 +3522,10 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         depth_valid = kwargs["depthValid"]
         camera_intrinsics = self.base.CameraIntrinsicsBatch(int(frame.size(0)))
 
-        pyramid = self.base.cnn_extractor(frame)
+        pyramid, enhancement_auxiliary = self.base.BuildAugmentedPyramid(
+            frame,
+            prevVisualState,
+            prevVisualValid)
         feat, depth_state = self.base.depth_fusion(
             pyramid["Deep"],
             pyramid["Layer3"],
@@ -1848,6 +3533,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             pyramid["Layer1"],
             depth=depth,
             depthValid=depth_valid)
+        depth_state = self.base.EnhanceDepthState(frame, depth_state)
         
         feat = self.base.cnn_feat_adapter(feat)
 
@@ -1882,21 +3568,25 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             padding=self.base.patch_embed.padding,
             dilation=self.base.patch_embed.dilation,
             groups=self.base.patch_embed.groups,)
+        patches = self.base.AddPatchContentProjection(feat, patches)
 
-        B, C, Ph, Pw = patches.shape
-        patches = rearrange(patches, "b c h w -> b (h w) c")
-        cls_tokens = repeat(self.base.cls_token, "1 1 d -> b 1 d", b=B)
-        xTok = torch.cat([cls_tokens, patches], dim=1)
-        xTok = self.base.pos_drop(xTok)
+        xTok, Ph, Pw = self.base.BuildTransformerInput(pyramid, patches)
         depth_attention_bias = self.base.BuildDepthAttentionBias(
             depth_state,
             Ph,
             Pw,
             cameraIntrinsics=camera_intrinsics,
-            frameSize=tuple(frame.shape[-2:]))
+            frameSize=self.base.CameraIntrinsicsReferenceSize())
+        rotary_positions = self.base.BuildRotaryPositions2D(
+            Ph,
+            Pw,
+            xTok.device)
 
         for i, layer in enumerate(self.base.transformer_layers):
-            xTok = layer(xTok, srcMask=depth_attention_bias)
+            xTok = layer(
+                xTok,
+                srcMask=depth_attention_bias,
+                rotaryPositions2D=rotary_positions)
             
             xTok = self.base.token_adapters[i](xTok)
             
@@ -1906,7 +3596,8 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
 
         return self.base.AssembleVisualState(
             frame, xTok, depth_state, camera_intrinsics, Ph, Pw, topDownContext,
-            prevVisualState, cameraMotion, prevVisualValid)
+            prevVisualState, cameraMotion, prevVisualValid,
+            enhancementAuxiliary=enhancement_auxiliary)
 
     @torch.no_grad()
     def CommitOne(self, site: str, layerIdx: int, a: torch.Tensor, b: torch.Tensor, scale: float) -> bool:
@@ -2073,8 +3764,17 @@ class PerceptionRecallHeads(nn.Module):
         node_h = self.node_trunk(visualState.ObjectTokens)
         B = visualState.IntegratedFeat.size(0)
 
+        patch_grid_shape = visualState.Auxiliary.get("PatchGridShape")
+        if patch_grid_shape is None:
+            patch_count = int(visualState.PatchTokens.size(1))
+            patch_height = int(math.sqrt(patch_count))
+            patch_grid_shape = torch.tensor(
+                [patch_height, patch_count // max(patch_height, 1)],
+                dtype=torch.long)
+
         return {
             **node_out,
+            "patch_grid_shape": patch_grid_shape,
             "reconstruction": self.reconstruction_head(global_h).view(B, 3, self.recon_size, self.recon_size),
             "patch_class_logits": self.patch_class_logits(patch_h),
             "patch_depth": F.softplus(self.patch_depth(patch_h).squeeze(-1)),
@@ -2200,35 +3900,52 @@ class PerceptionRecallLoss(nn.Module):
             mode="bilinear",
             align_corners=False).clamp(0.0, 1.0)
 
+    @staticmethod
+    def PatchGridShape(
+        patchGridShape: Union[torch.Tensor, Tuple[int, int], List[int]],
+        numPatches: int,) -> Tuple[int, int]:
+        if isinstance(patchGridShape, torch.Tensor):
+            values = patchGridShape.detach().cpu().view(-1).tolist()
+        else:
+            values = list(patchGridShape)
+        if len(values) != 2:
+            raise ValueError("patch grid shape must contain height and width")
+        height, width = int(values[0]), int(values[1])
+        if height <= 0 or width <= 0 or height * width != int(numPatches):
+            raise ValueError("patch grid shape does not match patch token count")
+        return height, width
+
     def SemanticTarget(
         self,
         targets: Dict[str, torch.Tensor],
-        numPatches: int) -> torch.Tensor:
+        numPatches: int,
+        patchGridShape) -> torch.Tensor:
         tensor = targets["semantic_segmentation"]
-        grid = int(math.sqrt(numPatches))
-        down = F.interpolate(tensor.unsqueeze(1).float(), size=(grid, grid), mode="nearest")
+        grid = self.PatchGridShape(patchGridShape, numPatches)
+        down = F.interpolate(tensor.unsqueeze(1).float(), size=grid, mode="nearest")
         return down[:, 0].reshape(tensor.size(0), numPatches).long()
 
     def DepthTarget(
         self,
         targets: Dict[str, torch.Tensor],
-        numPatches: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        numPatches: int,
+        patchGridShape) -> Tuple[torch.Tensor, torch.Tensor]:
         tensor = targets["depth"]
         valid = targets["depth_valid"].to(tensor.dtype)
-        grid = int(math.sqrt(numPatches))
+        grid = self.PatchGridShape(patchGridShape, numPatches)
         inverse = torch.where(valid > 0.0, tensor.clamp_min(1e-6).reciprocal(), torch.zeros_like(tensor))
-        weight = F.adaptive_avg_pool2d(valid, (grid, grid))
-        pooled_inverse = F.adaptive_avg_pool2d(inverse, (grid, grid)) / weight.clamp_min(1e-6)
+        weight = F.adaptive_avg_pool2d(valid, grid)
+        pooled_inverse = F.adaptive_avg_pool2d(inverse, grid) / weight.clamp_min(1e-6)
         target = pooled_inverse.clamp_min(1e-6).reciprocal()
         target_valid = weight > 0.0
         target = target[:, 0].reshape(tensor.size(0), numPatches)
         target_valid = target_valid[:, 0].reshape(tensor.size(0), numPatches)
         return target, target_valid
 
-    def NormalTarget(self, targets: Dict[str, torch.Tensor], numPatches: int) -> torch.Tensor:
+    def NormalTarget(self, targets: Dict[str, torch.Tensor], numPatches: int, patchGridShape) -> torch.Tensor:
         tensor = targets["normal"]
-        grid = int(math.sqrt(numPatches))
-        normal = F.interpolate(tensor, size=(grid, grid), mode="bilinear", align_corners=False)
+        grid = self.PatchGridShape(patchGridShape, numPatches)
+        normal = F.interpolate(tensor, size=grid, mode="bilinear", align_corners=False)
         normal = F.normalize(normal, dim=1, eps=1e-6)
         return rearrange(normal, "b c h w -> b (h w) c")
 
@@ -2236,10 +3953,11 @@ class PerceptionRecallLoss(nn.Module):
         self,
         nodeMasks: torch.Tensor,
         gtIndex: torch.Tensor,
-        numPatches: int) -> torch.Tensor:
-        grid = int(math.sqrt(numPatches))
+        numPatches: int,
+        patchGridShape) -> torch.Tensor:
+        grid = self.PatchGridShape(patchGridShape, numPatches)
         masks = nodeMasks[gtIndex]
-        return F.adaptive_max_pool2d(masks.unsqueeze(1).float(), (grid, grid)).flatten(1)
+        return F.adaptive_max_pool2d(masks.unsqueeze(1).float(), grid).flatten(1)
 
     def forward(self, recallOut: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         B, K, _ = recallOut["node_logits"].shape
@@ -2342,7 +4060,8 @@ class PerceptionRecallLoss(nn.Module):
             mask_target = self.NodeMaskTarget(
                 targets["node_instance_masks"][b],
                 matched_gt,
-                recallOut["node_mask_logits"].size(-1))
+                recallOut["node_mask_logits"].size(-1),
+                recallOut["patch_grid_shape"])
             mask_terms.append(F.binary_cross_entropy_with_logits(
                 recallOut["node_mask_logits"][b, pred_idx],
                 mask_target))
@@ -2379,14 +4098,23 @@ class PerceptionRecallLoss(nn.Module):
             recallOut["global_label_logits"], targets["global_labels"].to(recallOut["global_label_logits"].dtype)))
         image = self.ReconstructionTarget(targets, recallOut["reconstruction"].size(-1))
         add("reconstruction", F.l1_loss(recallOut["reconstruction"], image))
-        patch_sem = self.SemanticTarget(targets, recallOut["patch_class_logits"].size(1))
+        patch_sem = self.SemanticTarget(
+            targets,
+            recallOut["patch_class_logits"].size(1),
+            recallOut["patch_grid_shape"])
         logits = recallOut["patch_class_logits"].reshape(-1, recallOut["patch_class_logits"].size(-1))
         add("patch_semantic", F.cross_entropy(logits, patch_sem.reshape(-1)))
-        patch_depth, patch_depth_valid = self.DepthTarget(targets, recallOut["patch_depth"].size(1))
+        patch_depth, patch_depth_valid = self.DepthTarget(
+            targets,
+            recallOut["patch_depth"].size(1),
+            recallOut["patch_grid_shape"])
         error = F.smooth_l1_loss(recallOut["patch_depth"], patch_depth, reduction="none")
         valid = patch_depth_valid.to(error.dtype)
         add("patch_depth", (error * valid).sum() / valid.sum().clamp_min(1.0))
-        patch_normal = self.NormalTarget(targets, recallOut["patch_normal"].size(1))
+        patch_normal = self.NormalTarget(
+            targets,
+            recallOut["patch_normal"].size(1),
+            recallOut["patch_grid_shape"])
         normal_error = 1.0 - (recallOut["patch_normal"] * patch_normal).sum(dim=-1).clamp(-1.0, 1.0)
         add("patch_normal", (normal_error * valid).sum() / valid.sum().clamp_min(1.0))
         losses["loss"] = total
@@ -2457,6 +4185,36 @@ class TestPerceptionMTool:
             PredictedVisual=predictedVisual,
             Precision=torch.ones(B, device=self.device, dtype=dtype),
             MemoryCue=torch.zeros(B, integrated_dim, device=self.device, dtype=dtype),)
+
+    def MakeRegressionModel(
+        self,
+        imgSize: int = 32,
+        *,
+        useHebbian: bool = False,
+        enableRecallAuxiliary: bool = True,
+        ) -> PerceiveExtractor:
+        return PerceiveExtractor(
+            imgSize=imgSize,
+            patchSize=1,
+            embedDim=32,
+            numHeads=4,
+            numLayers=1,
+            baseChannels=8,
+            objectTokenCount=4,
+            useHebbian=useHebbian,
+            enableRecallAuxiliary=enableRecallAuxiliary).to(self.device)
+
+    def RunRegressionCheck(self, name: str, check) -> bool:
+        try:
+            check()
+            print(f"{name} passed.")
+            return True
+        except AssertionError as e:
+            print(f"{name} failed: {e}")
+            return False
+        except Exception as e:
+            print(f"{name} error: {e}")
+            return False
 
     def PerceptionForward(self, model, x: torch.Tensor, prevVisualState: Optional[VisualState] = None, predictedVisual: Optional[Dict[str, torch.Tensor]] = None) -> VisualState:
         B, _, H, W = x.shape
@@ -3043,6 +4801,8 @@ class TestPerceptionMTool:
     def WrapperForwardEqualWhenNoInitRank(self):
         try:
             base = PerceiveExtractor(imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            with torch.no_grad():
+                base.perception_enhancement.residual_gain.fill_(0.1)
             base.eval()
             wrapper = PerceptionOnlineWrapper(base=base, initRankEach=0).to(self.device)
             wrapper.eval()
@@ -3052,8 +4812,24 @@ class TestPerceptionMTool:
                 y_base = self.PerceptionForward(base, x)
                 y_wrap = self.PerceptionForward(wrapper, x)
 
-            max_abs = (y_base.IntegratedFeat - y_wrap.IntegratedFeat).abs().max().item()
-            assert max_abs < 1e-6, f"Wrapper forward differs when ranks=0: max_abs={max_abs:.3e}"
+            for name in (
+                "IntegratedFeat",
+                "PatchTokens",
+                "MotionToken",
+                "QualityToken",):
+                max_abs = (
+                    getattr(y_base, name) - getattr(y_wrap, name)
+                ).abs().max().item()
+                assert max_abs < 1e-6, (
+                    f"Wrapper {name} differs when ranks=0: "
+                    f"max_abs={max_abs:.3e}")
+            for key in ("MetricDepthFullRes", "CorticalEnergy"):
+                max_abs = (
+                    y_base.Auxiliary[key] - y_wrap.Auxiliary[key]
+                ).abs().max().item()
+                assert max_abs < 1e-6, (
+                    f"Wrapper auxiliary {key} differs when ranks=0: "
+                    f"max_abs={max_abs:.3e}")
             print("WrapperForwardEqualWhenNoInitRank passed.")
             return True
         except AssertionError as e:
@@ -3492,6 +5268,799 @@ class TestPerceptionMTool:
             print(f"SmallBatchSafety error: {e}")
             return False
 
+    def TestEvalDepthLossAuxiliarySchema(self):
+        def check():
+            model = self.MakeRegressionModel(64).eval()
+            frame = torch.rand(1, 3, 64, 64, device=self.device)
+            depth = torch.ones(1, 1, 64, 64, device=self.device)
+            valid = torch.ones_like(depth, dtype=torch.bool)
+            visual = model(
+                frame,
+                topDownContext=self.MakeTopDownContext(model, 1),
+                depth=depth,
+                depthValid=valid)
+            assert "VirtualTarget" in visual.Auxiliary
+            assert "EdgeAwareSmoothness" in visual.Auxiliary
+            loss = model.ComputePerceptionLoss(
+                visual,
+                depthTarget=depth,
+                depthTargetValid=valid)
+            assert torch.isfinite(loss)
+        return self.RunRegressionCheck("EvalDepthLossAuxiliarySchema", check)
+
+    def TestQualityStatisticsDType(self):
+        def check():
+            model = self.MakeRegressionModel(64).half()
+            frame = torch.rand(
+                2,
+                3,
+                64,
+                64,
+                device=self.device,
+                dtype=torch.float16)
+            stats = model.QualityStats(frame)
+            assert stats.dtype == torch.float16
+            assert model.quality_proj(stats).dtype == torch.float16
+        return self.RunRegressionCheck("QualityStatisticsDType", check)
+
+    def TestPatchProjectionContentSensitivity(self):
+        def check():
+            model = self.MakeRegressionModel(64).eval()
+            assert float(model.patch_embed.weight.norm()) > 0.0
+            with torch.no_grad():
+                black = model.cnn_extractor(
+                    torch.zeros(1, 3, 64, 64, device=self.device))["Deep"]
+                white = model.cnn_extractor(
+                    torch.ones(1, 3, 64, 64, device=self.device))["Deep"]
+                black_patch = model.AddPatchContentProjection(
+                    black,
+                    model.patch_adapter(black))
+                white_patch = model.AddPatchContentProjection(
+                    white,
+                    model.patch_adapter(white))
+                assert not torch.equal(black_patch, white_patch)
+                model.patch_embed.weight.zero_()
+                black_patch = model.AddPatchContentProjection(
+                    black,
+                    model.patch_adapter(black))
+                white_patch = model.AddPatchContentProjection(
+                    white,
+                    model.patch_adapter(white))
+            assert float(model.patch_content_gain) == 0.0
+            assert torch.count_nonzero(black_patch) == 0
+            assert torch.count_nonzero(white_patch) == 0
+        return self.RunRegressionCheck("PatchProjectionContentSensitivity", check)
+
+    def TestGrowableAdapterStateRoundTrip(self):
+        def check():
+            conv = GrowableLoRAConv2d(
+                nn.Conv2d(4, 6, 3, padding=1, bias=False).to(self.device))
+            conv.Grow(2)
+            restored_conv = GrowableLoRAConv2d(
+                nn.Conv2d(4, 6, 3, padding=1, bias=False).to(self.device))
+            restored_conv.load_state_dict(conv.state_dict(), strict=True)
+            assert len(restored_conv.A_list) == 1
+            assert torch.equal(restored_conv.A_list[0], conv.A_list[0])
+
+            feature = GrowableConv1x1Adapter(8).to(self.device)
+            feature.Grow(3)
+            restored_feature = GrowableConv1x1Adapter(8).to(self.device)
+            restored_feature.load_state_dict(feature.state_dict(), strict=True)
+            assert len(restored_feature.A_list) == 1
+            assert torch.equal(restored_feature.B_list[0], feature.B_list[0])
+
+            token = GrowableTokenAdapter(8).to(self.device)
+            token.Grow(2)
+            restored_token = GrowableTokenAdapter(8).to(self.device)
+            restored_token.load_state_dict(token.state_dict(), strict=True)
+            assert len(restored_token.A_list) == 1
+            assert torch.equal(restored_token.alpha[0], token.alpha[0])
+
+            model = self.MakeRegressionModel()
+            model.cnn_feat_adapter.Grow(2)
+            model.patch_adapter.Grow(2)
+            model.token_adapters[0].Grow(2)
+            restored_model = self.MakeRegressionModel()
+            incompatible = restored_model.load_state_dict(
+                model.state_dict(),
+                strict=True)
+            assert incompatible.missing_keys == []
+            assert incompatible.unexpected_keys == []
+            assert len(restored_model.cnn_feat_adapter.A_list) == 1
+            assert len(restored_model.patch_adapter.A_list) == 1
+            assert len(restored_model.token_adapters[0].A_list) == 1
+
+            empty_state = self.MakeRegressionModel().state_dict()
+            incompatible = restored_model.load_state_dict(
+                empty_state,
+                strict=True)
+            assert incompatible.missing_keys == []
+            assert incompatible.unexpected_keys == []
+            assert len(restored_model.cnn_feat_adapter.A_list) == 0
+            assert len(restored_model.patch_adapter.A_list) == 0
+            assert len(restored_model.token_adapters[0].A_list) == 0
+
+            legacy_source = self.MakeRegressionModel(useHebbian=True)
+            legacy_state = {
+                name: value
+                for name, value in legacy_source.state_dict().items()
+                if (
+                    name != "_enhancement_schema"
+                    and name not in {
+                        "patch_content_gain",
+                        "axial_position_gain"}
+                    and not name.startswith(
+                        PerceiveExtractor.ENHANCEMENT_STATE_PREFIXES)
+                    and not name.endswith(
+                        PerceiveExtractor.ENHANCEMENT_STATE_SUFFIXES)
+                    and not name.endswith("topology_count"))}
+            for name, module in legacy_source.named_modules():
+                if isinstance(module, (HebbianConv2d, HebbianLinear)):
+                    legacy_state[f"{name}.hebb_memory"] = torch.empty(
+                        0,
+                        device=self.device)
+            legacy_restored = self.MakeRegressionModel(useHebbian=True)
+            legacy_restored.cnn_feat_adapter.Grow(2)
+            legacy_restored.patch_adapter.Grow(2)
+            legacy_restored.token_adapters[0].Grow(2)
+            incompatible = legacy_restored.load_state_dict(
+                legacy_state,
+                strict=True)
+            assert incompatible.missing_keys == []
+            assert incompatible.unexpected_keys == []
+            assert all(
+                "hebb_memory" not in name
+                for name in legacy_restored.state_dict())
+            assert len(legacy_restored.cnn_feat_adapter.A_list) == 0
+            assert len(legacy_restored.patch_adapter.A_list) == 0
+            assert len(legacy_restored.token_adapters[0].A_list) == 0
+        return self.RunRegressionCheck("GrowableAdapterStateRoundTrip", check)
+
+    def TestPartialAdapterLoadPreservesRank(self):
+        def check():
+            adapter = GrowableConv1x1Adapter(8).to(self.device)
+            adapter.Grow(2)
+            adapter.load_state_dict(
+                {"anchor_": adapter.anchor_.clone()},
+                strict=False)
+            assert len(adapter.A_list) == 1
+            model = self.MakeRegressionModel()
+            model.load_state_dict(
+                {"patch_content_gain": torch.ones_like(
+                    model.patch_content_gain)},
+                strict=False)
+            assert torch.equal(
+                model.patch_content_gain,
+                torch.ones_like(model.patch_content_gain))
+        return self.RunRegressionCheck("PartialAdapterLoadPreservesRank", check)
+
+    def TestHebbianPartialRowReset(self):
+        def check():
+            layer = HebbianConv2d(
+                3,
+                4,
+                3,
+                padding=1,
+                useHebbian=True).to(self.device).train()
+            _ = layer(torch.rand(3, 3, 8, 8, device=self.device))
+            before = layer.hebb_memory.clone()
+            layer.ResetHebbianMemory(doneMask=torch.tensor(
+                [False, True, False],
+                device=self.device))
+            assert torch.equal(layer.hebb_memory[0], before[0])
+            assert torch.count_nonzero(layer.hebb_memory[1]) == 0
+            assert torch.equal(layer.hebb_memory[2], before[2])
+        return self.RunRegressionCheck("HebbianPartialRowReset", check)
+
+    def TestHebbianDisabledFastPath(self):
+        def check():
+            layer = HebbianConv2d(
+                3,
+                4,
+                3,
+                padding=1,
+                useHebbian=False).to(self.device)
+            value = torch.rand(
+                2,
+                3,
+                8,
+                8,
+                device=self.device,
+                requires_grad=True)
+            assert torch.allclose(
+                layer(value),
+                layer.conv(value),
+                atol=1e-6,
+                rtol=1e-5)
+            assert layer.hebb_memory.numel() == 0
+        return self.RunRegressionCheck("HebbianDisabledFastPath", check)
+
+    def TestHebbianEvalPlasticity(self):
+        def check():
+            layer = HebbianConv2d(
+                3,
+                4,
+                3,
+                padding=1,
+                useHebbian=True).to(self.device).eval()
+            value = torch.rand(2, 3, 8, 8, device=self.device)
+            expected = layer.conv(value)
+            first = layer(value)
+            assert torch.allclose(first, expected, atol=1e-6, rtol=1e-5)
+            before = layer.hebb_memory.clone()
+            _ = layer(value)
+            assert torch.count_nonzero(before) > 0
+            assert not torch.equal(layer.hebb_memory, before)
+        return self.RunRegressionCheck("HebbianEvalPlasticity", check)
+
+    def TestEdgeHebbianPolicy(self):
+        def check():
+            model = self.MakeRegressionModel(
+                useHebbian=True,
+                enableRecallAuxiliary=False)
+            enabled = model.ConfigureEdgeDeploymentHebbian(updatePeriod=4)
+            assert {
+                name for name, active in enabled.items() if active
+            } == {"mlp.2", "mlp.6"}
+            for name, module in model.named_modules():
+                if isinstance(module, HebbianConv2d):
+                    assert not module.use_hebbian
+                    assert module.hebb_memory.numel() == 0
+                if name in {"mlp.2", "mlp.6"}:
+                    assert module.use_hebbian
+                    assert module.hebbian_update_period == 4
+
+            automatic = self.MakeRegressionModel(
+                useHebbian=True,
+                enableRecallAuxiliary=False)
+            with torch.no_grad():
+                automatic.perception_enhancement.residual_gain.fill_(0.1)
+            automatic.eval()
+            automatic.IsJetsonOrinExecution = lambda frame: True
+            frame = torch.rand(1, 3, 32, 32, device=self.device)
+            depth = torch.ones(1, 1, 32, 32, device=self.device)
+            automatic_state = automatic(
+                frame,
+                topDownContext=self.MakeTopDownContext(automatic, 1),
+                depth=depth,
+                depthValid=torch.ones_like(depth, dtype=torch.bool))
+            assert automatic._jetson_auto_edge_policy
+            assert automatic_state.Auxiliary[
+                "MetricDepthFullRes"].dtype == torch.float16
+            assert automatic_state.Auxiliary[
+                "CorticalFastState"].dtype == torch.float16
+            assert automatic_state.Auxiliary[
+                "CorticalSlowState"].dtype == torch.float16
+            assert "CorticalEnergy" not in automatic_state.Auxiliary
+            assert all(
+                not module.use_hebbian
+                for module in automatic.modules()
+                if isinstance(module, HebbianConv2d))
+            automatic.train()
+            assert not automatic._jetson_auto_edge_policy
+            assert all(
+                module.use_hebbian
+                for module in automatic.modules()
+                if isinstance(module, HebbianConv2d)
+                and module.hebbian_capable)
+        return self.RunRegressionCheck("EdgeHebbianPolicy", check)
+
+    def TestNonSquarePatchSupervision(self):
+        def check():
+            model = self.MakeRegressionModel(64).train()
+            frame = torch.rand(1, 3, 64, 96, device=self.device)
+            depth = torch.ones(1, 1, 64, 96, device=self.device)
+            valid = torch.ones_like(depth, dtype=torch.bool)
+            normal = torch.zeros(1, 3, 64, 96, device=self.device)
+            normal[:, 2] = 1.0
+            targets = self.MakeSyntheticTargets(
+                frame,
+                depth,
+                valid,
+                normal,
+                torch.zeros(
+                    1,
+                    64,
+                    96,
+                    device=self.device,
+                    dtype=torch.long),
+                nodes=2)
+            visual = model(
+                frame,
+                topDownContext=self.MakeTopDownContext(model, 1),
+                depth=depth,
+                depthValid=valid)
+            recall = model.recall_heads(visual)
+            losses = PerceptionRecallLoss(
+                identityDim=model.recall_heads.identity_dim).to(self.device)(
+                    recall,
+                    targets)
+            assert torch.isfinite(losses["loss"])
+        return self.RunRegressionCheck("NonSquarePatchSupervision", check)
+
+    def TestAnisotropicDiffusionStability(self):
+        def check():
+            diffusion = StableAnisotropicDiffusion(
+                iterations=2).to(self.device)
+            value = torch.rand(
+                2,
+                6,
+                17,
+                19,
+                device=self.device,
+                requires_grad=True)
+            output = diffusion(value)
+            channel_min = value.detach().amin(
+                dim=(-2, -1),
+                keepdim=True)
+            channel_max = value.detach().amax(
+                dim=(-2, -1),
+                keepdim=True)
+            assert torch.all(output.detach() >= channel_min - 1e-6)
+            assert torch.all(output.detach() <= channel_max + 1e-6)
+            output.mean().backward()
+            assert value.grad is not None
+            assert torch.isfinite(value.grad).all()
+            assert 0.0 < float(diffusion.StepSize()) < 0.25
+        return self.RunRegressionCheck("AnisotropicDiffusionStability", check)
+
+    def TestCorticalGaborTemporalReset(self):
+        def check():
+            vision = CorticalEarlyVision(outChannels=8).to(self.device)
+            even = vision.gabor_even.float()
+            odd = vision.gabor_odd.float()
+            assert torch.allclose(
+                even.mean(dim=(-2, -1)),
+                torch.zeros_like(even[:, :, 0, 0]),
+                atol=1e-5)
+            assert torch.allclose(
+                odd.mean(dim=(-2, -1)),
+                torch.zeros_like(odd[:, :, 0, 0]),
+                atol=1e-5)
+            assert torch.allclose(
+                even.flatten(1).norm(dim=1),
+                torch.ones(even.size(0), device=self.device),
+                atol=1e-5)
+            assert torch.allclose(
+                odd.flatten(1).norm(dim=1),
+                torch.ones(odd.size(0), device=self.device),
+                atol=1e-5)
+            reloaded_state = vision.state_dict()
+            reloaded_state["gabor_even"] = (
+                reloaded_state["gabor_even"] + 0.01)
+            vision.load_state_dict(reloaded_state, strict=True)
+            assert torch.equal(
+                vision.gabor_quadrature,
+                torch.cat([vision.gabor_even, vision.gabor_odd], dim=0))
+            frame = torch.rand(2, 3, 64, 64, device=self.device)
+            feature1, state1 = vision(frame, None, None)
+            assert feature1.shape == (2, 8, 16, 16)
+            assert torch.count_nonzero(
+                state1["CorticalTemporalResponse"]) == 0
+            feature2, state2 = vision(
+                frame + 0.1,
+                state1["CorticalFastState"],
+                state1["CorticalSlowState"],
+                torch.tensor([True, False], device=self.device))
+            assert torch.isfinite(feature2).all()
+            assert torch.count_nonzero(
+                state2["CorticalTemporalResponse"][0]) > 0
+            assert torch.count_nonzero(
+                state2["CorticalTemporalResponse"][1]) == 0
+        return self.RunRegressionCheck("CorticalGaborTemporalReset", check)
+
+    def TestLogDepthResampling(self):
+        def check():
+            fusion = self.MakeRegressionModel(64).depth_fusion
+            depth = torch.tensor(
+                [[[[1.0, 4.0]]]],
+                device=self.device)
+            valid = torch.ones_like(depth, dtype=torch.bool)
+            log_depth, weight = fusion.ResampleSensorLogDepth(
+                depth,
+                valid,
+                (1, 1))
+            assert torch.allclose(
+                log_depth.exp(),
+                torch.tensor([[[[2.0]]]], device=self.device),
+                atol=1e-6)
+            assert torch.equal(weight, torch.ones_like(weight))
+        return self.RunRegressionCheck("LogDepthResampling", check)
+
+    def TestSPPAndAxialPositionEncoding(self):
+        def check():
+            spp = SPPContextAdapter(
+                inChannels=32,
+                embedDim=24,
+                reducedChannels=8).to(self.device)
+            context = spp(torch.rand(
+                2,
+                32,
+                5,
+                7,
+                device=self.device))
+            assert context.shape == (2, 24)
+            assert torch.isfinite(context).all()
+
+            encoding = AxialPositionEncoding2D(24)(
+                3,
+                5,
+                self.device,
+                torch.float32)
+            assert encoding.shape == (1, 15, 24)
+            assert not torch.equal(encoding[:, 4], encoding[:, 5])
+
+            model = self.MakeRegressionModel()
+            positions = model.BuildRotaryPositions2D(
+                2,
+                3,
+                self.device)
+            assert positions.shape == (7, 2)
+            assert torch.equal(
+                positions[0],
+                torch.zeros(2, device=self.device))
+            assert torch.equal(
+                positions[3],
+                torch.tensor([1.0, 3.0], device=self.device))
+            assert torch.equal(
+                positions[4],
+                torch.tensor([2.0, 1.0], device=self.device))
+
+            attention = PerceptionRoPEMultiheadAttention(
+                embedDim=24,
+                numHeads=4).to(self.device).eval()
+            tokens = torch.rand(2, 7, 24, device=self.device)
+            attended, weights = attention(
+                tokens,
+                tokens,
+                tokens,
+                rotaryPositions2D=positions)
+            assert attended.shape == tokens.shape
+            assert weights.shape == (2, 7, 7)
+            assert torch.isfinite(attended).all()
+            legacy_attention = RoPEMultiheadAttention(
+                embedDim=24,
+                numHeads=4).to(self.device)
+            legacy_attention.load_state_dict({
+                name: value
+                for name, value in attention.state_dict().items()
+                if name != "rotary_2d_gain"}, strict=True)
+            legacy_output, _ = legacy_attention(
+                tokens,
+                tokens,
+                tokens)
+            assert torch.allclose(
+                attended,
+                legacy_output,
+                atol=1e-6,
+                rtol=1e-5)
+            with torch.no_grad():
+                attention.rotary_2d_gain.fill_(0.5)
+            attention.eval()
+            raw_heads = attention.ReshapeHeads(attention.q_proj(tokens))
+            rotated_heads = attention.Apply2DRotary(
+                raw_heads,
+                positions,
+                spatialGain=torch.tanh(attention.rotary_2d_gain))
+            assert torch.allclose(
+                rotated_heads.norm(dim=-1),
+                raw_heads.norm(dim=-1),
+                atol=1e-5,
+                rtol=1e-5)
+            spatial_output, _ = attention(
+                tokens,
+                tokens,
+                tokens,
+                rotaryPositions2D=positions)
+            assert not torch.allclose(
+                spatial_output,
+                legacy_output,
+                atol=1e-7,
+                rtol=1e-6)
+        return self.RunRegressionCheck("SPPAndAxialPositionEncoding", check)
+
+    def TestProjectiveTopologyDiagnostics(self):
+        def check():
+            diagnostics = ProjectiveTopologyDiagnostics().to(self.device)
+            height = width = 4
+            yy, xx = torch.meshgrid(
+                torch.arange(height, device=self.device, dtype=torch.float32),
+                torch.arange(width, device=self.device, dtype=torch.float32),
+                indexing="ij")
+            pixel_x = 50.0 * xx
+            pixel_y = 50.0 * yy
+            grid = torch.stack([
+                2.0 * (pixel_x + 0.5) / width - 1.0,
+                2.0 * (pixel_y + 0.5) / height - 1.0,
+            ], dim=-1).unsqueeze(0).half()
+            output = diagnostics(
+                grid,
+                domainMask=torch.ones(
+                    1,
+                    1,
+                    height,
+                    width,
+                    device=self.device))
+            assert all(torch.isfinite(value).all() for value in output.values())
+            assert torch.allclose(
+                output["WarpJacobianDet"],
+                torch.full_like(output["WarpJacobianDet"], 2500.0),
+                atol=4.0)
+
+            nan_grid = torch.full(
+                (1, 2, 2, 2),
+                float("nan"),
+                device=self.device,
+                dtype=torch.float16)
+            invalid = diagnostics(
+                nan_grid,
+                domainMask=torch.ones(
+                    1,
+                    1,
+                    2,
+                    2,
+                    device=self.device))
+            assert float(invalid["WarpFoldPenalty"]) == 0.0
+            assert torch.count_nonzero(invalid["WarpTopologyValid"]) == 0
+            singleton = diagnostics(torch.zeros(
+                1,
+                1,
+                3,
+                2,
+                device=self.device))
+            assert torch.count_nonzero(singleton["WarpTopologyValid"]) == 0
+        return self.RunRegressionCheck("ProjectiveTopologyDiagnostics", check)
+
+    def TestEnhancedPerceptionAuxiliary(self):
+        def check():
+            model = self.MakeRegressionModel(64)
+            with torch.no_grad():
+                model.perception_enhancement.residual_gain.fill_(0.1)
+            model.eval()
+            frame = torch.rand(1, 3, 64, 64, device=self.device)
+            depth = torch.ones(1, 1, 64, 64, device=self.device)
+            valid = torch.ones_like(depth, dtype=torch.bool)
+            context = self.MakeTopDownContext(model, 1)
+            previous = model(
+                frame,
+                topDownContext=context,
+                depth=depth,
+                depthValid=valid)
+            motion = torch.zeros(1, 7, device=self.device)
+            motion[:, 6] = 1.0
+            current = model(
+                frame,
+                topDownContext=context,
+                depth=depth,
+                depthValid=valid,
+                prevVisualState=previous,
+                cameraMotion=motion)
+            assert current.Auxiliary["MetricDepthFullRes"].shape[-2:] == (64, 64)
+            grid_shape = model.VisualStateShapeMetadata(
+                current,
+                "PatchGridShape")
+            assert grid_shape is not None
+            assert current.PatchTokens.shape == (
+                1,
+                grid_shape[0] * grid_shape[1],
+                model.embed_dim)
+            assert "DenseSemanticTensor" not in current.Auxiliary
+            for key in (
+                "CorticalEnergy",
+                "CorticalTemporalResponse",
+                "RigidPatchFlow",
+                "WarpJacobianDet",
+                "WarpJacobianSigmaMin",
+                "WarpJacobianSigmaMax",
+                "WarpTopologyValid",):
+                assert key in current.Auxiliary
+                assert torch.isfinite(current.Auxiliary[key]).all()
+            assert torch.allclose(
+                current.Auxiliary["WarpJacobianDet"],
+                torch.ones_like(current.Auxiliary["WarpJacobianDet"]),
+                atol=2e-3,
+                rtol=2e-3)
+        return self.RunRegressionCheck("EnhancedPerceptionAuxiliary", check)
+
+    def TestPatchGridMismatchDisablesWarp(self):
+        def check():
+            model = self.MakeRegressionModel(64).eval()
+            previous_frame = torch.rand(
+                1,
+                3,
+                32,
+                128,
+                device=self.device)
+            previous_depth = torch.ones(
+                1,
+                1,
+                32,
+                128,
+                device=self.device)
+            previous = model(
+                previous_frame,
+                topDownContext=self.MakeTopDownContext(model, 1),
+                depth=previous_depth,
+                depthValid=torch.ones_like(
+                    previous_depth,
+                    dtype=torch.bool))
+            assert model.VisualStateShapeMetadata(
+                previous,
+                "PatchGridShape") == (1, 4)
+            # The scalar code remains valid even if an external batch reset
+            # mistakes the legacy two-element public shape for batch data.
+            previous.Auxiliary["PatchGridShape"].zero_()
+            previous.Auxiliary["InputFrameShape"].zero_()
+            assert model.VisualStateShapeMetadata(
+                previous,
+                "PatchGridShape") == (1, 4)
+            assert model.VisualStateShapeMetadata(
+                previous,
+                "InputFrameShape") == (32, 128)
+
+            current_frame = torch.rand(
+                1,
+                3,
+                64,
+                64,
+                device=self.device)
+            current_depth = torch.ones(
+                1,
+                1,
+                64,
+                64,
+                device=self.device)
+            motion = torch.zeros(1, 7, device=self.device)
+            motion[:, 6] = 1.0
+            current = model(
+                current_frame,
+                topDownContext=self.MakeTopDownContext(model, 1),
+                depth=current_depth,
+                depthValid=torch.ones_like(
+                    current_depth,
+                    dtype=torch.bool),
+                prevVisualState=previous,
+                prevVisualValid=torch.ones(
+                    1,
+                    device=self.device,
+                    dtype=torch.bool),
+                cameraMotion=motion)
+            assert model.VisualStateShapeMetadata(
+                current,
+                "PatchGridShape") == (2, 2)
+            assert torch.count_nonzero(
+                current.Auxiliary["WarpPrevPatchValid"]) == 0
+            losses = model.ComputeDepthGeometryLoss(
+                current,
+                depthTarget=current_depth,
+                depthTargetValid=torch.ones_like(
+                    current_depth,
+                    dtype=torch.bool),
+                prevVisualState=previous,
+                prevVisualValid=torch.ones(
+                    1,
+                    device=self.device,
+                    dtype=torch.bool),
+                cameraMotion=motion)
+            assert float(losses["loss_depth_temporal"]) == 0.0
+        return self.RunRegressionCheck("PatchGridMismatchDisablesWarp", check)
+
+    def TestNonfiniteCameraMotionFallback(self):
+        def check():
+            model = self.MakeRegressionModel(64).eval()
+            frame = torch.rand(2, 3, 64, 64, device=self.device)
+            depth = torch.ones(2, 1, 64, 64, device=self.device)
+            valid = torch.ones_like(depth, dtype=torch.bool)
+            context = self.MakeTopDownContext(model, 2)
+            previous = model(
+                frame,
+                topDownContext=context,
+                depth=depth,
+                depthValid=valid)
+            motion = torch.zeros(2, 7, device=self.device)
+            motion[:, 6] = 1.0
+            motion[0, 0] = float("nan")
+            current = model(
+                frame,
+                topDownContext=context,
+                depth=depth,
+                depthValid=valid,
+                prevVisualState=previous,
+                prevVisualValid=torch.ones(
+                    2,
+                    device=self.device,
+                    dtype=torch.bool),
+                cameraMotion=motion)
+            for value in (
+                current.IntegratedFeat,
+                current.MotionToken,
+                current.DorsalFeat,
+                current.Auxiliary["WarpedPrevPatchTokens"],
+                current.Auxiliary["RigidPatchFlow"],):
+                assert torch.isfinite(value).all()
+            assert torch.count_nonzero(
+                current.Auxiliary["WarpPrevPatchValid"][0]) == 0
+            assert torch.allclose(
+                current.Auxiliary["WarpedPrevPatchTokens"][0],
+                current.PatchTokens[0])
+        return self.RunRegressionCheck("NonfiniteCameraMotionFallback", check)
+
+    def TestEvalSkipsZeroGainEnhancements(self):
+        def check():
+            model = self.MakeRegressionModel(64).eval()
+            calls = {
+                "cortical": 0,
+                "patch": 0,
+                "spp": 0,
+                "dense": 0,
+                "gauge_gamma": 0,
+                "gauge_beta": 0,}
+
+            def count(name):
+                def hook(module, inputs, output):
+                    del module, inputs, output
+                    calls[name] += 1
+                return hook
+
+            handles = [
+                model.perception_enhancement.early_vision.register_forward_hook(
+                    count("cortical")),
+                model.patch_content_projection.register_forward_hook(
+                    count("patch")),
+                model.spp_context.reduce.register_forward_hook(count("spp")),
+                model.dense_depth_refiner.trunk.register_forward_hook(
+                    count("dense")),
+                model.patch_embed.gauge_gamma.register_forward_hook(
+                    count("gauge_gamma")),
+                model.patch_embed.gauge_beta.register_forward_hook(
+                    count("gauge_beta")),]
+            frame = torch.rand(1, 3, 64, 64, device=self.device)
+            depth = torch.ones(1, 1, 64, 64, device=self.device)
+            with torch.no_grad():
+                model(
+                    frame,
+                    topDownContext=self.MakeTopDownContext(model, 1),
+                    depth=depth,
+                    depthValid=torch.ones_like(depth, dtype=torch.bool))
+            for handle in handles:
+                handle.remove()
+            assert calls == {
+                "cortical": 0,
+                "patch": 0,
+                "spp": 0,
+                "dense": 0,
+                "gauge_gamma": 0,
+                "gauge_beta": 0,}
+        return self.RunRegressionCheck("EvalSkipsZeroGainEnhancements", check)
+
+    def TestEnhancementGradientCoverage(self):
+        def check():
+            model = self.MakeRegressionModel(64).train()
+            frame = torch.rand(2, 3, 64, 64, device=self.device)
+            depth = torch.rand(2, 1, 64, 64, device=self.device) + 0.5
+            valid = torch.ones_like(depth, dtype=torch.bool)
+            visual = model(
+                frame,
+                topDownContext=self.MakeTopDownContext(model, 2),
+                depth=depth,
+                depthValid=valid)
+            loss = model.ComputePerceptionLoss(
+                visual,
+                depthTarget=depth,
+                depthTargetValid=valid)
+            loss.backward()
+            for parameter in (
+                model.perception_enhancement.residual_gain,
+                model.spp_context.residual_gain,
+                model.axial_position_gain,
+                model.transformer_layers[0].self_atten.rotary_2d_gain,
+                model.dense_depth_refiner.output.weight,
+                model.patch_content_projection.weight,):
+                assert parameter.grad is not None
+                assert torch.isfinite(parameter.grad).all()
+            assert model.dense_depth_refiner.output.bias.grad[1].abs() > 0
+        return self.RunRegressionCheck("EnhancementGradientCoverage", check)
+
     def PartialPreviousVisualMask(self):
         try:
             B, H = 2, 32
@@ -3529,7 +6098,13 @@ class TestPerceptionMTool:
                 [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
                 device=self.device)
             ok = (
-                torch.equal(
+                all(bool(torch.isfinite(value).all().item()) for value in (
+                    current.IntegratedFeat,
+                    current.MotionToken,
+                    current.Auxiliary["WarpedPrevPatchTokens"],
+                    current.Auxiliary["WarpPrevPatchValid"],
+                    current.Auxiliary["PatchMotionDepthResidual"],))
+                and torch.equal(
                     current.Auxiliary["WarpedPrevPatchTokens"][0],
                     current.PatchTokens[0].detach())
                 and bool(torch.isfinite(current.Auxiliary["WarpPrevPatchValid"][0]).all().item())
@@ -3550,6 +6125,26 @@ class TestPerceptionMTool:
             "PerceiveExtractorIOShapes": self.TestPerceiveExtractorIOShapes(),
             "PerceiveExtractorStructuredState": self.TestPerceiveExtractorStructuredState(),
             "RGBDGeometryAndSupervision": self.TestRGBDGeometryAndSupervision(),
+            "EvalDepthLossAuxiliarySchema": self.TestEvalDepthLossAuxiliarySchema(),
+            "QualityStatisticsDType": self.TestQualityStatisticsDType(),
+            "PatchProjectionContentSensitivity": self.TestPatchProjectionContentSensitivity(),
+            "GrowableAdapterStateRoundTrip": self.TestGrowableAdapterStateRoundTrip(),
+            "PartialAdapterLoadPreservesRank": self.TestPartialAdapterLoadPreservesRank(),
+            "HebbianPartialRowReset": self.TestHebbianPartialRowReset(),
+            "HebbianDisabledFastPath": self.TestHebbianDisabledFastPath(),
+            "HebbianEvalPlasticity": self.TestHebbianEvalPlasticity(),
+            "EdgeHebbianPolicy": self.TestEdgeHebbianPolicy(),
+            "NonSquarePatchSupervision": self.TestNonSquarePatchSupervision(),
+            "AnisotropicDiffusionStability": self.TestAnisotropicDiffusionStability(),
+            "CorticalGaborTemporalReset": self.TestCorticalGaborTemporalReset(),
+            "LogDepthResampling": self.TestLogDepthResampling(),
+            "SPPAndAxialPositionEncoding": self.TestSPPAndAxialPositionEncoding(),
+            "ProjectiveTopologyDiagnostics": self.TestProjectiveTopologyDiagnostics(),
+            "EnhancedPerceptionAuxiliary": self.TestEnhancedPerceptionAuxiliary(),
+            "PatchGridMismatchDisablesWarp": self.TestPatchGridMismatchDisablesWarp(),
+            "NonfiniteCameraMotionFallback": self.TestNonfiniteCameraMotionFallback(),
+            "EvalSkipsZeroGainEnhancements": self.TestEvalSkipsZeroGainEnhancements(),
+            "EnhancementGradientCoverage": self.TestEnhancementGradientCoverage(),
             "RecallLossDecreases": self.TestRecallLossDecreases(),
             "TrainStepSmoke": self.TrainStepSmoke(),
             "NoNanAfterManySteps": self.NoNanAfterManySteps(),

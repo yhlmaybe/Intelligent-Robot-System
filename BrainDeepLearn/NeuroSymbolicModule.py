@@ -1351,7 +1351,6 @@ class NeuroSymbolicExtractor(AGICoreModule):
         subgoal_feature = mixed["subgoal_feature"]
         constraint_tokens = mixed["constraint_tokens"]
 
-        operator_prob = F.softmax(operator_logits, dim=-1)
         current_operator = operator_prob.argmax(dim=-1)
         if self.last_operator_prob.shape == operator_prob.shape:
             previous_operator = self.last_operator

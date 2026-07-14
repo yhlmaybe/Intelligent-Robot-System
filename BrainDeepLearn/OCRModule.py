@@ -18,8 +18,7 @@ def DefaultOcrVocabPath() -> str:
 
 def WidthToCtcSteps(validWidths: torch.Tensor) -> torch.Tensor:
     w = validWidths.to(torch.long)
-    w = torch.div(w, 2, rounding_mode="floor")
-    w = torch.div(w, 2, rounding_mode="floor")
+    w = torch.div(w, 4, rounding_mode="floor")
     w = (w - 1).clamp(min=1)
     return w
 
@@ -42,7 +41,7 @@ def Jaccard(a: set, b: set) -> float:
         return 1.0
     if not a or not b:
         return 0.0
-    return len(a & b) / max(1, len(a | b))
+    return len(a & b) / len(a | b)
 
 def TextSim(a: str, b: str) -> float:
     return Jaccard(CharNgrams(a, 2), CharNgrams(b, 2))
@@ -234,14 +233,16 @@ def BalancedBceLoss(predTensor: torch.Tensor, gtTensor: torch.Tensor, maskTensor
         mask = maskTensor
 
     valid = (mask > 0.5).float()
-    pos = (gt > 0.5).float() * valid
-    neg = (1.0 - (gt > 0.5).float()) * valid
+    gt_positive = (gt > 0.5).float()
+    pos = gt_positive * valid
+    neg = (1.0 - gt_positive) * valid
 
     n_pos = pos.sum().clamp(min=1.0)
     n_neg = neg.sum().clamp(min=1.0)
+    balance_total = n_pos + n_neg
 
-    w_pos = n_neg / (n_pos + n_neg)
-    w_neg = n_pos / (n_pos + n_neg)
+    w_pos = n_neg / balance_total
+    w_neg = n_pos / balance_total
 
     loss_pos = -w_pos * (pos * torch.log(pred)) 
     loss_neg = -w_neg * (neg * torch.log(1.0 - pred))
@@ -259,14 +260,16 @@ def BalancedBceWithLogitsLoss(logitsTensor: torch.Tensor, gtTensor: torch.Tensor
         mask = maskTensor
 
     valid = (mask > 0.5).float()
-    pos = (gt > 0.5).float() * valid
-    neg = (1.0 - (gt > 0.5).float()) * valid
+    gt_positive = (gt > 0.5).float()
+    pos = gt_positive * valid
+    neg = (1.0 - gt_positive) * valid
 
     n_pos = pos.sum().clamp(min=1.0)
     n_neg = neg.sum().clamp(min=1.0)
+    balance_total = n_pos + n_neg
 
-    w_pos = n_neg / (n_pos + n_neg)
-    w_neg = n_pos / (n_pos + n_neg)
+    w_pos = n_neg / balance_total
+    w_neg = n_pos / balance_total
     weight = w_pos * pos + w_neg * neg
 
     loss = F.binary_cross_entropy_with_logits(
@@ -408,10 +411,9 @@ class CRNNRecognizer(nn.Module):
 
     def FeaturesToSeq(self, featTensor: torch.Tensor) -> torch.Tensor:
         feat = featTensor
-        b, c, h, w = feat.size()
+        h, w = feat.shape[-2:]
         if h != 1:
             feat = F.adaptive_avg_pool2d(feat, (1, w))
-            b, c, h, w = feat.size()
         feat = feat.squeeze(2)
         feat = feat.permute(2, 0, 1)
         return feat
@@ -676,7 +678,7 @@ class OCREngineExtractor(nn.Module):
         targetH: int = 32,
         maxW: int = 512,) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        c, h_img, w_img = imageTensor.shape
+        _, h_img, w_img = imageTensor.shape
 
         gray = (0.299 * imageTensor[0]
             + 0.587 * imageTensor[1]
@@ -697,8 +699,6 @@ class OCREngineExtractor(nn.Module):
 
             patch = gray[y1:y2, x1:x2]  # [h,w]
             h, w = patch.shape
-            if h < 1 or w < 1:
-                continue
 
             patch = patch.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
 
@@ -862,11 +862,13 @@ class OCREngineExtractor(nn.Module):
         chosen_lp = logProbs.gather(dim=-1, index=preds.unsqueeze(-1)).squeeze(-1) 
         chosen_p = torch.exp(chosen_lp).clamp(0.0, 1.0)  
 
-        t, b = preds.shape
+        preds_cpu = preds.detach().cpu()
+        chosen_p_cpu = chosen_p.detach().cpu()
+        b = int(preds_cpu.size(1))
         out: List[tuple[str, float]] = []
         for li in range(b):
-            seq = preds[:, li].tolist()
-            pseq = chosen_p[:, li].detach().cpu().tolist()
+            seq = preds_cpu[:, li].tolist()
+            pseq = chosen_p_cpu[:, li].tolist()
             prev = None
             chars: List[str] = []
             confs: List[float] = []
@@ -880,7 +882,7 @@ class OCREngineExtractor(nn.Module):
                 confs.append(float(p))
                 prev = idx
             text = "".join(chars)
-            conf = float(sum(confs) / max(1, len(confs))) if confs else 0.0
+            conf = float(sum(confs) / len(confs)) if confs else 0.0
             out.append((text, conf))
         return out
 

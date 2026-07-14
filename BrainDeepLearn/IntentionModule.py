@@ -929,8 +929,7 @@ class IntentionExtractor(AGICoreModule):
 
         safe_mask = chunkValid.clone() # [B, N]
         all_pad = ~safe_mask.any(dim=1) # [B]
-        if all_pad.any():
-            safe_mask[all_pad, 0] = True
+        safe_mask[:, 0] |= all_pad
 
         slots_attn, _ = self.slotCrossAttn(
             query=query,  
@@ -1165,8 +1164,7 @@ class IntentionExtractor(AGICoreModule):
         scores = self.recallMemScore(recallMem).squeeze(-1) # [B, M]
         safe_valid = recallMemValid.clone()
         all_pad = ~safe_valid.any(dim=1)
-        if all_pad.any():
-            safe_valid[all_pad, 0] = True
+        safe_valid[:, 0] |= all_pad
 
         scores = scores.masked_fill(~safe_valid, float("-inf"))
         attn = F.softmax(scores, dim=-1)
@@ -1684,8 +1682,7 @@ class IntentionExtractor(AGICoreModule):
         def safe_token_mask(token_mask_: torch.Tensor) -> torch.Tensor:
             safe = token_mask_.clone()
             all_pad = ~safe.any(dim=1)
-            if all_pad.any():
-                safe[all_pad, 0] = True
+            safe[:, 0] |= all_pad
             return safe
 
         trans_tokens: Optional[torch.Tensor] = None
@@ -1697,12 +1694,13 @@ class IntentionExtractor(AGICoreModule):
 
             mask_float = token_mask.float().unsqueeze(-1)
             sum_vec = (trans_tokens * mask_float).sum(dim=1)
-            denom = mask_float.sum(dim=1).clamp(min=1.0)
+            mask_sum = mask_float.sum(dim=1)
+            denom = mask_sum.clamp(min=1.0)
             fused = sum_vec / denom
             intentSem = intentSem + self.beta_trans * fused
 
             extras["intent_trans_norm"] = fused.norm(dim=-1, keepdim=True).detach()
-            extras["intent_trans_mask_sum"] = mask_float.sum(dim=1).detach()
+            extras["intent_trans_mask_sum"] = mask_sum.detach()
 
         abs_ext_ocr = torch.abs(sem_ext - sem_ocr)
         mul_ext_ocr = sem_ext_control * sem_ocr
@@ -1732,7 +1730,7 @@ class IntentionExtractor(AGICoreModule):
             gate_ocr = self.fuse_ocr_gate(feat_ocr)
             sem_ocr_fused = gate_ocr * sem_ocr
             base2 = base_ctx + torch.tanh(self.beta_ocr) * ctrl["g_ocr"] * (
-                sem_ocr_fused * has_ocr_mask.unsqueeze(-1).float() * ocr_control_float)
+                sem_ocr_fused * ocr_mask_float * ocr_control_float)
 
             feat_ext = torch.cat([
                 base2,
@@ -1746,17 +1744,16 @@ class IntentionExtractor(AGICoreModule):
                 gamma0 = 0.5 + 0.5 * gate_ext
                 gamma_eff = gamma0 * ctrl["g_ext"]
                 candidate = (1.0 - gamma_eff) * base2 + gamma_eff * sem_ext_control
-                intent2 = torch.where(has_ext_control_mask.unsqueeze(-1), candidate, base2)
+                intent2 = torch.where(has_ext_mask_exp, candidate, base2)
             else:
                 sem_ext_fused = gate_ext * sem_ext_control
                 intent2 = base2 + torch.tanh(self.beta_ext) * ctrl["g_ext"] * (
-                    sem_ext_fused * has_ext_control_mask.unsqueeze(-1).float())
+                    sem_ext_fused * has_ext_mask_float)
 
-            if (trans_tokens is not None) and token_mask.any():
-                w = ctrl["tok_w"] * token_mask.float() 
-                denom = w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-                w = w / denom
-                fused2 = (trans_tokens * w.unsqueeze(-1)).sum(dim=1) 
+            if trans_tokens is not None:
+                w = ctrl["tok_w"]
+                w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+                fused2 = (trans_tokens * w.unsqueeze(-1)).sum(dim=1)
                 intent2 = intent2 + torch.tanh(self.beta_trans) * ctrl["g_trans"] * fused2
 
             intent2 = self.sym_norm(intent2 + torch.tanh(self.beta_sym) * ctrl["sym_ctx"])
@@ -2380,8 +2377,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         def safe_token_mask(token_mask: torch.Tensor) -> torch.Tensor:
             safe = token_mask.clone()
             all_pad = ~safe.any(dim=1) 
-            if all_pad.any():
-                safe[all_pad, 0] = True
+            safe[:, 0] |= all_pad
             return safe
 
         token_mask_safe = safe_token_mask(token_mask)
@@ -2393,12 +2389,13 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
 
             mask_float = token_mask.float().unsqueeze(-1) 
             sum_vec = (trans_out * mask_float).sum(dim=1)
-            denom = mask_float.sum(dim=1).clamp(min=1.0)
+            mask_sum = mask_float.sum(dim=1)
+            denom = mask_sum.clamp(min=1.0)
             fused = sum_vec / denom
 
             intentSem = intentSem + base.beta_trans * fused
             extras["intent_trans_norm"] = fused.norm(dim=-1, keepdim=True).detach()
-            extras["intent_trans_mask_sum"] = mask_float.sum(dim=1).detach()
+            extras["intent_trans_mask_sum"] = mask_sum.detach()
 
         base._last_reason_support = None
         for t in range(int(base.reason_steps)):
@@ -2432,7 +2429,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
             gate_ocr2 = self.GateWithDelta(base.fuse_ocr_gate, feat_ocr2, delta_ocr)
             sem_ocr_fused2 = gate_ocr2 * sem_ocr
             base2 = base_ctx + torch.tanh(base.beta_ocr) * ctrl["g_ocr"] * (
-                sem_ocr_fused2 * has_ocr_mask.unsqueeze(-1).float() * ocr_control_float)
+                sem_ocr_fused2 * ocr_mask_float * ocr_control_float)
 
             feat_ext2 = torch.cat([
                 base2,
@@ -2446,17 +2443,16 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 gamma0 = 0.5 + 0.5 * gate_ext2
                 gamma_eff = gamma0 * ctrl["g_ext"]
                 cand = (1.0 - gamma_eff) * base2 + gamma_eff * sem_ext_control
-                intent2 = torch.where(has_ext_control_mask.unsqueeze(-1), cand, base2)
+                intent2 = torch.where(has_ext_mask_exp, cand, base2)
             else:
                 sem_ext_fused2 = gate_ext2 * sem_ext_control
                 intent2 = base2 + torch.tanh(base.beta_ext) * ctrl["g_ext"] * (
-                    sem_ext_fused2 * has_ext_control_mask.unsqueeze(-1).float())
+                    sem_ext_fused2 * has_ext_mask_float)
 
-            if (trans_out is not None) and token_mask.any():
-                w = ctrl["tok_w"] * token_mask.float()
-                denom = w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-                w = w / denom
-                fused2 = (trans_out * w.unsqueeze(-1)).sum(dim=1) 
+            if trans_out is not None:
+                w = ctrl["tok_w"]
+                w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+                fused2 = (trans_out * w.unsqueeze(-1)).sum(dim=1)
                 intent2 = intent2 + torch.tanh(base.beta_trans) * ctrl["g_trans"] * fused2
 
             intent2 = base.sym_norm(intent2 + torch.tanh(base.beta_sym) * ctrl["sym_ctx"])

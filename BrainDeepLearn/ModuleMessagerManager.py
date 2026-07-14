@@ -352,7 +352,7 @@ class ModuleMessagerManager:
                 "timestamp": now,
                 "output": self.ToJsonSafe(output, tensorName=str(moduleName))}
 
-            stepRecord["modules"][str(moduleName)] = deepcopy(entry)
+            stepRecord["modules"][str(moduleName)] = entry
             stepRecord["updated_at"] = now
             self.meta["updated_at"] = now
             self.TrimHistory()
@@ -458,13 +458,12 @@ class ModuleMessagerManager:
         if is_dataclass(value):
             return self.ToJsonSafe(asdict(value), tensorName=tensorName)
 
-        if np is not None:
-            if isinstance(value, np.generic):
-                return self.ToJsonSafe(value.item(), tensorName=tensorName)
-            if isinstance(value, np.ndarray):
-                return self.tensorVisualProcessor.ProcessTensor(tensorName, value)
+        if isinstance(value, np.generic):
+            return self.ToJsonSafe(value.item(), tensorName=tensorName)
+        if isinstance(value, np.ndarray):
+            return self.tensorVisualProcessor.ProcessTensor(tensorName, value)
 
-        if torch is not None and isinstance(value, torch.Tensor):
+        if isinstance(value, torch.Tensor):
             return self.tensorVisualProcessor.ProcessTensor(tensorName, value)
 
         if isinstance(value, OrderedDict):

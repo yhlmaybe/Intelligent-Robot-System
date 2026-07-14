@@ -63,6 +63,7 @@ def BuildReferenceScaleContext(
     top_match = torch.topk(matched_strength, k=2, dim=1).values
 
     observed_total = observed_strength.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    observed_max = observed_strength.amax(dim=1, keepdim=True)
 
     best_match = top_match[:, :1]
     second_match = top_match[:, 1:2]
@@ -73,11 +74,11 @@ def BuildReferenceScaleContext(
 
     return torch.cat([
         observed_strength.mean(dim=1, keepdim=True),
-        observed_strength.amax(dim=1, keepdim=True),
+        observed_max,
         best_match,
         mean_match,
         1.0 - best_match,
-        1.0 - observed_strength.amax(dim=1, keepdim=True),
+        1.0 - observed_max,
         ambiguity,
         unresolved], dim=-1)
 
@@ -525,7 +526,7 @@ class BaseOnlineWrapper(nn.Module):
                 for a, b, s in zip(slot["A"], slot["B"], slot["s"]):
                     delta = delta + self.sites[name].composeFn(a, b, s)
 
-                if skipZeros and torch.allclose(delta, torch.zeros_like(delta)):
+                if skipZeros and torch.allclose(delta, delta.new_zeros(())):
                     row[name] = None
                 else:
                     if detach: delta = delta.detach()
@@ -783,9 +784,9 @@ class BaseOnlineWrapper(nn.Module):
                 rTarget = sugges_rank(
                     self.gradEmaBuf[name][layerIdx]["A"],
                     self.gradEmaBuf[name][layerIdx]["B"],
-                    list(self.cand[name][layerIdx]["A"]),
-                    list(self.cand[name][layerIdx]["B"]),
-                    list(self.cand[name][layerIdx]["s"]),
+                    self.cand[name][layerIdx]["A"],
+                    self.cand[name][layerIdx]["B"],
+                    self.cand[name][layerIdx]["s"],
                     spec.inDim, spec.outDim, spec.maxRank,)
                 if rTarget > cur:
                     a, b, s = spec.allocFn(rTarget - cur, self.deviceRef, self.dtypeRef)
@@ -801,9 +802,8 @@ class BaseOnlineWrapper(nn.Module):
                         slot["A"] = nn.ParameterList()
                         slot["B"] = nn.ParameterList()
                         slot["s"] = nn.ParameterList()
-                        if self.gradEmaBuf is not None:
-                            self.gradEmaBuf[name][layerIdx]["A"] = []
-                            self.gradEmaBuf[name][layerIdx]["B"] = []
+                        self.gradEmaBuf[name][layerIdx]["A"] = []
+                        self.gradEmaBuf[name][layerIdx]["B"] = []
                     else:
                         s_set = torch.tensor(1.0, device=self.deviceRef, dtype=self.dtypeRef)
                         c = torch.tanh(s_set) * float(GetParametersScale(s_set))
@@ -814,9 +814,8 @@ class BaseOnlineWrapper(nn.Module):
                         slot["A"] = nn.ParameterList([nn.Parameter(aNew)])
                         slot["B"] = nn.ParameterList([nn.Parameter(bNew)])
                         slot["s"] = nn.ParameterList([nn.Parameter(s_set)])
-                        if self.gradEmaBuf is not None:
-                            self.gradEmaBuf[name][layerIdx]["A"] = []
-                            self.gradEmaBuf[name][layerIdx]["B"] = []
+                        self.gradEmaBuf[name][layerIdx]["A"] = []
+                        self.gradEmaBuf[name][layerIdx]["B"] = []
 
     def ComposeOne(self, site: str, layerIdx: int) -> torch.Tensor:
         spec = self.sites[site]
@@ -859,7 +858,7 @@ class BaseOnlineWrapper(nn.Module):
             for layerIdx in range(spec.nLayers):
                 slot = self.cand[name][layerIdx]
                 for aParam, bParam, sParam in zip(slot["A"], slot["B"], slot["s"]):
-                    s_val = float(sParam.detach().item()) if torch.is_tensor(sParam) else float(sParam)
+                    s_val = float(sParam.detach().item())
                     if aParam.numel() == 0 or bParam.numel() == 0 or abs(s_val) < 1e-12:
                         continue
                     did_commit = self.CommitOne(name, layerIdx, aParam.detach().clone(), bParam.detach().clone(), s_val,)

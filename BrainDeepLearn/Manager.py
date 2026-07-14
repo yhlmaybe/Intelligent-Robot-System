@@ -2735,7 +2735,6 @@ class ManagerFunction:
                 self.controller.SetStatus("error", msg)
                 return 
 
-            brain.to(self.device)
             brain.eval()
 
             agent = Agent(brain,isTrain=False,device=self.device,worldMemoryPath=BasicParameters.WORLD_MEMORY_PATH,memMemoryPath=BasicParameters.MEMORY_MEMORY_PATH,)

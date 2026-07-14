@@ -950,8 +950,9 @@ class ConsciousnessExtractor(AGICoreModule):
             B = int(ref.size(0))
 
         self.EnsureB(B, device=device, dtype=dtype)
+        step = int(self._step.item())
 
-        if (ref is None) and (int(self._step.item()) <= 0):
+        if (ref is None) and (step <= 0):
             self_sem = self._last_sem
             intent_sem = self._last_self_intent
             zeros_1 = torch.zeros(B, 1, device=device, dtype=dtype)
@@ -1001,7 +1002,7 @@ class ConsciousnessExtractor(AGICoreModule):
             dtype=dtype,)
         world_bank = torch.cat([world_by_type[k] for k in self.world_type_keys], dim=1).contiguous() # [B, N_k, Dw]
 
-        if int(self._step.item()) <= 0:
+        if step <= 0:
             dev_ctx = torch.zeros(B, self.dev_dim, device=device, dtype=dtype)
         else:
             arousal = self.arousal_net(self._dev_trace)
@@ -1085,7 +1086,7 @@ class ConsciousnessExtractor(AGICoreModule):
         logvar_prior = logvar_prior.clamp(-8.0, 8.0)
         prec_prior = torch.exp(-logvar_prior).clamp(min=1e-6, max=1e6) # [B,H]
 
-        q_seed = prior_feat if int(self._step.item()) > 0 else ctx_base
+        q_seed = prior_feat if step > 0 else ctx_base
         q = self.ctx_query_proj(q_seed).unsqueeze(1)
 
         if memory_bank.size(1) > 0:

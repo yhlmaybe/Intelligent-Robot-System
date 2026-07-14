@@ -156,8 +156,9 @@ class GoalGrounding(AGICoreModule):
         B, _, _ = slot_embed.shape
         no_slot_token = self.no_slot_token.expand(B, 1, self.slot_dim)
         memory_tokens = torch.cat([slot_embed, no_slot_token], dim=1) # [B, K + 1, D]
+        invalid_slot = slot_weight <= 0.0
         key_padding = torch.cat([
-            slot_weight <= 0.0,
+            invalid_slot,
             torch.zeros(B, 1, device=slot_weight.device, dtype=torch.bool),], dim=1)
 
         grounded, _ = self.ground_attn(
@@ -182,7 +183,7 @@ class GoalGrounding(AGICoreModule):
         slot_logits = torch.einsum("bd,bkd->bk", grounded_query, slot_embed) / (float(self.slot_dim) ** 0.5)
         slot_logits = slot_logits + torch.einsum("bd,bkd->bk", subgoal_query, slot_embed) / (float(self.slot_dim) ** 0.5)
         slot_logits = slot_logits + slot_weight.clamp_min(1e-6).log()
-        slot_logits = slot_logits.masked_fill(slot_weight <= 0.0, -1e9)
+        slot_logits = slot_logits.masked_fill(invalid_slot, -1e9)
 
         no_slot_logit = self.no_slot_head(grounded_query + subgoal_query).squeeze(-1)
         reference_distribution = F.softmax(torch.cat([slot_logits, no_slot_logit.unsqueeze(-1)], dim=-1), dim=-1)

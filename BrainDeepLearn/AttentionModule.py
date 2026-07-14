@@ -819,7 +819,6 @@ class AttentionExtractor(AGICoreModule):
         B, S, E = x.shape
 
         tdError, uncertainty, precision = self.SanitizeModulators(tdError, uncertainty, precision, B, x)
-        goalBias = goalBias
         head_gate, channel_gate = self.ComputeDistributedGates(goalBias, precision, tdError, uncertainty)
 
         extras: Dict[str, Any] = {}
@@ -892,7 +891,6 @@ class AttentionExtractor(AGICoreModule):
         routed_mean = routed.mean(dim=1) # [B,E]
         
         if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).unsqueeze(-1)  # [B,S,1]
             denom = keep.sum(dim=1, keepdim=True).clamp_min(1.0) # [B,1,1]
             temp_mean = (x * keep).sum(dim=1) / denom.squeeze(-1)  
         else:
@@ -1056,7 +1054,6 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         B, S, E = x.shape
 
         tdError, uncertainty, precision = self.base.SanitizeModulators(tdError, uncertainty, precision, B, x)
-        goalBias = goalBias
         head_gate, channel_gate = self.base.ComputeDistributedGates(goalBias, precision, tdError, uncertainty)
 
         extras: Dict[str, Any] = {}
@@ -1131,9 +1128,8 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
 
         routed_mean = routed.mean(dim=1)
         if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).unsqueeze(-1)
-            denom = keep.sum(dim=1, keepdim=True).clamp_min(1.0) 
-            temp_mean = (h * keep).sum(dim=1) / denom.squeeze(-1) 
+            denom = keep0.sum(dim=1, keepdim=True).clamp_min(1.0)
+            temp_mean = (h * keep0).sum(dim=1) / denom.squeeze(-1)
         else:
             temp_mean = h.mean(dim=1)
 

@@ -648,7 +648,8 @@ class DecisionExtractor(AGICoreModule):
         mapper_hidden_next = 0.5 * prevMapperHidden + 0.5 * mapper_hidden
 
         option_in = torch.cat([decision_state, u_t, mapper_hidden_next], dim=-1)
-        option_logits = self.OptionLogits(option_in, prevOptionLogit.detach())
+        option_prior_logits = prevOptionLogit.detach()
+        option_logits = self.OptionLogits(option_in, option_prior_logits)
         option_log_probs = F.log_softmax(option_logits, dim=-1)
         w_t = option_log_probs.exp()
         psi_all = self.option_psi_head(option_in).view(B, self.num_options, self.psi_dim)
@@ -681,7 +682,7 @@ class DecisionExtractor(AGICoreModule):
                 "opt_idx": opt_idx,
                 "logp_option": option_log_probs.gather(1, opt_idx.view(-1, 1)).squeeze(1),
                 "policy_input": option_in,
-                "prior_logits": prevOptionLogit.detach(),},
+                "prior_logits": option_prior_logits,},
             "prevOptionLogit_next": option_logits.detach(),
             "belief": belief,
             "decision_state": decision_state,
@@ -867,6 +868,7 @@ class CEMPlanner(AGICoreModule):
                     (prior["r_pred"] - prior["d_prob"]).view(B, chunk_size))
             return torch.cat(score_chunks, dim=1), actions
 
+        b_idx = torch.arange(B, device=decisionLatent.device).unsqueeze(1).expand(B, E)
         for _ in range(self.iters):
             noise = torch.randn_like(std.unsqueeze(1).expand(B, N, -1, -1))
             latent_samples = mu.unsqueeze(1) + noise * std.unsqueeze(1)
@@ -878,7 +880,6 @@ class CEMPlanner(AGICoreModule):
                 weights = torch.full_like(elite_scores, 1.0 / float(E))
             else:
                 weights = F.softmax(elite_scores / float(self.temperature), dim=1)
-            b_idx = torch.arange(B, device=decisionLatent.device).unsqueeze(1).expand(B, E)
             w = weights.unsqueeze(-1).unsqueeze(-1)
             elite_latent = latent_samples[b_idx, topk]
             mu_new = (w * elite_latent).sum(dim=1)

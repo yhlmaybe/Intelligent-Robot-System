@@ -60,14 +60,6 @@ from FunctionTools import SynchronizeGrowableLoRATopologyForFullLoad
 
 BRAIN_RUNTIME_SCHEMA_VERSION = 4
 
-
-
-def ToDevice(x, device):
-    if isinstance(x, torch.Tensor):
-        return x.to(device)
-    return x
-
-
 class RobotSelfStateEncoder(nn.Module):
     def __init__(
         self,
@@ -962,7 +954,10 @@ class BrainCore(nn.Module):
         return executed_decision_tensor, feedback
 
     @torch.no_grad()
-    def ResetDecisionRuntimeRows(self, doneMask: torch.Tensor) -> None:
+    def ResetDecisionRuntimeRows(
+        self,
+        doneMask: torch.Tensor,
+        allDone: Optional[bool] = None,) -> None:
         keep = (~doneMask).float()
         keep_feature = keep.unsqueeze(-1)
         keep_pose = keep.view(-1, 1, 1)
@@ -997,7 +992,9 @@ class BrainCore(nn.Module):
         self.prev_measured_endpoint_pose[..., 6].add_(1.0 - keep.view(-1, 1))
         self.prev_measured_endpoint_valid.logical_and_(~doneMask)
 
-        if bool(doneMask.all().item()):
+        if allDone is None:
+            allDone = bool(doneMask.all().item())
+        if allDone:
             self.active_motion_command = None
         else:
             self.active_motion_command = self.ClearRuntimeRows(
@@ -1108,14 +1105,13 @@ class BrainCore(nn.Module):
             init_shadow_module_parms()
             self.smooth_queue.put((list(self.history), done_ext, "Done", self.attn_copy, self.mem_copy, self.critic_copy))
 
-        B, C, H, W = frame.shape
-
         credit_option_policy_input = self.active_option_policy_input.detach()
         credit_option_prior_logit = self.active_option_prior_logit.detach()
         credit_option_goal_mid = self.active_option_goal_mid.detach()
         credit_option_index = self.active_option_index.detach()
         credit_option_valid = (
             self.active_option_valid & model_command_executed).detach()
+        credit_option_weight = credit_option_valid.float()
         belief_prediction_state_prev = self.prev_belief_prediction_state.detach()
         belief_prediction_valid_prev = self.prev_belief_prediction_valid.detach()
 
@@ -1150,14 +1146,15 @@ class BrainCore(nn.Module):
         # Slow/fast split: OCR, consciousness, intention and the long/mid goal stack run
         # every slow_period steps; an external text command forces an immediate refresh.
         text_control_refresh = self.HasTrustedExternalText(textExt, textTrust)
-        planner_event_refresh = bool((robotState["planner_failed"] > 0.5).any().item())
-        done_refresh = done_ext is not None and bool((done_ext > 0.5).any().item())
         slow_refresh = (
             self.slow_cache is None
             or (self.slow_step_count % self.slow_period == 0)
-            or text_control_refresh
-            or planner_event_refresh
-            or done_refresh)
+            or text_control_refresh)
+        if not slow_refresh:
+            refresh_event = robotState["planner_failed"] > 0.5
+            if done_ext is not None:
+                refresh_event = refresh_event | (done_ext > 0.5)
+            slow_refresh = bool(refresh_event.any().item())
         self.slow_step_count += 1
         if slow_refresh:
             ocr_items = self.OCR(frame)
@@ -1296,7 +1293,7 @@ class BrainCore(nn.Module):
         value_comps = critic_out.rComps
         risk_sig = value_comps["risk"].detach()
         confidence_sig = value_comps["confidence"].detach()
-        if bool((risk_sig > 0.85).any().item()) and not slow_refresh:
+        if not slow_refresh and bool((risk_sig > 0.85).any().item()):
             slow_refresh = True
             ocr_items = self.OCR(frame)
             fuse_ocr = self.OCR.ExportFusedTexts()
@@ -1363,6 +1360,7 @@ class BrainCore(nn.Module):
             done_now = done_ext> 0.5
         else:
             done_now = d_t > 0.5
+        hard_stop = torch.maximum((risk_sig > 0.98).float(), done_now.float())
 
         self.prev_world_s = s_t.detach()
         self.prev_done_flag = done_now.detach()
@@ -1504,7 +1502,7 @@ class BrainCore(nn.Module):
             "prevMapperHidden": self.prev_mapper_hidden,
             # Fast plasticity may only reinforce an eligibility trace whose command
             # actually generated the transition that closes at this observation.
-            "feedbackTdError": td_sig * credit_option_valid.float(),}
+            "feedbackTdError": td_sig * credit_option_weight,}
         base_act_out = self.actor(stateFeat=mem_feat,intentFeat=intent_sem,sample=sampleActions,
                                   deterministic=deterministicActor,prevOptionLogit=self.prev_option_logit,
                                   valueTensor=value_current, vNextTensor=value_next_current,
@@ -1554,7 +1552,7 @@ class BrainCore(nn.Module):
             interruptRisk=torch.maximum(risk_sig, decision_uncertainty),
             observationFreshness=1.0 - grounding["no_slot_prob"].detach(),
             canInterrupt=torch.ones_like(risk_sig),
-            hardStop=torch.maximum((risk_sig > 0.98).float(), done_now.float()),
+            hardStop=hard_stop,
             plannerProgress=robotState["planner_progress"],
             plannerTrackingError=robotState["planner_tracking_error"],
             plannerExecuting=robotState["planner_executing"],
@@ -1646,7 +1644,7 @@ class BrainCore(nn.Module):
             interruptRisk=torch.maximum(act_out["temporal_decision"]["p_interrupt"], risk_sig),
             observationFreshness=1.0 - grounding["no_slot_prob"].detach(),
             canInterrupt=torch.ones_like(risk_sig),
-            hardStop=torch.maximum((risk_sig > 0.98).float(), done_now.float()),
+            hardStop=hard_stop,
             plannerProgress=robotState["planner_progress"],
             plannerTrackingError=robotState["planner_tracking_error"],
             plannerExecuting=robotState["planner_executing"],
@@ -1683,7 +1681,8 @@ class BrainCore(nn.Module):
             actionEnc=executed_feedback_embed,
             robotSelfState=robot_self_state,
             sample=False,)["reconstructed_visual_state"]
-        if B == 1 and bool(done_now.item()):
+        done_single = B == 1 and bool(done_now.item())
+        if done_single:
             self.prev_predicted_visual = None
         else:
             self.prev_predicted_visual = self.DetachRuntimeObject(next_visual_prediction)
@@ -1712,13 +1711,15 @@ class BrainCore(nn.Module):
             intent_hint_for_memory=intent_hint_for_memory,
             next_visual_prediction=next_visual_prediction)
         kind_id = temporal_envelope.kind_id
-        start_mask = ((kind_id == DISPATCH) | (kind_id == REDISPATCH)).float()
-        continue_mask = (kind_id == CONTINUE).float()
-        inactive_mask = 1.0 - torch.maximum(start_mask, continue_mask)
+        start_bool = (kind_id == DISPATCH) | (kind_id == REDISPATCH)
+        continue_bool = kind_id == CONTINUE
+        inactive_bool = ~(start_bool | continue_bool)
+        start_mask = start_bool.float()
+        continue_mask = continue_bool.float()
         self.temporal_action_epoch = temporal_envelope.action_epoch.detach()
         temporal_active_next = torch.maximum(start_mask, continue_mask * self.temporal_active_mask)
         self.temporal_action_age_steps = torch.where(
-            continue_mask.bool(),
+            continue_bool,
             self.temporal_action_age_steps + 1,
             torch.zeros_like(self.temporal_action_age_steps))
         self.temporal_invoke_drift = (invoke_drift * continue_mask).detach()
@@ -1741,16 +1742,16 @@ class BrainCore(nn.Module):
             start_mask.unsqueeze(-1) * goals["g_mid"].detach()
             + continue_mask.unsqueeze(-1) * self.active_option_goal_mid)
         self.active_option_index = torch.where(
-            start_mask.bool(),
+            start_bool,
             option_index,
             self.active_option_index)
         self.active_option_index = torch.where(
-            inactive_mask.bool(),
+            inactive_bool,
             torch.zeros_like(self.active_option_index),
             self.active_option_index)
         self.active_option_valid = (
-            start_mask.bool()
-            | (continue_mask.bool() & self.active_option_valid))
+            start_bool
+            | (continue_bool & self.active_option_valid))
 
         self.prev_belief_prediction_state = act_out["decision_state_next"]
         self.prev_belief_prediction_valid = ~done_now
@@ -1826,21 +1827,22 @@ class BrainCore(nn.Module):
         self.prev_td_error = td_sig.detach().clone()
         self.prev_measured_endpoint_pose = endpoint_pose.detach().clone()
         self.prev_measured_endpoint_valid = ~done_now
-        if bool(done_now.any().item()):
+        done_count = int(done_single) if B == 1 else int(done_now.sum().item())
+        if done_count > 0:
             self.RuntimeModule(self.world).ResetEpisodeState(done_now)
             world_keep = (~done_now).unsqueeze(-1)
             self.prev_world_h = self.prev_world_h * world_keep
             self.prev_world_z = self.prev_world_z * world_keep
             self.prev_world_x = self.prev_world_x * world_keep
             self.prev_world_s = self.prev_world_s * world_keep
-            self.ResetDecisionRuntimeRows(done_now)
+            self.ResetDecisionRuntimeRows(done_now, allDone=(done_count == B))
             self.ResetHebbianMemory(doneMask=done_now)
             self.neuro_symbolic.ResetPlan(doneMask=done_now)
             self.slow_step_count = 0
             if self.perception_recall_loss is not None:
                 self.perception_recall_loss.ResetIdentityBank()
             # Clear only the finished environments; unfinished batch rows retain their history.
-            if bool(done_now.all().item()):
+            if done_count == B:
                 self.prev_camera_pose_world = None
                 self.prev_camera_pose_valid.zero_()
                 self.prev_visual_state = None
@@ -1976,10 +1978,9 @@ class BrainCore(nn.Module):
                     credit_option_policy_input,
                     credit_option_prior_logit,
                     credit_option_index)
-                credit_weight = credit_option_valid.float()
                 actor_loss = -(
-                    advantage * credited_logp * credit_weight
-                ).sum() / credit_weight.sum()
+                    advantage * credited_logp * credit_option_weight
+                ).sum() / credit_option_weight.sum()
             goal_progress_loss = -goal_progress.mean()
 
             decision_prediction_loss = world_loss.new_zeros(())

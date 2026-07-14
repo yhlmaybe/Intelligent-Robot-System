@@ -192,8 +192,7 @@ class PhysicalStateExtractor(AGICoreModule):
             (nodeMask > self.node_mask_threshold)
             & (geometryValid.squeeze(-1) > self.geometry_mask_threshold)).to(objectTokens.dtype) # [B, K]
         
-        source_raw = self.in_proj(objectTokens) + self.motion_in_proj(objectMotion) # [B, K, 128]
-        S_raw = source_raw
+        S_raw = self.in_proj(objectTokens) + self.motion_in_proj(objectMotion) # [B, K, 128]
 
         for layer in self.slot_layers:
             S_raw = layer(S_raw, observation_mask)
@@ -512,15 +511,13 @@ class PerceptionPhysicalTrainer(nn.Module):
         targets: Dict[str, torch.Tensor],
         prevVisualState: Optional[VisualState] = None,
         cameraMotion: Optional[torch.Tensor] = None) -> Dict[str, Any]:
-        camera_motion = cameraMotion
-
         visual_state = self.perception(
             rgb,
             topDownContext=topDownContext,
             depth=depth,
             depthValid=depthValid,
             prevVisualState=prevVisualState,
-            cameraMotion=camera_motion)
+            cameraMotion=cameraMotion)
         
         recall_out = self.perception.recall_heads(visual_state)
 
@@ -529,7 +526,7 @@ class PerceptionPhysicalTrainer(nn.Module):
             depthTarget=targets["depth"],
             depthTargetValid=targets["depth_valid"],
             prevVisualState=prevVisualState,
-            cameraMotion=camera_motion)
+            cameraMotion=cameraMotion)
         
         recall_losses = self.recall_loss(recall_out, targets)
 

@@ -802,17 +802,16 @@ class DataPreprocessor:
 
             resized_samples: List[torch.Tensor] = []
             for sample in image_samples:
+                sample_for_tensor = sample
                 if needVisualState:
-                    if isinstance(sample, torch.Tensor):
-                        original_image = sample.detach().cpu().numpy()
-                    else:
-                        original_image = np.asarray(sample)
-                    original_images.append(np.array(original_image, copy=True))
+                    sample_for_tensor = sample.detach().cpu()
+                    original_images.append(
+                        np.array(sample_for_tensor.numpy(), copy=True))
 
-                sample_tensor = DataPreprocessor.ToImageTensor(sample)
+                sample_tensor = DataPreprocessor.ToImageTensor(sample_for_tensor)
 
                 if size is None:
-                    resized_tensor = sample_tensor.clone()
+                    resized_tensor = sample_tensor
                     _, src_h, src_w = sample_tensor.shape
                     meta = DataResizeMeta(
                         src_h=int(src_h),

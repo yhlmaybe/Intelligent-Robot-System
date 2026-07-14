@@ -14,7 +14,6 @@
 #include <cstdio>
 #include <mutex>
 #include <atomic>
-#include <thread>
 
 #include "../include/PythonInteraction.h"
 #include "../include/IRSFunction.h"

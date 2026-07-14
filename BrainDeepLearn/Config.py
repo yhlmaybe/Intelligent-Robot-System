@@ -10,7 +10,7 @@ class BasicParameters:
 
     IMAGE_SEQ_LEN = 16
 
-    IMAGE_RM_LEN = math.ceil(IMAGE_SEQ_LEN * 1 / 10)
+    IMAGE_RM_LEN = math.ceil(IMAGE_SEQ_LEN / 10)
 
     MEMORY_CALLBACK_LEN = 16
 
@@ -18,7 +18,7 @@ class BasicParameters:
 
     REWARD_MAX = 10.0
 
-    CONSCIOUSNESSTEM = 1 * 1024
+    CONSCIOUSNESSTEM = 1024
 
     SAVE_EVERY_SAMPLE_COUNT = 500
 
@@ -136,7 +136,7 @@ class BasicParameters:
     @classmethod
     def RefreshDerivedParameters(cls, changedName: str = ""):
         if changedName == "IMAGE_SEQ_LEN":
-            cls.IMAGE_RM_LEN = math.ceil(cls.IMAGE_SEQ_LEN * 1 / 10)
+            cls.IMAGE_RM_LEN = math.ceil(cls.IMAGE_SEQ_LEN / 10)
 
     @classmethod
     def IsConfigAttribute(cls, name: str) -> bool:

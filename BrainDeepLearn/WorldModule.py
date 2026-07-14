@@ -751,7 +751,7 @@ class NeSyHead(AGICoreModule):
         w = F.softmax((logits / self.temperature).float(), dim=-1) # [B,E]
 
         if updateAux and self.training and not deterministic:
-            importance = w.float().mean(dim=0) # [E]
+            importance = w.mean(dim=0) # [E]
             self.aux_loss = float(self.E) * (importance.pow(2).sum())
         elif updateAux:
             self.aux_loss = x_aligned.new_zeros(())
