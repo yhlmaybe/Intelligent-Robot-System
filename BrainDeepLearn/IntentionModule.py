@@ -1267,6 +1267,29 @@ class IntentionExtractor(AGICoreModule):
         self._last_recall_valid = recallValid
         self._last_recall_cons_sem = None if consSem is None else consSem
 
+    def ResetTransientLossCache(self) -> None:
+        self._last_reason_support = None
+        self.ResetRecallLossCache()
+
+    def ResetRecallLossCache(self) -> None:
+        self._last_recall_logits = None
+        self._last_recall_hidden = None
+        self._last_recall_targets = None
+        self._last_recall_valid = None
+        self._last_recall_cons_sem = None
+
+    @staticmethod
+    def BuildRecallSemanticFromTexts(
+        semOcr: torch.Tensor,
+        hasOcrMask: torch.Tensor,
+        semExt: torch.Tensor,
+        hasExtMask: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
+        recall_sem = torch.stack([semOcr, semExt], dim=1)
+        recall_valid = torch.stack([hasOcrMask, hasExtMask], dim=1)
+        return (
+            recall_sem * recall_valid.unsqueeze(-1),
+            recall_valid)
+
     def RunRecallFromSemantic(
         self,
         recallSem: Optional[torch.Tensor], # [B, D] or [B, M, D]
@@ -1282,7 +1305,10 @@ class IntentionExtractor(AGICoreModule):
         self._last_recall_valid = None
         self._last_recall_cons_sem = None
 
-        recall_texts = self.BuildRecallTexts(batchSize, ocrTexts=ocrTexts, extTexts=extTexts)
+        recall_texts = self.BuildRecallTexts(
+            batchSize,
+            ocrTexts=ocrTexts,
+            extTexts=extTexts)
 
         recall_targets = self.TokenizeBatch(
             recall_texts,
@@ -1315,25 +1341,13 @@ class IntentionExtractor(AGICoreModule):
             recallHidden=recall_hidden,
             recallTargets=recall_targets,
             recallValid=recall_valid,
-            consSem=recall_cond,)
+            consSem=None if recall_cond is None else recall_cond.detach(),)
 
         return {
             "recall_logits": recall_logits.detach(),
             "recall_targets": recall_targets.detach(),
             "recall_valid": recall_valid.detach(),
             "recall_pred_ids": recall_pred_ids.detach(),}
-
-    def BuildRecallSemanticFromTexts(
-        self,
-        semOcr: torch.Tensor,
-        hasOcrMask: torch.Tensor,
-        semExt: torch.Tensor,
-        hasExtMask: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        recall_mem = torch.stack([semOcr, semExt], dim=1) # [B, 2, D]
-        recall_mem_valid = torch.stack([hasOcrMask, hasExtMask], dim=1) # [B, 2]
-        recall_mem = recall_mem * recall_mem_valid.unsqueeze(-1).float()
-        return recall_mem, recall_mem_valid
 
     @torch.no_grad()
     def TokenIdsToTexts(
@@ -1557,6 +1571,7 @@ class IntentionExtractor(AGICoreModule):
         device = self.device
         batch_size = self.InferBatchSize(selfState, intentState, ocrTexts, extTexts)
         if batch_size is None:
+            self.ResetTransientLossCache()
             intent_zero = torch.zeros(0, self.dimSem, device=device)
             sym_zero = torch.zeros(0, int(self.conceptEmb.size(0)), device=device)
             return intent_zero, sym_zero, {}
@@ -1576,6 +1591,11 @@ class IntentionExtractor(AGICoreModule):
         extras["text_trust"] = list(text_trust)
         extras["ext_control_mask"] = ext_control_mask.detach()
         extras["ocr_control_weight"] = ocr_control.detach()
+        observed_ext_texts = None
+        if extTexts is not None:
+            observed_ext_texts = [
+                "" if text is None else str(text)
+                for text in extTexts]
 
         if ocrTexts is not None:
             merged = self.MergeOcrTexts(ocrTexts)
@@ -1587,9 +1607,8 @@ class IntentionExtractor(AGICoreModule):
             ocr_slot_mask = torch.zeros(batch_size, self.n_text_slots, dtype=torch.bool, device=device)
             has_ocr_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        if extTexts is not None:
-            normed = [("" if t is None else str(t)) for t in extTexts]
-            sem_ext, ext_slots, ext_slot_mask = self.EncodeStringsWithSlots(normed, device=device) # [B, D], [B, K, D], [B, K]
+        if observed_ext_texts is not None:
+            sem_ext, ext_slots, ext_slot_mask = self.EncodeStringsWithSlots(observed_ext_texts, device=device) # [B, D], [B, K, D], [B, K]
             has_ext_mask = ext_slot_mask.any(dim=1)
         else:
             sem_ext = torch.zeros(batch_size, self.dimSem, device=device)
@@ -1597,7 +1616,25 @@ class IntentionExtractor(AGICoreModule):
             ext_slot_mask = torch.zeros(batch_size, self.n_text_slots, dtype=torch.bool, device=device)
             has_ext_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        if (cons_sem is None) and (not has_ocr_mask.any()) and (not has_ext_mask.any()):
+        has_ext_control_mask = has_ext_mask & ext_control_mask
+        if (cons_sem is None) and (not has_ocr_mask.any()) and (not has_ext_control_mask.any()):
+            self._last_reason_support = None
+            if self.training and bool(has_ext_mask.any().item()):
+                recall_sem, recall_valid = self.BuildRecallSemanticFromTexts(
+                    semOcr=sem_ocr,
+                    hasOcrMask=has_ocr_mask,
+                    semExt=sem_ext,
+                    hasExtMask=has_ext_mask)
+                extras.update(self.RunRecallFromSemantic(
+                    recallSem=recall_sem,
+                    recallSemValid=recall_valid,
+                    batchSize=batch_size,
+                    ocrTexts=ocrTexts,
+                    extTexts=extTexts,
+                    device=device))
+            else:
+                self.ResetRecallLossCache()
+            extras["sem_ext_observed"] = sem_ext.detach()
             return None, None, extras
 
         if cons_sem is not None:
@@ -1607,7 +1644,6 @@ class IntentionExtractor(AGICoreModule):
 
         ext_control_float = ext_control.unsqueeze(-1)
         ext_slot_control = ext_control.view(batch_size, 1, 1)
-        has_ext_control_mask = has_ext_mask & ext_control_mask
         sem_ext_control = sem_ext * ext_control_float
         ext_slots_control = ext_slots * ext_slot_control
         ext_slot_mask_control = ext_slot_mask & ext_control_mask.view(batch_size, 1)
@@ -1656,11 +1692,12 @@ class IntentionExtractor(AGICoreModule):
 
             extras["gamma_ext"] = gamma.detach()
         else:
-            sem_ext_fused = gate_ext * sem_ext
+            sem_ext_fused = gate_ext * sem_ext_control
             intentSem = base + self.beta_ext * (sem_ext_fused * has_ext_mask_float)
             extras["sem_ext_fused"] = sem_ext_fused.detach()
 
-        extras["sem_ext_raw"] = sem_ext.detach()
+        extras["sem_ext_observed"] = sem_ext.detach()
+        extras["sem_ext_controlled"] = sem_ext_control.detach()
         extras["gate_ext"] = gate_ext.detach()
         extras["has_ext_mask"] = has_ext_mask.detach()
         extras["sem_ext_slots"] = ext_slots.detach()
@@ -1702,7 +1739,7 @@ class IntentionExtractor(AGICoreModule):
             extras["intent_trans_norm"] = fused.norm(dim=-1, keepdim=True).detach()
             extras["intent_trans_mask_sum"] = mask_sum.detach()
 
-        abs_ext_ocr = torch.abs(sem_ext - sem_ocr)
+        abs_ext_ocr = torch.abs(sem_ext_control - sem_ocr)
         mul_ext_ocr = sem_ext_control * sem_ocr
 
         self._last_reason_support = None
@@ -1779,15 +1816,14 @@ class IntentionExtractor(AGICoreModule):
         extras["reason_alpha_final"] = final_support["alpha_eff"].detach()
 
         if self.training:
-            recall_sem_train, recall_sem_valid = self.BuildRecallSemanticFromTexts(
+            recall_sem, recall_valid = self.BuildRecallSemanticFromTexts(
                 semOcr=sem_ocr,
                 hasOcrMask=has_ocr_mask,
                 semExt=sem_ext,
-                hasExtMask=has_ext_mask,)
-
+                hasExtMask=has_ext_mask)
             recall_output = self.RunRecallFromSemantic(
-                recallSem=recall_sem_train,
-                recallSemValid=recall_sem_valid,
+                recallSem=recall_sem,
+                recallSemValid=recall_valid,
                 batchSize=batch_size,
                 ocrTexts=ocrTexts,
                 extTexts=extTexts,
@@ -1801,6 +1837,7 @@ class IntentionExtractor(AGICoreModule):
             else:
                 extras["recall_texts"] = []
         else:
+            self.ResetRecallLossCache()
             _, recall_texts = self.RecallGenerateFromSemantic(
                 intentSem,
                 maxLen=self.recall_safety_max_len,)
@@ -1849,25 +1886,24 @@ class IntentionExtractor(AGICoreModule):
                 "recall_loss_align": zero.detach(),
                 "recall_loss_total": zero.detach(),}
 
-        V = logits.size(-1)
-        ce = F.cross_entropy(
-            logits.reshape(-1, V),
-            targets.reshape(-1),
-            reduction="none",).view_as(targets)
-
         token_valid = targets.ne(self.pad_idx) & valid_seq.unsqueeze(-1)
-        denom = token_valid.float().sum().clamp(min=1.0)
-        loss_ce = (ce * token_valid.float()).sum() / denom
+        loss_ce = F.cross_entropy(
+            logits[token_valid],
+            targets[token_valid],)
 
         loss_align = zero
         if self._last_recall_cons_sem is not None:
             cons_sem = self._last_recall_cons_sem
-
-            token_f = token_valid.float().unsqueeze(-1)
-            hidden_avg = (hidden * token_f).sum(dim=-2) / token_f.sum(dim=-2).clamp(min=1.0)
-            cos = F.cosine_similarity(hidden_avg, cons_sem, dim=-1)
-            loss_align = (1.0 - cos) * valid_seq.float()
-            loss_align = loss_align.sum() / valid_seq.float().sum().clamp(min=1.0)
+            valid_hidden = hidden[valid_seq]
+            valid_token = token_valid[valid_seq]
+            hidden_avg = (
+                torch.where(
+                    valid_token.unsqueeze(-1),
+                    valid_hidden,
+                    torch.zeros_like(valid_hidden),).sum(dim=-2)
+                / valid_token.sum(dim=-1, keepdim=True))
+            cos = F.cosine_similarity(hidden_avg, cons_sem[valid_seq], dim=-1)
+            loss_align = (1.0 - cos).mean()
 
         total = self.lossLambdaRecallCE * loss_ce + self.lossLambdaRecallAlign * loss_align
 
@@ -2248,6 +2284,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
 
         batch_size = base.InferBatchSize(self_state, intent_state, ocrTexts, extTexts)
         if batch_size is None:
+            base.ResetTransientLossCache()
             intent_zero = torch.zeros(0, base.dimSem, device=device)
             sym_zero = torch.zeros(0, int(base.conceptEmb.size(0)), device=device)
             return intent_zero, sym_zero, {}
@@ -2271,6 +2308,11 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         extras["text_trust"] = list(text_trust)
         extras["ext_control_mask"] = ext_control_mask.detach()
         extras["ocr_control_weight"] = ocr_control.detach()
+        observed_ext_texts = None
+        if extTexts is not None:
+            observed_ext_texts = [
+                "" if text is None else str(text)
+                for text in extTexts]
 
         if ocrTexts is not None:
             merged = base.MergeOcrTexts(ocrTexts)
@@ -2283,10 +2325,9 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
             ocr_slot_mask = torch.zeros(batch_size, base.n_text_slots, dtype=torch.bool, device=device)
             has_ocr_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-        if extTexts is not None:
-            normed = [("" if t is None else str(t)) for t in extTexts]
+        if observed_ext_texts is not None:
             sem_ext, ext_slots, ext_slot_mask = self.EncodeStringsWithDelta(
-                base, normed, device=device, delta_sem=delta_sem)
+                base, observed_ext_texts, device=device, delta_sem=delta_sem)
             has_ext_mask = ext_slot_mask.any(dim=1)
         else:
             sem_ext = torch.zeros(batch_size, dimSem, device=device)
@@ -2302,7 +2343,24 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         ext_slot_mask_control = ext_slot_mask & ext_control_mask.view(batch_size, 1)
         ocr_control_float = ocr_control.unsqueeze(-1)
 
-        if (cons_sem is None) and (not has_ocr_mask.any()) and (not has_ext_mask.any()):
+        if (cons_sem is None) and (not has_ocr_mask.any()) and (not has_ext_control_mask.any()):
+            base._last_reason_support = None
+            if self.training and bool(has_ext_mask.any().item()):
+                recall_sem, recall_valid = base.BuildRecallSemanticFromTexts(
+                    semOcr=sem_ocr,
+                    hasOcrMask=has_ocr_mask,
+                    semExt=sem_ext,
+                    hasExtMask=has_ext_mask)
+                extras.update(base.RunRecallFromSemantic(
+                    recallSem=recall_sem,
+                    recallSemValid=recall_valid,
+                    batchSize=batch_size,
+                    ocrTexts=ocrTexts,
+                    extTexts=extTexts,
+                    device=device))
+            else:
+                base.ResetRecallLossCache()
+            extras["sem_ext_observed"] = sem_ext.detach()
             return None, None, extras
 
         if cons_sem is not None:
@@ -2355,7 +2413,8 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
             intentSem = base_vec + base.beta_ext * (sem_ext_fused * has_ext_mask_float)
             extras["sem_ext_fused"] = sem_ext_fused.detach()
 
-        extras["sem_ext_raw"] = sem_ext.detach()
+        extras["sem_ext_observed"] = sem_ext.detach()
+        extras["sem_ext_controlled"] = sem_ext_control.detach()
         extras["gate_ext"] = gate_ext.detach()
         extras["has_ext_mask"] = has_ext_mask.detach()
         extras["sem_ext_slots"] = ext_slots.detach()
@@ -2475,44 +2534,24 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         base._last_reason_support = final_support
         extras["reason_alpha_final"] = final_support["alpha_eff"].detach()
         if self.training:
-            recall_sem_train, recall_sem_valid = base.BuildRecallSemanticFromTexts(
+            recall_sem, recall_valid = base.BuildRecallSemanticFromTexts(
                 semOcr=sem_ocr,
                 hasOcrMask=has_ocr_mask,
                 semExt=sem_ext,
-                hasExtMask=has_ext_mask,)
+                hasExtMask=has_ext_mask)
             extras.update(base.RunRecallFromSemantic(
-                recallSem=recall_sem_train,
-                recallSemValid=recall_sem_valid,
+                recallSem=recall_sem,
+                recallSemValid=recall_valid,
                 batchSize=batch_size,
                 ocrTexts=ocrTexts,
                 extTexts=extTexts,
                 device=device,))
         else:
-            recall_pred_ids, _ = base.RecallGenerateFromSemantic(
+            base.ResetRecallLossCache()
+            _, recall_texts = base.RecallGenerateFromSemantic(
                 intentSem,
                 maxLen=base.recall_safety_max_len,)
-            recall_targets = base.BuildRecallTargetsFromGenerated(
-                recall_pred_ids,
-                stride=base.max_seq_len,) # [B, N, T]
-            recall_target_valid = recall_targets.ne(base.pad_idx).any(dim=-1) # [B, N]
-            recall_mem = intentSem.unsqueeze(1) # [B, 1, D]
-            recall_valid_sem = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
-            recall_logits, recall_hidden, recall_has_sem = base.DecodeRecallChunked(
-                recallSem=recall_mem,
-                recallSemValid=recall_valid_sem,
-                recallTargets=recall_targets,)
-            recall_valid = recall_target_valid & recall_has_sem
-            recall_cond = intentSem.unsqueeze(1).expand(batch_size, recall_targets.size(1), base.dimSem)
-            base.CacheRecallState(
-                recallLogits=recall_logits,
-                recallHidden=recall_hidden,
-                recallTargets=recall_targets,
-                recallValid=recall_valid,
-                consSem=recall_cond,)
-            extras["recall_logits"] = recall_logits.detach()
-            extras["recall_targets"] = recall_targets.detach()
-            extras["recall_valid"] = recall_valid.detach()
-            extras["recall_pred_ids"] = recall_pred_ids.detach()
+            extras["recall_texts"] = recall_texts
         return intentSem, symProbs, extras
 
 
@@ -2688,13 +2727,15 @@ class TestIntentionMTool:
         extTexts: Optional[List[Optional[str]]],
         targetSym: torch.Tensor,
         *,
-        prioritizeExt: bool = False,) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        prioritizeExt: bool = False,
+        textTrust: Optional[List[str]] = None,) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Tensor], Dict[str, torch.Tensor]]:
         intentSem, symProbs, extras = model(
             selfState,
             intentState,
             ocrTexts=ocrTexts,
             extTexts=extTexts,
-            prioritizeExt=prioritizeExt,)
+            prioritizeExt=prioritizeExt,
+            textTrust=textTrust,)
 
         if symProbs is None:
             raise AssertionError("ComputeBaseLossBundle: symProbs is None.")
@@ -2814,8 +2855,9 @@ class TestIntentionMTool:
             assert intentSem is not None and symProbs is not None
             assert intentSem.shape == (B, dimSem)
             assert symProbs.shape == (B, nSymbols)
-            assert ("recall_logits" in extras) and ("recall_targets" in extras)
-            assert ("recall_pred_ids" in extras)
+            assert "recall_texts" in extras
+            assert "recall_logits" not in extras
+            assert "recall_targets" not in extras
 
             cons_self_only = torch.randn(B, selfDim, device=self.device)
             intentSem0, symProbs0, _ = model(cons_self_only, None, ocrTexts=None, extTexts=None)
@@ -3005,10 +3047,15 @@ class TestIntentionMTool:
     def BranchGradientCoverageBase(self) -> bool:
         try:
             specs = [
-                {"with_cons": True, "with_ocr": True, "with_ext": True, "prioritizeExt": False},
-                {"with_cons": True, "with_ocr": False, "with_ext": False, "prioritizeExt": False},
-                {"with_cons": False, "with_ocr": True, "with_ext": False, "prioritizeExt": False},
-                {"with_cons": False, "with_ocr": False, "with_ext": True, "prioritizeExt": True},]
+                {"with_cons": True, "with_ocr": True, "with_ext": True, "prioritizeExt": False, "textTrust": None},
+                {"with_cons": True, "with_ocr": False, "with_ext": False, "prioritizeExt": False, "textTrust": None},
+                {"with_cons": False, "with_ocr": True, "with_ext": False, "prioritizeExt": False, "textTrust": None},
+                {
+                    "with_cons": False,
+                    "with_ocr": False,
+                    "with_ext": True,
+                    "prioritizeExt": True,
+                    "textTrust": [TEXT_TRUST_OPERATOR_COMMAND, TEXT_TRUST_OPERATOR_COMMAND],},]
 
             union: set = set()
             branch_grads: Dict[str, set] = {}
@@ -3033,7 +3080,8 @@ class TestIntentionMTool:
                     ocrTexts,
                     extTexts,
                     targetSym,
-                    prioritizeExt=bool(spec["prioritizeExt"]),)
+                    prioritizeExt=bool(spec["prioritizeExt"]),
+                    textTrust=spec["textTrust"],)
 
                 model.zero_grad(set_to_none=True)
                 losses["loss_total"].backward()
@@ -3165,19 +3213,22 @@ class TestIntentionMTool:
 
     def WrapperForwardEqualWhenNoInitRank(self) -> bool:
         try:
-            base = IntentionExtractor().to(self.device)
+            base = self.MakeTestModel()
             base.eval()
             wrapper = IntentionOnlineWrapper(base=base, initRankEach=0).to(self.device)
             wrapper.eval()
 
-            selfState, intentState, ocrTexts, extTexts, _ = self.MakeDummyBatch(base, batch_size=5)
+            selfState, intentState, ocrTexts, extTexts, _ = self.MakeDummyBatch(
+                base,
+                batch_size=2,
+                compact_text=True,)
 
             with torch.no_grad():
                 y_base = base(selfState, intentState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=True)
                 y_wrap = wrapper(selfState, intentState, ocrTexts=ocrTexts, extTexts=extTexts, prioritizeExt=True)
 
-            intent_base, sym_base, _ = y_base
-            intent_wrap, sym_wrap, _ = y_wrap
+            intent_base, sym_base, extras_base = y_base
+            intent_wrap, sym_wrap, extras_wrap = y_wrap
 
             assert intent_base is not None and intent_wrap is not None
             assert sym_base is not None and sym_wrap is not None
@@ -3186,6 +3237,14 @@ class TestIntentionMTool:
             max_abs_sym = (sym_base - sym_wrap).abs().max().item()
             assert max_abs_int < 1e-6, f"intent mismatch: {max_abs_int:.3e}"
             assert max_abs_sym < 1e-6, f"symProbs mismatch: {max_abs_sym:.3e}"
+            assert extras_wrap["recall_texts"] == extras_base["recall_texts"]
+            for key in ("recall_logits", "recall_targets", "recall_valid", "recall_pred_ids"):
+                assert key not in extras_wrap, f"wrapper eval exposed training-only {key}"
+            assert base._last_recall_logits is None
+            assert base._last_recall_hidden is None
+            assert base._last_recall_targets is None
+            assert base._last_recall_valid is None
+            assert base._last_recall_cons_sem is None
 
             print("WrapperForwardEqualWhenNoInitRank passed.")
             return True
@@ -3508,6 +3567,17 @@ class TestIntentionMTool:
             assert bool(operator_extras["ext_control_mask"].all().item())
             assert not bool(unsafe_extras["ext_control_mask"].any().item())
             assert not bool(default_extras["ext_control_mask"].any().item())
+            assert float(unsafe_extras["sem_ext_observed"].norm().item()) > 0.0
+            assert torch.allclose(
+                unsafe_extras["sem_ext_observed"],
+                default_extras["sem_ext_observed"])
+            assert torch.allclose(
+                unsafe_extras["sem_ext_observed"],
+                operator_extras["sem_ext_observed"])
+            assert int(torch.count_nonzero(unsafe_extras["sem_ext_controlled"]).item()) == 0
+            assert torch.allclose(
+                operator_extras["sem_ext_controlled"],
+                operator_extras["sem_ext_observed"])
             assert float(operator_extras["ocr_control_weight"].max().item()) < 1.0
             print("TextTrustPolicy passed.")
             return True
@@ -3516,6 +3586,193 @@ class TestIntentionMTool:
             return False
         except Exception as e:
             print("TextTrustPolicy error:", e)
+            return False
+
+    def RecallConditionAndTrust(self) -> bool:
+        try:
+            B = 2
+            model = self.MakeTestModel()
+            model.train()
+            self_state = torch.randn(B, int(model.cons_self_dim), device=self.device)
+            intent_state = torch.randn(B, int(model.cons_intent_dim), device=self.device)
+            ocr_texts = [["ab"], ["a"]]
+            unsafe_ext = ["cd", "d"]
+            unsafe_trust = [TEXT_TRUST_UNSAFE_EXTERNAL for _ in range(B)]
+
+            stale_targets = torch.ones(B, 1, model.max_seq_len, dtype=torch.long, device=self.device)
+            stale_logits = torch.zeros(
+                B, 1, model.max_seq_len, model.vocab_size, device=self.device)
+            stale_hidden = torch.zeros(
+                B, 1, model.max_seq_len, model.dimSem, device=self.device)
+            stale_valid = torch.ones(B, 1, dtype=torch.bool, device=self.device)
+            model.CacheRecallState(
+                recallLogits=stale_logits,
+                recallHidden=stale_hidden,
+                recallTargets=stale_targets,
+                recallValid=stale_valid,
+                consSem=torch.zeros(B, 1, model.dimSem, device=self.device),)
+            empty_intent, empty_probs, empty_extras = model(
+                None,
+                None,
+                ocrTexts=None,
+                extTexts=unsafe_ext,
+                textTrust=unsafe_trust,)
+            assert empty_intent is None and empty_probs is None
+            assert "sem_ext_controlled" not in empty_extras
+            empty_expected_texts = model.BuildRecallTexts(
+                B,
+                ocrTexts=None,
+                extTexts=unsafe_ext,)
+            empty_expected_targets = model.TokenizeBatch(
+                empty_expected_texts,
+                device=self.device,
+                stride=model.max_seq_len,
+                appendEos=True,)
+            assert torch.equal(empty_extras["recall_targets"], empty_expected_targets)
+            assert torch.equal(model._last_recall_targets, empty_expected_targets)
+            assert model._last_recall_logits is not None
+            assert model._last_recall_hidden is not None
+            assert model._last_recall_valid is not None
+            assert bool(model._last_recall_valid.any().item())
+            assert model._last_recall_cons_sem is not None
+            assert float(empty_extras["sem_ext_observed"].norm().item()) > 0.0
+
+            intent_sem, sym_probs, extras = model(
+                self_state,
+                intent_state,
+                ocrTexts=ocr_texts,
+                extTexts=unsafe_ext,
+                textTrust=unsafe_trust,)
+            assert intent_sem is not None and sym_probs is not None
+
+            expected_texts = model.BuildRecallTexts(
+                B,
+                ocrTexts=ocr_texts,
+                extTexts=unsafe_ext,)
+            expected_targets = model.TokenizeBatch(
+                expected_texts,
+                device=self.device,
+                stride=model.max_seq_len,
+                appendEos=True,)
+            assert torch.equal(extras["recall_targets"], expected_targets)
+            assert model._last_recall_cons_sem is not None
+            recall_sem, recall_valid = model.BuildRecallSemanticFromTexts(
+                semOcr=extras["sem_ocr_raw"],
+                hasOcrMask=extras["has_ocr_mask"],
+                semExt=extras["sem_ext_observed"],
+                hasExtMask=extras["has_ext_mask"])
+            _, _, recall_summary = model.NormalizeRecallMemory(
+                recallSem=recall_sem,
+                recallSemValid=recall_valid,
+                batchSize=B,
+                device=self.device,
+                dtype=model.dtype,)
+            expected_condition = recall_summary.detach().unsqueeze(1).expand(
+                B,
+                expected_targets.size(1),
+                model.dimSem,)
+            assert torch.allclose(model._last_recall_cons_sem, expected_condition)
+
+            def text_encoder_grad_norm(trust: str) -> float:
+                probe = self.MakeTestModel()
+                probe.train()
+                probe.zero_grad(set_to_none=True)
+                _, probe_probs, _ = probe(
+                    self_state,
+                    intent_state,
+                    ocrTexts=None,
+                    extTexts=["cd", "cd"],
+                    textTrust=[trust for _ in range(B)],)
+                assert probe_probs is not None
+                probe_loss, _ = probe.GetInternalLoss(probe_probs)
+                probe_loss.backward()
+                grad = probe.encoder.embedding.weight.grad
+                return 0.0 if grad is None else float(grad.norm().item())
+
+            unsafe_grad = text_encoder_grad_norm(TEXT_TRUST_UNSAFE_EXTERNAL)
+            trusted_grad = text_encoder_grad_norm(TEXT_TRUST_OPERATOR_COMMAND)
+            assert unsafe_grad > 1e-10, "observed unsafe text did not train recall encoder"
+            assert trusted_grad > 1e-10, "trusted operator recall did not reach text encoder"
+
+            print("RecallConditionAndTrust passed.")
+            return True
+        except AssertionError as e:
+            print("RecallConditionAndTrust failed:", e)
+            return False
+        except Exception as e:
+            print("RecallConditionAndTrust error:", e)
+            return False
+
+    def RecallLossMasksBeforeComputation(self) -> bool:
+        try:
+            model = self.MakeTestModel()
+            model.train()
+
+            B, N, T = 2, 2, 3
+            targets = torch.full(
+                (B, N, T),
+                model.pad_idx,
+                dtype=torch.long,
+                device=self.device,)
+            targets[0, 0, 0] = 1
+            targets[0, 0, 1] = model.eos_idx
+            targets[1, 1, 0] = 2
+            targets[0, 1, 0] = 1
+            targets[1, 0, 0] = 2
+            valid_seq = torch.tensor(
+                [[True, False], [False, True]],
+                dtype=torch.bool,
+                device=self.device,)
+            token_valid = targets.ne(model.pad_idx) & valid_seq.unsqueeze(-1)
+
+            logits_data = torch.randn(
+                B, N, T, model.vocab_size, device=self.device)
+            hidden_data = torch.randn(B, N, T, model.dimSem, device=self.device)
+            logits_data[~token_valid] = float("inf")
+            hidden_data[~token_valid] = float("inf")
+            logits = logits_data.requires_grad_()
+            hidden = hidden_data.requires_grad_()
+            cons_sem = torch.randn(B, N, model.dimSem, device=self.device)
+
+            model.CacheRecallState(
+                recallLogits=logits,
+                recallHidden=hidden,
+                recallTargets=targets,
+                recallValid=valid_seq,
+                consSem=cons_sem,)
+            loss, stats = model.GetRecallLoss()
+
+            selected_hidden = torch.stack([
+                hidden[0, 0, :2].mean(dim=0),
+                hidden[1, 1, :1].mean(dim=0),])
+            selected_cons = torch.stack([cons_sem[0, 0], cons_sem[1, 1]])
+            expected_ce = F.cross_entropy(logits[token_valid], targets[token_valid])
+            expected_align = (
+                1.0 - F.cosine_similarity(selected_hidden, selected_cons, dim=-1)
+                ).mean()
+            expected = (
+                model.lossLambdaRecallCE * expected_ce
+                + model.lossLambdaRecallAlign * expected_align)
+
+            assert bool(torch.isfinite(loss).item())
+            assert torch.allclose(stats["recall_loss_ce"], expected_ce.detach())
+            assert torch.allclose(stats["recall_loss_align"], expected_align.detach())
+            assert torch.allclose(loss, expected)
+
+            loss.backward()
+            assert logits.grad is not None and hidden.grad is not None
+            assert bool(torch.isfinite(logits.grad).all().item())
+            assert bool(torch.isfinite(hidden.grad).all().item())
+            assert int(torch.count_nonzero(logits.grad[~token_valid]).item()) == 0
+            assert int(torch.count_nonzero(hidden.grad[~token_valid]).item()) == 0
+
+            print("RecallLossMasksBeforeComputation passed.")
+            return True
+        except AssertionError as e:
+            print("RecallLossMasksBeforeComputation failed:", e)
+            return False
+        except Exception as e:
+            print("RecallLossMasksBeforeComputation error:", e)
             return False
 
 
@@ -3534,7 +3791,9 @@ class TestIntentionMTool:
             "WrapperCandGradSmoke": self.WrapperCandGradSmoke(),
             "WrapperCandidateConvergence": self.WrapperCandidateConvergence(),
             "WrapperManualGrowTrainAndCommit": self.WrapperManualGrowTrainAndCommit(),
-            "TextTrustPolicy": self.TextTrustPolicy(),}
+            "TextTrustPolicy": self.TextTrustPolicy(),
+            "RecallConditionAndTrust": self.RecallConditionAndTrust(),
+            "RecallLossMasksBeforeComputation": self.RecallLossMasksBeforeComputation(),}
         
         passed = sum(1 for v in results.values() if v)
         print(f"\nIntention module tests (with wrapper): {passed}/{len(results)} passed.")

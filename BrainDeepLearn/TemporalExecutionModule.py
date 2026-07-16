@@ -6,7 +6,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn.functional as F
 
-from DecisionDecoupler import MotionCommand, SAFETY_MARGIN_NAMES
+from DecisionDecoupler import DecisionActionMask, MotionCommand, SAFETY_MARGIN_NAMES
 from FunctionTools import AGICoreModule
 from ModuleMessagerManager import ModuleDim
 
@@ -452,12 +452,11 @@ class TestTemporalExecutionGateExtractorMTool:
                 device=self.device),
             target_endpoint_pose=endpoint_pose + float(value) * 0.01,
             endpoint_names=ModuleDim.DecisionEndpointNames,
-            decision_dof_mask=torch.ones(
-                B,
-                ModuleDim.DecisionEndpointCount,
-                ModuleDim.DecisionActionDim,
-                device=self.device,
-                dtype=torch.bool),
+            decision_dof_mask=DecisionActionMask().to(
+                self.device).view(
+                    1,
+                    ModuleDim.DecisionEndpointCount,
+                    ModuleDim.DecisionActionDim).expand(B, -1, -1).bool(),
             gripper_cmd=torch.full((B, ModuleDim.ArmCount, 1), float(value), device=self.device),
             gripper_valid=torch.ones(B, device=self.device, dtype=torch.bool),
             mode_logits=torch.full((B, ModuleDim.ActTypeDim), float(value), device=self.device),

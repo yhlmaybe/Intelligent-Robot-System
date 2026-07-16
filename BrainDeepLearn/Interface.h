@@ -133,7 +133,7 @@ public:
 
     bool TrainOCRModule(int epochs = 400, int batchSize = 1, double valSplit = 0.1, bool resume = true);
 
-    bool DeployModule(int cameraIndex = 0, bool useHebbian = true, bool usePlanner = true);
+    bool DeployModule(bool useHebbian = true, bool usePlanner = true);
 
     bool ExportParmFromCheckpoint(bool isOverride);
 
@@ -149,16 +149,29 @@ public:
 
     bool SetParameterReceiver(std::optional<double> reward = std::nullopt, std::optional<double> done = std::nullopt, std::optional<std::string> textExt = std::nullopt);
 
-    bool InitAgentHandle();
+    bool InitAgentHandle(bool useHebbian = true, bool usePlanner = true);
 
-    // Returns a learned motion proposal. This transport layer does not perform
-    // IK, collision/actuator validation, timeout enforcement, or a certified
+    // sensorPacketJson carries one synchronized RGB-D frame, stream_id, monotonically
+    // increasing sequence_index, frame_id, calibration_id,
+    // rgb_encoding="rgb8", depth_unit="meter", and an explicit depth-valid mask;
+    // robotStateJson carries the matching stream/sequence/frame/calibration identifiers,
+    // a stable world_frame_id, and 13 pose-carrier rows: 10 fingertips, 2 wrists,
+    // and the camera's fixed optical-center translation plus its 3-DOF orientation;
+    // plus q_world_base (orientation only, no base/camera translation input) and the unit world-frame direction of
+    // gravitational acceleration (down). It must also carry all 13 planner target poses,
+    // planner progress/tracking/terminal state, and the model_command_executed plus
+    // executed_action_id feedback pair identifying whether the preceding proposal actually ran.
+    // All measurements refer to the sensor-frame exposure;
+    // gravity is dimensionless and does not contain the 9.81 m/s^2 magnitude. The returned motion
+    // proposal contains 12 full-SE(3) hand/wrist endpoints plus all 3 camera
+    // rotation DOFs and no camera translation: exactly 75 active DOFs. It echoes the request's
+    // stream/sequence/frame/calibration/world-frame identity. This transport layer does not
+    // perform IK, collision/actuator validation, timeout enforcement, or a certified
     // emergency stop; a downstream executor must validate before actuation.
     bool AgentHandleForward(
         StatusValue& result,
         const std::string& sensorPacketJson,
         const std::string& robotStateJson,
-        int cameraIndex = 0,
         std::optional<double> reward = std::nullopt,
         std::optional<double> done = std::nullopt);
 

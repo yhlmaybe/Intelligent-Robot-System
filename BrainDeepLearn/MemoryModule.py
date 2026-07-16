@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import math
 import os
 import inspect
+import tempfile
 
 
 
@@ -1112,7 +1113,9 @@ class ObjectUsageBank(AGICoreModule):
         # so we don't reduce to identity-only lookup.
         self.register_buffer("attribute_centroid", torch.zeros(self.num_objects, self.num_skills, self.attr_dim))
 
-        self.readout_proj = nn.Linear(self.param_dim + self.attr_dim + 3, self.usage_dim)
+        self.readout_proj = nn.Linear(
+            self.param_dim + self.attr_dim + 4,
+            self.usage_dim)
         self.needs_lookup = nn.Linear(4, 1)
 
     def SuccessRate(self) -> torch.Tensor:
@@ -1130,7 +1133,11 @@ class ObjectUsageBank(AGICoreModule):
     def BestObjectsForSkill(self, skillId: int) -> torch.Tensor:
         return self.applicable[:, int(skillId)].argmax()
 
-    def SlotReadout(self, identity: torch.Tensor, attribute: torch.Tensor) -> torch.Tensor:
+    def SlotReadout(
+        self,
+        identity: torch.Tensor,
+        attribute: torch.Tensor,
+        slotAttention: torch.Tensor,) -> torch.Tensor:
         """Per-slot top-1 skill summary cached into PST.U. identity [B,K,D_c] -> [B,K,D_u].
         Attribute residuals against the bank's centroid let attribute deltas refine the readout."""
         B, K, _ = identity.shape
@@ -1144,7 +1151,18 @@ class ObjectUsageBank(AGICoreModule):
         success = self.SuccessRate()[obj_idx, best_skill].unsqueeze(-1)
         confidence = self.Confidence()[obj_idx, best_skill].unsqueeze(-1)
         best_applicable = applicable_rows.gather(-1, best_skill.unsqueeze(-1))
-        summary = torch.cat([params, attribute_residual, success, confidence, best_applicable], dim=-1)
+        lookup_need = self.NeedsLookupScore(
+            best_applicable.squeeze(-1),
+            confidence.squeeze(-1),
+            success.squeeze(-1),
+            slotAttention).unsqueeze(-1)
+        summary = torch.cat([
+            params,
+            attribute_residual,
+            success,
+            confidence,
+            best_applicable,
+            lookup_need], dim=-1)
         return self.readout_proj(summary)
 
     def NeedsLookupScore(
@@ -1152,8 +1170,8 @@ class ObjectUsageBank(AGICoreModule):
         applicability: torch.Tensor,
         confidence: torch.Tensor,
         successRate: torch.Tensor,
-        intentAttention: torch.Tensor,) -> torch.Tensor:
-        feats = torch.stack([applicability, confidence, successRate, intentAttention], dim=-1)
+        slotAttention: torch.Tensor,) -> torch.Tensor:
+        feats = torch.stack([applicability, confidence, successRate, slotAttention], dim=-1)
         return torch.sigmoid(self.needs_lookup(feats)).squeeze(-1)
 
     @torch.no_grad()
@@ -1185,6 +1203,119 @@ class ObjectUsageBank(AGICoreModule):
 
 
 class MemoryExtractor(AGICoreModule):
+    DURABLE_MEMORY_ARTIFACT_TYPE = "MemoryExtractorDurableMemory"
+    DURABLE_MEMORY_SCHEMA_VERSION = 1
+    DURABLE_MEMORY_STATE_FIELDS = (
+        "time_step",
+        "memory_filled",
+        "memory_version",
+        "memory_keys",
+        "memory_values",
+        "memory_importance",
+        "memory_steps",
+        "memory_emotion",
+        "memory_source",
+        "memory_reward_abs",
+        "ltm_sem_global_step",
+        "ltm_sem_keys",
+        "ltm_sem_vals",
+        "ltm_sem_prio",
+        "ltm_sem_touch",
+        "ltm_sem_step",
+        "ltm_sem_filled",
+        "ltm_sem_source",
+        "ltm_epi_global_step",
+        "ltm_epi_keys",
+        "ltm_epi_state_keys",
+        "ltm_epi_vals",
+        "ltm_epi_prio",
+        "ltm_epi_rew",
+        "ltm_epi_rew_abs",
+        "ltm_epi_step",
+        "ltm_epi_touch",
+        "ltm_epi_filled",
+        "ltm_epi_source",
+        "sym_mem_global_step",
+        "sym_mem_P_keys",
+        "sym_mem_P_vals",
+        "sym_mem_prio",
+        "sym_mem_step",
+        "sym_mem_touch",
+        "sym_mem_filled",
+        "sym_mem_source",
+        "usage_applicable",
+        "usage_default_params",
+        "usage_expected_dx",
+        "usage_success_alpha",
+        "usage_success_beta",
+        "usage_param_mu",
+        "usage_param_logvar",
+        "usage_instance_descriptors",
+        "usage_attribute_centroid",)
+    TRANSIENT_MEMORY_STATE_FIELDS = (
+        "last_compress_step",
+        "h_state",
+        "fast_weights",
+        "ns_prev_P_post",
+        "ns_penalty_vec",
+        "gws_global_step",
+        "gws_keys",
+        "gws_vals",
+        "gws_priority",
+        "gws_ttl",
+        "gws_last_step",
+        "gws_source",)
+    FULL_MEMORY_STATE_FIELDS = (
+        "time_step",
+        "memory_filled",
+        "last_compress_step",
+        "h_state",
+        "fast_weights",
+        "ns_prev_P_post",
+        "ns_penalty_vec",
+        "gws_global_step",
+        "ltm_sem_global_step",
+        "ltm_epi_global_step",
+        "sym_mem_global_step",
+        "memory_version",
+        "memory_keys",
+        "memory_values",
+        "memory_importance",
+        "memory_steps",
+        "memory_emotion",
+        "memory_source",
+        "memory_reward_abs",
+        "gws_keys",
+        "gws_vals",
+        "gws_priority",
+        "gws_ttl",
+        "gws_last_step",
+        "gws_source",
+        "ltm_sem_keys",
+        "ltm_sem_vals",
+        "ltm_sem_prio",
+        "ltm_sem_touch",
+        "ltm_sem_step",
+        "ltm_sem_filled",
+        "ltm_sem_source",
+        "ltm_epi_keys",
+        "ltm_epi_state_keys",
+        "ltm_epi_vals",
+        "ltm_epi_prio",
+        "ltm_epi_rew",
+        "ltm_epi_rew_abs",
+        "ltm_epi_step",
+        "ltm_epi_touch",
+        "ltm_epi_filled",
+        "ltm_epi_source",
+        "sym_mem_P_keys",
+        "sym_mem_P_vals",
+        "sym_mem_prio",
+        "sym_mem_step",
+        "sym_mem_touch",
+        "sym_mem_filled",
+        "sym_mem_source",)
+
     def __init__(
         self,
         inputDim: int = 1024,
@@ -1580,7 +1711,8 @@ class MemoryExtractor(AGICoreModule):
         total_penalty, aux_reg = self.sym_rules(P, P_prev) # total_penalty: [B]
 
         if self.training:
-            self.AddInternalLoss(self.ns_lambda * aux_reg)
+            self.AddInternalLoss(
+                self.ns_lambda * (total_penalty.mean() + aux_reg))
 
         return total_penalty
 
@@ -2399,6 +2531,29 @@ class MemoryExtractor(AGICoreModule):
         self.ResetInternalLoss()
         self.pending.clear()
 
+    @torch.no_grad()
+    def ResetEpisodeState(self, doneMask: Optional[torch.Tensor] = None):
+        if doneMask is None:
+            done = torch.ones(
+                self.h_state.size(0),
+                device=self.h_state.device,
+                dtype=torch.bool)
+        else:
+            if not torch.is_tensor(doneMask) or doneMask.dtype != torch.bool:
+                raise TypeError("Memory episode reset mask must be a bool tensor")
+            if doneMask.device != self.h_state.device:
+                raise ValueError("Memory episode reset mask must be on the memory device")
+            if doneMask.shape != self.h_state.shape[:1]:
+                raise ValueError("Memory episode reset mask must have shape [B]")
+            done = doneMask
+        self.FlushPendingWrites()
+        self.h_state[done] = 0
+        self.fast_weights[done] = 0
+        self.ns_prev_P_post[done] = 0
+        self.ns_penalty_vec[done] = 0
+        if bool(done.all().item()):
+            self.gws.Reset()
+
 
     def ResetAll(self):
         self.h_state.zero_()
@@ -2426,8 +2581,16 @@ class MemoryExtractor(AGICoreModule):
         self.pending.clear()
         self.memory_version.add_(1)
 
-    def ResetHebbianMemory(self):
-        self.fast_weights.zero_()
+    def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
+        if doneMask is None:
+            self.fast_weights.zero_()
+            return
+        done = doneMask.view(-1).to(
+            device=self.fast_weights.device,
+            dtype=torch.bool)
+        if done.numel() != self.fast_weights.size(0):
+            raise ValueError("Memory Hebbian reset mask must match its batch size")
+        self.fast_weights[done] = 0
 
     @torch.no_grad()
     def InitMemoryDocument(self, path: str):
@@ -2505,98 +2668,214 @@ class MemoryExtractor(AGICoreModule):
 
     @torch.no_grad()
     def SaveState(self, path: str):
-        torch.save({
-            "state_dict": self.CollapseStateDictBatch(self.state_dict()),
-            "batch_first_only": True,
-            "memory_state_format": 2,}, path)
+        state = self.ExportDurableState()
+        payload = {
+            "artifact_type": self.DURABLE_MEMORY_ARTIFACT_TYPE,
+            "schema_version": self.DURABLE_MEMORY_SCHEMA_VERSION,
+            "batch_size": int(state["memory_filled"].size(0)),
+            "state": state,}
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".tmp",
+            dir=directory or ".")
+        os.close(fd)
+        try:
+            torch.save(payload, temporary_path)
+            os.replace(temporary_path, path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
 
     @torch.no_grad()
-    def LoadState(self, path: str):
+    def LoadState(self, path: str, *, expectedBatch: Optional[int] = None):
         if (not os.path.exists(path)) or (os.path.getsize(path) == 0):
             return
-        
-        obj = torch.load(path, weights_only=False)
-        sd = obj["state_dict"]
-        target_B = int(self.h_state.size(0))
-        self.EnsureB(target_B, device=self.device, dtype=self.dtype)
-        self.gws.EnsureB(target_B, device=self.device, dtype=self.dtype)
-        self.ltm.semantic.EnsureB(target_B, device=self.device, dtype=self.dtype)
-        self.ltm.episodic.EnsureB(target_B, device=self.device, dtype=self.dtype)
-        sd = self.ExpandStateDictBatch(sd, targetB=target_B)
 
-        self.load_state_dict(sd, strict=False)
+        obj = torch.load(path, map_location=self.device, weights_only=True)
+        expected_payload_fields = {"artifact_type", "schema_version", "batch_size", "state"}
+        if type(obj) is not dict or set(obj) != expected_payload_fields:
+            raise TypeError("memory artifact fields do not match the durable-memory schema")
+        if obj["artifact_type"] != self.DURABLE_MEMORY_ARTIFACT_TYPE:
+            raise ValueError(f"unsupported memory artifact type: {obj['artifact_type']!r}")
+        if (
+            type(obj["schema_version"]) is not int
+            or obj["schema_version"] != self.DURABLE_MEMORY_SCHEMA_VERSION
+        ):
+            raise ValueError(f"unsupported durable-memory schema: {obj['schema_version']!r}")
+        if type(obj["batch_size"]) is not int or obj["batch_size"] < 1:
+            raise TypeError("durable-memory batch_size must be a positive integer")
+        if expectedBatch is not None and obj["batch_size"] != int(expectedBatch):
+            raise ValueError(
+                f"durable memory batch_size={obj['batch_size']} does not match "
+                f"runtime batchSize={expectedBatch}")
+        state = obj["state"]
+        self.ValidateDurableState(state, expectedBatch=obj["batch_size"])
+        self.ImportDurableState(state)
+
+    def DurableStateTensors(self) -> Dict[str, torch.Tensor]:
+        sem = self.ltm.semantic
+        epi = self.ltm.episodic
+        sym = self.sym_mem
+        usage = self.usage_bank
+        return {
+            "time_step": self.time_step,
+            "memory_filled": self.memory_filled,
+            "memory_version": self.memory_version,
+            "memory_keys": self.memory_keys,
+            "memory_values": self.memory_values,
+            "memory_importance": self.memory_importance,
+            "memory_steps": self.memory_steps,
+            "memory_emotion": self.memory_emotion,
+            "memory_source": self.memory_source,
+            "memory_reward_abs": self.memory_reward_abs,
+            "ltm_sem_global_step": sem.global_step,
+            "ltm_sem_keys": sem.keys,
+            "ltm_sem_vals": sem.vals,
+            "ltm_sem_prio": sem.prio,
+            "ltm_sem_touch": sem.touch,
+            "ltm_sem_step": sem.step,
+            "ltm_sem_filled": sem.filled,
+            "ltm_sem_source": sem.source,
+            "ltm_epi_global_step": epi.global_step,
+            "ltm_epi_keys": epi.keys,
+            "ltm_epi_state_keys": epi.state_keys,
+            "ltm_epi_vals": epi.vals,
+            "ltm_epi_prio": epi.prio,
+            "ltm_epi_rew": epi.rew,
+            "ltm_epi_rew_abs": epi.rew_abs,
+            "ltm_epi_step": epi.step,
+            "ltm_epi_touch": epi.touch,
+            "ltm_epi_filled": epi.filled,
+            "ltm_epi_source": epi.source,
+            "sym_mem_global_step": sym.global_step,
+            "sym_mem_P_keys": sym.P_keys,
+            "sym_mem_P_vals": sym.P_vals,
+            "sym_mem_prio": sym.prio,
+            "sym_mem_step": sym.step,
+            "sym_mem_touch": sym.touch,
+            "sym_mem_filled": sym.filled,
+            "sym_mem_source": sym.source,
+            "usage_applicable": usage.applicable,
+            "usage_default_params": usage.default_params,
+            "usage_expected_dx": usage.expected_dx,
+            "usage_success_alpha": usage.success_alpha,
+            "usage_success_beta": usage.success_beta,
+            "usage_param_mu": usage.param_mu,
+            "usage_param_logvar": usage.param_logvar,
+            "usage_instance_descriptors": usage.instance_descriptors,
+            "usage_attribute_centroid": usage.attribute_centroid,}
+
+    @torch.no_grad()
+    def ExportDurableState(self) -> Dict[str, torch.Tensor]:
+        state = {
+            name: value.detach().clone()
+            for name, value in self.DurableStateTensors().items()}
+        if tuple(state) != self.DURABLE_MEMORY_STATE_FIELDS:
+            raise RuntimeError("durable-memory field declaration and export order disagree")
+        return state
+
+    def ValidateDurableState(
+        self,
+        state: Dict[str, torch.Tensor],
+        *,
+        expectedBatch: Optional[int] = None,) -> None:
+        if type(state) is not dict or set(state) != set(self.DURABLE_MEMORY_STATE_FIELDS):
+            raise TypeError("durable-memory state fields do not match the current schema")
+        if not all(type(state[name]) is torch.Tensor for name in self.DURABLE_MEMORY_STATE_FIELDS):
+            raise TypeError("every durable-memory state field must be a tensor")
+
+        memory_filled = state["memory_filled"]
+        if memory_filled.dim() != 1 or int(memory_filled.size(0)) < 1:
+            raise ValueError("durable-memory memory_filled must have shape [B] with B >= 1")
+        batch_size = int(memory_filled.size(0))
+        if expectedBatch is not None and batch_size != int(expectedBatch):
+            raise ValueError("durable-memory batch_size does not match its state tensors")
+
+        expected_shapes = {
+            "time_step": (batch_size,),
+            "memory_filled": (batch_size,),
+            "memory_version": (),
+            "memory_keys": (batch_size, self.memory_size, self.memory_dim),
+            "memory_values": (batch_size, self.memory_size, self.memory_dim),
+            "memory_importance": (batch_size, self.memory_size),
+            "memory_steps": (batch_size, self.memory_size),
+            "memory_emotion": (batch_size, self.memory_size, self.emotion_dim),
+            "memory_source": (batch_size, self.memory_size),
+            "memory_reward_abs": (batch_size, self.memory_size),
+            "ltm_sem_global_step": (batch_size,),
+            "ltm_sem_keys": (batch_size, self.ltm.semantic.capacity, self.memory_dim),
+            "ltm_sem_vals": (batch_size, self.ltm.semantic.capacity, self.memory_dim),
+            "ltm_sem_prio": (batch_size, self.ltm.semantic.capacity),
+            "ltm_sem_touch": (batch_size, self.ltm.semantic.capacity),
+            "ltm_sem_step": (batch_size, self.ltm.semantic.capacity),
+            "ltm_sem_filled": (batch_size,),
+            "ltm_sem_source": (batch_size, self.ltm.semantic.capacity),
+            "ltm_epi_global_step": (batch_size,),
+            "ltm_epi_keys": (batch_size, self.ltm.episodic.capacity, self.memory_dim),
+            "ltm_epi_state_keys": (batch_size, self.ltm.episodic.capacity, self.memory_dim),
+            "ltm_epi_vals": (batch_size, self.ltm.episodic.capacity, self.memory_dim),
+            "ltm_epi_prio": (batch_size, self.ltm.episodic.capacity),
+            "ltm_epi_rew": (batch_size, self.ltm.episodic.capacity),
+            "ltm_epi_rew_abs": (batch_size, self.ltm.episodic.capacity),
+            "ltm_epi_step": (batch_size, self.ltm.episodic.capacity),
+            "ltm_epi_touch": (batch_size, self.ltm.episodic.capacity),
+            "ltm_epi_filled": (batch_size,),
+            "ltm_epi_source": (batch_size, self.ltm.episodic.capacity),
+            "sym_mem_global_step": (),
+            "sym_mem_P_keys": tuple(self.sym_mem.P_keys.shape),
+            "sym_mem_P_vals": tuple(self.sym_mem.P_vals.shape),
+            "sym_mem_prio": tuple(self.sym_mem.prio.shape),
+            "sym_mem_step": tuple(self.sym_mem.step.shape),
+            "sym_mem_touch": tuple(self.sym_mem.touch.shape),
+            "sym_mem_filled": (),
+            "sym_mem_source": tuple(self.sym_mem.source.shape),
+            "usage_applicable": tuple(self.usage_bank.applicable.shape),
+            "usage_default_params": tuple(self.usage_bank.default_params.shape),
+            "usage_expected_dx": tuple(self.usage_bank.expected_dx.shape),
+            "usage_success_alpha": tuple(self.usage_bank.success_alpha.shape),
+            "usage_success_beta": tuple(self.usage_bank.success_beta.shape),
+            "usage_param_mu": tuple(self.usage_bank.param_mu.shape),
+            "usage_param_logvar": tuple(self.usage_bank.param_logvar.shape),
+            "usage_instance_descriptors": tuple(self.usage_bank.instance_descriptors.shape),
+            "usage_attribute_centroid": tuple(self.usage_bank.attribute_centroid.shape),}
+        current_dtypes = {
+            name: tensor.dtype
+            for name, tensor in self.DurableStateTensors().items()}
+        for name in self.DURABLE_MEMORY_STATE_FIELDS:
+            value = state[name]
+            if tuple(value.shape) != expected_shapes[name]:
+                raise ValueError(
+                    f"durable-memory field {name} has shape {tuple(value.shape)}, "
+                    f"expected {expected_shapes[name]}")
+            if value.dtype != current_dtypes[name]:
+                raise TypeError(
+                    f"durable-memory field {name} has dtype {value.dtype}, "
+                    f"expected {current_dtypes[name]}")
+
+    @torch.no_grad()
+    def ImportDurableState(self, state: Dict[str, torch.Tensor]) -> None:
+        self.ValidateDurableState(state)
+        batch_size = int(state["memory_filled"].size(0))
+        self.EnsureB(batch_size, device=self.device, dtype=self.dtype)
+        self.ltm.semantic.EnsureB(batch_size, device=self.device, dtype=self.dtype)
+        self.ltm.episodic.EnsureB(batch_size, device=self.device, dtype=self.dtype)
+
+        targets = self.DurableStateTensors()
+        for name in self.DURABLE_MEMORY_STATE_FIELDS:
+            targets[name].copy_(state[name])
+
+        self.h_state.zero_()
+        self.fast_weights.zero_()
+        self.ns_prev_P_post.zero_()
+        self.ns_penalty_vec.zero_()
+        self.last_compress_step.copy_(self.time_step)
+        self.gws.EnsureB(batch_size, device=self.device, dtype=self.dtype)
+        self.gws.Reset()
+        self.ResetInternalLoss()
         self.pending.clear()
-
-    def IsRuntimeBatchStateKey(self, key: str) -> bool:
-        if key in {
-            "h_state", "fast_weights", "memory_keys", "memory_values",
-            "memory_importance", "memory_steps", "memory_source",
-            "memory_reward_abs", "memory_emotion", "time_step",
-            "memory_filled", "last_compress_step", "ns_prev_P_post",
-            "ns_penalty_vec",}:
-            return True
-        return key.startswith("ltm.semantic.") or key.startswith("ltm.episodic.") or key.startswith("gws.")
-
-    def TargetBatchForStateKey(self, key: str, targetB: int) -> int:
-        return int(targetB)
-
-    def CollapseStateDictBatch(self, stateDict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        out: Dict[str, torch.Tensor] = {}
-        for k, v in stateDict.items():
-            if isinstance(v, torch.Tensor) and self.IsRuntimeBatchStateKey(k) and v.dim() > 0:
-                out[k] = v[:1].detach().clone()
-            elif isinstance(v, torch.Tensor):
-                out[k] = v.detach().clone()
-            else:
-                out[k] = v
-        return out
-
-    def ExpandStateDictBatch(self, stateDict: Dict[str, torch.Tensor], *, targetB: int) -> Dict[str, torch.Tensor]:
-        out: Dict[str, torch.Tensor] = {}
-        for k, v in stateDict.items():
-            if not isinstance(v, torch.Tensor):
-                out[k] = v
-                continue
-            if self.IsRuntimeBatchStateKey(k) and v.dim() > 0:
-                B = self.TargetBatchForStateKey(k, targetB)
-                if int(v.size(0)) == 0:
-                    out[k] = v
-                elif int(v.size(0)) == B:
-                    out[k] = v
-                else:
-                    out[k] = v[:1].expand(B, *v.shape[1:]).clone()
-            else:
-                out[k] = v
-        return out
-
-    def CollapseExportStateBatch(self, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        out: Dict[str, torch.Tensor] = {}
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor) and self.IsExportBatchStateKey(k) and v.dim() > 0:
-                out[k] = v[:1].detach().clone()
-            elif isinstance(v, torch.Tensor):
-                out[k] = v.detach().clone()
-            else:
-                out[k] = v
-        out["batch_first_only"] = torch.tensor(True, device=self.device)
-        out["memory_state_format"] = torch.tensor(2, device=self.device, dtype=torch.long)
-        return out
-
-    def IsExportBatchStateKey(self, key: str) -> bool:
-        return key in {
-            "time_step", "memory_filled", "last_compress_step", "h_state",
-            "fast_weights", "ns_prev_P_post", "ns_penalty_vec",
-            "gws_global_step", "ltm_sem_global_step", "ltm_epi_global_step",
-            "memory_keys", "memory_values", "memory_importance",
-            "memory_steps", "memory_emotion", "memory_source",
-            "memory_reward_abs", "gws_keys", "gws_vals", "gws_priority",
-            "gws_ttl", "gws_last_step", "gws_source", "ltm_sem_keys",
-            "ltm_sem_vals", "ltm_sem_prio", "ltm_sem_touch",
-            "ltm_sem_step", "ltm_sem_filled", "ltm_sem_source",
-            "ltm_epi_keys", "ltm_epi_state_keys", "ltm_epi_vals", "ltm_epi_prio",
-            "ltm_epi_rew", "ltm_epi_rew_abs", "ltm_epi_step",
-            "ltm_epi_touch", "ltm_epi_filled", "ltm_epi_source",}
-
 
     @torch.no_grad()
     def ExportMemoryBank(
@@ -2664,6 +2943,10 @@ class MemoryExtractor(AGICoreModule):
             gws_scores = gws_scores.masked_fill(~gws_valid, -1e9)
             _, gws_idx = StableTopk(gws_scores, K_gws)  # [B, K_gws]
             out["gws"] = GatherTopkLatestFirst(self.gws.vals[:1], gws_idx, self.gws.last_step[:1])
+            out["gws_valid"] = GatherMeta(
+                gws_valid,
+                gws_idx,
+                self.gws.last_step[:1])
             meta["gws"] = {
                 "score": GatherMeta(gws_scores, gws_idx, self.gws.last_step[:1]),
                 "source": GatherMeta(self.gws.source[:1], gws_idx, self.gws.last_step[:1]).float(),
@@ -2683,6 +2966,7 @@ class MemoryExtractor(AGICoreModule):
             scores = (self.memory_importance * (1.0 + 0.5 * torch.tanh(self.memory_reward_abs))).masked_fill(~valid, -1e9) # [B, M_kv]
             _, idx = StableTopk(scores, K_kv) # [B, K_kv]
             out["kv"] = GatherTopkLatestFirst(self.memory_values, idx, self.memory_steps) # [B, K_kv, D]
+            out["kv_valid"] = GatherMeta(valid, idx, self.memory_steps)
             meta["kv"] = {
                 "score": GatherMeta(scores, idx, self.memory_steps),
                 "source": GatherMeta(self.memory_source.float(), idx, self.memory_steps),
@@ -2704,6 +2988,7 @@ class MemoryExtractor(AGICoreModule):
             scores = (sem.prio * SourceConfidence(sem.source, dtype=sem.prio.dtype)).masked_fill(~valid, -1e9) # [B, M_sem]
             _, idx = StableTopk(scores, K_sem) # [B, K_sem]
             out["ltm_sem"] = GatherTopkLatestFirst(sem.vals, idx, sem.step) # [B, K_sem, D]
+            out["ltm_sem_valid"] = GatherMeta(valid, idx, sem.step)
             meta["ltm_sem"] = {
                 "score": GatherMeta(scores, idx, sem.step),
                 "source": GatherMeta(sem.source.float(), idx, sem.step),
@@ -2725,6 +3010,7 @@ class MemoryExtractor(AGICoreModule):
             scores = (epi.prio * (1.0 + 0.5 * torch.tanh(epi.rew_abs)) * SourceConfidence(epi.source, dtype=epi.prio.dtype)).masked_fill(~valid, -1e9) # [B, M_epi]
             _, idx = StableTopk(scores, K_epi) # [B, K_epi]
             out["ltm_epi"] = GatherTopkLatestFirst(epi.vals, idx, epi.step) # [B, K_epi, D]
+            out["ltm_epi_valid"] = GatherMeta(valid, idx, epi.step)
             meta["ltm_epi"] = {
                 "score": GatherMeta(scores, idx, epi.step),
                 "source": GatherMeta(epi.source.float(), idx, epi.step),
@@ -2748,6 +3034,7 @@ class MemoryExtractor(AGICoreModule):
             sym_idx = sym_idx.index_select(0, time_order)
             top_vals = sym.P_vals[:n_sym].index_select(0, sym_idx) # [K_sym, nsK]
             out["sym"] = top_vals.unsqueeze(0).expand(B, K_sym, nsK).contiguous() # [B, K_sym, nsK]
+            out["sym_valid"] = torch.ones(B, K_sym, device=device, dtype=torch.bool)
             if includeMeta:
                 age = (sym.global_step - sym.step[:n_sym]).clamp(min=0).float().index_select(0, sym_idx)
                 src = sym.source[:n_sym].index_select(0, sym_idx)
@@ -2764,6 +3051,30 @@ class MemoryExtractor(AGICoreModule):
             out["meta"] = meta
         return out
     
+
+    @torch.no_grad()
+    def ExportTransientState(self) -> Dict[str, torch.Tensor]:
+        gws = self.gws.Inspect()
+        state = {
+            "last_compress_step": self.last_compress_step.detach().clone(),
+            "h_state": self.h_state.detach().clone(),
+            "fast_weights": self.fast_weights.detach().clone(),
+            "ns_prev_P_post": self.ns_prev_P_post.detach().clone(),
+            "ns_penalty_vec": self.ns_penalty_vec.detach().clone(),
+            "gws_global_step": self.gws.global_step.detach().clone(),
+            "gws_keys": gws["keys"].detach().clone(),
+            "gws_vals": gws["vals"].detach().clone(),
+            "gws_priority": gws["priority"].detach().clone(),
+            "gws_ttl": gws["ttl"].detach().clone(),
+            "gws_last_step": gws["last_step"].detach().clone(),
+            "gws_source": gws["source"].detach().clone(),}
+        if tuple(state) != self.TRANSIENT_MEMORY_STATE_FIELDS:
+            raise RuntimeError("transient-memory field declaration and export order disagree")
+        return state
+
+    @torch.no_grad()
+    def ImportTransientState(self, state: Dict[str, torch.Tensor]) -> None:
+        self._ImportCurrentState(state, includeDurable=False)
 
     @torch.no_grad()
     def ExportState(self, step: Optional[int] = None) -> Dict[str, torch.Tensor]:
@@ -2837,9 +3148,9 @@ class MemoryExtractor(AGICoreModule):
             "sym_mem_filled": sym.filled.clone(), 
             "sym_mem_source": sym.source.clone(),}) # [Cap]
 
-        state = self.CollapseExportStateBatch(state)
-        
         if step is None:
+            if tuple(state) != self.FULL_MEMORY_STATE_FIELDS:
+                raise RuntimeError("memory-state export does not match its schema")
             return state
 
         s = int(step)
@@ -2953,6 +3264,8 @@ class MemoryExtractor(AGICoreModule):
         else:
             state["sym_mem_filled"] = state["sym_mem_filled"].clone().zero_()
 
+        if tuple(state) != self.FULL_MEMORY_STATE_FIELDS:
+            raise RuntimeError("memory-state export does not match its schema")
         return state
 
     @torch.no_grad()
@@ -2961,12 +3274,79 @@ class MemoryExtractor(AGICoreModule):
         state: Dict[str, torch.Tensor],
         mergeGws: bool = False,) -> None:
 
+        if type(state) is not dict or tuple(state) != self.FULL_MEMORY_STATE_FIELDS:
+            raise TypeError("merged memory-state fields do not match the current schema")
+        if not all(torch.is_tensor(value) for value in state.values()):
+            raise TypeError("every merged memory-state field must be a tensor")
+
+        def require_shape(condition: bool, message: str) -> None:
+            if not condition:
+                raise ValueError(f"invalid merged memory-state shape: {message}")
+
+        memory_keys = state["memory_keys"]
+        memory_values = state["memory_values"]
+        require_shape(memory_keys.dim() == 3, "memory_keys must be [B,M,D]")
+        require_shape(memory_values.shape == memory_keys.shape, "memory_values must match memory_keys")
+        B_src, M_src, D_src = memory_keys.shape
+        require_shape(D_src == self.memory_dim, "memory feature dimension differs from the destination")
+        require_shape(state["memory_filled"].shape == (B_src,), "memory_filled must be [B]")
+        for field in ("memory_importance", "memory_steps", "memory_source", "memory_reward_abs"):
+            require_shape(state[field].shape == (B_src, M_src), f"{field} must be [B,M]")
+        require_shape(
+            state["memory_emotion"].shape == (B_src, M_src, self.emotion_dim),
+            "memory_emotion must be [B,M,E]")
+
+        sem_keys = state["ltm_sem_keys"]
+        sem_vals = state["ltm_sem_vals"]
+        require_shape(sem_keys.dim() == 3, "ltm_sem_keys must be [B,C,D]")
+        require_shape(sem_vals.shape == sem_keys.shape, "ltm_sem_vals must match ltm_sem_keys")
+        B_sem, C_sem, D_sem = sem_keys.shape
+        require_shape(B_sem == B_src and D_sem == self.memory_dim, "semantic-memory batch/feature dimensions differ")
+        require_shape(state["ltm_sem_filled"].shape == (B_src,), "ltm_sem_filled must be [B]")
+        for field in ("ltm_sem_prio", "ltm_sem_touch", "ltm_sem_step", "ltm_sem_source"):
+            require_shape(state[field].shape == (B_src, C_sem), f"{field} must be [B,C]")
+
+        epi_keys = state["ltm_epi_keys"]
+        epi_state_keys = state["ltm_epi_state_keys"]
+        epi_vals = state["ltm_epi_vals"]
+        require_shape(epi_keys.dim() == 3, "ltm_epi_keys must be [B,C,D]")
+        require_shape(epi_state_keys.shape == epi_keys.shape, "ltm_epi_state_keys must match ltm_epi_keys")
+        require_shape(epi_vals.shape == epi_keys.shape, "ltm_epi_vals must match ltm_epi_keys")
+        B_epi, C_epi, D_epi = epi_keys.shape
+        require_shape(B_epi == B_src and D_epi == self.memory_dim, "episodic-memory batch/feature dimensions differ")
+        require_shape(state["ltm_epi_filled"].shape == (B_src,), "ltm_epi_filled must be [B]")
+        for field in (
+            "ltm_epi_prio", "ltm_epi_rew", "ltm_epi_rew_abs",
+            "ltm_epi_step", "ltm_epi_touch", "ltm_epi_source",):
+            require_shape(state[field].shape == (B_src, C_epi), f"{field} must be [B,C]")
+
+        sym_keys = state["sym_mem_P_keys"]
+        sym_vals = state["sym_mem_P_vals"]
+        require_shape(sym_keys.dim() == 2, "sym_mem_P_keys must be [C,K]")
+        require_shape(sym_vals.shape == sym_keys.shape, "sym_mem_P_vals must match sym_mem_P_keys")
+        C_sym, K_sym = sym_keys.shape
+        require_shape(K_sym == self.sym_mem.K, "symbolic-memory feature dimension differs")
+        for field in ("sym_mem_prio", "sym_mem_step", "sym_mem_touch", "sym_mem_source"):
+            require_shape(state[field].shape == (C_sym,), f"{field} must be [C]")
+        require_shape(state["sym_mem_filled"].shape == (), "sym_mem_filled must be scalar")
+
+        if mergeGws:
+            gws_keys = state["gws_keys"]
+            gws_vals = state["gws_vals"]
+            require_shape(gws_keys.dim() == 3, "gws_keys must be [B,S,D]")
+            require_shape(gws_vals.shape == gws_keys.shape, "gws_vals must match gws_keys")
+            B_gws, S_gws, D_gws = gws_keys.shape
+            require_shape(B_gws == B_src and D_gws == self.memory_dim, "workspace batch/feature dimensions differ")
+            for field in ("gws_priority", "gws_ttl", "gws_last_step", "gws_source"):
+                require_shape(state[field].shape == (B_src, S_gws), f"{field} must be [B,S]")
+            require_shape(state["gws_global_step"].shape == (B_src,), "gws_global_step must be [B]")
+
         device = self.device
         dtype = self.dtype
 
         B_dst = int(self.memory_filled.size(0))
 
-        if mergeGws and ("gws_keys" in state) and ("gws_vals" in state):
+        if mergeGws:
             gk = state["gws_keys"].to(device=self.gws.keys.device, dtype=self.gws.keys.dtype) # [B, S, D]
             gv = state["gws_vals"].to(device=self.gws.vals.device, dtype=self.gws.vals.dtype) # [B, S, D]
             gpr = state["gws_priority"].to(device=self.gws.priority.device, dtype=self.gws.priority.dtype) # [B, S]
@@ -2975,438 +3355,252 @@ class MemoryExtractor(AGICoreModule):
             gsrc = state["gws_source"].to(device=self.gws.source.device, dtype=torch.int8) # [B, S]
             ggs = state["gws_global_step"].to(device=self.gws.global_step.device, dtype=torch.long) # [B]
 
-            B_src = int(gk.size(0))
+            B_gws_src = int(gk.size(0))
             S_src = int(gk.size(1))
             S_dst = int(self.gws.slots)
-            D_dst = int(self.memory_dim)
-
-            B = min(B_dst, B_src)
+            B = min(B_dst, B_gws_src)
             S = min(S_dst, S_src)
 
-            if int(gk.size(-1)) == D_dst and int(gv.size(-1)) == D_dst:
-                self.gws.keys[:B, :S].copy_(gk[:B, :S])
-                self.gws.vals[:B, :S].copy_(gv[:B, :S])
-                self.gws.priority[:B, :S].copy_(gpr[:B, :S])
-                self.gws.ttl[:B, :S].copy_(gttl[:B, :S])
-                self.gws.last_step[:B, :S].copy_(gls[:B, :S])
-                self.gws.source[:B, :S].copy_(gsrc[:B, :S])
-                self.gws.global_step[:B].copy_(ggs[:B])
+            self.gws.keys[:B, :S].copy_(gk[:B, :S])
+            self.gws.vals[:B, :S].copy_(gv[:B, :S])
+            self.gws.priority[:B, :S].copy_(gpr[:B, :S])
+            self.gws.ttl[:B, :S].copy_(gttl[:B, :S])
+            self.gws.last_step[:B, :S].copy_(gls[:B, :S])
+            self.gws.source[:B, :S].copy_(gsrc[:B, :S])
+            self.gws.global_step[:B].copy_(ggs[:B])
 
-        if ("memory_keys" in state) and ("memory_values" in state):
-            k_src = state["memory_keys"].to(device=device, dtype=dtype) # [B, M, D]
-            v_src = state["memory_values"].to(device=device, dtype=dtype) # [B, M, D]
+        k_src = state["memory_keys"].to(device=device, dtype=dtype) # [B, M, D]
+        v_src = state["memory_values"].to(device=device, dtype=dtype) # [B, M, D]
+        B = min(B_dst, B_src)
+        filled_src = state["memory_filled"].to(device=device, dtype=torch.long)
+        if bool(((filled_src < 0) | (filled_src > M_src)).any().item()):
+            raise ValueError("memory_filled is outside the source memory capacity")
+        imp_src = state["memory_importance"].to(device=device, dtype=dtype)
+        emo_src = state["memory_emotion"].to(device=device, dtype=dtype)
+        src_src = state["memory_source"].to(device=device, dtype=torch.int8)
+        rew_abs_src = state["memory_reward_abs"].to(device=device, dtype=dtype)
+        step_src = state["memory_steps"].to(device=device, dtype=torch.long)  # [B, M]
 
-            if k_src.dim() == 3 and v_src.dim() == 3:
-                B_src, M_src, D_src = int(k_src.size(0)), int(k_src.size(1)), int(k_src.size(2))
-                B = min(B_dst, B_src)
+        max_n = int(filled_src[:B].max().item()) if B > 0 else 0
+        M_dst = int(self.memory_size)
+        for t in range(max_n):
+            mask = (t < filled_src[:B])  # [B]
+            filled_dst = self.memory_filled[:B] # [B]
+            is_full = filled_dst >= M_dst # [B]
+            idx_append = filled_dst.clamp(max=M_dst - 1) # [B]
+            idx_evict = torch.argmin(self.memory_importance[:B], dim=1) # [B]
+            tgt = torch.where(is_full, idx_evict, idx_append) # [B]
 
-                if D_src == int(self.memory_dim) and int(v_src.size(2)) == int(self.memory_dim):
-                    filled_src = state["memory_filled"].to(device=device, dtype=torch.long)
-                    filled_src = filled_src.clamp(min=0, max=M_src)  # [B_src]
+            b_idx = torch.arange(B, device=device, dtype=torch.long)
+            b_sel = b_idx[mask]
+            tgt_sel = tgt[mask]
 
-                    imp_src = state["memory_importance"].to(device=device, dtype=dtype)
+            self.memory_keys[b_sel, tgt_sel] = k_src[:B, t][mask]
+            self.memory_values[b_sel, tgt_sel] = v_src[:B, t][mask]
+            self.memory_importance[b_sel, tgt_sel] = imp_src[:B, t][mask]
+            self.memory_emotion[b_sel, tgt_sel] = emo_src[:B, t][mask]
+            self.memory_source[b_sel, tgt_sel] = src_src[:B, t][mask]
+            self.memory_reward_abs[b_sel, tgt_sel] = rew_abs_src[:B, t][mask]
+            self.memory_steps[b_sel, tgt_sel] = step_src[:B, t][mask]
 
-                    emo_src = state["memory_emotion"].to(device=device, dtype=dtype)
+            filled_new = filled_dst + (~is_full).long()
+            self.memory_filled[:B].copy_(torch.where(mask, filled_new, filled_dst))
 
-                    src_src = state["memory_source"].to(device=device, dtype=torch.int8)
-                    rew_abs_src = state.get("memory_reward_abs", torch.zeros_like(imp_src)).to(device=device, dtype=dtype)
+        sem = self.ltm.semantic
+        k_src = state["ltm_sem_keys"].to(device=sem.keys.device, dtype=sem.keys.dtype) # [B, C, D]
+        v_src = state["ltm_sem_vals"].to(device=sem.vals.device, dtype=sem.vals.dtype) # [B, C, D]
+        B = min(B_dst, B_sem, int(sem.filled.size(0)))
+        C_dst = int(sem.capacity)
+        filled_src = state["ltm_sem_filled"].to(device=sem.keys.device, dtype=torch.long)
+        if bool(((filled_src < 0) | (filled_src > C_sem)).any().item()):
+            raise ValueError("ltm_sem_filled is outside the source semantic-memory capacity")
+        pr_src = state["ltm_sem_prio"].to(device=sem.prio.device, dtype=sem.prio.dtype)
+        src_src = state["ltm_sem_source"].to(device=sem.source.device, dtype=torch.int8)
 
-                    step_src = state["memory_steps"].to(device=device, dtype=torch.long)  # [B, M]
+        max_n = int(filled_src[:B].max().item()) if B > 0 else 0
+        for t in range(max_n):
+            mask = (t < filled_src[:B])
+            filled_dst = sem.filled[:B]
+            is_full = filled_dst >= C_dst
+            idx_append = filled_dst.clamp(max=C_dst - 1)
+            idx_evict = torch.argmin(sem.prio[:B], dim=1)
+            tgt = torch.where(is_full, idx_evict, idx_append)
 
-                    max_n = int(filled_src[:B].max().item())
-                    M_dst = int(self.memory_size)
+            b_idx = torch.arange(B, device=sem.keys.device, dtype=torch.long)
+            b_sel = b_idx[mask]
+            tgt_sel = tgt[mask]
+            sem.keys[b_sel, tgt_sel] = k_src[:B, t][mask]
+            sem.vals[b_sel, tgt_sel] = v_src[:B, t][mask]
+            sem.prio[b_sel, tgt_sel] = pr_src[:B, t][mask]
+            sem.source[b_sel, tgt_sel] = src_src[:B, t][mask]
+            sem.touch[b_sel, tgt_sel] = 1
+            sem.step[b_sel, tgt_sel] = sem.global_step[:B][mask]
 
-                    for t in range(max_n):
-                        mask = (t < filled_src[:B])  # [B]
-                        if not bool(mask.any().item()):
-                            continue
+            filled_new = filled_dst + (~is_full).long()
+            sem.filled[:B].copy_(torch.where(mask, filled_new, filled_dst))
 
-                        filled_dst = self.memory_filled[:B] # [B]
-                        is_full = filled_dst >= M_dst # [B]
-                        idx_append = filled_dst.clamp(max=M_dst - 1) # [B]
-                        idx_evict = torch.argmin(self.memory_importance[:B], dim=1) # [B]
-                        tgt = torch.where(is_full, idx_evict, idx_append) # [B]
+        epi = self.ltm.episodic
+        k_src = state["ltm_epi_keys"].to(device=epi.keys.device, dtype=epi.keys.dtype) # [B, C, D]
+        ks_src = state["ltm_epi_state_keys"].to(device=epi.state_keys.device, dtype=epi.state_keys.dtype) # [B, C, D]
+        v_src = state["ltm_epi_vals"].to(device=epi.vals.device, dtype=epi.vals.dtype) # [B, C, D]
+        B = min(B_dst, B_epi, int(epi.filled.size(0)))
+        C_dst = int(epi.capacity)
+        filled_src = state["ltm_epi_filled"].to(device=epi.keys.device, dtype=torch.long)
+        if bool(((filled_src < 0) | (filled_src > C_epi)).any().item()):
+            raise ValueError("ltm_epi_filled is outside the source episodic-memory capacity")
+        pr_src = state["ltm_epi_prio"].to(device=epi.prio.device, dtype=epi.prio.dtype)
+        rw_src = state["ltm_epi_rew"].to(device=epi.rew.device, dtype=epi.rew.dtype)
+        rw_abs_src = state["ltm_epi_rew_abs"].to(device=epi.rew_abs.device, dtype=epi.rew_abs.dtype)
+        src_src = state["ltm_epi_source"].to(device=epi.source.device, dtype=torch.int8)
 
-                        b_idx = torch.arange(B, device=device, dtype=torch.long)
-                        b_sel = b_idx[mask]
-                        tgt_sel = tgt[mask]
+        max_n = int(filled_src[:B].max().item()) if B > 0 else 0
+        for t in range(max_n):
+            mask = (t < filled_src[:B])
+            filled_dst = epi.filled[:B]
+            is_full = filled_dst >= C_dst
+            idx_append = filled_dst.clamp(max=C_dst - 1)
+            idx_evict = torch.argmin(epi.prio[:B], dim=1)
+            tgt = torch.where(is_full, idx_evict, idx_append)
 
-                        k_t = k_src[:B, t] # [B, D]
-                        v_t = v_src[:B, t] # [B, D]
-                        imp_t = imp_src[:B, t]
-                        emo_t = emo_src[:B, t]
-                        src_t = src_src[:B, t]
-                        rew_abs_t = rew_abs_src[:B, t]
+            b_idx = torch.arange(B, device=epi.keys.device, dtype=torch.long)
+            b_sel = b_idx[mask]
+            tgt_sel = tgt[mask]
+            epi.keys[b_sel, tgt_sel] = k_src[:B, t][mask]
+            epi.state_keys[b_sel, tgt_sel] = ks_src[:B, t][mask]
+            epi.vals[b_sel, tgt_sel] = v_src[:B, t][mask]
+            epi.prio[b_sel, tgt_sel] = pr_src[:B, t][mask]
+            epi.rew[b_sel, tgt_sel] = rw_src[:B, t][mask]
+            epi.rew_abs[b_sel, tgt_sel] = rw_abs_src[:B, t][mask]
+            epi.source[b_sel, tgt_sel] = src_src[:B, t][mask]
+            epi.touch[b_sel, tgt_sel] = 1
+            epi.step[b_sel, tgt_sel] = epi.global_step[:B][mask]
 
-                        st_t = step_src[:B, t]
-
-                        self.memory_keys[b_sel, tgt_sel].copy_(k_t[mask])
-                        self.memory_values[b_sel, tgt_sel].copy_(v_t[mask])
-                        self.memory_importance[b_sel, tgt_sel].copy_(imp_t[mask])
-                        self.memory_emotion[b_sel, tgt_sel].copy_(emo_t[mask])
-                        self.memory_source[b_sel, tgt_sel].copy_(src_t[mask])
-                        self.memory_reward_abs[b_sel, tgt_sel].copy_(rew_abs_t[mask])
-                        self.memory_steps[b_sel, tgt_sel].copy_(st_t[mask])
-
-                        filled_new = (filled_dst + (~is_full).long()).clamp(max=M_dst)
-                        self.memory_filled[:B].copy_(torch.where(mask, filled_new, filled_dst))
-
-        if ("ltm_sem_keys" in state) and ("ltm_sem_vals" in state):
-            sem = self.ltm.semantic
-            k_src = state["ltm_sem_keys"].to(device=sem.keys.device, dtype=sem.keys.dtype) # [B, C, D]
-            v_src = state["ltm_sem_vals"].to(device=sem.vals.device, dtype=sem.vals.dtype) # [B, C, D]
-
-            if k_src.dim() == 3 and v_src.dim() == 3:
-                B_src, C_src, D_src = int(k_src.size(0)), int(k_src.size(1)), int(k_src.size(2))
-                B = min(B_dst, B_src, int(sem.filled.size(0)))
-                C_dst = int(sem.capacity)
-
-                if D_src == int(self.memory_dim) and int(v_src.size(2)) == int(self.memory_dim):
-                    filled_src = state["ltm_sem_filled"].to(device=sem.keys.device, dtype=torch.long)
-                    filled_src = filled_src.clamp(min=0, max=C_src)
-
-                    pr_src = state["ltm_sem_prio"].to(device=sem.prio.device, dtype=sem.prio.dtype)
-
-                    src_src = state["ltm_sem_source"].to(device=sem.source.device, dtype=torch.int8)
-
-                    max_n = int(filled_src[:B].max().item())
-                    for t in range(max_n):
-                        mask = (t < filled_src[:B])
-                        if not bool(mask.any().item()):
-                            continue
-
-                        filled_dst = sem.filled[:B]
-                        is_full = filled_dst >= C_dst
-                        idx_append = filled_dst.clamp(max=C_dst - 1)
-
-                        idx_evict = torch.argmin(sem.prio[:B], dim=1)
-                        tgt = torch.where(is_full, idx_evict, idx_append)
-
-                        b_idx = torch.arange(B, device=sem.keys.device, dtype=torch.long)
-                        b_sel = b_idx[mask]
-                        tgt_sel = tgt[mask]
-
-                        k_t = k_src[:B, t]
-                        v_t = v_src[:B, t]
-                        p_t = pr_src[:B, t]
-                        s_t = src_src[:B, t]
-
-                        sem.keys[b_sel, tgt_sel].copy_(k_t[mask])
-                        sem.vals[b_sel, tgt_sel].copy_(v_t[mask])
-                        sem.prio[b_sel, tgt_sel].copy_(p_t[mask])
-                        sem.source[b_sel, tgt_sel].copy_(s_t[mask])
-
-                        sem.touch[b_sel, tgt_sel].fill_(1)
-                        sem.step[b_sel, tgt_sel].copy_(sem.global_step[:B][mask])
-
-                        filled_new = (filled_dst + (~is_full).long()).clamp(max=C_dst)
-                        sem.filled[:B].copy_(torch.where(mask, filled_new, filled_dst))
-
-        if ("ltm_epi_keys" in state) and ("ltm_epi_vals" in state):
-            epi = self.ltm.episodic
-            k_src = state["ltm_epi_keys"].to(device=epi.keys.device, dtype=epi.keys.dtype) # [B, C, D]
-            ks_src = state.get("ltm_epi_state_keys", state["ltm_epi_keys"]).to(device=epi.state_keys.device, dtype=epi.state_keys.dtype) # [B, C, D]
-            v_src = state["ltm_epi_vals"].to(device=epi.vals.device, dtype=epi.vals.dtype) # [B, C, D]
-
-            if k_src.dim() == 3 and v_src.dim() == 3:
-                B_src, C_src, D_src = int(k_src.size(0)), int(k_src.size(1)), int(k_src.size(2))
-                B = min(B_dst, B_src, int(epi.filled.size(0)))
-                C_dst = int(epi.capacity)
-
-                if D_src == int(self.memory_dim) and int(v_src.size(2)) == int(self.memory_dim) and ks_src.dim() == 3 and int(ks_src.size(2)) == int(self.memory_dim):
-                    filled_src = state["ltm_epi_filled"].to(device=epi.keys.device, dtype=torch.long)
-                    filled_src = filled_src.clamp(min=0, max=C_src)
-
-                    pr_src = state["ltm_epi_prio"].to(device=epi.prio.device, dtype=epi.prio.dtype)
-
-                    rw_src = state["ltm_epi_rew"].to(device=epi.rew.device, dtype=epi.rew.dtype)
-                    rw_abs_src = state.get("ltm_epi_rew_abs", state["ltm_epi_rew"].abs()).to(device=epi.rew_abs.device, dtype=epi.rew_abs.dtype)
-
-                    src_src = state["ltm_epi_source"].to(device=epi.source.device, dtype=torch.int8)
-
-                    max_n = int(filled_src[:B].max().item())
-                    for t in range(max_n):
-                        mask = (t < filled_src[:B])
-                        if not bool(mask.any().item()):
-                            continue
-
-                        filled_dst = epi.filled[:B]
-                        is_full = filled_dst >= C_dst
-                        idx_append = filled_dst.clamp(max=C_dst - 1)
-
-                        idx_evict = torch.argmin(epi.prio[:B], dim=1)
-                        tgt = torch.where(is_full, idx_evict, idx_append)
-
-                        b_idx = torch.arange(B, device=epi.keys.device, dtype=torch.long)
-                        b_sel = b_idx[mask]
-                        tgt_sel = tgt[mask]
-
-                        k_t = k_src[:B, t]
-                        ks_t = ks_src[:B, t]
-                        v_t = v_src[:B, t]
-                        p_t = pr_src[:B, t]
-                        r_t = rw_src[:B, t]
-                        ra_t = rw_abs_src[:B, t]
-                        s_t = src_src[:B, t]
-
-                        epi.keys[b_sel, tgt_sel].copy_(k_t[mask])
-                        epi.state_keys[b_sel, tgt_sel].copy_(ks_t[mask])
-                        epi.vals[b_sel, tgt_sel].copy_(v_t[mask])
-                        epi.prio[b_sel, tgt_sel].copy_(p_t[mask])
-                        epi.rew[b_sel, tgt_sel].copy_(r_t[mask])
-                        epi.rew_abs[b_sel, tgt_sel].copy_(ra_t[mask])
-                        epi.source[b_sel, tgt_sel].copy_(s_t[mask])
-
-                        epi.touch[b_sel, tgt_sel].fill_(1)
-                        epi.step[b_sel, tgt_sel].copy_(epi.global_step[:B][mask])
-
-                        filled_new = (filled_dst + (~is_full).long()).clamp(max=C_dst)
-                        epi.filled[:B].copy_(torch.where(mask, filled_new, filled_dst))
+            filled_new = filled_dst + (~is_full).long()
+            epi.filled[:B].copy_(torch.where(mask, filled_new, filled_dst))
 
 
-        if ("sym_mem_P_keys" in state) and ("sym_mem_P_vals" in state):
-            sym = self.sym_mem
-            Pk = state["sym_mem_P_keys"].to(device=sym.P_keys.device, dtype=sym.P_keys.dtype) # [C, K]
-            Pv = state["sym_mem_P_vals"].to(device=sym.P_vals.device, dtype=sym.P_vals.dtype) # [C, K]
-            pr = state["sym_mem_prio"].to(device=sym.prio.device, dtype=sym.prio.dtype).view(-1)
-            src = state["sym_mem_source"].to(device=sym.source.device, dtype=torch.int8).view(-1)
-            filled_sym = state["sym_mem_filled"]
-            n = int(filled_sym.item())
-            n = max(0, min(n, Pk.size(0), Pv.size(0), pr.numel(), src.numel()))
+        sym = self.sym_mem
+        Pk = state["sym_mem_P_keys"].to(device=sym.P_keys.device, dtype=sym.P_keys.dtype) # [C, K]
+        Pv = state["sym_mem_P_vals"].to(device=sym.P_vals.device, dtype=sym.P_vals.dtype) # [C, K]
+        pr = state["sym_mem_prio"].to(device=sym.prio.device, dtype=sym.prio.dtype)
+        src = state["sym_mem_source"].to(device=sym.source.device, dtype=torch.int8)
+        n = int(state["sym_mem_filled"].item())
+        if n < 0 or n > C_sym:
+            raise ValueError("sym_mem_filled is outside the source symbolic-memory capacity")
 
-            for i in range(n):
-                sym.Store(
-                    key=Pk[i],
-                    value=Pv[i],
-                    score=float(pr[i].item()),
-                    source=int(src[i].item()),)
+        for i in range(n):
+            sym.Store(
+                key=Pk[i],
+                value=Pv[i],
+                score=float(pr[i].item()),
+                source=int(src[i].item()),)
 
         self.pending.clear()
         self.memory_version.add_(1)
 
     @torch.no_grad()
-    def ImportState(
+    def _ImportCurrentState(
         self,
         state: Dict[str, torch.Tensor],
         *,
-        importGws: bool = True,
-        importLtm: bool = True,
-        importSym: bool = True,) -> None:
+        includeDurable: bool,) -> None:
+        expected_fields = (
+            self.FULL_MEMORY_STATE_FIELDS
+            if includeDurable
+            else self.TRANSIENT_MEMORY_STATE_FIELDS)
+        if type(state) is not dict or tuple(state) != expected_fields:
+            raise TypeError("memory-state fields do not match the current schema")
+        if not all(torch.is_tensor(value) for value in state.values()):
+            raise TypeError("every memory-state field must be a tensor")
+
         dev = self.device
         dtype = self.dtype
 
-        B = None
-        state_batch_first_only = bool(
-            ("batch_first_only" in state)
-            and isinstance(state["batch_first_only"], torch.Tensor)
-            and bool(state["batch_first_only"].detach().view(-1)[0].item()))
-        for k in ("h_state", "memory_keys", "memory_values", "memory_importance", "time_step", "memory_filled"):
-            if k in state and isinstance(state[k], torch.Tensor):
-                t = state[k]
-                if t.dim() >= 1:
-                    B = int(t.size(0))
-                    break
-        if B is None:
-            B = int(self.h_state.size(0))
-        if state_batch_first_only:
-            B = int(self.h_state.size(0))
-
+        if state["h_state"].dim() == 0:
+            raise ValueError("memory-state h_state must have a batch dimension")
+        B = int(state["h_state"].size(0))
         self.EnsureB(B, device=dev, dtype=dtype)
 
-        if importGws:
-            self.gws.EnsureB(B, device=dev, dtype=dtype)
-        if importLtm:
+        self.gws.EnsureB(B, device=dev, dtype=dtype)
+        if includeDurable:
             self.ltm.semantic.EnsureB(B, device=dev, dtype=dtype)
             self.ltm.episodic.EnsureB(B, device=dev, dtype=dtype)
 
-        def as_B_vec(x: torch.Tensor, *, to_long: bool) -> torch.Tensor:
-            x = x.to(device=dev)
-            x = x.long() if to_long else x.to(dtype=dtype)
-            if x.dim() == 0:
-                x = x.view(1).expand(B)
-            elif x.dim() == 1 and x.numel() == 1 and B > 1:
-                x = x.expand(B)
-            return x
+        targets = [
+            ("last_compress_step", self.last_compress_step),
+            ("h_state", self.h_state),
+            ("fast_weights", self.fast_weights),
+            ("ns_prev_P_post", self.ns_prev_P_post),
+            ("ns_penalty_vec", self.ns_penalty_vec),
+            ("gws_global_step", self.gws.global_step),
+            ("gws_keys", self.gws.keys),
+            ("gws_vals", self.gws.vals),
+            ("gws_priority", self.gws.priority),
+            ("gws_ttl", self.gws.ttl),
+            ("gws_last_step", self.gws.last_step),
+            ("gws_source", self.gws.source),]
 
-        def copy_batch(dst: torch.Tensor, src: torch.Tensor, *, float_cast: bool = True):
-            if not isinstance(src, torch.Tensor):
-                return
-            src = src.to(device=dst.device)
-            if float_cast and dst.dtype.is_floating_point:
-                src = src.to(dtype=dst.dtype)
-
-            if src.dim() == dst.dim() - 1:
-                src = src.unsqueeze(0).expand(dst.size(0), *src.shape)
-            elif src.dim() == dst.dim() and src.size(0) == 1 and dst.size(0) > 1:
-                src = src.expand(dst.size(0), *src.shape[1:])
-
-            if src.dim() != dst.dim():
-                return 
-
-            dst.zero_()
-
-            slices_dst, slices_src = [], []
-            for d in range(dst.dim()):
-                n = min(dst.size(d), src.size(d))
-                slices_dst.append(slice(0, n))
-                slices_src.append(slice(0, n))
-            dst[tuple(slices_dst)].copy_(src[tuple(slices_src)])
-
-        if "time_step" in state:
-            self.time_step.copy_(as_B_vec(state["time_step"], to_long=True))
-
-        if "memory_filled" in state:
-            mf = as_B_vec(state["memory_filled"], to_long=True).clamp(min=0, max=int(self.memory_size))
-            self.memory_filled.copy_(mf)
-
-        if "last_compress_step" in state:
-            self.last_compress_step.copy_(as_B_vec(state["last_compress_step"], to_long=True))
-
-        if "h_state" in state:
-            copy_batch(self.h_state, state["h_state"], float_cast=True)
-
-        if "fast_weights" in state:
-            copy_batch(self.fast_weights, state["fast_weights"], float_cast=True)
-
-        if "memory_keys" in state:
-            copy_batch(self.memory_keys, state["memory_keys"], float_cast=True)
-        if "memory_values" in state:
-            copy_batch(self.memory_values, state["memory_values"], float_cast=True)
-        if "memory_importance" in state:
-            copy_batch(self.memory_importance, state["memory_importance"], float_cast=True)
-        if "memory_steps" in state:
-            copy_batch(self.memory_steps, state["memory_steps"].long(), float_cast=False)
-        if "memory_emotion" in state:
-            copy_batch(self.memory_emotion, state["memory_emotion"], float_cast=True)
-        if "memory_source" in state:
-            copy_batch(self.memory_source, state["memory_source"].to(torch.int8), float_cast=False)
-        if "memory_reward_abs" in state:
-            copy_batch(self.memory_reward_abs, state["memory_reward_abs"], float_cast=True)
-        if "memory_version" in state and isinstance(state["memory_version"], torch.Tensor):
-            self.memory_version.copy_(state["memory_version"].to(self.memory_version.device).long().view(()))
-
-        if importGws:
-            if "gws_global_step" in state:
-                self.gws.global_step.copy_(as_B_vec(state["gws_global_step"], to_long=True))
-
-            if "gws_keys" in state:
-                copy_batch(self.gws.keys, state["gws_keys"], float_cast=True)
-            if "gws_vals" in state:
-                copy_batch(self.gws.vals, state["gws_vals"], float_cast=True)
-            if "gws_priority" in state:
-                copy_batch(self.gws.priority, state["gws_priority"], float_cast=True)
-            if "gws_ttl" in state:
-                copy_batch(self.gws.ttl, state["gws_ttl"].long(), float_cast=False)
-            if "gws_last_step" in state:
-                copy_batch(self.gws.last_step, state["gws_last_step"].long(), float_cast=False)
-
-            if "gws_source" in state:
-                copy_batch(self.gws.source, state["gws_source"].to(torch.int8), float_cast=False)
-
-        if importLtm:
+        if includeDurable:
             sem = self.ltm.semantic
             epi = self.ltm.episodic
 
-            if "ltm_sem_global_step" in state:
-                sem.global_step.copy_(as_B_vec(state["ltm_sem_global_step"], to_long=True))
-            if "ltm_epi_global_step" in state:
-                epi.global_step.copy_(as_B_vec(state["ltm_epi_global_step"], to_long=True))
+            targets.extend([
+                ("time_step", self.time_step),
+                ("memory_filled", self.memory_filled),
+                ("memory_version", self.memory_version),
+                ("memory_keys", self.memory_keys),
+                ("memory_values", self.memory_values),
+                ("memory_importance", self.memory_importance),
+                ("memory_steps", self.memory_steps),
+                ("memory_emotion", self.memory_emotion),
+                ("memory_source", self.memory_source),
+                ("memory_reward_abs", self.memory_reward_abs),
+                ("ltm_sem_global_step", sem.global_step),
+                ("ltm_sem_keys", sem.keys),
+                ("ltm_sem_vals", sem.vals),
+                ("ltm_sem_prio", sem.prio),
+                ("ltm_sem_touch", sem.touch),
+                ("ltm_sem_step", sem.step),
+                ("ltm_sem_filled", sem.filled),
+                ("ltm_sem_source", sem.source),
+                ("ltm_epi_global_step", epi.global_step),
+                ("ltm_epi_keys", epi.keys),
+                ("ltm_epi_state_keys", epi.state_keys),
+                ("ltm_epi_vals", epi.vals),
+                ("ltm_epi_prio", epi.prio),
+                ("ltm_epi_rew", epi.rew),
+                ("ltm_epi_rew_abs", epi.rew_abs),
+                ("ltm_epi_step", epi.step),
+                ("ltm_epi_touch", epi.touch),
+                ("ltm_epi_filled", epi.filled),
+                ("ltm_epi_source", epi.source),])
 
-            if "ltm_sem_keys" in state:
-                copy_batch(sem.keys, state["ltm_sem_keys"], float_cast=True)
-            if "ltm_sem_vals" in state:
-                copy_batch(sem.vals, state["ltm_sem_vals"], float_cast=True)
-            if "ltm_sem_prio" in state:
-                copy_batch(sem.prio, state["ltm_sem_prio"], float_cast=True)
-            if "ltm_sem_touch" in state:
-                copy_batch(sem.touch, state["ltm_sem_touch"].long(), float_cast=False)
-            if "ltm_sem_step" in state:
-                copy_batch(sem.step, state["ltm_sem_step"].long(), float_cast=False)
-            if "ltm_sem_filled" in state:
-                sem.filled.copy_(as_B_vec(state["ltm_sem_filled"], to_long=True).clamp(min=0, max=int(sem.capacity)))
-            if "ltm_sem_source" in state:
-                copy_batch(sem.source, state["ltm_sem_source"].to(torch.int8), float_cast=False)
+        if includeDurable:
+            targets.extend([
+                ("sym_mem_global_step", self.sym_mem.global_step),
+                ("sym_mem_P_keys", self.sym_mem.P_keys),
+                ("sym_mem_P_vals", self.sym_mem.P_vals),
+                ("sym_mem_prio", self.sym_mem.prio),
+                ("sym_mem_step", self.sym_mem.step),
+                ("sym_mem_touch", self.sym_mem.touch),
+                ("sym_mem_filled", self.sym_mem.filled),
+                ("sym_mem_source", self.sym_mem.source),])
 
-            if "ltm_epi_keys" in state:
-                copy_batch(epi.keys, state["ltm_epi_keys"], float_cast=True)
-            if "ltm_epi_state_keys" in state:
-                copy_batch(epi.state_keys, state["ltm_epi_state_keys"], float_cast=True)
-            elif "ltm_epi_keys" in state:
-                copy_batch(epi.state_keys, state["ltm_epi_keys"], float_cast=True)
-            if "ltm_epi_vals" in state:
-                copy_batch(epi.vals, state["ltm_epi_vals"], float_cast=True)
-            if "ltm_epi_prio" in state:
-                copy_batch(epi.prio, state["ltm_epi_prio"], float_cast=True)
-            if "ltm_epi_rew" in state:
-                copy_batch(epi.rew, state["ltm_epi_rew"], float_cast=True)
-            if "ltm_epi_rew_abs" in state:
-                copy_batch(epi.rew_abs, state["ltm_epi_rew_abs"], float_cast=True)
-            elif "ltm_epi_rew" in state:
-                copy_batch(epi.rew_abs, state["ltm_epi_rew"].abs(), float_cast=True)
-            if "ltm_epi_step" in state:
-                copy_batch(epi.step, state["ltm_epi_step"].long(), float_cast=False)
-            if "ltm_epi_touch" in state:
-                copy_batch(epi.touch, state["ltm_epi_touch"].long(), float_cast=False)
-            if "ltm_epi_filled" in state:
-                epi.filled.copy_(as_B_vec(state["ltm_epi_filled"], to_long=True).clamp(min=0, max=int(epi.capacity)))
-            if "ltm_epi_source" in state:
-                copy_batch(epi.source, state["ltm_epi_source"].to(torch.int8), float_cast=False)
-
-        if importSym:
-            if "sym_mem_global_step" in state:
-                self.sym_mem.global_step.copy_(
-                    state["sym_mem_global_step"].to(self.sym_mem.global_step.device).long().view(()))
-
-            if "sym_mem_P_keys" in state:
-                self.sym_mem.P_keys.zero_()
-                src = state["sym_mem_P_keys"].to(self.sym_mem.P_keys.device).float()
-                n = min(self.sym_mem.P_keys.size(0), src.size(0))
-                self.sym_mem.P_keys[:n].copy_(src[:n])
-
-            if "sym_mem_P_vals" in state:
-                self.sym_mem.P_vals.zero_()
-                src = state["sym_mem_P_vals"].to(self.sym_mem.P_vals.device).float()
-                n = min(self.sym_mem.P_vals.size(0), src.size(0))
-                self.sym_mem.P_vals[:n].copy_(src[:n])
-
-            if "sym_mem_prio" in state:
-                self.sym_mem.prio.zero_()
-                src = state["sym_mem_prio"].to(self.sym_mem.prio.device).float()
-                n = min(self.sym_mem.prio.size(0), src.size(0))
-                self.sym_mem.prio[:n].copy_(src[:n])
-
-            if "sym_mem_step" in state:
-                self.sym_mem.step.zero_()
-                src = state["sym_mem_step"].to(self.sym_mem.step.device).long()
-                n = min(self.sym_mem.step.size(0), src.size(0))
-                self.sym_mem.step[:n].copy_(src[:n])
-
-            if "sym_mem_touch" in state:
-                self.sym_mem.touch.zero_()
-                src = state["sym_mem_touch"].to(self.sym_mem.touch.device).long()
-                n = min(self.sym_mem.touch.size(0), src.size(0))
-                self.sym_mem.touch[:n].copy_(src[:n])
-
-            if "sym_mem_source" in state:
-                self.sym_mem.source.zero_()
-                src = state["sym_mem_source"].to(self.sym_mem.source.device).to(torch.int8)
-                n = min(self.sym_mem.source.size(0), src.size(0))
-                self.sym_mem.source[:n].copy_(src[:n])
-
-            if "sym_mem_filled" in state:
-                filled = state["sym_mem_filled"].to(self.sym_mem.filled.device).long()
-                if filled.dim() != 0:
-                    filled = filled.view(-1)[0]
-                filled = filled.clamp(min=0, max=int(self.sym_mem.capacity))
-                self.sym_mem.filled.copy_(filled.view(()))
-
-        if "ns_prev_P_post" in state and isinstance(state["ns_prev_P_post"], torch.Tensor):
-            copy_batch(self.ns_prev_P_post, state["ns_prev_P_post"], float_cast=True)
-        if "ns_penalty_vec" in state and isinstance(state["ns_penalty_vec"], torch.Tensor):
-            copy_batch(self.ns_penalty_vec, state["ns_penalty_vec"], float_cast=True)
+        for field, dst in targets:
+            src = state[field]
+            if src.shape != dst.shape:
+                raise ValueError(
+                    f"memory-state field {field!r} has shape {tuple(src.shape)}, "
+                    f"expected {tuple(dst.shape)}")
+        for field, dst in targets:
+            dst.copy_(state[field].to(device=dst.device, dtype=dst.dtype))
 
         self.ResetInternalLoss()
         self.pending.clear()
+
+    @torch.no_grad()
+    def ImportState(self, state: Dict[str, torch.Tensor]) -> None:
+        self._ImportCurrentState(state, includeDurable=True)
 
 
     @torch.no_grad()
@@ -3946,6 +4140,10 @@ class TestMemoryMTool:
             for k in ("gws", "kv", "ltm_sem", "ltm_epi", "sym"):
                 got = bank[k][0, :, 0]
                 assert torch.allclose(got, expected), f"{k} export not latest-first: got {got.tolist()}"
+                valid = bank[f"{k}_valid"]
+                assert valid.dtype == torch.bool
+                assert valid.shape == bank[k].shape[:2]
+                assert bool(valid.all().item())
 
             print("ExportMemoryBank latest-first-order test passed.")
             return True
@@ -3956,79 +4154,186 @@ class TestMemoryMTool:
             print(f"ExportMemoryBank latest-first-order test error: {e}")
             return False
 
-    def TestBatchFirstSaveLoadReplicates(self):
+    def TestExportMemoryBankMixedRowValidity(self):
         try:
-            cfg = dict(
+            cfg = self.FilterKwargs(MemoryExtractor, dict(
+                inputDim=16,
+                ssmStateDim=16,
+                memoryDim=8,
+                memorySize=4,
+                symSize=8,
+                ltmSize=4,
+                nsK=4,
+                outputDim=8,
+                gwsSlots=2,
+                gwsTtl=4,
+                compressEvery=100,
+                emotionDim=4,))
+            mem = MemoryExtractor(**cfg).to(self.device).eval()
+            mem.EnsureB(2, device=self.device, dtype=mem.dtype)
+            mem.ResetAll()
+
+            with torch.no_grad():
+                mem.memory_filled.copy_(torch.tensor([2, 1], device=self.device))
+                mem.memory_importance[:, :2] = torch.tensor(
+                    [[2.0, 1.0], [2.0, 0.0]],
+                    device=self.device,
+                    dtype=mem.dtype)
+                mem.memory_steps[:, :2] = torch.tensor(
+                    [[2, 1], [2, 0]],
+                    device=self.device)
+
+            bank = mem.ExportMemoryBank(topk=2, includeMeta=False)
+            assert bank is not None
+            assert bank["kv_valid"].dtype == torch.bool
+            assert bank["kv_valid"].tolist() == [[True, True], [True, False]]
+
+            print("ExportMemoryBank mixed-row validity test passed.")
+            return True
+        except AssertionError as e:
+            print(f"ExportMemoryBank mixed-row validity test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"ExportMemoryBank mixed-row validity test error: {e}")
+            return False
+
+    def TestDurableStatePreservesBatchLanes(self):
+        path = self.StatePath("memory_durable_batch_test.pth")
+        try:
+            cfg = self.FilterKwargs(MemoryExtractor, dict(
                 inputDim=16, ssmStateDim=16, memoryDim=8, memorySize=6,
                 symSize=8, ltmSize=6, nsK=4, outputDim=8,
-                gwsSlots=3, gwsTtl=4, compressEvery=100, emotionDim=4)
-            cfg = self.FilterKwargs(MemoryExtractor, cfg)
+                gwsSlots=3, gwsTtl=4, compressEvery=100, emotionDim=4))
 
             mem = MemoryExtractor(**cfg).to(self.device).eval()
             mem.EnsureB(3, device=self.device, dtype=torch.float32)
             mem.ltm.semantic.EnsureB(3, device=self.device, dtype=torch.float32)
             mem.ltm.episodic.EnsureB(3, device=self.device, dtype=torch.float32)
+            mem.gws.EnsureB(3, device=self.device, dtype=torch.float32)
 
             with torch.no_grad():
-                mem.memory_filled[:] = torch.tensor([2, 1, 1], device=self.device, dtype=torch.long)
-                mem.memory_keys.zero_()
-                mem.memory_values.zero_()
-                mem.memory_keys[0, 0, 0] = 11.0
-                mem.memory_keys[1, 0, 0] = 22.0
-                mem.memory_keys[2, 0, 0] = 33.0
-                mem.memory_values[0, 0, 1] = 12.0
-                mem.memory_values[1, 0, 1] = 23.0
-                mem.memory_values[2, 0, 1] = 34.0
+                mem.time_step[:] = torch.tensor([101, 202, 303], device=self.device)
+                mem.memory_filled[:] = torch.tensor([2, 1, 1], device=self.device)
+                mem.memory_keys[:, 0, 0] = torch.tensor([11.0, 22.0, 33.0], device=self.device)
+                mem.memory_values[:, 0, 1] = torch.tensor([12.0, 23.0, 34.0], device=self.device)
                 mem.memory_importance[:, 0] = torch.tensor([0.9, 0.2, 0.1], device=self.device)
-                mem.memory_reward_abs[:, 0] = torch.tensor([3.0, 0.0, 0.0], device=self.device)
+                mem.memory_reward_abs[:, 0] = torch.tensor([3.0, 0.0, 4.0], device=self.device)
 
                 sem = mem.ltm.semantic
-                sem.filled[:] = torch.tensor([1, 1, 1], device=self.device, dtype=torch.long)
-                sem.keys.zero_()
-                sem.keys[0, 0, 0] = 41.0
-                sem.keys[1, 0, 0] = 42.0
-
+                sem.filled.fill_(1)
+                sem.keys[:, 0, 0] = torch.tensor([41.0, 42.0, 43.0], device=self.device)
                 epi = mem.ltm.episodic
-                epi.filled[:] = torch.tensor([1, 1, 1], device=self.device, dtype=torch.long)
-                epi.rew_abs.zero_()
-                epi.rew_abs[0, 0] = 9.0
-                epi.rew_abs[1, 0] = 1.0
+                epi.filled.fill_(1)
+                epi.rew_abs[:, 0] = torch.tensor([9.0, 1.0, 5.0], device=self.device)
 
-                sym = mem.sym_mem
-                sym.filled.fill_(1)
-                sym.P_vals.zero_()
-                sym.P_vals[0, 0] = 77.0
+                mem.sym_mem.filled.fill_(1)
+                mem.sym_mem.P_vals[0, 0] = 77.0
+                mem.usage_bank.success_alpha[0, 0] = 19.0
+                mem.usage_bank.attribute_centroid[0, 0, 0] = 23.0
 
-            path = self.StatePath("memory_batch_first_test.pth")
+                mem.h_state.fill_(31.0)
+                mem.fast_weights.fill_(32.0)
+                mem.gws.keys.fill_(33.0)
+                mem.ns_prev_P_post.fill_(34.0)
+                mem.ns_penalty_vec.fill_(35.0)
+                mem.last_compress_step.fill_(36)
+
+            expected_state = mem.ExportDurableState()
+            transient_state = mem.ExportTransientState()
+            assert set(transient_state).isdisjoint(expected_state)
             mem.SaveState(str(path))
+            payload = torch.load(path, map_location=self.device, weights_only=True)
+            assert set(payload) == {"artifact_type", "schema_version", "batch_size", "state"}
+            assert payload["batch_size"] == 3
+            assert set(payload["state"]) == set(MemoryExtractor.DURABLE_MEMORY_STATE_FIELDS)
+            assert "state_dict" not in payload
+            assert "h_state" not in payload["state"]
+            assert "gws_keys" not in payload["state"]
 
             mem2 = MemoryExtractor(**cfg).to(self.device).eval()
-            mem2.EnsureB(4, device=self.device, dtype=torch.float32)
+            with torch.no_grad():
+                mem2.A_full.fill_(0.314159)
             mem2.LoadState(str(path))
+
+            restored_state = mem2.ExportDurableState()
+            for name in MemoryExtractor.DURABLE_MEMORY_STATE_FIELDS:
+                assert torch.equal(restored_state[name], expected_state[name]), name
+            assert mem2.memory_keys[:, 0, 0].tolist() == [11.0, 22.0, 33.0]
+            assert mem2.ltm.semantic.keys[:, 0, 0].tolist() == [41.0, 42.0, 43.0]
+            assert mem2.ltm.episodic.rew_abs[:, 0].tolist() == [9.0, 1.0, 5.0]
+            assert torch.count_nonzero(mem2.h_state).item() == 0
+            assert torch.count_nonzero(mem2.fast_weights).item() == 0
+            assert torch.count_nonzero(mem2.gws.keys).item() == 0
+            assert torch.count_nonzero(mem2.ns_prev_P_post).item() == 0
+            assert torch.count_nonzero(mem2.ns_penalty_vec).item() == 0
+            assert torch.equal(mem2.last_compress_step, mem2.time_step)
+            assert torch.all(mem2.A_full == mem2.A_full.new_tensor(0.314159))
+
+            mem2.ImportTransientState(transient_state)
+            restored_transient = mem2.ExportTransientState()
+            for name in MemoryExtractor.TRANSIENT_MEMORY_STATE_FIELDS:
+                assert torch.equal(restored_transient[name], transient_state[name]), name
+
+            print("Durable-memory full-batch save/load test passed.")
+            return True
+        except AssertionError as e:
+            print(f"Durable-memory full-batch test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"Durable-memory full-batch test error: {e}")
+            return False
+        finally:
             try:
                 path.unlink()
             except OSError:
                 pass
 
-            assert int(mem2.memory_keys.size(0)) == 4
-            assert torch.all(mem2.memory_filled == 2), f"filled not replicated: {mem2.memory_filled.tolist()}"
-            for b in range(4):
-                self.AssertClose(mem2.memory_keys[b, 0], mem.memory_keys[0, 0], msg=f"kv key row{b}")
-                self.AssertClose(mem2.memory_values[b, 0], mem.memory_values[0, 0], msg=f"kv value row{b}")
-                assert float(mem2.memory_reward_abs[b, 0].item()) == 3.0
-                assert float(mem2.ltm.semantic.keys[b, 0, 0].item()) == 41.0
-                assert float(mem2.ltm.episodic.rew_abs[b, 0].item()) == 9.0
-            assert int(mem2.sym_mem.filled.item()) == 1
-            assert float(mem2.sym_mem.P_vals[0, 0].item()) == 77.0
+    def TestDurableStateRejectsNonCurrentSchema(self):
+        legacy_path = self.StatePath("memory_legacy_schema_test.pth")
+        incomplete_path = self.StatePath("memory_incomplete_schema_test.pth")
+        try:
+            cfg = self.FilterKwargs(MemoryExtractor, dict(
+                inputDim=16, ssmStateDim=16, memoryDim=8, memorySize=6,
+                symSize=8, ltmSize=6, nsK=4, outputDim=8,
+                gwsSlots=3, gwsTtl=4, compressEvery=100, emotionDim=4))
+            mem = MemoryExtractor(**cfg).to(self.device).eval()
 
-            print("Batch-first save/load replication test passed.")
+            torch.save({"state_dict": mem.state_dict()}, legacy_path)
+            legacy_rejected = False
+            try:
+                mem.LoadState(str(legacy_path))
+            except (TypeError, ValueError):
+                legacy_rejected = True
+            assert legacy_rejected, "legacy state_dict artifact was accepted"
+
+            state = mem.ExportDurableState()
+            del state["usage_attribute_centroid"]
+            torch.save({
+                "artifact_type": MemoryExtractor.DURABLE_MEMORY_ARTIFACT_TYPE,
+                "schema_version": MemoryExtractor.DURABLE_MEMORY_SCHEMA_VERSION,
+                "batch_size": 1,
+                "state": state,}, incomplete_path)
+            incomplete_rejected = False
+            try:
+                mem.LoadState(str(incomplete_path))
+            except (TypeError, ValueError):
+                incomplete_rejected = True
+            assert incomplete_rejected, "incomplete durable-memory state was accepted"
+
+            print("Durable-memory strict-schema rejection test passed.")
             return True
         except AssertionError as e:
-            print(f"Batch-first save/load replication test failed: {e}")
+            print(f"Durable-memory strict-schema rejection test failed: {e}")
             return False
         except Exception as e:
-            print(f"Batch-first save/load replication test error: {e}")
+            print(f"Durable-memory strict-schema rejection test error: {e}")
             return False
+        finally:
+            for path in (legacy_path, incomplete_path):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
 
     def TestGlobalWorkspaceSharedBatch(self):
         try:
@@ -4152,7 +4457,7 @@ class TestMemoryMTool:
             bank = mem.ExportMemoryBank(topk=3, totalBudget=5, includeMeta=True)
             assert bank is not None
             for key in ("gws", "kv", "ltm_sem", "ltm_epi", "sym"):
-                assert key in bank, f"missing legacy bank key: {key}"
+                assert key in bank, f"missing memory bank key: {key}"
                 assert int(bank[key].size(1)) <= 1, f"{key} budget not applied: {bank[key].shape}"
             assert "meta" in bank
             for key in ("gws", "kv", "ltm_sem", "ltm_epi", "sym"):
@@ -4733,7 +5038,7 @@ class TestMemoryMTool:
             cfg = self.FilterKwargs(MemoryExtractor, cfg)
             mem1 = MemoryExtractor(**cfg).to(self.device).eval()
 
-            B = 1
+            B = 3
             x = torch.randn(B, cfg.get("inputDim", 32), device=self.device)
             td = torch.randn(B, device=self.device)
             rwd = torch.randn(B, device=self.device)
@@ -4744,13 +5049,57 @@ class TestMemoryMTool:
 
             mem1.pending.clear()
             state = mem1.ExportState()
+            assert tuple(state["h_state"].shape[:1]) == (B,)
+            assert tuple(state["memory_keys"].shape[:1]) == (B,)
+
+            missing_state = dict(state)
+            del missing_state["ltm_epi_state_keys"]
+            strict_import_rejected = False
+            try:
+                mem1.ImportState(missing_state)
+            except TypeError:
+                strict_import_rejected = True
+            strict_merge_rejected = False
+            try:
+                mem1.MergeMemoryState(missing_state)
+            except TypeError:
+                strict_merge_rejected = True
+
+            invalid_shape_state = dict(state)
+            invalid_shape_state["gws_keys"] = state["gws_keys"][..., :-1]
+            invalid_shape_rejected = False
+            try:
+                mem1.ImportState(invalid_shape_state)
+            except ValueError:
+                invalid_shape_rejected = True
+
+            mixed_dtype_state = {
+                name: (
+                    value.to(torch.float64)
+                    if value.dtype.is_floating_point
+                    else value.to(torch.int32)
+                    if value.dtype in (torch.int64, torch.int8)
+                    else value)
+                for name, value in state.items()}
 
             mem2 = MemoryExtractor(**cfg).to(self.device).eval()
+            mem2.EnsureB(B, device=self.device, dtype=mem1.dtype)
+            mem2.gws.EnsureB(B, device=self.device, dtype=mem1.dtype)
+            mem2.ltm.semantic.EnsureB(B, device=self.device, dtype=mem1.dtype)
+            mem2.ltm.episodic.EnsureB(B, device=self.device, dtype=mem1.dtype)
             mem2.load_state_dict(mem1.state_dict(), strict=True)
             mem2.ltm.episodic.touch.zero_()
-            mem2.ImportState(state, importGws=True, importLtm=True, importSym=True)
+            mem2.ImportState(mixed_dtype_state)
 
             self.AssertClose(mem1.ltm.episodic.touch.float(), mem2.ltm.episodic.touch.float(), msg="Episodic touch ImportState")
+            assert strict_import_rejected
+            assert strict_merge_rejected
+            assert invalid_shape_rejected
+            assert mem2.memory_keys.dtype == mem1.memory_keys.dtype
+            assert mem2.memory_steps.dtype == mem1.memory_steps.dtype
+            assert mem2.memory_source.dtype == mem1.memory_source.dtype
+            assert mem2.sym_mem.P_keys.dtype == mem1.sym_mem.P_keys.dtype
+            assert mem2.sym_mem.step.dtype == mem1.sym_mem.step.dtype
 
             torch.manual_seed(5678)
             y1 = self.CallMemForward(mem1, x, tdError=td, reward=rwd, emotion=emotion)
@@ -4765,6 +5114,114 @@ class TestMemoryMTool:
             return False
         except Exception as e:
             print(f"Export/Import round-trip test error: {e}")
+            return False
+
+    def TestMergeStateCrossCapacityAndMalformedReject(self):
+        try:
+            common = dict(
+                inputDim=8,
+                ssmStateDim=8,
+                memoryDim=8,
+                nsK=4,
+                outputDim=8,
+                gwsTtl=4,
+                compressEvery=10_000,
+                emotionDim=4,)
+            src = MemoryExtractor(**self.FilterKwargs(MemoryExtractor, dict(
+                **common,
+                memorySize=4,
+                symSize=4,
+                ltmSize=4,
+                gwsSlots=3,))).to(self.device).eval()
+            dst = MemoryExtractor(**self.FilterKwargs(MemoryExtractor, dict(
+                **common,
+                memorySize=2,
+                symSize=2,
+                ltmSize=2,
+                gwsSlots=2,))).to(self.device).eval()
+
+            B_src, B_dst = 2, 3
+            src.EnsureB(B_src, device=self.device, dtype=src.dtype)
+            src.gws.EnsureB(B_src, device=self.device, dtype=src.dtype)
+            src.ltm.semantic.EnsureB(B_src, device=self.device, dtype=src.dtype)
+            src.ltm.episodic.EnsureB(B_src, device=self.device, dtype=src.dtype)
+            dst.EnsureB(B_dst, device=self.device, dtype=dst.dtype)
+            dst.gws.EnsureB(B_dst, device=self.device, dtype=dst.dtype)
+            dst.ltm.semantic.EnsureB(B_dst, device=self.device, dtype=dst.dtype)
+            dst.ltm.episodic.EnsureB(B_dst, device=self.device, dtype=dst.dtype)
+
+            with torch.no_grad():
+                src.memory_filled.copy_(torch.tensor([3, 1], device=self.device))
+                src.ltm.semantic.filled.copy_(torch.tensor([3, 1], device=self.device))
+                src.ltm.episodic.filled.copy_(torch.tensor([3, 1], device=self.device))
+                for t in range(3):
+                    value = float(t + 1)
+                    src.memory_keys[0, t, 0] = value
+                    src.memory_values[0, t, 0] = value
+                    src.memory_importance[0, t] = value
+                    src.memory_steps[0, t] = t + 1
+                    src.ltm.semantic.keys[0, t, 0] = value
+                    src.ltm.semantic.vals[0, t, 0] = value
+                    src.ltm.semantic.prio[0, t] = value
+                    src.ltm.episodic.keys[0, t, 0] = value
+                    src.ltm.episodic.state_keys[0, t, 0] = value + 10.0
+                    src.ltm.episodic.vals[0, t, 0] = value
+                    src.ltm.episodic.prio[0, t] = value
+                    src.ltm.episodic.rew[0, t] = value
+                    src.ltm.episodic.rew_abs[0, t] = value
+                    src.sym_mem.P_keys[t, t % src.sym_mem.K] = 1.0
+                    src.sym_mem.P_vals[t, 0] = value
+                    src.sym_mem.prio[t] = value
+                src.sym_mem.filled.fill_(3)
+                src.memory_keys[1, 0, 0] = 9.0
+                src.memory_values[1, 0, 0] = 9.0
+                src.memory_importance[1, 0] = 9.0
+                src.ltm.semantic.keys[1, 0, 0] = 9.0
+                src.ltm.semantic.vals[1, 0, 0] = 9.0
+                src.ltm.semantic.prio[1, 0] = 9.0
+                src.ltm.episodic.keys[1, 0, 0] = 9.0
+                src.ltm.episodic.state_keys[1, 0, 0] = 19.0
+                src.ltm.episodic.vals[1, 0, 0] = 9.0
+                src.ltm.episodic.prio[1, 0] = 9.0
+                src.gws.keys[:, :, 0] = 7.0
+                src.gws.vals[:, :, 0] = 8.0
+                src.gws.priority.fill_(1.0)
+                src.gws.ttl.fill_(2)
+
+            state = src.ExportState()
+            dst.MergeMemoryState(state, mergeGws=True)
+            assert dst.memory_filled.tolist() == [2, 1, 0], dst.memory_filled.tolist()
+            assert set(dst.memory_values[0, :2, 0].tolist()) == {2.0, 3.0}, dst.memory_values[0, :2, 0].tolist()
+            assert dst.memory_values[1, 0, 0].item() == 9.0, dst.memory_values[1, 0, 0].item()
+            assert dst.ltm.semantic.filled.tolist() == [2, 1, 0], dst.ltm.semantic.filled.tolist()
+            assert dst.ltm.episodic.filled.tolist() == [2, 1, 0], dst.ltm.episodic.filled.tolist()
+            assert int(dst.sym_mem.filled.item()) == 2, int(dst.sym_mem.filled.item())
+            assert bool((dst.gws.vals[:2, :2, 0] == 8.0).all().item()), dst.gws.vals[:2, :2, 0]
+
+            malformed_feature = dict(state)
+            malformed_feature["memory_values"] = state["memory_values"][..., :-1]
+            feature_rejected = False
+            try:
+                dst.MergeMemoryState(malformed_feature)
+            except ValueError:
+                feature_rejected = True
+
+            malformed_symbol = dict(state)
+            malformed_symbol["sym_mem_P_keys"] = state["sym_mem_P_keys"].unsqueeze(0)
+            symbol_rejected = False
+            try:
+                dst.MergeMemoryState(malformed_symbol)
+            except ValueError:
+                symbol_rejected = True
+            assert feature_rejected and symbol_rejected
+
+            print("MergeState cross-capacity and malformed-state test passed.")
+            return True
+        except AssertionError as e:
+            print(f"MergeState cross-capacity test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"MergeState cross-capacity test error: {e}")
             return False
 
     def TestAutoCompress(self):
@@ -4862,6 +5319,82 @@ class TestMemoryMTool:
             print(f"MemoryExtractor Reset/SoftReset test error: {e}")
             return False
 
+    def TestPartialEpisodeResetPreservesSharedState(self):
+        try:
+            cfg = dict(
+                inputDim=16, ssmStateDim=16, memoryDim=16, memorySize=8,
+                symSize=8, ltmSize=8, nsK=4,
+                outputDim=16, gwsSlots=4, gwsTtl=6,
+                compressEvery=10_000, emotionDim=8)
+            mem = MemoryExtractor(
+                **self.FilterKwargs(MemoryExtractor, cfg)).to(self.device).eval()
+            mem.EnsureB(2, device=self.device, dtype=mem.dtype)
+            mem.gws.EnsureB(2, device=self.device, dtype=mem.dtype)
+            with torch.no_grad():
+                mem.h_state.fill_(1.0)
+                mem.fast_weights.fill_(1.0)
+                mem.ns_prev_P_post.fill_(1.0)
+                mem.ns_penalty_vec.fill_(1.0)
+                mem.gws.keys[0, 0, 0] = 5.0
+                mem.gws.priority[0, 0] = 1.0
+                mem.gws.ttl[0, 0] = 5
+            key = torch.zeros(2, mem.memory_dim, device=self.device, dtype=mem.dtype)
+            value = torch.zeros_like(key)
+            key[:, 0] = torch.tensor([1.0, 2.0], device=self.device)
+            value[:, 0] = torch.tensor([3.0, 4.0], device=self.device)
+            pending_write = (
+                "kv",
+                (
+                    key,
+                    value,
+                    torch.ones(2, device=self.device, dtype=mem.dtype),
+                    torch.zeros(2, mem.emotion_dim, device=self.device, dtype=mem.dtype),
+                    torch.zeros(2, device=self.device, dtype=mem.dtype),
+                    torch.zeros(2, device=self.device, dtype=torch.int8),))
+            mem.pending = [pending_write]
+
+            mem.ResetEpisodeState(torch.tensor(
+                [True, False], device=self.device))
+            partial_ok = (
+                torch.count_nonzero(mem.h_state[0]).item() == 0
+                and torch.count_nonzero(mem.h_state[1]).item() > 0
+                and torch.count_nonzero(mem.fast_weights[0]).item() == 0
+                and torch.count_nonzero(mem.fast_weights[1]).item() > 0
+                and float(mem.gws.keys[0, 0, 0].item()) == 5.0
+                and float(mem.gws.priority[0, 0].item()) == 1.0
+                and mem.memory_filled.tolist() == [1, 1]
+                and not mem.pending)
+
+            mem.pending = [pending_write]
+            mem.ResetEpisodeState(torch.tensor(
+                [True, True], device=self.device))
+            full_ok = (
+                torch.count_nonzero(mem.gws.keys).item() == 0
+                and torch.count_nonzero(mem.gws.priority).item() == 0
+                and mem.memory_filled.tolist() == [2, 2]
+                and not mem.pending)
+            dtype_rejected = False
+            try:
+                mem.ResetEpisodeState(torch.ones(
+                    2, device=self.device, dtype=mem.dtype))
+            except TypeError:
+                dtype_rejected = True
+            device_rejected = False
+            try:
+                mem.ResetEpisodeState(torch.ones(
+                    2, device="meta", dtype=torch.bool))
+            except ValueError:
+                device_rejected = True
+            assert partial_ok and full_ok and dtype_rejected and device_rejected
+            print("MemoryExtractor partial episode reset test passed.")
+            return True
+        except AssertionError as e:
+            print(f"MemoryExtractor partial episode reset test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"MemoryExtractor partial episode reset test error: {e}")
+            return False
+
     def TrainStepSmoke(self):
         try:
             cfg = dict(
@@ -4944,10 +5477,15 @@ class TestMemoryMTool:
         cfg = self.FilterKwargs(MemoryExtractor, cfg)
 
         mem2 = MemoryExtractor(**cfg).to(device).eval()
+        with torch.no_grad():
+            source_parameters = dict(mem.named_parameters())
+            for name, parameter in mem2.named_parameters():
+                parameter.copy_(source_parameters[name])
 
         tmp_path = self.StatePath("memory_state_probe.pth")
         mem.SaveState(str(tmp_path))
         mem2.LoadState(str(tmp_path))
+        mem.ImportDurableState(mem.ExportDurableState())
         try:
             tmp_path.unlink()
         except OSError:
@@ -5035,7 +5573,17 @@ class TestMemoryMTool:
 
             out = self.CallMemForward(mem, x2, tdError=td2, reward=rwd2, emotion=emotion2)
             base = F.mse_loss(out, target)
-            total = self.AttachAllInternalLosses(mem, base)
+            usage = mem.usage_bank.SlotReadout(
+                torch.randn(
+                    B, 3, ModuleDim.PstIdDim,
+                    device=self.device),
+                torch.randn(
+                    B, 3, ModuleDim.PstAttrDim,
+                    device=self.device),
+                torch.rand(B, 3, device=self.device))
+            total = self.AttachAllInternalLosses(
+                mem,
+                base + 0.01 * usage.square().mean())
 
             opt.zero_grad(set_to_none=True)
             total.backward()
@@ -5065,6 +5613,54 @@ class TestMemoryMTool:
             print(f"All-trainable-params grad test error: {e}")
             return False
         
+    def TestSymbolicViolationBackprop(self):
+        try:
+            cfg = self.FilterKwargs(MemoryExtractor, dict(
+                inputDim=16,
+                ssmStateDim=16,
+                memoryDim=8,
+                memorySize=4,
+                symSize=4,
+                ltmSize=4,
+                nsK=4,
+                outputDim=8,
+                gwsSlots=2,
+                gwsTtl=2,
+                compressEvery=100,
+                emotionDim=4,))
+            mem = MemoryExtractor(**cfg).to(self.device).train()
+            proposition = torch.full(
+                (3, mem.ns_K),
+                0.8,
+                device=self.device,
+                requires_grad=True)
+            previous = torch.zeros_like(proposition)
+
+            mem.ResetInternalLoss()
+            violation = mem.NsRules(proposition, previous)
+            internal_loss = mem.GetInternalLoss()
+            proposition_grad = torch.autograd.grad(
+                internal_loss,
+                proposition,
+                retain_graph=True)[0]
+
+            _, auxiliary = mem.sym_rules(proposition, previous)
+            expected = mem.ns_lambda * (violation.mean() + auxiliary)
+            ok = bool(
+                float(violation.detach().mean().item()) > 0.0
+                and torch.isfinite(internal_loss).item()
+                and float(proposition_grad.detach().abs().sum().item()) > 0.0
+                and torch.allclose(
+                    internal_loss,
+                    expected,
+                    atol=1e-7,
+                    rtol=1e-6))
+            print(f"SymbolicViolationBackprop {'pass' if ok else 'fail'}")
+            return ok
+        except Exception as e:
+            print(f"SymbolicViolationBackprop error: {e}")
+            return False
+
     def TestLossDecreases(self):
         try:
             cfg = dict(
@@ -5152,7 +5748,9 @@ class TestMemoryMTool:
             "EpisodicEvictTouch": self.TestEpisodicEvictionTouchPrefersKeepHighTouch(),
             "EpisodicEvictAbsReward": self.TestEpisodicEvictionAbsRewardForNegative(),
             "ExportMemoryBankLatestFirst": self.TestExportMemoryBankLatestFirstOrder(),
-            "BatchFirstSaveLoadReplicates": self.TestBatchFirstSaveLoadReplicates(),
+            "ExportMemoryBankMixedRowValidity": self.TestExportMemoryBankMixedRowValidity(),
+            "DurableStatePreservesBatchLanes": self.TestDurableStatePreservesBatchLanes(),
+            "DurableStateRejectsNonCurrentSchema": self.TestDurableStateRejectsNonCurrentSchema(),
             "GlobalWorkspaceSharedBatch": self.TestGlobalWorkspaceSharedBatch(),
             "SourceConfidenceOrdering": self.TestSourceConfidenceOrdering(),
             "ExportMemoryBankMetaBudget": self.TestExportMemoryBankMetaBudget(),
@@ -5166,11 +5764,14 @@ class TestMemoryMTool:
             "MemoryExtractorIOShapes": self.TestMemoryExtractorIOShapes(),
             "StateSaveRestore": self.TestStateSaveRestore(),
             "ExportImportRoundTrip": self.TestExportImportStateRoundTrip(),
+            "MergeStateCrossCapacityAndMalformedReject": self.TestMergeStateCrossCapacityAndMalformedReject(),
             "AutoCompress": self.TestAutoCompress(),
             "ResetAndSoftReset": self.TestResetAndSoftReset(),
+            "PartialEpisodeResetPreservesSharedState": self.TestPartialEpisodeResetPreservesSharedState(),
             "TrainStepSmoke": self.TrainStepSmoke(),
             "NumericalStability": self.TestNumericalStability(),
             "AllTrainableParamsHaveGrad": self.TestAllTrainableParamsHaveGrad(),
+            "SymbolicViolationBackprop": self.TestSymbolicViolationBackprop(),
             "LossDecreases": self.TestLossDecreases()}
 
         passed = sum(1 for v in results.values() if v)

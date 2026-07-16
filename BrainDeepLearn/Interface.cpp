@@ -459,11 +459,12 @@ bool BrainDeepLearnInterface::TrainOCRModule(int epochs, int batchSize, double v
     });
 }
 
-bool BrainDeepLearnInterface::DeployModule(int cameraIndex, bool useHebbian, bool usePlanner)
+bool BrainDeepLearnInterface::DeployModule(bool useHebbian, bool usePlanner)
 {
-    return RunPythonAsync([this, cameraIndex, useHebbian, usePlanner]()
+    return RunPythonAsync([this, useHebbian, usePlanner]()
     {
-        (void)CALL_METHOD_RET_BOOL("DeployModule", "ibb", cameraIndex, useHebbian, usePlanner);
+        (void)CALL_METHOD_RET_BOOL(
+            "DeployModule", "bb", useHebbian, usePlanner);
     });
 }
 
@@ -592,16 +593,16 @@ bool BrainDeepLearnInterface::SetParameterReceiver(std::optional<double> reward,
     return ok;
 }
 
-bool BrainDeepLearnInterface::InitAgentHandle()
+bool BrainDeepLearnInterface::InitAgentHandle(bool useHebbian, bool usePlanner)
 {
-    return CALL_METHOD_NOARG("InitAgentHandle");
+    return CALL_METHOD_RET_BOOL(
+            "InitAgentHandle", "bb", useHebbian, usePlanner);
 }
 
 bool BrainDeepLearnInterface::AgentHandleForward(
     StatusValue& result,
     const std::string& sensorPacketJson,
     const std::string& robotStateJson,
-    int cameraIndex,
     std::optional<double> reward,
     std::optional<double> done)
 {
@@ -634,8 +635,7 @@ bool BrainDeepLearnInterface::AgentHandleForward(
     PyObject* response = PyObject_CallMethod(
         pManagerObj,
         "AgentHandleForwardJson",
-        "iOOss",
-        cameraIndex,
+        "OOss",
         rewardObj,
         doneObj,
         sensorPacketJson.c_str(),

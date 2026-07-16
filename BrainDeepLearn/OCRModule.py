@@ -539,12 +539,6 @@ class OCREngineExtractor(nn.Module):
         return {
             "vocab": list(self.idx2Char),
             "blank_index": int(self.blankIndex),
-            "legacy_prefixes": [
-                "backbone.",
-                "dbHead.probConv.",
-                "recognizer.conv",
-                "recognizer.rnn.",
-                "recognizer.fc.",],
             "addon_cfg": {
                 "db_residual": self.dbHead.residual is not None,
                 "rec_residual_rank": (
@@ -846,7 +840,19 @@ class OCREngineExtractor(nn.Module):
         return out_batch
 
 
-    def ResetTemporal(self):
+    def ResetTemporal(self, doneMask: Optional[torch.Tensor] = None):
+        if doneMask is not None:
+            done = doneMask.view(-1).to(dtype=torch.bool, device="cpu")
+            if self._last_batch_size not in (0, done.numel()):
+                raise ValueError("OCR reset mask must match its batch size")
+            if not bool(done.all().item()):
+                for batch_index in done.nonzero(as_tuple=False).flatten().tolist():
+                    self._tracks_by_bi.pop(int(batch_index), None)
+                if self._last_ocr_texts_batch:
+                    for batch_index in done.nonzero(as_tuple=False).flatten().tolist():
+                        if int(batch_index) < len(self._last_ocr_texts_batch):
+                            self._last_ocr_texts_batch[int(batch_index)] = []
+                return
         self._temporal_step = 0
         self._tracks_by_bi.clear()
         self._last_batch_size = 0

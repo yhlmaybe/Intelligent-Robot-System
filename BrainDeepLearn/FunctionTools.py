@@ -95,6 +95,84 @@ class GrowableLoRALinear(nn.Module):
         self.B_list = nn.ParameterList()
         self.alpha = nn.ParameterList()
 
+    @torch.no_grad()
+    def SynchronizeCommittedTopology(
+        self,
+        stateDict: Dict[str, Any],
+        prefix: str,
+        *,
+        authoritative: bool,) -> int:
+        def saved_indices(field: str) -> set[int]:
+            field_prefix = f"{prefix}{field}."
+            return {
+                int(str(key)[len(field_prefix):])
+                for key in stateDict
+                if str(key).startswith(field_prefix)
+                and str(key)[len(field_prefix):].isdigit()}
+
+        a_indices = saved_indices("A_list")
+        b_indices = saved_indices("B_list")
+        alpha_indices = saved_indices("alpha")
+        if not authoritative and not (
+            a_indices or b_indices or alpha_indices
+        ):
+            return 0
+
+        label = prefix[:-1] or self.__class__.__name__
+        expected_indices = set(range(len(a_indices)))
+        if (
+            a_indices != expected_indices
+            or b_indices != expected_indices
+            or alpha_indices != expected_indices
+        ):
+            raise ValueError(
+                f"{label} has inconsistent committed LoRA topology: "
+                f"A={sorted(a_indices)}, B={sorted(b_indices)}, "
+                f"alpha={sorted(alpha_indices)}")
+
+        saved_shapes = []
+        for index in sorted(expected_indices):
+            a_value = stateDict[f"{prefix}A_list.{index}"]
+            b_value = stateDict[f"{prefix}B_list.{index}"]
+            alpha_value = stateDict[f"{prefix}alpha.{index}"]
+            if not all(torch.is_tensor(value) for value in (
+                a_value,
+                b_value,
+                alpha_value,
+            )):
+                raise TypeError(
+                    f"{label} committed LoRA entries must be tensors")
+            rank = int(a_value.size(0)) if a_value.ndim == 2 else -1
+            if (
+                tuple(a_value.shape) != (rank, self.in_f)
+                or tuple(b_value.shape) != (self.out_f, rank)
+                or alpha_value.numel() != 1
+            ):
+                raise ValueError(
+                    f"{label} committed LoRA entry {index} has invalid shapes")
+            saved_shapes.append((rank, tuple(alpha_value.shape)))
+
+        current_shapes = [
+            (int(a_value.size(0)), tuple(alpha_value.shape))
+            for a_value, alpha_value in zip(self.A_list, self.alpha)]
+        if current_shapes == saved_shapes:
+            return 0
+
+        replaced = len(self.A_list)
+        self.A_list = nn.ParameterList()
+        self.B_list = nn.ParameterList()
+        self.alpha = nn.ParameterList()
+        for rank, alpha_shape in saved_shapes:
+            alpha = torch.zeros(
+                alpha_shape,
+                device=self.target.weight.device,
+                dtype=self.target.weight.dtype)
+            self.Grow(
+                rank,
+                init={"scale": alpha},
+                freezeOld=True)
+        return replaced
+
     def _load_from_state_dict(
         self,
         state_dict,
@@ -104,55 +182,13 @@ class GrowableLoRALinear(nn.Module):
         missing_keys,
         unexpected_keys,
         error_msgs,):
-        def saved_indices(name: str):
-            key_prefix = f"{prefix}{name}."
-            return {
-                int(key[len(key_prefix):])
-                for key in state_dict
-                if key.startswith(key_prefix) and key[len(key_prefix):].isdigit()}
-
-        a_indices = saved_indices("A_list")
-        b_indices = saved_indices("B_list")
-        s_indices = saved_indices("alpha")
-        if a_indices or b_indices or s_indices:
-            expected = set(range(len(a_indices)))
-            if a_indices != expected or b_indices != expected or s_indices != expected:
-                error_msgs.append(
-                    f"{prefix[:-1]} has inconsistent dynamic LoRA topology: "
-                    f"A={sorted(a_indices)}, B={sorted(b_indices)}, alpha={sorted(s_indices)}")
-            else:
-                saved_shapes = []
-                for index in sorted(expected):
-                    a_value = state_dict[f"{prefix}A_list.{index}"]
-                    b_value = state_dict[f"{prefix}B_list.{index}"]
-                    s_value = state_dict[f"{prefix}alpha.{index}"]
-                    rank = int(a_value.size(0)) if a_value.dim() == 2 else -1
-                    valid = (
-                        tuple(a_value.shape) == (rank, self.in_f)
-                        and tuple(b_value.shape) == (self.out_f, rank)
-                        and s_value.numel() == 1)
-                    if not valid:
-                        error_msgs.append(
-                            f"{prefix[:-1]} dynamic LoRA entry {index} has invalid shapes: "
-                            f"A={tuple(a_value.shape)}, B={tuple(b_value.shape)}, "
-                            f"alpha={tuple(s_value.shape)}")
-                        saved_shapes = []
-                        break
-                    saved_shapes.append((rank, tuple(s_value.shape)))
-
-                current_shapes = [
-                    (int(a_value.size(0)), tuple(s_value.shape))
-                    for a_value, s_value in zip(self.A_list, self.alpha)]
-                if saved_shapes and current_shapes != saved_shapes:
-                    self.A_list = nn.ParameterList()
-                    self.B_list = nn.ParameterList()
-                    self.alpha = nn.ParameterList()
-                    for rank, scale_shape in saved_shapes:
-                        scale = torch.zeros(
-                            scale_shape,
-                            device=self.target.weight.device,
-                            dtype=self.target.weight.dtype)
-                        self.Grow(rank, init={"scale": scale}, freezeOld=True)
+        try:
+            self.SynchronizeCommittedTopology(
+                state_dict,
+                prefix,
+                authoritative=False)
+        except (TypeError, ValueError) as error:
+            error_msgs.append(str(error))
 
         super()._load_from_state_dict(
             state_dict,
@@ -208,13 +244,7 @@ def SynchronizeGrowableLoRATopologyForFullLoad(
     root: nn.Module,
     stateDict: Dict[str, Any],
     ) -> int:
-    """Make an explicit full-state load authoritative over empty LoRA topology.
-
-    Generic ``load_state_dict(strict=False)`` remains suitable for partial updates and does
-    not remove omitted adapters. Full checkpoint/parameter loaders call this helper first;
-    when a layer's durable target weight is present but no committed LoRA entries are, the
-    incoming state explicitly represents an empty committed topology.
-    """
+    """Make a full model artifact authoritative over committed LoRA topology."""
     cleared = 0
     for module_name, module in root.named_modules():
         if not isinstance(module, GrowableLoRALinear):
@@ -222,18 +252,10 @@ def SynchronizeGrowableLoRATopologyForFullLoad(
         prefix = f"{module_name}." if module_name else ""
         if f"{prefix}target.weight" not in stateDict:
             continue
-        dynamic_prefixes = (
-            f"{prefix}A_list.",
-            f"{prefix}B_list.",
-            f"{prefix}alpha.")
-        if any(str(key).startswith(dynamic_prefixes) for key in stateDict):
-            continue
-        if not (module.A_list or module.B_list or module.alpha):
-            continue
-        cleared += len(module.A_list)
-        module.A_list = nn.ParameterList()
-        module.B_list = nn.ParameterList()
-        module.alpha = nn.ParameterList()
+        cleared += module.SynchronizeCommittedTopology(
+            stateDict,
+            prefix,
+            authoritative=True)
     return cleared
 
 
@@ -689,6 +711,126 @@ class BaseOnlineWrapper(nn.Module):
                         yield p
 
     @torch.no_grad()
+    def ExportCandidateState(self) -> Dict[str, Any]:
+        layers: Dict[str, List[Dict[str, List[torch.Tensor]]]] = {}
+        for name in self.sites:
+            layers[name] = []
+            for layerIdx in range(self.layerCount):
+                slot = self.cand[name][layerIdx]
+                layers[name].append({
+                    key: [parameter.detach().cpu().clone() for parameter in slot[key]]
+                    for key in ("A", "B", "s")})
+
+        grad_ema = None
+        if self.gradEmaBuf is not None:
+            grad_ema = {
+                name: [
+                    {
+                        key: [
+                            None if value is None else value.detach().cpu().clone()
+                            for value in self.gradEmaBuf[name][layerIdx][key]]
+                        for key in ("A", "B")}
+                    for layerIdx in range(self.layerCount)]
+                for name in self.sites}
+        return {
+            "site_names": tuple(self.sites),
+            "layers": layers,
+            "grad_ema": grad_ema,}
+
+    @torch.no_grad()
+    def ImportCandidateState(self, state: Dict[str, Any]) -> None:
+        if type(state) is not dict or set(state) != {"site_names", "layers", "grad_ema"}:
+            raise TypeError("online candidate state fields do not match the current schema")
+        if tuple(state["site_names"]) != tuple(self.sites):
+            raise ValueError("online candidate sites do not match the current wrapper")
+        layers = state["layers"]
+        if type(layers) is not dict or tuple(layers) != tuple(self.sites):
+            raise ValueError("online candidate layer sites do not match the current wrapper")
+
+        self.InitCandidates(0)
+        for name, spec in self.sites.items():
+            site_layers = layers[name]
+            if type(site_layers) is not list or len(site_layers) != self.layerCount:
+                raise ValueError("online candidate layer count does not match the current wrapper")
+            for layerIdx, saved_slot in enumerate(site_layers):
+                if type(saved_slot) is not dict or set(saved_slot) != {"A", "B", "s"}:
+                    raise TypeError("online candidate slot fields do not match the current schema")
+                a_values = saved_slot["A"]
+                b_values = saved_slot["B"]
+                s_values = saved_slot["s"]
+                if not (
+                    type(a_values) is list
+                    and type(b_values) is list
+                    and type(s_values) is list
+                    and len(a_values) == len(b_values) == len(s_values)
+                ):
+                    raise ValueError("online candidate slot lists must have equal lengths")
+                if layerIdx >= spec.nLayers and len(a_values) != 0:
+                    raise ValueError("online candidate state contains an inactive layer")
+                if not all(
+                    torch.is_tensor(value)
+                    for values in (a_values, b_values, s_values)
+                    for value in values
+                ):
+                    raise TypeError("online candidate entries must be tensors")
+                if sum(int(value.size(0)) for value in a_values) > spec.maxRank:
+                    raise ValueError("online candidate state exceeds the site rank limit")
+                target_slot = self.cand[name][layerIdx]
+                for a_value, b_value, s_value in zip(a_values, b_values, s_values):
+                    if (
+                        a_value.dim() != 2
+                        or b_value.dim() != 2
+                        or int(a_value.size(1)) != spec.inDim
+                        or int(b_value.size(0)) != spec.outDim
+                        or int(a_value.size(0)) != int(b_value.size(1))
+                        or a_value.size(0) < 1
+                        or s_value.numel() != 1
+                    ):
+                        raise ValueError("online candidate tensor shapes do not match the site")
+                    for key, value in (("A", a_value), ("B", b_value), ("s", s_value)):
+                        if not value.dtype.is_floating_point or not bool(torch.isfinite(value).all().item()):
+                            raise ValueError("online candidate tensors must be finite floating point")
+                        target_slot[key].append(nn.Parameter(
+                            value.to(device=self.deviceRef, dtype=self.dtypeRef).clone()))
+
+        grad_ema = state["grad_ema"]
+        if grad_ema is None:
+            self.gradEmaBuf = None
+            return
+        if type(grad_ema) is not dict or tuple(grad_ema) != tuple(self.sites):
+            raise ValueError("online candidate gradient EMA sites do not match the wrapper")
+        restored_ema: Dict[str, List[Dict[str, List[Optional[torch.Tensor]]]]] = {}
+        for name in self.sites:
+            saved_layers = grad_ema[name]
+            if type(saved_layers) is not list or len(saved_layers) != self.layerCount:
+                raise ValueError("online candidate gradient EMA layer count is invalid")
+            restored_ema[name] = []
+            for layerIdx, saved_slot in enumerate(saved_layers):
+                if type(saved_slot) is not dict or set(saved_slot) != {"A", "B"}:
+                    raise TypeError("online candidate gradient EMA fields are invalid")
+                restored_slot: Dict[str, List[Optional[torch.Tensor]]] = {}
+                for key in ("A", "B"):
+                    expected_parameters = self.cand[name][layerIdx][key]
+                    saved_values = saved_slot[key]
+                    if type(saved_values) is not list or len(saved_values) != len(expected_parameters):
+                        raise ValueError("online candidate gradient EMA length is invalid")
+                    restored_values: List[Optional[torch.Tensor]] = []
+                    for saved_value, parameter in zip(saved_values, expected_parameters):
+                        if saved_value is None:
+                            restored_values.append(None)
+                            continue
+                        if not torch.is_tensor(saved_value) or tuple(saved_value.shape) != tuple(parameter.shape):
+                            raise ValueError("online candidate gradient EMA shape is invalid")
+                        if not saved_value.dtype.is_floating_point or not bool(torch.isfinite(saved_value).all().item()):
+                            raise ValueError("online candidate gradient EMA must be finite floating point")
+                        restored_values.append(saved_value.to(
+                            device=self.deviceRef,
+                            dtype=self.dtypeRef).clone())
+                    restored_slot[key] = restored_values
+                restored_ema[name].append(restored_slot)
+        self.gradEmaBuf = restored_ema
+
+    @torch.no_grad()
     def AccumulateGrads(self):
         if self.gradEmaBuf is None:
             self.gradEmaBuf = {name: [{"A": [], "B": []} for _ in range(self.layerCount)] for name in self.sites}
@@ -989,6 +1131,51 @@ class _TestOnlineWrapper(BaseOnlineWrapper):
 
 
 class TestFunctionToolsMTool:
+    def TestOnlineCandidateCheckpointRoundTrip(self) -> bool:
+        try:
+            torch.manual_seed(23)
+            source = _TestOnlineWrapper(_TestOnlineBase(), initRankEach=1).train()
+            source_optimizer = torch.optim.Adam(
+                list(source.CandParameters()),
+                lr=0.01)
+            sample = torch.randn(5, 3)
+            source_optimizer.zero_grad(set_to_none=True)
+            source(sample).square().mean().backward()
+            source.Update("accumulategrads")
+            source_optimizer.step()
+
+            base_state = {
+                name: value.detach().clone()
+                for name, value in source.base.state_dict().items()}
+            candidate_state = source.ExportCandidateState()
+            optimizer_state = source_optimizer.state_dict()
+            expected = source(sample).detach()
+
+            restored = _TestOnlineWrapper(_TestOnlineBase(), initRankEach=0).train()
+            restored.base.load_state_dict(base_state, strict=True)
+            restored.ImportCandidateState(candidate_state)
+            restored_optimizer = torch.optim.Adam(
+                list(restored.CandParameters()),
+                lr=0.01)
+            restored_optimizer.load_state_dict(optimizer_state)
+            assert torch.equal(restored(sample), expected)
+
+            source.Update("commit")
+            deployed = source(sample).detach()
+            assert torch.allclose(deployed, expected, atol=1e-7, rtol=1e-6)
+
+            SynchronizeGrowableLoRATopologyForFullLoad(source.base, base_state)
+            source.base.load_state_dict(base_state, strict=True)
+            source.ImportCandidateState(candidate_state)
+            assert torch.equal(source(sample), expected)
+            print("Online candidate checkpoint round-trip test passed.")
+            return True
+        except Exception as e:
+            print(
+                "Online candidate checkpoint round-trip test failed: "
+                f"{type(e).__name__}: {e}")
+            return False
+
     def TestFullStateLoadClearsAbsentCommittedTopology(self) -> bool:
         try:
             torch.manual_seed(19)
@@ -1137,6 +1324,7 @@ class TestFunctionToolsMTool:
 
     def RunAll(self) -> Dict[str, bool]:
         results = {
+            "OnlineCandidateCheckpointRoundTrip": self.TestOnlineCandidateCheckpointRoundTrip(),
             "FullStateLoadClearsAbsentCommittedTopology": self.TestFullStateLoadClearsAbsentCommittedTopology(),
             "GrowableLoRACommitSaveStrictLoad": self.TestGrowableLoRACommitSaveStrictLoad(),
             "OnlineWrapperStrictLoadRestoresBaseTrainability": self.TestOnlineWrapperStrictLoadRestoresBaseTrainability(),

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from FunctionTools import AGICoreModule, BuildReferenceWeights, BuildReferenceScaleContext
 from ModuleMessagerManager import ModuleDim
+from DecisionDecoupler import FlattenActiveDecisionTensor
 
 
 PREDICATES: Tuple[str, ...] = (
@@ -159,6 +160,60 @@ class NeuroSymbolicOutput:
     redispatch_guard_score: torch.Tensor
 
 
+class NeuroSymbolicRobotStateEncoder(AGICoreModule):
+    """Neuro-symbolic private latent; never a shared RobotState input field."""
+
+    def __init__(
+        self,
+        bodyPoseDim: int = (
+            ModuleDim.DecisionBodyEndpointCount
+            * ModuleDim.DecisionEndpointPoseDim),
+        physicalReferenceDim: int = ModuleDim.RobotPhysicalReferenceDim,
+        outDim: int = ModuleDim.PstSlotDim,
+        hidden: int = 256,):
+        super().__init__()
+        in_dim = int(bodyPoseDim) + int(physicalReferenceDim)
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, int(outDim)),
+            nn.LayerNorm(int(outDim)),)
+
+    def forward(
+        self,
+        bodyProprioception: torch.Tensor,
+        robotPhysicalReference: torch.Tensor,) -> torch.Tensor:
+        return self.net(torch.cat([
+            bodyProprioception.flatten(1),
+            robotPhysicalReference], dim=-1))
+
+
+class NeuroSymbolicControlFeedbackEncoder(AGICoreModule):
+    """Private diagnostic state for control failure, correction, and replanning."""
+
+    def __init__(
+        self,
+        outDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        hidden: int = 256,):
+        super().__init__()
+        in_dim = 2 * ModuleDim.DecisionActiveDofCount
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, int(outDim)),
+            nn.LayerNorm(int(outDim)),)
+
+    def forward(
+        self,
+        targetTrackingError: torch.Tensor,
+        plannerTrackingError: torch.Tensor,) -> torch.Tensor:
+        return self.net(torch.cat([
+            FlattenActiveDecisionTensor(targetTrackingError),
+            FlattenActiveDecisionTensor(plannerTrackingError)], dim=-1))
+
+
 class PredicateGrounder(AGICoreModule):
     def __init__(
         self,
@@ -166,18 +221,18 @@ class PredicateGrounder(AGICoreModule):
         goalDim: int = ModuleDim.GoalShortDim,
         worldDim: int = ModuleDim.WorldOutHState + ModuleDim.WorldOutZState + ModuleDim.WorldOutXState,
         decisionDim: int = ModuleDim.DecisionBeliefDim,
-        endpointPoseFeatDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        robotPhysicalStateDim: int = ModuleDim.PstSlotDim,
         poseDim: int = ModuleDim.PstPoseDim,
         hidden: int = 512,):
         super().__init__()
         self.slot_dim = int(slotDim)
-        self.endpoint_pose_feat_dim = int(endpointPoseFeatDim)
+        self.robot_physical_state_dim = int(robotPhysicalStateDim)
         self.pose_dim = int(poseDim)
         self.summary_context_dim = (
             int(goalDim)
             + int(worldDim)
             + int(decisionDim)
-            + self.endpoint_pose_feat_dim
+            + self.robot_physical_state_dim
             + self.pose_dim
             + 6)
 
@@ -186,7 +241,7 @@ class PredicateGrounder(AGICoreModule):
             + int(goalDim)
             + int(worldDim)
             + int(decisionDim)
-            + self.endpoint_pose_feat_dim
+            + self.robot_physical_state_dim
             + self.pose_dim
             + 6)
 
@@ -253,7 +308,7 @@ class PredicateGrounder(AGICoreModule):
 
         slot_input = torch.cat([
             pst["SlotState"],
-            pst["PoseWorld"],
+            pst["PoseCamera"],
             m.unsqueeze(-1),
             observed_weight.unsqueeze(-1),
             memory_weight.unsqueeze(-1),
@@ -293,7 +348,7 @@ class PredicateGrounder(AGICoreModule):
         pst: Dict[str, torch.Tensor],
         referenceSlotIndex: torch.Tensor,
         referenceConfidence: torch.Tensor,) -> torch.Tensor:
-        pose = pst["PoseWorld"]
+        pose = pst["PoseCamera"]
         B = pose.size(0)
         batch_idx = torch.arange(B, device=pose.device)
         return pose[batch_idx, referenceSlotIndex] * referenceConfidence.unsqueeze(-1)
@@ -305,12 +360,12 @@ class PredicateGrounder(AGICoreModule):
         goalEmbed: torch.Tensor,
         worldBelief: torch.Tensor,
         decisionBelief: torch.Tensor,
-        endpointPoseFeat: torch.Tensor,
+        robotPhysicalState: torch.Tensor,
         referenced: torch.Tensor,
         uncertainty: torch.Tensor,
         novelty: torch.Tensor,
         recentFailure: torch.Tensor,
-        intentNovelty: torch.Tensor,
+        referenceUncertainty: torch.Tensor,
         satisfactionProb: torch.Tensor,
         referenceConfidence: torch.Tensor,
         noSlotProb: torch.Tensor,) -> Dict[str, torch.Tensor]:
@@ -321,7 +376,7 @@ class PredicateGrounder(AGICoreModule):
             uncertainty,
             novelty,
             recentFailure,
-            intentNovelty,
+            referenceUncertainty,
             satisfactionProb.view(-1),
             noSlotProb,], dim=-1)
 
@@ -329,7 +384,7 @@ class PredicateGrounder(AGICoreModule):
             goalEmbed,
             worldBelief,
             decisionBelief,
-            endpointPoseFeat,
+            robotPhysicalState,
             ref_pose,
             scalar,], dim=-1)
         reference_context = BuildReferenceScaleContext(
@@ -350,7 +405,7 @@ class PredicateGrounder(AGICoreModule):
             goalEmbed,
             worldBelief,
             decisionBelief,
-            endpointPoseFeat,
+            robotPhysicalState,
             ref_pose,
             scalar,], dim=-1)
 
@@ -989,26 +1044,35 @@ class NeuroSymbolicExtractor(AGICoreModule):
         worldDim: int = ModuleDim.WorldOutHState + ModuleDim.WorldOutZState + ModuleDim.WorldOutXState,
         decisionDim: int = ModuleDim.DecisionBeliefDim,
         poseDim: int = ModuleDim.PstPoseDim,
-        endpointPoseFeatDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        robotPhysicalStateDim: int = ModuleDim.PstSlotDim,
         planDim: int = 256,
         constraintTokenDim: int = 128,
         constraintTokens: int = 8,):
         super().__init__()
         self.pose_dim = int(poseDim)
-        self.endpoint_pose_feat_dim = int(endpointPoseFeatDim)
+        self.robot_physical_state_dim = int(robotPhysicalStateDim)
         self.plan_dim = int(planDim)
         self.constraint_token_dim = int(constraintTokenDim)
         self.constraint_tokens = int(constraintTokens)
+        self.control_feedback_dim = int(
+            ModuleDim.DecisionEndpointPoseFeatDim)
+        self.robot_state_encoder = NeuroSymbolicRobotStateEncoder(
+            outDim=self.robot_physical_state_dim)
+        self.control_feedback_encoder = NeuroSymbolicControlFeedbackEncoder(
+            outDim=self.control_feedback_dim)
 
         self.predicate_grounder = PredicateGrounder(
             slotDim=slotDim,
             goalDim=goalDim,
             worldDim=worldDim,
             decisionDim=decisionDim,
-            endpointPoseFeatDim=self.endpoint_pose_feat_dim,
+            robotPhysicalStateDim=self.robot_physical_state_dim,
             poseDim=self.pose_dim,)
 
-        base_feature_dim = self.predicate_grounder.feature_dim + len(PREDICATES)
+        base_feature_dim = (
+            self.predicate_grounder.feature_dim
+            + len(PREDICATES)
+            + self.control_feedback_dim)
 
         self.operator_library = OperatorLibrary()
 
@@ -1037,29 +1101,42 @@ class NeuroSymbolicExtractor(AGICoreModule):
         self.temporal_symbolic_head = TemporalSymbolicHead(base_feature_dim + ModuleDim.TemporalContextDim)
 
         self.invoke_head = nn.Sequential(
-            nn.LayerNorm(6),
-            nn.Linear(6, 32),
+            nn.LayerNorm(8),
+            nn.Linear(8, 32),
             nn.SiLU(),
             nn.Linear(32, 1),)
 
-        sampler_in = self.plan_dim + self.pose_dim + self.endpoint_pose_feat_dim
+        sampler_in = (
+            self.plan_dim
+            + self.pose_dim
+            + self.robot_physical_state_dim
+            + self.control_feedback_dim)
 
         self.subgoal_feature_head = nn.Sequential(
             nn.LayerNorm(sampler_in),
             nn.Linear(sampler_in, 256),
             nn.SiLU(),
-            nn.Linear(256, self.endpoint_pose_feat_dim),
-            nn.LayerNorm(self.endpoint_pose_feat_dim),)
+            nn.Linear(256, self.robot_physical_state_dim),
+            nn.LayerNorm(self.robot_physical_state_dim),)
 
         self.constraint_head = nn.Sequential(
-            nn.LayerNorm(self.plan_dim + len(PREDICATES) + len(OPERATORS)),
-            nn.Linear(self.plan_dim + len(PREDICATES) + len(OPERATORS), 512),
+            nn.LayerNorm(
+                self.plan_dim
+                + len(PREDICATES)
+                + len(OPERATORS)
+                + self.control_feedback_dim),
+            nn.Linear(
+                self.plan_dim
+                + len(PREDICATES)
+                + len(OPERATORS)
+                + self.control_feedback_dim,
+                512),
             nn.SiLU(),
             nn.Linear(512, self.constraint_tokens * self.constraint_token_dim),)
 
         self.symbolic_mixer = SymbolicFeatureMixer(
             planDim=self.plan_dim,
-            subgoalFeatureDim=self.endpoint_pose_feat_dim,
+            subgoalFeatureDim=self.robot_physical_state_dim,
             constraintTokens=self.constraint_tokens,
             constraintTokenDim=self.constraint_token_dim,
             poseDim=self.pose_dim,)
@@ -1086,6 +1163,29 @@ class NeuroSymbolicExtractor(AGICoreModule):
             "last_operator_prob": self.last_operator_prob.detach().clone(),
             "last_invoke": self.last_invoke.detach().clone(),
             "last_reference_summary": self.last_reference_summary.detach().clone(),}
+
+    @staticmethod
+    def InvocationNeedTarget(
+        uncertainty: torch.Tensor,
+        novelty: torch.Tensor,
+        recentFailure: torch.Tensor,
+        referenceUncertainty: torch.Tensor,
+        satisfactionProb: torch.Tensor,
+        noSlotProb: torch.Tensor,) -> torch.Tensor:
+        """Semantic teacher for the learned symbolic-invocation intensity.
+
+        Invocation is warranted by epistemic/risk/failure/binding evidence.  A
+        satisfied goal attenuates that need but cannot erase a hard failure or
+        missing reference.  The target is detached by the loss owner.
+        """
+        need = torch.stack([
+            uncertainty,
+            novelty,
+            recentFailure,
+            referenceUncertainty,
+            noSlotProb,
+        ], dim=-1).amax(dim=-1)
+        return need * (1.0 - 0.5 * satisfactionProb.view(-1))
 
     @torch.no_grad()
     def ImportPlanState(self, state: Dict[str, torch.Tensor]):
@@ -1229,12 +1329,14 @@ class NeuroSymbolicExtractor(AGICoreModule):
         self,
         planLatent: torch.Tensor,
         referencedPose: torch.Tensor,
-        endpointPoseFeat: torch.Tensor,) -> torch.Tensor:
+        robotPhysicalState: torch.Tensor,
+        controlFeedbackState: torch.Tensor,) -> torch.Tensor:
         ref_pose = referencedPose
         return self.subgoal_feature_head(torch.cat([
             planLatent,
             ref_pose,
-            endpointPoseFeat,], dim=-1))
+            robotPhysicalState,
+            controlFeedbackState,], dim=-1))
 
     def forward(
         self,
@@ -1243,22 +1345,31 @@ class NeuroSymbolicExtractor(AGICoreModule):
         goalEmbed: torch.Tensor,
         worldBelief: torch.Tensor,
         decisionBelief: torch.Tensor,
-        endpointPoseFeat: torch.Tensor,
+        bodyProprioception: torch.Tensor,
+        robotPhysicalReference: torch.Tensor,
+        targetTrackingError: torch.Tensor,
+        plannerTrackingError: torch.Tensor,
         uncertainty: torch.Tensor,
         novelty: torch.Tensor,
         recentFailure: torch.Tensor,
-        intentNovelty: torch.Tensor,
+        referenceUncertainty: torch.Tensor,
         satisfactionProb: torch.Tensor,
         referenced: torch.Tensor,
         referenceConfidence: torch.Tensor,
         noSlotProb: torch.Tensor,
         temporalContextFeat: torch.Tensor,
         returnExplain: bool = False,) -> NeuroSymbolicOutput:
+        robot_physical_state = self.robot_state_encoder(
+            bodyProprioception,
+            robotPhysicalReference)
+        control_feedback_state = self.control_feedback_encoder(
+            targetTrackingError,
+            plannerTrackingError)
         scalar = torch.stack([
             uncertainty,
             novelty,
             recentFailure,
-            intentNovelty,
+            referenceUncertainty,
             satisfactionProb.view(-1),
             noSlotProb,], dim=-1)
 
@@ -1268,12 +1379,12 @@ class NeuroSymbolicExtractor(AGICoreModule):
             goalEmbed=goalEmbed,
             worldBelief=worldBelief,
             decisionBelief=decisionBelief,
-            endpointPoseFeat=endpointPoseFeat,
+            robotPhysicalState=robot_physical_state,
             referenced=referenced,
             uncertainty=uncertainty,
             novelty=novelty,
             recentFailure=recentFailure,
-            intentNovelty=intentNovelty,
+            referenceUncertainty=referenceUncertainty,
             satisfactionProb=satisfactionProb,
             referenceConfidence=referenceConfidence,
             noSlotProb=noSlotProb,)
@@ -1290,20 +1401,28 @@ class NeuroSymbolicExtractor(AGICoreModule):
 
         predicate_prob = torch.sigmoid(predicate_logits)
 
-        ranker_in = torch.cat([grounded["features"], predicate_prob], dim=-1)
+        ranker_in = torch.cat([
+            grounded["features"],
+            predicate_prob,
+            control_feedback_state], dim=-1)
         ranked = self.plan_ranker(ranker_in, temporalContextFeat)
 
         goal_predicate_need = torch.sigmoid(self.goal_predicate_head(ranker_in))
         operator_scores = self.operator_library.Scores(predicate_prob, goal_predicate_need)
         operator_logits = ranked["operator_logits"] + operator_scores["symbolic_score"]
         plan_latent = self.plan_ranker.RefinePlan(ranked["plan_seed"], operator_logits)
-        subgoal_feature = self.BuildSubgoalFeature(plan_latent, grounded["referenced_pose"], endpointPoseFeat)
+        subgoal_feature = self.BuildSubgoalFeature(
+            plan_latent,
+            grounded["referenced_pose"],
+            robot_physical_state,
+            control_feedback_state)
         operator_prob = F.softmax(operator_logits, dim=-1)
 
         constraint_tokens = self.constraint_head(torch.cat([
             plan_latent,
             predicate_prob,
-            operator_prob,], dim=-1)).view(plan_latent.size(0), self.constraint_tokens, self.constraint_token_dim)
+            operator_prob,
+            control_feedback_state,], dim=-1)).view(plan_latent.size(0), self.constraint_tokens, self.constraint_token_dim)
 
         risk_cause_raw_logits = self.failure_explainer(
             ranker_in,
@@ -1321,7 +1440,14 @@ class NeuroSymbolicExtractor(AGICoreModule):
 
         risk_cause_logits = risk_cause_raw_logits + failure_gate_logits.unsqueeze(-1)
 
-        invoke_mask = torch.sigmoid(self.invoke_head(scalar)).squeeze(-1)
+        control_error_evidence = torch.stack([
+            FlattenActiveDecisionTensor(
+                targetTrackingError).square().mean(dim=-1).sqrt(),
+            FlattenActiveDecisionTensor(
+                plannerTrackingError).square().mean(dim=-1).sqrt()], dim=-1)
+        invoke_mask = torch.sigmoid(self.invoke_head(torch.cat([
+            scalar,
+            control_error_evidence], dim=-1))).squeeze(-1)
 
         temporal_out = self.temporal_symbolic_head(
             torch.cat([ranker_in, temporalContextFeat], dim=-1),
@@ -1451,11 +1577,20 @@ class TestNeuroSymbolicMTool:
             "SlotPresence": mask.clone(),
             "ObservedSlotMask": mask.clone(),
             "SlotState": torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
-            "PoseCamera": pose,
-            "PoseWorld": pose,}
+            "PoseCamera": pose,}
 
     def MakeExtractorInputs(self, B: int = 2, K: int = 4) -> Dict[str, torch.Tensor]:
         referenced = F.softmax(torch.randn(B, K, device=self.device), dim=-1)
+        body_proprioception = torch.zeros(
+            B,
+            ModuleDim.DecisionBodyEndpointCount,
+            ModuleDim.DecisionEndpointPoseDim,
+            device=self.device)
+        body_proprioception[..., 6] = 1.0
+        robot_physical_reference = torch.zeros(
+            B, ModuleDim.RobotPhysicalReferenceDim, device=self.device)
+        robot_physical_reference[:, 3] = 1.0
+        robot_physical_reference[:, 6] = -1.0
         return {
             "pst": self.MakePst(B=B, K=K),
             "observedPst": self.MakePst(B=B, K=K),
@@ -1465,11 +1600,22 @@ class TestNeuroSymbolicMTool:
                 ModuleDim.WorldOutHState + ModuleDim.WorldOutZState + ModuleDim.WorldOutXState,
                 device=self.device),
             "decisionBelief": torch.randn(B, ModuleDim.DecisionBeliefDim, device=self.device),
-            "endpointPoseFeat": torch.randn(B, ModuleDim.DecisionEndpointPoseFeatDim, device=self.device),
+            "bodyProprioception": body_proprioception,
+            "robotPhysicalReference": robot_physical_reference,
+            "targetTrackingError": torch.zeros(
+                B,
+                ModuleDim.DecisionEndpointCount,
+                ModuleDim.DecisionActionDim,
+                device=self.device),
+            "plannerTrackingError": torch.zeros(
+                B,
+                ModuleDim.DecisionEndpointCount,
+                ModuleDim.DecisionActionDim,
+                device=self.device),
             "uncertainty": torch.rand(B, device=self.device),
             "novelty": torch.rand(B, device=self.device),
             "recentFailure": torch.rand(B, device=self.device),
-            "intentNovelty": torch.rand(B, device=self.device),
+            "referenceUncertainty": torch.rand(B, device=self.device),
             "satisfactionProb": torch.rand(B, device=self.device),
             "referenced": referenced,
             "referenceConfidence": torch.rand(B, device=self.device),
@@ -1487,12 +1633,13 @@ class TestNeuroSymbolicMTool:
                 goalEmbed=inputs["goalEmbed"],
                 worldBelief=inputs["worldBelief"],
                 decisionBelief=inputs["decisionBelief"],
-                endpointPoseFeat=inputs["endpointPoseFeat"],
+                robotPhysicalState=torch.randn(
+                    B, ModuleDim.PstSlotDim, device=self.device),
                 referenced=inputs["referenced"],
                 uncertainty=inputs["uncertainty"],
                 novelty=inputs["novelty"],
                 recentFailure=inputs["recentFailure"],
-                intentNovelty=inputs["intentNovelty"],
+                referenceUncertainty=inputs["referenceUncertainty"],
                 satisfactionProb=inputs["satisfactionProb"],
                 referenceConfidence=inputs["referenceConfidence"],
                 noSlotProb=inputs["noSlotProb"],)
@@ -1686,6 +1833,176 @@ class TestNeuroSymbolicMTool:
             print(f"NeuroSymbolicExtractor forward/explain switch test failed: {type(e).__name__}: {e}")
             return False
 
+    def TestNeuroSymbolicPhysicalAndControlInputSeparation(self) -> bool:
+        try:
+            from inspect import signature
+
+            B, K = 2, 4
+            model = NeuroSymbolicExtractor().to(self.device).eval()
+            inputs = self.MakeExtractorInputs(B=B, K=K)
+            forward_parameters = set(signature(model.forward).parameters)
+            assert {
+                "bodyProprioception",
+                "robotPhysicalReference",
+                "targetTrackingError",
+                "plannerTrackingError",} <= forward_parameters
+            assert forward_parameters.isdisjoint({
+                "robotPhysicalState",
+                "robotSelfState",
+                "endpointControlEncoding",})
+
+            physical_captures = []
+            control_captures = []
+
+            def CaptureRobotPhysicalInput(module, args, output):
+                del module
+                assert len(args) == 2
+                physical_captures.append(
+                    (args[0], args[1], output.detach().clone()))
+
+            def CaptureControlFeedbackInput(module, args, output):
+                del module
+                assert len(args) == 2
+                control_captures.append(
+                    (args[0], args[1], output.detach().clone()))
+
+            physical_handle = model.robot_state_encoder.register_forward_hook(
+                CaptureRobotPhysicalInput)
+            control_handle = model.control_feedback_encoder.register_forward_hook(
+                CaptureControlFeedbackInput)
+
+            def EncodeThroughExtractor(**overrides):
+                run_inputs = {**inputs, **overrides}
+                physical_captures.clear()
+                control_captures.clear()
+                model.ResetPlan(torch.ones(
+                    B, device=self.device, dtype=torch.bool))
+                with torch.no_grad():
+                    output = model(**run_inputs, returnExplain=False)
+                assert len(physical_captures) == 1
+                assert len(control_captures) == 1
+                body_input, reference_input, physical_latent = physical_captures[0]
+                target_input, planner_input, control_latent = control_captures[0]
+                assert body_input is run_inputs["bodyProprioception"]
+                assert reference_input is run_inputs["robotPhysicalReference"]
+                assert target_input is run_inputs["targetTrackingError"]
+                assert planner_input is run_inputs["plannerTrackingError"]
+                return physical_latent, control_latent, output
+
+            try:
+                baseline_physical, baseline_control, baseline_output = (
+                    EncodeThroughExtractor())
+                external_physical, external_control, _ = EncodeThroughExtractor(
+                    worldBelief=torch.full_like(inputs["worldBelief"], -53.0),
+                    decisionBelief=torch.full_like(inputs["decisionBelief"], 37.0))
+
+                changed_body = inputs["bodyProprioception"].clone()
+                changed_body[:, 0, 0] = 0.25
+                body_physical, _, _ = EncodeThroughExtractor(
+                    bodyProprioception=changed_body)
+
+                changed_rotation = inputs["robotPhysicalReference"].clone()
+                sqrt_half = 2.0 ** -0.5
+                changed_rotation[:, 0:4] = changed_rotation.new_tensor([
+                    0.0, 0.0, sqrt_half, sqrt_half])
+                rotation_physical, _, _ = EncodeThroughExtractor(
+                    robotPhysicalReference=changed_rotation)
+
+                changed_gravity = inputs["robotPhysicalReference"].clone()
+                changed_gravity[:, 4:7] = changed_gravity.new_tensor([
+                    0.0, -1.0, 0.0])
+                gravity_physical, _, _ = EncodeThroughExtractor(
+                    robotPhysicalReference=changed_gravity)
+
+                changed_target = inputs["targetTrackingError"].clone()
+                changed_target[:, 0, 0] = 2.0
+                target_physical, target_control, target_output = (
+                    EncodeThroughExtractor(targetTrackingError=changed_target))
+
+                changed_planner = inputs["plannerTrackingError"].clone()
+                changed_planner[:, 1, 3] = -3.0
+                planner_physical, planner_control, planner_output = (
+                    EncodeThroughExtractor(plannerTrackingError=changed_planner))
+
+                inactive_camera_error = inputs["targetTrackingError"].clone()
+                inactive_camera_error[
+                    :, ModuleDim.DecisionCameraEndpointIndex, 0] = 5.0
+                inactive_physical, inactive_control, inactive_output = (
+                    EncodeThroughExtractor(
+                        targetTrackingError=inactive_camera_error))
+
+                camera_rotation_error = inputs["targetTrackingError"].clone()
+                camera_rotation_error[
+                    :, ModuleDim.DecisionCameraEndpointIndex, 5] = 2.0
+                camera_physical, camera_control, camera_output = (
+                    EncodeThroughExtractor(
+                        targetTrackingError=camera_rotation_error))
+            finally:
+                physical_handle.remove()
+                control_handle.remove()
+
+            assert tuple(baseline_physical.shape) == (B, ModuleDim.PstSlotDim)
+            assert tuple(baseline_control.shape) == (
+                B, ModuleDim.DecisionEndpointPoseFeatDim)
+            self.AssertFinite(
+                baseline_physical,
+                "NeuroSymbolic private robot physical latent")
+            self.AssertFinite(
+                baseline_control,
+                "NeuroSymbolic private control feedback latent")
+            assert torch.equal(baseline_physical, external_physical)
+            assert torch.equal(baseline_control, external_control)
+            for latent in (
+                    body_physical,
+                    rotation_physical,
+                    gravity_physical):
+                per_sample_delta = (
+                    latent - baseline_physical).abs().amax(dim=-1)
+                assert bool((per_sample_delta > 1e-7).all().item())
+            assert torch.equal(baseline_physical, target_physical)
+            assert torch.equal(baseline_physical, planner_physical)
+            assert torch.equal(baseline_physical, inactive_physical)
+            assert torch.equal(baseline_physical, camera_physical)
+            assert torch.equal(baseline_control, inactive_control)
+            assert torch.equal(
+                baseline_output.subgoal_feature,
+                inactive_output.subgoal_feature)
+            assert torch.equal(
+                baseline_output.constraint_tokens,
+                inactive_output.constraint_tokens)
+            assert torch.equal(
+                baseline_output.invoke_mask,
+                inactive_output.invoke_mask)
+            for latent in (
+                    target_control,
+                    planner_control,
+                    camera_control):
+                per_sample_delta = (
+                    latent - baseline_control).abs().amax(dim=-1)
+                assert bool((per_sample_delta > 1e-7).all().item())
+
+            for changed_output in (
+                    target_output,
+                    planner_output,
+                    camera_output):
+                output_delta = (
+                    (changed_output.subgoal_feature - baseline_output.subgoal_feature)
+                    .abs().sum()
+                    + (changed_output.constraint_tokens - baseline_output.constraint_tokens)
+                    .abs().sum()
+                    + (changed_output.invoke_mask - baseline_output.invoke_mask)
+                    .abs().sum())
+                assert bool((output_delta > 1e-7).item())
+
+            print(
+                "NeuroSymbolicExtractor physical/control input separation test passed.")
+            return True
+        except Exception as e:
+            print(
+                "NeuroSymbolicExtractor physical/control input separation "
+                f"test failed: {type(e).__name__}: {e}")
+            return False
+
     def TestNeuroSymbolicContinuityAndReset(self) -> bool:
         try:
             B, K = 2, 4
@@ -1768,6 +2085,38 @@ class TestNeuroSymbolicMTool:
             print(f"NeuroSymbolicExtractor strict plan state schema test failed: {type(e).__name__}: {e}")
             return False
 
+    def TestInvocationNeedCalibration(self) -> bool:
+        try:
+            zeros = torch.zeros(2, device=self.device)
+            low = NeuroSymbolicExtractor.InvocationNeedTarget(
+                zeros, zeros, zeros, zeros, torch.ones_like(zeros), zeros)
+            failure = NeuroSymbolicExtractor.InvocationNeedTarget(
+                zeros, zeros, torch.ones_like(zeros), zeros,
+                torch.ones_like(zeros), zeros)
+            missing_reference = NeuroSymbolicExtractor.InvocationNeedTarget(
+                zeros, zeros, zeros, zeros, zeros, torch.ones_like(zeros))
+
+            invoke = torch.tensor(
+                [0.2, 0.8], device=self.device, requires_grad=True)
+            target = torch.tensor([1.0, 0.0], device=self.device)
+            F.binary_cross_entropy(invoke, target).backward()
+            ok = bool(
+                torch.count_nonzero(low).item() == 0
+                and torch.allclose(
+                    failure,
+                    torch.full_like(failure, 0.5))
+                and torch.allclose(
+                    missing_reference,
+                    torch.ones_like(missing_reference))
+                and invoke.grad is not None
+                and invoke.grad[0] < 0.0
+                and invoke.grad[1] > 0.0)
+            print(f"InvocationNeedCalibration {'passed' if ok else 'failed'}.")
+            return ok
+        except Exception as e:
+            print(f"InvocationNeedCalibration failed: {type(e).__name__}: {e}")
+            return False
+
     def RunAll(self) -> Dict[str, bool]:
         results = {
             "PredicateGrounderShapes": self.TestPredicateGrounderShapes(),
@@ -1777,10 +2126,12 @@ class TestNeuroSymbolicMTool:
             "TemporalSymbolicHeadShapes": self.TestTemporalSymbolicHeadShapes(),
             "SymbolicFeatureMixerShapes": self.TestSymbolicFeatureMixerShapes(),
             "NeuroSymbolicExtractorForwardAndExplainSwitch": self.TestNeuroSymbolicExtractorForwardAndExplainSwitch(),
+            "NeuroSymbolicPhysicalAndControlInputSeparation": self.TestNeuroSymbolicPhysicalAndControlInputSeparation(),
             "NeuroSymbolicContinuityAndReset": self.TestNeuroSymbolicContinuityAndReset(),
             "ReferenceDriftRespondsToBindingChange": self.TestReferenceDriftRespondsToBindingChange(),
             "PlanStateExportImportRoundTrip": self.TestPlanStateExportImportRoundTrip(),
             "PlanStateStrictSchema": self.TestPlanStateStrictSchema(),}
+        results["InvocationNeedCalibration"] = self.TestInvocationNeedCalibration()
         passed = sum(1 for value in results.values() if value)
         print(f"\n[NeuroSymbolicModule Tests] {passed}/{len(results)} passed.")
         return results

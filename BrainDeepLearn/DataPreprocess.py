@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -12,6 +13,10 @@ import torch.nn.functional as F
 
 from torch.utils.data import Dataset
 from Config import BasicParameters
+from CoreTypes import (
+    ROBOT_STATE_FIELDS,
+    ValidateOfflineSensorManifest,
+    ValidateRobotStateWirePacket)
 from ModuleMessagerManager import ModuleDim
 
 try:
@@ -78,45 +83,115 @@ def ListJsonFiles(path: Union[str, Path]) -> List[Path]:
 
 
 class OfflineGameDataset(Dataset):
-    def __init__(self, isTest: bool = False) -> None:
+    def __init__(self, *, calibrationId: str, isTest: bool = False) -> None:
+        self.calibration_id = calibrationId
         if isTest:
             p = Path(BasicParameters.DATA_ROOT_PATH_TEST)
+            sensor_manifest_path = Path(
+                BasicParameters.DATA_SENSOR_MANIFEST_PATH_TEST)
             self.imgs = sorted((p / "frames").glob("*.png"))
             self.reward = sorted((p / "reward").glob("*.npy"))
             self.done = sorted((p / "done").glob("*.npy"))
             self.depths = ListDepthFiles(getattr(BasicParameters, "DATA_DEPTH_PATH_TEST", p / "depth"))
             self.depth_valids = ListDepthFiles(getattr(BasicParameters, "DATA_DEPTH_VALID_PATH_TEST", p / "depth_valid"))
             self.texts = sorted((p / "texts").glob("*.txt"))
-            self.actions = sorted((p / "actions").glob("*.npy"))
+            self.robot_states = ListJsonFiles(BasicParameters.DATA_ROBOT_STATE_PATH_TEST)
             self.normals = ListArrayFiles(getattr(BasicParameters, "DATA_NORMAL_PATH_TEST", p / "normal"))
             self.semantic_segmentations = ListArrayFiles(getattr(BasicParameters, "DATA_SEMANTIC_SEGMENTATION_PATH_TEST", p / "semantic_segmentation"))
             self.instance_segmentations = ListArrayFiles(getattr(BasicParameters, "DATA_INSTANCE_SEGMENTATION_PATH_TEST", p / "instance_segmentation"))
             self.synthetic_annotations = ListJsonFiles(getattr(BasicParameters, "DATA_SYNTHETIC_SUPERVISION_PATH_TEST", p / "synthetic_supervision"))
         else:
+            sensor_manifest_path = Path(BasicParameters.DATA_SENSOR_MANIFEST_PATH)
             self.imgs = sorted(Path(BasicParameters.DATA_FRAMES_PATH).glob("*.png"))
             self.reward = sorted(Path(BasicParameters.DATA_REWARD_PATH).glob("*.npy"))
             self.done = sorted(Path(BasicParameters.DATA_DONE_PATH).glob("*.npy"))
             self.depths = ListDepthFiles(BasicParameters.DATA_DEPTH_PATH)
             self.depth_valids = ListDepthFiles(BasicParameters.DATA_DEPTH_VALID_PATH)
             self.texts = sorted(Path(BasicParameters.DATA_TEXTS_PATH).glob("*.txt"))
-            self.actions = sorted(Path(BasicParameters.DATA_ACTIONS_PATH).glob("*.npy"))
+            self.robot_states = ListJsonFiles(BasicParameters.DATA_ROBOT_STATE_PATH)
             self.normals = ListArrayFiles(BasicParameters.DATA_NORMAL_PATH)
             self.semantic_segmentations = ListArrayFiles(BasicParameters.DATA_SEMANTIC_SEGMENTATION_PATH)
             self.instance_segmentations = ListArrayFiles(BasicParameters.DATA_INSTANCE_SEGMENTATION_PATH)
             self.synthetic_annotations = ListJsonFiles(BasicParameters.DATA_SYNTHETIC_SUPERVISION_PATH)
 
-        assert len(self.imgs) == len(self.reward) == len(self.done) == len(self.depths), "frames/reward/done/depth The number of files is inconsistent."
-        if self.depth_valids:
-            assert len(self.depth_valids) == len(self.imgs), "depth_valid The number of files is inconsistent."
+        sensor_manifest = json.loads(
+            sensor_manifest_path.read_text(encoding="utf-8"))
+        ValidateOfflineSensorManifest(sensor_manifest, calibrationId)
+
+        if not (
+            len(self.imgs)
+            == len(self.reward)
+            == len(self.done)
+            == len(self.depths)
+            == len(self.depth_valids)
+            == len(self.robot_states)
+        ):
+            raise ValueError(
+                "frames/reward/done/depth/robot_state counts must match")
+        frame_ids = [path.stem for path in self.imgs]
+        required_streams = {
+            "reward": self.reward,
+            "done": self.done,
+            "depth": self.depths,
+            "depth_valid": self.depth_valids,
+            "robot_state": self.robot_states,}
+        for name, paths in required_streams.items():
+            if [path.stem for path in paths] != frame_ids:
+                raise ValueError(
+                    f"{name} filenames must match frame identifiers exactly")
         if self.texts:
-            assert len(self.texts) == len(self.imgs), "texts The number of files is inconsistent."
-        if self.actions:
-            assert len(self.actions) == len(self.imgs), "actions The number of files is inconsistent."
+            if len(self.texts) != len(self.imgs):
+                raise ValueError("text count must match frames")
+            if [path.stem for path in self.texts] != frame_ids:
+                raise ValueError("text filenames must match frame identifiers exactly")
         if self.synthetic_annotations:
-            assert len(self.synthetic_annotations) == len(self.imgs), "synthetic_supervision The number of files is inconsistent."
-            assert len(self.normals) == len(self.imgs), "normal The number of files is inconsistent."
-            assert len(self.semantic_segmentations) == len(self.imgs), "semantic_segmentation The number of files is inconsistent."
-            assert len(self.instance_segmentations) == len(self.imgs), "instance_segmentation The number of files is inconsistent."
+            if any(
+                len(paths) != len(self.imgs)
+                for paths in (
+                    self.synthetic_annotations,
+                    self.normals,
+                    self.semantic_segmentations,
+                    self.instance_segmentations)
+            ):
+                raise ValueError(
+                    "synthetic supervision stream counts must match frames")
+            for name, paths in {
+                "synthetic_supervision": self.synthetic_annotations,
+                "normal": self.normals,
+                "semantic_segmentation": self.semantic_segmentations,
+                "instance_segmentation": self.instance_segmentations,}.items():
+                if [path.stem for path in paths] != frame_ids:
+                    raise ValueError(
+                        f"{name} filenames must match frame identifiers exactly")
+
+        self.robot_state_payloads: List[Dict[str, Any]] = []
+        stream_id: Optional[str] = None
+        world_frame_id: Optional[str] = None
+        for sequence_index, (frame_id, state_path) in enumerate(zip(
+            frame_ids,
+            self.robot_states)):
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            ValidateRobotStateWirePacket(payload, self.calibration_id)
+            if payload["frame_id"] != frame_id:
+                raise ValueError(
+                    "offline RobotState frame_id must match the RGB-D frame identifier")
+            if payload["sequence_index"] != sequence_index:
+                raise ValueError(
+                    "offline RobotState sequence_index must match dataset order")
+            if stream_id is None:
+                stream_id = payload["stream_id"]
+                world_frame_id = payload["world_frame_id"]
+            elif (
+                payload["stream_id"] != stream_id
+                or payload["world_frame_id"] != world_frame_id
+            ):
+                raise ValueError(
+                    "offline RobotState stream_id and world_frame_id must remain stable")
+            self.robot_state_payloads.append(payload)
+        if stream_id is None or world_frame_id is None:
+            raise ValueError("offline RGB-D/RobotState dataset must not be empty")
+        self.stream_id = stream_id
+        self.world_frame_id = world_frame_id
 
     def __len__(self) -> int:
         return len(self.imgs)
@@ -126,28 +201,35 @@ class OfflineGameDataset(Dataset):
         reward = np.load(self.reward[idx]).astype(np.float32)
         done = np.load(self.done[idx]).astype(np.float32)
         depth = LoadDepthArray(self.depths[idx])
-        if self.depth_valids:
-            depth_valid = LoadDepthArray(self.depth_valids[idx]).astype(bool)
-        else:
-            depth_valid = np.isfinite(depth) & (depth > 0)
+        depth_valid = LoadDepthArray(self.depth_valids[idx])
+        image_size = BasicParameters.IMAGE_SIZE
+        if imgs.dtype != np.uint8 or imgs.shape != (image_size, image_size, 3):
+            raise ValueError(
+                f"offline RGB must be uint8 [{image_size}, {image_size}, 3]")
+        if depth.dtype != np.float32 or depth.shape != (image_size, image_size):
+            raise ValueError(
+                f"offline depth must be float32 metres [{image_size}, {image_size}]")
+        if depth_valid.dtype != np.bool_ or depth_valid.shape != depth.shape:
+            raise ValueError(
+                "offline depth_valid must be a bool mask matching depth")
+        if not np.isfinite(depth).all():
+            raise ValueError("offline depth must contain only finite metre values")
+        if np.any(depth_valid & (depth <= 0.0)):
+            raise ValueError("offline valid depth pixels must be positive")
         ext_text = ""
         if self.texts:
             ext_text = self.texts[idx].read_text(encoding="utf-8").strip()
-        # Per-frame executed endpoint poses [endpoint_count, 7] (xyz + xyzw quaternion);
-        # identity poses until the recording pipeline supplies real actions.
-        if self.actions:
-            action = np.load(self.actions[idx]).astype(np.float32)
-        else:
-            action = np.zeros((ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim), dtype=np.float32)
-            action[:, 6] = 1.0
+        robot_state_payload = self.robot_state_payloads[idx]
+        robot_state = {
+            name: torch.as_tensor(robot_state_payload[name])
+            for name in ROBOT_STATE_FIELDS}
         synthetic_targets: Dict[str, torch.Tensor] = {}
         if self.synthetic_annotations:
             annotation = json.loads(self.synthetic_annotations[idx].read_text(encoding="utf-8"))
             rgb_tensor = DataPreprocessor.ToImageTensor(imgs)
             depth_tensor, depth_valid_tensor = DataPreprocessor.ToDepthTensor(
                 depth,
-                depth_valid,
-                depthScaleMeters=BasicParameters.DATA_DEPTH_SCALE_METERS)
+                depth_valid)
             normal_tensor = DataPreprocessor.ToNormalTensor(LoadDepthArray(self.normals[idx]))
             semantic_segmentation = DataPreprocessor.ToSegmentationTensor(LoadDepthArray(self.semantic_segmentations[idx]))
             instance_segmentation = DataPreprocessor.ToSegmentationTensor(LoadDepthArray(self.instance_segmentations[idx]))
@@ -165,7 +247,7 @@ class OfflineGameDataset(Dataset):
                 attrDim=ModuleDim.PstAttrDim,
                 affordanceDim=ModuleDim.PstAffordanceDim,
                 relationClasses=ModuleDim.PstRelationClasses)
-        return imgs, reward, done, depth, depth_valid, ext_text, action, synthetic_targets
+        return imgs, reward, done, depth, depth_valid, ext_text, robot_state, synthetic_targets
 
 
 class OfflineOCRDataset(Dataset):
@@ -276,6 +358,10 @@ class DataPreprocessor:
     @staticmethod
     def ListDepthFiles(path: Union[str, Path]) -> List[Path]:
         return ListDepthFiles(path)
+
+    @staticmethod
+    def ListJsonFiles(path: Union[str, Path]) -> List[Path]:
+        return ListJsonFiles(path)
 
     @staticmethod
     def ListImageFiles(path: Union[str, Path]) -> List[Path]:
@@ -476,67 +562,31 @@ class DataPreprocessor:
     @staticmethod
     def ToDepthTensor(
         depth: Union[np.ndarray, torch.Tensor],
-        valid: Optional[Union[np.ndarray, torch.Tensor]] = None,
-        *,
-        depthScaleMeters: float = 1.0,) -> Tuple[torch.Tensor, torch.Tensor]:
-        depth_t = torch.as_tensor(depth).float()
+        valid: Union[np.ndarray, torch.Tensor],) -> Tuple[torch.Tensor, torch.Tensor]:
+        depth_t = torch.as_tensor(depth)
         if depth_t.ndim == 2:
             depth_t = depth_t.unsqueeze(0)
         elif depth_t.ndim == 3 and depth_t.shape[-1] == 1:
             depth_t = depth_t.permute(2, 0, 1)
+        if depth_t.dtype != torch.float32:
+            raise TypeError("depth sample must be float32 metres")
         if depth_t.ndim != 3 or depth_t.size(0) != 1:
-            raise ValueError(f"depth sample must have shape [H, W] or [1, H, W], got {tuple(depth_t.shape)}")
-        depth_t = depth_t * float(depthScaleMeters)
-        depth_valid = torch.isfinite(depth_t) & (depth_t > 0.0)
-
-        if valid is not None:
-            valid_t = torch.as_tensor(valid)
-            if valid_t.ndim == 2:
-                valid_t = valid_t.unsqueeze(0)
-            elif valid_t.ndim == 3 and valid_t.shape[-1] == 1:
-                valid_t = valid_t.permute(2, 0, 1)
-            if valid_t.shape != depth_t.shape:
-                raise ValueError(f"depth valid mask must match depth sample shape, got {tuple(valid_t.shape)}")
-            depth_valid = depth_valid & valid_t.bool()
-
-        depth_t = torch.where(depth_valid, depth_t, torch.zeros_like(depth_t))
-        return depth_t, depth_valid
-
-    @staticmethod
-    def ResizeDepth(
-        depthTensor: torch.Tensor,
-        validTensor: torch.Tensor,
-        size: Union[int, Tuple[int, int]],) -> Tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(size, int):
-            dst_size = (int(size), int(size))
-        else:
-            dst_size = (int(size[0]), int(size[1]))
-        valid_float = validTensor.float()
-        inverse = torch.where(validTensor, depthTensor.clamp_min(1e-6).reciprocal(), torch.zeros_like(depthTensor))
-        valid_weight = F.interpolate(valid_float.unsqueeze(0), size=dst_size, mode="area").squeeze(0)
-        inverse_sum = F.interpolate(inverse.unsqueeze(0), size=dst_size, mode="area").squeeze(0)
-        valid = valid_weight > 1e-6
-        resized_inverse = inverse_sum / valid_weight.clamp_min(1e-6)
-        depth = resized_inverse.clamp_min(1e-6).reciprocal()
-        return torch.where(valid, depth, torch.zeros_like(depth)), valid
-
-    @staticmethod
-    def ResizeCameraIntrinsics(
-        cameraIntrinsics: Union[np.ndarray, torch.Tensor],
-        sourceSize: Tuple[int, int],
-        targetSize: Tuple[int, int],
-        *,
-        device: Optional[torch.device] = None,) -> torch.Tensor:
-        intrinsics = torch.as_tensor(cameraIntrinsics).float().clone()
-        src_h, src_w = int(sourceSize[0]), int(sourceSize[1])
-        dst_h, dst_w = int(targetSize[0]), int(targetSize[1])
-        sx = float(dst_w) / float(max(1, src_w))
-        sy = float(dst_h) / float(max(1, src_h))
-        intrinsics[..., 0, 0] *= sx
-        intrinsics[..., 1, 1] *= sy
-        intrinsics[..., 0, 2] *= sx
-        intrinsics[..., 1, 2] *= sy
-        return intrinsics.to(device) if device is not None else intrinsics
+            raise ValueError(
+                f"depth sample must have shape [H, W] or [1, H, W], got "
+                f"{tuple(depth_t.shape)}")
+        valid_t = torch.as_tensor(valid)
+        if valid_t.ndim == 2:
+            valid_t = valid_t.unsqueeze(0)
+        elif valid_t.ndim == 3 and valid_t.shape[-1] == 1:
+            valid_t = valid_t.permute(2, 0, 1)
+        if valid_t.dtype != torch.bool or valid_t.shape != depth_t.shape:
+            raise ValueError(
+                "depth valid mask must be bool and match the depth sample shape")
+        if not bool(torch.isfinite(depth_t).all().item()):
+            raise ValueError("depth sample must contain only finite metre values")
+        if bool((valid_t & (depth_t <= 0.0)).any().item()):
+            raise ValueError("valid depth pixels must be positive")
+        return torch.where(valid_t, depth_t, torch.zeros_like(depth_t)), valid_t
 
     @staticmethod
     def TensorizeSyntheticSupervision(
@@ -555,9 +605,44 @@ class DataPreprocessor:
         attrDim: int = 32,
         affordanceDim: int = 8,
         relationClasses: int = 32,) -> Dict[str, torch.Tensor]:
+        """Tensorize labels under the coordinate contract in the dataset manifest.
+
+        ``motion`` is an SE(3) spatial delta from the previous object state to
+        the current state after camera-egomotion compensation, expressed in the
+        current camera-optical axes (metres plus an XYZW quaternion).
+        """
         dtype = rgb.dtype
         device = rgb.device
         height, width = rgb.shape[-2:]
+        coverage = annotation["coverage"]
+        if type(coverage) is not dict or set(coverage) != {
+            "relations_exhaustive",
+            "contact_events_exhaustive",
+        }:
+            raise ValueError(
+                "synthetic coverage must declare exhaustive relation and contact labels")
+        if (
+            coverage["relations_exhaustive"] is not True
+            or coverage["contact_events_exhaustive"] is not True
+        ):
+            raise ValueError(
+                "relation/contact negatives require exhaustive synthetic annotations")
+        temporal = annotation["temporal"]
+        if type(temporal["kind_valid"]) is not bool or type(
+            temporal["duration_valid"]
+        ) is not bool:
+            raise TypeError("temporal validity fields must be booleans")
+        temporal_kind = int(temporal["kind"])
+        temporal_duration_ms = float(temporal["duration_ms"])
+        temporal_kind_valid = temporal["kind_valid"]
+        temporal_duration_valid = temporal["duration_valid"]
+        if not 0 <= temporal_kind < ModuleDim.TemporalPrimitiveCount:
+            raise ValueError("temporal.kind is outside the temporal primitive vocabulary")
+        if not math.isfinite(temporal_duration_ms):
+            raise ValueError("temporal.duration_ms must be finite")
+        if temporal_duration_valid != (temporal_duration_ms > 0.0):
+            raise ValueError(
+                "temporal.duration_ms must be positive exactly when duration_valid is true")
         nodes: List[Tuple[Dict[str, Any], int]] = []
 
         def flatten(node: Dict[str, Any], parentIndex: int) -> None:
@@ -570,6 +655,9 @@ class DataPreprocessor:
             flatten(obj, -1)
 
         N = int(maxNodes)
+        if N < 1 or len(nodes) > N:
+            raise ValueError(
+                f"synthetic annotation has {len(nodes)} nodes, maxNodes={N}")
         node_valid = torch.zeros(N, device=device, dtype=torch.bool)
         node_id = torch.full((N,), -1, device=device, dtype=torch.long)
         node_level = torch.zeros(N, device=device, dtype=torch.long)
@@ -593,21 +681,61 @@ class DataPreprocessor:
         symbol_type = torch.zeros(N, device=device, dtype=torch.long)
         node_lookup: Dict[int, int] = {}
 
+        def validated_pose(value: Any, *, field: str) -> torch.Tensor:
+            pose = torch.as_tensor(value, device=device, dtype=dtype)
+            if tuple(pose.shape) != (7,) or not bool(torch.isfinite(pose).all().item()):
+                raise ValueError(f"{field} must be a finite 7D pose")
+            if not torch.allclose(
+                pose[3:7].norm(),
+                pose.new_tensor(1.0),
+                rtol=1e-3,
+                atol=1e-3,
+            ):
+                raise ValueError(f"{field} quaternion must have unit length")
+            return pose
+
         for index, (node, parent) in enumerate(nodes):
             level = int(node["level"])
+            current_node_id = int(node["node_id"])
+            if current_node_id in node_lookup:
+                raise ValueError(f"duplicate synthetic node_id {current_node_id}")
             node_valid[index] = True
-            node_id[index] = int(node["node_id"])
+            node_id[index] = current_node_id
             node_level[index] = level
             parent_index[index] = int(parent)
             track_id[index] = int(annotation["episode_id"]) * 1000000 + int(node["identity_id"])
-            pose_camera[index] = torch.tensor(node["pose_camera"], device=device, dtype=dtype)
-            pose_world[index] = torch.tensor(node["pose_world"], device=device, dtype=dtype)
-            size_3d[index] = torch.tensor(node["size_3d"], device=device, dtype=dtype)
+            pose_camera[index] = validated_pose(
+                node["pose_camera"], field=f"node {current_node_id} pose_camera")
+            pose_world[index] = validated_pose(
+                node["pose_world"], field=f"node {current_node_id} pose_world")
+            node_size = torch.as_tensor(node["size_3d"], device=device, dtype=dtype)
+            if (
+                tuple(node_size.shape) != (3,)
+                or not bool(torch.isfinite(node_size).all().item())
+                or bool((node_size <= 0.0).any().item())
+            ):
+                raise ValueError(f"node {current_node_id} size_3d must be finite and positive")
+            size_3d[index] = node_size
             xyxy = torch.tensor(node["bbox_2d"], device=device, dtype=dtype)
+            if (
+                tuple(xyxy.shape) != (4,)
+                or not bool(torch.isfinite(xyxy).all().item())
+                or not (
+                    0.0 <= float(xyxy[0]) < float(xyxy[2]) <= float(width)
+                    and 0.0 <= float(xyxy[1]) < float(xyxy[3]) <= float(height)
+                )
+            ):
+                raise ValueError(f"node {current_node_id} bbox_2d is outside the image")
             bbox_2d[index] = xyxy / xyxy.new_tensor([width, height, width, height])
             node_instance_masks[index] = instanceSegmentation.eq(int(node["instance_id"]))
             visible_ratio[index] = float(node["visible_ratio"])
             occlusion_ratio[index] = float(node["occlusion_ratio"])
+            if not (
+                0.0 <= float(visible_ratio[index]) <= 1.0
+                and 0.0 <= float(occlusion_ratio[index]) <= 1.0
+            ):
+                raise ValueError(
+                    f"node {current_node_id} visibility ratios must be in [0, 1]")
             if level == 0:
                 object_classes[index] = int(node["object_class"])
                 node_state[index] = torch.tensor(node["object_state"], device=device, dtype=dtype)
@@ -622,7 +750,7 @@ class DataPreprocessor:
                 symbol_type[index] = int(node["symbol_type"])
                 if int(node["has_text"]) == 1:
                     text_embed[index] = torch.tensor(node["text_embed"], device=device, dtype=dtype)
-            node_lookup[int(node["node_id"])] = index
+            node_lookup[current_node_id] = index
 
         relation_type = torch.zeros(N, N, device=device, dtype=torch.long)
         relation_valid = node_valid.unsqueeze(1) & node_valid.unsqueeze(0)
@@ -632,19 +760,33 @@ class DataPreprocessor:
         for relation in annotation["relations"]:
             subject = int(relation["subject_node_id"])
             obj = int(relation["object_node_id"])
-            if subject in node_lookup and obj in node_lookup:
-                relation_type[node_lookup[subject], node_lookup[obj]] = int(relation["relation_type"])
-            elif subject in node_lookup:
-                external_relation[node_lookup[subject], int(relation["relation_type"])] = 1.0
+            relation_id = int(relation["relation_type"])
+            if subject not in node_lookup:
+                raise ValueError(f"relation references unknown subject node_id {subject}")
+            if not 0 <= relation_id < relationClasses:
+                raise ValueError(f"relation_type {relation_id} is outside the vocabulary")
+            if obj in node_lookup:
+                relation_type[node_lookup[subject], node_lookup[obj]] = relation_id
+            else:
+                external_relation[node_lookup[subject], relation_id] = 1.0
 
         motion = torch.zeros(N, 7, device=device, dtype=dtype)
         motion[:, 6] = 1.0
-        motion_valid = node_valid.clone()
+        motion_valid = torch.zeros(N, device=device, dtype=torch.bool)
         is_moving = torch.zeros(N, device=device, dtype=dtype)
         for entry in annotation["motion"]["object_motions_from_prev"]:
-            index = node_lookup[int(entry["node_id"])]
-            motion[index] = torch.tensor(entry["motion"], device=device, dtype=dtype)
+            entry_node_id = int(entry["node_id"])
+            if entry_node_id not in node_lookup:
+                raise ValueError(f"motion references unknown node_id {entry_node_id}")
+            index = node_lookup[entry_node_id]
+            if bool(motion_valid[index].item()):
+                raise ValueError(f"duplicate motion label for node_id {entry_node_id}")
+            motion[index] = validated_pose(
+                entry["motion"], field=f"node {entry_node_id} motion")
+            motion_valid[index] = True
             is_moving[index] = float(entry["is_moving"])
+            if not 0.0 <= float(is_moving[index]) <= 1.0:
+                raise ValueError(f"node {entry_node_id} is_moving must be in [0, 1]")
 
         affordance = torch.zeros(N, affordanceDim, device=device, dtype=dtype)
         affordance_valid = torch.zeros(N, device=device, dtype=torch.bool)
@@ -652,8 +794,17 @@ class DataPreprocessor:
             "graspable", "pushable", "pressable", "pullable",
             "rotatable", "openable", "container", "support_surface")
         for entry in annotation["interaction"]["affordance_targets"]:
-            index = node_lookup[int(entry["node_id"])]
-            affordance[index] = torch.tensor([entry[name] for name in affordance_keys], device=device, dtype=dtype)
+            entry_node_id = int(entry["node_id"])
+            if entry_node_id not in node_lookup:
+                raise ValueError(f"affordance references unknown node_id {entry_node_id}")
+            index = node_lookup[entry_node_id]
+            affordance_value = torch.tensor(
+                [entry[name] for name in affordance_keys],
+                device=device,
+                dtype=dtype)
+            if bool(((affordance_value < 0.0) | (affordance_value > 1.0)).any().item()):
+                raise ValueError(f"node {entry_node_id} affordances must be in [0, 1]")
+            affordance[index] = affordance_value
             affordance_valid[index] = True
 
         contact = torch.zeros(N, device=device, dtype=dtype)
@@ -661,23 +812,44 @@ class DataPreprocessor:
         contact_force = torch.zeros(N, 2, device=device, dtype=dtype)
         contact_point_camera = torch.zeros(N, 3, device=device, dtype=dtype)
         for event in annotation["interaction"]["contact_events"]:
-            index = node_lookup[int(event["actor_b_node_id"])]
+            entry_node_id = int(event["actor_b_node_id"])
+            if entry_node_id not in node_lookup:
+                raise ValueError(f"contact references unknown node_id {entry_node_id}")
+            index = node_lookup[entry_node_id]
             contact[index] = 1.0
-            contact_force[index] = torch.tensor(
+            force = torch.tensor(
                 [event["normal_force_n"], event["tangential_force_n"]],
                 device=device,
                 dtype=dtype)
-            contact_point_camera[index] = torch.tensor(event["contact_point_camera"], device=device, dtype=dtype)
+            point = torch.tensor(
+                event["contact_point_camera"], device=device, dtype=dtype)
+            if (
+                tuple(point.shape) != (3,)
+                or not bool(torch.isfinite(point).all().item())
+                or not bool(torch.isfinite(force).all().item())
+                or bool((force < 0.0).any().item())
+            ):
+                raise ValueError(f"contact for node {entry_node_id} is invalid")
+            contact_force[index] = force
+            contact_point_camera[index] = point
+
+        global_labels = annotation["scene"]["global_labels"]
+        if len(global_labels) != numGlobalLabels:
+            raise ValueError(
+                f"scene.global_labels must contain exactly {numGlobalLabels} values")
 
         return {
             "rgb": rgb,
             "depth": depth,
             "depth_valid": depthValid,
             "normal": normal,
+            "normal_valid": (
+                normal.norm(dim=0, keepdim=True) > 0.5
+            ),
             "semantic_segmentation": semanticSegmentation.long(),
             "instance_segmentation": instanceSegmentation.long(),
             "scene_class": torch.tensor(annotation["scene"]["scene_class"], device=device, dtype=torch.long),
-            "global_labels": torch.tensor(annotation["scene"]["global_labels"][:numGlobalLabels], device=device, dtype=dtype),
+            "global_labels": torch.tensor(global_labels, device=device, dtype=dtype),
             "node_valid": node_valid,
             "node_id": node_id,
             "node_level": node_level,
@@ -712,10 +884,14 @@ class DataPreprocessor:
             "contact_valid": contact_valid,
             "contact_force": contact_force,
             "contact_point_camera": contact_point_camera,
-            # Per-frame absolute camera pose (camera->world, xyz + xyzw quaternion). The
-            # inter-frame camera_motion is derived from consecutive poses in BrainCore.Step,
-            # so the dataset only stores each frame's own pose, never a relative transform.
-            "camera_pose_world": torch.tensor(annotation["camera"]["pose_world"], device=device, dtype=dtype)}
+            "temporal_kind": torch.tensor(
+                temporal_kind, device=device, dtype=torch.long),
+            "temporal_kind_valid": torch.tensor(
+                temporal_kind_valid, device=device, dtype=torch.bool),
+            "temporal_duration_ms": torch.tensor(
+                temporal_duration_ms, device=device, dtype=dtype),
+            "temporal_duration_valid": torch.tensor(
+                temporal_duration_valid, device=device, dtype=torch.bool),}
 
     @staticmethod
     def CollateSyntheticSupervision(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -771,159 +947,233 @@ class DataPreprocessor:
         return resized_image_t, scaled_boxes, resize_meta
 
     @staticmethod
+    def TensorizeFeedbackSignal(
+        value: Any,
+        *,
+        name: str,
+        batchSize: int,
+        device: Optional[torch.device],) -> Optional[torch.Tensor]:
+        """Validate external reward/done feedback once at the input seam."""
+        if value is None:
+            return None
+        try:
+            value_tensor = torch.as_tensor(value)
+        except Exception as error:
+            raise ValueError(f"{name} must contain real numbers") from error
+        if value_tensor.dtype == torch.bool or not (
+            value_tensor.is_floating_point()
+            or value_tensor.dtype in (
+                torch.uint8,
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+            )
+        ):
+            raise TypeError(f"{name} must contain real numbers")
+        if tuple(value_tensor.shape) != (batchSize,):
+            raise ValueError(f"{name} must have shape [{batchSize}]")
+        if not bool(torch.isfinite(value_tensor).all().item()):
+            raise ValueError(f"{name} must contain only finite values")
+        if name == "reward":
+            if bool((
+                (value_tensor < float(BasicParameters.REWARD_MIN))
+                | (value_tensor > float(BasicParameters.REWARD_MAX))
+            ).any().item()):
+                raise ValueError(
+                    f"reward must be in [{BasicParameters.REWARD_MIN}, "
+                    f"{BasicParameters.REWARD_MAX}]")
+        elif name == "done":
+            if bool(((value_tensor != 0) & (value_tensor != 1)).any().item()):
+                raise ValueError("done must contain only binary 0/1 flags")
+        else:
+            raise ValueError(f"unsupported feedback signal: {name}")
+        return value_tensor.to(device=device, dtype=torch.float32)
+
+    @staticmethod
     def ConvertRobotInputs(
-        imgs: Optional[Union[np.ndarray, torch.Tensor]],
+        imgs: Union[np.ndarray, torch.Tensor],
         reward: Optional[Union[np.ndarray, torch.Tensor]],
         done: Optional[Union[np.ndarray, torch.Tensor]],
         *,
-        size: Optional[Tuple[int, int]] = (BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE),
         device: Optional[torch.device] = None,
         needVisualState: bool = True,
-        depths: Optional[Union[np.ndarray, torch.Tensor]] = None,
-        depthValids: Optional[Union[np.ndarray, torch.Tensor]] = None,
-        depthScaleMeters: float = 1.0,
-        cameraIntrinsics: Optional[Union[np.ndarray, torch.Tensor]] = None,) -> Dict[str, Any]:
+        depths: Union[np.ndarray, torch.Tensor],
+        depthValids: Union[np.ndarray, torch.Tensor],) -> Dict[str, Any]:
+        image_size = BasicParameters.IMAGE_SIZE
+        img_tensor = torch.as_tensor(imgs)
+        depth_tensor = torch.as_tensor(depths)
+        depth_valid_tensor = torch.as_tensor(depthValids)
+        if img_tensor.ndim == 3:
+            img_tensor = img_tensor.unsqueeze(0)
+        if depth_tensor.ndim == 2:
+            depth_tensor = depth_tensor.unsqueeze(0)
+        if depth_valid_tensor.ndim == 2:
+            depth_valid_tensor = depth_valid_tensor.unsqueeze(0)
+        if (
+            img_tensor.dtype != torch.uint8
+            or tuple(img_tensor.shape[1:]) != (image_size, image_size, 3)
+        ):
+            raise ValueError(
+                f"RGB must be uint8 [B, {image_size}, {image_size}, 3]")
+        if (
+            depth_tensor.dtype != torch.float32
+            or tuple(depth_tensor.shape[1:]) != (image_size, image_size)
+        ):
+            raise ValueError(
+                f"depth must be float32 metres [B, {image_size}, {image_size}]")
+        if (
+            depth_valid_tensor.dtype != torch.bool
+            or tuple(depth_valid_tensor.shape) != tuple(depth_tensor.shape)
+        ):
+            raise ValueError("depth_valid must be a bool mask matching depth")
+        batch_size = int(img_tensor.size(0))
+        if int(depth_tensor.size(0)) != batch_size:
+            raise ValueError("RGB, depth and depth_valid batch sizes must match")
+        if not bool(torch.isfinite(depth_tensor).all().item()):
+            raise ValueError("depth must contain only finite metre values")
+        if bool((depth_valid_tensor & (depth_tensor <= 0.0)).any().item()):
+            raise ValueError("valid depth pixels must be positive")
 
         original_images: List[np.ndarray] = []
         resize_meta: List[DataResizeMeta] = []
-        # Source image size, captured regardless of needVisualState, so the camera
-        # intrinsics can be rescaled to the same target grid as RGB/depth.
-        image_source_size: Optional[Tuple[int, int]] = None
-        image_target_size: Optional[Tuple[int, int]] = None
+        if needVisualState:
+            original_images = [
+                np.array(sample.detach().cpu().numpy(), copy=True)
+                for sample in img_tensor]
+            resize_meta = [
+                DataResizeMeta(
+                    src_h=image_size,
+                    src_w=image_size,
+                    dst_h=image_size,
+                    dst_w=image_size,
+                    scale_x=1.0,
+                    scale_y=1.0)
+                for _ in range(batch_size)]
 
-        if imgs is not None:
-            img_tensor = torch.as_tensor(imgs)
-            if img_tensor.ndim == 3:
-                image_samples = [img_tensor]
-            elif img_tensor.ndim == 4:
-                image_samples = [img_tensor[i] for i in range(int(img_tensor.shape[0]))]
-            else:
-                raise ValueError(f"Unexpected image batch shape: {tuple(img_tensor.shape)}")
-
-            resized_samples: List[torch.Tensor] = []
-            for sample in image_samples:
-                sample_for_tensor = sample
-                if needVisualState:
-                    sample_for_tensor = sample.detach().cpu()
-                    original_images.append(
-                        np.array(sample_for_tensor.numpy(), copy=True))
-
-                sample_tensor = DataPreprocessor.ToImageTensor(sample_for_tensor)
-
-                if size is None:
-                    resized_tensor = sample_tensor
-                    _, src_h, src_w = sample_tensor.shape
-                    meta = DataResizeMeta(
-                        src_h=int(src_h),
-                        src_w=int(src_w),
-                        dst_h=int(src_h),
-                        dst_w=int(src_w),
-                        scale_x=1.0,
-                        scale_y=1.0,)
-                else:
-                    resized_tensor, meta = DataPreprocessor.ResizeImage(
-                        sample_tensor,
-                        size=size,
-                        antialias=True,)
-
-                if image_source_size is None:
-                    image_source_size = (int(meta.src_h), int(meta.src_w))
-                    image_target_size = (int(meta.dst_h), int(meta.dst_w))
-
-                resized_samples.append(resized_tensor)
-                if needVisualState:
-                    resize_meta.append(meta)
-
-            img_tensor = torch.stack(resized_samples, dim=0) if len(resized_samples) > 0 else torch.empty(0)
-            if device is not None:
-                img_tensor = img_tensor.to(device)
-        else:
-            img_tensor = None
-
-        depth_tensor = None
-        depth_valid_tensor = None
-        if depths is not None:
-            depth_batch = torch.as_tensor(depths)
-            expected_batch = None if img_tensor is None else int(img_tensor.size(0))
-            if depth_batch.ndim == 2:
-                depth_samples = [depth_batch]
-            elif depth_batch.ndim == 3:
-                if expected_batch is not None and expected_batch > 1 and int(depth_batch.size(0)) == expected_batch:
-                    depth_samples = [depth_batch[i] for i in range(expected_batch)]
-                else:
-                    depth_samples = [depth_batch]
-            elif depth_batch.ndim == 4:
-                depth_samples = [depth_batch[i] for i in range(int(depth_batch.size(0)))]
-            else:
-                raise ValueError(f"Unexpected depth batch shape: {tuple(depth_batch.shape)}")
-            if expected_batch is not None and len(depth_samples) != expected_batch:
-                raise ValueError(f"RGB/depth batch mismatch: {expected_batch} vs {len(depth_samples)}")
-
-            valid_samples: List[Optional[torch.Tensor]] = [None] * len(depth_samples)
-            if depthValids is not None:
-                valid_batch = torch.as_tensor(depthValids)
-                if valid_batch.ndim == 2:
-                    valid_samples = [valid_batch]
-                elif valid_batch.ndim == 3 and len(depth_samples) > 1 and int(valid_batch.size(0)) == len(depth_samples):
-                    valid_samples = [valid_batch[i] for i in range(len(depth_samples))]
-                elif valid_batch.ndim == 3:
-                    valid_samples = [valid_batch]
-                elif valid_batch.ndim == 4:
-                    valid_samples = [valid_batch[i] for i in range(int(valid_batch.size(0)))]
-                else:
-                    raise ValueError(f"Unexpected depth valid batch shape: {tuple(valid_batch.shape)}")
-                if len(valid_samples) != len(depth_samples):
-                    raise ValueError("depth/depth valid batch mismatch")
-
-            resized_depth: List[torch.Tensor] = []
-            resized_valid: List[torch.Tensor] = []
-            for sample, sample_valid in zip(depth_samples, valid_samples):
-                one_depth, one_valid = DataPreprocessor.ToDepthTensor(
-                    sample,
-                    sample_valid,
-                    depthScaleMeters=depthScaleMeters)
-                if size is not None:
-                    one_depth, one_valid = DataPreprocessor.ResizeDepth(one_depth, one_valid, size)
-                resized_depth.append(one_depth)
-                resized_valid.append(one_valid)
-            depth_tensor = torch.stack(resized_depth, dim=0)
-            depth_valid_tensor = torch.stack(resized_valid, dim=0)
-            if device is not None:
-                depth_tensor = depth_tensor.to(device)
-                depth_valid_tensor = depth_valid_tensor.to(device)
-
-        # Camera intrinsics: rescale to the same target grid as RGB/depth when supplied.
-        # If not passed, leave as None; if passed but no resize happened, return as-is.
-        camera_intrinsics_tensor = None
-        if cameraIntrinsics is not None:
-            if image_source_size is not None and image_target_size is not None and size is not None:
-                camera_intrinsics_tensor = DataPreprocessor.ResizeCameraIntrinsics(
-                    cameraIntrinsics,
-                    sourceSize=image_source_size,
-                    targetSize=image_target_size,
-                    device=device)
-            else:
-                camera_intrinsics_tensor = torch.as_tensor(cameraIntrinsics).float()
-                if device is not None:
-                    camera_intrinsics_tensor = camera_intrinsics_tensor.to(device)
-
-        def convert_tensor(value: Optional[Union[np.ndarray, torch.Tensor]]):
-            if value is None:
-                return None
-            value_tensor = torch.as_tensor(value).float()
-            if device is not None:
-                value_tensor = value_tensor.to(device)
-            return value_tensor
+        frame_tensor = img_tensor.permute(0, 3, 1, 2).contiguous().float().div_(255.0)
+        depth_tensor = depth_tensor.unsqueeze(1)
+        depth_valid_tensor = depth_valid_tensor.unsqueeze(1)
+        if device is not None:
+            frame_tensor = frame_tensor.to(device)
+            depth_tensor = depth_tensor.to(device)
+            depth_valid_tensor = depth_valid_tensor.to(device)
 
         return {
-            "frames": img_tensor,
+            "frames": frame_tensor,
             "original_images": original_images,
             "resize_meta": resize_meta,
             "depths": depth_tensor,
             "depth_valid": depth_valid_tensor,
-            "camera_intrinsics": camera_intrinsics_tensor,
-            "rewards": convert_tensor(reward),
-            "dones": convert_tensor(done),}
+            "rewards": DataPreprocessor.TensorizeFeedbackSignal(
+                reward,
+                name="reward",
+                batchSize=batch_size,
+                device=device),
+            "dones": DataPreprocessor.TensorizeFeedbackSignal(
+                done,
+                name="done",
+                batchSize=batch_size,
+                device=device),}
+
+    @staticmethod
+    def PreprocessSingleFrame(
+        bitmap: Union[List[Any], np.ndarray, torch.Tensor],
+        reward: Optional[float],
+        done: Optional[float],
+        *,
+        depthBitmap: Union[List[Any], np.ndarray, torch.Tensor],
+        depthValid: Union[List[Any], np.ndarray, torch.Tensor],
+        device: Optional[torch.device] = None,
+        needVisualState: bool = False,) -> Dict[str, Any]:
+        if isinstance(bitmap, torch.Tensor):
+            rgb = bitmap
+        else:
+            bitmap_array = np.asarray(bitmap)
+            if not np.issubdtype(bitmap_array.dtype, np.integer):
+                raise TypeError("wire RGB input must contain integers")
+            if bitmap_array.size and (
+                int(bitmap_array.min()) < 0 or int(bitmap_array.max()) > 255
+            ):
+                raise ValueError("wire RGB values must be in [0, 255]")
+            rgb = torch.from_numpy(bitmap_array.astype(np.uint8, copy=False))
+
+        if isinstance(depthBitmap, torch.Tensor):
+            depth = depthBitmap
+        else:
+            depth_array = np.asarray(depthBitmap)
+            if not np.issubdtype(depth_array.dtype, np.floating):
+                raise TypeError("wire depth input must contain metre values")
+            depth = torch.from_numpy(depth_array.astype(np.float32, copy=False))
+
+        if isinstance(depthValid, torch.Tensor):
+            depth_valid = depthValid
+        else:
+            valid_array = np.asarray(depthValid)
+            if valid_array.dtype != np.bool_:
+                raise TypeError("wire depth valid input must contain booleans")
+            depth_valid = torch.from_numpy(valid_array)
+
+        image_size = BasicParameters.IMAGE_SIZE
+        if rgb.dtype != torch.uint8:
+            raise TypeError("RGB input must use uint8 rgb8 samples")
+        if tuple(rgb.shape) != (image_size, image_size, 3):
+            raise ValueError(
+                f"RGB input must have shape [{image_size}, {image_size}, 3]")
+        if depth.dtype != torch.float32:
+            raise TypeError("depth input must use float32 metre values")
+        if tuple(depth.shape) != (image_size, image_size):
+            raise ValueError(
+                f"depth input must have shape [{image_size}, {image_size}]")
+        if depth_valid.dtype != torch.bool:
+            raise TypeError("depth valid input must use bool samples")
+        if tuple(depth_valid.shape) != (image_size, image_size):
+            raise ValueError(
+                f"depth valid input must have shape [{image_size}, {image_size}]")
+        if not bool(torch.isfinite(depth).all().item()):
+            raise ValueError("depth input must contain only finite metre values")
+        if bool((depth_valid & (depth <= 0.0)).any().item()):
+            raise ValueError("valid depth pixels must be positive")
+
+        original_images: List[np.ndarray] = []
+        resize_meta: List[DataResizeMeta] = []
+        if needVisualState:
+            original_images.append(np.array(rgb.detach().cpu().numpy(), copy=True))
+            resize_meta.append(DataResizeMeta(
+                src_h=image_size,
+                src_w=image_size,
+                dst_h=image_size,
+                dst_w=image_size,
+                scale_x=1.0,
+                scale_y=1.0,))
+
+        frame = rgb.permute(2, 0, 1).contiguous().unsqueeze(0).float().div_(255.0)
+        depth = depth.unsqueeze(0).unsqueeze(0)
+        depth_valid = depth_valid.unsqueeze(0).unsqueeze(0)
+        if device is not None:
+            frame = frame.to(device)
+            depth = depth.to(device)
+            depth_valid = depth_valid.to(device)
+
+        reward_value = DataPreprocessor.TensorizeFeedbackSignal(
+            None if reward is None else [reward],
+            name="reward",
+            batchSize=1,
+            device=device)
+        done_value = DataPreprocessor.TensorizeFeedbackSignal(
+            None if done is None else [done],
+            name="done",
+            batchSize=1,
+            device=device)
+
+        return {
+            "frames": frame,
+            "original_images": original_images,
+            "resize_meta": resize_meta,
+            "depths": depth,
+            "depth_valid": depth_valid,
+            "rewards": reward_value,
+            "dones": done_value,}
 
     @staticmethod
     def ConvertCppCameraFrame(
@@ -931,31 +1181,18 @@ class DataPreprocessor:
         reward: Optional[float],
         done: Optional[float],
         *,
-        depthBitmap: Optional[Union[List[Any], np.ndarray, torch.Tensor]] = None,
-        depthValid: Optional[Union[List[Any], np.ndarray, torch.Tensor]] = None,
-        depthScaleMeters: float = 1.0,
-        cameraIntrinsics: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        depthBitmap: Union[List[Any], np.ndarray, torch.Tensor],
+        depthValid: Union[List[Any], np.ndarray, torch.Tensor],
         device: Optional[torch.device] = None,
         needVisualState: bool = False,) -> Dict[str, Any]:
-        if isinstance(bitmap, torch.Tensor):
-            bitmap_value: Union[np.ndarray, torch.Tensor] = bitmap
-        else:
-            bitmap_value = np.asarray(bitmap)
-
-        reward_value = None if reward is None else np.asarray([float(reward)], dtype=np.float32)
-        done_value = None if done is None else np.asarray([float(done)], dtype=np.float32)
-
-        return DataPreprocessor.ConvertRobotInputs(
-            imgs=bitmap_value,
-            reward=reward_value,
-            done=done_value,
-            size=(BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE),
+        return DataPreprocessor.PreprocessSingleFrame(
+            bitmap,
+            reward,
+            done,
+            depthBitmap=depthBitmap,
+            depthValid=depthValid,
             device=device,
-            needVisualState=needVisualState,
-            depths=depthBitmap,
-            depthValids=depthValid,
-            depthScaleMeters=depthScaleMeters,
-            cameraIntrinsics=cameraIntrinsics,)
+            needVisualState=needVisualState,)
 
     @staticmethod
     def CropAndResizeLineImagesWithMeta(

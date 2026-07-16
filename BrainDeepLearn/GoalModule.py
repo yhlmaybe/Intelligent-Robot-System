@@ -48,7 +48,20 @@ class CodebookGoalHead(AGICoreModule):
 
     def UtilizationLoss(self, logits: torch.Tensor) -> torch.Tensor:
         prob = F.softmax(logits, dim=-1).mean(dim=0)
-        return (math.log(self.codes) + (prob * prob.clamp_min(1e-8).log()).sum(dim=-1)).mean()
+        soft_balance = (
+            math.log(self.codes)
+            + (prob * prob.clamp_min(1e-8).log()).sum(dim=-1)).mean()
+
+        sample_prob = F.softmax(logits, dim=-1)
+        hard_index = sample_prob.argmax(dim=-1, keepdim=True)
+        hard = torch.zeros_like(sample_prob).scatter_(-1, hard_index, 1.0)
+        hard_st = hard + sample_prob - sample_prob.detach()
+        hard_usage = hard_st.mean(dim=0)
+        hard_balance = (
+            math.log(self.codes)
+            + (hard_usage * hard_usage.clamp_min(1e-8).log()).sum(dim=-1)
+        ).mean()
+        return soft_balance + 0.25 * hard_balance
 
     @torch.no_grad()
     def ResetDeadCodes(self, threshold: float = 0.05):
@@ -69,6 +82,7 @@ class GoalGrounding(AGICoreModule):
         goalDim: int = ModuleDim.GoalShortDim,
         intentDim: int = ModuleDim.IntentionFeat,
         slotDim: int = ModuleDim.PstSlotDim,
+        usageDim: int = ModuleDim.PstUsageDim,
         numSkills: int = ModuleDim.UsageNumSkills,
         paramDim: int = ModuleDim.UsageParamDim,
         subgoalSteps: int = 4,
@@ -91,8 +105,8 @@ class GoalGrounding(AGICoreModule):
             nn.Linear(self.slot_dim, 1),)
 
         self.slot_ground_encoder = nn.Sequential(
-            nn.LayerNorm(self.slot_dim + 4),
-            nn.Linear(self.slot_dim + 4, self.slot_dim),
+            nn.LayerNorm(self.slot_dim + int(usageDim) + 4),
+            nn.Linear(self.slot_dim + int(usageDim) + 4, self.slot_dim),
             nn.SiLU(),
             nn.Linear(self.slot_dim, self.slot_dim),
             nn.LayerNorm(self.slot_dim),)
@@ -147,6 +161,7 @@ class GoalGrounding(AGICoreModule):
 
         slot_input = torch.cat([
             slot_tensor,
+            physicalState["U"],
             observed_weight.unsqueeze(-1),
             memory_weight.unsqueeze(-1),
             slot_weight.unsqueeze(-1),
@@ -180,13 +195,46 @@ class GoalGrounding(AGICoreModule):
         subgoal_step_weight = F.softmax(subgoal_step_logits, dim=-1)
         subgoal_query = (decoded * subgoal_step_weight.unsqueeze(-1)).sum(dim=1)
 
-        slot_logits = torch.einsum("bd,bkd->bk", grounded_query, slot_embed) / (float(self.slot_dim) ** 0.5)
-        slot_logits = slot_logits + torch.einsum("bd,bkd->bk", subgoal_query, slot_embed) / (float(self.slot_dim) ** 0.5)
-        slot_logits = slot_logits + slot_weight.clamp_min(1e-6).log()
+        reference_prior = slot_weight.clamp_min(1e-6).log()
+        query_slot_logits = (
+            torch.einsum("bd,bkd->bk", grounded_query, slot_embed)
+            / (float(self.slot_dim) ** 0.5)
+            + reference_prior)
+        subgoal_slot_logits = (
+            torch.einsum("bd,bkd->bk", subgoal_query, slot_embed)
+            / (float(self.slot_dim) ** 0.5)
+            + reference_prior)
+        query_slot_logits = query_slot_logits.masked_fill(invalid_slot, -1e9)
+        subgoal_slot_logits = subgoal_slot_logits.masked_fill(invalid_slot, -1e9)
+        slot_logits = query_slot_logits + subgoal_slot_logits - reference_prior
         slot_logits = slot_logits.masked_fill(invalid_slot, -1e9)
 
         no_slot_logit = self.no_slot_head(grounded_query + subgoal_query).squeeze(-1)
         reference_distribution = F.softmax(torch.cat([slot_logits, no_slot_logit.unsqueeze(-1)], dim=-1), dim=-1)
+        query_reference_distribution = F.softmax(torch.cat([
+            query_slot_logits,
+            self.no_slot_head(grounded_query).squeeze(-1).unsqueeze(-1),
+        ], dim=-1), dim=-1)
+        subgoal_reference_distribution = F.softmax(torch.cat([
+            subgoal_slot_logits,
+            self.no_slot_head(subgoal_query).squeeze(-1).unsqueeze(-1),
+        ], dim=-1), dim=-1)
+        agreement_mean = 0.5 * (
+            query_reference_distribution + subgoal_reference_distribution)
+        grounding_consistency_loss = 0.5 * (
+            (
+                query_reference_distribution
+                * (
+                    query_reference_distribution.clamp_min(1e-6).log()
+                    - agreement_mean.clamp_min(1e-6).log())
+            ).sum(dim=-1)
+            + (
+                subgoal_reference_distribution
+                * (
+                    subgoal_reference_distribution.clamp_min(1e-6).log()
+                    - agreement_mean.clamp_min(1e-6).log())
+            ).sum(dim=-1)
+        ).mean()
         referenced = reference_distribution[:, :-1]
         no_slot_prob = reference_distribution[:, -1]
         referenced_slot_summary = (slot_embed * referenced.unsqueeze(-1)).sum(dim=1)
@@ -196,6 +244,9 @@ class GoalGrounding(AGICoreModule):
         return {
             "referenced_object_probs": referenced,
             "reference_distribution": reference_distribution,
+            "query_reference_distribution": query_reference_distribution,
+            "subgoal_reference_distribution": subgoal_reference_distribution,
+            "grounding_consistency_loss": grounding_consistency_loss,
             "referenced_slot_summary": referenced_slot_summary,
             "reference_confidence": reference_confidence,
             "no_slot_prob": no_slot_prob,}
@@ -204,9 +255,9 @@ class GoalGrounding(AGICoreModule):
 class TemporalGoalHead(AGICoreModule):
     """Predict nominal/soft duration and derive a policy hard-deadline grace.
 
-    The existing ``temporal_duration_ms`` label supervises the soft duration.
-    There is no independent hard-timeout label, so the hard deadline is not
-    represented as a learned head.
+    Synthetic supervision supplies an explicitly-valid soft-duration label.
+    There is no independent hard-timeout label, so the hard deadline is
+    derived as a fixed grace beyond the learned soft timeout.
     """
 
     def __init__(
@@ -540,6 +591,7 @@ class TestGoalMTool:
             intent = torch.randn(B, ModuleDim.IntentionFeat, device=self.device)
             physical_state = {
                 "SlotState": torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
+                "U": torch.randn(B, K, ModuleDim.PstUsageDim, device=self.device),
                 "MphysRaw": torch.ones(B, K, device=self.device),
                 "Observed": torch.tensor([[1, 1, 0, 0], [1, 0, 1, 0]], device=self.device),
                 "LastSeen": torch.tensor([[8, 8, 4, 0], [8, 3, 8, 0]], device=self.device),
@@ -590,6 +642,98 @@ class TestGoalMTool:
             print(f"FourLevelGoalManager backward test failed: {type(e).__name__}: {e}")
             return False
 
+    def TestHardCodebookCollapsePenalty(self) -> bool:
+        try:
+            codes = 4
+            head = CodebookGoalHead(
+                contextDim=8,
+                groups=1,
+                codes=codes,
+                goalDim=8,
+                hidden=8).to(self.device)
+            collapsed_logits = torch.zeros(
+                codes, 1, codes, device=self.device, requires_grad=True)
+            collapsed_loss = head.UtilizationLoss(collapsed_logits)
+            collapsed_loss.backward()
+            balanced_logits = torch.full(
+                (codes, 1, codes), -8.0, device=self.device)
+            balanced_logits[
+                torch.arange(codes, device=self.device),
+                0,
+                torch.arange(codes, device=self.device)] = 8.0
+            balanced_loss = head.UtilizationLoss(balanced_logits)
+            ok = bool(
+                collapsed_loss.item() > balanced_loss.item()
+                and collapsed_logits.grad is not None
+                and collapsed_logits.grad.abs().sum().item() > 0.0)
+            print(f"HardCodebookCollapsePenalty {'passed' if ok else 'failed'}.")
+            return ok
+        except Exception as e:
+            print(f"HardCodebookCollapsePenalty failed: {type(e).__name__}: {e}")
+            return False
+
+    def TestGroundingConsistencyGradient(self) -> bool:
+        try:
+            B, K = 2, 4
+            grounding = GoalGrounding().to(self.device).train()
+            physical_state = {
+                "SlotState": torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
+                "U": torch.randn(B, K, ModuleDim.PstUsageDim, device=self.device),
+                "MphysRaw": torch.ones(B, K, device=self.device),
+                "Observed": torch.ones(B, K, device=self.device),
+                "LastSeen": torch.full((B, K), 4, device=self.device),
+                "Step": torch.full((B,), 4, device=self.device, dtype=torch.long),
+                "SlotPresence": torch.ones(B, K, device=self.device),
+                "ObservedSlotMask": torch.ones(B, K, device=self.device),}
+            out = grounding(
+                torch.randn(B, ModuleDim.GoalShortDim, device=self.device),
+                torch.randn(B, ModuleDim.IntentionFeat, device=self.device),
+                physical_state,
+                physical_state)
+            out["grounding_consistency_loss"].backward()
+            query_grad = sum(
+                float(parameter.grad.abs().sum().item())
+                for parameter in grounding.goal_intent_proj.parameters()
+                if parameter.grad is not None)
+            subgoal_grad = sum(
+                float(parameter.grad.abs().sum().item())
+                for parameter in grounding.decomposer.parameters()
+                if parameter.grad is not None)
+
+            no_slot_state = dict(physical_state)
+            no_slot_state["MphysRaw"] = torch.zeros(B, K, device=self.device)
+            no_slot_state["Observed"] = torch.zeros(B, K, device=self.device)
+            no_slot_state["SlotPresence"] = torch.zeros(B, K, device=self.device)
+            no_slot_state["ObservedSlotMask"] = torch.zeros(B, K, device=self.device)
+            no_slot = grounding(
+                torch.randn(B, ModuleDim.GoalShortDim, device=self.device),
+                torch.randn(B, ModuleDim.IntentionFeat, device=self.device),
+                no_slot_state,
+                no_slot_state)
+            ok = bool(
+                query_grad > 0.0
+                and subgoal_grad > 0.0
+                and torch.allclose(
+                    no_slot["no_slot_prob"],
+                    torch.ones_like(no_slot["no_slot_prob"]),
+                    atol=1e-6,
+                    rtol=1e-6)
+                and torch.allclose(
+                    no_slot["referenced_slot_summary"],
+                    torch.zeros_like(no_slot["referenced_slot_summary"]),
+                    atol=1e-6,
+                    rtol=1e-6)
+                and torch.allclose(
+                    no_slot["grounding_consistency_loss"],
+                    torch.zeros_like(no_slot["grounding_consistency_loss"]),
+                    atol=1e-6,
+                    rtol=1e-6))
+            print(f"GroundingConsistencyGradient {'passed' if ok else 'failed'}.")
+            return ok
+        except Exception as e:
+            print(f"GroundingConsistencyGradient failed: {type(e).__name__}: {e}")
+            return False
+
     def RunAll(self) -> Dict[str, bool]:
         results = {
             "FourLevelForwardShapes": self.TestFourLevelForwardShapes(),
@@ -597,6 +741,8 @@ class TestGoalMTool:
             "TemporalGoalShapes": self.TestTemporalGoalShapes(),
             "TemporalTimeoutGradientSemantics": self.TestTemporalTimeoutGradientSemantics(),
             "GoalGroundingShapes": self.TestGoalGroundingShapes(),
+            "HardCodebookCollapsePenalty": self.TestHardCodebookCollapsePenalty(),
+            "GroundingConsistencyGradient": self.TestGroundingConsistencyGradient(),
             "GoalManagerBackward": self.TestGoalManagerBackward(),}
         passed = sum(1 for value in results.values() if value)
         print(f"\n[GoalModule Tests] {passed}/{len(results)} passed.")

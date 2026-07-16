@@ -1503,9 +1503,17 @@ class EmotionCore(AGICoreModule):
 
 
 class GeoTropicalOut(NamedTuple):
+    """Critic output; value[..., 0] is the bounded scalar-return coordinate.
+
+    The remaining value coordinates encode geometric/risk structure.  valueNext
+    transports the same coordinate contract to the predicted next state.
+    """
+
     value: torch.Tensor
     valueNext: torch.Tensor
     tdError: torch.Tensor
+    returnValue: torch.Tensor
+    returnAdvantage: torch.Tensor
     loss: torch.Tensor
     emotion: torch.Tensor
     rComps: Dict[str, torch.Tensor]
@@ -1535,6 +1543,51 @@ class ResidualMLPBlock(nn.Module):
 
 
 class ValueEstimationExtractor(AGICoreModule):
+    RUNTIME_STATE_FIELDS = (
+        "ve_is_training",
+        "ve_last_batch_size",
+        "pending_transitions",
+        "active_stream_ids",
+        "transport_prev_grad",
+        "transport_curr_grad",
+        "transport_delayed_ready",
+        "transport_grad_accum_steps",
+        "transport_prev_grad_hook_seen",
+        "transport_curr_grad_hook_seen",
+        "return_value_prev",
+        "return_value_valid",
+        "td_out_ema_mean",
+        "td_out_ema_var",
+        "emo_h",
+        "emo_c",
+        "emo_mood",
+        "emo_fast_H",
+        "emo_slow_H",
+    ) + tuple(
+        f"unc_{name}_{stat}"
+        for name in ("td_ema", "ent_ema", "state_ema", "tr_ema", "ph_ema", "ctx_ema")
+        for stat in ("mean", "var")
+    ) + tuple(
+        f"{prefix}_{name}"
+        for prefix in ("reward_pred", "done_pred")
+        for name in (
+            "kf_mean",
+            "kf_var",
+            "smooth_hist",
+            "hist_len",
+            "predict_mode",
+            "auto_policy",
+            "auto_temperature",
+            "fit_last_n",)
+    ) + (
+        "micro_anchor_value",
+        "micro_anchor_value_next",
+        "micro_anchor_z",
+        "micro_filled",
+        "micro_ptr",
+        "micro_step",
+        "transport_manifold_tensor_field_ema",)
+
     def __init__(self,
         memoryDim: int = 768, attnDim: int = 1024, stateDim: int = 256, *,
         emotionDim: int = 64,
@@ -1559,7 +1612,8 @@ class ValueEstimationExtractor(AGICoreModule):
         tdHuberKappa: float = 1.0, # Huber threshold for elementwise residual
         tdGeomSignTau: float = 1.0, # τ in sign σ_b = tanh(td_anchor / τ)
         tdGeomSobAlpha: float = 0.10, # α coupling for Sobolev term  ||Δ||² + α(Δᵀ L Δ)
-        tdGeomEps: float = 1e-6,):
+        tdGeomEps: float = 1e-6,
+        returnDiscount: float = 0.99,):
         super().__init__()
 
         self.in_dim = memoryDim + attnDim + stateDim
@@ -1582,6 +1636,7 @@ class ValueEstimationExtractor(AGICoreModule):
         self.td_geom_sign_tau = max(float(tdGeomSignTau), 1e-6)
         self.td_geom_sob_alpha = float(tdGeomSobAlpha)
         self.td_geom_eps = float(tdGeomEps)
+        self.return_discount = float(returnDiscount)
 
         self.use_hebb = useHebb
 
@@ -1619,6 +1674,13 @@ class ValueEstimationExtractor(AGICoreModule):
 
         self.value_tensor_out_norm = nn.LayerNorm(self.value_tensor_dim)
         self.value_tensor_log_scale = nn.Parameter(torch.tensor(math.log(math.exp(0.5) - 1.0)))
+        self.return_value_head = nn.Sequential(
+            nn.LayerNorm(H),
+            nn.Linear(H, H // 4),
+            nn.GELU(),
+            nn.Linear(H // 4, 1),)
+        self.register_buffer("return_value_prev", torch.zeros(1), persistent=False)
+        self.register_buffer("return_value_valid", torch.zeros(1, dtype=torch.bool), persistent=False)
 
         scale_init = math.log(math.e - 1.0)
         self.latent_mahalanobis_logvar = nn.Parameter(torch.full((self.value_tensor_dim,), scale_init))
@@ -1696,6 +1758,8 @@ class ValueEstimationExtractor(AGICoreModule):
         nn.init.constant_(self.emotion_fusion_gate.bias, -2.0)
         nn.init.zeros_(self.quantile_head.weight)
         nn.init.zeros_(self.quantile_head.bias)
+        nn.init.zeros_(self.return_value_head[-1].weight)
+        nn.init.zeros_(self.return_value_head[-1].bias)
         nn.init.normal_(self.td_context_head[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.td_context_head[-1].bias)
         nn.init.normal_(self.td_heat_basis, mean=0.0, std=1.0 / math.sqrt(float(self.value_tensor_dim)))
@@ -1705,6 +1769,9 @@ class ValueEstimationExtractor(AGICoreModule):
     def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
         self.td_out_ema.EnsureB(B, device, dtype)
         self.micro.EnsureB(B, device, dtype)
+        if self.return_value_prev.shape != (B,):
+            self.return_value_prev = torch.zeros(B, device=device, dtype=dtype)
+            self.return_value_valid = torch.zeros(B, device=device, dtype=torch.bool)
 
         if self._last_batch_size is None:
             self._last_batch_size = int(B)
@@ -2103,10 +2170,16 @@ class ValueEstimationExtractor(AGICoreModule):
         h: torch.Tensor,
         value: torch.Tensor,
         gradBucket: Dict[str, torch.Tensor],
-        hookSeen: set) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        hookSeen: set,
+        transportState: Optional[Dict[str, torch.Tensor]] = None,
+        ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         params = {}
         for name, p in self.transport.named_parameters():
-            snap = p.detach().clone().requires_grad_(p.requires_grad)
+            source = (
+                p
+                if transportState is None
+                else transportState[name])
+            snap = source.detach().clone().requires_grad_(p.requires_grad)
             if snap.requires_grad:
                 def snapshot_hook(
                     grad: torch.Tensor,
@@ -2123,7 +2196,12 @@ class ValueEstimationExtractor(AGICoreModule):
                     return grad
                 snap.register_hook(snapshot_hook)
             params[name] = snap
-        buffers = {name: b for name, b in self.transport.named_buffers()}
+        buffers = {
+            name: (
+                b
+                if transportState is None
+                else transportState[name])
+            for name, b in self.transport.named_buffers()}
         transport_state = {}
         transport_state.update(params)
         transport_state.update(buffers)
@@ -2132,6 +2210,16 @@ class ValueEstimationExtractor(AGICoreModule):
             transport_state,
             (h, value),
             {"returnExtras": True})
+
+    @torch.no_grad()
+    def ExportTransportSnapshotState(self) -> Dict[str, torch.Tensor]:
+        state = {
+            name: parameter.detach().clone()
+            for name, parameter in self.transport.named_parameters()}
+        state.update({
+            name: buffer.detach().clone()
+            for name, buffer in self.transport.named_buffers()})
+        return state
 
     def InstallTransportGradHooks(self):
         for handle in self._transport_grad_hooks:
@@ -2254,15 +2342,6 @@ class ValueEstimationExtractor(AGICoreModule):
         self._active_stream_ids = normalized
         return normalized
 
-    def SelectLiveRow(self, x: Any, row: int, B: int) -> Any:
-        if torch.is_tensor(x):
-            if x.dim() > 0 and int(x.size(0)) == int(B):
-                return x[row:row + 1]
-            return x
-        if isinstance(x, dict):
-            return {k: self.SelectLiveRow(v, row, B) for k, v in x.items()}
-        return x
-
     def StackLiveRows(self, items: List[Any]) -> Any:
         first = items[0]
         if torch.is_tensor(first):
@@ -2273,21 +2352,40 @@ class ValueEstimationExtractor(AGICoreModule):
             return {k: self.StackLiveRows([it[k] for it in items if k in it]) for k in first.keys()}
         return first
 
+    def SelectBatchRow(self, value: Any, row: int, batchSize: int) -> Any:
+        if torch.is_tensor(value):
+            if value.dim() > 0 and int(value.size(0)) == int(batchSize):
+                return value[row:row + 1]
+            return value
+        if isinstance(value, dict):
+            return {
+                key: self.SelectBatchRow(item, row, batchSize)
+                for key, item in value.items()}
+        return value
+
     def CacheDelayedTransitionInputs(
         self,
-        vNextHat: torch.Tensor,
+        transportHidden: torch.Tensor,
+        transportValue: torch.Tensor,
+        rewardNext: torch.Tensor,
+        transportState: Dict[str, torch.Tensor],
+        microGraph: Dict[str, torch.Tensor],
+        returnHidden: torch.Tensor,
         alive: torch.Tensor,
-        transpExtras: Dict[str, Any],
         streamIds: Optional[torch.Tensor] = None):
-        B = int(vNextHat.size(0))
+        B = int(transportHidden.size(0))
         sids = self.NormalizeStreamIds(B, streamIds)
         alive_f = alive.detach().view(B)
 
         for i, sid in enumerate(sids):
             item = {
-                "pred_live": vNextHat[i:i + 1],
-                "alive": alive_f[i],
-                "transp_extras_live": self.SelectLiveRow(transpExtras, i, B),}
+                "transport_hidden": transportHidden[i:i + 1].detach(),
+                "transport_value": transportValue[i:i + 1].detach(),
+                "reward_next": rewardNext[i:i + 1].detach(),
+                "transport_state": transportState,
+                "micro_graph": self.SelectBatchRow(microGraph, i, B),
+                "return_hidden": returnHidden[i:i + 1].detach(),
+                "alive": alive_f[i],}
             q = self._pending_transitions.setdefault(int(sid), deque())
             q.append(item)
             while len(q) > int(self._max_pending_per_stream):
@@ -2378,7 +2476,8 @@ class ValueEstimationExtractor(AGICoreModule):
             "ready": False,
             "pred": target_empty,
             "transp_extras": {},
-            "loss_mask": valueLabel.new_zeros((0,)),}
+            "loss_mask": valueLabel.new_zeros((0,)),
+            "rows": torch.empty(0, device=valueLabel.device, dtype=torch.long),}
 
         sids = self.NormalizeStreamIds(B, streamIds)
         rows: List[int] = []
@@ -2400,13 +2499,66 @@ class ValueEstimationExtractor(AGICoreModule):
 
         target = valueLabel.index_select(0, rows_t)
         z_target = zLabel.index_select(0, rows_t)
-        pred = torch.cat([it["pred_live"] for it in items], dim=0)
-        transp_extras = self.StackLiveRows([it["transp_extras_live"] for it in items])
+        grouped: Dict[int, Dict[str, Any]] = {}
+        for position, item in enumerate(items):
+            group = grouped.setdefault(id(item["transport_state"]), {
+                "state": item["transport_state"],
+                "positions": [],
+                "items": []})
+            group["positions"].append(position)
+            group["items"].append(item)
+
+        rebuilt_items: List[Optional[Dict[str, Any]]] = [None] * len(items)
+        for group in grouped.values():
+            group_items = group["items"]
+            group_hidden = torch.cat([
+                item["transport_hidden"]
+                for item in group_items], dim=0)
+            group_value = torch.cat([
+                item["transport_value"]
+                for item in group_items], dim=0)
+            group_reward = torch.cat([
+                item["reward_next"]
+                for item in group_items], dim=0)
+            group_micro_graph = self.StackLiveRows([
+                item["micro_graph"]
+                for item in group_items])
+            pred_item, extras_item = self.BuildTransportSnapshotGraph(
+                group_hidden,
+                group_value,
+                self._transport_prev_grad,
+                self._transport_prev_grad_hook_seen,
+                transportState=group["state"])
+            pred_item, extras_item = self.ApplyRewardNextModulation(
+                group_value,
+                pred_item,
+                extras_item,
+                group_reward)
+            pred_item, extras_item = self.ApplyMicroGraphPrior(
+                pred_item,
+                extras_item,
+                group_micro_graph)
+            group_size = len(group_items)
+            for local_row, position in enumerate(group["positions"]):
+                rebuilt_items[position] = {
+                    "pred": pred_item[local_row:local_row + 1],
+                    "transp_extras": self.SelectBatchRow(
+                        extras_item,
+                        local_row,
+                        group_size)}
+        if any(item is None for item in rebuilt_items):
+            raise RuntimeError("delayed transport reconstruction lost a stream row")
+        pred = torch.cat([item["pred"] for item in rebuilt_items], dim=0)
+        return_hidden = torch.cat([it["return_hidden"] for it in items], dim=0)
+        transp_extras = self.StackLiveRows([
+            item["transp_extras"]
+            for item in rebuilt_items])
         manifold = transp_extras["manifold"]
 
         prev.update({
             "ready": True,
             "pred": pred,
+            "return_hidden": return_hidden,
             "transp_extras": transp_extras,
             "target_m": target,
             "loss_mask": alive,
@@ -2415,6 +2567,7 @@ class ValueEstimationExtractor(AGICoreModule):
             "u": manifold["u"],
             "z_target": z_target,
             "manifold_reg_per_row": manifold["reg_per_row"],})
+        prev["rows"] = rows_t
         return prev
 
     def forward(self,
@@ -2428,6 +2581,7 @@ class ValueEstimationExtractor(AGICoreModule):
         worldDeltaTransport: Optional[torch.Tensor] = None, # [B,stateDim]
         worldDeltaPhysics: Optional[torch.Tensor] = None, # [B,stateDim]
         streamIds: Optional[torch.Tensor] = None,
+        computeLoss: Optional[bool] = None,
         )-> GeoTropicalOut: 
 
         B = state.size(0)
@@ -2453,6 +2607,16 @@ class ValueEstimationExtractor(AGICoreModule):
 
         value_parts = self.BuildValueGraph(h=h)
         value = value_parts["value"]
+        return_value = self.return_value_head(h).squeeze(-1)
+        return_target_now = (
+            reward_value
+            + self.return_discount * (1.0 - done_value) * return_value.detach())
+        return_advantage = torch.where(
+            self.return_value_valid,
+            return_target_now - self.return_value_prev,
+            torch.zeros_like(return_target_now))
+        self.return_value_prev = return_value.detach()
+        self.return_value_valid = torch.ones_like(self.return_value_valid)
         value_epistemic = value_parts["value_epistemic"]
         dist_stats = value_parts["dist_stats"]
 
@@ -2525,12 +2689,18 @@ class ValueEstimationExtractor(AGICoreModule):
             z=manifold_out["z"].detach(),
             alive=1.0 - done_value)
 
-        if not self.training:
+        should_compute_loss = (
+            bool(self.training)
+            if computeLoss is None
+            else bool(computeLoss))
+        if not should_compute_loss:
             self.transport.CommitManifoldField(manifold_out["field"])
             return GeoTropicalOut(
                 value=value,
                 valueNext=value_next,
                 tdError=td_bounded.detach(),
+                returnValue=return_value,
+                returnAdvantage=return_advantage.detach(),
                 loss=None,
                 emotion=emotion,
                 rComps=rComps,
@@ -2554,11 +2724,9 @@ class ValueEstimationExtractor(AGICoreModule):
         loss_manifold_latent = value.new_zeros(())
         loss_manifold_reg = value.new_zeros(())
         loss_mask = prev["loss_mask"]
-        valid_denom = loss_mask.sum().clamp_min(1.0) if loss_mask.numel() > 0 else value.new_tensor(1.0)
+        valid_denom = loss_mask.sum().clamp_min(1.0)
 
         def ValidMeanM(vec: torch.Tensor) -> torch.Tensor:
-            if loss_mask.numel() <= 0:
-                return value.new_zeros(())
             return (vec.view(-1) * loss_mask).sum() / valid_denom
 
         if has_prev_pred:
@@ -2607,6 +2775,22 @@ class ValueEstimationExtractor(AGICoreModule):
             + value.new_tensor(self.wBranchStructure) * loss_branch_structure
             + value.new_tensor(self.wManifoldLatent) * loss_manifold_latent
             + loss_manifold_reg)
+        loss_return = value.new_zeros(())
+        if has_prev_pred:
+            rows = prev["rows"]
+            previous_return_value = self.return_value_head(
+                prev["return_hidden"]).squeeze(-1)
+            bellman_target = (
+                reward_value.index_select(0, rows)
+                + self.return_discount
+                * (1.0 - done_value.index_select(0, rows))
+                * return_value.detach().index_select(0, rows))
+            return_loss_vec = F.smooth_l1_loss(
+                previous_return_value,
+                bellman_target,
+                reduction="none")
+            loss_return = ValidMeanM(return_loss_vec)
+        loss_transport = loss_transport + loss_return
         loss_transport_delayed = loss_transport
 
         alive_current = 1.0 - done_value
@@ -2629,6 +2813,20 @@ class ValueEstimationExtractor(AGICoreModule):
         loss_physical_param_reg = value.new_tensor(self.wPhysicalTDParamReg) * physical_param_reg["loss"]
         
         loss_value_tensor_energy = value.new_tensor(1e-6) * CurrentMean(value.pow(2).mean(dim=-1))
+
+        # Channel 0 is the bounded reward-return coordinate consumed by Decision.
+        # The scalar return branch owns the Bellman target; detaching it here keeps
+        # the geometric objectives from changing that teacher while giving the
+        # 512-D value tensor a non-self-referential reward anchor.  Time indexing is
+        # V_{t-1} <- r_t + gamma*(1-done_t)*V_t: the current terminal V_t is an
+        # absorbing bootstrap value, so its channel-0 target is zero rather than
+        # carrying r_t (which belongs to the preceding value target).
+        value_return_target = (
+            (1.0 - done_value) * torch.tanh(return_value.detach()))
+        loss_value_return_anchor = F.smooth_l1_loss(
+            value[:, 0],
+            value_return_target,
+            reduction="mean")
         
         quantile_target = (
             td_bounded.detach().view(-1, 1)
@@ -2665,33 +2863,35 @@ class ValueEstimationExtractor(AGICoreModule):
                 ensemble_var_target,
                 reduction="none")))
         
-        pending_v_next_hat, pending_transp_extras = self.BuildTransportSnapshotGraph(
-            transport_h,
-            transport_value,
-            self._transport_prev_grad,
-            self._transport_prev_grad_hook_seen)
-
-        pending_v_next_hat, pending_transp_extras = self.ApplyRewardNextModulation(
-            transport_value,
-            pending_v_next_hat,
-            pending_transp_extras,
-            r_next_hat)
-        
         self.CacheDelayedTransitionInputs(
-            vNextHat=pending_v_next_hat,
+            transportHidden=transport_h,
+            transportValue=transport_value,
+            rewardNext=r_next_hat,
+            transportState=self.ExportTransportSnapshotState(),
+            microGraph=micro_graph,
+            returnHidden=h,
             alive=1.0 - done_value,
-            transpExtras=pending_transp_extras,
             streamIds=streamIds)
 
         self.transport.CommitManifoldField(manifold_out["field"])
 
-        loss_current = loss_physical_td + loss_physical_aux + loss_physical_param_reg + loss_value_tensor_energy + loss_quantile + loss_ensemble
+        loss_current = (
+            loss_physical_td
+            + loss_physical_aux
+            + loss_physical_param_reg
+            + loss_value_tensor_energy
+            + loss_value_return_anchor
+            + loss_quantile
+            + loss_ensemble)
 
         extras = {
             "loss_transport": loss_transport_delayed.detach(),
+            "loss_return": loss_return.detach(),
             "loss_physical_td": loss_physical_td.detach(),
             "loss_physical_aux": loss_physical_aux.detach(),
             "loss_physical_param_reg": loss_physical_param_reg.detach(),
+            "loss_value_tensor_energy": loss_value_tensor_energy.detach(),
+            "loss_value_return_anchor": loss_value_return_anchor.detach(),
             "loss_quantile": loss_quantile.detach(),
             "loss_ensemble": loss_ensemble.detach(),
             "loss_diff": loss_diff.detach(),
@@ -2708,6 +2908,8 @@ class ValueEstimationExtractor(AGICoreModule):
             value=value,
             valueNext=value_next,
             tdError=td_bounded.detach(),
+            returnValue=return_value,
+            returnAdvantage=return_advantage.detach(),
             loss=loss_current,
             emotion=emotion,
             rComps=rComps,
@@ -2725,6 +2927,8 @@ class ValueEstimationExtractor(AGICoreModule):
     @torch.no_grad()
     def ResetState(self, doneMask: Optional[torch.Tensor] = None):
         if doneMask is None:
+            self.return_value_prev.zero_()
+            self.return_value_valid.zero_()
             self.micro.Reset()
             self.emotion_core.ResetState()
             self.td_out_ema.ResetAll()
@@ -2737,6 +2941,8 @@ class ValueEstimationExtractor(AGICoreModule):
             self._active_stream_ids = None
             self.ClearTransportGradAccumulator()
             return
+        self.return_value_prev.masked_fill_(doneMask.view(-1).bool(), 0.0)
+        self.return_value_valid.logical_and_(~doneMask.view(-1).bool())
         self.micro.Reset(doneMask=doneMask)
         self.emotion_core.ResetState(doneMask=doneMask)
         self.td_out_ema.ResetAll(doneMask=doneMask)
@@ -2789,19 +2995,63 @@ class ValueEstimationExtractor(AGICoreModule):
 
     @torch.no_grad()
     def ExportState(self) -> Dict[str, Any]:
+        clone_memo: Dict[int, Any] = {}
+
+        def clone_runtime(value: Any) -> Any:
+            value_id = id(value)
+            if value_id in clone_memo:
+                return clone_memo[value_id]
+            if torch.is_tensor(value):
+                cloned = value.detach().clone()
+                clone_memo[value_id] = cloned
+                return cloned
+            if isinstance(value, dict):
+                cloned: Dict[Any, Any] = {}
+                clone_memo[value_id] = cloned
+                cloned.update({
+                    key: clone_runtime(item)
+                    for key, item in value.items()})
+                return cloned
+            if isinstance(value, (list, tuple, deque)):
+                cloned_list: List[Any] = []
+                clone_memo[value_id] = cloned_list
+                cloned_list.extend(clone_runtime(item) for item in value)
+                return cloned_list
+            return value
+
         state: Dict[str, Any] = {"ve_is_training": bool(self.training)}
         state["ve_last_batch_size"] = self._last_batch_size
+        state["pending_transitions"] = {
+            int(stream_id): [
+                clone_runtime(item)
+                for item in queue]
+            for stream_id, queue in self._pending_transitions.items()}
+        state["active_stream_ids"] = (
+            None
+            if self._active_stream_ids is None
+            else list(self._active_stream_ids))
+        state["transport_prev_grad"] = clone_runtime(
+            self._transport_prev_grad)
+        state["transport_curr_grad"] = clone_runtime(
+            self._transport_curr_grad)
+        state["transport_delayed_ready"] = bool(
+            self._transport_delayed_ready)
+        state["transport_grad_accum_steps"] = int(
+            self._transport_grad_accum_steps)
+        state["transport_prev_grad_hook_seen"] = sorted(
+            self._transport_prev_grad_hook_seen)
+        state["transport_curr_grad_hook_seen"] = sorted(
+            self._transport_curr_grad_hook_seen)
+        state["return_value_prev"] = self.return_value_prev.detach().clone()
+        state["return_value_valid"] = self.return_value_valid.detach().clone()
 
         state["td_out_ema_mean"] = self.td_out_ema.mean.detach().clone()
         state["td_out_ema_var"] = self.td_out_ema.var.detach().clone()
 
         ec = self.emotion_core
-        if ec.h is not None:
-            state["emo_h"] = ec.h.detach().clone()
-        if ec.c is not None:
-            state["emo_c"] = ec.c.detach().clone()
-        if ec.mood is not None:
-            state["emo_mood"] = ec.mood.detach().clone()
+        state["emo_h"] = None if ec.h is None else ec.h.detach().clone()
+        state["emo_c"] = None if ec.c is None else ec.c.detach().clone()
+        state["emo_mood"] = None if ec.mood is None else ec.mood.detach().clone()
         state["emo_fast_H"] = ec.fast_head.H.detach().clone()
         state["emo_slow_H"] = ec.slow_head.H.detach().clone()
 
@@ -2826,19 +3076,21 @@ class ValueEstimationExtractor(AGICoreModule):
         state["micro_step"] = int(mg._step)
         state["transport_manifold_tensor_field_ema"] = self.transport.manifold_tensor_field_ema.detach().clone()
 
+        if tuple(state) != self.RUNTIME_STATE_FIELDS:
+            raise RuntimeError("value runtime-state export does not match its schema")
         return state
 
     @torch.no_grad()
     def ImportState(self, state: Dict[str, Any],):
-        def need_(key: str) -> Any:
-            return state[key] if key in state else None
+        if type(state) is not dict or tuple(state) != self.RUNTIME_STATE_FIELDS:
+            raise TypeError("value runtime-state fields do not match the current schema")
 
-        if "ve_is_training" in state:
-            self.train(bool(state["ve_is_training"]))
+        self.train(bool(state["ve_is_training"]))
 
-        def copy_tensor_attr(obj: Any, name: str, t: Optional[torch.Tensor]):
-            if t is None:
-                return
+        def copy_tensor_attr(obj: Any, name: str, t: torch.Tensor):
+            if not torch.is_tensor(t):
+                raise TypeError(f"value runtime-state field {name!r} must be a tensor")
+            t = move_runtime(t)
             cur = getattr(obj, name)
             if not torch.is_tensor(cur):
                 setattr(obj, name, t)
@@ -2848,46 +3100,94 @@ class ValueEstimationExtractor(AGICoreModule):
             else:
                 cur.copy_(t)
 
-        self._last_batch_size = state.get("ve_last_batch_size", getattr(self, "_last_batch_size", None))
+        move_memo: Dict[int, Any] = {}
+
+        def move_runtime(value: Any) -> Any:
+            value_id = id(value)
+            if value_id in move_memo:
+                return move_memo[value_id]
+            if torch.is_tensor(value):
+                if value.dtype.is_floating_point:
+                    moved = value.to(device=self.device, dtype=self.dtype)
+                else:
+                    moved = value.to(device=self.device)
+                move_memo[value_id] = moved
+                return moved
+            if isinstance(value, dict):
+                moved: Dict[Any, Any] = {}
+                move_memo[value_id] = moved
+                moved.update({
+                    key: move_runtime(item)
+                    for key, item in value.items()})
+                return moved
+            if isinstance(value, list):
+                moved_list: List[Any] = []
+                move_memo[value_id] = moved_list
+                moved_list.extend(move_runtime(item) for item in value)
+                return moved_list
+            return value
+
+        self._last_batch_size = state["ve_last_batch_size"]
         self._active_stream_ids = None
         self._pending_transitions.clear()
         self.ClearTransportGradAccumulator()
+        pending = state["pending_transitions"]
+        self._pending_transitions = {
+            int(stream_id): deque(
+                move_runtime(item)
+                for item in items)
+            for stream_id, items in pending.items()}
+        active_stream_ids = state["active_stream_ids"]
+        self._active_stream_ids = (
+            None
+            if active_stream_ids is None
+            else [int(item) for item in active_stream_ids])
+        self._transport_prev_grad = move_runtime(
+            state["transport_prev_grad"])
+        self._transport_curr_grad = move_runtime(
+            state["transport_curr_grad"])
+        self._transport_delayed_ready = bool(
+            state["transport_delayed_ready"])
+        self._transport_grad_accum_steps = int(
+            state["transport_grad_accum_steps"])
+        self._transport_prev_grad_hook_seen = set(
+            state["transport_prev_grad_hook_seen"])
+        self._transport_curr_grad_hook_seen = set(
+            state["transport_curr_grad_hook_seen"])
+        copy_tensor_attr(self, "return_value_prev", state["return_value_prev"])
+        copy_tensor_attr(self, "return_value_valid", state["return_value_valid"])
 
-        copy_tensor_attr(self.td_out_ema, "mean", need_("td_out_ema_mean"))
-        copy_tensor_attr(self.td_out_ema, "var", need_("td_out_ema_var"))
+        copy_tensor_attr(self.td_out_ema, "mean", state["td_out_ema_mean"])
+        copy_tensor_attr(self.td_out_ema, "var", state["td_out_ema_var"])
 
         ec = self.emotion_core
-        if need_("emo_h") is not None:
-            ec.h = need_("emo_h")
-        if need_("emo_c") is not None:
-            ec.c = need_("emo_c")
-        if need_("emo_mood") is not None:
-            ec.mood = need_("emo_mood")
-        copy_tensor_attr(ec.fast_head, "H", need_("emo_fast_H"))
-        copy_tensor_attr(ec.slow_head, "H", need_("emo_slow_H"))
+        ec.h = move_runtime(state["emo_h"])
+        ec.c = move_runtime(state["emo_c"])
+        ec.mood = move_runtime(state["emo_mood"])
+        copy_tensor_attr(ec.fast_head, "H", state["emo_fast_H"])
+        copy_tensor_attr(ec.slow_head, "H", state["emo_slow_H"])
 
         uc = self.unc_core
         for name in ["td_ema", "ent_ema", "state_ema", "tr_ema", "ph_ema", "ctx_ema"]:
             ema = getattr(uc, name)
-            copy_tensor_attr(ema, "mean", need_(f"unc_{name}_mean"))
-            copy_tensor_attr(ema, "var", need_(f"unc_{name}_var"))
+            copy_tensor_attr(ema, "mean", state[f"unc_{name}_mean"])
+            copy_tensor_attr(ema, "var", state[f"unc_{name}_var"])
 
         for prefix, pred in [("reward_pred", self.reward_predictor),
                              ("done_pred", self.done_predictor)]:
             for n in ["kf_mean", "kf_var", "smooth_hist", "hist_len"]:
-                copy_tensor_attr(pred, n, need_(f"{prefix}_{n}"))
+                copy_tensor_attr(pred, n, state[f"{prefix}_{n}"])
             for n in ["predict_mode", "auto_policy", "auto_temperature", "fit_last_n"]:
-                k = f"{prefix}_{n}"
-                if k in state:
-                    setattr(pred, n, state[k])
+                setattr(pred, n, state[f"{prefix}_{n}"])
 
         mg = self.micro
         for n in ["anchor_value", "anchor_value_next", "anchor_z", "filled", "ptr"]:
-            copy_tensor_attr(mg, n, need_(f"micro_{n}"))
-        if "micro_step" in state:
-            mg._step = int(state["micro_step"])
-        transport_field_ema = need_("transport_manifold_tensor_field_ema")
-        copy_tensor_attr(self.transport, "manifold_tensor_field_ema", transport_field_ema)
+            copy_tensor_attr(mg, n, state[f"micro_{n}"])
+        mg._step = int(state["micro_step"])
+        copy_tensor_attr(
+            self.transport,
+            "manifold_tensor_field_ema",
+            state["transport_manifold_tensor_field_ema"])
 
 
 class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
@@ -2911,6 +3211,8 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
     def RestoreBaseTrainabilityAfterCommit(self) -> None:
         super().RestoreBaseTrainabilityAfterCommit()
         for parameter in self.base.transport.parameters():
+            parameter.requires_grad_(True)
+        for parameter in self.base.return_value_head.parameters():
             parameter.requires_grad_(True)
 
     @staticmethod
@@ -2987,6 +3289,7 @@ class ValueEstimationOnlineWrapper(BaseOnlineWrapper):
             "rewardModel": kwargs["rewardModel"],
             "doneModel": kwargs["doneModel"],
             "streamIds": kwargs.get("streamIds", None),
+            "computeLoss": kwargs.get("computeLoss", None),
             "policyEntropyPrev": kwargs.get("policyEntropyPrev", None),
             "worldDeltaTransport": kwargs.get("worldDeltaTransport", None),
             "worldDeltaPhysics": kwargs.get("worldDeltaPhysics", None),}
@@ -3115,6 +3418,40 @@ class TestValueEstimationMTool:
             doneModel=done,
             worldDeltaTransport=d_tr,
             worldDeltaPhysics=d_ph,)
+
+    def RebuildSharedPendingPrediction(
+        self,
+        est: ValueEstimationExtractor,
+        items: List[Dict[str, Any]],) -> torch.Tensor:
+        transport_state = items[0]["transport_state"]
+        if any(item["transport_state"] is not transport_state for item in items):
+            raise RuntimeError("synchronous batch does not share one transport snapshot")
+        with torch.no_grad():
+            transport_value = torch.cat([
+                item["transport_value"]
+                for item in items], dim=0)
+            prediction, extras = est.BuildTransportSnapshotGraph(
+                torch.cat([
+                    item["transport_hidden"]
+                    for item in items], dim=0),
+                transport_value,
+                {},
+                set(),
+                transportState=transport_state)
+            prediction, extras = est.ApplyRewardNextModulation(
+                transport_value,
+                prediction,
+                extras,
+                torch.cat([
+                    item["reward_next"]
+                    for item in items], dim=0))
+            prediction, _ = est.ApplyMicroGraphPrior(
+                prediction,
+                extras,
+                est.StackLiveRows([
+                    item["micro_graph"]
+                    for item in items]))
+        return prediction
 
     def CloneTransportParams(self, est: ValueEstimationExtractor) -> Dict[str, torch.Tensor]:
         return {name: p.detach().clone() for name, p in est.transport.named_parameters() if p.requires_grad}
@@ -3375,7 +3712,8 @@ class TestValueEstimationMTool:
             reward2, entropy2, done2, d_tr2, d_ph2 = self.RandSignals(B, doneProb=0.0)
 
             _ = self.ForwardOnce(est, mem1, attn1, state1, reward1, entropy1, done1, d_tr1, d_ph1)
-            prev_pred = torch.cat([est._pending_transitions[i][0]["pred_live"].detach() for i in range(B)], dim=0)
+            pending_items = [est._pending_transitions[i][0] for i in range(B)]
+            prev_pred = self.RebuildSharedPendingPrediction(est, pending_items)
             out2 = self.ForwardOnce(est, mem2, attn2, state2, reward2, entropy2, done2, d_tr2, d_ph2)
 
             ok = True
@@ -3434,7 +3772,27 @@ class TestValueEstimationMTool:
 
             ok = True
             ok &= all("unc" not in it for it in pending_items)
-            ok &= all("pred_live" in it and "transp_extras_live" in it for it in pending_items)
+            expected_keys = {
+                "transport_hidden",
+                "transport_value",
+                "reward_next",
+                "transport_state",
+                "micro_graph",
+                "return_hidden",
+                "alive",}
+            ok &= all(set(it.keys()) == expected_keys for it in pending_items)
+            ok &= len({id(it["transport_state"]) for it in pending_items}) == 1
+            cached_tensors = []
+            for item in pending_items:
+                for key in expected_keys:
+                    value = item[key]
+                    cached_tensors.extend(
+                        value.values()
+                        if isinstance(value, dict)
+                        else (value,))
+            ok &= all(
+                tensor.grad_fn is None and not tensor.requires_grad
+                for tensor in cached_tensors)
             ok &= sum(len(q) for q in est._pending_transitions.values()) == B
             ok &= torch.isfinite(out2.extras["loss_current_graph"]).item()
             ok &= torch.isfinite(out2.extras["loss_transport_delayed_graph"]).item()
@@ -3679,12 +4037,15 @@ class TestValueEstimationMTool:
 
             _ = self.ForwardOnce(est, mem1, attn1, state1, reward1, entropy1, done1, d_tr1, d_ph1)
             items = [est._pending_transitions[i][0] for i in range(B)]
-            _ = self.ForwardOnce(est, mem2, attn2, state2, reward2, entropy2, done2, d_tr2, d_ph2)
+            out2 = self.ForwardOnce(est, mem2, attn2, state2, reward2, entropy2, done2, d_tr2, d_ph2)
 
             ok = True
             ok &= all("hebb_state" not in it for it in items)
             ok &= all("memory" not in it and "attn" not in it and "state" not in it for it in items)
-            ok &= torch.isfinite(est._pending_transitions[0][0]["pred_live"]).all().item()
+            ok &= len({id(it["transport_state"]) for it in items}) == 1
+            ok &= all(torch.isfinite(it["transport_hidden"]).all().item() for it in items)
+            ok &= all(not it["transport_hidden"].requires_grad for it in items)
+            ok &= torch.isfinite(out2.extras["loss_transport_delayed_graph"]).item()
 
             print(f"HebbianSnapshotUsedForDelayedRebuild {'pass' if ok else 'fail'}")
             return ok
@@ -3857,17 +4218,16 @@ class TestValueEstimationMTool:
             mem, attn, state = self.RandSmallBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSmallSignals(B)
             out = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
-            cached = torch.cat([
-                est._pending_transitions[row][0]["pred_live"].detach()
-                for row in range(B)], dim=0)
-            ok = torch.allclose(out.valueNext.detach(), cached, atol=1e-7, rtol=1e-6)
+            pending_items = [est._pending_transitions[row][0] for row in range(B)]
+            rebuilt = self.RebuildSharedPendingPrediction(est, pending_items)
+            ok = torch.allclose(out.valueNext.detach(), rebuilt, atol=1e-7, rtol=1e-6)
             print(f"TransportSnapshotUsesSameRuntimeState {'pass' if ok else 'fail'}")
             return bool(ok)
         except Exception as e:
             print(f"TransportSnapshotUsesSameRuntimeState error: {e}")
             return False
 
-    def TestCurrentTransitionLossMasksTerminalRows(self) -> bool:
+    def TestCurrentTransitionLossMasksTerminalGeometry(self) -> bool:
         try:
             torch.manual_seed(20260718)
             B = 2
@@ -3894,11 +4254,26 @@ class TestValueEstimationMTool:
 
             out_a = self.ForwardOnce(est_a, mem, attn, state, reward, entropy, done, d_tr, d_ph)
             out_b = self.ForwardOnce(est_b, mem_b, attn_b, state_b, reward_b, entropy_b, done, d_tr_b, d_ph_b)
-            ok = torch.allclose(out_a.loss, out_b.loss, atol=1e-7, rtol=1e-6)
-            print(f"CurrentTransitionLossMasksTerminalRows {'pass' if ok else 'fail'}")
+            loss_without_anchor_a = (
+                out_a.loss - out_a.extras["loss_value_return_anchor"])
+            loss_without_anchor_b = (
+                out_b.loss - out_b.extras["loss_value_return_anchor"])
+            target_a = (
+                (1.0 - done) * torch.tanh(out_a.returnValue.detach()))
+            target_b = (
+                (1.0 - done) * torch.tanh(out_b.returnValue.detach()))
+            ok = bool(
+                torch.allclose(
+                    loss_without_anchor_a,
+                    loss_without_anchor_b,
+                    atol=1e-7,
+                    rtol=1e-6)
+                and float(target_a[1].item()) == 0.0
+                and float(target_b[1].item()) == 0.0)
+            print(f"CurrentTransitionLossMasksTerminalGeometry {'pass' if ok else 'fail'}")
             return bool(ok)
         except Exception as e:
-            print(f"CurrentTransitionLossMasksTerminalRows error: {e}")
+            print(f"CurrentTransitionLossMasksTerminalGeometry error: {e}")
             return False
 
     def TestHebbianFlag(self) -> bool:
@@ -4204,7 +4579,10 @@ class TestValueEstimationMTool:
                 reward, entropy, done, d_tr, d_ph = self.RandSignals(B)
 
                 out = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
-                loss = out.loss + 1e-2 * (out.emotion ** 2).mean()
+                loss = (
+                    out.loss
+                    + out.extras["loss_transport_delayed_graph"]
+                    + 1e-2 * (out.emotion ** 2).mean())
                 if not torch.isfinite(loss).item():
                     print("AllTrainableParamsHaveGradAndStep fail: loss is not finite")
                     return False
@@ -4388,15 +4766,27 @@ class TestValueEstimationMTool:
                 changed = []
                 for b, p in zip(before, cand_params):
                     changed.append(float((p.detach() - b).abs().max().item()) > 0.0)
-                transport_ids = {id(p) for p in wrapper.base.transport.parameters()}
+                trainable_base_ids = {
+                    id(p)
+                    for p in wrapper.base.transport.parameters()}
+                trainable_base_ids.update(
+                    id(p)
+                    for p in wrapper.base.return_value_head.parameters())
                 base_frozen_ok = not any(
                     p.requires_grad
                     for p in wrapper.base.parameters()
-                    if id(p) not in transport_ids)
+                    if id(p) not in trainable_base_ids)
                 transport_trainable = all(
                     p.requires_grad for p in wrapper.base.transport.parameters())
+                return_head_trainable = all(
+                    p.requires_grad
+                    for p in wrapper.base.return_value_head.parameters())
 
-            ok = all(changed) and base_frozen_ok and transport_trainable
+            ok = (
+                all(changed)
+                and base_frozen_ok
+                and transport_trainable
+                and return_head_trainable)
             print(f"WrapperCandidateParamsTrainable {'pass' if ok else 'fail'}")
             return ok
         except Exception as e:
@@ -4559,6 +4949,26 @@ class TestValueEstimationMTool:
                 _ = self.ForwardOnce(est1, mem, attn, state, reward, entropy, done, d_tr, d_ph)
 
             dyn_state = est1.ExportState()
+            missing_state = dict(dyn_state)
+            del missing_state["return_value_prev"]
+            missing_rejected = False
+            try:
+                est1.ImportState(missing_state)
+            except TypeError:
+                missing_rejected = True
+
+            unexpected_state = dict(dyn_state)
+            unexpected_state["legacy_runtime_field"] = None
+            unexpected_rejected = False
+            try:
+                est1.ImportState(unexpected_state)
+            except TypeError:
+                unexpected_rejected = True
+
+            exported_pending = [
+                items[0]
+                for items in dyn_state["pending_transitions"].values()
+                if len(items) > 0]
 
             est2 = self.NewEstimator(useHebb=True).train()
             src = est1.state_dict()
@@ -4566,9 +4976,19 @@ class TestValueEstimationMTool:
             loadable = {k: v for k, v in src.items() if (k in dst and dst[k].shape == v.shape)}
             est2.load_state_dict(loadable, strict=False)
             est2.ImportState(dyn_state)
+            imported_pending = [
+                queue[0]
+                for queue in est2._pending_transitions.values()
+                if len(queue) > 0]
 
             ok = True
-            ok &= len(est2._pending_transitions) == 0
+            ok &= missing_rejected
+            ok &= unexpected_rejected
+            ok &= len(exported_pending) == B
+            ok &= len({id(item["transport_state"]) for item in exported_pending}) == 1
+            ok &= len(imported_pending) == B
+            ok &= len({id(item["transport_state"]) for item in imported_pending}) == 1
+            ok &= len(est2._pending_transitions) == len(est1._pending_transitions)
             ok &= torch.equal(est1.micro.filled, est2.micro.filled)
             ok &= torch.equal(est1.micro.ptr, est2.micro.ptr)
             ok &= torch.allclose(est1.micro.anchor_value, est2.micro.anchor_value)
@@ -4583,11 +5003,24 @@ class TestValueEstimationMTool:
             mem, attn, state = self.RandBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
 
+            cpu_rng_state = torch.random.get_rng_state()
+            cuda_rng_state = (
+                torch.cuda.get_rng_state(self.device)
+                if self.device.type == "cuda"
+                else None)
             out1 = self.ForwardOnce(est1, mem, attn, state, reward, entropy, done, d_tr, d_ph)
+            torch.random.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, self.device)
             out2 = self.ForwardOnce(est2, mem, attn, state, reward, entropy, done, d_tr, d_ph)
 
             atol, rtol = 1e-6, 1e-5
             ok &= torch.allclose(out1.value, out2.value, atol=atol, rtol=rtol)
+            ok &= torch.allclose(
+                out1.extras["loss_transport_delayed_graph"],
+                out2.extras["loss_transport_delayed_graph"],
+                atol=atol,
+                rtol=rtol)
 
             print(f"ExportImportStateRoundTrip {'pass' if ok else 'fail'}")
             return ok
@@ -4598,28 +5031,34 @@ class TestValueEstimationMTool:
     def TestTransientTrainingGraphRoundTrip(self) -> bool:
         try:
             torch.manual_seed(20260717)
-            est = self.NewSmallEstimator(useHebb=False).train()
+            source = self.NewSmallEstimator(useHebb=False).train()
             _ = self.ForwardOnce(
-                est,
+                source,
                 *self.RandSmallBatch(2),
                 *self.RandSmallSignals(2))
 
-            runtime_state = est.ExportState()
-            pending = est._pending_transitions
-            graph_state = est.SuspendTransientTrainingGraph()
-            est.ImportState(runtime_state)
-            est.RestoreTransientTrainingGraph(graph_state)
+            runtime_state = source.ExportState()
+            restored = self.NewSmallEstimator(useHebb=False).train()
+            source_parameters = source.state_dict()
+            restored_parameters = restored.state_dict()
+            loadable = {
+                name: tensor
+                for name, tensor in source_parameters.items()
+                if (
+                    name in restored_parameters
+                    and restored_parameters[name].shape == tensor.shape)}
+            restored.load_state_dict(loadable, strict=False)
+            restored.ImportState(runtime_state)
 
             out = self.ForwardOnce(
-                est,
+                restored,
                 *self.RandSmallBatch(2),
                 *self.RandSmallSignals(2))
             delayed = out.extras["loss_transport_delayed_graph"]
             delayed.backward()
-            captured = est.CaptureTransportGrad()
+            captured = restored.CaptureTransportGrad()
 
-            ok = est._pending_transitions is pending
-            ok &= delayed.requires_grad
+            ok = delayed.requires_grad
             ok &= captured["captured"] > 0.0
             print(f"TransientTrainingGraphRoundTrip {'pass' if ok else 'fail'}")
             return bool(ok)
@@ -4736,6 +5175,176 @@ class TestValueEstimationMTool:
             print(f"NoNanStress error: {e}")
             return False
 
+    def TestBellmanReturnSemantics(self) -> bool:
+        try:
+            torch.manual_seed(20260718)
+            B = 2
+            batch = self.RandSmallBatch(B)
+            _, entropy, _, d_tr, d_ph = self.RandSmallSignals(B)
+
+            sign_est = self.NewSmallEstimator(useHebb=False).eval()
+            with torch.no_grad():
+                sign_est.return_value_head[-1].weight.zero_()
+                sign_est.return_value_head[-1].bias.zero_()
+                _ = self.ForwardOnce(
+                    sign_est, *batch, torch.zeros(B, device=self.device),
+                    entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
+                positive = self.ForwardOnce(
+                    sign_est, *batch, torch.ones(B, device=self.device),
+                    entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
+                sign_est.ResetState()
+                _ = self.ForwardOnce(
+                    sign_est, *batch, torch.zeros(B, device=self.device),
+                    entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
+                negative = self.ForwardOnce(
+                    sign_est, *batch, -torch.ones(B, device=self.device),
+                    entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
+
+            terminal_est = self.NewSmallEstimator(useHebb=False).eval()
+            with torch.no_grad():
+                terminal_est.return_value_head[-1].weight.zero_()
+                terminal_est.return_value_head[-1].bias.fill_(2.0)
+                _ = self.ForwardOnce(
+                    terminal_est, *batch, torch.zeros(B, device=self.device),
+                    entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
+                terminal = self.ForwardOnce(
+                    terminal_est, *batch, torch.zeros(B, device=self.device),
+                    entropy, torch.ones(B, device=self.device), d_tr, d_ph)
+                terminal_est.ResetState()
+                _ = self.ForwardOnce(
+                    terminal_est, *batch, torch.zeros(B, device=self.device),
+                    entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
+                nonterminal = self.ForwardOnce(
+                    terminal_est, *batch, torch.zeros(B, device=self.device),
+                    entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
+
+            train_est = self.NewSmallEstimator(useHebb=False).train()
+            with torch.no_grad():
+                train_est.return_value_head[-1].weight.zero_()
+                train_est.return_value_head[-1].bias.zero_()
+            first_train = self.ForwardOnce(
+                train_est, *batch, torch.zeros(B, device=self.device),
+                entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
+            return_parameters = list(train_est.return_value_head.parameters())
+            return_optimizer = torch.optim.SGD(return_parameters, lr=1e-2)
+            return_optimizer.zero_grad(set_to_none=True)
+            first_train.returnValue.mean().backward()
+            return_optimizer.step()
+            trained = self.ForwardOnce(
+                train_est, *batch, torch.ones(B, device=self.device),
+                entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
+            return_optimizer.zero_grad(set_to_none=True)
+            trained.extras["loss_transport_delayed_graph"].backward(
+                inputs=return_parameters)
+            return_grad = sum(
+                float(parameter.grad.detach().abs().sum().item())
+                for parameter in return_parameters
+                if parameter.grad is not None)
+
+            ok = bool(
+                torch.all(positive.returnAdvantage > 0.0).item()
+                and torch.all(negative.returnAdvantage < 0.0).item()
+                and torch.allclose(
+                    terminal.returnAdvantage,
+                    terminal.returnAdvantage.new_full((B,), -2.0),
+                    atol=1e-6,
+                    rtol=1e-6)
+                and torch.allclose(
+                    nonterminal.returnAdvantage,
+                    nonterminal.returnAdvantage.new_full(
+                        (B,), 2.0 * (terminal_est.return_discount - 1.0)),
+                    atol=1e-6,
+                    rtol=1e-6)
+                and float(trained.extras["loss_return"].item()) > 0.0
+                and return_grad > 0.0)
+            print(f"BellmanReturnSemantics {'pass' if ok else 'fail'}")
+            return ok
+        except Exception as e:
+            print(f"BellmanReturnSemantics error: {e}")
+            return False
+
+    def TestValueTensorBellmanAnchor(self) -> bool:
+        try:
+            torch.manual_seed(20260719)
+            B = 3
+            est = self.NewSmallEstimator(useHebb=False).train()
+            with torch.no_grad():
+                est.value_tensor_tail[-1].weight.zero_()
+                est.value_tensor_tail[-1].bias.zero_()
+                est.value_tensor_out_norm.weight.fill_(1.0)
+                est.value_tensor_out_norm.bias.zero_()
+                est.return_value_head[-1].weight.zero_()
+                est.return_value_head[-1].bias.fill_(1.5)
+
+            batch = self.RandSmallBatch(B)
+            _, entropy, _, d_tr, d_ph = self.RandSmallSignals(B)
+            done = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+            out = self.ForwardOnce(
+                est,
+                *batch,
+                torch.zeros(B, device=self.device),
+                entropy,
+                done,
+                d_tr,
+                d_ph)
+
+            return_target = (
+                (1.0 - done) * torch.tanh(out.returnValue.detach()))
+            anchor_graph = F.smooth_l1_loss(
+                out.value[:, 0],
+                return_target,
+                reduction="mean")
+            value_parameters = (
+                list(est.value_tensor_tail.parameters())
+                + list(est.value_tensor_out_norm.parameters())
+                + [est.value_tensor_log_scale])
+            return_parameters = list(est.return_value_head.parameters())
+            gradients = torch.autograd.grad(
+                anchor_graph,
+                value_parameters + return_parameters,
+                allow_unused=True)
+            value_grad = sum(
+                float(grad.detach().abs().sum().item())
+                for grad in gradients[:len(value_parameters)]
+                if grad is not None)
+            return_grad = sum(
+                float(grad.detach().abs().sum().item())
+                for grad in gradients[len(value_parameters):]
+                if grad is not None)
+
+            current_part_names = (
+                "loss_physical_td",
+                "loss_physical_aux",
+                "loss_physical_param_reg",
+                "loss_value_tensor_energy",
+                "loss_value_return_anchor",
+                "loss_quantile",
+                "loss_ensemble",)
+            expected_current = sum(
+                (out.extras[name] for name in current_part_names),
+                out.loss.new_zeros(()))
+            ok = bool(
+                torch.all(return_target[[0, 2]].abs() > 0.0).item()
+                and float(return_target[1].item()) == 0.0
+                and float(anchor_graph.detach().item()) > 0.0
+                and value_grad > 0.0
+                and return_grad == 0.0
+                and torch.allclose(
+                    out.extras["loss_value_return_anchor"],
+                    anchor_graph.detach(),
+                    atol=1e-7,
+                    rtol=1e-6)
+                and torch.allclose(
+                    out.extras["loss_current_graph"].detach(),
+                    expected_current,
+                    atol=1e-7,
+                    rtol=1e-6))
+            print(f"ValueTensorBellmanAnchor {'pass' if ok else 'fail'}")
+            return ok
+        except Exception as e:
+            print(f"ValueTensorBellmanAnchor error: {e}")
+            return False
+
     def RunAll(self):
         import gc as _gc
         tests = [
@@ -4758,7 +5367,7 @@ class TestValueEstimationMTool:
             ("CurrentDoneMasksTemporalUncertaintyEvidence", self.TestCurrentDoneMasksTemporalUncertaintyEvidence),
             ("ManifoldFieldEmaIsRuntimeState", self.TestManifoldFieldEmaIsRuntimeState),
             ("TransportSnapshotUsesSameRuntimeState", self.TestTransportSnapshotUsesSameRuntimeState),
-            ("CurrentTransitionLossMasksTerminalRows", self.TestCurrentTransitionLossMasksTerminalRows),
+            ("CurrentTransitionLossMasksTerminalGeometry", self.TestCurrentTransitionLossMasksTerminalGeometry),
             ("HebbianFlag", self.TestHebbianFlag),
             ("StreamIdEpisodeReplacement", self.TestStreamIdEpisodeReplacement),
             ("GeometricDistances", self.TestGeometricDistances),
@@ -4776,6 +5385,8 @@ class TestValueEstimationMTool:
             ("WrapperUpdateWorkflow", self.TestWrapperUpdateWorkflow),
             ("ExportImportStateRoundTrip", self.TestExportImportStateRoundTrip),
             ("TransientTrainingGraphRoundTrip", self.TestTransientTrainingGraphRoundTrip),
+            ("BellmanReturnSemantics", self.TestBellmanReturnSemantics),
+            ("ValueTensorBellmanAnchor", self.TestValueTensorBellmanAnchor),
             ("LossDecreases", self.TestLossDecreases),
             ("NoNanStress", self.TestNoNanStress),]
         results = {}

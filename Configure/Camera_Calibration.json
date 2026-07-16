@@ -1,17 +1,28 @@
 {
-    "version": "1.0",
+    "version": "3.0",
+    "calibration_id": "camera_v1_rectified_512x512_v1",
     "camera_name": "camera_v1",
     "sensor_type": "rgbd",
+    "rgb_encoding": "rgb8",
+    "depth_unit": "meter",
+    "depth_representation": "optical_axis_z",
+    "rgb_depth_alignment": "registered_to_rgb",
+    "rectification": "rectified",
+    "synchronization": "synchronized_exposure",
     "coordinate_frame": {
-        "base_frame": "base_link",
-        "camera_frame": "camera_link",
-        "unit_position": "mm",
-        "unit_rotation": "quaternion_xyzw",
+        "camera_frame": "camera_optical",
+        "handedness": "right_handed",
+        "x_axis_positive": "right",
+        "y_axis_positive": "down",
         "z_axis_positive": "forward"
     },
+    "pixel_convention": {
+        "pixel_centers": "integer_coordinates",
+        "resampling": "align_corners_false"
+    },
     "image": {
-        "width": 640,
-        "height": 480
+        "width": 512,
+        "height": 512
     },
     "camera_intrinsics": {
         "model": "pinhole",
@@ -19,29 +30,6 @@
         "fy": 0.0,
         "cx": 0.0,
         "cy": 0.0,
-        "skew": 0.0,
-        "distortion_model": "plumb_bob",
-        "distortion_coefficients": {
-            "k1": 0.0,
-            "k2": 0.0,
-            "p1": 0.0,
-            "p2": 0.0,
-            "k3": 0.0
-        }
-    },
-    "camera_pose": {
-        "present": true,
-        "relative_to": "base_link",
-        "position": {
-            "x": 0.0,
-            "y": 0.0,
-            "z": 0.0
-        },
-        "rotation": {
-            "x": 0.0,
-            "y": 0.0,
-            "z": 0.0,
-            "w": 1.0
-        }
+        "skew": 0.0
     }
 }

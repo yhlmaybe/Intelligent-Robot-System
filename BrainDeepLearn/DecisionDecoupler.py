@@ -23,7 +23,19 @@ SAFETY_MARGIN_NAMES = (
 @dataclass
 class EndpointPoseEncoding:
     endpoint_pose_tokens: torch.Tensor
-    endpoint_pose_feat: torch.Tensor
+    body_pose_feat: torch.Tensor
+
+
+@dataclass
+class EndpointControlEncoding:
+    endpoint_control_tokens: torch.Tensor
+    control_feedback_feat: torch.Tensor
+
+
+@dataclass
+class DecisionRobotStateEncoding:
+    body_pose: EndpointPoseEncoding
+    endpoint_control: EndpointControlEncoding
 
 
 @dataclass
@@ -32,8 +44,10 @@ class MotionCommand:
 
     ``decision_tensor`` is a local/body-frame SE(3) increment (metres and
     axis-angle radians); ``target_endpoint_pose`` is an absolute world-frame
-    pose using XYZW quaternions. ``decision_dof_mask`` identifies modelled
-    increment components. ``safety_scores`` are advisory model margins only;
+    pose using XYZW quaternions. ``decision_dof_mask`` declares the physically
+    modelled action coordinates: 12 full SE(3) endpoints plus all three camera
+    rotations, exactly 75 active DOFs. Camera translation is never modelled.
+    ``safety_scores`` are advisory model margins only;
     they do not prove IK feasibility, joint limits, collision freedom or
     actuator safety.
     """
@@ -59,7 +73,6 @@ class DecoupledDecision:
     z_uncertainty: torch.Tensor
     decision_latent: torch.Tensor
     decision_tensor: torch.Tensor
-    target_endpoint_pose: torch.Tensor
     gripper_cmd: torch.Tensor
     gripper_valid: torch.Tensor
     mode_logits: torch.Tensor
@@ -68,20 +81,28 @@ class DecoupledDecision:
     explanation_tokens: torch.Tensor
 
 
-def NormalizePose(pose: torch.Tensor) -> torch.Tensor:
-    quat = F.normalize(pose[..., 3:7], dim=-1, eps=1e-6)
+def CanonicalizeQuaternion(quat: torch.Tensor) -> torch.Tensor:
     canonical_index = quat.abs().argmax(dim=-1, keepdim=True)
     canonical_component = torch.gather(quat, dim=-1, index=canonical_index)
-    quat = quat * (1.0 - 2.0 * (canonical_component < 0.0).to(quat.dtype))
+    sign = torch.where(
+        canonical_component < 0.0,
+        -torch.ones_like(canonical_component),
+        torch.ones_like(canonical_component))
+    return quat * sign
+
+
+def NormalizePose(pose: torch.Tensor) -> torch.Tensor:
+    quat = CanonicalizeQuaternion(
+        F.normalize(pose[..., 3:7], dim=-1, eps=1e-6))
     return torch.cat([pose[..., :3], quat], dim=-1)
 
 
 def AxisAngleToQuat(axisAngle: torch.Tensor) -> torch.Tensor:
-    angle = axisAngle.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    angle = axisAngle.norm(dim=-1, keepdim=True)
     half = 0.5 * angle
-    quat_xyz = axisAngle / angle * torch.sin(half)
+    quat_xyz = axisAngle * (0.5 * torch.sinc(angle / (2.0 * torch.pi)))
     quat_w = torch.cos(half)
-    return F.normalize(torch.cat([quat_xyz, quat_w], dim=-1), dim=-1, eps=1e-6)
+    return torch.cat([quat_xyz, quat_w], dim=-1)
 
 
 def QuatMultiply(qA: torch.Tensor, qB: torch.Tensor) -> torch.Tensor:
@@ -122,6 +143,20 @@ def QuatToAxisAngle(quat: torch.Tensor) -> torch.Tensor:
     return quat[..., :3] / sin_half * angle
 
 
+def RelativePose(referencePose: torch.Tensor, targetPose: torch.Tensor) -> torch.Tensor:
+    """Return ``T_reference_target`` from two absolute poses in a shared frame."""
+    reference_pose = NormalizePose(referencePose)
+    target_pose = NormalizePose(targetPose)
+    reference_quat_inv = QuatConjugate(reference_pose[..., 3:7])
+    translation = QuatRotate(
+        reference_quat_inv,
+        target_pose[..., :3] - reference_pose[..., :3])
+    relative_quat = QuatMultiply(
+        reference_quat_inv,
+        target_pose[..., 3:7])
+    return NormalizePose(torch.cat([translation, relative_quat], dim=-1))
+
+
 def RelativePoseError(commandedPose: torch.Tensor, measuredPose: torch.Tensor) -> torch.Tensor:
     """Body-frame SE(3) increment carrying ``commandedPose`` onto ``measuredPose``.
 
@@ -130,14 +165,10 @@ def RelativePoseError(commandedPose: torch.Tensor, measuredPose: torch.Tensor) -
     axis-angle. The same representation therefore describes measured execution increments,
     command tracking residuals, and network actions.
     """
-    commanded_pose = NormalizePose(commandedPose)
-    measured_pose = NormalizePose(measuredPose)
-    commanded_quat_inv = QuatConjugate(commanded_pose[..., 3:7])
-    translation = QuatRotate(
-        commanded_quat_inv,
-        measured_pose[..., :3] - commanded_pose[..., :3])
-    relative_quat = QuatMultiply(commanded_quat_inv, measured_pose[..., 3:7])
-    return torch.cat([translation, QuatToAxisAngle(relative_quat)], dim=-1)
+    relative_pose = RelativePose(commandedPose, measuredPose)
+    return torch.cat([
+        relative_pose[..., :3],
+        QuatToAxisAngle(relative_pose[..., 3:7])], dim=-1)
 
 
 def DecisionActionMask(
@@ -145,29 +176,52 @@ def DecisionActionMask(
     actionDim: int = ModuleDim.DecisionActionDim,
 ) -> torch.Tensor:
     mask = torch.ones(int(endpointCount), int(actionDim))
-    for idx in ModuleDim.DecisionRotationOnlyEndpoints:
-        mask[idx, :3] = 0.0
-        mask[idx, 5] = 0.0
+    for endpoint_index in ModuleDim.DecisionRotationOnlyEndpoints:
+        if endpoint_index < int(endpointCount):
+            mask[endpoint_index, :3] = 0.0
     return mask
+
+
+def FlattenActiveDecisionTensor(
+    decisionTensor: torch.Tensor,
+) -> torch.Tensor:
+    """Flatten the strict 12xSE(3) body plus 3-DOF camera boundary."""
+    body = decisionTensor[
+        ..., :ModuleDim.DecisionBodyEndpointCount, :].flatten(start_dim=-2)
+    camera_rotation = decisionTensor[
+        ..., ModuleDim.DecisionCameraEndpointIndex, 3:6]
+    return torch.cat([body, camera_rotation], dim=-1)
+
+
+def UnflattenActiveDecisionTensor(
+    activeDecision: torch.Tensor,
+) -> torch.Tensor:
+    """Restore the 13x6 carrier without creating camera-translation coordinates."""
+    body_dof = ModuleDim.DecisionBodyDofCount
+    body = activeDecision[..., :body_dof].reshape(
+        *activeDecision.shape[:-1],
+        ModuleDim.DecisionBodyEndpointCount,
+        ModuleDim.DecisionActionDim)
+    camera = torch.cat([
+        activeDecision.new_zeros(*activeDecision.shape[:-1], 3),
+        activeDecision[..., body_dof:]], dim=-1).unsqueeze(-2)
+    return torch.cat([body, camera], dim=-2)
 
 
 class EndpointPoseEncoder(AGICoreModule):
     def __init__(
         self,
-        endpointCount: int = ModuleDim.DecisionEndpointCount,
+        endpointCount: int = ModuleDim.DecisionBodyEndpointCount,
         poseDim: int = ModuleDim.DecisionEndpointPoseDim,
         embedDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
-        actionDim: int = ModuleDim.DecisionActionDim,
         hidden: int = 256,
     ):
         super().__init__()
         self.endpoint_count = int(endpointCount)
         self.pose_dim = int(poseDim)
         self.embed_dim = int(embedDim)
-        self.action_dim = int(actionDim)
         self.endpoint_embed = nn.Parameter(torch.zeros(1, self.endpoint_count, self.embed_dim))
-        # A fixed code preserves endpoint identity when loading older checkpoints whose
-        # learned endpoint embeddings may all be equal.
+        # A fixed code preserves endpoint identity independently of learned embeddings.
         position = torch.arange(self.endpoint_count, dtype=torch.float32).unsqueeze(1)
         frequency = 10000.0 ** (
             -torch.arange(0, self.embed_dim, 2, dtype=torch.float32)
@@ -181,12 +235,10 @@ class EndpointPoseEncoder(AGICoreModule):
             endpoint_identity.unsqueeze(0),
             persistent=False,
         )
-        # Each endpoint token carries both where it is (measured pose) and how well it tracked
-        # its last command (tracking error), so the whole decision/temporal stack downstream
-        # perceives actuator drift / limits, not just the current pose.
+        # The pose input is body-relative proprioception, never raw world coordinates.
         self.token_net = nn.Sequential(
-            nn.LayerNorm(self.pose_dim + self.action_dim * 2),
-            nn.Linear(self.pose_dim + self.action_dim * 2, hidden),
+            nn.LayerNorm(self.pose_dim),
+            nn.Linear(self.pose_dim, hidden),
             nn.SiLU(),
             nn.Linear(hidden, self.embed_dim),
             nn.LayerNorm(self.embed_dim),
@@ -201,18 +253,70 @@ class EndpointPoseEncoder(AGICoreModule):
 
     def forward(
         self,
-        endpointPose: torch.Tensor,
-        targetTrackingError: torch.Tensor,
-        plannerTrackingError: torch.Tensor,) -> EndpointPoseEncoding:
-        endpointPose = NormalizePose(endpointPose)
+        endpointPoseRelative: torch.Tensor,) -> EndpointPoseEncoding:
+        endpoint_pose_relative = NormalizePose(endpointPoseRelative)
         tokens = (
-            self.token_net(torch.cat([endpointPose, targetTrackingError, plannerTrackingError], dim=-1))
+            self.token_net(endpoint_pose_relative)
             + self.endpoint_embed
             + self.endpoint_identity)
-        # Keep identity attached through a nonlinear map; averaging first would reduce
-        # every endpoint embedding to the same input-independent constant.
-        feat = self.summary_net(tokens).mean(dim=1)
-        return EndpointPoseEncoding(endpoint_pose_tokens=tokens, endpoint_pose_feat=feat)
+        body_feat = self.summary_net(tokens).mean(dim=1)
+        return EndpointPoseEncoding(
+            endpoint_pose_tokens=tokens,
+            body_pose_feat=body_feat)
+
+
+class EndpointControlEncoder(AGICoreModule):
+    def __init__(
+        self,
+        embedDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        hidden: int = 256,
+    ):
+        super().__init__()
+        self.endpoint_count = ModuleDim.DecisionEndpointCount
+        self.action_dim = ModuleDim.DecisionActionDim
+        self.embed_dim = int(embedDim)
+        endpoint_control_dim = self.action_dim * 2
+        camera_control_dim = ModuleDim.DecisionCameraDofCount * 2
+        self.token_net = nn.Sequential(
+            nn.LayerNorm(endpoint_control_dim),
+            nn.Linear(endpoint_control_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),)
+        self.camera_token_net = nn.Sequential(
+            nn.LayerNorm(camera_control_dim),
+            nn.Linear(camera_control_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),)
+        self.summary_net = nn.Sequential(
+            nn.LayerNorm(2 * ModuleDim.DecisionActiveDofCount),
+            nn.Linear(2 * ModuleDim.DecisionActiveDofCount, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),)
+
+    def forward(
+        self,
+        targetTrackingError: torch.Tensor,
+        plannerTrackingError: torch.Tensor,) -> EndpointControlEncoding:
+        body_control = torch.cat([
+            targetTrackingError[:, :ModuleDim.DecisionBodyEndpointCount],
+            plannerTrackingError[:, :ModuleDim.DecisionBodyEndpointCount]],
+            dim=-1)
+        camera_control = torch.cat([
+            targetTrackingError[
+                :, ModuleDim.DecisionCameraEndpointIndex, 3:6],
+            plannerTrackingError[
+                :, ModuleDim.DecisionCameraEndpointIndex, 3:6]], dim=-1)
+        active_control = torch.cat([
+            FlattenActiveDecisionTensor(targetTrackingError),
+            FlattenActiveDecisionTensor(plannerTrackingError)], dim=-1)
+        return EndpointControlEncoding(
+            endpoint_control_tokens=torch.cat([
+                self.token_net(body_control),
+                self.camera_token_net(camera_control).unsqueeze(1)], dim=1),
+            control_feedback_feat=self.summary_net(active_control))
 
 
 class ActionConstraintProjector(AGICoreModule):
@@ -224,12 +328,6 @@ class ActionConstraintProjector(AGICoreModule):
         rotationLimit: float = 0.25,
     ):
         super().__init__()
-        action_mask = DecisionActionMask(endpointCount, actionDim)
-        self.register_buffer(
-            "action_mask",
-            action_mask.view(1, int(endpointCount), int(actionDim)),
-            persistent=False,
-        )
         action_limit = torch.empty(int(endpointCount), int(actionDim))
         action_limit[:, :3] = float(translationLimit)
         action_limit[:, 3:] = float(rotationLimit)
@@ -237,55 +335,41 @@ class ActionConstraintProjector(AGICoreModule):
             "action_limit",
             action_limit.view(1, int(endpointCount), int(actionDim)),
             persistent=True,)
+        self.register_buffer(
+            "action_mask",
+            DecisionActionMask(endpointCount, actionDim).view(
+                1, int(endpointCount), int(actionDim)),
+            persistent=True,)
 
     def forward(self, decisionLatent: torch.Tensor) -> torch.Tensor:
-        masked = decisionLatent * self.action_mask
         translation = (
-            masked[..., :3]
-            / (1.0 + masked[..., :3].norm(dim=-1, keepdim=True))
+            decisionLatent[..., :3]
+            / (1.0 + decisionLatent[..., :3].norm(dim=-1, keepdim=True))
             * self.action_limit[..., :1])
         rotation = (
-            masked[..., 3:]
-            / (1.0 + masked[..., 3:].norm(dim=-1, keepdim=True))
+            decisionLatent[..., 3:]
+            / (1.0 + decisionLatent[..., 3:].norm(dim=-1, keepdim=True))
             * self.action_limit[..., 3:4])
-        return torch.cat([translation, rotation], dim=-1)
+        return torch.cat([translation, rotation], dim=-1) * self.action_mask
+
+    def Mask(self, decisionTensor: torch.Tensor) -> torch.Tensor:
+        return decisionTensor * self.action_mask
 
     def Normalize(self, decisionTensor: torch.Tensor) -> torch.Tensor:
         return decisionTensor / self.action_limit * self.action_mask
 
-    def Mask(self, decisionTensor: torch.Tensor) -> torch.Tensor:
-        mask = self.action_mask.reshape(
-            *([1] * (decisionTensor.dim() - 2)),
-            self.action_mask.size(-2),
-            self.action_mask.size(-1))
-        return decisionTensor * mask
 
-
-class EndpointPoseDecoder(AGICoreModule):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, baseEndpointPose: torch.Tensor, decisionTensor: torch.Tensor) -> torch.Tensor:
-        return ApplyPoseDelta(baseEndpointPose, decisionTensor)
-
-
-class DecisionFeedbackEncoder(AGICoreModule):
+class EndpointActionEncoder(AGICoreModule):
     def __init__(
         self,
-        endpointCount: int = ModuleDim.DecisionEndpointCount,
-        poseDim: int = ModuleDim.DecisionEndpointPoseDim,
-        actionDim: int = ModuleDim.DecisionActionDim,
-        poseFeatDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
-        outDim: int = ModuleDim.DecisionFeedbackEmbedDim,
+        outDim: int = ModuleDim.EndpointActionEmbedDim,
         hidden: int = 512,
     ):
         super().__init__()
-        self.endpoint_count = int(endpointCount)
-        self.pose_dim = int(poseDim)
-        self.action_dim = int(actionDim)
-        self.pose_feat_dim = int(poseFeatDim)
+        self.endpoint_count = ModuleDim.DecisionEndpointCount
+        self.action_dim = ModuleDim.DecisionActionDim
         self.out_dim = int(outDim)
-        in_dim = self.endpoint_count * self.action_dim + self.endpoint_count * self.pose_dim + self.pose_feat_dim
+        in_dim = ModuleDim.DecisionActiveDofCount
         self.net = nn.Sequential(
             nn.LayerNorm(in_dim),
             nn.Linear(in_dim, hidden),
@@ -298,16 +382,45 @@ class DecisionFeedbackEncoder(AGICoreModule):
 
     def forward(
         self,
+        decisionTensor: torch.Tensor,) -> torch.Tensor:
+        return self.net(FlattenActiveDecisionTensor(decisionTensor))
+
+
+class DecisionFeedbackEncoder(AGICoreModule):
+    """Closed-loop decision feedback kept separate from the World efference copy."""
+
+    def __init__(
+        self,
+        stateFeatureDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        physicalReferenceDim: int = ModuleDim.RobotPhysicalReferenceDim,
+        outDim: int = ModuleDim.EndpointActionEmbedDim,
+        hidden: int = 512,):
+        super().__init__()
+        self.endpoint_count = ModuleDim.DecisionEndpointCount
+        self.action_dim = ModuleDim.DecisionActionDim
+        in_dim = (
+            ModuleDim.DecisionActiveDofCount
+            + 2 * int(stateFeatureDim)
+            + int(physicalReferenceDim))
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, int(outDim)),
+            nn.LayerNorm(int(outDim)),)
+
+    def forward(
+        self,
         decisionTensor: torch.Tensor,
-        targetEndpointPose: torch.Tensor,
-        endpointPoseFeat: torch.Tensor,
-    ) -> torch.Tensor:
-        x = torch.cat([
-            decisionTensor.reshape(decisionTensor.size(0), self.endpoint_count * self.action_dim),
-            targetEndpointPose.reshape(targetEndpointPose.size(0), self.endpoint_count * self.pose_dim),
-            endpointPoseFeat,
-        ], dim=-1)
-        return self.net(x)
+        robotStateEncoding: DecisionRobotStateEncoding,
+        robotPhysicalReference: torch.Tensor,) -> torch.Tensor:
+        return self.net(torch.cat([
+            FlattenActiveDecisionTensor(decisionTensor),
+            robotStateEncoding.body_pose.body_pose_feat,
+            robotStateEncoding.endpoint_control.control_feedback_feat,
+            robotPhysicalReference], dim=-1))
 
 
 class LatentFactorProjector(AGICoreModule):
@@ -407,7 +520,8 @@ class SE3ActionHead(AGICoreModule):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         active = self.net(x)
-        full = active.new_zeros(x.size(0), self.endpoint_count * self.action_dim)
+        full = active.new_zeros(
+            x.size(0), self.endpoint_count * self.action_dim)
         full = full.scatter(
             1,
             self.active_flat_indices.unsqueeze(0).expand(x.size(0), -1),
@@ -448,11 +562,12 @@ class ResidualErrorCompensator(SE3ActionHead):
 
 
 class EndpointActionRefiner(AGICoreModule):
-    """Shared local residual head that preserves per-endpoint pose/error identity."""
+    """Local residual heads with a strict body-SE(3)/camera-SO(3) split."""
 
     def __init__(
         self,
-        endpointTokenDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        endpointPoseTokenDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        endpointControlTokenDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
         subgoalDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
         motionDim: int = 256,
         dynamicsDim: int = 128,
@@ -462,7 +577,8 @@ class EndpointActionRefiner(AGICoreModule):
     ):
         super().__init__()
         local_dim = (
-            int(endpointTokenDim)
+            int(endpointPoseTokenDim)
+            + int(endpointControlTokenDim)
             + int(subgoalDim)
             + int(motionDim)
             + int(dynamicsDim)
@@ -472,27 +588,46 @@ class EndpointActionRefiner(AGICoreModule):
             nn.Linear(local_dim, hidden),
             nn.SiLU(),
             nn.Linear(hidden, int(actionDim)),)
+        self.camera_rotation_net = nn.Sequential(
+            nn.LayerNorm(local_dim),
+            nn.Linear(local_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, ModuleDim.DecisionCameraDofCount),)
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
+        nn.init.zeros_(self.camera_rotation_net[-1].weight)
+        nn.init.zeros_(self.camera_rotation_net[-1].bias)
 
     def forward(
         self,
-        endpointTokens: torch.Tensor,
+        endpointPoseTokens: torch.Tensor,
+        endpointControlTokens: torch.Tensor,
         zMotion: torch.Tensor,
         zDynamics: torch.Tensor,
         zUncertainty: torch.Tensor,
         subgoalFeature: torch.Tensor,) -> torch.Tensor:
-        endpoint_count = endpointTokens.size(1)
+        endpoint_count = endpointPoseTokens.size(1)
         global_local_context = torch.cat([
             zMotion,
             zDynamics,
             zUncertainty,
             subgoalFeature,
         ], dim=-1).unsqueeze(1).expand(-1, endpoint_count, -1)
-        return self.net(torch.cat([
-            endpointTokens,
+        local_features = torch.cat([
+            endpointPoseTokens,
+            endpointControlTokens,
             global_local_context,
-        ], dim=-1))
+        ], dim=-1)
+        body_action = self.net(local_features[
+            :, :ModuleDim.DecisionBodyEndpointCount])
+        camera_rotation = self.camera_rotation_net(local_features[
+            :, ModuleDim.DecisionCameraEndpointIndex])
+        camera_action = torch.cat([
+            camera_rotation.new_zeros(
+                camera_rotation.size(0),
+                ModuleDim.DecisionActionDim - ModuleDim.DecisionCameraDofCount),
+            camera_rotation], dim=-1).unsqueeze(1)
+        return torch.cat([body_action, camera_action], dim=1)
 
 
 class DiscreteCommandContract(AGICoreModule):
@@ -521,11 +656,9 @@ class DecisionDecouplerV2(AGICoreModule):
         planDim: int = 256,
         subgoalFeatureDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
         constraintTokenDim: int = 128,
-        endpointPoseFeatDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
-        feedbackEmbedDim: int = ModuleDim.DecisionFeedbackEmbedDim,
-        endpointCount: int = ModuleDim.DecisionEndpointCount,
-        poseDim: int = ModuleDim.DecisionEndpointPoseDim,
-        actionDim: int = ModuleDim.DecisionActionDim,
+        poseFeatureDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        physicalReferenceDim: int = ModuleDim.RobotPhysicalReferenceDim,
+        endpointActionEmbedDim: int = ModuleDim.EndpointActionEmbedDim,
         translationLimit: float = 0.05,
         rotationLimit: float = 0.25,
     ):
@@ -534,41 +667,61 @@ class DecisionDecouplerV2(AGICoreModule):
         self.plan_dim = int(planDim)
         self.subgoal_feature_dim = int(subgoalFeatureDim)
         self.constraint_token_dim = int(constraintTokenDim)
-        self.endpoint_pose_feat_dim = int(endpointPoseFeatDim)
-        self.feedback_embed_dim = int(feedbackEmbedDim)
-        self.endpoint_count = int(endpointCount)
-        self.pose_dim = int(poseDim)
-        self.action_dim = int(actionDim)
-        self.endpoint_names = tuple(ModuleDim.DecisionEndpointNames)
-
+        self.pose_feature_dim = int(poseFeatureDim)
+        self.physical_reference_dim = int(physicalReferenceDim)
+        self.endpoint_action_embed_dim = int(endpointActionEmbedDim)
+        self.endpoint_count = ModuleDim.DecisionEndpointCount
+        self.body_endpoint_count = ModuleDim.DecisionBodyEndpointCount
+        self.pose_dim = ModuleDim.DecisionEndpointPoseDim
+        self.action_dim = ModuleDim.DecisionActionDim
         self.endpoint_pose_encoder = EndpointPoseEncoder(
-            endpointCount=self.endpoint_count,
+            endpointCount=self.body_endpoint_count,
             poseDim=self.pose_dim,
-            embedDim=self.endpoint_pose_feat_dim,
+            embedDim=self.pose_feature_dim,
+        )
+        self.endpoint_control_encoder = EndpointControlEncoder(
+            embedDim=self.pose_feature_dim,
         )
         self.action_projector = ActionConstraintProjector(
             endpointCount=self.endpoint_count,
             actionDim=self.action_dim,
             translationLimit=translationLimit,
             rotationLimit=rotationLimit,)
-        self.endpoint_pose_decoder = EndpointPoseDecoder()
-        self.decision_feedback_encoder = DecisionFeedbackEncoder(
-            endpointCount=self.endpoint_count,
-            poseDim=self.pose_dim,
-            actionDim=self.action_dim,
-            poseFeatDim=self.endpoint_pose_feat_dim,
-            outDim=self.feedback_embed_dim,
+        self.endpoint_action_encoder = EndpointActionEncoder(
+            outDim=self.endpoint_action_embed_dim,
         )
+        self.decision_feedback_encoder = DecisionFeedbackEncoder(
+            stateFeatureDim=self.pose_feature_dim,
+            physicalReferenceDim=self.physical_reference_dim,
+            outDim=self.endpoint_action_embed_dim,)
+        self.camera_state_token = nn.Sequential(
+            nn.LayerNorm(self.physical_reference_dim),
+            nn.Linear(self.physical_reference_dim, self.pose_feature_dim),
+            nn.SiLU(),
+            nn.Linear(self.pose_feature_dim, self.pose_feature_dim),
+            nn.LayerNorm(self.pose_feature_dim),)
 
-        factor_input = self.decision_dim + self.plan_dim + self.subgoal_feature_dim + self.endpoint_pose_feat_dim
+        factor_input = (
+            self.decision_dim
+            + self.plan_dim
+            + self.subgoal_feature_dim
+            + self.pose_feature_dim
+            + self.physical_reference_dim
+            + self.pose_feature_dim)
         self.factor_projector = LatentFactorProjector(factor_input)
         self.cross_attention = TaskMotionCrossAttention(tokenDim=self.constraint_token_dim)
 
         z_total = 256 + 256 + 128 + 128 + 64
         cross_dim = 256 * 2
-        action_input = z_total + self.endpoint_pose_feat_dim + self.plan_dim + self.subgoal_feature_dim + cross_dim
-        dyn_input = 128 + self.endpoint_pose_feat_dim + cross_dim
-        residual_input = 64 + self.endpoint_pose_feat_dim + self.subgoal_feature_dim
+        action_input = (
+            z_total
+            + self.pose_feature_dim
+            + self.plan_dim
+            + self.subgoal_feature_dim
+            + cross_dim)
+        dyn_input = 128 + self.pose_feature_dim + cross_dim
+        residual_input = (
+            64 + self.pose_feature_dim + self.subgoal_feature_dim)
 
         self.action_head = SE3ActionHead(
             action_input,
@@ -587,84 +740,56 @@ class DecisionDecouplerV2(AGICoreModule):
             actionDim=self.action_dim,
         )
         self.endpoint_action_refiner = EndpointActionRefiner(
-            endpointTokenDim=self.endpoint_pose_feat_dim,
+            endpointPoseTokenDim=self.pose_feature_dim,
+            endpointControlTokenDim=self.pose_feature_dim,
             subgoalDim=self.subgoal_feature_dim,
             motionDim=self.factor_projector.motion_dim,
             dynamicsDim=self.factor_projector.dyn_dim,
             uncertaintyDim=self.factor_projector.uncertainty_dim,
             actionDim=self.action_dim,)
 
-    def EncodeEndpointPose(
-        self,
-        endpointPose: torch.Tensor,
-        targetTrackingError: torch.Tensor,
-        plannerTrackingError: torch.Tensor,) -> EndpointPoseEncoding:
-        return self.endpoint_pose_encoder(endpointPose, targetTrackingError, plannerTrackingError)
+    def ProjectDecisionLatent(self, decisionLatent: torch.Tensor) -> torch.Tensor:
+        return self.action_projector(decisionLatent)
 
     def MaskDecisionTensor(self, decisionTensor: torch.Tensor) -> torch.Tensor:
         return self.action_projector.Mask(decisionTensor)
 
-    def ProjectDecisionLatent(self, decisionLatent: torch.Tensor) -> torch.Tensor:
-        return self.action_projector(decisionLatent)
-
     def NormalizeDecisionTensor(self, decisionTensor: torch.Tensor) -> torch.Tensor:
         return self.action_projector.Normalize(decisionTensor)
 
-    def DecodeEndpointPose(self, baseEndpointPose: torch.Tensor, decisionTensor: torch.Tensor) -> torch.Tensor:
-        return self.endpoint_pose_decoder(baseEndpointPose, self.MaskDecisionTensor(decisionTensor))
+    def EncodeRobotState(
+        self,
+        bodyEndpointPoseRelative: torch.Tensor,
+        targetTrackingError: torch.Tensor,
+        plannerTrackingError: torch.Tensor,) -> DecisionRobotStateEncoding:
+        return DecisionRobotStateEncoding(
+            body_pose=self.endpoint_pose_encoder(bodyEndpointPoseRelative),
+            endpoint_control=self.endpoint_control_encoder(
+                targetTrackingError,
+                plannerTrackingError))
+
+    def EncodeEndpointAction(
+        self,
+        decisionTensor: torch.Tensor,) -> torch.Tensor:
+        return self.endpoint_action_encoder(
+            self.MaskDecisionTensor(decisionTensor))
 
     def EncodeDecisionFeedback(
         self,
         decisionTensor: torch.Tensor,
-        targetEndpointPose: torch.Tensor,
-        endpointPoseEncoding: EndpointPoseEncoding,
-    ) -> torch.Tensor:
+        robotStateEncoding: DecisionRobotStateEncoding,
+        robotPhysicalReference: torch.Tensor,) -> torch.Tensor:
         return self.decision_feedback_encoder(
-            decisionTensor,
-            targetEndpointPose,
-            endpointPoseEncoding.endpoint_pose_feat,
-        )
+            self.MaskDecisionTensor(decisionTensor),
+            robotStateEncoding,
+            robotPhysicalReference)
 
-    def ToMotionCommand(self, decision: DecoupledDecision) -> MotionCommand:
-        decision_dof_mask = self.action_projector.action_mask.expand(
-            decision.decision_tensor.size(0), -1, -1).bool()
-        return MotionCommand(
-            decision_tensor=decision.decision_tensor,
-            target_endpoint_pose=decision.target_endpoint_pose,
-            endpoint_names=self.endpoint_names,
-            decision_dof_mask=decision_dof_mask,
-            gripper_cmd=decision.gripper_cmd,
-            gripper_valid=decision.gripper_valid,
-            mode_logits=decision.mode_logits,
-            mode_valid=decision.mode_valid,
-            safety_scores=decision.safety_scores,
-            safety_names=SAFETY_MARGIN_NAMES,
-        )
-
-    def RebaseMotionCommand(
+    def CameraMotionFromDecisionTensor(
         self,
-        command: MotionCommand,
-        currentEndpointPose: torch.Tensor,
-        risk: torch.Tensor,
-        confidence: torch.Tensor,
-        precision: torch.Tensor,) -> MotionCommand:
-        target_endpoint_pose = command.target_endpoint_pose.clone()
-        for endpoint_index in ModuleDim.DecisionRotationOnlyEndpoints:
-            target_endpoint_pose[:, endpoint_index, :3] = (
-                currentEndpointPose[:, endpoint_index, :3])
-        remaining_decision = RelativePoseError(
-            currentEndpointPose,
-            target_endpoint_pose)
-        remaining_decision = self.MaskDecisionTensor(remaining_decision)
-        return replace(
-            command,
-            decision_tensor=remaining_decision,
-            target_endpoint_pose=target_endpoint_pose,
-            safety_scores=self.SafetyScores(
-                remaining_decision,
-                risk,
-                confidence,
-                precision))
+        decisionTensor: torch.Tensor,) -> torch.Tensor:
+        camera_delta = self.MaskDecisionTensor(decisionTensor)[
+            ..., ModuleDim.DecisionCameraEndpointIndex, :]
+        return AxisAngleToQuat(camera_delta[..., 3:6])
 
     def SafetyScores(
         self,
@@ -687,12 +812,10 @@ class DecisionDecouplerV2(AGICoreModule):
         decision: DecoupledDecision,
         decisionLatent: torch.Tensor,
         decisionTensor: torch.Tensor,
-        baseEndpointPose: torch.Tensor,
         risk: torch.Tensor,
         confidence: torch.Tensor,
         precision: torch.Tensor,) -> DecoupledDecision:
         decision_tensor = self.MaskDecisionTensor(decisionTensor)
-        target_endpoint_pose = self.DecodeEndpointPose(baseEndpointPose, decision_tensor)
         safety_scores = self.SafetyScores(
             decision_tensor,
             risk,
@@ -700,9 +823,8 @@ class DecisionDecouplerV2(AGICoreModule):
             precision,)
         return replace(
             decision,
-            decision_latent=decisionLatent,
+            decision_latent=self.MaskDecisionTensor(decisionLatent),
             decision_tensor=decision_tensor,
-            target_endpoint_pose=target_endpoint_pose,
             safety_scores=safety_scores,)
 
     def forward(
@@ -711,14 +833,21 @@ class DecisionDecouplerV2(AGICoreModule):
         planLatent: torch.Tensor,
         subgoalFeature: torch.Tensor,
         constraintTokens: torch.Tensor,
-        endpointPoseEncoding: EndpointPoseEncoding,
-        baseEndpointPose: torch.Tensor,
+        robotStateEncoding: DecisionRobotStateEncoding,
+        robotPhysicalReference: torch.Tensor,
         risk: torch.Tensor,
         confidence: torch.Tensor,
         precision: torch.Tensor,
     ) -> DecoupledDecision:
-        endpoint_feat = endpointPoseEncoding.endpoint_pose_feat
-        factors = self.factor_projector(torch.cat([decisionBackbone, planLatent, subgoalFeature, endpoint_feat], dim=-1))
+        endpoint_pose_encoding = robotStateEncoding.body_pose
+        endpoint_control_encoding = robotStateEncoding.endpoint_control
+        factors = self.factor_projector(torch.cat([
+            decisionBackbone,
+            planLatent,
+            subgoalFeature,
+            endpoint_pose_encoding.body_pose_feat,
+            robotPhysicalReference,
+            endpoint_control_encoding.control_feedback_feat], dim=-1))
         cross = self.cross_attention(factors["z_task"], factors["z_motion"], constraintTokens)
         z_cat = torch.cat([
             factors["z_task"],
@@ -728,22 +857,38 @@ class DecisionDecouplerV2(AGICoreModule):
             factors["z_uncertainty"],
         ], dim=-1)
 
-        action_in = torch.cat([z_cat, endpoint_feat, planLatent, subgoalFeature, cross], dim=-1)
-        dyn_in = torch.cat([factors["z_dyn"], endpoint_feat, cross], dim=-1)
-        residual_in = torch.cat([factors["z_uncertainty"], endpoint_feat, subgoalFeature], dim=-1)
+        action_in = torch.cat([
+            z_cat,
+            endpoint_pose_encoding.body_pose_feat,
+            planLatent,
+            subgoalFeature,
+            cross], dim=-1)
+        dyn_in = torch.cat([
+            factors["z_dyn"],
+            endpoint_pose_encoding.body_pose_feat,
+            cross], dim=-1)
+        residual_in = torch.cat([
+            factors["z_uncertainty"],
+            endpoint_pose_encoding.body_pose_feat,
+            subgoalFeature], dim=-1)
+        camera_state_token = self.camera_state_token(
+            robotPhysicalReference).unsqueeze(1)
+        endpoint_pose_tokens = torch.cat([
+            endpoint_pose_encoding.endpoint_pose_tokens,
+            camera_state_token], dim=1)
 
-        decision_latent = (
+        decision_latent = self.MaskDecisionTensor(
             self.action_head(action_in)
             + 0.1 * self.dynamics_head(dyn_in)
             + 0.1 * self.residual_compensator(residual_in)
             + 0.1 * self.endpoint_action_refiner(
-                endpointPoseEncoding.endpoint_pose_tokens,
+                endpoint_pose_tokens,
+                endpoint_control_encoding.endpoint_control_tokens,
                 factors["z_motion"],
                 factors["z_dyn"],
                 factors["z_uncertainty"],
                 subgoalFeature))
         decision_tensor = self.ProjectDecisionLatent(decision_latent)
-        target_endpoint_pose = self.DecodeEndpointPose(baseEndpointPose, decision_tensor)
         constraint_out = self.discrete_command_contract(factors["z_constraint"])
         safety_scores = self.SafetyScores(decision_tensor, risk, confidence, precision)
         explanation_tokens = constraintTokens.mean(dim=1)
@@ -756,7 +901,6 @@ class DecisionDecouplerV2(AGICoreModule):
             z_uncertainty=factors["z_uncertainty"],
             decision_latent=decision_latent,
             decision_tensor=decision_tensor,
-            target_endpoint_pose=target_endpoint_pose,
             gripper_cmd=constraint_out["gripper_cmd"],
             gripper_valid=constraint_out["gripper_valid"],
             mode_logits=constraint_out["mode_logits"],

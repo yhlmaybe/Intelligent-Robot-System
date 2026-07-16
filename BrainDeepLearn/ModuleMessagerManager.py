@@ -82,11 +82,14 @@ class ModuleDim:
     GatherTypeDim: int = 8
     ActTypeDim: int = 8
     ArmCount: int = 2                  # per-arm wrist SE(3) targets
-    DecisionEndpointCount: int = 13
     DecisionEndpointPoseDim: int = 7
     DecisionActionDim: int = 6
     DecisionEndpointPoseFeatDim: int = 128
-    DecisionFeedbackEmbedDim: int = 256
+    # q_camera_base is an XYZW carrier for exactly three camera-rotation DOFs.
+    # Gravity is an environmental direction, not a robot/control DOF. Fixed
+    # camera/base translation is deliberately absent from every learned input.
+    RobotPhysicalReferenceDim: int = 7  # q_camera_base (4) + gravity_camera (3)
+    EndpointActionEmbedDim: int = 256
     TemporalPrimitiveCount: int = 6
     TemporalContextDim: int = 20
     TemporalReasonDim: int = 8
@@ -97,7 +100,7 @@ class ModuleDim:
         "CANCEL",
         "FAILSAFE_STOP",
         "REDISPATCH",)
-    DecisionEndpointNames: Tuple[str, ...] = (
+    RobotStateEndpointNames: Tuple[str, ...] = (
         "left_thumb_tip",
         "left_index_tip",
         "left_middle_tip",
@@ -110,11 +113,41 @@ class ModuleDim:
         "right_little_tip",
         "left_wrist",
         "right_wrist",
-        "camera",)
-    # Endpoints with restricted rotational control and no translation. The fixed
-    # camera mount exposes pan/tilt only, so translation and roll are absent from
-    # both the policy parameterization and the proposed action tensor.
-    DecisionRotationOnlyEndpoints: Tuple[int, ...] = (DecisionEndpointNames.index("camera"),)
+        "camera_optical",)
+    RobotStateEndpointCount: int = len(RobotStateEndpointNames)
+    RobotStateCameraEndpointIndex: int = RobotStateEndpointNames.index(
+        "camera_optical")
+    RobotStateBodyEndpointSlice: slice = slice(
+        0, RobotStateCameraEndpointIndex)
+    RobotStateControlledEndpointSlice: slice = slice(
+        0, RobotStateEndpointCount)
+
+    # Body proprioception and action ownership are deliberately separate.
+    # Strict control boundary: 12 body SE(3) endpoints plus all three camera
+    # rotations. The camera has no translational action coordinates.
+    DecisionBodyEndpointNames: Tuple[str, ...] = RobotStateEndpointNames[
+        RobotStateBodyEndpointSlice]
+    DecisionBodyEndpointCount: int = len(DecisionBodyEndpointNames)
+    DecisionEndpointNames: Tuple[str, ...] = RobotStateEndpointNames
+    DecisionEndpointCount: int = len(DecisionEndpointNames)
+    DecisionBodyDofCount: int = (
+        DecisionBodyEndpointCount * DecisionActionDim)
+    DecisionCameraDofCount: int = 3
+    CameraMotionDim: int = 4  # XYZW unit quaternion, three rotational DOFs
+    DecisionActiveDofCount: int = (
+        DecisionBodyDofCount + DecisionCameraDofCount)
+    DecisionLeftWristEndpointIndex: int = DecisionEndpointNames.index(
+        "left_wrist")
+    DecisionRightWristEndpointIndex: int = DecisionEndpointNames.index(
+        "right_wrist")
+    DecisionCameraEndpointIndex: int = DecisionEndpointNames.index(
+        "camera_optical")
+    DecisionRotationOnlyEndpoints: Tuple[int, ...] = (
+        DecisionCameraEndpointIndex,)
+    DecisionEndpointReferenceRobotStateIndices: Tuple[int, ...] = (
+        (DecisionLeftWristEndpointIndex,) * 5
+        + (DecisionRightWristEndpointIndex,) * 5
+        + (RobotStateCameraEndpointIndex,) * 2)
     GatherParamDim: int = 32
 
     # Object usage knowledge bank

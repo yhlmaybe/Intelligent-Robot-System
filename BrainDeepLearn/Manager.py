@@ -1,10 +1,13 @@
 from __future__ import annotations
 from typing import Callable, Tuple, List, Dict, Any, Optional, Union
 from pathlib import Path
+from types import SimpleNamespace
+from dataclasses import dataclass
 import threading
 import random
 import time
 import json
+import math
 
 import numpy as np
 import torch
@@ -12,6 +15,7 @@ import torch.nn as nn
 import shutil
 import traceback
 import os
+import tempfile
 
 from torch.utils.data import Dataset, DataLoader
 
@@ -25,21 +29,146 @@ from ConsciousnessModule import TestConsciousMTool
 from IntentionModule import TestIntentionMTool
 from OCRModule import TestOCRMTool, OCREngineExtractor, IouXyxy
 from DataPreprocess import DataPreprocessor, DataResizeMeta, OfflineGameDataset, OfflineOCRDataset, OfflineOCRRecognitionDataset
-from AGICore import Agent, BRAIN_RUNTIME_SCHEMA_VERSION, BrainCore, TestAGICoreMTool
+from AGICore import (
+    Agent,
+    BRAIN_RUNTIME_SCHEMA_VERSION,
+    BrainCore,
+    ExportDeploymentModelState,
+    ExportBrainModelState,
+    IsWorldRuntimeStateKey,
+    LoadBrainModelState,
+    LoadDeploymentModelState,
+    TestAGICoreMTool)
 from Config import BasicParameters
 from CoreTypes import (
     AgentActInput,
+    CameraCalibration,
+    ExpectedRobotStateWireMetadata,
+    OFFLINE_SENSOR_MANIFEST_SCHEMA_VERSION,
+    ROBOT_STATE_FIELDS,
     ROBOT_STATE_WIRE_SCHEMA_VERSION,
+    SENSOR_PACKET_WIRE_FIELDS,
     SENSOR_PACKET_WIRE_SCHEMA_VERSION,
     RobotState,
+    ValidateOfflineSensorManifest,
+    ValidateRobotStateWirePacket,
     TEXT_TRUST_OCR_OBSERVED,
     TEXT_TRUST_OPERATOR_COMMAND,
     TEXT_TRUST_UNSAFE_EXTERNAL)
 from ModuleMessagerManager import ModuleDim
-from FunctionTools import SynchronizeGrowableLoRATopologyForFullLoad
 
 
 TRAIN_CHECKPOINT_SCHEMA_VERSION = BRAIN_RUNTIME_SCHEMA_VERSION
+
+MODULE_PARAMETER_FIELDS = frozenset({
+    "schema_version",
+    "calibration_id",
+    "brain",
+})
+
+TRAIN_CHECKPOINT_FIELDS = frozenset({
+    "schema_version",
+    "calibration_id",
+    "world_frame_id",
+    "epoch",
+    "next_batch_index",
+    "epoch_loss_sum",
+    "best_val",
+    "no_improve",
+    "train_stage",
+    "batch_size",
+    "online_learning",
+    "brain",
+    "online_candidates",
+    "opt_actor",
+    "opt_critic",
+    "opt_world",
+    "train_indices",
+    "val_indices",
+    "test_indices",
+    "processed_sample_count_total",
+    "rng",
+    "buffers",
+    "world_memory",
+    "memory_durable",
+})
+
+TRAIN_RNG_FIELDS = frozenset({
+    "python",
+    "torch",
+    "numpy",
+    "cuda_all",
+})
+
+DEPLOYMENT_MANIFEST_FIELDS = frozenset({
+    "schema_version",
+    "calibration_id",
+    "generation",
+    "model_path",
+    "world_memory_path",
+    "memory_path",
+})
+
+OCR_METADATA_FIELDS = frozenset({
+    "vocab",
+    "blank_index",
+    "addon_cfg",
+})
+
+OCR_MODULE_PARAMETER_FIELDS = frozenset({
+    "schema_version",
+    "ocr",
+    "ocr_meta",
+})
+
+OCR_RECOGNIZER_PARAMETER_FIELDS = frozenset({
+    "schema_version",
+    "recognizer",
+    "ocr_meta",
+})
+
+OCR_TRAIN_CHECKPOINT_FIELDS = frozenset({
+    "schema_version",
+    "epoch",
+    "best_val",
+    "ocr",
+    "ocr_meta",
+    "optimizer",
+    "train_indices",
+    "val_indices",
+    "test_indices",
+    "processed_sample_count_total",
+    "rng",
+    "train_detection",
+    "train_recognition",
+})
+
+OCR_RECOGNIZER_TRAIN_CHECKPOINT_FIELDS = frozenset({
+    "schema_version",
+    "epoch",
+    "best_val",
+    "recognizer",
+    "ocr_meta",
+    "optimizer",
+    "train_indices",
+    "val_indices",
+    "test_indices",
+    "processed_sample_count_total",
+    "rng",
+})
+
+
+@dataclass(frozen=True)
+class TrainingResumeState:
+    epoch: int
+    next_batch_index: int
+    epoch_loss_sum: float
+    best_val: float
+    no_improve: int
+    processed_sample_count_total: int
+    train_dataset: Dataset
+    validation_dataset: Dataset
+    test_dataset: Dataset
 
 try:
     import imageio.v3 as iio
@@ -56,13 +185,30 @@ class SequentialTrajectoryLoader:
     def __init__(self, dataset: Dataset, *, batchSize: int):
         self.dataset = dataset
         self.batch_size = int(batchSize)
-        self.steps = len(dataset) // self.batch_size
+        if self.batch_size <= 0:
+            raise ValueError("batchSize must be positive")
+        dataset_size = len(dataset)
+        if dataset_size < self.batch_size:
+            raise ValueError(
+                f"sequential split has {dataset_size} frames, fewer than "
+                f"batchSize={self.batch_size}; it cannot form one recurrent batch")
+        if dataset_size % self.batch_size != 0:
+            raise ValueError(
+                f"sequential split has {dataset_size} frames, which is not divisible "
+                f"by batchSize={self.batch_size}; equal-length recurrent streams "
+                "cannot consume a partial batch")
+        self.steps = dataset_size // self.batch_size
 
     def __len__(self) -> int:
         return self.steps
 
     def __iter__(self):
-        for t in range(self.steps):
+        return self.IterFrom(0)
+
+    def IterFrom(self, startStep: int):
+        if type(startStep) is not int or not (0 <= startStep <= self.steps):
+            raise ValueError("startStep must be within the sequential loader")
+        for t in range(startStep, self.steps):
             items = [self.dataset[j * self.steps + t] for j in range(self.batch_size)]
             yield torch.utils.data.default_collate(items)
 
@@ -178,6 +324,8 @@ class ModuleController:
 
 
 class ManagerFunction:
+    DEFAULT_OVERRIDE_CHECKPOINT_WITH_MODULE_PARAMS = False
+
     def __init__(self, device: Optional[str] = None):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.controller = ModuleController()
@@ -185,8 +333,13 @@ class ManagerFunction:
         self.br_thread: Optional[threading.Thread] = None
         self.message_thread: Optional[threading.Thread] = None
         self.is_begin = False
-        self.overrideCheckpointWithModuleParams = True
+        self.overrideCheckpointWithModuleParams = (
+            self.DEFAULT_OVERRIDE_CHECKPOINT_WITH_MODULE_PARAMS)
         self.agent_handle: Optional[AgentHandle] = None
+        self.camera_calibration_id: Optional[str] = None
+        self.active_sensor_stream_id: Optional[str] = None
+        self.active_world_frame_id: Optional[str] = None
+        self.last_sensor_sequence_index: Optional[int] = None
         self.json_queue = None
 
         self.test = {
@@ -204,10 +357,21 @@ class ManagerFunction:
 
     @staticmethod
     def NormalizeTrainStage(trainStage: str) -> str:
-        stage = str(trainStage).strip().lower()
+        if type(trainStage) is not str:
+            raise TypeError("trainStage must be a string")
+        stage = trainStage.strip().lower()
         if stage not in ("full", "world", "policy"):
             raise ValueError("trainStage must be one of: full/world/policy")
         return stage
+
+    @staticmethod
+    def TrainStageLossNames(trainStage: str) -> Tuple[str, ...]:
+        stage = ManagerFunction.NormalizeTrainStage(trainStage)
+        if stage == "world":
+            return ("world",)
+        if stage == "policy":
+            return ("critic", "policy")
+        return ("world", "critic", "policy")
 
     @staticmethod
     def TrainStageOnlineWrappers(brain: BrainCore, trainStage: str) -> List[nn.Module]:
@@ -225,6 +389,9 @@ class ManagerFunction:
         evaluate: Callable[[], Any],) -> Any:
         """Run evaluation without changing the following training trajectory."""
         training_runtime = brain.ExportBuffers()
+        world = brain.RuntimeModule(brain.world)
+        training_world_physical = world.ExportPhysicalState()
+        training_memory_durable = brain.mem.ExportDurableState()
         training_rng = self.CaptureRngState()
         training_modes = [
             (module, bool(module.training))
@@ -234,6 +401,8 @@ class ManagerFunction:
             return evaluate()
         finally:
             try:
+                world.ImportPhysicalState(training_world_physical)
+                brain.mem.ImportDurableState(training_memory_durable)
                 brain.ImportBuffers(training_runtime)
             finally:
                 try:
@@ -257,8 +426,283 @@ class ManagerFunction:
             brain, evaluateTest)
         return validation_result, test_result
         
-    def InitAgentHandle(self):
-        self.agent_handle = AgentHandle()
+    @staticmethod
+    def LoadCameraCalibration(
+        calibrationPath: str = BasicParameters.CAMERA_CALIBRATION_PATH,
+        ) -> CameraCalibration:
+        """Load K once for the fixed, already rectified 512x512 RGB-D lattice."""
+        calibration = json.loads(Path(calibrationPath).read_text(encoding="utf-8"))
+        expected_fields = {
+            "version",
+            "calibration_id",
+            "camera_name",
+            "sensor_type",
+            "rgb_encoding",
+            "depth_unit",
+            "depth_representation",
+            "rgb_depth_alignment",
+            "rectification",
+            "synchronization",
+            "coordinate_frame",
+            "pixel_convention",
+            "image",
+            "camera_intrinsics",
+        }
+        if type(calibration) is not dict or set(calibration) != expected_fields:
+            raise ValueError("camera calibration fields do not match the current schema")
+        if calibration["version"] != "3.0":
+            raise ValueError("camera calibration version must be 3.0")
+        if (
+            type(calibration["calibration_id"]) is not str
+            or not calibration["calibration_id"]
+        ):
+            raise ValueError("camera calibration_id must be a non-empty string")
+        expected_contract = {
+            "sensor_type": "rgbd",
+            "rgb_encoding": "rgb8",
+            "depth_unit": "meter",
+            "depth_representation": "optical_axis_z",
+            "rgb_depth_alignment": "registered_to_rgb",
+            "rectification": "rectified",
+            "synchronization": "synchronized_exposure",
+        }
+        for name, expected in expected_contract.items():
+            if calibration[name] != expected:
+                raise ValueError(f"camera calibration {name} must be {expected!r}")
+        if calibration["coordinate_frame"] != {
+            "camera_frame": "camera_optical",
+            "handedness": "right_handed",
+            "x_axis_positive": "right",
+            "y_axis_positive": "down",
+            "z_axis_positive": "forward",
+        }:
+            raise ValueError("camera calibration optical-frame convention is invalid")
+        if calibration["pixel_convention"] != {
+            "pixel_centers": "integer_coordinates",
+            "resampling": "align_corners_false",
+        }:
+            raise ValueError("camera calibration pixel convention is invalid")
+
+        image = calibration["image"]
+        if type(image) is not dict or set(image) != {"width", "height"}:
+            raise ValueError("camera calibration image fields must be width and height")
+        if image != {
+            "width": BasicParameters.IMAGE_SIZE,
+            "height": BasicParameters.IMAGE_SIZE,
+        }:
+            raise ValueError(
+                f"camera calibration must use the fixed "
+                f"{BasicParameters.IMAGE_SIZE}x{BasicParameters.IMAGE_SIZE} lattice")
+
+        intrinsics = calibration["camera_intrinsics"]
+        if (
+            type(intrinsics) is not dict
+            or set(intrinsics) != {"model", "fx", "fy", "cx", "cy", "skew"}
+            or intrinsics["model"] != "pinhole"
+        ):
+            raise ValueError("camera intrinsics do not match the pinhole schema")
+        intrinsic_names = ("fx", "fy", "cx", "cy", "skew")
+        if any(type(intrinsics[name]) not in (int, float) for name in intrinsic_names):
+            raise TypeError("camera intrinsics must be JSON numbers")
+        values = [float(intrinsics[name]) for name in intrinsic_names]
+        if not np.isfinite(values).all() or min(values[0], values[1]) <= 0.0:
+            raise ValueError("camera intrinsics must be finite with positive focal lengths")
+        camera_intrinsics = torch.tensor([
+            [values[0], values[4], values[2]],
+            [0.0, values[1], values[3]],
+            [0.0, 0.0, 1.0],
+        ], dtype=torch.float32)
+        return CameraCalibration(
+            calibration_id=calibration["calibration_id"],
+            intrinsics=camera_intrinsics)
+
+    @staticmethod
+    def TensorizeRobotState(
+        state: Dict[str, Any],
+        device: torch.device,
+        *,
+        batched: bool,) -> RobotState:
+        if type(state) is not dict or set(state) != set(ROBOT_STATE_FIELDS):
+            raise ValueError(f"RobotState fields must be exactly {sorted(ROBOT_STATE_FIELDS)}")
+
+        tensors: Dict[str, torch.Tensor] = {}
+        for name in ROBOT_STATE_FIELDS:
+            try:
+                value = torch.as_tensor(state[name])
+            except Exception as error:
+                raise ValueError(f"RobotState {name} must contain real numbers") from error
+            if value.dtype == torch.bool or not (
+                value.is_floating_point()
+                or value.dtype in (
+                    torch.uint8,
+                    torch.int8,
+                    torch.int16,
+                    torch.int32,
+                    torch.int64,
+                )
+            ):
+                raise TypeError(f"RobotState {name} must contain real numbers")
+            if not bool(torch.isfinite(value).all().item()):
+                raise ValueError(f"RobotState {name} must contain only finite values")
+            if name == "executed_action_id":
+                if bool((value < 0).any().item()) or bool(
+                    (value != value.round()).any().item()
+                ):
+                    raise ValueError(
+                        "RobotState executed_action_id must contain non-negative integers")
+                value = value.to(device=device, dtype=torch.long)
+            else:
+                value = value.to(device=device, dtype=torch.float32)
+            tensors[name] = value
+
+        endpoint_shape = (
+            (None, ModuleDim.RobotStateEndpointCount, ModuleDim.DecisionEndpointPoseDim)
+            if batched else
+            (ModuleDim.RobotStateEndpointCount, ModuleDim.DecisionEndpointPoseDim))
+        planner_shape = (
+            (None, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim)
+            if batched else
+            (ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim))
+        base_orientation_shape = (None, 4) if batched else (4,)
+        gravity_shape = (None, 3) if batched else (3,)
+        actual_endpoint_shape = tuple(tensors["endpoint_pose"].shape)
+        actual_planner_shape = tuple(tensors["planner_expected_endpoint_pose"].shape)
+        actual_base_orientation_shape = tuple(
+            tensors["base_orientation_world"].shape)
+        actual_gravity_shape = tuple(tensors["gravity_direction_world"].shape)
+        if (
+            len(actual_endpoint_shape) != len(endpoint_shape)
+            or any(
+                expected is not None and actual != expected
+                for actual, expected in zip(actual_endpoint_shape, endpoint_shape))
+        ):
+            raise ValueError("RobotState endpoint_pose must have shape [B, 13, 7] or [13, 7]")
+        if (
+            len(actual_planner_shape) != len(planner_shape)
+            or any(
+                expected is not None and actual != expected
+                for actual, expected in zip(actual_planner_shape, planner_shape))
+        ):
+            raise ValueError(
+                "RobotState planner_expected_endpoint_pose must have shape [B, 13, 7] or [13, 7]")
+        if (
+            len(actual_base_orientation_shape) != len(base_orientation_shape)
+            or any(
+                expected is not None and actual != expected
+                for actual, expected in zip(
+                    actual_base_orientation_shape,
+                    base_orientation_shape))
+        ):
+            raise ValueError(
+                "RobotState base_orientation_world must have shape [B, 4] or [4]")
+        if (
+            len(actual_gravity_shape) != len(gravity_shape)
+            or any(
+                expected is not None and actual != expected
+                for actual, expected in zip(actual_gravity_shape, gravity_shape))
+        ):
+            raise ValueError(
+                "RobotState gravity_direction_world must have shape [B, 3] or [3]")
+
+        scalar_shape = (actual_endpoint_shape[0],) if batched else ()
+        if any(
+            tuple(tensors[name].shape) != scalar_shape
+            for name in ROBOT_STATE_FIELDS
+            if name not in (
+                "endpoint_pose",
+                "base_orientation_world",
+                "gravity_direction_world",
+                "planner_expected_endpoint_pose")
+        ):
+            raise ValueError(f"RobotState scalar fields must have shape {scalar_shape}")
+        if batched and any(
+            shape[0] != actual_endpoint_shape[0]
+            for shape in (
+                actual_planner_shape,
+                actual_base_orientation_shape,
+                actual_gravity_shape)
+        ):
+            raise ValueError("RobotState fields must have one batch size")
+
+        for name in (
+            "planner_progress",
+        ):
+            value = tensors[name]
+            if bool(((value < 0.0) | (value > 1.0)).any().item()):
+                raise ValueError(f"RobotState {name} must be in [0, 1]")
+        for name in (
+            "planner_executing",
+            "planner_reached",
+            "planner_failed",
+            "model_command_executed",
+        ):
+            value = tensors[name]
+            if bool(((value != 0.0) & (value != 1.0)).any().item()):
+                raise ValueError(f"RobotState {name} must contain only binary 0/1 flags")
+        if bool((tensors["planner_tracking_error"] < 0.0).any().item()):
+            raise ValueError("RobotState planner_tracking_error must be non-negative")
+        planner_terminal_count = (
+            tensors["planner_executing"]
+            + tensors["planner_reached"]
+            + tensors["planner_failed"])
+        if bool((planner_terminal_count > 1).any().item()):
+            raise ValueError(
+                "RobotState planner_executing/planner_reached/planner_failed "
+                "must be mutually exclusive")
+        model_command_executed = tensors["model_command_executed"].eq(1.0)
+        feedback_without_id = (
+            model_command_executed
+            & (tensors["executed_action_id"] == 0))
+        id_without_feedback = (
+            ~model_command_executed
+            & (tensors["executed_action_id"] != 0))
+        if bool((feedback_without_id | id_without_feedback).any().item()):
+            raise ValueError(
+                "RobotState model_command_executed and executed_action_id must "
+                "identify the same executed model command")
+        for name in ("endpoint_pose", "planner_expected_endpoint_pose"):
+            quaternion_norm = tensors[name][..., 3:7].norm(dim=-1)
+            if not torch.allclose(
+                quaternion_norm,
+                torch.ones_like(quaternion_norm),
+                rtol=1e-3,
+                atol=1e-3,
+            ):
+                raise ValueError(f"RobotState {name} quaternions must have unit length")
+        base_orientation_norm = tensors["base_orientation_world"].norm(dim=-1)
+        if not torch.allclose(
+            base_orientation_norm,
+            torch.ones_like(base_orientation_norm),
+            rtol=1e-3,
+            atol=1e-3,
+        ):
+            raise ValueError(
+                "RobotState base_orientation_world must have unit length")
+        gravity_norm = tensors["gravity_direction_world"].norm(dim=-1)
+        if not torch.allclose(
+            gravity_norm,
+            torch.ones_like(gravity_norm),
+            rtol=1e-3,
+            atol=1e-3,
+        ):
+            raise ValueError(
+                "RobotState gravity_direction_world must have unit length")
+        return {name: tensors[name] for name in ROBOT_STATE_FIELDS}  # type: ignore[return-value]
+
+    def InitAgentHandle(
+        self,
+        useHebbian: bool = True,
+        usePlanner: bool = True,):
+        calibration = self.LoadCameraCalibration()
+        self.camera_calibration_id = calibration.calibration_id
+        self.agent_handle = AgentHandle(
+            calibration=calibration,
+            plasticHebbian=useHebbian,
+            usePlanner=usePlanner,
+            device=self.device)
+        self.active_sensor_stream_id = None
+        self.active_world_frame_id = None
+        self.last_sensor_sequence_index = None
         return True
 
     def SetJsonQueue(self, queue):
@@ -269,20 +713,9 @@ class ManagerFunction:
         self.controller.SetParameterReceiver(reward=reward, done=done, textExt=textExt)
         return True
 
-    def SetCameraIntrinsics(
+    def _ForwardValidatedBatch(
         self,
-        cameraIntrinsics: Union[np.ndarray, torch.Tensor],
-        sourceSize: Tuple[int, int]) -> None:
-        """One-shot calibration: scales K from (cameraResH, cameraResW) to the
-        perception input grid and writes it into the perception's K buffer.
-        Subsequent AgentHandleForward() calls no longer take cameraIntrinsics."""
-        if self.agent_handle is None:
-            raise RuntimeError("agent_handle has not been initialized")
-        self.agent_handle.SetCameraIntrinsics(cameraIntrinsics, sourceSize=sourceSize)
-
-    def AgentHandleForward(
-        self,
-        cameraIndex: int = 0,
+        bitmap: Union[List[Any], np.ndarray, torch.Tensor],
         reward: Optional[float] = None,
         done: Optional[float] = None,
         textExt: Optional[List[Optional[str]]] = None,
@@ -291,27 +724,33 @@ class ManagerFunction:
         deterministicActor: bool = False,
         *,
         depthBitmap: Union[List[Any], np.ndarray, torch.Tensor],
-        depthValid: Optional[Union[List[Any], np.ndarray, torch.Tensor]] = None,
-        depthScaleMeters: float = 1.0,
-        robotState: RobotState,):
+        depthValid: Union[List[Any], np.ndarray, torch.Tensor],
+        robotState: Dict[str, Any],
+        requestProvenance: Dict[str, Any],):
         if self.agent_handle is None:
             raise RuntimeError("agent_handle has not been initialized")
-        if iio is None:
-            raise RuntimeError("imageio.v3 cant use")
-
-        frame_np = iio.imread(f"<video{int(cameraIndex)}>", index=0)
-        if frame_np is None:
-            raise RuntimeError(f"cannot read frame from camera {int(cameraIndex)}")
 
         converted = DataPreprocessor.ConvertCppCameraFrame(
-            bitmap=frame_np,
+            bitmap=bitmap,
             reward=reward,
             done=done,
             depthBitmap=depthBitmap,
             depthValid=depthValid,
-            depthScaleMeters=depthScaleMeters,
             device=self.device,
             needVisualState=False,)
+        robot_state = self.TensorizeRobotState(
+            robotState,
+            self.device,
+            batched=True)
+        batch_size = int(converted["frames"].size(0))
+        self.agent_handle.agent.BindWorldMemoryContext(
+            requestProvenance["world_frame_id"],
+            batchSize=batch_size)
+        if any(
+            int(value.size(0)) != batch_size
+            for value in robot_state.values()
+        ):
+            raise ValueError("RGB-D and RobotState must have one batch size")
 
         act_out = self.agent_handle.ForwardStep(
             converted["frames"],
@@ -323,20 +762,20 @@ class ManagerFunction:
             deterministicActor=deterministicActor,
             depth=converted["depths"],
             depthValid=converted["depth_valid"],
-            robotState=robotState,)
-        return self.agent_handle.agent.UnpackActPacked(act_out)
+            robotState=robot_state,)
+        return self.agent_handle.agent.UnpackActPacked(
+            act_out,
+            requestProvenance=requestProvenance)
 
     def AgentHandleForwardJson(
         self,
-        cameraIndex: int,
         reward: Optional[float],
         done: Optional[float],
         sensorPacketJson: str,
         robotStateJson: str,) -> str:
         """C++ single-frame wire protocol.
 
-        ``sensorPacketJson`` contains explicit text trust, action sampling mode,
-        unbatched ``depth``, ``depth_valid`` and ``depth_scale_meters``.
+        ``sensorPacketJson`` contains one fixed-lattice synchronized RGB-D frame.
         ``robotStateJson`` contains the unbatched fields defined by
         :class:`CoreTypes.RobotState`; this adapter adds the one-frame batch axis.
         The returned command is a proposal: this adapter neither validates
@@ -344,83 +783,95 @@ class ManagerFunction:
         """
         sensor_packet = json.loads(sensorPacketJson)
         robot_packet = json.loads(robotStateJson)
-        if int(sensor_packet["schema_version"]) != SENSOR_PACKET_WIRE_SCHEMA_VERSION:
+        if type(sensor_packet) is not dict or set(sensor_packet) != set(SENSOR_PACKET_WIRE_FIELDS):
+            raise ValueError("sensor packet fields do not match the current schema")
+        if (
+            type(sensor_packet["schema_version"]) is not int
+            or sensor_packet["schema_version"] != SENSOR_PACKET_WIRE_SCHEMA_VERSION
+        ):
             raise ValueError("unsupported sensor packet schema")
-        if int(robot_packet["schema_version"]) != ROBOT_STATE_WIRE_SCHEMA_VERSION:
-            raise ValueError("unsupported robot state packet schema")
-        if tuple(robot_packet["endpoint_names"]) != ModuleDim.DecisionEndpointNames:
-            raise ValueError("robot endpoint order does not match DecisionEndpointNames")
-        if robot_packet["pose_frame"] != "world":
-            raise ValueError("robot poses must use the world frame")
-        if robot_packet["pose_unit"] != "meter":
-            raise ValueError("robot poses must use metres")
-        if robot_packet["quaternion_order"] != "xyzw":
-            raise ValueError("robot pose quaternions must use XYZW order")
+        if self.camera_calibration_id is None:
+            raise RuntimeError("agent_handle has not been initialized")
+        ValidateRobotStateWirePacket(
+            robot_packet,
+            self.camera_calibration_id)
+        if sensor_packet["calibration_id"] != self.camera_calibration_id:
+            raise ValueError("sensor packet calibration_id does not match configured K")
+        if type(sensor_packet["stream_id"]) is not str or not sensor_packet["stream_id"]:
+            raise ValueError("sensor stream_id must be a non-empty string")
+        if (
+            type(sensor_packet["sequence_index"]) is not int
+            or sensor_packet["sequence_index"] < 0
+        ):
+            raise ValueError(
+                "sensor sequence_index must be a non-negative integer")
+        if sensor_packet["stream_id"] != robot_packet["stream_id"]:
+            raise ValueError("RGB-D and RobotState stream_id must match")
+        if sensor_packet["sequence_index"] != robot_packet["sequence_index"]:
+            raise ValueError("RGB-D and RobotState sequence_index must match")
+        if sensor_packet["frame_id"] != robot_packet["frame_id"]:
+            raise ValueError("RGB-D and RobotState frame_id must match")
+        if not isinstance(sensor_packet["frame_id"], str) or not sensor_packet["frame_id"]:
+            raise ValueError("frame_id must be a non-empty string")
+        if sensor_packet["rgb_encoding"] != "rgb8" or sensor_packet["depth_unit"] != "meter":
+            raise ValueError("sensor packet must contain rgb8 and metre depth")
+        sequence_index = sensor_packet["sequence_index"]
+        if self.active_sensor_stream_id is None:
+            if sequence_index != 0:
+                raise ValueError("a sensor stream must begin at sequence_index 0")
+        else:
+            if sensor_packet["stream_id"] != self.active_sensor_stream_id:
+                raise ValueError(
+                    "sensor stream_id changed; initialize a new AgentHandle")
+            if robot_packet["world_frame_id"] != self.active_world_frame_id:
+                raise ValueError(
+                    "world_frame_id changed within an active sensor stream")
+            if sequence_index != self.last_sensor_sequence_index + 1:
+                raise ValueError(
+                    "sensor sequence_index must increase by exactly one")
         text_ext = sensor_packet["text_ext"]
         text_trust = sensor_packet["text_trust"]
+        if type(text_ext) is not list or type(text_trust) is not list:
+            raise TypeError("sensor text_ext and text_trust must be arrays")
         if len(text_ext) != 1 or len(text_trust) != 1:
             raise ValueError("single-frame sensor text_ext/text_trust must have length 1")
+        if text_ext[0] is not None and type(text_ext[0]) is not str:
+            raise TypeError("sensor text_ext item must be a string or null")
         if text_trust[0] not in (
             TEXT_TRUST_OCR_OBSERVED,
             TEXT_TRUST_OPERATOR_COMMAND,
             TEXT_TRUST_UNSAFE_EXTERNAL,
         ):
             raise ValueError("unsupported text_trust value")
-
-        def batched_tensor(name: str) -> torch.Tensor:
-            return torch.as_tensor(
-                robot_packet[name],
-                device=self.device,
-                dtype=torch.float32).unsqueeze(0)
-
-        robot_state: RobotState = {
-            "endpoint_pose": batched_tensor("endpoint_pose"),
-            "camera_pose_world": batched_tensor("camera_pose_world"),
-            "planner_expected_endpoint_pose": batched_tensor(
-                "planner_expected_endpoint_pose"),
-            "planner_progress": batched_tensor("planner_progress"),
-            "planner_tracking_error": batched_tensor("planner_tracking_error"),
-            "planner_executing": batched_tensor("planner_executing"),
-            "planner_reached": batched_tensor("planner_reached"),
-            "planner_failed": batched_tensor("planner_failed"),
-            "model_command_executed": batched_tensor(
-                "model_command_executed"),}
-        if tuple(robot_state["endpoint_pose"].shape) != (
-            1,
-            ModuleDim.DecisionEndpointCount,
-            ModuleDim.DecisionEndpointPoseDim,
-        ):
-            raise ValueError("endpoint_pose must have wire shape [13, 7]")
-        if tuple(robot_state["planner_expected_endpoint_pose"].shape) != (
-            1,
-            ModuleDim.DecisionEndpointCount,
-            ModuleDim.DecisionEndpointPoseDim,
-        ):
-            raise ValueError(
-                "planner_expected_endpoint_pose must have wire shape [13, 7]")
-        if tuple(robot_state["camera_pose_world"].shape) != (1, ModuleDim.PstPoseDim):
-            raise ValueError("camera_pose_world must have wire shape [7]")
-        scalar_fields = (
-            "planner_progress",
-            "planner_tracking_error",
-            "planner_executing",
-            "planner_reached",
-            "planner_failed",
-            "model_command_executed")
-        if any(tuple(robot_state[name].shape) != (1,) for name in scalar_fields):
-            raise ValueError("planner and provenance fields must be wire scalars")
-        return self.AgentHandleForward(
-            cameraIndex,
+        if type(sensor_packet["sample_actions"]) is not bool:
+            raise TypeError("sensor sample_actions must be a boolean")
+        if type(sensor_packet["deterministic_actor"]) is not bool:
+            raise TypeError("sensor deterministic_actor must be a boolean")
+        robot_state = {
+            name: [robot_packet[name]]
+            for name in ROBOT_STATE_FIELDS}
+        result = self._ForwardValidatedBatch(
+            sensor_packet["rgb"],
             reward,
             done,
             textExt=text_ext,
             textTrust=text_trust,
-            sampleActions=bool(sensor_packet["sample_actions"]),
-            deterministicActor=bool(sensor_packet["deterministic_actor"]),
+            sampleActions=sensor_packet["sample_actions"],
+            deterministicActor=sensor_packet["deterministic_actor"],
             depthBitmap=sensor_packet["depth"],
             depthValid=sensor_packet["depth_valid"],
-            depthScaleMeters=float(sensor_packet["depth_scale_meters"]),
-            robotState=robot_state)
+            robotState=robot_state,
+            requestProvenance={
+                "stream_id": sensor_packet["stream_id"],
+                "sequence_index": sequence_index,
+                "frame_id": sensor_packet["frame_id"],
+                "calibration_id": sensor_packet["calibration_id"],
+                "world_frame_id": robot_packet["world_frame_id"],
+            })
+        self.active_sensor_stream_id = sensor_packet["stream_id"]
+        self.active_world_frame_id = robot_packet["world_frame_id"]
+        self.last_sensor_sequence_index = sequence_index
+        return result
 
     def ResetAgentHandleHebbian(self):
         if self.agent_handle is None:
@@ -484,11 +935,19 @@ class ManagerFunction:
         onlineLearning:bool = False,
         isTest: bool = False, 
         overrideCheckpointWithModuleParams: Optional[bool] = None, 
-        saveEverySampleCount = 2000,):
+        saveEverySampleCount = 2000,
+        trainStage: str = "full",):
+        train_stage = self.NormalizeTrainStage(trainStage)
         ckpt_path = BasicParameters.CKPT_PATH_TEST if isTest else BasicParameters.CKPT_PATH_TRAIN
         out_path = BasicParameters.MODULEPARAMETER_PATH_TEST if isTest else BasicParameters.MODULEPARAMETER_PATH
-        wm_mem_path = BasicParameters.WORLD_MEMORY_PATH_TEST if isTest else BasicParameters.WORLD_MEMORY_PATH
-        mem_mem_path = BasicParameters.MEMORY_MEMORY_PATH_TEST if isTest else BasicParameters.MEMORY_MEMORY_PATH
+        wm_mem_path = (
+            BasicParameters.WORLD_MEMORY_PATH_TEST_TRAIN
+            if isTest
+            else BasicParameters.WORLD_MEMORY_PATH_TRAIN)
+        mem_mem_path = (
+            BasicParameters.MEMORY_MEMORY_PATH_TEST_TRAIN
+            if isTest
+            else BasicParameters.MEMORY_MEMORY_PATH_TRAIN)
         override_enabled = bool(self.overrideCheckpointWithModuleParams) if overrideCheckpointWithModuleParams is None else bool(overrideCheckpointWithModuleParams)
 
         return self.StartBackgroundTask(
@@ -501,6 +960,7 @@ class ManagerFunction:
                 "outPath": out_path,
                 "overrideCheckpointWithModuleParams": override_enabled,
                 "saveEverySampleCount": saveEverySampleCount,
+                "trainStage": train_stage,
                 "isTest": isTest,})
 
     def StartOCRTraining(
@@ -694,6 +1154,9 @@ class ManagerFunction:
             reward_dir = Path(BasicParameters.DATA_REWARD_PATH)
             done_dir = Path(BasicParameters.DATA_DONE_PATH)
             depth_dir = Path(BasicParameters.DATA_DEPTH_PATH)
+            depth_valid_dir = Path(BasicParameters.DATA_DEPTH_VALID_PATH)
+            robot_state_dir = Path(BasicParameters.DATA_ROBOT_STATE_PATH)
+            sensor_manifest_path = Path(BasicParameters.DATA_SENSOR_MANIFEST_PATH)
             texts_dir = Path(BasicParameters.DATA_TEXTS_PATH)
         else:
             root = Path(dataRoot)
@@ -701,17 +1164,40 @@ class ManagerFunction:
             reward_dir = root / "reward"
             done_dir = root / "done"
             depth_dir = root / "depth"
+            depth_valid_dir = root / "depth_valid"
+            robot_state_dir = root / "robot_state"
+            sensor_manifest_path = root / "sensor_manifest.json"
             texts_dir = root / "texts"
 
-        required_dirs = [frames_dir, reward_dir, done_dir, depth_dir]
-        if not all(p.exists() for p in required_dirs):
+        required_dirs = [
+            frames_dir,
+            reward_dir,
+            done_dir,
+            depth_dir,
+            depth_valid_dir,
+            robot_state_dir]
+        if (
+            not all(p.exists() for p in required_dirs)
+            or not sensor_manifest_path.is_file()
+        ):
+            return False
+        try:
+            calibration = self.LoadCameraCalibration()
+            sensor_manifest = json.loads(
+                sensor_manifest_path.read_text(encoding="utf-8"))
+            ValidateOfflineSensorManifest(
+                sensor_manifest,
+                calibration.calibration_id)
+        except (OSError, TypeError, ValueError):
             return False
 
         counts = [
             len(sorted(frames_dir.glob("*.png"))),
             len(sorted(reward_dir.glob("*.npy"))),
             len(sorted(done_dir.glob("*.npy"))),
-            len(DataPreprocessor.ListDepthFiles(depth_dir)),]
+            len(DataPreprocessor.ListDepthFiles(depth_dir)),
+            len(DataPreprocessor.ListDepthFiles(depth_valid_dir)),
+            len(DataPreprocessor.ListJsonFiles(robot_state_dir)),]
         if counts[0] == 0 or len(set(counts)) != 1:
             return False
 
@@ -720,33 +1206,6 @@ class ManagerFunction:
             if text_count not in (0, counts[0]):
                 return False
         return True
-
-    def BuildDefaultRobotState(
-        self,
-        batchSize: int,
-        *,
-        device: torch.device,
-        dtype: torch.dtype) -> RobotState:
-        endpoint_pose = torch.zeros(
-            int(batchSize),
-            ModuleDim.DecisionEndpointCount,
-            ModuleDim.DecisionEndpointPoseDim,
-            device=device,
-            dtype=dtype)
-        endpoint_pose[..., 6] = 1.0
-        camera_pose_world = torch.zeros(int(batchSize), ModuleDim.PstPoseDim, device=device, dtype=dtype)
-        camera_pose_world[:, 6] = 1.0
-        planner_scalar = torch.zeros(int(batchSize), device=device, dtype=dtype)
-        return {
-            "endpoint_pose": endpoint_pose,
-            "camera_pose_world": camera_pose_world,
-            "planner_expected_endpoint_pose": endpoint_pose.clone(),
-            "planner_progress": planner_scalar,
-            "planner_tracking_error": planner_scalar,
-            "planner_executing": planner_scalar,
-            "planner_reached": planner_scalar,
-            "planner_failed": planner_scalar,
-            "model_command_executed": torch.zeros_like(planner_scalar),}
 
     def SummarizeImageDirectory(self, path: Union[str, Path]) -> str:
         img_dir = Path(path)
@@ -986,66 +1445,201 @@ class ManagerFunction:
             "items": restored_items,
             "updated_at": updated_at,}
 
+    @staticmethod
+    def AtomicTorchSave(payload: Any, path: Union[str, Path]) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=str(target.parent))
+        os.close(fd)
+        try:
+            torch.save(payload, temporary_path)
+            os.replace(temporary_path, target)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+    @staticmethod
+    def DeploymentManifestPath(modelPath: Union[str, Path]) -> Path:
+        return Path(f"{modelPath}.manifest.json")
+
+    @staticmethod
+    def AtomicJsonSave(payload: Dict[str, Any], path: Union[str, Path]) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=str(target.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, allow_nan=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, target)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+    @classmethod
+    def ResolveDeploymentArtifactPaths(
+        cls,
+        modelPath: Union[str, Path],
+        *,
+        calibrationId: str,) -> Tuple[str, str, str]:
+        manifest_path = cls.DeploymentManifestPath(modelPath)
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"deployment manifest not found: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if type(manifest) is not dict or set(manifest) != DEPLOYMENT_MANIFEST_FIELDS:
+            raise ValueError("deployment manifest fields do not match the current schema")
+        if manifest["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError("deployment manifest schema is unsupported")
+        if manifest["calibration_id"] != calibrationId:
+            raise ValueError("deployment manifest calibration_id does not match configured K")
+        for field in ("generation", "model_path", "world_memory_path", "memory_path"):
+            if type(manifest[field]) is not str or not manifest[field]:
+                raise TypeError(f"deployment manifest {field} must be a non-empty string")
+        artifact_paths = tuple(Path(manifest[field]) for field in (
+            "model_path", "world_memory_path", "memory_path"))
+        generation_directories = {path.parent for path in artifact_paths}
+        if (
+            any(not path.is_absolute() for path in artifact_paths)
+            or len(generation_directories) != 1
+            or next(iter(generation_directories)).name != manifest["generation"]
+        ):
+            raise ValueError(
+                "deployment artifacts must belong to the declared generation")
+        for artifact_path in artifact_paths:
+            if not artifact_path.is_file() or artifact_path.stat().st_size <= 0:
+                raise FileNotFoundError(
+                    f"deployment generation artifact is missing or empty: {artifact_path}")
+        return tuple(str(path) for path in artifact_paths)
+
     def SaveModuleParameters(self, brain: BrainCore, path: str) -> None:
         out_path = Path(path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         brain_state = {
             k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
-            for k, v in brain.state_dict().items()}
+            for k, v in ExportDeploymentModelState(brain).items()}
 
-        torch.save({
+        self.AtomicTorchSave({
             "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
-            "brain": brain_state,}, str(out_path))
+            "calibration_id": brain.calibration_id,
+            "brain": brain_state,}, out_path)
 
     def SaveOCRParameters(self, engine: OCREngineExtractor, path: str) -> None:
         out_path = Path(path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         ocr_state = {k: v.detach().cpu() for k, v in engine.state_dict().items()}
-        brain_state = {f"OCR.{k}": v for k, v in ocr_state.items()}
-        ocr_meta = engine.OcrMetadata()
-
-        torch.save({
+        self.AtomicTorchSave({
+            "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
             "ocr": ocr_state,
-            "brain": brain_state,
-            "vocab": ocr_meta["vocab"],
-            "ocr_meta": ocr_meta,
-            "legacy_prefixes": ocr_meta["legacy_prefixes"],
-            "addon_cfg": ocr_meta["addon_cfg"],}, str(out_path))
+            "ocr_meta": self.CurrentOcrMetadata(engine),}, out_path)
 
     def SaveOCRRecognizerParameters(self, engine: OCREngineExtractor, path: str) -> None:
         out_path = Path(path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         rec_state = {k: v.detach().cpu() for k, v in engine.recognizer.state_dict().items()}
-        ocr_state = {f"recognizer.{k}": v for k, v in rec_state.items()}
-        brain_state = {f"OCR.recognizer.{k}": v for k, v in rec_state.items()}
-        ocr_meta = engine.OcrMetadata()
-
-        torch.save({
+        self.AtomicTorchSave({
+            "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
             "recognizer": rec_state,
-            "ocr": ocr_state,
-            "brain": brain_state,
-            "vocab": ocr_meta["vocab"],
-            "ocr_meta": ocr_meta,
-            "addon_cfg": ocr_meta["addon_cfg"],}, str(out_path))
+            "ocr_meta": self.CurrentOcrMetadata(engine),}, out_path)
+
+    @staticmethod
+    def CurrentOcrMetadata(engine: OCREngineExtractor) -> Dict[str, Any]:
+        metadata = engine.OcrMetadata()
+        if type(metadata) is not dict:
+            raise TypeError("OCR metadata must be a dictionary")
+        if set(metadata) != OCR_METADATA_FIELDS:
+            raise RuntimeError("OCR metadata does not match the current schema")
+        return metadata
+
+    @classmethod
+    def ValidateOcrMetadata(
+        cls,
+        engine: OCREngineExtractor,
+        metadata: Any,) -> None:
+        if type(metadata) is not dict or set(metadata) != OCR_METADATA_FIELDS:
+            raise ValueError("OCR metadata fields do not match the current schema")
+        if metadata != cls.CurrentOcrMetadata(engine):
+            raise ValueError("OCR metadata does not match the configured model")
+
+    @staticmethod
+    def ValidateExactStateDict(
+        module: nn.Module,
+        state: Any,
+        *,
+        name: str,) -> None:
+        if not isinstance(state, dict):
+            raise TypeError(f"{name} state must be a dictionary")
+        expected = module.state_dict()
+        if set(state) != set(expected):
+            raise ValueError(f"{name} state fields do not match the current model")
+        for key, value in state.items():
+            current = expected[key]
+            if not torch.is_tensor(value):
+                raise TypeError(f"{name} state {key} must be a tensor")
+            if tuple(value.shape) != tuple(current.shape) or value.dtype != current.dtype:
+                raise ValueError(f"{name} state {key} shape or dtype does not match")
+
+    @staticmethod
+    def ValidateOcrCheckpointCursor(
+        checkpoint: Dict[str, Any],
+        dataset: Dataset,) -> None:
+        if type(checkpoint["epoch"]) is not int or checkpoint["epoch"] < 0:
+            raise ValueError("OCR checkpoint epoch must be a non-negative integer")
+        if type(checkpoint["processed_sample_count_total"]) is not int or (
+            checkpoint["processed_sample_count_total"] < 0
+        ):
+            raise ValueError("OCR checkpoint processed sample count is invalid")
+        if type(checkpoint["best_val"]) not in (int, float):
+            raise TypeError("OCR checkpoint best_val must be numeric")
+        best_val = float(checkpoint["best_val"])
+        if math.isnan(best_val) or best_val == float("-inf"):
+            raise ValueError("OCR checkpoint best_val is invalid")
+        split_indices: List[int] = []
+        for field in ("train_indices", "val_indices", "test_indices"):
+            indices = checkpoint[field]
+            if type(indices) is not list or any(type(index) is not int for index in indices):
+                raise TypeError(f"OCR checkpoint {field} must be a list of integers")
+            if len(indices) == 0 or len(set(indices)) != len(indices):
+                raise ValueError(f"OCR checkpoint {field} must be non-empty and unique")
+            if any(index < 0 or index >= len(dataset) for index in indices):
+                raise ValueError(f"OCR checkpoint {field} contains an invalid index")
+            split_indices.extend(indices)
+        if len(set(split_indices)) != len(split_indices):
+            raise ValueError("OCR checkpoint dataset splits must be disjoint")
+        if set(split_indices) != set(range(len(dataset))):
+            raise ValueError("OCR checkpoint dataset splits must cover the dataset")
 
     def CaptureRngState(self) -> Dict[str, Any]:
-        state = {
+        return {
             "python": random.getstate(),
             "torch": torch.get_rng_state(),
-            "numpy": np.random.get_state(),}
-        if torch.cuda.is_available():
-            state["cuda_all"] = torch.cuda.get_rng_state_all()
-        return state
+            "numpy": np.random.get_state(),
+            "cuda_all": (
+                torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available()
+                else None),}
 
     def RestoreRngState(self, state: Dict[str, Any]) -> None:
         random.setstate(state["python"])
         torch.set_rng_state(state["torch"].cpu())
         np.random.set_state(state["numpy"])
-        if torch.cuda.is_available() and "cuda_all" in state:
+        if torch.cuda.is_available() and state["cuda_all"] is not None:
             torch.cuda.set_rng_state_all(state["cuda_all"])
+
+    @staticmethod
+    def ValidateTrainingRngState(state: Dict[str, Any]) -> None:
+        if type(state) is not dict or set(state) != TRAIN_RNG_FIELDS:
+            raise ValueError("training RNG fields do not match the current schema")
 
     def ShouldTriggerPeriodicSave(
         self,
@@ -1116,13 +1710,7 @@ class ManagerFunction:
 
 
     def LoadTorchPayload(self, path: str):
-        try:
-            return torch.load(path, map_location=self.device, weights_only=True)
-        except TypeError:
-            return torch.load(path, map_location=self.device)
-        except Exception as e:
-            print(f"Safe mode loading failed: {e}, try the normal mode")
-            return torch.load(path, map_location=self.device)
+        return torch.load(path, map_location=self.device, weights_only=True)
 
     def LoadBrainWeights(
         self,
@@ -1131,24 +1719,25 @@ class ManagerFunction:
         *,
         agent: Optional[Agent] = None,) -> None:
         payload = self.LoadTorchPayload(path)
+        if type(payload) is not dict or set(payload) != MODULE_PARAMETER_FIELDS:
+            raise TypeError(
+                f"checkpoint {path} brain-weight fields do not match the current schema")
+        if (
+            type(payload["schema_version"]) is not int
+            or payload["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"unsupported brain parameter schema {payload['schema_version']!r}")
+        if payload["calibration_id"] != brain.calibration_id:
+            raise ValueError(
+                "brain parameter calibration_id does not match configured K")
+        brain_state = payload["brain"]
+        if type(brain_state) is not dict:
+            raise TypeError("brain model state must be a dictionary")
 
-        if isinstance(payload, dict) and "brain" in payload:
-            checkpoint_version = int(payload.get("schema_version", 1))
-            if checkpoint_version not in (1, 2, 3, TRAIN_CHECKPOINT_SCHEMA_VERSION):
-                raise ValueError(
-                    f"unsupported brain parameter schema {checkpoint_version}")
-            brain_state = payload["brain"]
-        elif isinstance(payload, dict):
-            brain_state = payload
-        else:
-            raise TypeError(f"checkpoint {path} has invalid brain weights payload")
-
-        SynchronizeGrowableLoRATopologyForFullLoad(brain, brain_state)
-        brain_state = brain.UpgradeDecisionStateDict(brain_state)
-        brain.ResizeStateBuffersForLoad(brain_state)
-        brain.load_state_dict(brain_state, strict=False)
+        LoadDeploymentModelState(brain, brain_state)
         if agent is not None:
-            agent.SyncTrainableOptimizers()
+            agent.ResetOnlineCandidateState()
             agent.ClearTrainableOptimizerState()
 
     def ApplyParameterOverrideAfterResume(
@@ -1161,41 +1750,17 @@ class ManagerFunction:
         if not enabled:
             return False
         if not parameterPath:
-            print(f"[{logPrefix}] parameter override skipped: parameter path is empty")
-            return False
+            raise ValueError(
+                f"[{logPrefix}] parameter override path must not be empty")
 
         override_path = Path(parameterPath)
-        if not override_path.exists():
-            print(f"[{logPrefix}] parameter override skipped, file not found: {override_path}")
-            return False
+        if not override_path.is_file():
+            raise FileNotFoundError(
+                f"[{logPrefix}] parameter override file not found: {override_path}")
 
         loadFn(str(override_path))
         print(f"[{logPrefix}] checkpoint weights overridden from parameter file: {override_path}")
         return True
-
-    def FilterLoadableStateDict(
-        self,
-        module: nn.Module,
-        stateDict: Dict[str, Any],
-        *,
-        logPrefix: str,) -> Dict[str, Any]:
-        current = module.state_dict()
-        filtered: Dict[str, Any] = {}
-        skipped: List[str] = []
-
-        for k, v in stateDict.items():
-            if k in current and isinstance(v, torch.Tensor):
-                if tuple(current[k].shape) != tuple(v.shape):
-                    skipped.append(str(k))
-                    continue
-            filtered[k] = v
-
-        if skipped:
-            preview = ", ".join(skipped[:8])
-            more = "" if len(skipped) <= 8 else f", ... +{len(skipped) - 8}"
-            print(f"[{logPrefix}] skipped shape-mismatched keys: {preview}{more}")
-
-        return filtered
 
     def ConfigureOCRTrainingTargets(
         self,
@@ -1211,53 +1776,40 @@ class ManagerFunction:
             p.requires_grad = bool(trainRecognition)
 
     def LoadOCRWeightsIntoEngine(self, engine: OCREngineExtractor, path: str) -> None:
-        payload = torch.load(path, map_location=self.device)
-
-        ocr_state = None
-        if isinstance(payload, dict):
-            if "ocr" in payload:
-                ocr_state = payload["ocr"]
-            elif "brain" in payload:
-                ocr_state = {
-                    k[len("OCR."):]: v
-                    for k, v in payload["brain"].items()
-                    if k.startswith("OCR.")}
-            elif all(str(k).startswith(("backbone.", "dbHead.", "recognizer.")) for k in payload.keys()):
-                ocr_state = payload
-
-        if not ocr_state:
-            raise KeyError(f"checkpoint {path} has no OCR weights")
-
-        ocr_state = self.FilterLoadableStateDict(engine, ocr_state, logPrefix="LoadOCR")
-        engine.load_state_dict(ocr_state, strict=False)
+        payload = torch.load(
+            path,
+            map_location=self.device,
+            weights_only=True)
+        if type(payload) is not dict or set(payload) != OCR_MODULE_PARAMETER_FIELDS:
+            raise ValueError("OCR parameter fields do not match the current schema")
+        if (
+            type(payload["schema_version"]) is not int
+            or payload["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
+        ):
+            raise ValueError("OCR parameter schema is unsupported")
+        self.ValidateOcrMetadata(engine, payload["ocr_meta"])
+        self.ValidateExactStateDict(engine, payload["ocr"], name="OCR")
+        engine.load_state_dict(payload["ocr"], strict=True)
 
     def LoadRecognizerWeightsIntoEngine(self, engine: OCREngineExtractor, path: str) -> None:
-        payload = torch.load(path, map_location=self.device)
-
-        rec_state = None
-        if isinstance(payload, dict):
-            if "recognizer" in payload:
-                rec_state = payload["recognizer"]
-            elif "ocr" in payload:
-                rec_state = {
-                    k[len("recognizer."):]: v
-                    for k, v in payload["ocr"].items()
-                    if k.startswith("recognizer.")}
-            elif "brain" in payload:
-                rec_state = {
-                    k[len("OCR.recognizer."):]: v
-                    for k, v in payload["brain"].items()
-                    if k.startswith("OCR.recognizer.")}
-            elif all(str(k).startswith("recognizer.") for k in payload.keys()):
-                rec_state = {k[len("recognizer."):]: v for k, v in payload.items()}
-            elif all(not str(k).startswith("backbone.") and not str(k).startswith("dbHead.") for k in payload.keys()):
-                rec_state = payload
-
-        if not rec_state:
-            raise KeyError(f"checkpoint {path} has no recognizer weights")
-
-        rec_state = self.FilterLoadableStateDict(engine.recognizer, rec_state, logPrefix="LoadOCRRec")
-        engine.recognizer.load_state_dict(rec_state, strict=False)
+        payload = torch.load(
+            path,
+            map_location=self.device,
+            weights_only=True)
+        if type(payload) is not dict or set(payload) != OCR_RECOGNIZER_PARAMETER_FIELDS:
+            raise ValueError(
+                "OCR recognizer parameter fields do not match the current schema")
+        if (
+            type(payload["schema_version"]) is not int
+            or payload["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
+        ):
+            raise ValueError("OCR recognizer parameter schema is unsupported")
+        self.ValidateOcrMetadata(engine, payload["ocr_meta"])
+        self.ValidateExactStateDict(
+            engine.recognizer,
+            payload["recognizer"],
+            name="OCR recognizer")
+        engine.recognizer.load_state_dict(payload["recognizer"], strict=True)
 
     def LoadOCRCheckpoint(
         self,
@@ -1266,45 +1818,42 @@ class ManagerFunction:
         dataset: Dataset,
         path: str,
         *,
-        allowOptimizerMismatch: bool = False,):
-        ckpt = torch.load(path, map_location=self.device)
+        trainDetection: bool,
+        trainRecognition: bool,):
+        ckpt = torch.load(
+            path,
+            map_location=self.device,
+            weights_only=False)
+        if type(ckpt) is not dict or set(ckpt) != OCR_TRAIN_CHECKPOINT_FIELDS:
+            raise ValueError("OCR checkpoint fields do not match the current schema")
+        if (
+            type(ckpt["schema_version"]) is not int
+            or ckpt["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
+        ):
+            raise ValueError("OCR checkpoint schema is unsupported")
+        if (
+            type(ckpt["train_detection"]) is not bool
+            or ckpt["train_detection"] != trainDetection
+            or type(ckpt["train_recognition"]) is not bool
+            or ckpt["train_recognition"] != trainRecognition
+        ):
+            raise ValueError("OCR checkpoint training mode does not match")
+        self.ValidateTrainingRngState(ckpt["rng"])
+        self.ValidateOcrMetadata(engine, ckpt["ocr_meta"])
+        self.ValidateExactStateDict(engine, ckpt["ocr"], name="OCR")
+        self.ValidateOcrCheckpointCursor(ckpt, dataset)
 
-        if "ocr" in ckpt:
-            ocr_state = self.FilterLoadableStateDict(engine, ckpt["ocr"], logPrefix="LoadOCRCkpt")
-            engine.load_state_dict(ocr_state, strict=False)
-        elif "brain" in ckpt:
-            ocr_state = {
-                k[len("OCR."):]: v
-                for k, v in ckpt["brain"].items()
-                if k.startswith("OCR.")}
-            if len(ocr_state) == 0:
-                raise KeyError(f"checkpoint {path} has no OCR weights")
-            ocr_state = self.FilterLoadableStateDict(engine, ocr_state, logPrefix="LoadOCRCkpt")
-            engine.load_state_dict(ocr_state, strict=False)
-        else:
-            raise KeyError(f"checkpoint {path} has no 'ocr' or 'brain' field")
+        engine.load_state_dict(ckpt["ocr"], strict=True)
+        optimizer.load_state_dict(ckpt["optimizer"])
+        self.RestoreRngState(ckpt["rng"])
 
-        if "optimizer" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer"])
-            except ValueError:
-                if not allowOptimizerMismatch:
-                    raise
-                print("[LoadOCRCkpt] optimizer state skipped because parameter groups changed")
+        train_ds = torch.utils.data.Subset(dataset, ckpt["train_indices"])
+        val_ds = torch.utils.data.Subset(dataset, ckpt["val_indices"])
+        test_ds = torch.utils.data.Subset(dataset, ckpt["test_indices"])
 
-        if "rng" in ckpt:
-            self.RestoreRngState(ckpt["rng"])
-
-        train_ds = val_ds = test_ds = None
-        if ckpt.get("train_indices") is not None:
-            train_ds = torch.utils.data.Subset(dataset, ckpt["train_indices"])
-            val_ds = torch.utils.data.Subset(dataset, ckpt["val_indices"])
-            if ckpt.get("test_indices") is not None:
-                test_ds = torch.utils.data.Subset(dataset, ckpt["test_indices"])
-
-        start_epoch = int(ckpt.get("epoch", 0))
-        best_val = float(ckpt.get("best_val", float("inf")))
-        processed_sample_count_total = int(ckpt.get("processed_sample_count_total", 0))
+        start_epoch = ckpt["epoch"]
+        best_val = float(ckpt["best_val"])
+        processed_sample_count_total = ckpt["processed_sample_count_total"]
         return start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds
 
     def LoadOCRRecognizerCheckpoint(
@@ -1313,51 +1862,40 @@ class ManagerFunction:
         optimizer: torch.optim.Optimizer,
         dataset: Dataset,
         path: str,):
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(
+            path,
+            map_location=self.device,
+            weights_only=False)
+        if (
+            type(ckpt) is not dict
+            or set(ckpt) != OCR_RECOGNIZER_TRAIN_CHECKPOINT_FIELDS
+        ):
+            raise ValueError(
+                "OCR recognizer checkpoint fields do not match the current schema")
+        if (
+            type(ckpt["schema_version"]) is not int
+            or ckpt["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
+        ):
+            raise ValueError("OCR recognizer checkpoint schema is unsupported")
+        self.ValidateTrainingRngState(ckpt["rng"])
+        self.ValidateOcrMetadata(engine, ckpt["ocr_meta"])
+        self.ValidateExactStateDict(
+            engine.recognizer,
+            ckpt["recognizer"],
+            name="OCR recognizer")
+        self.ValidateOcrCheckpointCursor(ckpt, dataset)
 
-        if "recognizer" in ckpt:
-            rec_state = self.FilterLoadableStateDict(engine.recognizer, ckpt["recognizer"], logPrefix="LoadOCRRecCkpt")
-            engine.recognizer.load_state_dict(rec_state, strict=False)
-        elif "ocr" in ckpt:
-            rec_state = {
-                k[len("recognizer."):]: v
-                for k, v in ckpt["ocr"].items()
-                if k.startswith("recognizer.")}
-            if len(rec_state) == 0:
-                raise KeyError(f"checkpoint {path} has no recognizer weights")
-            rec_state = self.FilterLoadableStateDict(engine.recognizer, rec_state, logPrefix="LoadOCRRecCkpt")
-            engine.recognizer.load_state_dict(rec_state, strict=False)
-        elif "brain" in ckpt:
-            rec_state = {
-                k[len("OCR.recognizer."):]: v
-                for k, v in ckpt["brain"].items()
-                if k.startswith("OCR.recognizer.")}
-            if len(rec_state) == 0:
-                raise KeyError(f"checkpoint {path} has no recognizer weights")
-            rec_state = self.FilterLoadableStateDict(engine.recognizer, rec_state, logPrefix="LoadOCRRecCkpt")
-            engine.recognizer.load_state_dict(rec_state, strict=False)
-        else:
-            raise KeyError(f"checkpoint {path} has no recognizer field")
+        engine.recognizer.load_state_dict(ckpt["recognizer"], strict=True)
+        optimizer.load_state_dict(ckpt["optimizer"])
+        self.RestoreRngState(ckpt["rng"])
 
-        if "optimizer" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer"])
-            except ValueError:
-                print("[LoadOCRRecCkpt] optimizer state skipped because parameter groups changed")
+        train_ds = torch.utils.data.Subset(dataset, ckpt["train_indices"])
+        val_ds = torch.utils.data.Subset(dataset, ckpt["val_indices"])
+        test_ds = torch.utils.data.Subset(dataset, ckpt["test_indices"])
 
-        if "rng" in ckpt:
-            self.RestoreRngState(ckpt["rng"])
-
-        train_ds = val_ds = test_ds = None
-        if ckpt.get("train_indices") is not None:
-            train_ds = torch.utils.data.Subset(dataset, ckpt["train_indices"])
-            val_ds = torch.utils.data.Subset(dataset, ckpt["val_indices"])
-            if ckpt.get("test_indices") is not None:
-                test_ds = torch.utils.data.Subset(dataset, ckpt["test_indices"])
-
-        start_epoch = int(ckpt.get("epoch", 0))
-        best_val = float(ckpt.get("best_val", float("inf")))
-        processed_sample_count_total = int(ckpt.get("processed_sample_count_total", 0))
+        start_epoch = ckpt["epoch"]
+        best_val = float(ckpt["best_val"])
+        processed_sample_count_total = ckpt["processed_sample_count_total"]
         return start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds
 
     def OCRTrainLoop(
@@ -1374,7 +1912,7 @@ class ManagerFunction:
         trainDetection: bool = True,
         trainRecognition: bool = True,
         recognizerInitPath: Optional[str] = None,
-        overrideCheckpointWithModuleParams: bool = True,):
+        overrideCheckpointWithModuleParams: bool = False,):
         try:
 
             self.ResetControllerFlags()
@@ -1408,37 +1946,26 @@ class ManagerFunction:
                     optimizer,
                     ds,
                     ckptPath,
-                    allowOptimizerMismatch=True)
+                    trainDetection=trainDetection,
+                    trainRecognition=trainRecognition)
             else:
                 if recognizerInitPath and Path(recognizerInitPath).exists():
                     self.LoadRecognizerWeightsIntoEngine(engine, recognizerInitPath)
                 elif not trainRecognition:
-                    init_candidates = [Path(outPath), Path(ckptPath)]
-                    init_error = None
-                    loaded = False
-                    for init_path in init_candidates:
-                        if not init_path.exists():
-                            continue
-                        try:
-                            self.LoadOCRWeightsIntoEngine(engine, str(init_path))
-                            loaded = True
-                            break
-                        except Exception as e:
-                            init_error = e
-
-                    if not loaded:
-                        msg = (
-                            "detect-only OCR training requires existing OCR weights "
-                            "or recognizerInitPath to preserve recognizer parameters")
-                        if init_error is not None:
-                            raise RuntimeError(msg) from init_error
-                        raise FileNotFoundError(msg)
+                    if not Path(outPath).is_file():
+                        raise FileNotFoundError(
+                            "detect-only OCR training requires the current OCR "
+                            "parameter artifact or recognizerInitPath")
+                    self.LoadOCRWeightsIntoEngine(engine, outPath)
                     
-            self.ApplyParameterOverrideAfterResume(
+            parameters_overridden = self.ApplyParameterOverrideAfterResume(
                 enabled=overrideCheckpointWithModuleParams,
                 parameterPath=outPath,
                 loadFn=lambda path: self.LoadOCRWeightsIntoEngine(engine, path),
                 logPrefix="TrainOCR")
+            if parameters_overridden:
+                optimizer.state.clear()
+                best_val = float("inf")
             self.ConfigureOCRTrainingTargets(
                 engine,
                 trainDetection=trainDetection,
@@ -1573,28 +2100,28 @@ class ManagerFunction:
                 return avg_split_loss, avg_split_det_loss, avg_split_rec_loss, box_hmean, text_char_acc
 
             def BuildOCRCheckpointPayload(epochValue: int) -> Dict[str, Any]:
-                ocr_meta = engine.OcrMetadata()
                 return {
                     "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                     "epoch": int(epochValue),
                     "best_val": best_val,
                     "ocr": engine.state_dict(),
-                    "vocab": ocr_meta["vocab"],
-                    "ocr_meta": ocr_meta,
-                    "legacy_prefixes": ocr_meta["legacy_prefixes"],
-                    "addon_cfg": ocr_meta["addon_cfg"],
+                    "ocr_meta": self.CurrentOcrMetadata(engine),
                     "optimizer": optimizer.state_dict(),
-                    "train_indices": list(train_ds.indices) if hasattr(train_ds, "indices") else None,
-                    "val_indices": list(val_ds.indices) if hasattr(val_ds, "indices") else None,
-                    "test_indices": list(test_ds.indices) if hasattr(test_ds, "indices") else None,
+                    "train_indices": list(train_ds.indices),
+                    "val_indices": list(val_ds.indices),
+                    "test_indices": list(test_ds.indices),
                     "processed_sample_count_total": processed_sample_count_total,
-                    "rng": self.CaptureRngState(),}
+                    "rng": self.CaptureRngState(),
+                    "train_detection": bool(trainDetection),
+                    "train_recognition": bool(trainRecognition),}
 
             def SaveOCRTrainingArtifacts(epochValue: int, *, logPeriodic: bool = False) -> None:
                 self.SaveOCRParameters(engine, outPath)
                 ckpt_dir = Path(ckptPath).parent
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(BuildOCRCheckpointPayload(epochValue), ckptPath)
+                self.AtomicTorchSave(
+                    BuildOCRCheckpointPayload(epochValue),
+                    ckptPath)
                 if logPeriodic:
                     print(
                         f"[TrainOCR] periodic save at processed_sample_count_total={processed_sample_count_total} "
@@ -1939,11 +2466,14 @@ class ManagerFunction:
                 start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds = self.LoadOCRRecognizerCheckpoint(
                     engine, optimizer, ds, ckptPath)
                 
-            self.ApplyParameterOverrideAfterResume(
+            parameters_overridden = self.ApplyParameterOverrideAfterResume(
                 enabled=overrideCheckpointWithModuleParams,
                 parameterPath=outPath,
                 loadFn=lambda path: self.LoadRecognizerWeightsIntoEngine(engine, path),
                 logPrefix="TrainOCRRec")
+            if parameters_overridden:
+                optimizer.state.clear()
+                best_val = float("inf")
             self.ConfigureOCRTrainingTargets(
                 engine,
                 trainDetection=False,
@@ -2032,18 +2562,16 @@ class ManagerFunction:
                 return avg_split_loss, split_acc
 
             def BuildOCRRecognizerCheckpointPayload(epochValue: int) -> Dict[str, Any]:
-                ocr_meta = engine.OcrMetadata()
                 return {
+                    "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                     "epoch": int(epochValue),
                     "best_val": best_val,
                     "recognizer": engine.recognizer.state_dict(),
-                    "vocab": ocr_meta["vocab"],
-                    "ocr_meta": ocr_meta,
-                    "addon_cfg": ocr_meta["addon_cfg"],
+                    "ocr_meta": self.CurrentOcrMetadata(engine),
                     "optimizer": optimizer.state_dict(),
-                    "train_indices": list(train_ds.indices) if hasattr(train_ds, "indices") else None,
-                    "val_indices": list(val_ds.indices) if hasattr(val_ds, "indices") else None,
-                    "test_indices": list(test_ds.indices) if hasattr(test_ds, "indices") else None,
+                    "train_indices": list(train_ds.indices),
+                    "val_indices": list(val_ds.indices),
+                    "test_indices": list(test_ds.indices),
                     "processed_sample_count_total": processed_sample_count_total,
                     "rng": self.CaptureRngState(),}
 
@@ -2051,7 +2579,9 @@ class ManagerFunction:
                 self.SaveOCRRecognizerParameters(engine, outPath)
                 ckpt_dir = Path(ckptPath).parent
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(BuildOCRRecognizerCheckpointPayload(epochValue), ckptPath)
+                self.AtomicTorchSave(
+                    BuildOCRRecognizerCheckpointPayload(epochValue),
+                    ckptPath)
                 if logPeriodic:
                     print(
                         f"[TrainOCRRec] periodic save at processed_sample_count_total={processed_sample_count_total} "
@@ -2238,37 +2768,90 @@ class ManagerFunction:
 
             self.ResetControllerFlags()
     
-            ds = OfflineGameDataset(isTest=isTest)
+            calibration = self.LoadCameraCalibration()
+            ds = OfflineGameDataset(
+                calibrationId=calibration.calibration_id,
+                isTest=isTest)
 
             brain = BrainCore(
+                calibration=calibration,
                 device=self.device,
                 plasticHebbian=True,
                 plasticOnlineLearning=onlineLearning,
                 enablePerceptionSupervision=True)
 
-            agent = Agent(brain, isTrain=True, device=self.device, worldMemoryPath=worldMemPath, memMemoryPath=memMemPath,)
-
-            if onlineLearning:
-                agent.UpdateWrappers(
-                    self.TrainStageOnlineWrappers(brain, trainStage),
-                    "autogrow")
+            resume_checkpoint_exists = resume and Path(ckptPath).exists()
+            if overrideCheckpointWithModuleParams:
+                (
+                    deployment_model_path,
+                    initial_world_memory_path,
+                    initial_memory_path,
+                ) = self.ResolveDeploymentArtifactPaths(
+                    outPath,
+                    calibrationId=calibration.calibration_id)
+            else:
+                deployment_model_path = str(outPath)
+                initial_world_memory_path = worldMemPath
+                initial_memory_path = memMemPath
+            agent = Agent(
+                brain,
+                isTrain=True,
+                device=self.device,
+                worldMemoryPath=initial_world_memory_path,
+                memMemoryPath=initial_memory_path)
+            agent.BindWorldMemoryContext(
+                ds.world_frame_id,
+                batchSize=batchSize,
+                loadPersistent=(
+                    not resume_checkpoint_exists
+                    and overrideCheckpointWithModuleParams))
+            if onlineLearning and not resume_checkpoint_exists:
+                agent.ResetOnlineCandidateState()
 
             start_epoch = 0
             best_val = float("inf")
             processed_sample_count_total = 0
+            no_improve = 0
+            resume_next_batch_index = 0
+            resume_epoch_loss_sum = 0.0
             train_ds = val_ds = test_ds = None
 
             testSplit = 0.1
 
-            if resume and Path(ckptPath).exists():
-                start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds = self.LoadCheckpoint(brain, agent, ds, ckptPath)
+            if resume_checkpoint_exists:
+                resume_state = self.LoadCheckpoint(
+                    brain,
+                    agent,
+                    ds,
+                    ckptPath,
+                    batchSize=batchSize,
+                    trainStage=trainStage,
+                    onlineLearning=onlineLearning)
+                start_epoch = resume_state.epoch
+                resume_next_batch_index = resume_state.next_batch_index
+                resume_epoch_loss_sum = resume_state.epoch_loss_sum
+                best_val = resume_state.best_val
+                no_improve = resume_state.no_improve
+                processed_sample_count_total = (
+                    resume_state.processed_sample_count_total)
+                train_ds = resume_state.train_dataset
+                val_ds = resume_state.validation_dataset
+                test_ds = resume_state.test_dataset
                 
-            self.ApplyParameterOverrideAfterResume(
+            parameters_overridden = self.ApplyParameterOverrideAfterResume(
                 enabled=overrideCheckpointWithModuleParams,
-                parameterPath=outPath,
+                parameterPath=deployment_model_path,
                 loadFn=lambda path: self.LoadBrainWeights(brain, path, agent=agent),
                 logPrefix="Train")
-
+            if parameters_overridden:
+                resume_next_batch_index = 0
+                resume_epoch_loss_sum = 0.0
+                best_val = float("inf")
+                no_improve = 0
+            if onlineLearning and (not resume_checkpoint_exists or parameters_overridden):
+                agent.UpdateWrappers(
+                    self.TrainStageOnlineWrappers(brain, trainStage),
+                    "autogrow")
             train_ds, val_ds, test_ds = self.SplitDatasetSequential(
                 ds,
                 valSplit=valSplit,
@@ -2283,50 +2866,112 @@ class ManagerFunction:
 
             patience = 5 
             min_delta = 1e-4 
-            no_improve = 0
-
             def unpack_batch(batch):
-                img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b, synthetic_targets = batch
+                img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, robot_state_b, synthetic_targets = batch
 
                 ext_text_b = [
                     None if (t is None or str(t).strip() == "") else str(t)
                     for t in ext_text_b]
 
-                return img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b, synthetic_targets
+                return img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, robot_state_b, synthetic_targets
 
             def move_target_batch(targets: Dict[str, Any]) -> Dict[str, Any]:
                 return {
                     name: value.to(self.device) if torch.is_tensor(value) else value
                     for name, value in targets.items()}
 
-            def BuildTrainCheckpointPayload(epochValue: int) -> Dict[str, Any]:
+            def BuildTrainCheckpointPayload(
+                epochValue: int,
+                *,
+                nextBatchIndex: int,
+                epochLossSum: float,) -> Dict[str, Any]:
                 return {
                     "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                    "calibration_id": calibration.calibration_id,
+                    "world_frame_id": ds.world_frame_id,
                     "epoch": int(epochValue),
+                    "next_batch_index": int(nextBatchIndex),
+                    "epoch_loss_sum": float(epochLossSum),
                     "best_val": best_val,
-                    "brain": brain.state_dict(),
+                    "no_improve": int(no_improve),
+                    "train_stage": trainStage,
+                    "batch_size": int(batchSize),
+                    "online_learning": bool(onlineLearning),
+                    "brain": ExportBrainModelState(brain),
+                    "online_candidates": agent.ExportOnlineCandidateState(),
                     "opt_actor": agent.opt_actor.state_dict(),
                     "opt_critic": agent.opt_critic.state_dict(),
                     "opt_world": agent.opt_world.state_dict(),
-                    "train_indices": list(train_ds.indices)
-                    if hasattr(train_ds, "indices")
-                    else None,
-                    "val_indices": list(val_ds.indices)
-                    if hasattr(val_ds, "indices")
-                    else None,
-                    "test_indices": list(test_ds.indices)
-                    if hasattr(test_ds, "indices")
-                    else None,
+                    "train_indices": list(train_ds.indices),
+                    "val_indices": list(val_ds.indices),
+                    "test_indices": list(test_ds.indices),
                     "processed_sample_count_total": processed_sample_count_total,
                     "rng": self.CaptureRngState(),
-                    "buffers": brain.ExportBuffers(),}
+                    "buffers": brain.ExportBuffers(),
+                    "world_memory": agent.GetRuntimeWorld().ExportMemoryPayload(),
+                    "memory_durable": brain.mem.ExportDurableState(),}
 
-            def SaveTrainArtifacts(epochValue: int, *, logPeriodic: bool = False) -> None:
-                agent.SaveRuntimeMemories()
-                self.SaveModuleParameters(brain, outPath)
-                ckpt_dir = Path(ckptPath).parent
-                ckpt_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(BuildTrainCheckpointPayload(epochValue), ckptPath)
+            def SaveTrainArtifacts(
+                epochValue: int,
+                *,
+                nextBatchIndex: int = 0,
+                epochLossSum: float = 0.0,
+                publishDeployment: bool = False,
+                logPeriodic: bool = False,) -> None:
+                checkpoint_payload = BuildTrainCheckpointPayload(
+                    epochValue,
+                    nextBatchIndex=nextBatchIndex,
+                    epochLossSum=epochLossSum)
+                if publishDeployment:
+                    training_modes = [
+                        (module, bool(module.training))
+                        for module in brain.modules()]
+                    try:
+                        if onlineLearning:
+                            agent.UpdateAllWrappers("commit")
+                        generation = (
+                            f"epoch-{int(epochValue):08d}-"
+                            f"samples-{int(processed_sample_count_total):012d}-"
+                            f"{time.time_ns()}")
+                        model_path = Path(outPath)
+                        generation_dir = (
+                            model_path.parent
+                            / f".{model_path.stem}_deployments"
+                            / generation)
+                        generation_model_path = generation_dir / model_path.name
+                        generation_world_path = generation_dir / (
+                            Path(worldMemPath).name
+                            if worldMemPath
+                            else "world_memory.pth")
+                        generation_memory_path = generation_dir / (
+                            Path(memMemPath).name
+                            if memMemPath
+                            else "memory.pth")
+                        generation_dir.mkdir(parents=True, exist_ok=False)
+                        agent.GetRuntimeWorld().SaveMemory(
+                            str(generation_world_path))
+                        brain.mem.SaveState(str(generation_memory_path))
+                        self.SaveModuleParameters(
+                            brain,
+                            str(generation_model_path))
+                        self.AtomicJsonSave({
+                            "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                            "calibration_id": calibration.calibration_id,
+                            "generation": generation,
+                            "model_path": str(generation_model_path.resolve()),
+                            "world_memory_path": str(generation_world_path.resolve()),
+                            "memory_path": str(generation_memory_path.resolve()),
+                        }, self.DeploymentManifestPath(outPath))
+                    finally:
+                        if onlineLearning:
+                            self.ImportTrainingCheckpointState(
+                                brain,
+                                agent,
+                                checkpoint_payload,
+                                batchSize=batchSize)
+                            for module, was_training in training_modes:
+                                module.training = was_training
+                self.AtomicTorchSave(checkpoint_payload, ckptPath)
                 if logPeriodic:
                     print(
                         f"[Train] periodic save at processed_sample_count_total={processed_sample_count_total} "
@@ -2340,16 +2985,34 @@ class ManagerFunction:
                     break
 
                 if not self.WaitWhilePaused("Training paused"):
+                    if self.controller.ShouldStop():
+                        self.controller.SetStatus("stopped", "Training stopped")
                     break
 
                 brain.train()
-                epoch_loss = 0.0
-                nb = 0
+                resume_this_epoch = (
+                    ep == start_epoch and resume_next_batch_index > 0)
+                if resume_this_epoch:
+                    if resume_next_batch_index > len(train_dl):
+                        raise ValueError(
+                            "checkpoint next_batch_index exceeds the train split")
+                    epoch_loss = resume_epoch_loss_sum
+                    nb = resume_next_batch_index
+                    train_iterator = train_dl.IterFrom(resume_next_batch_index)
+                    train_enumeration_start = resume_next_batch_index + 1
+                else:
+                    epoch_loss = 0.0
+                    nb = 0
+                    agent.ResetBrainState(B=batchSize, isOnlineLearning=onlineLearning)
+                    train_iterator = iter(train_dl)
+                    train_enumeration_start = 1
 
-                agent.ResetBrainState(B=batchSize, isOnlineLearning=onlineLearning)
-
-                for bi, batch in enumerate(train_dl, start=1):
-                    img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b, synthetic_targets_b = unpack_batch(batch)
+                for bi, batch in enumerate(
+                    train_iterator,
+                    start=train_enumeration_start):
+                    if self.controller.ShouldStop():
+                        break
+                    img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, robot_state_b, synthetic_targets_b = unpack_batch(batch)
 
                     visual_enabled = self.controller.IsVisualStateEnabled()
                     pack = DataPreprocessor.ConvertRobotInputs(
@@ -2368,23 +3031,16 @@ class ManagerFunction:
                     depth_valid_t = pack["depth_valid"]
                     reward_t = pack["rewards"]
                     done_t = pack["dones"]
-                    robot_state_t = self.BuildDefaultRobotState(
-                        int(frames.size(0)),
-                        device=self.device,
-                        dtype=frames.dtype)
                     synthetic_targets_t = move_target_batch(synthetic_targets_b)
-                    action_t = action_b.to(self.device)
-                    robot_state_t["endpoint_pose"] = action_t
-                    robot_state_t["planner_expected_endpoint_pose"] = robot_state_t["endpoint_pose"]
-                    if "camera_pose_world" in synthetic_targets_t:
-                        robot_state_t["camera_pose_world"] = synthetic_targets_t["camera_pose_world"]
-                    perception_targets = {
+                    robot_state_t = self.TensorizeRobotState(
+                        robot_state_b,
+                        self.device,
+                        batched=True)
+                    perception_targets = dict(synthetic_targets_t)
+                    perception_targets.update({
+                        "rgb": frames,
                         "depth": depth_t,
-                        "depth_valid": depth_valid_t,}
-                    perception_targets.update(synthetic_targets_t)
-                    perception_targets["rgb"] = frames
-                    perception_targets["depth"] = depth_t
-                    perception_targets["depth_valid"] = depth_valid_t
+                        "depth_valid": depth_valid_t,})
 
                     if self.controller.ShouldResetHebbian():
                         agent.ResetHebbianMemory()
@@ -2401,6 +3057,7 @@ class ManagerFunction:
                         depth_valid=depth_valid_t,
                         perception_targets=perception_targets,
                         robot_state=robot_state_t,
+                        compute_critic_loss=critic_stage_enabled,
                         text_trust=[TEXT_TRUST_OPERATOR_COMMAND for _ in range(len(ext_text_b))]))
 
                     if act_out is None:
@@ -2410,18 +3067,52 @@ class ManagerFunction:
                     transport_delayed_loss = act_out.transport_delayed_loss
                     ocr_items = act_out.ocr
 
-                    loss = model_loss
+                    optimization_losses = act_out.optimization_losses
+                    if set(optimization_losses) != {"world", "critic", "policy"}:
+                        raise RuntimeError(
+                            "BrainCore must expose world/critic/policy optimization losses")
+                    selected_loss_names = self.TrainStageLossNames(trainStage)
+                    current_stage_loss = sum(
+                        (optimization_losses[name] for name in selected_loss_names),
+                        model_loss.new_zeros(()))
+                    loss = current_stage_loss
+                    if critic_stage_enabled:
+                        loss = loss + transport_delayed_loss.detach()
 
                     agent.opt_world.zero_grad(set_to_none=True)
                     agent.opt_critic.zero_grad(set_to_none=True)
                     agent.opt_actor.zero_grad(set_to_none=True)
 
+                    world_parameters = agent.OptimizerParameters([agent.opt_world])
+                    critic_parameters = agent.OptimizerParameters([agent.opt_critic])
+                    policy_parameters = agent.OptimizerParameters([agent.opt_actor])
+
                     transport_capture_delayed = {"captured": 0.0, "grad_norm": 0.0, "accum_steps": 0.0}
                     if critic_stage_enabled and transport_delayed_loss.requires_grad:
+                        # The delayed critic graph owns independent transport snapshots;
+                        # restricting backward to current parameters would exclude those
+                        # leaves and silently suppress their gradient hooks.
                         transport_delayed_loss.backward()
                         transport_capture_delayed = agent.CaptureCriticTransportGrad()
 
-                    loss.backward()
+                    current_backward_jobs = []
+                    if trainStage in ("full", "world"):
+                        current_backward_jobs.append(
+                            (optimization_losses["world"], world_parameters))
+                    if critic_stage_enabled:
+                        current_backward_jobs.append(
+                            (optimization_losses["critic"], critic_parameters))
+                    if trainStage in ("full", "policy"):
+                        current_backward_jobs.append(
+                            (optimization_losses["policy"], policy_parameters))
+                    current_backward_jobs = [
+                        (objective, parameters)
+                        for objective, parameters in current_backward_jobs
+                        if objective.requires_grad and len(parameters) > 0]
+                    for job_index, (objective, parameters) in enumerate(current_backward_jobs):
+                        objective.backward(
+                            inputs=parameters,
+                            retain_graph=(job_index + 1 < len(current_backward_jobs)))
                     transport_capture_current = {"captured": 0.0, "grad_norm": 0.0, "accum_steps": 0.0}
                     if critic_stage_enabled:
                         transport_capture_current = agent.CaptureCriticTransportGrad()
@@ -2469,7 +3160,11 @@ class ManagerFunction:
                         previous_processed_sample_count_total,
                         processed_sample_count_total,
                         saveEverySampleCount):
-                        SaveTrainArtifacts(ep, logPeriodic=True)
+                        SaveTrainArtifacts(
+                            ep,
+                            nextBatchIndex=bi,
+                            epochLossSum=epoch_loss + float(loss.item()),
+                            logPeriodic=True)
 
                     epoch_loss += float(loss.item())
                     nb += 1
@@ -2513,11 +3208,19 @@ class ManagerFunction:
                     if not self.WaitWhilePaused("Training paused"):
                         break
 
+                resume_next_batch_index = 0
+                resume_epoch_loss_sum = 0.0
+
                 avg_train = epoch_loss / max(1, nb)
 
                 self.controller.SetStatus("training", f"Epoch {ep+1}/{epochs} done, avg_train={avg_train:.4f}", epoch=ep + 1, total_epochs=epochs,)
 
+                SaveTrainArtifacts(
+                    ep,
+                    nextBatchIndex=nb,
+                    epochLossSum=epoch_loss)
                 if self.controller.ShouldStop():
+                    self.controller.SetStatus("stopped", "Training stopped")
                     break
 
                 def eval_split(dl):
@@ -2528,7 +3231,7 @@ class ManagerFunction:
 
                     with torch.no_grad():
                         for batch in dl:
-                            img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, action_b, synthetic_targets_b = unpack_batch(batch)
+                            img_b, reward_b, done_b, depth_b, depth_valid_b, ext_text_b, robot_state_b, synthetic_targets_b = unpack_batch(batch)
 
                             v_pack = DataPreprocessor.ConvertRobotInputs(
                                 imgs=img_b,
@@ -2544,23 +3247,16 @@ class ManagerFunction:
                             v_depth_valid_t = v_pack["depth_valid"]
                             v_reward_t = v_pack["rewards"]
                             v_done_t = v_pack["dones"]
-                            v_robot_state_t = self.BuildDefaultRobotState(
-                                int(v_frames.size(0)),
-                                device=self.device,
-                                dtype=v_frames.dtype)
                             v_synthetic_targets_t = move_target_batch(synthetic_targets_b)
-                            v_action_t = action_b.to(self.device)
-                            v_robot_state_t["endpoint_pose"] = v_action_t
-                            v_robot_state_t["planner_expected_endpoint_pose"] = v_robot_state_t["endpoint_pose"]
-                            if "camera_pose_world" in v_synthetic_targets_t:
-                                v_robot_state_t["camera_pose_world"] = v_synthetic_targets_t["camera_pose_world"]
-                            v_perception_targets = {
+                            v_robot_state_t = self.TensorizeRobotState(
+                                robot_state_b,
+                                self.device,
+                                batched=True)
+                            v_perception_targets = dict(v_synthetic_targets_t)
+                            v_perception_targets.update({
+                                "rgb": v_frames,
                                 "depth": v_depth_t,
-                                "depth_valid": v_depth_valid_t,}
-                            v_perception_targets.update(v_synthetic_targets_t)
-                            v_perception_targets["rgb"] = v_frames
-                            v_perception_targets["depth"] = v_depth_t
-                            v_perception_targets["depth_valid"] = v_depth_valid_t
+                                "depth_valid": v_depth_valid_t,})
 
                             act_out = agent.Act(AgentActInput(
                                 frame=v_frames,
@@ -2573,12 +3269,24 @@ class ManagerFunction:
                                 depth_valid=v_depth_valid_t,
                                 perception_targets=v_perception_targets,
                                 robot_state=v_robot_state_t,
+                                compute_critic_loss=critic_stage_enabled,
                                 text_trust=[TEXT_TRUST_OPERATOR_COMMAND for _ in range(len(ext_text_b))]))
                             
                             if act_out is None:
                                 continue
 
-                            v_model_loss = act_out.loss
+                            v_optimization_losses = act_out.optimization_losses
+                            if set(v_optimization_losses) != {"world", "critic", "policy"}:
+                                raise RuntimeError(
+                                    "BrainCore must expose world/critic/policy optimization losses")
+                            v_loss_names = self.TrainStageLossNames(trainStage)
+                            v_model_loss = sum(
+                                (v_optimization_losses[name] for name in v_loss_names),
+                                act_out.loss.new_zeros(()))
+                            if critic_stage_enabled:
+                                v_model_loss = (
+                                    v_model_loss
+                                    + act_out.transport_delayed_loss)
 
                             split_loss += float(v_model_loss.item())
                             split_batches += 1
@@ -2595,9 +3303,11 @@ class ManagerFunction:
                 if improved:
                     best_val = avg_val
                     no_improve = 0
-                    SaveTrainArtifacts(ep + 1)
                 else:
                     no_improve += 1
+                SaveTrainArtifacts(
+                    ep + 1,
+                    publishDeployment=improved)
 
                 self.controller.SetStatus(
                     "training",
@@ -2635,12 +3345,32 @@ class ManagerFunction:
             raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
 
         raw = torch.load(str(ckpt_path), map_location="cpu")
-        if "brain" not in raw:
-            raise KeyError(f"checkpoint {ckpt_path} has no 'brain' field")
+        if type(raw) is not dict or set(raw) != TRAIN_CHECKPOINT_FIELDS:
+            raise ValueError(
+                f"checkpoint {ckpt_path} fields do not match the current schema")
 
+        if (
+            type(raw["schema_version"]) is not int
+            or raw["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"unsupported training checkpoint schema {raw['schema_version']!r}")
+        if type(raw["brain"]) is not dict:
+            raise TypeError("training checkpoint brain state must be a dictionary")
+        if raw["online_learning"]:
+            raise ValueError(
+                "online training checkpoints require the published deployment artifact; "
+                "their candidate adapters cannot be exported without materialization")
         params = {
-            "schema_version": int(raw.get("schema_version", 1)),
+            "schema_version": raw["schema_version"],
+            "calibration_id": raw["calibration_id"],
             "brain": raw["brain"],}
+        runtime_keys = sorted(
+            name for name in params["brain"]
+            if IsWorldRuntimeStateKey(name))
+        if runtime_keys:
+            raise ValueError(
+                f"training checkpoint brain contains runtime world state: {runtime_keys}")
 
         if out_path.exists() and not overwrite:
             stem = out_path.stem
@@ -2656,203 +3386,146 @@ class ManagerFunction:
                     break
                 idx += 1
 
-        torch.save(params, str(out_path))
+        self.AtomicTorchSave(params, out_path)
         print(f"[ExportParamsOnly] saved params to {out_path}")
 
 
-    def LoadCheckpoint(self, brain: BrainCore, agent: Agent, dataset: Dataset, path: str = None):
-        ckpt = torch.load(path,  map_location=self.device)
-        checkpoint_version = int(ckpt.get("schema_version", 1))
-        if checkpoint_version not in (1, 2, 3, TRAIN_CHECKPOINT_SCHEMA_VERSION):
+    def LoadCheckpoint(
+        self,
+        brain: BrainCore,
+        agent: Agent,
+        dataset: Dataset,
+        path: str = None,
+        *,
+        batchSize: int,
+        trainStage: str,
+        onlineLearning: bool,) -> TrainingResumeState:
+        ckpt = torch.load(
+            path,
+            map_location=self.device,
+            weights_only=False)
+        if type(ckpt) is not dict or set(ckpt) != TRAIN_CHECKPOINT_FIELDS:
             raise ValueError(
-                f"unsupported training checkpoint schema {checkpoint_version}")
+                "training checkpoint fields do not match the current schema")
+        self.ValidateTrainingRngState(ckpt["rng"])
+        if (
+            type(ckpt["schema_version"]) is not int
+            or ckpt["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"unsupported training checkpoint schema {ckpt['schema_version']!r}")
+        if ckpt["calibration_id"] != brain.calibration_id:
+            raise ValueError(
+                "training checkpoint calibration_id does not match configured K")
+        if ckpt["world_frame_id"] != dataset.world_frame_id:
+            raise ValueError(
+                "training checkpoint world_frame_id does not match the dataset")
+        if type(ckpt["batch_size"]) is not int or ckpt["batch_size"] != batchSize:
+            raise ValueError(
+                "training checkpoint batch_size does not match the trajectory loader")
+        if type(ckpt["online_learning"]) is not bool or ckpt["online_learning"] != onlineLearning:
+            raise ValueError(
+                "training checkpoint online_learning mode does not match the brain")
+
+        for field in ("epoch", "next_batch_index"):
+            if type(ckpt[field]) is not int:
+                raise TypeError(f"training checkpoint {field} must be an integer")
+        if type(ckpt["epoch_loss_sum"]) not in (int, float):
+            raise TypeError("training checkpoint epoch_loss_sum must be numeric")
+        start_epoch = ckpt["epoch"]
+        next_batch_index = ckpt["next_batch_index"]
+        epoch_loss_sum = float(ckpt["epoch_loss_sum"])
+        if (
+            start_epoch < 0
+            or next_batch_index < 0
+            or not math.isfinite(epoch_loss_sum)
+        ):
+            raise ValueError("training checkpoint cursor is invalid")
+        checkpoint_stage = self.NormalizeTrainStage(ckpt["train_stage"])
+        requested_stage = self.NormalizeTrainStage(trainStage)
+        if checkpoint_stage != requested_stage:
+            raise ValueError(
+                "training checkpoint train_stage does not match the requested stage")
+        split_indices: List[int] = []
+        for field in ("train_indices", "val_indices", "test_indices"):
+            indices = ckpt[field]
+            if type(indices) is not list or any(type(index) is not int for index in indices):
+                raise TypeError(f"training checkpoint {field} must be a list of integers")
+            if len(set(indices)) != len(indices):
+                raise ValueError(f"training checkpoint {field} contains duplicate indices")
+            if any(index < 0 or index >= len(dataset) for index in indices):
+                raise ValueError(f"training checkpoint {field} contains an invalid index")
+            split_indices.extend(indices)
+        if len(set(split_indices)) != len(split_indices):
+            raise ValueError("training checkpoint dataset splits must be disjoint")
+        if set(split_indices) != set(range(len(dataset))):
+            raise ValueError("training checkpoint dataset splits must cover the dataset")
+        maximum_batch_cursor = len(ckpt["train_indices"]) // batchSize
+        if next_batch_index > maximum_batch_cursor:
+            raise ValueError("training checkpoint cursor exceeds the train split")
+        if type(ckpt["no_improve"]) is not int or ckpt["no_improve"] < 0:
+            raise ValueError("training checkpoint no_improve is invalid")
+        if type(ckpt["processed_sample_count_total"]) is not int or ckpt["processed_sample_count_total"] < 0:
+            raise ValueError("training checkpoint processed sample count is invalid")
+        if type(ckpt["best_val"]) not in (int, float):
+            raise TypeError("training checkpoint best_val must be numeric")
+        best_val = float(ckpt["best_val"])
+        if math.isnan(best_val) or best_val == float("-inf"):
+            raise ValueError("training checkpoint best_val is invalid")
+        no_improve = ckpt["no_improve"]
+        processed_sample_count_total = ckpt["processed_sample_count_total"]
+
         brain_state = ckpt["brain"]
-        SynchronizeGrowableLoRATopologyForFullLoad(brain, brain_state)
-        brain_state = brain.UpgradeDecisionStateDict(brain_state)
-        brain.ResizeStateBuffersForLoad(brain_state)
-        brain.load_state_dict(
-            brain_state,
-            strict=checkpoint_version == TRAIN_CHECKPOINT_SCHEMA_VERSION)
+        if type(brain_state) is not dict:
+            raise TypeError("brain model state must be a dictionary")
+        world = agent.GetRuntimeWorld()
+        world_batch_size, _ = world._ValidateMemoryPayload(ckpt["world_memory"])
+        if world_batch_size != batchSize:
+            raise ValueError("training checkpoint World memory batch size is invalid")
+        brain.mem.ValidateDurableState(
+            ckpt["memory_durable"],
+            expectedBatch=batchSize)
+
+        self.ImportTrainingCheckpointState(
+            brain,
+            agent,
+            ckpt,
+            batchSize=batchSize)
+
+        train_ds = torch.utils.data.Subset(dataset, ckpt["train_indices"])
+        val_ds = torch.utils.data.Subset(dataset, ckpt["val_indices"])
+        test_ds = torch.utils.data.Subset(dataset, ckpt["test_indices"])
+
+        return TrainingResumeState(
+            epoch=start_epoch,
+            next_batch_index=next_batch_index,
+            epoch_loss_sum=epoch_loss_sum,
+            best_val=best_val,
+            no_improve=no_improve,
+            processed_sample_count_total=processed_sample_count_total,
+            train_dataset=train_ds,
+            validation_dataset=val_ds,
+            test_dataset=test_ds)
+
+    def ImportTrainingCheckpointState(
+        self,
+        brain: BrainCore,
+        agent: Agent,
+        checkpoint: Dict[str, Any],
+        *,
+        batchSize: int,) -> None:
+        LoadBrainModelState(brain, checkpoint["brain"])
+        agent.ImportOnlineCandidateState(checkpoint["online_candidates"])
         agent.SyncTrainableOptimizers()
-        if checkpoint_version == TRAIN_CHECKPOINT_SCHEMA_VERSION:
-            try:
-                agent.opt_actor.load_state_dict(ckpt["opt_actor"])
-            except ValueError:
-                print("[LoadCheckpoint] opt_actor state skipped because parameter groups changed")
-            try:
-                agent.opt_critic.load_state_dict(ckpt["opt_critic"])
-            except ValueError:
-                print("[LoadCheckpoint] opt_critic state skipped because parameter groups changed")
-            try:
-                agent.opt_world.load_state_dict(ckpt["opt_world"])
-            except ValueError:
-                print("[LoadCheckpoint] opt_world state skipped because parameter groups changed")
-        else:
-            print("[LoadCheckpoint] legacy optimizer states skipped after schema migration")
-        agent.ClearTransientCandidateOptimizerState()
-
-        if "buffers" in ckpt:
-            brain.ImportBuffers(ckpt["buffers"])
-
-        if "rng" in ckpt:
-            self.RestoreRngState(ckpt["rng"])
-
-        train_ds = val_ds = test_ds = None
-        if ckpt.get("train_indices") is not None:
-            train_ds = torch.utils.data.Subset(dataset, ckpt["train_indices"])
-            val_ds = torch.utils.data.Subset(dataset, ckpt["val_indices"])
-            if ckpt.get("test_indices") is not None:
-                test_ds = torch.utils.data.Subset(dataset, ckpt["test_indices"])
-
-        start_epoch = int(ckpt.get("epoch", 0))
-        best_val = float(ckpt.get("best_val", float("inf")))
-        processed_sample_count_total = int(ckpt.get("processed_sample_count_total", 0))
-        return start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds
-
-    def StartDeployment(self, cameraIndex: int = 0, useHebbian: bool = True):
-        return self.StartBackgroundTask(
-            self.DeployLoop,
-            args=(cameraIndex,),
-            kwargs={"useHebbian": useHebbian,})
-
-
-    def DeployLoop(self, cameraIndex: int,* ,useHebbian: bool = True,):
-        try:
-            self.ResetControllerFlags()
-
-            brain = BrainCore(
-                device=self.device,
-                plasticHebbian=useHebbian,
-                plasticOnlineLearning=False,)
-
-            model_path = BasicParameters.MODULEPARAMETER_PATH
-
-            if os.path.exists(model_path):
-                self.LoadBrainWeights(brain, model_path)
-            else:
-                msg = f"The module file is not exit: {model_path}"
-                print(msg)
-                self.controller.SetStatus("error", msg)
-                return 
-
-            brain.eval()
-
-            agent = Agent(brain,isTrain=False,device=self.device,worldMemoryPath=BasicParameters.WORLD_MEMORY_PATH,memMemoryPath=BasicParameters.MEMORY_MEMORY_PATH,)
-            agent.ResetBrainState(isOnlineLearning=False)
-
-            if iio is None:
-                raise RuntimeError("imageio.v3 cant use")
-
-            self.controller.SetStatus("is_begin", "Deployment started", visual=self.controller.EmptyVisualStatus(touch=True))
-
-            while not self.controller.ShouldStop():
-                frame_np = iio.imread(f"<video{int(cameraIndex)}>", index=0)
-                if frame_np is None:
-                    raise RuntimeError(f"cannot read frame from camera {int(cameraIndex)}")
-
-                visual_enabled = self.controller.IsVisualStateEnabled()
-                frame_arr = np.asarray(frame_np)
-                depth_np = np.ones(frame_arr.shape[:2], dtype=np.float32)
-                depth_valid_np = np.ones(frame_arr.shape[:2], dtype=bool)
-                pack = DataPreprocessor.ConvertRobotInputs(
-                    imgs=frame_np,
-                    reward=None,
-                    done=None,
-                    depths=depth_np,
-                    depthValids=depth_valid_np,
-                    device=self.device,
-                    needVisualState=visual_enabled,)
-
-                frames = pack["frames"]
-                original_images = pack["original_images"]
-                resize_meta = pack["resize_meta"]
-                depth_t = pack["depths"]
-                depth_valid_t = pack["depth_valid"]
-                robot_state_t = self.BuildDefaultRobotState(
-                    int(frames.size(0)),
-                    device=self.device,
-                    dtype=frames.dtype)
-
-                if self.controller.ShouldResetHebbian():
-                    agent.ResetHebbianMemory()
-                    self.controller.RequestCancelResetHebbian()
-
-                parameters = self.controller.GetParameterReceiver()
-
-                reward_param = parameters["reward"]
-                done_param = parameters["done"]
-                text_param = parameters["textExt"]
-
-                reward_tensor = None
-                if reward_param is not None:
-                    reward_tensor = torch.tensor([[float(reward_param)]], dtype=torch.float32, device=self.device)
-
-                done_tensor = None
-                if done_param is not None:
-                    done_tensor = torch.tensor([[float(done_param)]], dtype=torch.float32, device=self.device)
-
-                text_ext = None
-                if text_param is not None:
-                    if isinstance(text_param, (list, tuple)):
-                        text_ext = [None if (item is None or str(item).strip() == "") else str(item) for item in text_param]
-                    else:
-                        text_value = str(text_param).strip()
-                        text_ext = [None if text_value == "" else text_value]
-
-                act_out = agent.Act(AgentActInput(
-                    frame=frames,
-                    text_ext=text_ext,
-                    reward=reward_tensor,
-                    done=done_tensor,
-                    sample_actions=True,
-                    deterministic_actor=True,
-                    depth=depth_t,
-                    depth_valid=depth_valid_t,
-                    robot_state=robot_state_t,
-                    text_trust=(
-                        [TEXT_TRUST_OPERATOR_COMMAND for _ in range(len(text_ext))]
-                        if text_ext is not None else None)))
-                if act_out is None:
-                    continue
-
-                act_json = agent.UnpackActPacked(act_out)
-                if self.json_queue is not None:
-                    self.json_queue.clearandpush(act_json)
-               
-                status_kwargs = {}
-
-                if visual_enabled and original_images:
-                    ocr_items = act_out.ocr
-                    deploy_items = (ocr_items[0] if (ocr_items is not None and len(ocr_items) > 0) else [])
-                    deploy_texts = [
-                        str(item.get("text", "")).strip()
-                        for item in deploy_items
-                        if str(item.get("text", "")).strip() != ""]
-                    resize_meta_0 = resize_meta[0] if resize_meta else None
-                    visual_payload = None
-
-                    visual_payload = self.BuildVisualPayload(
-                        original_images[0],
-                        ocrTexts=deploy_texts,
-                        ocrItems=deploy_items,
-                        resizeMeta=resize_meta_0,
-                        title="Deploy",
-                        extraLines=deploy_texts,)
-
-                    if visual_payload is not None:
-                        status_kwargs["visual"] = visual_payload
-
-                self.controller.SetStatus("is_begin", act_json, **status_kwargs)
-
-            self.controller.SetStatus("stopped", "Deployment stopped")
-
-        except Exception as e:
-            tb = traceback.format_exc()
-            self.controller.SetStatus("error", f"Deployment error: {e}", trace=tb)
-        finally:
-            self.is_begin = False
-
-
+        agent.opt_actor.load_state_dict(checkpoint["opt_actor"])
+        agent.opt_critic.load_state_dict(checkpoint["opt_critic"])
+        agent.opt_world.load_state_dict(checkpoint["opt_world"])
+        agent.GetRuntimeWorld().ImportMemoryPayload(
+            checkpoint["world_memory"],
+            batchSize=batchSize)
+        brain.mem.ImportDurableState(checkpoint["memory_durable"])
+        brain.ImportBuffers(checkpoint["buffers"])
+        self.RestoreRngState(checkpoint["rng"])
 
     def TestPerceptionModule(self):
         return self.RunNamedTest("perception")
@@ -2925,6 +3598,30 @@ class ManagerFunction:
         try:
             root = Path(dataRoot)
             BasicParameters.Set("DATA_ROOT_PATH_TEST", str(root))
+            BasicParameters.Set(
+                "DATA_SENSOR_MANIFEST_PATH_TEST",
+                str(root / "sensor_manifest.json"))
+            BasicParameters.Set(
+                "DATA_DEPTH_PATH_TEST",
+                str(root / "depth"))
+            BasicParameters.Set(
+                "DATA_DEPTH_VALID_PATH_TEST",
+                str(root / "depth_valid"))
+            BasicParameters.Set(
+                "DATA_ROBOT_STATE_PATH_TEST",
+                str(root / "robot_state"))
+            BasicParameters.Set(
+                "DATA_NORMAL_PATH_TEST",
+                str(root / "normal"))
+            BasicParameters.Set(
+                "DATA_SEMANTIC_SEGMENTATION_PATH_TEST",
+                str(root / "semantic_segmentation"))
+            BasicParameters.Set(
+                "DATA_INSTANCE_SEGMENTATION_PATH_TEST",
+                str(root / "instance_segmentation"))
+            BasicParameters.Set(
+                "DATA_SYNTHETIC_SUPERVISION_PATH_TEST",
+                str(root / "synthetic_supervision"))
 
             if not self.HasGameDataset(root):
                 if iio is None:
@@ -2937,9 +3634,38 @@ class ManagerFunction:
                 (root / "reward").mkdir(parents=True, exist_ok=True)
                 (root / "done").mkdir(parents=True, exist_ok=True)
                 (root / "depth").mkdir(parents=True, exist_ok=True)
+                (root / "depth_valid").mkdir(parents=True, exist_ok=True)
+                (root / "robot_state").mkdir(parents=True, exist_ok=True)
                 (root / "texts").mkdir(parents=True, exist_ok=True)
 
                 H, W = BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE
+                calibration = self.LoadCameraCalibration()
+                sensor_manifest = {
+                    "schema_version": OFFLINE_SENSOR_MANIFEST_SCHEMA_VERSION,
+                    "calibration_id": calibration.calibration_id,
+                    "rgb_encoding": "rgb8",
+                    "depth_unit": "meter",
+                    "depth_representation": "optical_axis_z",
+                    "rgb_depth_alignment": "registered_to_rgb",
+                    "rectification": "rectified",
+                    "synchronization": "synchronized_exposure",
+                    "object_motion_frame": "current_camera_optical",
+                    "object_motion_representation": "se3_spatial_delta",
+                    "object_motion_reference": (
+                        "previous_to_current_after_camera_egomotion_compensation"),
+                    "object_motion_translation_unit": "meter",
+                    "object_motion_quaternion_order": "xyzw",}
+                (root / "sensor_manifest.json").write_text(
+                    json.dumps(sensor_manifest),
+                    encoding="utf-8")
+
+                endpoint_pose = np.zeros((
+                    ModuleDim.RobotStateEndpointCount,
+                    ModuleDim.DecisionEndpointPoseDim), dtype=np.float32)
+                endpoint_pose[..., 6] = 1.0
+                base_orientation_world = np.zeros(4, dtype=np.float32)
+                base_orientation_world[3] = 1.0
+                robot_metadata = ExpectedRobotStateWireMetadata()
 
                 templates = ["move left", "move right", "move forward", "move back",
                             "use skill", "defend", "attack", "pickup item",
@@ -2951,12 +3677,40 @@ class ManagerFunction:
 
                     depth = rng.uniform(0.1, 2.0, size=(H, W)).astype(np.float32)
                     np.save(str(root / "depth" / f"{i:05d}.npy"), depth)
+                    np.save(
+                        str(root / "depth_valid" / f"{i:05d}.npy"),
+                        np.ones((H, W), dtype=np.bool_))
 
                     reward = rng.normal(loc=0.0, scale=2.0, size=(1,)).astype(np.float32)
                     np.save(str(root / "reward" / f"{i:05d}.npy"), reward)
 
                     done = rng.normal(loc=0.0, scale=2.0, size=(1,)).astype(np.float32)
                     np.save(str(root / "done" / f"{i:05d}.npy"), done)
+
+                    frame_id = f"{i:05d}"
+                    robot_packet = {
+                        "schema_version": ROBOT_STATE_WIRE_SCHEMA_VERSION,
+                        "stream_id": "offline-test",
+                        "sequence_index": i,
+                        "frame_id": frame_id,
+                        "calibration_id": calibration.calibration_id,
+                        "world_frame_id": "test_world",
+                        **robot_metadata,
+                        "endpoint_pose": endpoint_pose.tolist(),
+                        "base_orientation_world": base_orientation_world.tolist(),
+                        "gravity_direction_world": [0.0, 0.0, -1.0],
+                        "planner_expected_endpoint_pose": endpoint_pose[
+                            ModuleDim.RobotStateControlledEndpointSlice].tolist(),
+                        "planner_progress": 0.0,
+                        "planner_tracking_error": 0.0,
+                        "planner_executing": 0.0,
+                        "planner_reached": 0.0,
+                        "planner_failed": 0.0,
+                        "model_command_executed": 0.0,
+                        "executed_action_id": 0,}
+                    (root / "robot_state" / f"{frame_id}.json").write_text(
+                        json.dumps(robot_packet),
+                        encoding="utf-8")
 
                     if rng.random() < 0.35:
                         ext_text = ""
@@ -2982,7 +3736,7 @@ class ManagerFunction:
             self.message_thread = threading.Thread(target=self.MonitorTraining,args=(),daemon=False,)
             self.message_thread.start()"""
 
-            self.TrainLoop(epochs, batchSize, valSplit, False, onlineLearning, isTest=True, worldMemPath=BasicParameters.WORLD_MEMORY_PATH_TEST, memMemPath=BasicParameters.MEMORY_MEMORY_PATH_TEST,ckptPath=BasicParameters.CKPT_PATH_TEST)
+            self.TrainLoop(epochs, batchSize, valSplit, False, onlineLearning, isTest=True, worldMemPath=BasicParameters.WORLD_MEMORY_PATH_TEST_TRAIN, memMemPath=BasicParameters.MEMORY_MEMORY_PATH_TEST_TRAIN,ckptPath=BasicParameters.CKPT_PATH_TEST)
         
             return {"ok": True}
 
@@ -3366,7 +4120,8 @@ class ManagerFunction:
         valSplit: float = 0.2,
         isResume: bool = False,
         overrideCheckpointWithModuleParams: Optional[bool] = None,
-        saveEverySampleCount: Optional[int] = None,) -> Dict[str, Any]:
+        saveEverySampleCount: Optional[int] = None,
+        trainStage: str = "full",) -> Dict[str, Any]:
         try:
             if saveEverySampleCount is None:
                 saveEverySampleCount = BasicParameters.SAVE_EVERY_SAMPLE_COUNT
@@ -3394,7 +4149,8 @@ class ManagerFunction:
                 onlineLearning=onlineLearning,
                 isTest=False,
                 overrideCheckpointWithModuleParams=overrideCheckpointWithModuleParams,
-                saveEverySampleCount=saveEverySampleCount,)
+                saveEverySampleCount=saveEverySampleCount,
+                trainStage=trainStage,)
 
             if not ok:
                 print("StartTraining returns False (training may already be running)")
@@ -3412,17 +4168,21 @@ class ManagerFunction:
 
     def DeployModule(
         self,
-        cameraIndex: int = 0,
-        useHebbian: bool = True,) -> Dict[str, Any]:
+        useHebbian: bool = True,
+        usePlanner: bool = True,) -> Dict[str, Any]:
+        """Initialize the push-stream runtime used by AgentHandleForward(Json).
+
+        RGB-D and measured RobotState remain caller-owned synchronized inputs;
+        deployment never opens a camera or fabricates depth/robot poses.
+        """
         try:
-            ok = self.StartDeployment(cameraIndex=cameraIndex, useHebbian=useHebbian,)
-
-            if not ok:
-                print("StartDeployment returns False (deployment may already be running)")
-                return {"ok": False, "msg": "already_running"}
-
-            self.StartMessageMonitor(self.MonitorDeployment)
-
+            self.InitAgentHandle(
+                useHebbian=useHebbian,
+                usePlanner=usePlanner)
+            self.controller.SetStatus(
+                "is_begin",
+                "Agent streaming initialized",
+                visual=self.controller.EmptyVisualStatus(touch=True))
             return {"ok": True}
 
         except Exception as e:
@@ -3431,6 +4191,35 @@ class ManagerFunction:
             raise
 
 class TestManagerMTool:
+    def TestDeploymentConfigurationRouting(self) -> bool:
+        try:
+            manager = object.__new__(ManagerFunction)
+            captured: Dict[str, Any] = {}
+
+            def init_agent_handle(**kwargs):
+                captured.update(kwargs)
+                return True
+
+            manager.InitAgentHandle = init_agent_handle
+            manager.controller = ModuleController()
+            result = ManagerFunction.DeployModule(
+                manager,
+                useHebbian=False,
+                usePlanner=False)
+            ok = (
+                result == {"ok": True}
+                and ManagerFunction.DEFAULT_OVERRIDE_CHECKPOINT_WITH_MODULE_PARAMS is False
+                and captured == {
+                    "useHebbian": False,
+                    "usePlanner": False})
+            print(
+                f"Manager deployment configuration routing "
+                f"{'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager deployment configuration routing error: {e}")
+            return False
+
     def TestPauseStopImmediateExit(self) -> bool:
         try:
             manager = ManagerFunction.__new__(ManagerFunction)
@@ -3467,14 +4256,39 @@ class TestManagerMTool:
     def TestEvaluationRuntimeRestoredBeforeSave(self) -> bool:
         caller_rng = None
         try:
+            class FakeMemory:
+                def __init__(self):
+                    self.durable = torch.tensor([5.0])
+
+                def ExportDurableState(self):
+                    return {"durable": self.durable.detach().clone()}
+
+                def ImportDurableState(self, state):
+                    self.durable = state["durable"].detach().clone()
+
+            class FakeWorld:
+                def __init__(self):
+                    self.physical = torch.tensor([7.0])
+
+                def ExportPhysicalState(self):
+                    return {"physical": self.physical.detach().clone()}
+
+                def ImportPhysicalState(self, state):
+                    self.physical = state["physical"].detach().clone()
+
             class FakeBrain(nn.Module):
                 def __init__(self):
                     super().__init__()
+                    self.mem = FakeMemory()
+                    self.world = FakeWorld()
                     self.runtime = torch.tensor([3.0])
                     self.training_graph = {"pending": object()}
                     self.child = nn.Linear(1, 1)
                     self.train()
                     self.child.eval()
+
+                def RuntimeModule(self, module):
+                    return module
 
                 def ExportBuffers(self):
                     return {"runtime": self.runtime.detach().clone()}
@@ -3512,6 +4326,8 @@ class TestManagerMTool:
                 split_random.append(draw_random())
                 brain.eval()
                 brain.runtime.fill_(11.0)
+                brain.world.physical.fill_(77.0)
+                brain.mem.durable.fill_(55.0)
                 return 1.25
 
             def evaluate_test():
@@ -3519,6 +4335,8 @@ class TestManagerMTool:
                 split_random.append(draw_random())
                 brain.eval()
                 brain.runtime.fill_(99.0)
+                brain.world.physical.fill_(99.0)
+                brain.mem.durable.fill_(99.0)
                 return 2.5
 
             result = manager.EvaluateValidationAndTestWithRestoredBrainBuffers(
@@ -3537,7 +4355,9 @@ class TestManagerMTool:
                 and brain.training
                 and not brain.child.training
                 and "pending" in brain.training_graph
-                and torch.equal(saved_buffers["runtime"], torch.tensor([3.0])))
+                and torch.equal(saved_buffers["runtime"], torch.tensor([3.0]))
+                and torch.equal(brain.world.physical, torch.tensor([7.0]))
+                and torch.equal(brain.mem.durable, torch.tensor([5.0])))
             print(f"Manager evaluation runtime/RNG restore {'passed' if ok else 'failed'}")
             return bool(ok)
         except Exception as e:
@@ -3547,25 +4367,109 @@ class TestManagerMTool:
             if caller_rng is not None:
                 manager.RestoreRngState(caller_rng)
 
+    def TestDeploymentManifestRoutesOneCompleteGeneration(self) -> bool:
+        try:
+            import tempfile as tempfile_module
+
+            manager = ManagerFunction.__new__(ManagerFunction)
+            with tempfile_module.TemporaryDirectory() as directory:
+                root = Path(directory)
+                configured_model = root / "model.pth"
+                configured_world = root / "world.pth"
+                configured_memory = root / "memory.pth"
+                missing_manifest_rejected = False
+                try:
+                    manager.ResolveDeploymentArtifactPaths(
+                        configured_model,
+                        calibrationId="calibration-a")
+                except FileNotFoundError:
+                    missing_manifest_rejected = True
+
+                generation = root / ".model_deployments" / "generation-1"
+                model = generation / "model.pth"
+                world = generation / "world.pth"
+                memory = generation / "memory.pth"
+                for path in (model, world, memory):
+                    manager.AtomicTorchSave({"complete": True}, path)
+                manager.AtomicJsonSave({
+                    "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                    "calibration_id": "calibration-a",
+                    "generation": "generation-1",
+                    "model_path": str(model),
+                    "world_memory_path": str(world),
+                    "memory_path": str(memory),
+                }, manager.DeploymentManifestPath(configured_model))
+                resolved = manager.ResolveDeploymentArtifactPaths(
+                    configured_model,
+                    calibrationId="calibration-a")
+                mismatch_rejected = False
+                try:
+                    manager.ResolveDeploymentArtifactPaths(
+                        configured_model,
+                        calibrationId="calibration-b")
+                except ValueError:
+                    mismatch_rejected = True
+                mixed_generation = dict(json.loads(
+                    manager.DeploymentManifestPath(configured_model).read_text(
+                        encoding="utf-8")))
+                mixed_generation["memory_path"] = str(configured_memory.resolve())
+                manager.AtomicTorchSave({"complete": True}, configured_memory)
+                manager.AtomicJsonSave(
+                    mixed_generation,
+                    manager.DeploymentManifestPath(configured_model))
+                try:
+                    manager.ResolveDeploymentArtifactPaths(
+                        configured_model,
+                        calibrationId="calibration-a")
+                    mixed_generation_rejected = False
+                except ValueError:
+                    mixed_generation_rejected = True
+                ok = (
+                    resolved == (str(model), str(world), str(memory))
+                    and missing_manifest_rejected
+                    and mismatch_rejected
+                    and mixed_generation_rejected)
+            print(f"Manager deployment generation routing {'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager deployment generation routing error: {e}")
+            return False
+
     def TestLoadCheckpointRestoresTopologyBeforeOptimizers(self) -> bool:
         try:
             import io
 
             events: List[str] = []
 
+            class FakeMemory:
+                def ValidateDurableState(self, state, *, expectedBatch):
+                    if state != {"batch_size": expectedBatch}:
+                        raise ValueError("invalid durable memory")
+                    events.append("memory_validate")
+
+                def ImportDurableState(self, state):
+                    events.append("memory_import")
+
+            class FakeWorld:
+                def _ValidateMemoryPayload(self, state):
+                    events.append("world_validate")
+                    return int(state["batch_size"]), 1
+
+                def ImportMemoryPayload(self, state, *, batchSize):
+                    if state["batch_size"] != batchSize:
+                        raise ValueError("invalid World memory")
+                    events.append("world_import")
+
             class FakeBrain(nn.Module):
                 def __init__(self):
                     super().__init__()
-
-                def ResizeStateBuffersForLoad(self, state):
-                    events.append("resize")
-
-                def UpgradeDecisionStateDict(self, state):
-                    events.append("migrate")
-                    return state
+                    self.calibration_id = "test-calibration"
+                    self.register_buffer("buffer", torch.zeros(2))
+                    self.mem = FakeMemory()
 
                 def load_state_dict(self, state, strict):
                     events.append(f"brain_load:{strict}")
+                    return super().load_state_dict(state, strict=strict)
 
                 def ImportBuffers(self, state):
                     events.append("buffers")
@@ -3579,46 +4483,177 @@ class TestManagerMTool:
 
             class FakeAgent:
                 def __init__(self):
+                    self.world = FakeWorld()
                     self.opt_actor = FakeOptimizer("opt_actor")
                     self.opt_critic = FakeOptimizer("opt_critic")
                     self.opt_world = FakeOptimizer("opt_world")
 
+                def GetRuntimeWorld(self):
+                    return self.world
+
+                def ImportOnlineCandidateState(self, state):
+                    if state != {}:
+                        raise ValueError("unexpected online candidates")
+                    events.append("candidates")
+
                 def SyncTrainableOptimizers(self):
                     events.append("sync")
 
-                def ClearTransientCandidateOptimizerState(self):
-                    events.append("clear_candidates")
+            class FakeDataset:
+                world_frame_id = "test-world"
 
+                def __len__(self):
+                    return 3
+
+                def __getitem__(self, index):
+                    return index
+
+            manager = ManagerFunction.__new__(ManagerFunction)
+            manager.device = torch.device("cpu")
             checkpoint = {
                 "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                "calibration_id": "test-calibration",
+                "world_frame_id": "test-world",
+                "epoch": 3,
+                "next_batch_index": 0,
+                "epoch_loss_sum": 0.0,
+                "best_val": 0.25,
+                "no_improve": 2,
+                "train_stage": "full",
+                "batch_size": 1,
+                "online_learning": False,
                 "brain": {"buffer": torch.zeros(2)},
+                "online_candidates": {},
                 "opt_actor": {},
                 "opt_critic": {},
                 "opt_world": {},
-                "buffers": {},}
+                "train_indices": [0],
+                "val_indices": [1],
+                "test_indices": [2],
+                "processed_sample_count_total": 9,
+                "rng": manager.CaptureRngState(),
+                "buffers": {},
+                "world_memory": {"batch_size": 1},
+                "memory_durable": {"batch_size": 1},}
             payload = io.BytesIO()
             torch.save(checkpoint, payload)
             payload.seek(0)
-            manager = ManagerFunction.__new__(ManagerFunction)
-            manager.device = torch.device("cpu")
-            manager.LoadCheckpoint(FakeBrain(), FakeAgent(), [], payload)
-            ok = events == [
-                "migrate",
-                "resize",
-                "brain_load:True",
+            dataset = FakeDataset()
+            resume_state = manager.LoadCheckpoint(
+                FakeBrain(),
+                FakeAgent(),
+                dataset,
+                payload,
+                batchSize=1,
+                trainStage="full",
+                onlineLearning=False)
+            success_events = list(events)
+
+            def serialized(value):
+                result = io.BytesIO()
+                torch.save(value, result)
+                result.seek(0)
+                return result
+
+            missing = dict(checkpoint)
+            missing.pop("rng")
+            try:
+                manager.LoadCheckpoint(
+                    FakeBrain(), FakeAgent(), dataset, serialized(missing),
+                    batchSize=1, trainStage="full", onlineLearning=False)
+                missing_rejected = False
+            except ValueError:
+                missing_rejected = True
+
+            extra = dict(checkpoint)
+            extra["legacy_camera_pose"] = torch.zeros(7)
+            try:
+                manager.LoadCheckpoint(
+                    FakeBrain(), FakeAgent(), dataset, serialized(extra),
+                    batchSize=1, trainStage="full", onlineLearning=False)
+                extra_rejected = False
+            except ValueError:
+                extra_rejected = True
+
+            class FailingOptimizer(FakeOptimizer):
+                def load_state_dict(self, state):
+                    raise ValueError("optimizer topology mismatch")
+
+            failing_agent = FakeAgent()
+            failing_agent.opt_actor = FailingOptimizer("opt_actor")
+            try:
+                manager.LoadCheckpoint(
+                    FakeBrain(), failing_agent, dataset, serialized(checkpoint),
+                    batchSize=1, trainStage="full", onlineLearning=False)
+                optimizer_error_propagated = False
+            except ValueError as error:
+                optimizer_error_propagated = (
+                    str(error) == "optimizer topology mismatch")
+
+            malformed_rng = dict(checkpoint)
+            malformed_rng["rng"] = dict(checkpoint["rng"])
+            malformed_rng["rng"].pop("cuda_all")
+            try:
+                manager.LoadCheckpoint(
+                    FakeBrain(), FakeAgent(), dataset, serialized(malformed_rng),
+                    batchSize=1, trainStage="full", onlineLearning=False)
+                rng_error_propagated = False
+            except ValueError as error:
+                rng_error_propagated = (
+                    str(error)
+                    == "training RNG fields do not match the current schema")
+
+            mismatch_rejected_before_load = True
+            for keyword, value in (
+                ("batchSize", 2),
+                ("trainStage", "world"),
+                ("onlineLearning", True),
+            ):
+                events.clear()
+                arguments = {
+                    "batchSize": 1,
+                    "trainStage": "full",
+                    "onlineLearning": False,}
+                arguments[keyword] = value
+                try:
+                    manager.LoadCheckpoint(
+                        FakeBrain(),
+                        FakeAgent(),
+                        dataset,
+                        serialized(checkpoint),
+                        **arguments)
+                    mismatch_rejected_before_load = False
+                except ValueError:
+                    mismatch_rejected_before_load &= not any(
+                        event.startswith("brain_load")
+                        for event in events)
+
+            ok = (
+                success_events == [
+                "world_validate",
+                "memory_validate",
+                "brain_load:False",
+                "candidates",
                 "sync",
                 "opt_actor",
                 "opt_critic",
                 "opt_world",
-                "clear_candidates",
+                "world_import",
+                "memory_import",
                 "buffers",]
+                and resume_state.no_improve == 2
+                and missing_rejected
+                and extra_rejected
+                and optimizer_error_propagated
+                and rng_error_propagated
+                and mismatch_rejected_before_load)
             print(f"Manager checkpoint restore order {'passed' if ok else 'failed'}")
             return bool(ok)
         except Exception as e:
             print(f"Manager checkpoint restore order error: {e}")
             return False
 
-    def TestLoadBrainWeightsResizesAndSyncsOverride(self) -> bool:
+    def TestLoadBrainWeightsStrictModelStateAndSync(self) -> bool:
         try:
             events: List[str] = []
 
@@ -3627,22 +4662,17 @@ class TestManagerMTool:
             class FakeBrain(nn.Module):
                 def __init__(self):
                     super().__init__()
+                    self.calibration_id = "test-calibration"
                     self.adapter = GrowableLoRALinear(nn.Linear(2, 2))
                     self.adapter.Grow(1)
 
-                def ResizeStateBuffersForLoad(self, state):
-                    events.append("resize")
-
-                def UpgradeDecisionStateDict(self, state):
-                    events.append("migrate")
-                    return state
-
                 def load_state_dict(self, state, strict):
                     events.append(f"load:{strict}")
+                    return super().load_state_dict(state, strict=strict)
 
             class FakeAgent:
-                def SyncTrainableOptimizers(self):
-                    events.append("sync")
+                def ResetOnlineCandidateState(self):
+                    events.append("reset_candidates")
 
                 def ClearTrainableOptimizerState(self):
                     events.append("clear_optimizer_state")
@@ -3650,6 +4680,28 @@ class TestManagerMTool:
             brain = FakeBrain()
             manager = ManagerFunction.__new__(ManagerFunction)
             manager.LoadTorchPayload = lambda path: {
+                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION - 1,
+                "calibration_id": "test-calibration",
+                "brain": {}}
+            old_schema_rejected = False
+            try:
+                manager.LoadBrainWeights(brain, "unused.pth")
+            except ValueError:
+                old_schema_rejected = True
+
+            manager.LoadTorchPayload = lambda path: {
+                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                "calibration_id": "other-calibration",
+                "brain": {}}
+            calibration_mismatch_rejected = False
+            try:
+                manager.LoadBrainWeights(brain, "unused.pth")
+            except ValueError:
+                calibration_mismatch_rejected = True
+
+            manager.LoadTorchPayload = lambda path: {
+                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                "calibration_id": "test-calibration",
                 "brain": {
                     "adapter.target.weight": torch.randn_like(brain.adapter.target.weight),
                     "adapter.target.bias": torch.randn_like(brain.adapter.target.bias)}}
@@ -3657,12 +4709,14 @@ class TestManagerMTool:
                 brain,
                 "unused.pth",
                 agent=FakeAgent())
-            ok = events == [
-                "migrate",
-                "resize",
-                "load:False",
-                "sync",
-                "clear_optimizer_state"] and len(brain.adapter.A_list) == 0
+            ok = (
+                old_schema_rejected
+                and calibration_mismatch_rejected
+                and events == [
+                    "load:False",
+                    "reset_candidates",
+                    "clear_optimizer_state"]
+                and len(brain.adapter.A_list) == 0)
             print(f"Manager parameter override restore order {'passed' if ok else 'failed'}")
             return bool(ok)
         except Exception as e:
@@ -3689,6 +4743,11 @@ class TestManagerMTool:
                 ManagerFunction.NormalizeTrainStage("invalid")
             except ValueError:
                 invalid_rejected = True
+            non_string_rejected = False
+            try:
+                ManagerFunction.NormalizeTrainStage(1)  # type: ignore[arg-type]
+            except TypeError:
+                non_string_rejected = True
 
             ok = True
             ok &= world == [brain.world]
@@ -3696,7 +4755,11 @@ class TestManagerMTool:
             ok &= brain.critic in policy and brain.actor not in policy
             ok &= brain.world in full and brain.critic in full
             ok &= brain.actor not in full
+            ok &= ManagerFunction.TrainStageLossNames("world") == ("world",)
+            ok &= ManagerFunction.TrainStageLossNames("policy") == ("critic", "policy")
+            ok &= ManagerFunction.TrainStageLossNames("full") == ("world", "critic", "policy")
             ok &= invalid_rejected
+            ok &= non_string_rejected
 
             world_param = nn.Parameter(torch.tensor(0.0))
             policy_param = nn.Parameter(torch.tensor(0.0))
@@ -3714,16 +4777,203 @@ class TestManagerMTool:
                 1.0)
             ok &= float(world_param.grad.abs().item()) > 0.99
             ok &= float(policy_param.grad.abs().item()) == 100.0
+
+            isolated_world = nn.Parameter(torch.tensor(1.0))
+            isolated_critic = nn.Parameter(torch.tensor(2.0))
+            isolated_policy = nn.Parameter(torch.tensor(3.0))
+            shared = isolated_world + isolated_critic + isolated_policy
+            world_objective = shared.square()
+            critic_objective = (2.0 * shared).square()
+            policy_objective = (3.0 * shared).square()
+            world_objective.backward(inputs=[isolated_world], retain_graph=True)
+            critic_objective.backward(inputs=[isolated_critic], retain_graph=True)
+            policy_objective.backward(inputs=[isolated_policy])
+            ok &= isolated_world.grad is not None
+            ok &= isolated_critic.grad is not None
+            ok &= isolated_policy.grad is not None
+            ok &= float(isolated_world.grad.item()) == 12.0
+            ok &= float(isolated_critic.grad.item()) == 48.0
+            ok &= float(isolated_policy.grad.item()) == 108.0
             print(f"Manager train-stage isolation contract {'passed' if ok else 'failed'}")
             return bool(ok)
         except Exception as e:
             print(f"Manager train-stage isolation contract error: {e}")
             return False
 
+    def TestOcrCheckpointStrictContract(self) -> bool:
+        caller_rng = None
+        try:
+            import io
+
+            class FakeOcrEngine(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.backbone_weight = nn.Parameter(torch.ones(2))
+                    self.recognizer = nn.Linear(2, 2)
+
+                def OcrMetadata(self):
+                    return {
+                        "vocab": ["<blank>", "a"],
+                        "blank_index": 0,
+                        "addon_cfg": {
+                            "db_residual": True,
+                            "rec_residual_rank": 1,
+                            "width_aware_ctc": True,},}
+
+            def serialized(value):
+                result = io.BytesIO()
+                torch.save(value, result)
+                result.seek(0)
+                return result
+
+            manager = ManagerFunction.__new__(ManagerFunction)
+            manager.device = torch.device("cpu")
+            dataset = torch.utils.data.TensorDataset(torch.arange(6))
+            engine = FakeOcrEngine()
+            optimizer = torch.optim.AdamW(engine.parameters(), lr=1e-3)
+            caller_rng = manager.CaptureRngState()
+            checkpoint = {
+                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                "epoch": 2,
+                "best_val": 0.25,
+                "ocr": engine.state_dict(),
+                "ocr_meta": manager.CurrentOcrMetadata(engine),
+                "optimizer": optimizer.state_dict(),
+                "train_indices": [0, 1],
+                "val_indices": [2, 3],
+                "test_indices": [4, 5],
+                "processed_sample_count_total": 12,
+                "rng": manager.CaptureRngState(),
+                "train_detection": True,
+                "train_recognition": True,}
+            restored = manager.LoadOCRCheckpoint(
+                engine,
+                optimizer,
+                dataset,
+                serialized(checkpoint),
+                trainDetection=True,
+                trainRecognition=True)
+
+            missing = dict(checkpoint)
+            missing.pop("rng")
+            try:
+                manager.LoadOCRCheckpoint(
+                    FakeOcrEngine(),
+                    torch.optim.AdamW(FakeOcrEngine().parameters(), lr=1e-3),
+                    dataset,
+                    serialized(missing),
+                    trainDetection=True,
+                    trainRecognition=True)
+                missing_rejected = False
+            except ValueError:
+                missing_rejected = True
+
+            try:
+                manager.LoadOCRCheckpoint(
+                    engine,
+                    optimizer,
+                    dataset,
+                    serialized(checkpoint),
+                    trainDetection=False,
+                    trainRecognition=True)
+                mode_mismatch_rejected = False
+            except ValueError:
+                mode_mismatch_rejected = True
+
+            legacy_parameter = {
+                "ocr": engine.state_dict(),
+                "brain": {
+                    f"OCR.{name}": value
+                    for name, value in engine.state_dict().items()},}
+            try:
+                manager.LoadOCRWeightsIntoEngine(
+                    engine,
+                    serialized(legacy_parameter))
+                legacy_parameter_rejected = False
+            except ValueError:
+                legacy_parameter_rejected = True
+
+            recognizer_optimizer = torch.optim.AdamW(
+                engine.recognizer.parameters(),
+                lr=1e-3)
+            recognizer_checkpoint = {
+                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                "epoch": 3,
+                "best_val": 0.1,
+                "recognizer": engine.recognizer.state_dict(),
+                "ocr_meta": manager.CurrentOcrMetadata(engine),
+                "optimizer": recognizer_optimizer.state_dict(),
+                "train_indices": [0, 1],
+                "val_indices": [2, 3],
+                "test_indices": [4, 5],
+                "processed_sample_count_total": 18,
+                "rng": manager.CaptureRngState(),}
+            recognizer_restored = manager.LoadOCRRecognizerCheckpoint(
+                engine,
+                recognizer_optimizer,
+                dataset,
+                serialized(recognizer_checkpoint))
+
+            ok = (
+                restored[0:3] == (2, 0.25, 12)
+                and [list(split.indices) for split in restored[3:]]
+                == [[0, 1], [2, 3], [4, 5]]
+                and recognizer_restored[0:3] == (3, 0.1, 18)
+                and missing_rejected
+                and mode_mismatch_rejected
+                and legacy_parameter_rejected)
+            print(
+                f"Manager OCR strict checkpoint contract "
+                f"{'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager OCR strict checkpoint contract error: {e}")
+            return False
+        finally:
+            if caller_rng is not None:
+                manager.RestoreRngState(caller_rng)
+
+    def TestSequentialLoaderRejectsEmptyRecurrentSplit(self) -> bool:
+        try:
+            dataset = torch.utils.data.TensorDataset(torch.arange(3))
+            undersized_rejected = False
+            try:
+                SequentialTrajectoryLoader(dataset, batchSize=4)
+            except ValueError:
+                undersized_rejected = True
+
+            remainder_dataset = torch.utils.data.TensorDataset(torch.arange(9))
+            remainder_rejected = False
+            try:
+                SequentialTrajectoryLoader(remainder_dataset, batchSize=4)
+            except ValueError:
+                remainder_rejected = True
+
+            full_dataset = torch.utils.data.TensorDataset(torch.arange(8))
+            loader = SequentialTrajectoryLoader(full_dataset, batchSize=2)
+            resumed = list(loader.IterFrom(2))
+            ok = bool(
+                undersized_rejected
+                and remainder_rejected
+                and len(loader) == 4
+                and len(resumed) == 2
+                and torch.equal(resumed[0][0], torch.tensor([2, 6])))
+            print(
+                f"Manager sequential-loader recurrent split "
+                f"{'passed' if ok else 'failed'}")
+            return ok
+        except Exception as e:
+            print(f"Manager sequential-loader recurrent split error: {e}")
+            return False
+
     def TestCppDecisionWireContract(self) -> bool:
         try:
             manager = object.__new__(ManagerFunction)
             manager.device = torch.device("cpu")
+            manager.camera_calibration_id = "test-camera"
+            manager.active_sensor_stream_id = None
+            manager.active_world_frame_id = None
+            manager.last_sensor_sequence_index = None
             captured: Dict[str, Any] = {}
 
             def capture_forward(*args, **kwargs):
@@ -3731,72 +4981,504 @@ class TestManagerMTool:
                 captured["kwargs"] = kwargs
                 return "ok"
 
-            manager.AgentHandleForward = capture_forward
+            manager._ForwardValidatedBatch = capture_forward
             endpoint_pose = torch.zeros(
-                ModuleDim.DecisionEndpointCount,
+                ModuleDim.RobotStateEndpointCount,
                 ModuleDim.DecisionEndpointPoseDim)
             endpoint_pose[..., 6] = 1.0
+            planner_pose = endpoint_pose[
+                ModuleDim.RobotStateControlledEndpointSlice].clone()
+            base_orientation_world = torch.tensor([0.0, 0.0, 0.0, 1.0])
             robot_packet = {
                 "schema_version": ROBOT_STATE_WIRE_SCHEMA_VERSION,
-                "endpoint_names": list(ModuleDim.DecisionEndpointNames),
+                "stream_id": "stream-1",
+                "sequence_index": 0,
+                "frame_id": "frame-1",
+                "calibration_id": "test-camera",
+                "world_frame_id": "map-v1",
+                "endpoint_names": list(ModuleDim.RobotStateEndpointNames),
+                "controlled_endpoint_names": list(ModuleDim.DecisionEndpointNames),
                 "pose_frame": "world",
+                "pose_convention": "T_world_endpoint",
+                "pose_time_reference": "sensor_frame_exposure",
                 "pose_unit": "meter",
                 "quaternion_order": "xyzw",
+                "pose_handedness": "right_handed",
+                "base_orientation_convention": "q_world_base_xyzw",
+                "gravity_convention": "unit_acceleration_direction_world",
                 "endpoint_pose": endpoint_pose.tolist(),
-                "camera_pose_world": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-                "planner_expected_endpoint_pose": endpoint_pose.tolist(),
+                "base_orientation_world": base_orientation_world.tolist(),
+                "gravity_direction_world": [0.0, 0.0, -1.0],
+                "planner_expected_endpoint_pose": planner_pose.tolist(),
                 "planner_progress": 0.2,
                 "planner_tracking_error": 0.1,
                 "planner_executing": 1.0,
                 "planner_reached": 0.0,
                 "planner_failed": 0.0,
-                "model_command_executed": 1.0,}
+                "model_command_executed": 0.0,
+                "executed_action_id": 0,}
             sensor_packet = {
                 "schema_version": SENSOR_PACKET_WIRE_SCHEMA_VERSION,
+                "stream_id": "stream-1",
+                "sequence_index": 0,
+                "frame_id": "frame-1",
+                "calibration_id": "test-camera",
+                "rgb_encoding": "rgb8",
+                "depth_unit": "meter",
                 "text_ext": ["pick up the cup"],
                 "text_trust": [TEXT_TRUST_OPERATOR_COMMAND],
                 "sample_actions": False,
                 "deterministic_actor": True,
+                "rgb": [[[0, 0, 0]]],
                 "depth": [[1.0, 2.0], [3.0, 4.0]],
-                "depth_valid": [[True, True], [True, False]],
-                "depth_scale_meters": 0.001,}
+                "depth_valid": [[True, True], [True, False]],}
             result = ManagerFunction.AgentHandleForwardJson(
                 manager,
-                2,
                 0.5,
                 0.0,
                 json.dumps(sensor_packet),
                 json.dumps(robot_packet))
             robot_state = captured["kwargs"]["robotState"]
+
+            duplicate_rejected = False
+            try:
+                ManagerFunction.AgentHandleForwardJson(
+                    manager,
+                    0.5,
+                    0.0,
+                    json.dumps(sensor_packet),
+                    json.dumps(robot_packet))
+            except ValueError:
+                duplicate_rejected = True
+
+            gap_sensor_packet = dict(sensor_packet)
+            gap_sensor_packet["sequence_index"] = 2
+            gap_sensor_packet["frame_id"] = "frame-3"
+            gap_robot_packet = dict(robot_packet)
+            gap_robot_packet["sequence_index"] = 2
+            gap_robot_packet["frame_id"] = "frame-3"
+            gap_rejected = False
+            try:
+                ManagerFunction.AgentHandleForwardJson(
+                    manager,
+                    0.5,
+                    0.0,
+                    json.dumps(gap_sensor_packet),
+                    json.dumps(gap_robot_packet))
+            except ValueError:
+                gap_rejected = True
+
+            next_sensor_packet = dict(sensor_packet)
+            next_sensor_packet["sequence_index"] = 1
+            next_sensor_packet["frame_id"] = "frame-2"
+            next_robot_packet = dict(robot_packet)
+            next_robot_packet["sequence_index"] = 1
+            next_robot_packet["frame_id"] = "frame-2"
+            next_robot_packet["world_frame_id"] = "map-v2"
+            world_frame_change_rejected = False
+            try:
+                ManagerFunction.AgentHandleForwardJson(
+                    manager,
+                    0.5,
+                    0.0,
+                    json.dumps(next_sensor_packet),
+                    json.dumps(next_robot_packet))
+            except ValueError:
+                world_frame_change_rejected = True
+
+            wrong_calibration_sensor = dict(next_sensor_packet)
+            wrong_calibration_sensor["calibration_id"] = "other-camera"
+            next_robot_packet["world_frame_id"] = "map-v1"
+            calibration_mismatch_rejected = False
+            try:
+                ManagerFunction.AgentHandleForwardJson(
+                    manager,
+                    0.5,
+                    0.0,
+                    json.dumps(wrong_calibration_sensor),
+                    json.dumps(next_robot_packet))
+            except ValueError:
+                calibration_mismatch_rejected = True
+
             ok = (
                 result == "ok"
-                and captured["args"] == (2, 0.5, 0.0)
-                and tuple(robot_state["endpoint_pose"].shape)
+                and captured["args"] == (sensor_packet["rgb"], 0.5, 0.0)
+                and tuple(torch.as_tensor(robot_state["endpoint_pose"]).shape)
+                == (1, ModuleDim.RobotStateEndpointCount, ModuleDim.DecisionEndpointPoseDim)
+                and tuple(torch.as_tensor(
+                    robot_state["planner_expected_endpoint_pose"]).shape)
                 == (1, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim)
-                and tuple(robot_state["camera_pose_world"].shape) == (1, ModuleDim.PstPoseDim)
-                and tuple(robot_state["model_command_executed"].shape) == (1,)
+                and tuple(torch.as_tensor(
+                    robot_state["base_orientation_world"]).shape) == (1, 4)
+                and tuple(torch.as_tensor(
+                    robot_state["gravity_direction_world"]).shape) == (1, 3)
+                and tuple(torch.as_tensor(
+                    robot_state["model_command_executed"]).shape) == (1,)
+                and tuple(torch.as_tensor(
+                    robot_state["executed_action_id"]).shape) == (1,)
+                and "camera_pose_world" not in robot_state
                 and captured["kwargs"]["textExt"] == sensor_packet["text_ext"]
                 and captured["kwargs"]["textTrust"] == sensor_packet["text_trust"]
                 and captured["kwargs"]["sampleActions"] is False
                 and captured["kwargs"]["deterministicActor"] is True
                 and captured["kwargs"]["depthBitmap"] == sensor_packet["depth"]
                 and captured["kwargs"]["depthValid"] == sensor_packet["depth_valid"]
-                and captured["kwargs"]["depthScaleMeters"] == 0.001)
+                and captured["kwargs"]["requestProvenance"] == {
+                    "stream_id": "stream-1",
+                    "sequence_index": 0,
+                    "frame_id": "frame-1",
+                    "calibration_id": "test-camera",
+                    "world_frame_id": "map-v1",
+                }
+                and duplicate_rejected
+                and gap_rejected
+                and world_frame_change_rejected
+                and calibration_mismatch_rejected
+                and manager.active_sensor_stream_id == "stream-1"
+                and manager.active_world_frame_id == "map-v1"
+                and manager.last_sensor_sequence_index == 0)
             print(f"Manager C++ decision wire contract {'passed' if ok else 'failed'}")
             return bool(ok)
         except Exception as e:
             print(f"Manager C++ decision wire contract error: {e}")
             return False
 
+    def TestRobotStatePhysicalReferenceContract(self) -> bool:
+        try:
+            batch_size = 2
+            endpoint_pose = torch.zeros(
+                batch_size,
+                ModuleDim.RobotStateEndpointCount,
+                ModuleDim.DecisionEndpointPoseDim)
+            endpoint_pose[..., 6] = 1.0
+            base_orientation_world = torch.zeros(batch_size, 4)
+            base_orientation_world[..., 3] = 1.0
+            scalar = torch.zeros(batch_size)
+            state = {
+                "endpoint_pose": endpoint_pose,
+                "base_orientation_world": base_orientation_world,
+                "gravity_direction_world": torch.tensor(
+                    [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]),
+                "planner_expected_endpoint_pose": endpoint_pose[
+                    :, ModuleDim.RobotStateControlledEndpointSlice].clone(),
+                "planner_progress": scalar,
+                "planner_tracking_error": scalar,
+                "planner_executing": scalar,
+                "planner_reached": scalar,
+                "planner_failed": scalar,
+                "model_command_executed": scalar,
+                "executed_action_id": torch.zeros(batch_size, dtype=torch.long),}
+            converted = ManagerFunction.TensorizeRobotState(
+                state,
+                torch.device("cpu"),
+                batched=True)
+
+            missing_rejected = False
+            missing = dict(state)
+            missing.pop("gravity_direction_world")
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    missing,
+                    torch.device("cpu"),
+                    batched=True)
+            except ValueError:
+                missing_rejected = True
+
+            base_quaternion_rejected = False
+            bad_base = dict(state)
+            bad_base["base_orientation_world"] = base_orientation_world.clone()
+            bad_base["base_orientation_world"][0] = 0.0
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_base,
+                    torch.device("cpu"),
+                    batched=True)
+            except ValueError:
+                base_quaternion_rejected = True
+
+            gravity_rejected = False
+            bad_gravity = dict(state)
+            bad_gravity["gravity_direction_world"] = torch.tensor(
+                [[0.0, 0.0, -9.81], [0.0, 1.0, 0.0]])
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_gravity,
+                    torch.device("cpu"),
+                    batched=True)
+            except ValueError:
+                gravity_rejected = True
+
+            bool_rejected = False
+            bad_bool = dict(state)
+            bad_bool["planner_executing"] = torch.zeros(
+                batch_size, dtype=torch.bool)
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_bool,
+                    torch.device("cpu"),
+                    batched=True)
+            except TypeError:
+                bool_rejected = True
+
+            planner_range_rejected = False
+            bad_range = dict(state)
+            bad_range["planner_progress"] = torch.tensor([1.1, 0.0])
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_range,
+                    torch.device("cpu"),
+                    batched=True)
+            except ValueError:
+                planner_range_rejected = True
+
+            fractional_flag_rejected = False
+            bad_flag = dict(state)
+            bad_flag["planner_executing"] = torch.tensor([0.25, 0.0])
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_flag,
+                    torch.device("cpu"),
+                    batched=True)
+            except ValueError:
+                fractional_flag_rejected = True
+
+            planner_conflict_rejected = False
+            bad_status = dict(state)
+            bad_status["planner_executing"] = torch.tensor([1.0, 0.0])
+            bad_status["planner_reached"] = torch.tensor([1.0, 0.0])
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_status,
+                    torch.device("cpu"),
+                    batched=True)
+            except ValueError:
+                planner_conflict_rejected = True
+
+            action_provenance_rejected = False
+            bad_action_id = dict(state)
+            bad_action_id["executed_action_id"] = torch.tensor([1, 0])
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_action_id,
+                    torch.device("cpu"),
+                    batched=True)
+            except ValueError:
+                action_provenance_rejected = True
+
+            sensor_manifest = {
+                "schema_version": OFFLINE_SENSOR_MANIFEST_SCHEMA_VERSION,
+                "calibration_id": "calibration-a",
+                "rgb_encoding": "rgb8",
+                "depth_unit": "meter",
+                "depth_representation": "optical_axis_z",
+                "rgb_depth_alignment": "registered_to_rgb",
+                "rectification": "rectified",
+                "synchronization": "synchronized_exposure",
+                "object_motion_frame": "current_camera_optical",
+                "object_motion_representation": "se3_spatial_delta",
+                "object_motion_reference": (
+                    "previous_to_current_after_camera_egomotion_compensation"),
+                "object_motion_translation_unit": "meter",
+                "object_motion_quaternion_order": "xyzw",}
+            ValidateOfflineSensorManifest(
+                sensor_manifest,
+                "calibration-a")
+            calibration_mismatch_rejected = False
+            try:
+                ValidateOfflineSensorManifest(
+                    sensor_manifest,
+                    "calibration-b")
+            except ValueError:
+                calibration_mismatch_rejected = True
+
+            motion_frame_rejected = False
+            wrong_motion_frame = dict(sensor_manifest)
+            wrong_motion_frame["object_motion_frame"] = "world"
+            try:
+                ValidateOfflineSensorManifest(
+                    wrong_motion_frame,
+                    "calibration-a")
+            except ValueError:
+                motion_frame_rejected = True
+
+            ok = (
+                tuple(converted["base_orientation_world"].shape)
+                == (batch_size, 4)
+                and tuple(converted["gravity_direction_world"].shape)
+                == (batch_size, 3)
+                and converted["executed_action_id"].dtype == torch.long
+                and missing_rejected
+                and base_quaternion_rejected
+                and gravity_rejected
+                and bool_rejected
+                and planner_range_rejected
+                and fractional_flag_rejected
+                and planner_conflict_rejected
+                and action_provenance_rejected
+                and calibration_mismatch_rejected
+                and motion_frame_rejected)
+            print(
+                f"Manager RobotState physical reference contract "
+                f"{'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager RobotState physical reference contract error: {e}")
+            return False
+
+    def TestSingleFramePreprocessContract(self) -> bool:
+        try:
+            image_size = BasicParameters.IMAGE_SIZE
+            rgb = torch.zeros(image_size, image_size, 3, dtype=torch.uint8)
+            depth = torch.ones(image_size, image_size, dtype=torch.float32)
+            depth_valid = torch.ones(image_size, image_size, dtype=torch.bool)
+            pack = DataPreprocessor.PreprocessSingleFrame(
+                rgb,
+                0.5,
+                0.0,
+                depthBitmap=depth,
+                depthValid=depth_valid,
+                device=torch.device("cpu"))
+            wrong_shape_rejected = False
+            try:
+                DataPreprocessor.PreprocessSingleFrame(
+                    rgb[:-1],
+                    None,
+                    None,
+                    depthBitmap=depth[:-1],
+                    depthValid=depth_valid[:-1])
+            except ValueError:
+                wrong_shape_rejected = True
+            nonfinite_reward_rejected = False
+            try:
+                DataPreprocessor.PreprocessSingleFrame(
+                    rgb,
+                    float("nan"),
+                    None,
+                    depthBitmap=depth,
+                    depthValid=depth_valid)
+            except ValueError:
+                nonfinite_reward_rejected = True
+            fractional_done_rejected = False
+            try:
+                DataPreprocessor.PreprocessSingleFrame(
+                    rgb,
+                    None,
+                    0.5,
+                    depthBitmap=depth,
+                    depthValid=depth_valid)
+            except ValueError:
+                fractional_done_rejected = True
+            ok = (
+                tuple(pack["frames"].shape) == (1, 3, image_size, image_size)
+                and tuple(pack["depths"].shape) == (1, 1, image_size, image_size)
+                and tuple(pack["depth_valid"].shape) == (1, 1, image_size, image_size)
+                and pack["frames"].dtype == torch.float32
+                and pack["depths"].dtype == torch.float32
+                and pack["depth_valid"].dtype == torch.bool
+                and "camera_intrinsics" not in pack
+                and wrong_shape_rejected
+                and nonfinite_reward_rejected
+                and fractional_done_rejected)
+            print(f"Manager single-frame preprocess contract {'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager single-frame preprocess contract error: {e}")
+            return False
+
+    def TestOfflinePreprocessStrictContract(self) -> bool:
+        try:
+            image_size = BasicParameters.IMAGE_SIZE
+            rgb = torch.zeros(
+                2, image_size, image_size, 3, dtype=torch.uint8)
+            depth = torch.ones(
+                2, image_size, image_size, dtype=torch.float32)
+            depth_valid = torch.ones_like(depth, dtype=torch.bool)
+            pack = DataPreprocessor.ConvertRobotInputs(
+                imgs=rgb,
+                reward=torch.zeros(2),
+                done=torch.zeros(2),
+                depths=depth,
+                depthValids=depth_valid,
+                needVisualState=False)
+            wrong_lattice_rejected = False
+            try:
+                DataPreprocessor.ConvertRobotInputs(
+                    imgs=rgb[:, :-1],
+                    reward=torch.zeros(2),
+                    done=torch.zeros(2),
+                    depths=depth[:, :-1],
+                    depthValids=depth_valid[:, :-1],
+                    needVisualState=False)
+            except ValueError:
+                wrong_lattice_rejected = True
+            wrong_mask_type_rejected = False
+            try:
+                DataPreprocessor.ConvertRobotInputs(
+                    imgs=rgb,
+                    reward=torch.zeros(2),
+                    done=torch.zeros(2),
+                    depths=depth,
+                    depthValids=depth_valid.float(),
+                    needVisualState=False)
+            except ValueError:
+                wrong_mask_type_rejected = True
+            wrong_feedback_shape_rejected = False
+            try:
+                DataPreprocessor.ConvertRobotInputs(
+                    imgs=rgb,
+                    reward=torch.zeros(2, 1),
+                    done=torch.zeros(2),
+                    depths=depth,
+                    depthValids=depth_valid,
+                    needVisualState=False)
+            except ValueError:
+                wrong_feedback_shape_rejected = True
+            out_of_range_reward_rejected = False
+            try:
+                DataPreprocessor.ConvertRobotInputs(
+                    imgs=rgb,
+                    reward=torch.tensor([
+                        float(BasicParameters.REWARD_MAX) + 1.0,
+                        0.0]),
+                    done=torch.zeros(2),
+                    depths=depth,
+                    depthValids=depth_valid,
+                    needVisualState=False)
+            except ValueError:
+                out_of_range_reward_rejected = True
+            ok = (
+                tuple(pack["frames"].shape)
+                == (2, 3, image_size, image_size)
+                and tuple(pack["depths"].shape)
+                == (2, 1, image_size, image_size)
+                and torch.equal(pack["depths"], depth.unsqueeze(1))
+                and wrong_lattice_rejected
+                and wrong_mask_type_rejected
+                and wrong_feedback_shape_rejected
+                and out_of_range_reward_rejected
+                and "camera_intrinsics" not in pack)
+            print(f"Manager strict offline preprocess {'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager offline preprocess contract error: {e}")
+            return False
+
     def RunAll(self) -> Dict[str, bool]:
         results = {
+            "DeploymentConfigurationRouting": self.TestDeploymentConfigurationRouting(),
+            "DeploymentManifestRoutesOneCompleteGeneration": self.TestDeploymentManifestRoutesOneCompleteGeneration(),
             "PauseStopImmediateExit": self.TestPauseStopImmediateExit(),
             "BackgroundExceptionStatus": self.TestBackgroundExceptionStatus(),
             "EvaluationRuntimeRestoredBeforeSave": self.TestEvaluationRuntimeRestoredBeforeSave(),
             "LoadCheckpointRestoresTopologyBeforeOptimizers": self.TestLoadCheckpointRestoresTopologyBeforeOptimizers(),
-            "LoadBrainWeightsResizesAndSyncsOverride": self.TestLoadBrainWeightsResizesAndSyncsOverride(),
+            "LoadBrainWeightsStrictModelStateAndSync": self.TestLoadBrainWeightsStrictModelStateAndSync(),
             "TrainStageIsolationContract": self.TestTrainStageIsolationContract(),
-            "CppDecisionWireContract": self.TestCppDecisionWireContract(),}
+            "OcrCheckpointStrictContract": self.TestOcrCheckpointStrictContract(),
+            "SequentialLoaderRejectsEmptyRecurrentSplit": self.TestSequentialLoaderRejectsEmptyRecurrentSplit(),
+            "RobotStatePhysicalReferenceContract": self.TestRobotStatePhysicalReferenceContract(),
+            "CppDecisionWireContract": self.TestCppDecisionWireContract(),
+            "SingleFramePreprocessContract": self.TestSingleFramePreprocessContract(),
+            "OfflinePreprocessStrictContract": self.TestOfflinePreprocessStrictContract(),}
         passed = sum(1 for v in results.values() if v)
         print(f"\nManager tests: {passed}/{len(results)} passed.")
         return results
@@ -3805,13 +5487,13 @@ class TestManagerMTool:
 class AgentHandle:
     def __init__(
         self,
+        calibration: CameraCalibration,
         *,
         brainParameterPath: str = BasicParameters.MODULEPARAMETER_PATH,
-        device: Optional[str] = None,
-        worldMemoryPath: str = BasicParameters.WORLD_MEMORY_PATH,
-        memMemoryPath: str = BasicParameters.MEMORY_MEMORY_PATH,
+        device: Optional[Union[str, torch.device]] = None,
         seqLen: int = BasicParameters.IMAGE_SEQ_LEN,
         plasticHebbian: bool = True,
+        usePlanner: bool = True,
         prioritizeExtStr: bool = True,
         saveModuleMessagerOutput: bool = True,):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -3820,34 +5502,36 @@ class AgentHandle:
         if parameter_path == "":
             raise ValueError("brainParameterPath must not be empty")
 
-        resolved_path = Path(parameter_path)
+        (
+            resolved_model_path,
+            resolved_world_memory_path,
+            resolved_memory_path,
+        ) = ManagerFunction.ResolveDeploymentArtifactPaths(
+            parameter_path,
+            calibrationId=calibration.calibration_id)
+        resolved_path = Path(resolved_model_path)
         if not resolved_path.exists():
             raise FileNotFoundError(f"brain parameter file not found: {resolved_path}")
 
         self.brain = BrainCore(
+            calibration=calibration,
             device=self.device,
             seqLen=seqLen,
             plasticHebbian=plasticHebbian,
             prioritizeExtStr=prioritizeExtStr,
             plasticOnlineLearning=False,
+            usePlanner=usePlanner,
             saveModuleMessagerOutput=saveModuleMessagerOutput,)
 
         self.agent = Agent(
             self.brain,
             isTrain=False,
             device=self.device,
-            worldMemoryPath=worldMemoryPath,
-            memMemoryPath=memMemoryPath)
+            worldMemoryPath=resolved_world_memory_path,
+            memMemoryPath=resolved_memory_path)
 
         self.agent.LoadBrainWeights(str(resolved_path))
         self.brain.eval()
-
-    def SetCameraIntrinsics(
-        self,
-        cameraIntrinsics: Union[np.ndarray, torch.Tensor],
-        sourceSize: Optional[Tuple[int, int]] = None) -> None:
-        k = torch.as_tensor(cameraIntrinsics)
-        self.agent.SetCameraIntrinsics(k, sourceSize=sourceSize)
 
     def ForwardStep(
         self,
@@ -3855,8 +5539,8 @@ class AgentHandle:
         *,
         textExt: Optional[List[Optional[str]]] = None,
         textTrust: Optional[List[str]] = None,
-        reward: Optional[int] = None,
-        done: Optional[int] = None,
+        reward: Optional[torch.Tensor] = None,
+        done: Optional[torch.Tensor] = None,
         sampleActions: bool = True,
         deterministicActor: bool = False,
         depth: torch.Tensor,

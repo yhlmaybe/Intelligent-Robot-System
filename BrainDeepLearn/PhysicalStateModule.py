@@ -191,37 +191,43 @@ class PhysicalStateExtractor(AGICoreModule):
         observation_mask = (
             (nodeMask > self.node_mask_threshold)
             & (geometryValid.squeeze(-1) > self.geometry_mask_threshold)).to(objectTokens.dtype) # [B, K]
+        feature_mask = (
+            geometryValid.squeeze(-1) > self.geometry_mask_threshold
+        ).to(objectTokens.dtype)
         
         S_raw = self.in_proj(objectTokens) + self.motion_in_proj(objectMotion) # [B, K, 128]
 
         for layer in self.slot_layers:
-            S_raw = layer(S_raw, observation_mask)
+            S_raw = layer(S_raw, feature_mask)
 
-        S_raw = self.slot_post(S_raw) * observation_mask.unsqueeze(-1) # [B, K, 128]
+        # Keep an unmasked training feature so a missed object can still receive
+        # positive supervision.  Runtime state remains masked at the output seam.
+        S_feature = self.slot_post(S_raw) # [B, K, 128]
+        S_raw = S_feature * observation_mask.unsqueeze(-1)
 
-        mphys_logits = self.objectness_head(S_raw).squeeze(-1)
+        mphys_logits = self.objectness_head(S_feature).squeeze(-1)
         mphys_raw = torch.sigmoid(mphys_logits) # [B, K]
         physical_available = mphys_raw * observation_mask
         slot_available = physical_available.unsqueeze(-1)
 
-        state_logits = self.state_head(S_raw) # [B, K, PstStateDim]
+        state_logits = self.state_head(S_feature) # [B, K, PstStateDim]
         state_raw = torch.sigmoid(state_logits) * slot_available
 
-        attr_pred = self.attribute_head(S_raw)
+        attr_pred = self.attribute_head(S_feature)
         attr_raw = attr_pred * slot_available
 
-        affordance_logits = self.affordance_head(S_raw)
+        affordance_logits = self.affordance_head(S_feature)
         affordance_raw = torch.sigmoid(affordance_logits) * slot_available
 
-        motion_pred = self.NormalizePose(self.motion_head(S_raw))
+        motion_pred = self.NormalizePose(self.motion_head(S_feature))
         identity_motion = torch.zeros_like(motion_pred)
         identity_motion[..., 6] = 1.0
         motion_raw = self.NormalizePose(identity_motion + (motion_pred - identity_motion) * slot_available)
 
-        moving_logits = self.moving_head(S_raw).squeeze(-1)
+        moving_logits = self.moving_head(S_feature).squeeze(-1)
         moving_raw = torch.sigmoid(moving_logits) * physical_available
 
-        contact_raw = self.contact_head(S_raw) # [B, K, 6]
+        contact_raw = self.contact_head(S_feature) # [B, K, 6]
         contact_logits = contact_raw[..., 0]
         contact_prob_raw = torch.sigmoid(contact_logits) * physical_available
         contact_force_pred = F.softplus(contact_raw[..., 1:3])
@@ -230,7 +236,7 @@ class PhysicalStateExtractor(AGICoreModule):
         contact_force_raw = contact_force_pred * contact_weight
         contact_point_raw = contact_point_pred * contact_weight
 
-        external_relation_logits = self.external_relation_head(S_raw)
+        external_relation_logits = self.external_relation_head(S_feature)
         external_relation_raw = torch.sigmoid(external_relation_logits) * slot_available
         pair_mask = observation_mask.unsqueeze(1) * observation_mask.unsqueeze(2)
 
@@ -238,7 +244,7 @@ class PhysicalStateExtractor(AGICoreModule):
             observation_mask.size(1), device=observation_mask.device, dtype=observation_mask.dtype)
         
         pair_mask = pair_mask * off_diagonal.unsqueeze(0) # [B, K, K]
-        pairwise_relation, relation_logits_raw = self.BuildRelations(S_raw, objectGeometry, pair_mask)
+        pairwise_relation, relation_logits_raw = self.BuildRelations(S_feature, objectGeometry, pair_mask)
         
         return {
             "SlotState": S_raw,
@@ -252,7 +258,7 @@ class PhysicalStateExtractor(AGICoreModule):
             "AffordanceLogits": affordance_logits,
             "AffordanceRaw": affordance_raw,
             "MotionPred": motion_pred,
-            "MotionRaw": motion_raw,
+            "MotionCameraRaw": motion_raw,
             "MovingLogits": moving_logits,
             "MovingProbRaw": moving_raw,
             "ContactLogits": contact_logits,
@@ -260,8 +266,8 @@ class PhysicalStateExtractor(AGICoreModule):
             "ContactForcePred": contact_force_pred,
             "ContactForceRaw": contact_force_raw,
             "ContactPointPred": contact_point_pred,
-            "ContactPointRaw": contact_point_raw,
-            "PairwiseRelation": pairwise_relation,
+            "ContactPointCameraRaw": contact_point_raw,
+            "PairwiseRelationCamera": pairwise_relation,
             "RelationLogitsRaw": relation_logits_raw,
             "ExternalRelationLogits": external_relation_logits,
             "ExternalRelationProbRaw": external_relation_raw}
@@ -316,10 +322,9 @@ class PhysicalStateLoss(nn.Module):
         if gt.numel() == 0:
             empty = torch.empty(0, device=pst["SlotState"].device, dtype=torch.long)
             return empty, empty
-        candidate = torch.nonzero(pst["ObservedSlotMask"][b] > 0.0, as_tuple=False).flatten()
-        if candidate.numel() == 0:
-            empty = torch.empty(0, device=pst["SlotState"].device, dtype=torch.long)
-            return empty, empty
+        candidate = torch.arange(
+            pst["MphysLogits"].size(1),
+            device=pst["SlotState"].device)
         levels = targets["node_level"][b, gt]
         object_score = pst["ObjectClassProb"][b, candidate][:, targets["object_classes"][b, gt]]
         part_score = pst["PartClassProb"][b, candidate][:, targets["part_classes"][b, gt]]
@@ -482,25 +487,22 @@ class PhysicalStateLoss(nn.Module):
 class PerceptionPhysicalTrainer(nn.Module):
     def __init__(
         self,
+        cameraIntrinsics: torch.Tensor,
         physicalWeight: float = 1.0,
         recallLossKwargs: Optional[Dict[str, Any]] = None,
         **perceptionKwargs: Any):
         super().__init__()
         perceptionKwargs = dict(perceptionKwargs)
         perceptionKwargs["enableRecallAuxiliary"] = True
-        self.perception = PerceiveExtractor(**perceptionKwargs)
+        self.perception = PerceiveExtractor(
+            cameraIntrinsics=cameraIntrinsics,
+            **perceptionKwargs)
         self.recall_loss = PerceptionRecallLoss(**({} if recallLossKwargs is None else recallLossKwargs))
         self.physical = PhysicalStateExtractor(
             inObjectDim=self.perception.embed_dim,
             motionDim=self.perception.embed_dim)
         self.physical_loss = PhysicalStateLoss()
         self.physical_weight = float(physicalWeight)
-
-    def SetCameraIntrinsics(
-        self,
-        intrinsics: torch.Tensor,
-        sourceSize: Optional[Tuple[int, int]] = None) -> None:
-        self.perception.SetCameraIntrinsics(intrinsics, sourceSize=sourceSize)
 
     def forward(
         self,
@@ -509,15 +511,17 @@ class PerceptionPhysicalTrainer(nn.Module):
         depthValid: torch.Tensor,
         topDownContext: TopDownContext,
         targets: Dict[str, torch.Tensor],
-        prevVisualState: Optional[VisualState] = None,
-        cameraMotion: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+        cameraMotion: torch.Tensor,
+        prevVisualValid: torch.Tensor,
+        prevVisualState: Optional[VisualState] = None) -> Dict[str, Any]:
         visual_state = self.perception(
             rgb,
             topDownContext=topDownContext,
             depth=depth,
             depthValid=depthValid,
             prevVisualState=prevVisualState,
-            cameraMotion=cameraMotion)
+            cameraMotion=cameraMotion,
+            prevVisualValid=prevVisualValid)
         
         recall_out = self.perception.recall_heads(visual_state)
 
@@ -526,7 +530,8 @@ class PerceptionPhysicalTrainer(nn.Module):
             depthTarget=targets["depth"],
             depthTargetValid=targets["depth_valid"],
             prevVisualState=prevVisualState,
-            cameraMotion=cameraMotion)
+            cameraMotion=cameraMotion,
+            prevVisualValid=prevVisualValid)
         
         recall_losses = self.recall_loss(recall_out, targets)
 
@@ -682,27 +687,34 @@ class PSTWorldBinder(AGICoreModule):
             physicalState["Step"].view(-1, 1).float(),
             memoryScale=self.memory_scale,
             memoryDecayHorizon=self.memory_decay_horizon)
-        clean = lambda value: torch.nan_to_num(
-            value, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        observed = physicalState["Observed"]
+        observed_weight = torch.where(
+            observed,
+            reference_weights.observed_weight,
+            torch.zeros_like(reference_weights.observed_weight))
+        memory_active = ~observed & (physicalState["SlotPresence"] > 0.0)
+        memory_weight = torch.where(
+            memory_active,
+            reference_weights.memory_weight,
+            torch.zeros_like(reference_weights.memory_weight))
         return (
-            clean(reference_weights.slot_weight),
-            clean(reference_weights.observed_weight),
-            clean(reference_weights.memory_weight))
+            observed_weight + memory_weight,
+            observed_weight,
+            memory_weight)
 
     def RelationSummary(self, physicalState: Dict[str, torch.Tensor], slotWeight: torch.Tensor) -> torch.Tensor:
-        relation = physicalState["PairwiseRelation"]
-        if "PairRelationLastSeen" in physicalState and "Step" in physicalState:
-            pair_last_seen = physicalState["PairRelationLastSeen"]
-            pair_age = (
-                physicalState["Step"].view(-1, 1, 1).to(pair_last_seen.dtype)
-                - pair_last_seen).clamp_min(0).to(relation.dtype)
-            pair_seen = pair_last_seen > 0
-            semantic_recency = (
-                torch.exp(-pair_age / max(self.memory_decay_horizon, 1e-6))
-                * pair_seen.to(relation.dtype))
-            relation = torch.cat([
-                relation[..., :4],
-                relation[..., 4:] * semantic_recency.unsqueeze(-1),], dim=-1)
+        relation = physicalState["PairwiseRelationCamera"]
+        pair_last_seen = physicalState["PairRelationLastSeen"]
+        pair_age = (
+            physicalState["Step"].view(-1, 1, 1).to(pair_last_seen.dtype)
+            - pair_last_seen).clamp_min(0).to(relation.dtype)
+        pair_seen = pair_last_seen > 0
+        semantic_recency = (
+            torch.exp(-pair_age / max(self.memory_decay_horizon, 1e-6))
+            * pair_seen.to(relation.dtype))
+        relation = torch.cat([
+            relation[..., :4],
+            relation[..., 4:] * semantic_recency.unsqueeze(-1),], dim=-1)
         K = int(relation.size(1))
         slot_valid = slotWeight > 0.0
         off_diagonal = ~torch.eye(K, device=relation.device, dtype=torch.bool)
@@ -757,24 +769,18 @@ class PSTWorldBinder(AGICoreModule):
         slot_mask = slot_valid.unsqueeze(-1)
         has_source = slot_valid.any(dim=1, keepdim=True).to(world_context.dtype)
         relation_summary = self.RelationSummary(physicalState, slot_binding_weight)
-        if "ContactPointWorldRaw" in physicalState:
-            contact_point = physicalState["ContactPointWorldRaw"]
-        elif "ContactPointWorld" in physicalState:
-            contact_point = physicalState["ContactPointWorld"]
-        else:
-            contact_point = physicalState["ContactPointRaw"]
         slot_content = torch.cat([
             physicalState["SlotState"],
-            physicalState["PoseWorld"],
+            physicalState["PoseCamera"],
             physicalState["ARaw"],
             physicalState["Size"],
             physicalState["StateRaw"],
             physicalState["AffordanceRaw"],
-            physicalState["MotionRaw"],
+            physicalState["MotionCameraRaw"],
             physicalState["MovingProbRaw"].unsqueeze(-1),
             physicalState["ContactProbRaw"].unsqueeze(-1),
             physicalState["ContactForceRaw"],
-            contact_point,
+            physicalState["ContactPointCameraRaw"],
             physicalState["Visibility"].unsqueeze(-1),
             physicalState["Occlusion"].unsqueeze(-1),
             physicalState["Semantic"],
@@ -831,6 +837,15 @@ class TestPhysicalStateMTool:
             PredictedVisual=None,
             Precision=torch.ones(B, device=self.device, dtype=dtype),
             MemoryCue=torch.zeros(B, int(runtime.integrated_dim), device=self.device, dtype=dtype),)
+
+    def MakeCameraIntrinsics(self, imageSize: int) -> torch.Tensor:
+        focal_length = 0.75 * float(imageSize)
+        principal_point = 0.5 * (float(imageSize) - 1.0)
+        return torch.tensor([
+            [focal_length, 0.0, principal_point],
+            [0.0, focal_length, principal_point],
+            [0.0, 0.0, 1.0],
+        ], device=self.device)
 
     def MakeExtractorInputs(
         self,
@@ -902,13 +917,12 @@ class TestPhysicalStateMTool:
         depth = torch.ones(B, 1, H, W, device=self.device)
         normal = torch.zeros(B, 3, H, W, device=self.device)
         normal[:, 2] = 1.0
-        camera_pose_world = torch.zeros(B, ModuleDim.PstPoseDim, device=self.device)
-        camera_pose_world[:, 6] = 1.0
         return {
             "rgb": torch.rand(B, 3, H, W, device=self.device),
             "depth": depth,
             "depth_valid": torch.ones_like(depth, dtype=torch.bool),
             "normal": normal,
+            "normal_valid": torch.ones_like(depth, dtype=torch.bool),
             "semantic_segmentation": torch.zeros(B, H, W, device=self.device, dtype=torch.long),
             "scene_class": torch.ones(B, device=self.device, dtype=torch.long),
             "global_labels": torch.ones(B, ModuleDim.PstGlobalLabels, device=self.device),
@@ -919,7 +933,6 @@ class TestPhysicalStateMTool:
             "part_classes": part_class,
             "track_id": torch.arange(K, device=self.device).unsqueeze(0).expand(B, -1),
             "pose_camera": pose,
-            "pose_world": pose,
             "size_3d": torch.ones(B, K, 3, device=self.device) * 0.1,
             "bbox_2d": torch.ones(B, K, 4, device=self.device) * 0.25,
             "node_instance_masks": masks,
@@ -944,8 +957,7 @@ class TestPhysicalStateMTool:
             "contact": torch.zeros(B, K, device=self.device),
             "contact_valid": valid,
             "contact_force": torch.zeros(B, K, 2, device=self.device),
-            "contact_point_camera": torch.zeros(B, K, 3, device=self.device),
-            "camera_pose_world": camera_pose_world,}
+            "contact_point_camera": torch.zeros(B, K, 3, device=self.device),}
 
     def MakePhysicalState(
         self,
@@ -969,7 +981,8 @@ class TestPhysicalStateMTool:
         pst["Observed"] = torch.ones(B, K, device=self.device, dtype=torch.bool)
         pst["Step"] = torch.full((B,), 8, device=self.device, dtype=torch.long)
         pst["LastSeen"] = torch.arange(K, device=self.device, dtype=torch.long).unsqueeze(0).expand(B, -1)
-        pst["PoseWorld"] = pst["PoseCamera"]
+        pst["PairRelationLastSeen"] = torch.zeros(
+            B, K, K, device=self.device, dtype=torch.long)
         pst["SlotPresence"] = pst["ObservedSlotMask"]
         return model, pst, self.MakeTargets(B=B, K=K)
 
@@ -1025,20 +1038,20 @@ class TestPhysicalStateMTool:
                 inputs["node_mask"],
                 inputs["geometry_valid"])
             assert tuple(out["SlotState"].shape) == (B, K, ModuleDim.PstSlotDim)
-            assert tuple(out["PairwiseRelation"].shape) == (B, K, K, ModuleDim.PstRelDim)
+            assert tuple(out["PairwiseRelationCamera"].shape) == (B, K, K, ModuleDim.PstRelDim)
             assert tuple(out["RelationLogitsRaw"].shape) == (B, K, K, ModuleDim.PstRelationClasses)
             assert bool((out["ObservationMask"][:, -1] == 0.0).all().item())
-            quat_norm = out["MotionRaw"][..., 3:7].norm(dim=-1)
+            quat_norm = out["MotionCameraRaw"][..., 3:7].norm(dim=-1)
             assert bool(torch.allclose(quat_norm, torch.ones_like(quat_norm), atol=1e-4))
             assert bool((out["SlotState"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
             assert bool((out["ARaw"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
             assert bool((out["StateRaw"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
             assert bool((out["AffordanceRaw"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
             assert bool((out["ContactForceRaw"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
-            assert bool((out["ContactPointRaw"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
-            assert bool((out["MotionRaw"][:, -1, :3].abs().sum(dim=-1) == 0.0).all().item())
-            assert bool((out["MotionRaw"][:, -1, 3:6].abs().sum(dim=-1) == 0.0).all().item())
-            assert bool(torch.allclose(out["MotionRaw"][:, -1, 6], torch.ones(B, device=self.device), atol=1e-5))
+            assert bool((out["ContactPointCameraRaw"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
+            assert bool((out["MotionCameraRaw"][:, -1, :3].abs().sum(dim=-1) == 0.0).all().item())
+            assert bool((out["MotionCameraRaw"][:, -1, 3:6].abs().sum(dim=-1) == 0.0).all().item())
+            assert bool(torch.allclose(out["MotionCameraRaw"][:, -1, 6], torch.ones(B, device=self.device), atol=1e-5))
             for name, value in out.items():
                 self.AssertFinite(value, f"PhysicalStateExtractor {name}")
             print("PhysicalStateExtractor forward shape test passed.")
@@ -1123,6 +1136,51 @@ class TestPhysicalStateMTool:
             print(f"PhysicalStateLoss finite/backward test failed: {type(e).__name__}: {e}")
             return False
 
+    def TestMissedObservationStillReceivesPositiveSupervision(self) -> bool:
+        try:
+            B, K, token_dim = 1, 1, 32
+            model = PhysicalStateExtractor(
+                inObjectDim=token_dim,
+                motionDim=token_dim,
+                numSlotLayers=1,
+                numHeads=4).to(self.device)
+            inputs = self.MakeExtractorInputs(B=B, K=K, tokenDim=token_dim)
+            inputs["node_mask"].zero_()
+            physical = model(
+                inputs["object_tokens"],
+                inputs["object_motion"],
+                inputs["object_geometry"],
+                inputs["node_mask"],
+                inputs["geometry_valid"])
+            pst = {
+                **physical,
+                **model.SemanticWorldView(self.MakeSemanticNodes(B=B, K=K)),}
+            losses = PhysicalStateLoss().to(self.device)(
+                pst,
+                self.MakeTargets(B=B, K=K))
+            model.zero_grad(set_to_none=True)
+            (losses["loss_mphys"] + losses["loss_state"]).backward()
+            objectness_grad = sum(
+                float(parameter.grad.abs().sum().item())
+                for parameter in model.objectness_head.parameters()
+                if parameter.grad is not None)
+            state_grad = sum(
+                float(parameter.grad.abs().sum().item())
+                for parameter in model.state_head.parameters()
+                if parameter.grad is not None)
+            ok = bool(
+                torch.count_nonzero(physical["ObservationMask"]).item() == 0
+                and losses["loss_mphys"].item() > 0.0
+                and objectness_grad > 0.0
+                and state_grad > 0.0)
+            print(
+                f"MissedObservationPositiveSupervision "
+                f"{'passed' if ok else 'failed'}.")
+            return ok
+        except Exception as e:
+            print(f"MissedObservationPositiveSupervision failed: {type(e).__name__}: {e}")
+            return False
+
     def TestPSTWorldBinderShapes(self) -> bool:
         try:
             B, K = 2, 4
@@ -1165,8 +1223,8 @@ class TestPhysicalStateMTool:
             pst["SlotPresence"][0].zero_()
             pst["MphysRaw"][0].fill_(float("nan"))
             vector_fields = (
-                "SlotState", "PoseWorld", "ARaw", "Size", "StateRaw",
-                "AffordanceRaw", "MotionRaw", "ContactForceRaw", "ContactPointRaw",
+                "SlotState", "PoseCamera", "ARaw", "Size", "StateRaw",
+                "AffordanceRaw", "MotionCameraRaw", "ContactForceRaw", "ContactPointCameraRaw",
                 "Semantic", "ExternalRelationProbRaw", "IdentityKey")
             scalar_fields = (
                 "MovingProbRaw", "ContactProbRaw", "Visibility", "Occlusion")
@@ -1174,7 +1232,7 @@ class TestPhysicalStateMTool:
                 pst[key][0].fill_(float("nan"))
             for key in scalar_fields:
                 pst[key][0].fill_(float("nan"))
-            pst["PairwiseRelation"][0].fill_(float("nan"))
+            pst["PairwiseRelationCamera"][0].fill_(float("nan"))
 
             binder = PSTWorldBinder().to(self.device).eval()
             world_z = torch.randn(B, ModuleDim.WorldOutZState, device=self.device)
@@ -1203,6 +1261,7 @@ class TestPhysicalStateMTool:
         try:
             B, H, W, K = 1, 32, 32, 4
             trainer = PerceptionPhysicalTrainer(
+                cameraIntrinsics=self.MakeCameraIntrinsics(H),
                 physicalWeight=0.25,
                 recallLossKwargs={"identityBankSize": 16},
                 imgSize=H,
@@ -1220,12 +1279,17 @@ class TestPhysicalStateMTool:
             targets["rgb"] = frames
             targets["depth"] = depth
             targets["depth_valid"] = depth_valid
+            camera_motion = torch.zeros(
+                B, ModuleDim.CameraMotionDim, device=self.device)
+            camera_motion[:, 3] = 1.0
             out = trainer(
                 frames,
                 depth,
                 depth_valid,
                 self.MakeTopDownContext(trainer.perception, B, frames.dtype),
-                targets)
+                targets,
+                cameraMotion=camera_motion,
+                prevVisualValid=torch.zeros(B, device=self.device, dtype=torch.bool))
             assert "physical_state" in out and "physical_losses" in out
             assert tuple(out["physical_state"]["SlotState"].shape[:2]) == (B, K)
             self.AssertFinite(out["loss"], "PerceptionPhysicalTrainer loss")
@@ -1244,6 +1308,7 @@ class TestPhysicalStateMTool:
             "SemanticWorldView": self.TestSemanticWorldView(),
             "IdentityKeySeparatesSameSemanticEntities": self.TestIdentityKeySeparatesSameSemanticEntities(),
             "PhysicalStateLossFiniteAndBackward": self.TestPhysicalStateLossFiniteAndBackward(),
+            "MissedObservationPositiveSupervision": self.TestMissedObservationStillReceivesPositiveSupervision(),
             "PSTWorldBinderShapes": self.TestPSTWorldBinderShapes(),
             "PSTWorldBinderEmptyAndInvalidMask": self.TestPSTWorldBinderEmptyAndInvalidMask(),
             "PerceptionPhysicalTrainerForwardSmoke": self.TestPerceptionPhysicalTrainerForwardSmoke(),}

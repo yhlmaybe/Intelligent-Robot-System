@@ -5,31 +5,119 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 import torch
 
+from ModuleMessagerManager import ModuleDim
+
 
 TEXT_TRUST_OCR_OBSERVED = "ocr_observed"
 TEXT_TRUST_OPERATOR_COMMAND = "operator_command"
 TEXT_TRUST_UNSAFE_EXTERNAL = "unsafe_external"
-ROBOT_STATE_WIRE_SCHEMA_VERSION = 1
-SENSOR_PACKET_WIRE_SCHEMA_VERSION = 2
-DECISION_WIRE_SCHEMA_VERSION = 2
+ROBOT_STATE_WIRE_SCHEMA_VERSION = 7
+SENSOR_PACKET_WIRE_SCHEMA_VERSION = 4
+DECISION_WIRE_SCHEMA_VERSION = 7
+OFFLINE_SENSOR_MANIFEST_SCHEMA_VERSION = 2
+
+
+@dataclass(frozen=True)
+class CameraCalibration:
+    calibration_id: str
+    intrinsics: torch.Tensor
+
+
+ROBOT_STATE_WIRE_METADATA_FIELDS = (
+    "schema_version",
+    "stream_id",
+    "sequence_index",
+    "frame_id",
+    "calibration_id",
+    "world_frame_id",
+    "endpoint_names",
+    "controlled_endpoint_names",
+    "pose_frame",
+    "pose_convention",
+    "pose_time_reference",
+    "pose_unit",
+    "quaternion_order",
+    "pose_handedness",
+    "base_orientation_convention",
+    "gravity_convention",
+)
+
+SENSOR_PACKET_WIRE_FIELDS = (
+    "schema_version",
+    "stream_id",
+    "sequence_index",
+    "frame_id",
+    "calibration_id",
+    "rgb_encoding",
+    "depth_unit",
+    "text_ext",
+    "text_trust",
+    "sample_actions",
+    "deterministic_actor",
+    "rgb",
+    "depth",
+    "depth_valid",
+)
+
+DECISION_REQUEST_PROVENANCE_FIELDS = (
+    "stream_id",
+    "sequence_index",
+    "frame_id",
+    "calibration_id",
+    "world_frame_id",
+)
+
+OFFLINE_SENSOR_MANIFEST_FIELDS = (
+    "schema_version",
+    "calibration_id",
+    "rgb_encoding",
+    "depth_unit",
+    "depth_representation",
+    "rgb_depth_alignment",
+    "rectification",
+    "synchronization",
+    "object_motion_frame",
+    "object_motion_representation",
+    "object_motion_reference",
+    "object_motion_translation_unit",
+    "object_motion_quaternion_order",
+)
 
 
 class RobotState(TypedDict):
     """Measured robot/planner state for the current frame.
 
     Poses are batched, expressed in the world frame in metres, and use XYZW
-    quaternions. Endpoint tensors follow ``ModuleDim.DecisionEndpointNames``:
-    ``endpoint_pose`` and ``planner_expected_endpoint_pose`` are ``[B, 13, 7]``;
-    ``camera_pose_world`` is ``[B, 7]``; planner/provenance scalars are ``[B]``.
+    quaternions. ``endpoint_pose`` follows ``ModuleDim.RobotStateEndpointNames``
+    and is ``[B, 13, 7]``. The first 12 rows are the ten fingertips and two
+    wrists. The ``camera_optical`` row uses a fixed optical-center translation
+    plus an XYZW unit quaternion; the quaternion represents exactly three
+    rotational DOFs, while its xyz carrier is not a camera motion DOF. There is
+    deliberately no second camera-pose field. ``base_orientation_world`` is an
+    XYZW unit quaternion shaped ``[B, 4]``. It is used only to remove the
+    arbitrary world-frame gauge from the camera orientation; base translation
+    is fixed hardware geometry and never enters a learned layer.
+    ``gravity_direction_world`` is the
+    unit, dimensionless direction of gravitational acceleration in the world
+    frame (down), shaped ``[B, 3]``; it is not accelerometer specific force and
+    does not include the 9.81 m/s^2 magnitude. Both physical references use the
+    current sensor-frame exposure time. ``planner_expected_endpoint_pose``
+    follows all 13 ``ModuleDim.DecisionEndpointNames`` and is ``[B, 13, 7]``.
+    The strict action boundary is 12 full SE(3) endpoints plus three camera
+    rotations, for 75 active DOFs. Camera target translation remains the fixed
+    optical-center translation. Planner/provenance scalars are ``[B]``.
 
     ``model_command_executed`` states whether the measured transition into this
-    frame was produced by the model command emitted on the preceding frame. It
-    is feedback provenance, not an action label. An executor-side rejection
-    reports ``model_command_executed = 0`` and ``planner_failed = 1``.
+    frame was produced by the model command emitted on the preceding frame.
+    When it is true, ``executed_action_id`` must identify that command; zero is
+    the no-model-command sentinel. These are feedback provenance, not action
+    labels. An executor-side rejection reports ``model_command_executed = 0``,
+    ``executed_action_id = 0`` and ``planner_failed = 1``.
     """
 
     endpoint_pose: torch.Tensor
-    camera_pose_world: torch.Tensor
+    base_orientation_world: torch.Tensor
+    gravity_direction_world: torch.Tensor
     planner_expected_endpoint_pose: torch.Tensor
     planner_progress: torch.Tensor
     planner_tracking_error: torch.Tensor
@@ -37,6 +125,86 @@ class RobotState(TypedDict):
     planner_reached: torch.Tensor
     planner_failed: torch.Tensor
     model_command_executed: torch.Tensor
+    executed_action_id: torch.Tensor
+
+
+ROBOT_STATE_FIELDS = tuple(RobotState.__annotations__)
+ROBOT_STATE_WIRE_FIELDS = ROBOT_STATE_WIRE_METADATA_FIELDS + ROBOT_STATE_FIELDS
+
+
+def ExpectedRobotStateWireMetadata() -> Dict[str, Any]:
+    return {
+        "endpoint_names": list(ModuleDim.RobotStateEndpointNames),
+        "controlled_endpoint_names": list(ModuleDim.DecisionEndpointNames),
+        "pose_frame": "world",
+        "pose_convention": "T_world_endpoint",
+        "pose_time_reference": "sensor_frame_exposure",
+        "pose_unit": "meter",
+        "quaternion_order": "xyzw",
+        "pose_handedness": "right_handed",
+        "base_orientation_convention": "q_world_base_xyzw",
+        "gravity_convention": "unit_acceleration_direction_world",}
+
+
+def ValidateRobotStateWirePacket(
+    packet: Any,
+    calibrationId: str,) -> None:
+    if type(packet) is not dict or set(packet) != set(ROBOT_STATE_WIRE_FIELDS):
+        raise ValueError("robot packet fields do not match the current schema")
+    if (
+        type(packet["schema_version"]) is not int
+        or packet["schema_version"] != ROBOT_STATE_WIRE_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported robot state packet schema")
+    if type(packet["frame_id"]) is not str or not packet["frame_id"]:
+        raise ValueError("RobotState frame_id must be a non-empty string")
+    if type(packet["stream_id"]) is not str or not packet["stream_id"]:
+        raise ValueError("RobotState stream_id must be a non-empty string")
+    if type(packet["sequence_index"]) is not int or packet["sequence_index"] < 0:
+        raise ValueError("RobotState sequence_index must be a non-negative integer")
+    if packet["calibration_id"] != calibrationId:
+        raise ValueError(
+            "RobotState calibration_id does not match the configured camera")
+    if type(packet["world_frame_id"]) is not str or not packet["world_frame_id"]:
+        raise ValueError("RobotState world_frame_id must be a non-empty string")
+    for name, expected in ExpectedRobotStateWireMetadata().items():
+        if packet[name] != expected:
+            raise ValueError(
+                f"robot packet {name} does not match the current contract")
+
+
+def ValidateOfflineSensorManifest(
+    manifest: Any,
+    calibrationId: str,) -> None:
+    if (
+        type(manifest) is not dict
+        or set(manifest) != set(OFFLINE_SENSOR_MANIFEST_FIELDS)
+    ):
+        raise ValueError(
+            "offline sensor manifest fields do not match the current schema")
+    if (
+        type(manifest["schema_version"]) is not int
+        or manifest["schema_version"] != OFFLINE_SENSOR_MANIFEST_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported offline sensor manifest schema")
+    expected = {
+        "calibration_id": calibrationId,
+        "rgb_encoding": "rgb8",
+        "depth_unit": "meter",
+        "depth_representation": "optical_axis_z",
+        "rgb_depth_alignment": "registered_to_rgb",
+        "rectification": "rectified",
+        "synchronization": "synchronized_exposure",
+        "object_motion_frame": "current_camera_optical",
+        "object_motion_representation": "se3_spatial_delta",
+        "object_motion_reference": (
+            "previous_to_current_after_camera_egomotion_compensation"),
+        "object_motion_translation_unit": "meter",
+        "object_motion_quaternion_order": "xyzw",}
+    for name, value in expected.items():
+        if manifest[name] != value:
+            raise ValueError(
+                f"offline sensor manifest {name} does not match the current contract")
 
 
 @dataclass
@@ -53,6 +221,7 @@ class BrainStepInput:
     perception_targets: Optional[Dict[str, torch.Tensor]]
     robot_state: RobotState
     text_trust: Optional[List[str]] = None
+    compute_critic_loss: bool = True
 
 
 @dataclass
@@ -68,6 +237,7 @@ class AgentActInput:
     robot_state: RobotState
     perception_targets: Optional[Dict[str, torch.Tensor]] = None
     text_trust: Optional[List[str]] = None
+    compute_critic_loss: bool = True
 
 
 @dataclass
@@ -85,12 +255,12 @@ class BrainStepOutput:
 @dataclass
 class AgentActOutput:
     motion_command: Any
-    target_endpoint_pose: torch.Tensor
     temporal_envelope: Any
     decision: Dict[str, Any]
     loss: Optional[torch.Tensor]
     ocr: Any
     intention_texts: List[str]
+    optimization_losses: Dict[str, torch.Tensor] = field(default_factory=dict)
     total_loss: Optional[torch.Tensor] = None
     transport_delayed_loss: Optional[torch.Tensor] = None
     physical_loss: Optional[torch.Tensor] = None
@@ -106,8 +276,6 @@ class PerceptionPhysicalStage:
     quality_seq: torch.Tensor
     pred_error_seq: torch.Tensor
     key_padding_mask: torch.Tensor
-    camera_pose_world: torch.Tensor
-    camera_motion_from_prev: Any
     prev_visual_for_loss: Any
     ocr_items: Any
     fuse_ocr: List[List[str]]
@@ -117,8 +285,6 @@ class PerceptionPhysicalStage:
     pst: Dict[str, torch.Tensor]
     observed_pst: Dict[str, torch.Tensor]
     pst_summary: torch.Tensor
-    endpoint_pose: torch.Tensor
-    endpoint_pose_encoding: Any
     world_action_feedback: torch.Tensor
 
 
@@ -145,7 +311,7 @@ class ValueMemoryWorldStage:
     mem_feat: torch.Tensor
     memory_reward: torch.Tensor
     intent_hint_for_memory: torch.Tensor
-    next_visual_prediction: Any
+    prospective_visual_prediction: Any
 
 
 @dataclass
@@ -172,7 +338,7 @@ class ExecutionStage:
     decoupled_decision: Any
     planner_prior: Optional[Dict[str, torch.Tensor]]
     network_decision_tensor: torch.Tensor
-    executed_feedback_embed: torch.Tensor
+    prospective_action_embed: torch.Tensor
     temporal_goal: Dict[str, torch.Tensor]
     world_abstract: Dict[str, torch.Tensor]
-    intent_novelty: torch.Tensor
+    reference_uncertainty: torch.Tensor
