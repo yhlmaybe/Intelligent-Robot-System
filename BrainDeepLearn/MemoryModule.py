@@ -477,18 +477,18 @@ class GlobalWorkspace(AGICoreModule):
         self.register_buffer("global_step", torch.zeros(B0, dtype=torch.long))
 
     @torch.no_grad()
-    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
+    def EnsureB(self, B: int):
         B0 = int(self.keys.size(0))
         if B0 == int(B):
             return
 
-        self.keys = torch.zeros(B, self.slots, self.dim, device=device, dtype=dtype)
-        self.vals = torch.zeros(B, self.slots, self.dim, device=device, dtype=dtype)
-        self.priority = torch.zeros(B, self.slots, device=device, dtype=dtype)
-        self.ttl = torch.zeros(B, self.slots, device=device, dtype=torch.long)
-        self.last_step = torch.zeros(B, self.slots, device=device, dtype=torch.long)
-        self.source = torch.zeros(B, self.slots, device=device, dtype=torch.int8)
-        self.global_step = torch.zeros(B, device=device, dtype=torch.long)
+        self.keys = self.keys.new_zeros(B, self.slots, self.dim)
+        self.vals = self.vals.new_zeros(B, self.slots, self.dim)
+        self.priority = self.priority.new_zeros(B, self.slots)
+        self.ttl = self.ttl.new_zeros(B, self.slots)
+        self.last_step = self.last_step.new_zeros(B, self.slots)
+        self.source = self.source.new_zeros(B, self.slots)
+        self.global_step = self.global_step.new_zeros(B)
 
 
     @torch.no_grad()
@@ -528,7 +528,7 @@ class GlobalWorkspace(AGICoreModule):
         ) -> torch.Tensor:
         B = int(key.size(0))
 
-        self.EnsureB(B, device=self.device, dtype=self.dtype)
+        self.EnsureB(B)
 
         if priority is None:
             pr = torch.ones(B, device=self.device, dtype=self.dtype)
@@ -576,7 +576,7 @@ class GlobalWorkspace(AGICoreModule):
 
         B = int(query.size(0))
 
-        self.EnsureB(B, device=self.device, dtype=self.dtype)
+        self.EnsureB(B)
 
         alive_one = (self.ttl[:1] > 0) & (self.priority[:1] > 0) #[1, slots]
 
@@ -657,19 +657,19 @@ class SemanticLTM(AGICoreModule):
         self.register_buffer("global_step", torch.zeros(B0, dtype=torch.long))
 
     @torch.no_grad()
-    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
+    def EnsureB(self, B: int):
         B0 = int(self.keys.size(0))
         if B0 == int(B):
             return
 
-        self.keys = torch.zeros(B, self.capacity, self.dim, device=device, dtype=dtype)
-        self.vals = torch.zeros(B, self.capacity, self.dim, device=device, dtype=dtype)
-        self.prio = torch.zeros(B, self.capacity, device=device, dtype=dtype)
-        self.touch = torch.zeros(B, self.capacity, device=device, dtype=torch.long)
-        self.step = torch.zeros(B, self.capacity, device=device, dtype=torch.long)
-        self.source = torch.zeros(B, self.capacity, device=device, dtype=torch.int8)
-        self.filled = torch.zeros(B, device=device, dtype=torch.long)
-        self.global_step = torch.zeros(B, device=device, dtype=torch.long)
+        self.keys = self.keys.new_zeros(B, self.capacity, self.dim)
+        self.vals = self.vals.new_zeros(B, self.capacity, self.dim)
+        self.prio = self.prio.new_zeros(B, self.capacity)
+        self.touch = self.touch.new_zeros(B, self.capacity)
+        self.step = self.step.new_zeros(B, self.capacity)
+        self.source = self.source.new_zeros(B, self.capacity)
+        self.filled = self.filled.new_zeros(B)
+        self.global_step = self.global_step.new_zeros(B)
 
 
     @torch.no_grad()
@@ -686,7 +686,7 @@ class SemanticLTM(AGICoreModule):
         writeMask: Optional[torch.Tensor] = None): #[int = MemoryType.SRC_REAL]
 
         B = int(key.size(0))
-        self.EnsureB(B, self.device, self.dtype)
+        self.EnsureB(B)
 
         if source is None:
             source = torch.full((B,), MemoryType.SRC_REAL, device=self.device, dtype=torch.int8)
@@ -732,7 +732,7 @@ class SemanticLTM(AGICoreModule):
         query: torch.Tensor, #[B, D]
         topk: int = 8):
         B = int(query.size(0))
-        self.EnsureB(B, self.device, self.dtype)
+        self.EnsureB(B)
 
         filled = self.filled
         gstep = self.global_step
@@ -801,22 +801,22 @@ class EpisodicLTM(AGICoreModule):
         self.global_step.add_(1)
 
     @torch.no_grad()
-    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
+    def EnsureB(self, B: int):
         B0 = int(self.keys.size(0))
         if B0 == int(B):
             return
 
-        self.keys = torch.zeros(B, self.capacity, self.dim, device=device, dtype=dtype)
-        self.state_keys = torch.zeros(B, self.capacity, self.dim, device=device, dtype=dtype)
-        self.vals = torch.zeros(B, self.capacity, self.dim, device=device, dtype=dtype)
-        self.rew = torch.zeros(B, self.capacity, device=device, dtype=dtype)
-        self.rew_abs = torch.zeros(B, self.capacity, device=device, dtype=dtype)
-        self.prio = torch.zeros(B, self.capacity, device=device, dtype=dtype)
-        self.step = torch.zeros(B, self.capacity, device=device, dtype=torch.long)
-        self.touch = torch.zeros(B, self.capacity, device=device, dtype=torch.long)
-        self.source = torch.zeros(B, self.capacity, device=device, dtype=torch.int8)
-        self.filled = torch.zeros(B, device=device, dtype=torch.long)
-        self.global_step = torch.zeros(B, device=device, dtype=torch.long)
+        self.keys = self.keys.new_zeros(B, self.capacity, self.dim)
+        self.state_keys = self.state_keys.new_zeros(B, self.capacity, self.dim)
+        self.vals = self.vals.new_zeros(B, self.capacity, self.dim)
+        self.rew = self.rew.new_zeros(B, self.capacity)
+        self.rew_abs = self.rew_abs.new_zeros(B, self.capacity)
+        self.prio = self.prio.new_zeros(B, self.capacity)
+        self.step = self.step.new_zeros(B, self.capacity)
+        self.touch = self.touch.new_zeros(B, self.capacity)
+        self.source = self.source.new_zeros(B, self.capacity)
+        self.filled = self.filled.new_zeros(B)
+        self.global_step = self.global_step.new_zeros(B)
 
     @torch.no_grad()
     def Store(
@@ -829,7 +829,7 @@ class EpisodicLTM(AGICoreModule):
         writeMask: Optional[torch.Tensor] = None,
         stateKey: Optional[torch.Tensor] = None): #  [int = MemoryType.SRC_REAL]
         B = int(key.size(0))
-        self.EnsureB(B, self.device, self.dtype)
+        self.EnsureB(B)
 
         if source is None:
             source = torch.full((B,), MemoryType.SRC_REAL, device=self.device, dtype=torch.int8)
@@ -879,7 +879,7 @@ class EpisodicLTM(AGICoreModule):
 
     def Retrieve(self, query: torch.Tensor, topk: int = 8, recentBias: float = 0.05, useStateKey: bool = False):
         B = int(query.size(0))
-        self.EnsureB(B, self.device, self.dtype)
+        self.EnsureB(B)
 
         filled = self.filled
         gstep = self.global_step
@@ -1371,7 +1371,10 @@ class MemoryExtractor(AGICoreModule):
 
         B0 = 1
         self.register_buffer("h_state", torch.zeros(B0, ssmStateDim))
-        self.register_buffer("fast_weights", torch.zeros(B0, memoryDim, memoryDim))
+        self.register_buffer(
+            "fast_weights",
+            torch.zeros(B0, memoryDim, memoryDim),
+            persistent=False)
         self.register_buffer("memory_keys", torch.zeros(B0, memorySize, memoryDim))
         self.register_buffer("memory_values", torch.zeros(B0, memorySize, memoryDim))
         self.register_buffer("memory_importance", torch.zeros(B0, memorySize))
@@ -1612,31 +1615,37 @@ class MemoryExtractor(AGICoreModule):
         self.usage_bank = ObjectUsageBank()
 
     @torch.no_grad()
-    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype) -> None:
+    def EnsureB(self, B: int) -> None:
         B0 = int(self.h_state.size(0))
         if B0 == int(B):
             return
 
-        self.h_state = torch.zeros(B, self.ssm_state_dim, device=device, dtype=dtype)
+        self.h_state = self.h_state.new_zeros(B, self.ssm_state_dim)
 
-        self.fast_weights = torch.zeros(B, self.memory_dim, self.memory_dim, device=device, dtype=dtype)
+        self.fast_weights = self.fast_weights.new_zeros(
+            B, self.memory_dim, self.memory_dim)
 
-        self.memory_keys = torch.zeros(B, self.memory_size, self.memory_dim, device=device, dtype=dtype)
-        self.memory_values = torch.zeros(B, self.memory_size, self.memory_dim, device=device, dtype=dtype)
+        self.memory_keys = self.memory_keys.new_zeros(
+            B, self.memory_size, self.memory_dim)
+        self.memory_values = self.memory_values.new_zeros(
+            B, self.memory_size, self.memory_dim)
 
-        self.memory_importance = torch.zeros(B, self.memory_size, device=device, dtype=dtype)
-        self.memory_steps = torch.zeros(B, self.memory_size, device=device, dtype=torch.long)
-        self.memory_source = torch.zeros(B, self.memory_size, device=device, dtype=torch.int8)
-        self.memory_reward_abs = torch.zeros(B, self.memory_size, device=device, dtype=dtype)
+        self.memory_importance = self.memory_importance.new_zeros(
+            B, self.memory_size)
+        self.memory_steps = self.memory_steps.new_zeros(B, self.memory_size)
+        self.memory_source = self.memory_source.new_zeros(B, self.memory_size)
+        self.memory_reward_abs = self.memory_reward_abs.new_zeros(
+            B, self.memory_size)
 
-        self.memory_emotion = torch.zeros(B, self.memory_size, self.emotion_dim, device=device, dtype=dtype)
+        self.memory_emotion = self.memory_emotion.new_zeros(
+            B, self.memory_size, self.emotion_dim)
 
-        self.time_step = torch.zeros(B, device=device, dtype=torch.long)
-        self.memory_filled = torch.zeros(B, device=device, dtype=torch.long)
-        self.last_compress_step = torch.zeros(B, device=device, dtype=torch.long)
+        self.time_step = self.time_step.new_zeros(B)
+        self.memory_filled = self.memory_filled.new_zeros(B)
+        self.last_compress_step = self.last_compress_step.new_zeros(B)
 
-        self.ns_prev_P_post = torch.zeros(B, self.ns_K, device=device, dtype=dtype)
-        self.ns_penalty_vec = torch.zeros(B, 1, device=device, dtype=dtype)
+        self.ns_prev_P_post = self.ns_prev_P_post.new_zeros(B, self.ns_K)
+        self.ns_penalty_vec = self.ns_penalty_vec.new_zeros(B, 1)
 
         self.ResetInternalLoss()
 
@@ -1870,7 +1879,7 @@ class MemoryExtractor(AGICoreModule):
 
         B = x.size(0)
 
-        self.EnsureB(B, self.device, self.dtype)
+        self.EnsureB(B)
 
         src_all = sourceLabel
         if sourceLabel is None:
@@ -1986,9 +1995,8 @@ class MemoryExtractor(AGICoreModule):
         fusion_gate = torch.sigmoid(f_raw).squeeze(-1) # [B]
         gate_bias = 0.5 * torch.tanh(bias_raw).squeeze(-1) # [B]
 
-        self.HebbianUpdate(key, gate_local, td_memory, a, b)
-
         mem_recall = self.Retrieve(key, fusion_gate, importance=importance_eff, localGate=gate_local, emotion=emotion_eff, tdError=td_memory,) # [B, memoryDim]
+        self.HebbianUpdate(key, gate_local, td_memory, a, b)
         
         mem_film_ctx = self.BuildFilmContext(val, mem_recall, emo_emb, td_memory, risk_eff, uncertainty_eff, confidence_eff)
         g2, b2 = self.FilmParams(self.film_mem, mem_film_ctx)
@@ -2207,7 +2215,7 @@ class MemoryExtractor(AGICoreModule):
         M = int(self.memory_size)
         D = int(self.memory_dim)
 
-        fw = self.fast_weights # [B, memory_dim, memory_dim]
+        fw = self.fast_weights.detach().clone() # [B, memory_dim, memory_dim]
         qf = query
         fast_part = torch.bmm(qf.unsqueeze(1), fw).squeeze(1) # [B, memory_dim]
 
@@ -2585,9 +2593,7 @@ class MemoryExtractor(AGICoreModule):
         if doneMask is None:
             self.fast_weights.zero_()
             return
-        done = doneMask.view(-1).to(
-            device=self.fast_weights.device,
-            dtype=torch.bool)
+        done = doneMask.view(-1)
         if done.numel() != self.fast_weights.size(0):
             raise ValueError("Memory Hebbian reset mask must match its batch size")
         self.fast_weights[done] = 0
@@ -2859,9 +2865,9 @@ class MemoryExtractor(AGICoreModule):
     def ImportDurableState(self, state: Dict[str, torch.Tensor]) -> None:
         self.ValidateDurableState(state)
         batch_size = int(state["memory_filled"].size(0))
-        self.EnsureB(batch_size, device=self.device, dtype=self.dtype)
-        self.ltm.semantic.EnsureB(batch_size, device=self.device, dtype=self.dtype)
-        self.ltm.episodic.EnsureB(batch_size, device=self.device, dtype=self.dtype)
+        self.EnsureB(batch_size)
+        self.ltm.semantic.EnsureB(batch_size)
+        self.ltm.episodic.EnsureB(batch_size)
 
         targets = self.DurableStateTensors()
         for name in self.DURABLE_MEMORY_STATE_FIELDS:
@@ -2872,7 +2878,7 @@ class MemoryExtractor(AGICoreModule):
         self.ns_prev_P_post.zero_()
         self.ns_penalty_vec.zero_()
         self.last_compress_step.copy_(self.time_step)
-        self.gws.EnsureB(batch_size, device=self.device, dtype=self.dtype)
+        self.gws.EnsureB(batch_size)
         self.gws.Reset()
         self.ResetInternalLoss()
         self.pending.clear()
@@ -3513,18 +3519,15 @@ class MemoryExtractor(AGICoreModule):
         if not all(torch.is_tensor(value) for value in state.values()):
             raise TypeError("every memory-state field must be a tensor")
 
-        dev = self.device
-        dtype = self.dtype
-
         if state["h_state"].dim() == 0:
             raise ValueError("memory-state h_state must have a batch dimension")
         B = int(state["h_state"].size(0))
-        self.EnsureB(B, device=dev, dtype=dtype)
+        self.EnsureB(B)
 
-        self.gws.EnsureB(B, device=dev, dtype=dtype)
+        self.gws.EnsureB(B)
         if includeDurable:
-            self.ltm.semantic.EnsureB(B, device=dev, dtype=dtype)
-            self.ltm.episodic.EnsureB(B, device=dev, dtype=dtype)
+            self.ltm.semantic.EnsureB(B)
+            self.ltm.episodic.EnsureB(B)
 
         targets = [
             ("last_compress_step", self.last_compress_step),
@@ -3970,7 +3973,7 @@ class TestMemoryMTool:
             dim = 16
             cap = 3
             epi = EpisodicLTM(dim=dim, capacity=cap).to(self.device)
-            epi.EnsureB(B=1, device=self.device, dtype=torch.float32)
+            epi.EnsureB(1)
             epi.StepTick()
 
             def store_with(i, prio, rew):
@@ -4015,7 +4018,7 @@ class TestMemoryMTool:
             dim = 16
             cap = 3
             epi = EpisodicLTM(dim=dim, capacity=cap).to(self.device)
-            epi.EnsureB(B=1, device=self.device, dtype=torch.float32)
+            epi.EnsureB(1)
             epi.StepTick()
 
             def store_with(i, prio, rew):
@@ -4170,7 +4173,7 @@ class TestMemoryMTool:
                 compressEvery=100,
                 emotionDim=4,))
             mem = MemoryExtractor(**cfg).to(self.device).eval()
-            mem.EnsureB(2, device=self.device, dtype=mem.dtype)
+            mem.EnsureB(2)
             mem.ResetAll()
 
             with torch.no_grad():
@@ -4206,10 +4209,10 @@ class TestMemoryMTool:
                 gwsSlots=3, gwsTtl=4, compressEvery=100, emotionDim=4))
 
             mem = MemoryExtractor(**cfg).to(self.device).eval()
-            mem.EnsureB(3, device=self.device, dtype=torch.float32)
-            mem.ltm.semantic.EnsureB(3, device=self.device, dtype=torch.float32)
-            mem.ltm.episodic.EnsureB(3, device=self.device, dtype=torch.float32)
-            mem.gws.EnsureB(3, device=self.device, dtype=torch.float32)
+            mem.EnsureB(3)
+            mem.ltm.semantic.EnsureB(3)
+            mem.ltm.episodic.EnsureB(3)
+            mem.gws.EnsureB(3)
 
             with torch.no_grad():
                 mem.time_step[:] = torch.tensor([101, 202, 303], device=self.device)
@@ -4482,9 +4485,9 @@ class TestMemoryMTool:
                 gwsSlots=4, gwsTtl=6, compressEvery=100, emotionDim=4)
             cfg = self.FilterKwargs(MemoryExtractor, cfg)
             mem = MemoryExtractor(**cfg).to(self.device).eval()
-            mem.EnsureB(2, device=self.device, dtype=torch.float32)
-            mem.ltm.semantic.EnsureB(2, device=self.device, dtype=torch.float32)
-            mem.ltm.episodic.EnsureB(2, device=self.device, dtype=torch.float32)
+            mem.EnsureB(2)
+            mem.ltm.semantic.EnsureB(2)
+            mem.ltm.episodic.EnsureB(2)
             mem.ltm.semantic.filled.zero_()
             mem.sym_mem.filled.zero_()
 
@@ -4657,9 +4660,9 @@ class TestMemoryMTool:
                 mem.ltm.episodic.state_keys[0, 0, 0] = 4.0
                 mem.ltm.episodic.filled[0] = 1
 
-            mem.EnsureB(3, device=self.device, dtype=torch.float32)
-            mem.ltm.semantic.EnsureB(3, device=self.device, dtype=torch.float32)
-            mem.ltm.episodic.EnsureB(3, device=self.device, dtype=torch.float32)
+            mem.EnsureB(3)
+            mem.ltm.semantic.EnsureB(3)
+            mem.ltm.episodic.EnsureB(3)
 
             assert int(mem.memory_keys.size(0)) == 3
             assert int(mem.memory_filled.sum().item()) == 0
@@ -4677,7 +4680,8 @@ class TestMemoryMTool:
                 gws.keys[0, 0, 0] = 1.0
                 gws.priority[0, 0] = 1.0
                 gws.ttl[0, 0] = 4
-            gws.EnsureB(2, device=self.device, dtype=torch.float64)
+            gws = gws.to(dtype=torch.float64)
+            gws.EnsureB(2)
             assert int(gws.keys.size(0)) == 2
             assert gws.keys.dtype == torch.float64
             assert torch.count_nonzero(gws.keys).item() == 0
@@ -5083,10 +5087,10 @@ class TestMemoryMTool:
                 for name, value in state.items()}
 
             mem2 = MemoryExtractor(**cfg).to(self.device).eval()
-            mem2.EnsureB(B, device=self.device, dtype=mem1.dtype)
-            mem2.gws.EnsureB(B, device=self.device, dtype=mem1.dtype)
-            mem2.ltm.semantic.EnsureB(B, device=self.device, dtype=mem1.dtype)
-            mem2.ltm.episodic.EnsureB(B, device=self.device, dtype=mem1.dtype)
+            mem2.EnsureB(B)
+            mem2.gws.EnsureB(B)
+            mem2.ltm.semantic.EnsureB(B)
+            mem2.ltm.episodic.EnsureB(B)
             mem2.load_state_dict(mem1.state_dict(), strict=True)
             mem2.ltm.episodic.touch.zero_()
             mem2.ImportState(mixed_dtype_state)
@@ -5141,14 +5145,14 @@ class TestMemoryMTool:
                 gwsSlots=2,))).to(self.device).eval()
 
             B_src, B_dst = 2, 3
-            src.EnsureB(B_src, device=self.device, dtype=src.dtype)
-            src.gws.EnsureB(B_src, device=self.device, dtype=src.dtype)
-            src.ltm.semantic.EnsureB(B_src, device=self.device, dtype=src.dtype)
-            src.ltm.episodic.EnsureB(B_src, device=self.device, dtype=src.dtype)
-            dst.EnsureB(B_dst, device=self.device, dtype=dst.dtype)
-            dst.gws.EnsureB(B_dst, device=self.device, dtype=dst.dtype)
-            dst.ltm.semantic.EnsureB(B_dst, device=self.device, dtype=dst.dtype)
-            dst.ltm.episodic.EnsureB(B_dst, device=self.device, dtype=dst.dtype)
+            src.EnsureB(B_src)
+            src.gws.EnsureB(B_src)
+            src.ltm.semantic.EnsureB(B_src)
+            src.ltm.episodic.EnsureB(B_src)
+            dst.EnsureB(B_dst)
+            dst.gws.EnsureB(B_dst)
+            dst.ltm.semantic.EnsureB(B_dst)
+            dst.ltm.episodic.EnsureB(B_dst)
 
             with torch.no_grad():
                 src.memory_filled.copy_(torch.tensor([3, 1], device=self.device))
@@ -5277,6 +5281,9 @@ class TestMemoryMTool:
             cfg = self.FilterKwargs(MemoryExtractor, cfg)
 
             mem = MemoryExtractor(**cfg).to(self.device).train()
+            mem_without_hebbian = MemoryExtractor(**cfg).to(self.device).train()
+            mem_without_hebbian.load_state_dict(mem.state_dict(), strict=True)
+            mem_without_hebbian.use_hebbian = False
 
             B = 4
             x = torch.randn(B, cfg.get("inputDim", 32), device=self.device)
@@ -5284,7 +5291,22 @@ class TestMemoryMTool:
             rwd = torch.randn(B, device=self.device)
             emotion = self.MakeEmotion(B, mem)
 
-            _ = self.CallMemForward(mem, x, tdError=td, reward=rwd, emotion=emotion)
+            torch.manual_seed(91)
+            first = self.CallMemForward(
+                mem, x, tdError=td, reward=rwd, emotion=emotion)
+            torch.manual_seed(91)
+            first_without_hebbian = self.CallMemForward(
+                mem_without_hebbian,
+                x,
+                tdError=td,
+                reward=rwd,
+                emotion=emotion)
+            assert torch.allclose(
+                first,
+                first_without_hebbian,
+                atol=1e-7,
+                rtol=1e-6)
+            assert "fast_weights" not in mem.state_dict()
 
             fw_before = mem.fast_weights.detach().clone()
             h_before = mem.h_state.detach().clone()
@@ -5328,8 +5350,8 @@ class TestMemoryMTool:
                 compressEvery=10_000, emotionDim=8)
             mem = MemoryExtractor(
                 **self.FilterKwargs(MemoryExtractor, cfg)).to(self.device).eval()
-            mem.EnsureB(2, device=self.device, dtype=mem.dtype)
-            mem.gws.EnsureB(2, device=self.device, dtype=mem.dtype)
+            mem.EnsureB(2)
+            mem.gws.EnsureB(2)
             with torch.no_grad():
                 mem.h_state.fill_(1.0)
                 mem.fast_weights.fill_(1.0)

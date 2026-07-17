@@ -63,10 +63,10 @@ from TemporalExecutionModule import (
     TemporalDecisionEnvelope,
     TemporalExecutionGateExtractor)
 from ModuleMessagerManager import ModuleDim, ModuleMessagerManager
-from FunctionTools import SynchronizeGrowableLoRATopologyForFullLoad
+from FunctionTools import SynchronizeDynamicAdapterTopologiesForFullLoad
  
 
-BRAIN_RUNTIME_SCHEMA_VERSION = 14
+BRAIN_RUNTIME_SCHEMA_VERSION = 15
 
 BRAIN_RUNTIME_BUFFER_FIELDS = frozenset({
     "schema_version",
@@ -103,6 +103,7 @@ BRAIN_RUNTIME_BUFFER_FIELDS = frozenset({
     "critic_state",
     "perc_buffer",
     "prev_visual_state",
+    "prev_visual_valid",
     "prospective_visual_prediction",
     "prev_precision",
     "prev_goal_bias",
@@ -254,7 +255,7 @@ def LoadBrainModelState(
     if runtime_keys:
         raise ValueError(
             f"brain parameter artifact contains non-model state: {runtime_keys}")
-    SynchronizeGrowableLoRATopologyForFullLoad(brain, state)
+    SynchronizeDynamicAdapterTopologiesForFullLoad(brain, state)
     expected = ExportBrainModelState(brain)
     missing = sorted(set(expected).difference(state))
     unexpected = sorted(set(state).difference(expected))
@@ -576,26 +577,12 @@ class BrainCore(nn.Module):
 
     @torch.no_grad()
     def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None) -> None:
-        modules = (
-            self.RuntimeModule(self.perc),
-            self.RuntimeModule(self.attn),
-            self.RuntimeModule(self.actor),
-            self.RuntimeModule(self.critic),
-            self.RuntimeModule(self.mem),
-            self.RuntimeModule(self.conscious),)
-        seen = set()
-        for mod in modules:
-            if mod is None or id(mod) in seen:
-                continue
-            seen.add(id(mod))
-            reset_fn = getattr(mod, "ResetHebbianMemory", None)
-            if reset_fn is None:
-                continue
-            params = inspect.signature(reset_fn).parameters
-            if doneMask is not None and "doneMask" in params:
-                reset_fn(doneMask=doneMask)
-            elif doneMask is None or bool(doneMask.all().item()):
-                reset_fn()
+        self.RuntimeModule(self.perc).ResetHebbianMemory(doneMask=doneMask)
+        self.RuntimeModule(self.attn).ResetHebbianMemory(doneMask=doneMask)
+        self.RuntimeModule(self.actor).ResetHebbianMemory(doneMask=doneMask)
+        self.RuntimeModule(self.critic).ResetHebbianMemory(doneMask=doneMask)
+        self.RuntimeModule(self.mem).ResetHebbianMemory(doneMask=doneMask)
+        self.RuntimeModule(self.conscious).ResetHebbianMemory(doneMask=doneMask)
 
     @torch.no_grad()
     def ResizeStateBuffersForLoad(self, stateDict: Dict[str, Any]) -> None:
@@ -868,6 +855,8 @@ class BrainCore(nn.Module):
         self.prev_entropy = z()
 
         self.prev_visual_state = None
+        self.prev_visual_valid = torch.zeros(
+            B, device=device, dtype=torch.bool)
         self.prospective_visual_prediction = None
         self.prev_precision = torch.ones(B, device=device, dtype=torch.float32)
         self.prev_goal_bias = z(ModuleDim.IntentionFeat)
@@ -1223,7 +1212,7 @@ class BrainCore(nn.Module):
 
         def init_shadow_module_parms():
             mem_state = self.mem.ExportState()
-            self.mem_copy.EnsureB(B, device=dev, dtype=self.prev_mem.dtype)
+            self.mem_copy.EnsureB(B)
             self.mem_copy.ImportState(mem_state)
             self.mem_copy.load_state_dict(self.mem.state_dict(), strict=True)
             self.mem_copy.pending = self.DetachRuntimeObject(self.mem.pending, clone=True)
@@ -1284,12 +1273,12 @@ class BrainCore(nn.Module):
                 ~prev_done_for_prediction
                 & self.prev_measured_endpoint_valid),)
         top_down = self.BuildTopDownContext(realized_visual_prior)
-        prev_visual_for_loss = self.prev_visual_state
-        prev_visual_valid_for_loss = self.prev_measured_endpoint_valid
+        previous_visual_state = self.prev_visual_state
+        previous_visual_valid = self.prev_visual_valid
         visual_state = self.perc(
             frame,
-            prevVisualState=prev_visual_for_loss,
-            prevVisualValid=prev_visual_valid_for_loss,
+            prevVisualState=previous_visual_state,
+            prevVisualValid=previous_visual_valid,
             topDownContext=top_down,
             depth=depth,
             depthValid=depthValid,
@@ -1337,6 +1326,7 @@ class BrainCore(nn.Module):
         self.visual_state_valid_buffer = [valid.detach().clone() for valid in visual_valid_src]
         self.perc_buffer = [v.IntegratedFeat for v in self.visual_state_buffer if v is not None]
         self.prev_visual_state = self.DetachVisualState(visual_state)
+        self.prev_visual_valid.fill_(True)
 
         saveModuleOutput("Perception", {
             "feat": perc_feats,
@@ -1387,7 +1377,7 @@ class BrainCore(nn.Module):
             quality_seq=quality_seq,
             pred_error_seq=pred_error_seq,
             key_padding_mask=key_padding_mask,
-            prev_visual_for_loss=prev_visual_for_loss,
+            prev_visual_for_loss=previous_visual_state,
             ocr_items=ocr_items,
             fuse_ocr=fuse_ocr,
             ocr_semantic=ocr_semantic,
@@ -2006,9 +1996,11 @@ class BrainCore(nn.Module):
         self.prev_td_error = td_sig.detach().clone()
         self.prev_measured_endpoint_pose = endpoint_pose.detach().clone()
         self.prev_measured_endpoint_valid = ~done_now
+        self.prev_visual_valid.logical_and_(~done_now)
         done_count = int(done_single) if B == 1 else int(done_now.sum().item())
         if done_count > 0:
             self.mem.ResetEpisodeState(done_now)
+            self.RuntimeModule(self.critic).ResetState(doneMask=done_now)
             self.conscious.ResetState(doneMask=done_now)
             self.OCR.ResetTemporal(doneMask=done_now)
             self.RuntimeModule(self.world).ResetEpisodeState(done_now)
@@ -2115,8 +2107,8 @@ class BrainCore(nn.Module):
                     visual_state,
                     depthTarget=perceptionTargets["depth"],
                     depthTargetValid=perceptionTargets["depth_valid"],
-                    prevVisualState=prev_visual_for_loss,
-                    prevVisualValid=prev_visual_valid_for_loss,
+                    prevVisualState=previous_visual_state,
+                    prevVisualValid=previous_visual_valid,
                     cameraMotion=camera_motion_from_prev)
                 if self.perception_recall_loss is not None and "node_valid" in perceptionTargets:
                     recall_out = self.RuntimeModule(self.perc).recall_heads(visual_state)
@@ -2127,7 +2119,7 @@ class BrainCore(nn.Module):
             world_prediction_losses: Dict[str, torch.Tensor] = {}
             alive_prediction_mask = (
                 ~prev_done_for_prediction
-                & prev_visual_valid_for_loss)
+                & previous_visual_valid)
             world_prediction_losses = self.ComputeAliveWorldPredictionLoss(
                 prevWorldH=prev_world_h_for_prediction,
                 prevWorldZ=prev_world_z_for_prediction,
@@ -2481,6 +2473,7 @@ class BrainCore(nn.Module):
             "critic_state": critic_mod.ExportState(),
             "perc_buffer": [t.detach().clone() for t in self.perc_buffer],
             "prev_visual_state": self.DetachVisualState(self.prev_visual_state, clone=True),
+            "prev_visual_valid": self.prev_visual_valid.detach().clone(),
             "prospective_visual_prediction": self.DetachRuntimeObject(
                 self.prospective_visual_prediction, clone=True),
             "prev_precision": self.prev_precision.detach().clone(),
@@ -2583,7 +2576,7 @@ class BrainCore(nn.Module):
         self.prev_world_s = world_state["s"]
         self.prev_done_flag = world_state["done"]
 
-        self.mem.EnsureB(int(self.prev_mem.size(0)), device=device, dtype=self.prev_mem.dtype)
+        self.mem.EnsureB(int(self.prev_mem.size(0)))
         self.mem.ImportTransientState(state["mem_state"])
         self.mem.pending = state["mem_pending"]
         attn_mod.ImportState(state["attn_state"])
@@ -2591,6 +2584,7 @@ class BrainCore(nn.Module):
 
         self.perc_buffer = state["perc_buffer"]
         self.prev_visual_state = state["prev_visual_state"]
+        self.prev_visual_valid = state["prev_visual_valid"]
         self.prospective_visual_prediction = state[
             "prospective_visual_prediction"]
         self.prev_precision = state["prev_precision"]
@@ -3027,17 +3021,14 @@ class Agent:
             if loadPersistent:
                 self.LoadWorldMemory(self.wm_mem_path)
             else:
-                world.EnsureB(batchSize, world.device, world.dtype)
+                world.EnsureB(batchSize)
         if self.mem_mem_path is not None:
             if loadPersistent:
                 self.LoadAgentMemory(
                     self.mem_mem_path,
                     batchSize=batchSize)
             else:
-                self.brain.mem.EnsureB(
-                    batchSize,
-                    device=self.brain.mem.device,
-                    dtype=self.brain.mem.dtype)
+                self.brain.mem.EnsureB(batchSize)
 
     def LoadWorldMemory(self, path: str):
         if self.world_frame_id is None:
@@ -3052,10 +3043,7 @@ class Agent:
                 batchSize=self.world_memory_batch_size,
                 mapLocation=None)
         else:
-            world.EnsureB(
-                self.world_memory_batch_size,
-                world.device,
-                world.dtype)
+            world.EnsureB(self.world_memory_batch_size)
             world.SaveMemory(path)
 
     def LoadAgentMemory(self, path: str, *, batchSize: int):
@@ -3065,7 +3053,7 @@ class Agent:
             return
 
         self.EnsureFile(path)
-        mem.EnsureB(batchSize, device=mem.device, dtype=mem.dtype)
+        mem.EnsureB(batchSize)
         mem.SaveState(path)
 
     def SaveRuntimeMemories(self):
@@ -4827,6 +4815,7 @@ class TestAGICoreMTool:
                 "prev_decision_state", "prev_latent_control",
                 "prev_target_endpoint_pose", "prev_target_endpoint_valid",
                 "prev_measured_endpoint_pose", "prev_measured_endpoint_valid",
+                "prev_visual_valid",
                 "active_option_policy_input", "active_option_prior_logit",
                 "active_option_goal_mid", "active_option_index",
                 "active_option_valid", "prev_belief_prediction_state",
@@ -4838,6 +4827,8 @@ class TestAGICoreMTool:
                 "prev_intent_sem", "prev_failure_count")
             for name in tensor_state_names:
                 setattr(brain, name, torch.zeros(1))
+            brain.prev_measured_endpoint_valid = torch.tensor([False, True])
+            brain.prev_visual_valid = torch.tensor([True, False])
             brain.active_motion_command = None
             brain.prev_visual_state = None
             brain.prospective_visual_prediction = None
@@ -4887,6 +4878,10 @@ class TestAGICoreMTool:
             runtime_has_intrinsics = has_intrinsics_key(exported_buffers)
             ok = (
                 observed == [1.0, 2.0, 3.0, 4.0, 5.0]
+                and exported_buffers["prev_measured_endpoint_valid"].tolist()
+                == [False, True]
+                and exported_buffers["prev_visual_valid"].tolist()
+                == [True, False]
                 and not state_dict_has_intrinsics
                 and not runtime_has_intrinsics)
             print(f"AGICore adaptive runtime buffers {'passed' if ok else 'failed'}.")
@@ -5777,8 +5772,8 @@ class TestAGICoreMTool:
                 def LoadMemory(self, path, *, batchSize, mapLocation=None):
                     events.append(("load", path, batchSize, mapLocation))
 
-                def EnsureB(self, batchSize, device, dtype):
-                    events.append(("ensure", batchSize, device, dtype))
+                def EnsureB(self, batchSize):
+                    events.append(("ensure", batchSize))
 
             class MinimalBrain(nn.Module):
                 def __init__(self):
@@ -5815,7 +5810,7 @@ class TestAGICoreMTool:
                 deferred
                 and events == [
                     ("bind", "test-calibration", "test-world"),
-                    ("ensure", 1, torch.device("cpu"), torch.float32),
+                    ("ensure", 1),
                     ("save", path),
                 ]
                 and different_batch_rejected

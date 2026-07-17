@@ -106,25 +106,34 @@ class ConsciousHebbianLinear(AGICoreModule):
         self.weight = nn.Parameter(torch.randn(self.out_f, self.in_f) * 0.02) # [O,I]
         self.bias = nn.Parameter(torch.zeros(self.out_f)) # [O]
 
-        self.register_buffer("hebb", torch.zeros(1, self.out_f, self.in_f)) # [1,O,I]
+        self.register_buffer(
+            "hebb",
+            torch.zeros(1, self.out_f, self.in_f),
+            persistent=False)
 
         self.hebb_alpha = float(hebbAlpha)
         self.use_hebbian: bool = bool(useHebb)
 
     @torch.no_grad()
-    def EnsureB(self, B: int, device, dtype):
+    def EnsureB(self, B: int):
         if self.hebb.size(0) != B :
-            self.hebb = torch.zeros(B, self.out_f, self.in_f, device=device, dtype=dtype) # [B,O,I]
+            self.hebb = self.hebb.new_zeros(B, self.out_f, self.in_f) # [B,O,I]
 
     @torch.no_grad()
-    def ResetHebbianMemory(self):
-        self.hebb.zero_()
+    def ResetHebbianMemory(
+        self,
+        doneMask: Optional[torch.Tensor] = None,
+        ) -> None:
+        if doneMask is None:
+            self.hebb.zero_()
+            return
+        mask = doneMask.view(-1)
+        if mask.numel() != self.hebb.size(0):
+            raise ValueError("Consciousness Hebbian reset mask must match its batch size")
+        self.hebb[mask] = 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, I = x.shape
-
-        if self.use_hebbian:
-            self.EnsureB(B, device=self.device, dtype=self.dtype)
 
         if self.use_hebbian:
             W_eff = self.weight.unsqueeze(0) + self.hebb # [B,O,I]
@@ -650,13 +659,17 @@ class ConsciousnessExtractor(AGICoreModule):
         self.register_buffer("_step", torch.zeros(1, dtype=torch.long), persistent=True)
 
     @torch.no_grad()
-    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
+    def EnsureB(self, B: int):
         if self._dev_trace.size(0) != B:
-            self._dev_trace = torch.zeros(B, self.dev_dim, device=device, dtype=dtype)
-            self._last_self_intent = torch.zeros(B, self.intent_dim, device=device, dtype=dtype)
-            self._last_sem = torch.zeros(B, self.self_dim, device=device, dtype=dtype)
-            self._state_valid = torch.zeros(B, device=device, dtype=torch.bool)
-            self._step = torch.zeros(1, device=device, dtype=torch.long)
+            self._dev_trace = self._dev_trace.new_zeros(B, self.dev_dim)
+            self._last_self_intent = self._last_self_intent.new_zeros(
+                B, self.intent_dim)
+            self._last_sem = self._last_sem.new_zeros(B, self.self_dim)
+            self._state_valid = self._state_valid.new_zeros(B)
+            self._step = self._step.new_zeros(1)
+        for module in self.modules():
+            if isinstance(module, ConsciousHebbianLinear) and module.use_hebbian:
+                module.EnsureB(B)
 
     @torch.no_grad()
     def ResetState(self, doneMask: Optional[torch.Tensor] = None):
@@ -1074,7 +1087,7 @@ class ConsciousnessExtractor(AGICoreModule):
         else:
             B = int(ref.size(0))
 
-        self.EnsureB(B, device=device, dtype=dtype)
+        self.EnsureB(B)
 
         mem_by_type = self.NormalizeBankDictInput(
             memoryBank,
@@ -1149,7 +1162,6 @@ class ConsciousnessExtractor(AGICoreModule):
         if bool(inactive_rows.any().item()):
             for module in self.modules():
                 if isinstance(module, ConsciousHebbianLinear) and module.use_hebbian:
-                    module.EnsureB(B, device=device, dtype=dtype)
                     hebbian_snapshots.append((module, module.hebb.detach().clone()))
 
         arousal = self.arousal_net(self._dev_trace)
@@ -1649,10 +1661,13 @@ class ConsciousnessExtractor(AGICoreModule):
             extras=extras,)
     
     @torch.no_grad()
-    def ResetHebbianMemory(self):
-        for m in self.modules():
-            if hasattr(m, "ResetHebbianMemory") and m is not self:
-                m.ResetHebbianMemory()
+    def ResetHebbianMemory(
+        self,
+        doneMask: Optional[torch.Tensor] = None,
+        ) -> None:
+        for module in self.modules():
+            if isinstance(module, ConsciousHebbianLinear):
+                module.ResetHebbianMemory(doneMask=doneMask)
 
 
 
@@ -2116,12 +2131,17 @@ class TestConsciousMTool:
             lin = ConsciousHebbianLinear(inFeatures=16, outFeatures=12, hebbAlpha=0.1, useHebb=True).to(self.device)
 
             x = torch.randn(5, 16, device=self.device)
+            lin.EnsureB(int(x.size(0)))
             with torch.no_grad():
                 n0 = lin.hebb.norm().item()
-                for _ in range(3):
+                expected = F.linear(x, lin.weight, lin.bias)
+                first = lin(x)
+                assert torch.allclose(first, expected, atol=1e-7, rtol=1e-6)
+                for _ in range(2):
                     _ = lin(x)
                 n1 = lin.hebb.norm().item()
                 assert n1 > n0 + 1e-12, f"hebb did not grow: before={n0:.3e}, after={n1:.3e}"
+                assert "hebb" not in lin.state_dict()
 
                 lin.ResetHebbianMemory()
                 n2 = lin.hebb.norm().item()
@@ -2152,6 +2172,21 @@ class TestConsciousMTool:
                     hebb_norm_before.append(m.hebb.norm().item())
             assert len(hebb_norm_before) > 0, "No hebb buffers found in model."
             assert any(n > 1e-9 for n in hebb_norm_before), "All hebb norms are zero before reset; nothing to test."
+
+            before = [
+                module.hebb.detach().clone()
+                for module in model.modules()
+                if isinstance(module, ConsciousHebbianLinear)]
+            model.ResetHebbianMemory(doneMask=torch.tensor(
+                [True, False, True, False],
+                device=self.device))
+            after = [
+                module.hebb.detach().clone()
+                for module in model.modules()
+                if isinstance(module, ConsciousHebbianLinear)]
+            for previous, current in zip(before, after):
+                assert torch.count_nonzero(current[[0, 2]]).item() == 0
+                assert torch.equal(current[[1, 3]], previous[[1, 3]])
 
             model.ResetHebbianMemory()
             hebb_norm_after = []

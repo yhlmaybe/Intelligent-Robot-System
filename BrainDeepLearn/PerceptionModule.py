@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from einops import rearrange, repeat
 from typing import Any, Dict, List, Optional, Iterable, Tuple, Union
-from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, RoPEMultiheadAttention, HungarianAssignment
+from FunctionTools import DynamicAdapterTopologyMixin, GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, RoPEMultiheadAttention, HungarianAssignment, SynchronizeDynamicAdapterTopologiesForFullLoad
 from ModuleMessagerManager import ModuleDim
 
 
@@ -55,99 +55,13 @@ def FrobeniusCapPerSample(mem: torch.Tensor, cap: Optional[float]):
         mem.mul_(scale.view(B, *([1] * (mem.dim() - 1))))
 
 
-def SynchronizeDynamicAdapterTopology(
-    module: nn.Module,
-    stateDict: Dict[str, torch.Tensor],
-    prefix: str,
-    errorMessages: List[str],
-    shapeValidator,) -> None:
-    """Restore the ParameterList topology before PyTorch copies adapter tensors."""
-    names = ("A_list", "B_list", "alpha")
-    topology_key = f"{prefix}topology_count"
-
-    def saved_indices(name: str) -> set:
-        key_prefix = f"{prefix}{name}."
-        return {
-            int(key[len(key_prefix):])
-            for key in stateDict
-            if key.startswith(key_prefix) and key[len(key_prefix):].isdigit()}
-
-    index_sets = [saved_indices(name) for name in names]
-    marker_present = topology_key in stateDict
-    if not any(index_sets):
-        if not marker_present:
-            # ``strict=False`` partial updates preserve the local topology.
-            # A strict full load reports the missing current-schema marker.
-            return
-        saved_count = int(torch.as_tensor(stateDict[topology_key]).item())
-        if saved_count != 0:
-            errorMessages.append(
-                f"{prefix[:-1]} topology_count={saved_count} has no adapter entries")
-            return
-        module.A_list = nn.ParameterList()
-        module.B_list = nn.ParameterList()
-        module.alpha = nn.ParameterList()
-        module.topology_count.zero_()
-        return
-
-    expected = set(range(len(index_sets[0])))
-    if any(indices != expected for indices in index_sets):
-        errorMessages.append(
-            f"{prefix[:-1]} has inconsistent dynamic adapter topology: "
-            f"A={sorted(index_sets[0])}, B={sorted(index_sets[1])}, "
-            f"alpha={sorted(index_sets[2])}")
-        return
-    if not marker_present:
-        errorMessages.append(
-            f"{prefix[:-1]} is missing required topology_count")
-        return
-    saved_count = int(torch.as_tensor(stateDict[topology_key]).item())
-    if saved_count != len(expected):
-        errorMessages.append(
-            f"{prefix[:-1]} topology_count={saved_count} does not match "
-            f"{len(expected)} saved adapter entries")
-        return
-
-    saved_shapes = []
-    for index in sorted(expected):
-        a_value = stateDict[f"{prefix}A_list.{index}"]
-        b_value = stateDict[f"{prefix}B_list.{index}"]
-        scale = stateDict[f"{prefix}alpha.{index}"]
-        if not shapeValidator(a_value, b_value, scale):
-            errorMessages.append(
-                f"{prefix[:-1]} dynamic adapter entry {index} has invalid shapes: "
-                f"A={tuple(a_value.shape)}, B={tuple(b_value.shape)}, "
-                f"alpha={tuple(scale.shape)}")
-            return
-        saved_shapes.append((int(a_value.size(0)), tuple(scale.shape)))
-
-    current_shapes = [
-        (int(a_value.size(0)), tuple(scale.shape))
-        for a_value, scale in zip(module.A_list, module.alpha)]
-    if current_shapes == saved_shapes:
-        module.topology_count.fill_(len(saved_shapes))
-        return
-
-    module.A_list = nn.ParameterList()
-    module.B_list = nn.ParameterList()
-    module.alpha = nn.ParameterList()
-    reference = (
-        module.target.weight
-        if hasattr(module, "target")
-        else module.anchor_)
-    for rank, scale_shape in saved_shapes:
-        scale = torch.zeros(
-            scale_shape,
-            device=reference.device,
-            dtype=reference.dtype)
-        module.Grow(rank, init={"scale": scale}, freezeOld=True)
-    module.topology_count.fill_(len(saved_shapes))
-
-
-class GrowableLoRAConv2d(nn.Module):
+class GrowableLoRAConv2d(DynamicAdapterTopologyMixin, nn.Module):
     def __init__(self, targetConv: nn.Conv2d):
         super().__init__()
-        self.target = targetConv 
+        # The target convolution is owned by PerceiveExtractor.  Keeping this
+        # as a non-registered reference prevents one tensor from appearing
+        # twice under patch_embed.* and patch_adapter.target.* in state_dict.
+        object.__setattr__(self, "target", targetConv)
         self.A_list = nn.ParameterList() 
         self.B_list = nn.ParameterList() 
         self.alpha = nn.ParameterList()
@@ -159,33 +73,16 @@ class GrowableLoRAConv2d(nn.Module):
         w = self.target.weight # [cout, cin, kh, kw]
         self.cout, self.cin, self.kh, self.kw = w.shape
 
-    def _load_from_state_dict(
+    def ValidateDynamicAdapterEntry(
         self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,):
-        SynchronizeDynamicAdapterTopology(
-            self,
-            state_dict,
-            prefix,
-            error_msgs,
-            lambda a, b, s: (
-                a.dim() == 2
-                and tuple(a.shape[1:]) == (self.cin * self.kh * self.kw,)
-                and tuple(b.shape) == (self.cout, int(a.size(0)))
-                and s.numel() == 1))
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs)
+        aValue: torch.Tensor,
+        bValue: torch.Tensor,
+        scale: torch.Tensor,) -> bool:
+        return (
+            aValue.dim() == 2
+            and tuple(aValue.shape[1:]) == (self.cin * self.kh * self.kw,)
+            and tuple(bValue.shape) == (self.cout, int(aValue.size(0)))
+            and scale.numel() == 1)
 
     @torch.no_grad()
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
@@ -233,7 +130,7 @@ class GrowableLoRAConv2d(nn.Module):
                         padding=self.target.padding, dilation=self.target.dilation, groups=self.target.groups)
 
 
-class GrowableConv1x1Adapter(AGICoreModule):
+class GrowableConv1x1Adapter(DynamicAdapterTopologyMixin, AGICoreModule):
     def __init__(self, channels: int):
         super().__init__()
         self.C = channels
@@ -245,33 +142,16 @@ class GrowableConv1x1Adapter(AGICoreModule):
             torch.zeros((), dtype=torch.int64),
             persistent=True)
 
-    def _load_from_state_dict(
+    def ValidateDynamicAdapterEntry(
         self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,):
-        SynchronizeDynamicAdapterTopology(
-            self,
-            state_dict,
-            prefix,
-            error_msgs,
-            lambda a, b, s: (
-                a.dim() == 4
-                and tuple(a.shape[1:]) == (self.C, 1, 1)
-                and tuple(b.shape) == (self.C, int(a.size(0)), 1, 1)
-                and s.numel() == 1))
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs)
+        aValue: torch.Tensor,
+        bValue: torch.Tensor,
+        scale: torch.Tensor,) -> bool:
+        return (
+            aValue.dim() == 4
+            and tuple(aValue.shape[1:]) == (self.C, 1, 1)
+            and tuple(bValue.shape) == (self.C, int(aValue.size(0)), 1, 1)
+            and scale.numel() == 1)
 
     @torch.no_grad()
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
@@ -306,7 +186,7 @@ class GrowableConv1x1Adapter(AGICoreModule):
         return y
 
 
-class GrowableTokenAdapter(AGICoreModule):
+class GrowableTokenAdapter(DynamicAdapterTopologyMixin, AGICoreModule):
     def __init__(self, dim: int):
         super().__init__()
         self.D = dim
@@ -318,33 +198,16 @@ class GrowableTokenAdapter(AGICoreModule):
             torch.zeros((), dtype=torch.int64),
             persistent=True)
 
-    def _load_from_state_dict(
+    def ValidateDynamicAdapterEntry(
         self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,):
-        SynchronizeDynamicAdapterTopology(
-            self,
-            state_dict,
-            prefix,
-            error_msgs,
-            lambda a, b, s: (
-                a.dim() == 2
-                and tuple(a.shape[1:]) == (self.D,)
-                and tuple(b.shape) == (self.D, int(a.size(0)))
-                and s.numel() == 1))
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs)
+        aValue: torch.Tensor,
+        bValue: torch.Tensor,
+        scale: torch.Tensor,) -> bool:
+        return (
+            aValue.dim() == 2
+            and tuple(aValue.shape[1:]) == (self.D,)
+            and tuple(bValue.shape) == (self.D, int(aValue.size(0)))
+            and scale.numel() == 1)
 
     @torch.no_grad()
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
@@ -408,7 +271,8 @@ class SheafGaugeConv2d(nn.Conv2d):
         self.sheaf_gain_h = nn.Parameter(torch.ones(in_channels, **factory))
         self.sheaf_gain_v = nn.Parameter(torch.ones(in_channels, **factory))
 
-        assert in_channels % gauge_groups == 0, "gauge_groups must be divisible by in_channels"
+        assert in_channels % gauge_groups == 0, (
+            "in_channels must be divisible by gauge_groups")
         self.gauge_gamma = nn.Conv2d(in_channels, in_channels, kernel_size=1, groups=gauge_groups, bias=True, **factory)
         self.gauge_beta = nn.Conv2d(in_channels, in_channels, kernel_size=1, groups=gauge_groups, bias=True, **factory)
 
@@ -559,9 +423,6 @@ class HebbianConv2d(AGICoreModule):
         self._hebbian_update_step = 0
         self.finite_diagnostics = bool(finiteDiagnostics)
 
-        # Per-batch plasticity is transient runtime state. Keeping it out of
-        # state_dict prevents deployment artifacts from scaling with batch and
-        # spatial kernel size while leaving learned convolution weights intact.
         self.register_buffer("hebb_memory", torch.empty(0), persistent=False)
 
     def _load_from_state_dict(
@@ -586,31 +447,25 @@ class HebbianConv2d(AGICoreModule):
     def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
         with torch.no_grad():
             if doneMask is not None and self.hebb_memory.numel() > 0:
-                mask = torch.as_tensor(
-                    doneMask,
-                    device=self.hebb_memory.device,
-                    dtype=torch.bool).view(-1)
+                mask = doneMask.view(-1)
                 if int(mask.numel()) != int(self.hebb_memory.size(0)):
                     raise ValueError("doneMask batch size must match Hebbian convolution memory")
                 self.hebb_memory[mask] = 0
+                if bool(mask.all().item()):
+                    self._hebbian_update_step = 0
                 return
-            self.hebb_memory = torch.empty(0, device=self.device, dtype=self.dtype)
+            self.hebb_memory.zero_()
             self._hebbian_update_step = 0
 
     def SetHebbianUpdatePeriod(self, period: int) -> None:
         self.hebbian_update_period = max(1, int(period))
         self._hebbian_update_step = 0
 
-    def EnsureB(self, B: int, device, dtype):
+    def EnsureB(self, B: int):
         w = self.conv.weight
-        target_shape = (B, w.size(0), w.size(1), w.size(2), w.size(3)) 
-        if (
-            self.hebb_memory.numel() == 0
-            or tuple(self.hebb_memory.shape) != target_shape
-            or self.hebb_memory.device != device
-            or self.hebb_memory.dtype != dtype
-        ):
-            self.hebb_memory = torch.zeros(*target_shape, device=device, dtype=dtype)
+        if self.hebb_memory.size(0) != B:
+            self.hebb_memory = w.new_zeros(B, *w.shape)
+            self._hebbian_update_step = 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.use_hebbian:
@@ -622,46 +477,31 @@ class HebbianConv2d(AGICoreModule):
         g = self.groups
         in_per_g = inC // g
 
-        memory_shape = (B, w.size(0), w.size(1), w.size(2), w.size(3))
-        has_compatible_memory = (
-            self.hebb_memory.numel() > 0
-            and tuple(self.hebb_memory.shape) == memory_shape
-            and self.hebb_memory.device == x.device
-            and self.hebb_memory.dtype == x.dtype)
-        if not has_compatible_memory:
-            # A zero Hebbian correction is exactly the native convolution.  Keep
-            # the first/reset frame on the vendor-optimized kernel, then update
-            # the newly allocated memory from that result below.
-            out = self.conv(x)
-            self.EnsureB(B, x.device, x.dtype)
-        else:
-            w_eff = w.unsqueeze(0) + self.apply_scale * self.hebb_memory.detach()
-            x_big = x.reshape(1, B * inC, H, W)
-            w_big = w_eff.reshape(
-                B * outC,
-                w.size(1),
-                w.size(2),
-                w.size(3))
-            groups_total = B * g
-            b_big = (
-                None
-                if self.conv.bias is None
-                else self.conv.bias.repeat(B))
-            out_big = F.conv2d(
-                x_big,
-                w_big,
-                b_big,
-                stride=self.stride,
-                padding=self.padding,
-                dilation=self.dilation,
-                groups=groups_total,)
-            Hout, Wout = out_big.shape[-2], out_big.shape[-1]
-            out = out_big.reshape(B, outC, Hout, Wout)
+        w_eff = w.unsqueeze(0) + self.apply_scale * self.hebb_memory.detach()
+        x_big = x.reshape(1, B * inC, H, W)
+        w_big = w_eff.reshape(
+            B * outC,
+            w.size(1),
+            w.size(2),
+            w.size(3))
+        groups_total = B * g
+        b_big = (
+            None
+            if self.conv.bias is None
+            else self.conv.bias.repeat(B))
+        out_big = F.conv2d(
+            x_big,
+            w_big,
+            b_big,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=groups_total,)
+        Hout, Wout = out_big.shape[-2], out_big.shape[-1]
+        out = out_big.reshape(B, outC, Hout, Wout)
         if self.finite_diagnostics and not bool(torch.isfinite(out).all().item()):
             raise FloatingPointError("Hebbian convolution produced non-finite output")
 
-        # ``use_hebbian`` is the online-plasticity contract.  Deployment calls
-        # eval() for dropout/norm semantics but still expects this state update.
         should_update = (
             self._hebbian_update_step % self.hebbian_update_period == 0)
         self._hebbian_update_step += 1
@@ -723,7 +563,10 @@ class HebbianLinear(AGICoreModule):
         self.use_bias = bool(bias)
 
         self.weight = nn.Parameter(torch.randn(outFeatures, inFeatures) * 0.01)
-        self.bias = nn.Parameter(torch.zeros(outFeatures))
+        self.bias = (
+            nn.Parameter(torch.zeros(outFeatures))
+            if self.use_bias
+            else None)
 
         self.hebb_rate = float(hebbRate)
         self.ema_alpha = float(emaMomentum)
@@ -760,29 +603,25 @@ class HebbianLinear(AGICoreModule):
     def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
         with torch.no_grad():
             if doneMask is not None and self.hebb_memory.numel() > 0:
-                mask = torch.as_tensor(
-                    doneMask,
-                    device=self.hebb_memory.device,
-                    dtype=torch.bool).view(-1)
+                mask = doneMask.view(-1)
                 if int(mask.numel()) != int(self.hebb_memory.size(0)):
                     raise ValueError("doneMask batch size must match Hebbian linear memory")
                 self.hebb_memory[mask] = 0
+                if bool(mask.all().item()):
+                    self._hebbian_update_step = 0
                 return
-            self.hebb_memory = torch.empty(0, device=self.device, dtype=self.dtype)
+            self.hebb_memory.zero_()
             self._hebbian_update_step = 0
 
     def SetHebbianUpdatePeriod(self, period: int) -> None:
         self.hebbian_update_period = max(1, int(period))
         self._hebbian_update_step = 0
 
-    def EnsureB(self, B: int, device, dtype):
-        if (
-            self.hebb_memory.numel() == 0
-            or tuple(self.hebb_memory.shape) != (B, self.outFeatures, self.inFeatures)
-            or self.hebb_memory.device != device
-            or self.hebb_memory.dtype != dtype
-        ):
-            self.hebb_memory = torch.zeros(B, self.outFeatures, self.inFeatures, device=device, dtype=dtype)
+    def EnsureB(self, B: int):
+        if self.hebb_memory.size(0) != B:
+            self.hebb_memory = self.weight.new_zeros(
+                B, self.outFeatures, self.inFeatures)
+            self._hebbian_update_step = 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.size(0)
@@ -796,23 +635,13 @@ class HebbianLinear(AGICoreModule):
             return (y - mean) / torch.sqrt(var + 1e-5)
 
         x2 = x.reshape(B, -1, self.inFeatures)  
-        memory_shape = (B, self.outFeatures, self.inFeatures)
-        has_compatible_memory = (
-            self.hebb_memory.numel() > 0
-            and tuple(self.hebb_memory.shape) == memory_shape
-            and self.hebb_memory.device == x.device
-            and self.hebb_memory.dtype == x.dtype)
-        if not has_compatible_memory:
-            y = F.linear(x, self.weight, self.bias if self.use_bias else None)
-            self.EnsureB(B, x.device, x.dtype)
-        else:
-            w_eff = (
-                self.weight.unsqueeze(0)
-                + self.apply_scale * self.hebb_memory.detach())
-            y2 = torch.einsum("bni,boi->bno", x2, w_eff)
-            if self.use_bias:
-                y2 = y2 + self.bias.view(1, 1, -1)
-            y = y2.view(*x.shape[:-1], self.outFeatures)
+        w_eff = (
+            self.weight.unsqueeze(0)
+            + self.apply_scale * self.hebb_memory.detach())
+        y2 = torch.einsum("bni,boi->bno", x2, w_eff)
+        if self.use_bias:
+            y2 = y2 + self.bias.view(1, 1, -1)
+        y = y2.view(*x.shape[:-1], self.outFeatures)
 
         if self.normalize:
             mean = y.mean(dim=-1, keepdim=True)
@@ -1054,9 +883,17 @@ class ResidualBlock(AGICoreModule):
     def __init__(self, inChannels: int, outChannels: int, stride: int = 1, useHebbian: bool = False):
         super().__init__()
         self.use_downsample = bool(stride != 1 or inChannels != outChannels)
-        self.downsample = nn.Sequential(
-            nn.Conv2d(inChannels, outChannels, kernel_size=1, stride=stride, bias=False),
-            Norm2d(outChannels))
+        self.downsample = (
+            nn.Sequential(
+                nn.Conv2d(
+                    inChannels,
+                    outChannels,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False),
+                Norm2d(outChannels))
+            if self.use_downsample
+            else nn.Identity())
             
         self.conv1 = HebbianConv2d(inChannels, outChannels, 3, stride=stride, padding=1,bias=False, useHebbian=useHebbian)
         self.bn1 = Norm2d(outChannels)
@@ -1065,7 +902,7 @@ class ResidualBlock(AGICoreModule):
         self.relu = nn.SiLU() 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = self.downsample(x) if self.use_downsample else x
+        identity = self.downsample(x)
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out = out + identity
@@ -1125,6 +962,11 @@ class CorticalEarlyVision(AGICoreModule):
         self.orientations = int(orientations)
         self.kernel_size = int(kernelSize)
         self.eps = 1e-6
+        # The same quadrature bank is evaluated as a stationary dyadic filter
+        # bank on the half-resolution cortical lattice (effective RGB
+        # wavelengths are wavelength * 2 * scale).  No scale is decimated, so
+        # phase comparisons refer to the same retinal sample at every scale.
+        self.frequency_scales = (1.0, 2.0, 4.0)
 
         even, odd = self.BuildGaborBank(
             self.orientations,
@@ -1142,6 +984,25 @@ class CorticalEarlyVision(AGICoreModule):
             "anti_alias_kernel",
             self.BinomialKernel(),
             persistent=True)
+        self.register_buffer(
+            "scale_response_calibration",
+            self.BuildScaleResponseCalibration(
+                self.orientations,
+                self.frequency_scales,
+                float(wavelength)),
+            persistent=False)
+        orientation_phase = (
+            2.0 * math.pi
+            * torch.arange(self.orientations, dtype=torch.float32)
+            / float(self.orientations))
+        self.register_buffer(
+            "orientation_cosine",
+            orientation_phase.cos().view(1, self.orientations, 1, 1),
+            persistent=False)
+        self.register_buffer(
+            "orientation_sine",
+            orientation_phase.sin().view(1, self.orientations, 1, 1),
+            persistent=False)
         collinear, surround = self.BuildContourKernels(
             self.orientations,
             kernelSize=7)
@@ -1151,6 +1012,11 @@ class CorticalEarlyVision(AGICoreModule):
         self.divisive_bias_raw = nn.Parameter(torch.tensor(-2.0))
         self.collinear_gain_raw = nn.Parameter(torch.tensor(-1.0))
         self.surround_gain_raw = nn.Parameter(torch.tensor(-1.0))
+        self.spectral_scale_logits = nn.Parameter(torch.zeros(
+            len(self.frequency_scales)))
+        self.phase_congruency_gain_raw = nn.Parameter(torch.tensor(-2.0))
+        self.fast_decay_raw = nn.Parameter(torch.tensor(0.0))
+        self.slow_gap_raw = nn.Parameter(torch.tensor(math.log(4.0)))
         self.diffusion = StableAnisotropicDiffusion(iterations=1)
         self.feature_projection = nn.Sequential(
             nn.Conv2d(self.orientations * 2, int(outChannels), kernel_size=1, bias=False),
@@ -1239,9 +1105,202 @@ class CorticalEarlyVision(AGICoreModule):
             torch.stack(surround_bank).unsqueeze(1))
 
     def AntiAliasDownsample(self, value: torch.Tensor, groups: int = 1) -> torch.Tensor:
-        kernel = self.anti_alias_kernel.to(value.dtype).expand(groups, 1, -1, -1)
+        kernel = self.anti_alias_kernel.expand(groups, 1, -1, -1)
         value = F.pad(value, (2, 2, 2, 2), mode="replicate")
         return F.conv2d(value, kernel, stride=2, groups=groups)
+
+    @staticmethod
+    def BuildScaleResponseCalibration(
+        orientations: int,
+        frequencyScales: Tuple[float, ...],
+        wavelength: float,
+        ) -> torch.Tensor:
+        """Equalize the preferred-frequency gain of the stationary scales."""
+        calibration = []
+        for scale_value in frequencyScales:
+            scale = int(scale_value)
+            angular_frequency = 2.0 * math.pi / (float(wavelength) * scale)
+            orientation_gain = []
+            for index in range(int(orientations)):
+                theta = math.pi * float(index) / float(orientations)
+                smoothing_gain = 1.0
+                dilation = 1
+                while dilation < scale:
+                    # The centred five-tap binomial response is cos(w/2)^4.
+                    frequency_x = (
+                        angular_frequency * math.cos(theta) * dilation)
+                    frequency_y = (
+                        angular_frequency * math.sin(theta) * dilation)
+                    smoothing_gain *= math.cos(0.5 * frequency_x) ** 4
+                    smoothing_gain *= math.cos(0.5 * frequency_y) ** 4
+                    dilation *= 2
+                orientation_gain.append(1.0 / smoothing_gain)
+            calibration.append(orientation_gain + orientation_gain)
+        return torch.tensor(calibration).view(
+            1,
+            len(frequencyScales),
+            2 * int(orientations),
+            1,
+            1)
+
+    def MultiscaleQuadrature(
+        self,
+        luminance: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # A stationary (undecimated) binomial pyramid preserves translation
+        # phase while progressively removing frequencies that would alias in
+        # the coarser dilated Gabor filters.
+        levels = [luminance]
+        smoothed = luminance
+        smoothing_dilation = 1
+        for _ in range(1, len(self.frequency_scales)):
+            smoothing_padding = 2 * smoothing_dilation
+            smoothed = F.conv2d(
+                F.pad(
+                    smoothed,
+                    (
+                        smoothing_padding,
+                        smoothing_padding,
+                        smoothing_padding,
+                        smoothing_padding),
+                    mode="replicate"),
+                self.anti_alias_kernel,
+                dilation=smoothing_dilation)
+            levels.append(smoothed)
+            smoothing_dilation *= 2
+
+        responses = []
+        for level, scale in zip(levels, self.frequency_scales):
+            dilation = int(scale)
+            padding = (self.kernel_size // 2) * dilation
+            response = F.conv2d(
+                F.pad(
+                    level,
+                    (padding, padding, padding, padding),
+                    mode="replicate"),
+                self.gabor_quadrature,
+                dilation=dilation)
+            responses.append(response)
+        response_stack = (
+            torch.stack(responses, dim=1)
+            * self.scale_response_calibration)
+        return response_stack.chunk(2, dim=2)
+
+    def QuadratureAmplitude(
+        self,
+        real: torch.Tensor,
+        imaginary: torch.Tensor,
+        ) -> torch.Tensor:
+        # Construct and square-root epsilon in the response dtype.  Subtracting
+        # Python sqrt(eps) leaves a false non-zero floor in pure FP16 because
+        # eps itself is quantized before the tensor square root.
+        epsilon = real.new_full((), self.eps)
+        if real.dtype in (torch.float16, torch.bfloat16):
+            real_work = real.float()
+            imaginary_work = imaginary.float()
+            epsilon_work = epsilon.float()
+            return (
+                torch.sqrt(
+                    real_work.square()
+                    + imaginary_work.square()
+                    + epsilon_work)
+                - torch.sqrt(epsilon_work)
+            ).clamp_min(0.0).to(dtype=real.dtype)
+        return (
+            torch.sqrt(
+                real.square() + imaginary.square() + epsilon)
+            - torch.sqrt(epsilon)
+        ).clamp_min(0.0)
+
+    def StablePositiveRatio(
+        self,
+        numerator: torch.Tensor,
+        denominator: torch.Tensor,
+        ) -> torch.Tensor:
+        # FP16 division backward overflows/underflows around 1e-6, while BF16
+        # loses the unit upper bound through coarse rounding.  Use a
+        # representable noise floor and perform only this quotient in FP32;
+        # gradients stay bounded and the result returns to the model dtype.
+        denominator_floor = max(
+            self.eps,
+            float(torch.finfo(denominator.dtype).tiny))
+        if denominator.dtype in (torch.float16, torch.bfloat16):
+            # The entropy derivative contributes |log(eps)| on top of the
+            # reciprocal.  sqrt(eps) is also the quadrature amplitude's own
+            # noise floor and keeps that combined gradient representable.
+            denominator_floor = max(
+                denominator_floor,
+                math.sqrt(self.eps))
+            ratio = (
+                numerator.float()
+                / denominator.float().clamp_min(denominator_floor)
+            ).to(dtype=numerator.dtype)
+        else:
+            ratio = numerator / denominator.clamp_min(denominator_floor)
+        # Every caller divides one non-negative component/magnitude by its
+        # corresponding total.  Unit range is part of that statistic's
+        # definition; low-precision rounding can otherwise yield > 1.
+        return ratio.clamp(max=1.0)
+
+    def MultiscalePhaseStatistics(
+        self,
+        even: torch.Tensor,
+        odd: torch.Tensor,
+        energy: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Phase agreement must remain genuinely multi-scale.  Learned scale
+        # weights are used for feature energy below, but not here: if a
+        # softmax collapses to one scale, every non-zero signal has a false
+        # phase-congruency score of exactly one.
+        phase_real = even.mean(dim=1)
+        phase_imag = odd.mean(dim=1)
+        phase_denominator = energy.mean(dim=1)
+        phase_magnitude = self.QuadratureAmplitude(
+            phase_real,
+            phase_imag)
+        phase_congruency = self.StablePositiveRatio(
+            phase_magnitude,
+            phase_denominator)
+
+        # Entropy across the three scale energies measures local frequency
+        # spread.  It is distinct from the frame-level FFT statistic used by
+        # QualityToken.
+        spectral_probability = self.StablePositiveRatio(
+            energy,
+            energy.sum(dim=1, keepdim=True))
+        scale_entropy = -(
+            spectral_probability
+            * spectral_probability.clamp_min(self.eps).log()
+        ).sum(dim=1) / math.log(float(len(self.frequency_scales)))
+        return phase_congruency, scale_entropy
+
+    def OrientationCoherence(self, energy: torch.Tensor) -> torch.Tensor:
+        # Gabor orientations are pi-periodic, hence the doubled-angle circular
+        # mean.  Coherent contours approach one; isotropic noise approaches
+        # zero.  This is a reliability term, not an object/existence mask.
+        orientation_energy = energy.mean(dim=1)
+        phase_real = (
+            orientation_energy * self.orientation_cosine).sum(
+                dim=1,
+                keepdim=True)
+        phase_imag = (
+            orientation_energy * self.orientation_sine).sum(
+                dim=1,
+                keepdim=True)
+        phase_magnitude = self.QuadratureAmplitude(
+            phase_real,
+            phase_imag)
+        total_energy = orientation_energy.sum(dim=1, keepdim=True)
+        return self.StablePositiveRatio(
+            phase_magnitude,
+            total_energy)
+
+    def FastDecay(self) -> torch.Tensor:
+        return torch.sigmoid(self.fast_decay_raw)
+
+    def SlowDecay(self) -> torch.Tensor:
+        fast = self.FastDecay()
+        return fast + (1.0 - fast) * torch.sigmoid(self.slow_gap_raw)
 
     def forward(
         self,
@@ -1255,25 +1314,37 @@ class CorticalEarlyVision(AGICoreModule):
             + 0.7152 * frame[:, 1:2]
             + 0.0722 * frame[:, 2:3])
         luminance = self.AntiAliasDownsample(luminance)
-        padding = self.kernel_size // 2
-        luminance_pad = F.pad(
-            luminance,
-            (padding, padding, padding, padding),
-            mode="replicate")
-        quadrature = F.conv2d(
-            luminance_pad,
-            self.gabor_quadrature.to(frame.dtype))
-        even, odd = quadrature.chunk(2, dim=1)
-        energy = torch.sqrt(even.square() + odd.square() + self.eps)
+        even, odd = self.MultiscaleQuadrature(luminance)
+        energy = self.QuadratureAmplitude(even, odd)
+
+        scale_prior = F.softmax(
+            self.spectral_scale_logits,
+            dim=0).view(1, -1, 1, 1, 1)
+        orientation_energy = (scale_prior * energy).sum(dim=1)
+        cortical_energy = orientation_energy
+        phase_congruency, scale_entropy = self.MultiscalePhaseStatistics(
+            even,
+            odd,
+            energy)
+        orientation_coherence = self.OrientationCoherence(energy)
+        spectral_structure = (
+            phase_congruency
+            * scale_entropy
+            * orientation_coherence)
+        orientation_energy = orientation_energy * (
+            1.0
+            + torch.sigmoid(self.phase_congruency_gain_raw)
+            * spectral_structure)
+
         orientation_pool = F.avg_pool2d(
             F.pad(
-                energy.mean(dim=1, keepdim=True),
+                orientation_energy.mean(dim=1, keepdim=True),
                 (2, 2, 2, 2),
                 mode="replicate"),
             kernel_size=5,
             stride=1)
         divisive_bias = F.softplus(self.divisive_bias_raw).to(frame.dtype) + self.eps
-        normalized = energy / (divisive_bias + orientation_pool)
+        normalized = orientation_energy / (divisive_bias + orientation_pool)
         normalized = self.diffusion(normalized)
 
         normalized_pad = F.pad(normalized, (3, 3, 3, 3), mode="replicate")
@@ -1309,13 +1380,15 @@ class CorticalEarlyVision(AGICoreModule):
             previous_slow = previousSlow.detach().to(dtype=current.dtype)
             valid = previousValid
             valid = valid.view(-1, 1, 1, 1)
+            fast_decay = self.FastDecay()
+            slow_decay = self.SlowDecay()
             fast = torch.where(
                 valid,
-                0.5 * previous_fast + 0.5 * current,
+                fast_decay * previous_fast + (1.0 - fast_decay) * current,
                 current)
             slow = torch.where(
                 valid,
-                0.9 * previous_slow + 0.1 * current,
+                slow_decay * previous_slow + (1.0 - slow_decay) * current,
                 current)
         else:
             fast = current
@@ -1323,7 +1396,7 @@ class CorticalEarlyVision(AGICoreModule):
         temporal_response = fast - slow
         feature = self.feature_projection(torch.cat([current, temporal_response], dim=1))
         raw_energy = self.AntiAliasDownsample(
-            energy.mean(dim=1, keepdim=True))
+            cortical_energy.mean(dim=1, keepdim=True))
         return feature, {
             "CorticalFastState": fast.detach(),
             "CorticalSlowState": slow.detach(),
@@ -1340,7 +1413,7 @@ class PerceptionEnhancementBlock(AGICoreModule):
     def __init__(self, stemChannels: int):
         super().__init__()
         self.early_vision = CorticalEarlyVision(outChannels=int(stemChannels))
-        self.residual_gain = nn.Parameter(torch.tensor(0.0))
+        self.residual_gain = nn.Parameter(torch.tensor(0.05))
 
     def forward(
         self,
@@ -2139,7 +2212,7 @@ class PerceiveExtractor(AGICoreModule):
         self.patch_aggregator = nn.Sequential(
             nn.Linear(embedDim, embedDim // 4, bias= True),
             nn.SiLU(),
-            nn.Linear(embedDim // 4, 1, bias=True))
+            nn.Linear(embedDim // 4, 1, bias=False))
 
         self.cortical_proj = nn.Sequential(
             nn.LayerNorm(self.integrated_dim),
@@ -2178,7 +2251,7 @@ class PerceiveExtractor(AGICoreModule):
             nn.LayerNorm(embedDim))
 
         self.quality_proj = nn.Sequential(
-            nn.Linear(4, embedDim),
+            nn.Linear(5, embedDim),
             nn.LayerNorm(embedDim),
             nn.SiLU(),
             nn.Linear(embedDim, embedDim),
@@ -2202,6 +2275,15 @@ class PerceiveExtractor(AGICoreModule):
         self.object_queries = nn.Parameter(torch.randn(self.object_token_count, embedDim) * 0.02)
         self.object_key = nn.Linear(embedDim, embedDim)
         self.object_value = nn.Linear(embedDim, embedDim)
+        self.object_geometry_key = nn.Sequential(
+            nn.LayerNorm(6),
+            nn.Linear(6, embedDim),
+            nn.GELU(),
+            nn.Linear(embedDim, embedDim, bias=False))
+        self.object_geometry_assignment_gain = nn.Parameter(
+            torch.tensor(0.1))
+        self.object_competition_raw = nn.Parameter(
+            torch.tensor(-math.log(4.0)))
         self.object_post = nn.Sequential(
             nn.LayerNorm(embedDim),
             nn.Linear(embedDim, embedDim),
@@ -2212,6 +2294,20 @@ class PerceiveExtractor(AGICoreModule):
             nn.Linear(6, embedDim),
             nn.GELU(),
             nn.Linear(embedDim, embedDim))
+        self.object_relation_norm1 = nn.LayerNorm(embedDim)
+        self.object_relation_attention = nn.MultiheadAttention(
+            embedDim,
+            numHeads,
+            dropout=dropout,
+            batch_first=True)
+        self.object_relation_norm2 = nn.LayerNorm(embedDim)
+        self.object_relation_ff = nn.Sequential(
+            nn.Linear(embedDim, embedDim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embedDim * 2, embedDim))
+        self.object_relation_output_norm = nn.LayerNorm(embedDim)
+        self.object_relation_gain = nn.Parameter(torch.tensor(0.05))
 
         self.temporal_state = nn.GRUCell(self.integrated_dim, self.integrated_dim)
         self.temporal_norm = nn.LayerNorm(self.integrated_dim)
@@ -2328,6 +2424,14 @@ class PerceiveExtractor(AGICoreModule):
             self.ConfigureEdgeDeploymentHebbian(updatePeriod=4)
             self._jetson_auto_edge_policy = True
 
+    def EnsureB(self, B: int) -> None:
+        for module in self.modules():
+            if (
+                isinstance(module, (HebbianConv2d, HebbianLinear))
+                and module.use_hebbian
+            ):
+                module.EnsureB(B)
+
     def BuildAugmentedPyramid(
         self,
         frame: torch.Tensor,
@@ -2418,6 +2522,74 @@ class PerceiveExtractor(AGICoreModule):
         return patchMap + torch.tanh(
             self.patch_content_gain).to(patchMap.dtype) * content
 
+    @staticmethod
+    def SpatialFrequencyEntropy(
+        x: torch.Tensor,
+        bandCount: int = 8,
+        maxResolution: int = 64,
+        ) -> torch.Tensor:
+        if int(bandCount) <= 1:
+            return x.new_zeros(int(x.size(0)))
+        luminance = (
+            0.2126 * x[:, 0:1]
+            + 0.7152 * x[:, 1:2]
+            + 0.0722 * x[:, 2:3])
+        target_size = (
+            min(int(luminance.size(-2)), int(maxResolution)),
+            min(int(luminance.size(-1)), int(maxResolution)))
+        if tuple(luminance.shape[-2:]) != target_size:
+            luminance = F.adaptive_avg_pool2d(luminance, target_size)
+
+        signal = luminance.float()
+        signal = signal - signal.mean(dim=(-2, -1), keepdim=True)
+        spectrum = torch.fft.rfft2(signal, norm="ortho")
+        power = spectrum.real.square() + spectrum.imag.square()
+        height = int(signal.size(-2))
+        width = int(signal.size(-1))
+        if height == 1 and width == 1:
+            return x.new_zeros(int(signal.size(0)))
+        fy = torch.fft.fftfreq(
+            height,
+            device=signal.device,
+            dtype=signal.dtype)
+        fx = torch.fft.rfftfreq(
+            width,
+            device=signal.device,
+            dtype=signal.dtype)
+        radius = torch.sqrt(
+            fy.view(-1, 1).square() + fx.view(1, -1).square())
+        frequency_mask = radius > 0.0
+        radius_values = radius[frequency_mask]
+        min_radius = radius_values.amin()
+        max_radius = radius_values.amax()
+        log_radius = torch.log(radius_values / min_radius)
+        log_span = torch.log(max_radius / min_radius).clamp_min(1e-6)
+        band_index = torch.floor(
+            log_radius / log_span * float(bandCount)
+        ).to(torch.long).clamp(max=int(bandCount) - 1)
+
+        batch = int(signal.size(0))
+        selected_power = power[:, 0, frequency_mask]
+        expanded_index = band_index.view(1, -1).expand(batch, -1)
+        band_power = signal.new_zeros(batch, int(bandCount))
+        band_power.scatter_add_(1, expanded_index, selected_power)
+        band_count = signal.new_zeros(int(bandCount))
+        band_count.scatter_add_(
+            0,
+            band_index,
+            torch.ones_like(radius_values))
+        mean_band_power = band_power / band_count.clamp_min(1.0).view(1, -1)
+        total_power = mean_band_power.sum(dim=-1, keepdim=True)
+        probability = mean_band_power / total_power.clamp_min(1e-12)
+        entropy = -(
+            probability * probability.clamp_min(1e-12).log()
+        ).sum(dim=-1) / math.log(float(bandCount))
+        entropy = torch.where(
+            total_power.squeeze(-1) > 1e-12,
+            entropy,
+            torch.zeros_like(entropy))
+        return entropy.to(dtype=x.dtype)
+
     def QualityStats(self, x: torch.Tensor) -> torch.Tensor:
         x_det = x.detach()
         mean = x_det.mean(dim=(1, 2, 3))
@@ -2426,7 +2598,13 @@ class PerceiveExtractor(AGICoreModule):
         gy = (x_det[..., 1:, :] - x_det[..., :-1, :]).abs().mean(dim=(1, 2, 3))
         grad = 0.5 * (gx + gy)
         clipped = ((x_det <= 0.01) | (x_det >= 0.99)).to(x_det.dtype).mean(dim=(1, 2, 3))
-        return torch.stack([mean, std, grad, clipped], dim=-1)
+        spectral_entropy = self.SpatialFrequencyEntropy(x_det)
+        return torch.stack([
+            mean,
+            std,
+            grad,
+            clipped,
+            spectral_entropy], dim=-1)
 
     def BuildDepthAttentionBias(
         self,
@@ -2623,17 +2801,68 @@ class PerceiveExtractor(AGICoreModule):
         patchTokens: torch.Tensor,
         patchGeometry: torch.Tensor,
         patchCoordinateValid: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        B, _, D = patchTokens.shape
-        k = self.object_key(patchTokens)
+        _, _, D = patchTokens.shape
+        k = F.normalize(
+            self.object_key(patchTokens),
+            dim=-1,
+            eps=1e-6)
         v = self.object_value(patchTokens)
-        q = self.object_queries
-        scores = torch.einsum("kd,bnd->bkn", q, k) / max(float(D) ** 0.5, 1.0)
-        weights = F.softmax(scores, dim=-1)
+        q = F.normalize(self.object_queries, dim=-1, eps=1e-6)
+        score_scale = max(float(D) ** 0.5, 1.0)
+        scores = torch.einsum("kd,bnd->bkn", q, k) * score_scale
+
+        geometry_reliability = patchCoordinateValid.detach()
+        geometry_center = (
+            patchGeometry[..., :3] * geometry_reliability
+        ).sum(dim=1, keepdim=True) / geometry_reliability.sum(
+            dim=1,
+            keepdim=True).clamp_min(1e-6)
+        assignment_geometry = torch.cat([
+            patchGeometry[..., :3] - geometry_center,
+            patchGeometry[..., 3:],
+        ], dim=-1)
+        geometry_key = F.normalize(
+            self.object_geometry_key(assignment_geometry),
+            dim=-1,
+            eps=1e-6)
+        geometry_scores = torch.einsum(
+            "kd,bnd->bkn",
+            q,
+            geometry_key) * score_scale
+        scores = scores + torch.tanh(
+            self.object_geometry_assignment_gain
+        ) * geometry_scores * geometry_reliability.squeeze(-1).unsqueeze(1)
+
+        content_weights = F.softmax(scores, dim=-1)
+        slot_competition = F.softmax(scores, dim=1) * float(
+            self.object_token_count)
+        competition_gain = torch.sigmoid(self.object_competition_raw)
+        weights = content_weights * (
+            (1.0 - competition_gain)
+            + competition_gain * slot_competition)
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
         tokens = torch.einsum("bkn,bnd->bkd", weights, v)
         object_geometry = torch.einsum("bkn,bnd->bkd", weights, patchGeometry)
-        tokens = tokens + self.object_geometry_proj(object_geometry)
         object_valid = torch.einsum("bkn,bnd->bkd", weights, patchCoordinateValid)
-        return self.object_post(tokens), object_geometry, object_valid, weights
+        tokens = tokens + object_valid.detach() * self.object_geometry_proj(
+            object_geometry)
+        tokens = self.object_post(tokens)
+
+        # object_valid measures coordinate observability, not object existence;
+        # appearance-only slots must remain able to exchange relation messages.
+        relation_input = self.object_relation_norm1(tokens)
+        relation, _ = self.object_relation_attention(
+            relation_input,
+            relation_input,
+            relation_input,
+            need_weights=False)
+        relation_gain = torch.tanh(self.object_relation_gain)
+        tokens = tokens + relation_gain * relation
+        tokens = tokens + relation_gain * self.object_relation_ff(
+            self.object_relation_norm2(tokens))
+        tokens = self.object_relation_output_norm(tokens)
+        return tokens, object_geometry, object_valid, weights
 
     def BuildMotionSummary(
         self,
@@ -2799,6 +3028,24 @@ class PerceiveExtractor(AGICoreModule):
 
     def CameraIntrinsicsReferenceSize(self) -> Tuple[int, int]:
         return self.intrinsics_reference_size
+
+    @staticmethod
+    def ValidatePreviousVisualMask(
+        frame: torch.Tensor,
+        prevVisualValid: torch.Tensor,
+        ) -> None:
+        batch_size = int(frame.size(0))
+        if prevVisualValid.dtype != torch.bool:
+            raise TypeError(
+                f"prevVisualValid must be bool, got {prevVisualValid.dtype}")
+        if tuple(prevVisualValid.shape) != (batch_size,):
+            raise ValueError(
+                f"prevVisualValid must have shape ({batch_size},), "
+                f"got {tuple(prevVisualValid.shape)}")
+        if prevVisualValid.device != frame.device:
+            raise ValueError(
+                f"prevVisualValid must be on {frame.device}, "
+                f"got {prevVisualValid.device}")
 
     def AssembleVisualState(
         self,
@@ -2967,8 +3214,12 @@ class PerceiveExtractor(AGICoreModule):
         position_residual_camera = semantic_nodes.pop(
             "position_residual_camera")
         orientation_camera = semantic_nodes.pop("orientation_camera")
-        semantic_nodes["pose_camera"] = torch.cat([
+        object_geometry = torch.cat([
             object_geometry[..., :3] + position_residual_camera,
+            object_geometry[..., 3:],
+        ], dim=-1)
+        semantic_nodes["pose_camera"] = torch.cat([
+            object_geometry[..., :3],
             orientation_camera], dim=-1)
         topology_auxiliary = {
             name: value if name == "WarpFoldPenalty" else value.detach()
@@ -3017,17 +3268,9 @@ class PerceiveExtractor(AGICoreModule):
         # x: [B, 3, H, W]
         frame = x
         batch_size = int(frame.size(0))
-        if prevVisualValid.dtype != torch.bool:
-            raise TypeError(
-                f"prevVisualValid must be bool, got {prevVisualValid.dtype}")
-        if tuple(prevVisualValid.shape) != (batch_size,):
-            raise ValueError(
-                f"prevVisualValid must have shape ({batch_size},), "
-                f"got {tuple(prevVisualValid.shape)}")
-        if prevVisualValid.device != frame.device:
-            raise ValueError(
-                f"prevVisualValid must be on {frame.device}, got {prevVisualValid.device}")
+        self.ValidatePreviousVisualMask(frame, prevVisualValid)
         self.MaybeConfigureJetsonEdgeHebbian(frame)
+        self.EnsureB(batch_size)
         pyramid, enhancement_auxiliary = self.BuildAugmentedPyramid(
             frame,
             prevVisualState,
@@ -3154,12 +3397,9 @@ class PerceiveExtractor(AGICoreModule):
                     nn.init.zeros_(m.bias)
 
     def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
-        for m in self.modules(): 
-            if m is self:
-                continue
-            
-            if hasattr(m, "ResetHebbianMemory"): 
-                m.ResetHebbianMemory(doneMask=doneMask)
+        for module in self.modules():
+            if isinstance(module, (HebbianConv2d, HebbianLinear)):
+                module.ResetHebbianMemory(doneMask=doneMask)
 
     def ConfigureHebbianRuntime(
         self,
@@ -3318,7 +3558,11 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         cameraMotion = kwargs["cameraMotion"]
         depth = kwargs["depth"]
         depth_valid = kwargs["depthValid"]
-        camera_intrinsics = self.base.CameraIntrinsicsBatch(int(frame.size(0)))
+        batch_size = int(frame.size(0))
+        self.base.ValidatePreviousVisualMask(frame, prevVisualValid)
+        self.base.MaybeConfigureJetsonEdgeHebbian(frame)
+        self.base.EnsureB(batch_size)
+        camera_intrinsics = self.base.CameraIntrinsicsBatch(batch_size)
 
         pyramid, enhancement_auxiliary = self.base.BuildAugmentedPyramid(
             frame,
@@ -3948,9 +4192,12 @@ class PerceptionTrainer(nn.Module):
         self.extractor = PerceiveExtractor(
             cameraIntrinsics=cameraIntrinsics,
             **extractorKwargs)
-        self.recall_heads = self.extractor.recall_heads
         recallLossKwargs = {} if recallLossKwargs is None else dict(recallLossKwargs)
         self.recall_loss = PerceptionRecallLoss(**recallLossKwargs)
+
+    @property
+    def recall_heads(self) -> PerceptionRecallHeads:
+        return self.extractor.recall_heads
 
     def forward(
         self,
@@ -4190,8 +4437,15 @@ class TestPerceptionMTool:
         try:
             conv = HebbianConv2d(inChannels=3, outChannels=16, kernelSize=3, stride=1, padding=1, useHebbian=True).to(self.device)
             x = torch.randn(4, 3, 32, 32, device=self.device)
+            conv.EnsureB(int(x.size(0)))
+            expected = conv.conv(x)
             y = conv(x)
             assert y.shape == (4, 16, 32, 32), f"Output shape does not match: {y.shape}"
+            assert torch.allclose(y, expected, atol=1e-6, rtol=1e-5)
+            assert torch.count_nonzero(conv.hebb_memory).item() > 0
+            assert "hebb_memory" not in conv.state_dict()
+            y_next = conv(x)
+            assert not torch.equal(y_next, y)
             conv.ResetHebbianMemory()
             print("HebbianConv2d test passed.")
             return True
@@ -4206,8 +4460,15 @@ class TestPerceptionMTool:
         try:
             lin = HebbianLinear(inFeatures=32, outFeatures=64, useHebbian=True).to(self.device)
             x = torch.randn(5, 32, device=self.device)
+            lin.EnsureB(int(x.size(0)))
+            expected = F.linear(x, lin.weight, lin.bias)
             y = lin(x)
             assert y.shape == (5, 64), f"Output shape does not match: {y.shape}"
+            assert torch.allclose(y, expected, atol=1e-7, rtol=1e-6)
+            assert torch.count_nonzero(lin.hebb_memory).item() > 0
+            assert "hebb_memory" not in lin.state_dict()
+            y_next = lin(x)
+            assert not torch.equal(y_next, y)
             lin.ResetHebbianMemory()
             print("HebbianLinear test passed.")
             return True
@@ -4864,6 +5125,27 @@ class TestPerceptionMTool:
             assert head.weight.grad is not None and torch.isfinite(head.weight.grad).all(), "Head grad invalid with wrapper."
             opt.step()
 
+            invalid_mask_rejected = False
+            try:
+                wrapper(
+                    x,
+                    topDownContext=self.MakeTopDownContext(wrapper, 8),
+                    depth=torch.ones(
+                        8, 1, img_size, img_size,
+                        device=self.device),
+                    depthValid=torch.ones(
+                        8, 1, img_size, img_size,
+                        device=self.device,
+                        dtype=torch.bool),
+                    cameraMotion=self.CameraTemporalInputs(x)[
+                        "cameraMotion"],
+                    prevVisualValid=torch.zeros(
+                        8,
+                        device=self.device))
+            except TypeError:
+                invalid_mask_rejected = True
+            assert invalid_mask_rejected
+
             print("WrapperPipelineCompatible passed.")
             return True
         except AssertionError as e:
@@ -5053,6 +5335,7 @@ class TestPerceptionMTool:
         try:
             conv = HebbianConv2d(3, 8, 3, stride=1, padding=1, useHebbian=True).to(self.device)
             x = torch.randn(4, 3, 32, 32, device=self.device)
+            conv.EnsureB(int(x.size(0)))
             n0 = conv.hebb_memory.norm().item()
             for _ in range(3):
                 _ = conv(x)
@@ -5064,6 +5347,7 @@ class TestPerceptionMTool:
 
             lin = HebbianLinear(32, 16, useHebbian=True).to(self.device)
             z = torch.randn(6, 32, device=self.device)
+            lin.EnsureB(int(z.size(0)))
             n0 = lin.hebb_memory.norm().item()
             for _ in range(3):
                 _ = lin(z)
@@ -5151,9 +5435,265 @@ class TestPerceptionMTool:
                 device=self.device,
                 dtype=torch.float16)
             stats = model.QualityStats(frame)
+            assert stats.shape == (2, 5)
             assert stats.dtype == torch.float16
             assert model.quality_proj(stats).dtype == torch.float16
         return self.RunRegressionCheck("QualityStatisticsDType", check)
+
+    def TestSpatialFrequencyEntropyAndCorticalSelectivity(self):
+        def check():
+            size = 64
+            coordinate = torch.arange(
+                size,
+                device=self.device,
+                dtype=torch.float32).view(1, 1, 1, size)
+            sinusoid = (
+                0.5
+                + 0.4 * torch.cos(2.0 * math.pi * coordinate / 8.0)
+            ).expand(1, 1, size, size)
+            constant = torch.full_like(sinusoid, 0.5)
+            noise = torch.rand_like(sinusoid)
+            frames = torch.cat([
+                constant,
+                sinusoid,
+                noise,
+                0.5 * sinusoid,
+            ], dim=0).expand(-1, 3, -1, -1)
+            entropy = PerceiveExtractor.SpatialFrequencyEntropy(frames)
+            assert float(entropy[0]) < 1e-6
+            assert float(entropy[1]) < 0.1
+            assert float(entropy[2]) > float(entropy[1]) + 0.5
+            assert torch.allclose(entropy[1], entropy[3], atol=1e-5)
+            singleton_entropy = PerceiveExtractor.SpatialFrequencyEntropy(
+                torch.ones(2, 3, 1, 1, device=self.device))
+            assert torch.equal(
+                singleton_entropy,
+                torch.zeros_like(singleton_entropy))
+            one_band_entropy = PerceiveExtractor.SpatialFrequencyEntropy(
+                frames,
+                bandCount=1)
+            assert torch.equal(
+                one_band_entropy,
+                torch.zeros_like(one_band_entropy))
+
+            vision = CorticalEarlyVision(outChannels=8).to(self.device)
+            stationary_input = torch.randn(
+                1,
+                1,
+                80,
+                80,
+                device=self.device)
+            stationary_even, stationary_odd = vision.MultiscaleQuadrature(
+                stationary_input)
+            shifted_even, shifted_odd = vision.MultiscaleQuadrature(
+                torch.roll(stationary_input, shifts=1, dims=-1))
+            interior = (..., slice(31, -31), slice(31, -31))
+            assert torch.equal(
+                shifted_even[interior],
+                torch.roll(stationary_even, shifts=1, dims=-1)[interior])
+            assert torch.equal(
+                shifted_odd[interior],
+                torch.roll(stationary_odd, shifts=1, dims=-1)[interior])
+
+            calibration_size = 96
+            calibration_x = torch.arange(
+                calibration_size,
+                device=self.device,
+                dtype=torch.float32).view(1, 1, 1, calibration_size)
+            calibration_input = torch.cat([
+                torch.cos(
+                    2.0 * math.pi * calibration_x
+                    / (4.0 * scale)
+                ).expand(1, 1, calibration_size, calibration_size)
+                for scale in vision.frequency_scales
+            ], dim=0)
+            calibration_even, calibration_odd = vision.MultiscaleQuadrature(
+                calibration_input)
+            calibration_energy = vision.QuadratureAmplitude(
+                calibration_even,
+                calibration_odd)
+            matched_response = torch.stack([
+                calibration_energy[
+                    index,
+                    index,
+                    0,
+                    31:-31,
+                    31:-31].mean()
+                for index in range(len(vision.frequency_scales))
+            ])
+            assert (
+                matched_response.max() / matched_response.min()
+            ) < 1.001
+            _, blank_auxiliary = vision(frames[0:1], None, None)
+            assert float(blank_auxiliary["CorticalEnergy"].abs().max()) < 1e-6
+            luminance = vision.AntiAliasDownsample(sinusoid)
+            even, odd = vision.MultiscaleQuadrature(luminance)
+            assert even.shape == (1, 3, vision.orientations, 32, 32)
+            energy = vision.QuadratureAmplitude(even, odd)
+            orientation_response = energy.mean(dim=(0, 1, 3, 4))
+            assert int(orientation_response.argmax().item()) == 0
+            assert orientation_response[0] > 4.0 * orientation_response[3]
+            phase_congruency, _ = vision.MultiscalePhaseStatistics(
+                even,
+                odd,
+                energy)
+            assert float(phase_congruency.max()) <= 1.0 + 1e-4
+            orientation_coherence = vision.OrientationCoherence(energy)
+            assert float(orientation_coherence.min()) >= 0.0
+            assert float(orientation_coherence.max()) <= 1.0 + 1e-4
+
+            structured_luminance = calibration_input[1:2]
+            noise_luminance = torch.randn_like(structured_luminance)
+
+            def structure_score(value: torch.Tensor) -> torch.Tensor:
+                value_even, value_odd = vision.MultiscaleQuadrature(value)
+                value_energy = vision.QuadratureAmplitude(
+                    value_even,
+                    value_odd)
+                value_phase, value_entropy = (
+                    vision.MultiscalePhaseStatistics(
+                        value_even,
+                        value_odd,
+                        value_energy))
+                value_orientation = vision.OrientationCoherence(
+                    value_energy)
+                return (
+                    value_phase
+                    * value_entropy
+                    * value_orientation
+                )[..., 31:-31, 31:-31].mean()
+
+            assert (
+                structure_score(structured_luminance)
+                > 2.0 * structure_score(noise_luminance))
+
+            half_vision = CorticalEarlyVision(
+                outChannels=8).to(
+                    device=self.device,
+                    dtype=torch.float16)
+            zero_quadrature = torch.zeros(
+                1,
+                len(half_vision.frequency_scales),
+                half_vision.orientations,
+                4,
+                4,
+                device=self.device,
+                dtype=torch.float16)
+            half_energy = half_vision.QuadratureAmplitude(
+                zero_quadrature,
+                zero_quadrature)
+            half_coherence = half_vision.OrientationCoherence(half_energy)
+            assert torch.equal(half_energy, torch.zeros_like(half_energy))
+            assert torch.equal(
+                half_coherence,
+                torch.zeros_like(half_coherence))
+
+            half_generator = torch.Generator(
+                device=self.device).manual_seed(137)
+            for magnitude in (0.0, 1e-4, 1e-3, 1e-2):
+                weak_even = (
+                    torch.rand(
+                        zero_quadrature.shape,
+                        generator=half_generator,
+                        device=self.device,
+                        dtype=torch.float16)
+                    * magnitude).requires_grad_()
+                weak_odd = (
+                    torch.rand(
+                        zero_quadrature.shape,
+                        generator=half_generator,
+                        device=self.device,
+                        dtype=torch.float16)
+                    * magnitude).requires_grad_()
+                weak_amplitude = half_vision.QuadratureAmplitude(
+                    weak_even,
+                    weak_odd)
+                weak_phase, weak_entropy = (
+                    half_vision.MultiscalePhaseStatistics(
+                        weak_even,
+                        weak_odd,
+                        weak_amplitude))
+                weak_coherence = half_vision.OrientationCoherence(
+                    weak_amplitude)
+                (
+                    weak_phase.sum()
+                    + weak_entropy.sum()
+                    + weak_coherence.sum()
+                ).backward()
+                assert weak_even.grad is not None
+                assert weak_odd.grad is not None
+                assert torch.isfinite(weak_even.grad).all()
+                assert torch.isfinite(weak_odd.grad).all()
+
+            bfloat_vision = CorticalEarlyVision(
+                outChannels=8).to(
+                    device=self.device,
+                    dtype=torch.bfloat16)
+            for magnitude in (1e-4, 1.0):
+                bfloat_even = (
+                    torch.rand(
+                        zero_quadrature.shape,
+                        generator=half_generator,
+                        device=self.device,
+                        dtype=torch.bfloat16)
+                    * magnitude).requires_grad_()
+                bfloat_odd = (
+                    torch.rand(
+                        zero_quadrature.shape,
+                        generator=half_generator,
+                        device=self.device,
+                        dtype=torch.bfloat16)
+                    * magnitude).requires_grad_()
+                bfloat_amplitude = bfloat_vision.QuadratureAmplitude(
+                    bfloat_even,
+                    bfloat_odd)
+                bfloat_phase, bfloat_entropy = (
+                    bfloat_vision.MultiscalePhaseStatistics(
+                        bfloat_even,
+                        bfloat_odd,
+                        bfloat_amplitude))
+                bfloat_coherence = bfloat_vision.OrientationCoherence(
+                    bfloat_amplitude)
+                for statistic in (
+                    bfloat_phase,
+                    bfloat_entropy,
+                    bfloat_coherence,):
+                    assert torch.isfinite(statistic).all()
+                    assert float(statistic.min()) >= 0.0
+                    assert float(statistic.max()) <= 1.0
+                (
+                    bfloat_phase.sum()
+                    + bfloat_entropy.sum()
+                    + bfloat_coherence.sum()
+                ).backward()
+                assert torch.isfinite(bfloat_even.grad).all()
+                assert torch.isfinite(bfloat_odd.grad).all()
+            with torch.no_grad():
+                vision.spectral_scale_logits.copy_(
+                    vision.spectral_scale_logits.new_tensor(
+                        [20.0, -20.0, -20.0]))
+            collapsed_independent_phase, _ = vision.MultiscalePhaseStatistics(
+                even,
+                odd,
+                energy)
+            assert torch.equal(
+                collapsed_independent_phase,
+                phase_congruency)
+            with torch.no_grad():
+                vision.spectral_scale_logits.zero_()
+
+            feature, _ = vision(frames[1:2], None, None)
+            feature.square().mean().backward()
+            for parameter in (
+                vision.spectral_scale_logits,
+                vision.phase_congruency_gain_raw,
+                vision.feature_projection[0].weight,):
+                assert parameter.grad is not None
+                assert torch.isfinite(parameter.grad).all()
+                assert float(parameter.grad.abs().sum()) > 0.0
+        return self.RunRegressionCheck(
+            "SpatialFrequencyEntropyAndCorticalSelectivity",
+            check)
 
     def TestPatchProjectionContentSensitivity(self):
         def check():
@@ -5223,6 +5763,12 @@ class TestPerceptionMTool:
             assert len(restored_model.token_adapters[0].A_list) == 1
 
             empty_state = self.MakeRegressionModel().state_dict()
+            SynchronizeDynamicAdapterTopologiesForFullLoad(
+                restored_model,
+                empty_state)
+            assert len(restored_model.cnn_feat_adapter.A_list) == 0
+            assert len(restored_model.patch_adapter.A_list) == 0
+            assert len(restored_model.token_adapters[0].A_list) == 0
             incompatible = restored_model.load_state_dict(
                 empty_state,
                 strict=True)
@@ -5259,6 +5805,98 @@ class TestPerceptionMTool:
             assert incomplete_model_rejected
         return self.RunRegressionCheck("GrowableAdapterStateRoundTrip", check)
 
+    def TestInternalRegistrationAndTransientState(self):
+        def check():
+            model = self.MakeRegressionModel()
+            model_state_keys = tuple(model.state_dict())
+            assert not any(
+                name.startswith("patch_adapter.target.")
+                for name in model_state_keys)
+            assert model.patch_embed is model.patch_adapter.target
+            assert model.patch_aggregator[-1].bias is None
+            for block in (
+                model.cnn_extractor.layer1[0],
+                model.cnn_extractor.layer1[1],
+                model.cnn_extractor.layer2[1],
+                model.cnn_extractor.layer3[1],
+                model.cnn_extractor.layer4[1],):
+                assert not block.use_downsample
+                assert isinstance(block.downsample, nn.Identity)
+                assert sum(
+                    parameter.numel()
+                    for parameter in block.downsample.parameters()) == 0
+
+            conv = HebbianConv2d(
+                3,
+                4,
+                3,
+                padding=1,
+                useHebbian=True).to(self.device)
+            conv.EnsureB(2)
+            _ = conv(torch.rand(2, 3, 8, 8, device=self.device))
+            assert torch.count_nonzero(conv.hebb_memory) > 0
+            conv.load_state_dict(conv.state_dict(), strict=True)
+            assert torch.count_nonzero(conv.hebb_memory) == 0
+            assert conv._hebbian_update_step == 0
+            conv.hebb_memory.fill_(1.0)
+            conv._hebbian_update_step = 3
+            conv.ResetHebbianMemory(doneMask=torch.ones(
+                2,
+                device=self.device,
+                dtype=torch.bool))
+            assert torch.count_nonzero(conv.hebb_memory) == 0
+            assert conv._hebbian_update_step == 0
+
+            linear = HebbianLinear(
+                8,
+                4,
+                bias=False,
+                useHebbian=True).to(self.device)
+            assert linear.bias is None
+            linear.EnsureB(2)
+            _ = linear(torch.rand(2, 8, device=self.device))
+            assert torch.count_nonzero(linear.hebb_memory) > 0
+            linear.load_state_dict(linear.state_dict(), strict=True)
+            assert torch.count_nonzero(linear.hebb_memory) == 0
+            assert linear._hebbian_update_step == 0
+            linear.hebb_memory.fill_(1.0)
+            linear._hebbian_update_step = 3
+            linear.ResetHebbianMemory(doneMask=torch.ones(
+                2,
+                device=self.device,
+                dtype=torch.bool))
+            assert torch.count_nonzero(linear.hebb_memory) == 0
+            assert linear._hebbian_update_step == 0
+
+            trainer = PerceptionTrainer(
+                cameraIntrinsics=self.MakeCameraIntrinsics(32),
+                imgSize=32,
+                patchSize=1,
+                embedDim=32,
+                numHeads=4,
+                numLayers=1,
+                baseChannels=8,
+                objectTokenCount=4,
+                useHebbian=False).to(self.device)
+            assert trainer.recall_heads is trainer.extractor.recall_heads
+            trainer_state_keys = tuple(trainer.state_dict())
+            assert not any(
+                name.startswith("recall_heads.")
+                for name in trainer_state_keys)
+            parameter_ids = [
+                id(parameter)
+                for _, parameter in model.named_parameters(
+                    remove_duplicate=False)]
+            buffer_ids = [
+                id(buffer)
+                for _, buffer in model.named_buffers(
+                    remove_duplicate=False)]
+            assert len(parameter_ids) == len(set(parameter_ids))
+            assert len(buffer_ids) == len(set(buffer_ids))
+        return self.RunRegressionCheck(
+            "InternalRegistrationAndTransientState",
+            check)
+
     def TestPartialAdapterLoadPreservesRank(self):
         def check():
             adapter = GrowableConv1x1Adapter(8).to(self.device)
@@ -5285,14 +5923,19 @@ class TestPerceptionMTool:
                 3,
                 padding=1,
                 useHebbian=True).to(self.device).train()
-            _ = layer(torch.rand(3, 3, 8, 8, device=self.device))
+            value = torch.rand(3, 3, 8, 8, device=self.device)
+            layer.EnsureB(int(value.size(0)))
+            layer.SetHebbianUpdatePeriod(4)
+            _ = layer(value)
             before = layer.hebb_memory.clone()
+            update_step = layer._hebbian_update_step
             layer.ResetHebbianMemory(doneMask=torch.tensor(
                 [False, True, False],
                 device=self.device))
             assert torch.equal(layer.hebb_memory[0], before[0])
             assert torch.count_nonzero(layer.hebb_memory[1]) == 0
             assert torch.equal(layer.hebb_memory[2], before[2])
+            assert layer._hebbian_update_step == update_step
         return self.RunRegressionCheck("HebbianPartialRowReset", check)
 
     def TestHebbianDisabledFastPath(self):
@@ -5327,6 +5970,7 @@ class TestPerceptionMTool:
                 padding=1,
                 useHebbian=True).to(self.device).eval()
             value = torch.rand(2, 3, 8, 8, device=self.device)
+            layer.EnsureB(int(value.size(0)))
             expected = layer.conv(value)
             first = layer(value)
             assert torch.allclose(first, expected, atol=1e-6, rtol=1e-5)
@@ -5462,6 +6106,8 @@ class TestPerceptionMTool:
     def TestCorticalGaborTemporalReset(self):
         def check():
             vision = CorticalEarlyVision(outChannels=8).to(self.device)
+            assert vision.frequency_scales == (1.0, 2.0, 4.0)
+            assert 0.0 < float(vision.FastDecay()) < float(vision.SlowDecay()) < 1.0
             even = vision.gabor_even.float()
             odd = vision.gabor_odd.float()
             assert torch.allclose(
@@ -5480,28 +6126,53 @@ class TestPerceptionMTool:
                 odd.flatten(1).norm(dim=1),
                 torch.ones(odd.size(0), device=self.device),
                 atol=1e-5)
-            reloaded_state = vision.state_dict()
-            reloaded_state["gabor_even"] = (
-                reloaded_state["gabor_even"] + 0.01)
-            vision.load_state_dict(reloaded_state, strict=True)
+            original_state = {
+                name: value.clone()
+                for name, value in vision.state_dict().items()}
+            modified_state = {
+                name: value.clone()
+                for name, value in original_state.items()}
+            modified_state["gabor_even"] = (
+                modified_state["gabor_even"] + 0.01)
+            vision.load_state_dict(modified_state, strict=True)
             assert torch.equal(
                 vision.gabor_quadrature,
                 torch.cat([vision.gabor_even, vision.gabor_odd], dim=0))
-            frame = torch.rand(2, 3, 64, 64, device=self.device)
+            vision.load_state_dict(original_state, strict=True)
+            frame = torch.zeros(2, 3, 64, 64, device=self.device)
+            frame[..., 16:48, 20:36] = 1.0
             feature1, state1 = vision(frame, None, None)
             assert feature1.shape == (2, 8, 16, 16)
             assert torch.count_nonzero(
                 state1["CorticalTemporalResponse"]) == 0
+            moved_frame = torch.roll(frame, shifts=2, dims=-1)
+            _, current_state = vision(moved_frame, None, None)
             feature2, state2 = vision(
-                frame + 0.1,
+                moved_frame,
                 state1["CorticalFastState"],
                 state1["CorticalSlowState"],
                 torch.tensor([True, False], device=self.device))
             assert torch.isfinite(feature2).all()
-            assert torch.count_nonzero(
-                state2["CorticalTemporalResponse"][0]) > 0
-            assert torch.count_nonzero(
-                state2["CorticalTemporalResponse"][1]) == 0
+            expected_temporal = (
+                vision.SlowDecay() - vision.FastDecay()
+            ) * (
+                current_state["CorticalFastState"]
+                - state1["CorticalFastState"])
+            assert torch.allclose(
+                state2["CorticalFastState"][0]
+                - state2["CorticalSlowState"][0],
+                expected_temporal[0],
+                atol=1e-6,
+                rtol=1e-5)
+            assert torch.equal(
+                state2["CorticalFastState"][1],
+                state2["CorticalSlowState"][1])
+            feature2.square().mean().backward()
+            for parameter in (
+                vision.fast_decay_raw,
+                vision.slow_gap_raw,):
+                assert parameter.grad is not None
+                assert float(parameter.grad.abs()) > 0.0
         return self.RunRegressionCheck("CorticalGaborTemporalReset", check)
 
     def TestLogDepthResampling(self):
@@ -5781,6 +6452,26 @@ class TestPerceptionMTool:
             assert torch.allclose(
                 visual.SemanticNodes["pose_camera"][..., :3],
                 visual.Auxiliary["ObjectGeometry"][..., :3])
+            pose_delta = visual.Auxiliary["ObjectGeometry"].new_tensor(
+                [0.1, -0.2, 0.3])
+            with torch.no_grad():
+                model.recall_heads.position_residual_camera_head.bias.copy_(
+                    pose_delta)
+            refined = model(
+                frame,
+                topDownContext=self.MakeTopDownContext(model, 1),
+                depth=depth,
+                depthValid=valid,
+                **self.CameraTemporalInputs(frame))
+            assert torch.allclose(
+                refined.Auxiliary["ObjectGeometry"][..., :3],
+                visual.Auxiliary["ObjectGeometry"][..., :3]
+                + pose_delta.view(1, 1, 3),
+                atol=1e-6,
+                rtol=1e-5)
+            assert torch.equal(
+                refined.SemanticNodes["pose_camera"][..., :3],
+                refined.Auxiliary["ObjectGeometry"][..., :3])
 
             model.train()
             fallback = model(
@@ -5802,48 +6493,109 @@ class TestPerceptionMTool:
 
     def TestObjectTokensCanEncodeCameraGeometry(self):
         def check():
-            model = self.MakeRegressionModel(64).train()
+            model = self.MakeRegressionModel(64).eval()
             patch_tokens = torch.randn(
                 1, 9, model.embed_dim, device=self.device)
             geometry_a = torch.randn(1, 9, 6, device=self.device)
+            translated_geometry = geometry_a.clone()
+            translated_geometry[..., :3] += translated_geometry.new_tensor(
+                [3.0, -2.0, 1.0])
             geometry_b = geometry_a.clone()
-            geometry_b[..., :3] += geometry_b.new_tensor([3.0, -2.0, 1.0])
+            geometry_b[:, :3, :3] += geometry_b.new_tensor(
+                [0.5, -0.25, 0.75])
             coordinate_valid = torch.ones(1, 9, 1, device=self.device)
-            tokens_a, object_geometry_a, _, _ = model.BuildObjectTokens(
+            tokens_a, object_geometry_a, _, weights_a = model.BuildObjectTokens(
                 patch_tokens,
                 geometry_a,
                 coordinate_valid)
-            tokens_b, object_geometry_b, _, _ = model.BuildObjectTokens(
+            _, _, _, translated_weights = model.BuildObjectTokens(
+                patch_tokens,
+                translated_geometry,
+                coordinate_valid)
+            tokens_b, object_geometry_b, _, weights_b = model.BuildObjectTokens(
                 patch_tokens,
                 geometry_b,
                 coordinate_valid)
+            assert hasattr(model, "object_geometry_key")
             assert hasattr(model, "object_geometry_proj")
-            assert torch.equal(tokens_a, tokens_b)
-            probe = torch.randn_like(tokens_a)
-            (tokens_a * probe).sum().backward()
-            residual_output = model.object_geometry_proj[-1]
-            assert residual_output.weight.grad is not None
-            assert bool((residual_output.weight.grad.abs().sum() > 0.0).item())
+            assert torch.allclose(
+                weights_a,
+                translated_weights,
+                atol=1e-6,
+                rtol=1e-5)
+            assert float((weights_a - weights_b).abs().max()) > 1e-4
+            assert float((tokens_a - tokens_b).abs().max()) > 1e-4
+            assert float(
+                (object_geometry_a - object_geometry_b).abs().max()
+            ) > 1e-4
 
             with torch.no_grad():
-                residual_output.weight.normal_(mean=0.0, std=1e-3)
-            tokens_a, _, _, _ = model.BuildObjectTokens(
+                competition_value = model.object_competition_raw.clone()
+                model.object_competition_raw.fill_(-20.0)
+            _, _, _, independent_weights = model.BuildObjectTokens(
                 patch_tokens,
                 geometry_a,
                 coordinate_valid)
-            tokens_b, _, _, _ = model.BuildObjectTokens(
+            with torch.no_grad():
+                model.object_competition_raw.fill_(20.0)
+            _, _, _, competitive_weights = model.BuildObjectTokens(
                 patch_tokens,
-                geometry_b,
+                geometry_a,
                 coordinate_valid)
-            assert not torch.equal(tokens_a, tokens_b)
-            assert not torch.equal(object_geometry_a, object_geometry_b)
+            with torch.no_grad():
+                model.object_competition_raw.copy_(competition_value)
+            assert float(
+                (independent_weights - competitive_weights).abs().max()
+            ) > 1e-4
+
+            zero_valid = torch.zeros_like(coordinate_valid)
+            appearance_tokens, _, appearance_valid, appearance_weights = (
+                model.BuildObjectTokens(
+                    patch_tokens,
+                    geometry_a,
+                    zero_valid))
+            modified_patch_tokens = patch_tokens.clone()
+            modified_patch_tokens[:, 0] += 1.0
+            modified_appearance, _, _, _ = model.BuildObjectTokens(
+                modified_patch_tokens,
+                geometry_a,
+                zero_valid)
+            assert torch.count_nonzero(appearance_valid) == 0
+            assert torch.isfinite(appearance_tokens).all()
+            assert torch.allclose(
+                appearance_weights.sum(dim=-1),
+                torch.ones_like(appearance_weights[..., 0]))
+            assert float(
+                (appearance_tokens - modified_appearance).abs().max()
+            ) > 1e-4
+            normalized_weights = F.normalize(weights_a, dim=-1, eps=1e-6)
+            weight_similarity = torch.matmul(
+                normalized_weights,
+                normalized_weights.transpose(1, 2))
+            off_diagonal = ~torch.eye(
+                model.object_token_count,
+                device=self.device,
+                dtype=torch.bool).unsqueeze(0)
+            assert float(weight_similarity[off_diagonal].mean()) < 0.95
+            probe = torch.randn_like(tokens_a)
+            (tokens_a * probe).sum().backward()
+            for parameter in (
+                model.object_geometry_key[-1].weight,
+                model.object_geometry_proj[-1].weight,
+                model.object_relation_attention.in_proj_weight,):
+                assert parameter.grad is not None
+                assert torch.isfinite(parameter.grad).all()
+                assert float(parameter.grad.abs().sum()) > 0.0
         return self.RunRegressionCheck(
             "ObjectTokensCanEncodeCameraGeometry",
             check)
 
     def TestEvalSkipsZeroGainEnhancements(self):
         def check():
-            model = self.MakeRegressionModel(64).eval()
+            model = self.MakeRegressionModel(64)
+            with torch.no_grad():
+                model.perception_enhancement.residual_gain.zero_()
+            model.eval()
             calls = {
                 "cortical": 0,
                 "patch": 0,
@@ -5917,6 +6669,15 @@ class TestPerceptionMTool:
                 model.patch_content_projection.weight,):
                 assert parameter.grad is not None
                 assert torch.isfinite(parameter.grad).all()
+            for parameter in (
+                model.perception_enhancement.early_vision.spectral_scale_logits,
+                model.perception_enhancement.early_vision.phase_congruency_gain_raw,
+                model.perception_enhancement.early_vision.feature_projection[0].weight,
+                model.object_geometry_key[-1].weight,
+                model.object_relation_attention.in_proj_weight,):
+                assert parameter.grad is not None
+                assert torch.isfinite(parameter.grad).all()
+                assert float(parameter.grad.abs().sum()) > 0.0
             assert model.dense_depth_refiner.output.bias.grad[1].abs() > 0
         return self.RunRegressionCheck("EnhancementGradientCoverage", check)
 
@@ -6024,8 +6785,10 @@ class TestPerceptionMTool:
             "RGBDGeometryAndSupervision": self.TestRGBDGeometryAndSupervision(),
             "EvalDepthLossAuxiliarySchema": self.TestEvalDepthLossAuxiliarySchema(),
             "QualityStatisticsDType": self.TestQualityStatisticsDType(),
+            "SpatialFrequencyEntropyAndCorticalSelectivity": self.TestSpatialFrequencyEntropyAndCorticalSelectivity(),
             "PatchProjectionContentSensitivity": self.TestPatchProjectionContentSensitivity(),
             "GrowableAdapterStateRoundTrip": self.TestGrowableAdapterStateRoundTrip(),
+            "InternalRegistrationAndTransientState": self.TestInternalRegistrationAndTransientState(),
             "PartialAdapterLoadPreservesRank": self.TestPartialAdapterLoadPreservesRank(),
             "HebbianPartialRowReset": self.TestHebbianPartialRowReset(),
             "HebbianDisabledFastPath": self.TestHebbianDisabledFastPath(),

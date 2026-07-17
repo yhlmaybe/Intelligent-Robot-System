@@ -574,10 +574,10 @@ class S4DCell(AGICoreModule):
 
         self.register_buffer("x", torch.zeros(1, self.ssm_dim), persistent=True)
 
-    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
+    def EnsureB(self, B: int):
         B = int(B)
-        if self.x.size(0) != B or self.x.device != device or self.x.dtype != dtype:
-            self.x = torch.zeros(int(B), self.ssm_dim, device=device, dtype=dtype)
+        if self.x.size(0) != B:
+            self.x = self.x.new_zeros(B, self.ssm_dim)
 
     def CayleyStep(self, aDiag: torch.Tensor, x: torch.Tensor, Bu: torch.Tensor, dt: float):
         A = -F.softplus(aDiag)
@@ -1995,65 +1995,58 @@ class RSSMWorldModel(AGICoreModule):
             nn.Linear(self.state_dim, self.state_dim),
             nn.LayerNorm(self.state_dim),)
 
-    def EnsurePhysicalMemory(self, B: int, device: torch.device, dtype: torch.dtype):
-        if (self._pst_slot_state.size(0) == B
-            and self._pst_slot_state.size(1) == self.physical_slots
-            and self._pst_slot_state.size(2) == self.physical_slot_dim
-            and tuple(self._pst_pair_last_seen.shape[1:]) == (self.physical_slots, self.physical_slots)
-            and self._pst_semantic.size(2) == self.physical_semantic_dim
-            and self._pst_slot_state.device == device
-            and self._pst_slot_state.dtype == dtype):
-
+    def EnsurePhysicalMemory(self, B: int):
+        if self._pst_slot_state.size(0) == B:
             return
         K = self.physical_slots
-        self._pst_slot_state = torch.zeros(B, K, self.physical_slot_dim, device=device, dtype=dtype)
-        self._pst_pose_world = torch.zeros(B, K, self.physical_pose_dim, device=device, dtype=dtype)
-        self._pst_attribute = torch.zeros(B, K, self.physical_attr_dim, device=device, dtype=dtype)
-        self._pst_slot_presence = torch.zeros(B, K, device=device, dtype=dtype)
-        self._pst_entity_prob = torch.zeros(B, K, device=device, dtype=dtype)
-        self._pst_identity_key = torch.zeros(B, K, self.physical_id_dim, device=device, dtype=dtype)
-        self._pst_pairwise_relation = torch.zeros(B, K, K, self.physical_rel_dim, device=device, dtype=dtype)
-        self._pst_pair_last_seen = torch.zeros(B, K, K, device=device, dtype=torch.long)
-        self._pst_external_relation = torch.zeros(B, K, self.physical_relation_classes, device=device, dtype=dtype)
-        self._pst_semantic = torch.zeros(B, K, self.physical_semantic_dim, device=device, dtype=dtype)
-        self._pst_size = torch.zeros(B, K, 3, device=device, dtype=dtype)
-        self._pst_state = torch.zeros(B, K, self.physical_state_dim, device=device, dtype=dtype)
-        self._pst_affordance = torch.zeros(B, K, self.physical_affordance_dim, device=device, dtype=dtype)
-        self._pst_motion = torch.zeros(B, K, self.physical_pose_dim, device=device, dtype=dtype)
-        self._pst_moving = torch.zeros(B, K, device=device, dtype=dtype)
-        self._pst_contact = torch.zeros(B, K, device=device, dtype=dtype)
-        self._pst_contact_force = torch.zeros(B, K, 2, device=device, dtype=dtype)
-        self._pst_contact_point = torch.zeros(B, K, 3, device=device, dtype=dtype)
-        self._pst_parent = torch.zeros(B, K, K, device=device, dtype=dtype)
-        self._pst_visibility = torch.zeros(B, K, device=device, dtype=dtype)
-        self._pst_occlusion = torch.zeros(B, K, device=device, dtype=dtype)
-        self._pst_has_text = torch.zeros(B, K, device=device, dtype=dtype)
-        self._pst_text = torch.zeros(B, K, self.physical_text_dim, device=device, dtype=dtype)
-        self._pst_symbol = torch.zeros(B, K, self.physical_symbol_dim, device=device, dtype=dtype)
-        self._pst_observed = torch.zeros(B, K, device=device, dtype=torch.bool)
-        self._pst_last_seen = torch.zeros(B, K, device=device, dtype=torch.long)
-        self._pst_step = torch.zeros(B, device=device, dtype=torch.long)
-        self._robot_physical_state = torch.zeros(B, self.robot_physical_dim, device=device, dtype=dtype)
+        self._pst_slot_state = self._pst_slot_state.new_zeros(B, K, self.physical_slot_dim)
+        self._pst_pose_world = self._pst_pose_world.new_zeros(B, K, self.physical_pose_dim)
+        self._pst_attribute = self._pst_attribute.new_zeros(B, K, self.physical_attr_dim)
+        self._pst_slot_presence = self._pst_slot_presence.new_zeros(B, K)
+        self._pst_entity_prob = self._pst_entity_prob.new_zeros(B, K)
+        self._pst_identity_key = self._pst_identity_key.new_zeros(B, K, self.physical_id_dim)
+        self._pst_pairwise_relation = self._pst_pairwise_relation.new_zeros(B, K, K, self.physical_rel_dim)
+        self._pst_pair_last_seen = self._pst_pair_last_seen.new_zeros(B, K, K)
+        self._pst_external_relation = self._pst_external_relation.new_zeros(B, K, self.physical_relation_classes)
+        self._pst_semantic = self._pst_semantic.new_zeros(B, K, self.physical_semantic_dim)
+        self._pst_size = self._pst_size.new_zeros(B, K, 3)
+        self._pst_state = self._pst_state.new_zeros(B, K, self.physical_state_dim)
+        self._pst_affordance = self._pst_affordance.new_zeros(B, K, self.physical_affordance_dim)
+        self._pst_motion = self._pst_motion.new_zeros(B, K, self.physical_pose_dim)
+        self._pst_moving = self._pst_moving.new_zeros(B, K)
+        self._pst_contact = self._pst_contact.new_zeros(B, K)
+        self._pst_contact_force = self._pst_contact_force.new_zeros(B, K, 2)
+        self._pst_contact_point = self._pst_contact_point.new_zeros(B, K, 3)
+        self._pst_parent = self._pst_parent.new_zeros(B, K, K)
+        self._pst_visibility = self._pst_visibility.new_zeros(B, K)
+        self._pst_occlusion = self._pst_occlusion.new_zeros(B, K)
+        self._pst_has_text = self._pst_has_text.new_zeros(B, K)
+        self._pst_text = self._pst_text.new_zeros(B, K, self.physical_text_dim)
+        self._pst_symbol = self._pst_symbol.new_zeros(B, K, self.physical_symbol_dim)
+        self._pst_observed = self._pst_observed.new_zeros(B, K)
+        self._pst_last_seen = self._pst_last_seen.new_zeros(B, K)
+        self._pst_step = self._pst_step.new_zeros(B)
+        self._robot_physical_state = self._robot_physical_state.new_zeros(B, self.robot_physical_dim)
 
-    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
+    def EnsureB(self, B: int):
         B = int(B)
         cap = int(self._mem_capacity)
-        self.EnsurePhysicalMemory(B, device, dtype)
+        self.EnsurePhysicalMemory(B)
 
         if self._mem_keys.size(0) != B:
-            self._mem_keys = torch.zeros(B, cap, self.stoch_dim, device=device, dtype=dtype)
-            self._mem_vals = torch.zeros(B, cap, self.state_dim, device=device, dtype=dtype)
-            self._mem_imp = torch.zeros(B, cap, device=device, dtype=dtype)
-            self._mem_steps = torch.zeros(B, cap, device=device, dtype=torch.long)
-            self._mem_size = torch.zeros(B, device=device, dtype=torch.long)
-            self._mem_global_step = torch.zeros(B, device=device, dtype=torch.long)
+            self._mem_keys = self._mem_keys.new_zeros(B, cap, self.stoch_dim)
+            self._mem_vals = self._mem_vals.new_zeros(B, cap, self.state_dim)
+            self._mem_imp = self._mem_imp.new_zeros(B, cap)
+            self._mem_steps = self._mem_steps.new_zeros(B, cap)
+            self._mem_size = self._mem_size.new_zeros(B)
+            self._mem_global_step = self._mem_global_step.new_zeros(B)
 
-        if self._h.size(0) != B or self._h.device != device or self._h.dtype != dtype:
-            self._h = torch.zeros(B, self.deter_dim, device=device, dtype=dtype)
-            self._z = torch.zeros(B, self.stoch_dim, device=device, dtype=dtype)
+        if self._h.size(0) != B:
+            self._h = self.NewZeros(B, self.deter_dim)
+            self._z = self.NewZeros(B, self.stoch_dim)
             self._A_prev = None
 
-        self.s4.EnsureB(B, device, dtype)
+        self.s4.EnsureB(B)
 
 
     def BindMemoryContext(self, calibrationId: str, worldFrameId: str) -> None:
@@ -2295,7 +2288,7 @@ class RSSMWorldModel(AGICoreModule):
         self._mem_steps = new_steps
         self._mem_size = payload["mem_size"].to(device=dev, dtype=torch.long)
         self._mem_global_step = payload["mem_global_step"].to(device=dev, dtype=torch.long)
-        self.EnsureB(Bf, dev, dtyp)
+        self.EnsureB(Bf)
 
         float_buffers = {
             "_pst_slot_state": "pst_slot_state",
@@ -2761,7 +2754,7 @@ class RSSMWorldModel(AGICoreModule):
     @torch.no_grad()
     def ImportPhysicalState(self, physicalState: Dict[str, torch.Tensor]) -> None:
         reference = physicalState["SlotState"]
-        self.EnsurePhysicalMemory(int(reference.size(0)), self.device, self.dtype)
+        self.EnsurePhysicalMemory(int(reference.size(0)))
 
         def copy_from(buffer: torch.Tensor, key: str) -> None:
             buffer.copy_(physicalState[key])
@@ -2923,7 +2916,7 @@ class RSSMWorldModel(AGICoreModule):
             observedPst,
             cameraPoseWorld,
             robotPhysicalState)
-        self.EnsurePhysicalMemory(B, self.device, self.dtype)
+        self.EnsurePhysicalMemory(B)
 
         self._robot_physical_state.copy_(robotPhysicalState.detach())
 
@@ -3147,9 +3140,9 @@ class RSSMWorldModel(AGICoreModule):
         self._A_prev = None
 
         # PST is part of the world state even when episodic key/value memory is disabled.
-        self.EnsurePhysicalMemory(B, device, dtype)
+        self.EnsurePhysicalMemory(B)
         if self._use_memory:
-            self.EnsureB(B, device, self.dtype)
+            self.EnsureB(B)
 
     def ExportState(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self._h, self._z, self.s4.x
@@ -3633,8 +3626,7 @@ class RSSMWorldModel(AGICoreModule):
         """
 
         B = int(visionIn.size(0))
-        device, dtype = self.device, self.dtype
-        self.EnsureB(B, device, dtype)
+        self.EnsureB(B)
 
         raw_e = self.obs_enc(visionIn) # [B, stochDim]
         transition_embodied_action, transition_robot_world_context = self.BuildEmbodiedAction(
@@ -3777,8 +3769,7 @@ class RSSMWorldModel(AGICoreModule):
         pstBindCoef: float = 0.05,) -> Dict[str, torch.Tensor]:
 
         B = visionIn.size(0)
-        device, dtype = self.device, self.dtype
-        self.EnsureB(B, device, dtype)
+        self.EnsureB(B)
         sample = bool(self.training) if sample is None else bool(sample)
         update_memory = bool(self.training) if updateMemory is None else bool(updateMemory)
         update_memory = update_memory and bool(self.training)
@@ -4614,8 +4605,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         pstBindCoef = kwargs.get("pstBindCoef", 0.05)
 
         B = int(visionIn.size(0))
-        device, dtype = self.base.device, self.base.dtype
-        self.base.EnsureB(B, device, dtype)
+        self.base.EnsureB(B)
 
         d = deltasPerLayer[0] if (deltasPerLayer is not None) else {}
 
@@ -5508,7 +5498,7 @@ class TestWorldMTool:
     def TestPriorRolloutIsPureAndDeterministic(self) -> bool:
         wm = self.wm.train()
         wm.ResetState(batchSize=1)
-        wm.EnsureB(1, wm.device, wm.dtype)
+        wm.EnsureB(1)
         wm.ImportPhysicalState(self.MakePhysicalState(wm, 1, activeSlots=3))
         wm._h.normal_()
         wm._z.normal_()
@@ -5710,7 +5700,7 @@ class TestWorldMTool:
             for name, parameter in self.wm.named_parameters()}
         wm = self.wm.eval()
         wm.ResetState(batchSize=1)
-        wm.EnsureB(1, wm.device, wm.dtype)
+        wm.EnsureB(1)
         wm.ImportPhysicalState(self.MakePhysicalState(wm, 1, activeSlots=2))
         wrapper = WorldOnlineWrapper(wm, initRankEach=0, autoRank=False).to(self.device).train()
         spec = wrapper.sites["rew"]
@@ -6334,7 +6324,7 @@ class TestWorldMTool:
             B = 2
             wm.ResetState(batchSize=B)
             wm.ResetMemory()
-            wm.EnsureB(B, wm.device, wm.dtype)
+            wm.EnsureB(B)
             wm.MemAdd(
                 F.normalize(torch.randn(B, wm.stoch_dim, device=self.device), dim=-1),
                 torch.randn(B, wm.state_dim, device=self.device),
@@ -6404,7 +6394,7 @@ class TestWorldMTool:
             B = 1
             wm.ResetState(batchSize=B)
             wm.ResetMemory()
-            wm.EnsureB(B, wm.device, wm.dtype)
+            wm.EnsureB(B)
             wm.MemAdd(
                 F.normalize(torch.randn(B, wm.stoch_dim, device=self.device), dim=-1),
                 torch.randn(B, wm.state_dim, device=self.device),
@@ -6499,7 +6489,7 @@ class TestWorldMTool:
             B = 1
             wm.ResetState(batchSize=B)
             wm.ResetMemory()
-            wm.EnsureB(B, wm.device, wm.dtype)
+            wm.EnsureB(B)
             wm.MemAdd(
                 F.normalize(torch.randn(B, wm.stoch_dim, device=self.device), dim=-1),
                 torch.randn(B, wm.state_dim, device=self.device),
@@ -7644,7 +7634,7 @@ class TestWorldMTool:
             wm = self.wm.eval()
             B = 2
             wm.ResetState(batchSize=B)
-            wm.EnsureB(B, wm.device, wm.dtype)
+            wm.EnsureB(B)
             wm._h.fill_(1.0)
             wm._z.fill_(2.0)
             wm.s4.x.fill_(3.0)

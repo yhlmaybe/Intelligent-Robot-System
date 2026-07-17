@@ -83,17 +83,107 @@ def BuildReferenceScaleContext(
         unresolved], dim=-1)
 
 
-class GrowableLoRALinear(nn.Module):
-    def __init__(self, targetLinear: nn.Linear):
-        super().__init__()
-        assert isinstance(targetLinear, nn.Linear)
-        self.target = targetLinear
-        self.in_f = targetLinear.in_features
-        self.out_f = targetLinear.out_features
+@torch.no_grad()
+def SynchronizeDynamicAdapterTopology(
+    module: nn.Module,
+    stateDict: Dict[str, Any],
+    prefix: str,
+    shapeValidator: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], bool],
+    *,
+    authoritative: bool,) -> int:
+    """Restore committed dynamic-Adapter parameters before tensor loading."""
+    names = ("A_list", "B_list", "alpha")
+    topology_key = f"{prefix}topology_count"
 
-        self.A_list = nn.ParameterList()
-        self.B_list = nn.ParameterList()
-        self.alpha = nn.ParameterList()
+    def SavedIndices(name: str) -> set[int]:
+        key_prefix = f"{prefix}{name}."
+        return {
+            int(str(key)[len(key_prefix):])
+            for key in stateDict
+            if str(key).startswith(key_prefix)
+            and str(key)[len(key_prefix):].isdigit()}
+
+    index_sets = [SavedIndices(name) for name in names]
+    marker_present = topology_key in stateDict
+    label = prefix[:-1] or module.__class__.__name__
+    if not any(index_sets):
+        if not marker_present:
+            if authoritative:
+                raise ValueError(f"{label} is missing required topology_count")
+            return 0
+        saved_count = int(torch.as_tensor(stateDict[topology_key]).item())
+        if saved_count != 0:
+            raise ValueError(
+                f"{label} topology_count={saved_count} has no adapter entries")
+        replaced = len(module.A_list)
+        module.A_list = nn.ParameterList()
+        module.B_list = nn.ParameterList()
+        module.alpha = nn.ParameterList()
+        module.topology_count.zero_()
+        return replaced
+
+    expected = set(range(len(index_sets[0])))
+    if any(indices != expected for indices in index_sets):
+        raise ValueError(
+            f"{label} has inconsistent dynamic adapter topology: "
+            f"A={sorted(index_sets[0])}, B={sorted(index_sets[1])}, "
+            f"alpha={sorted(index_sets[2])}")
+    if not marker_present:
+        raise ValueError(f"{label} is missing required topology_count")
+    saved_count = int(torch.as_tensor(stateDict[topology_key]).item())
+    if saved_count != len(expected):
+        raise ValueError(
+            f"{label} topology_count={saved_count} does not match "
+            f"{len(expected)} saved adapter entries")
+
+    saved_shapes = []
+    for index in sorted(expected):
+        a_value = stateDict[f"{prefix}A_list.{index}"]
+        b_value = stateDict[f"{prefix}B_list.{index}"]
+        scale = stateDict[f"{prefix}alpha.{index}"]
+        if (
+            not all(torch.is_tensor(value) for value in (a_value, b_value, scale))
+            or not shapeValidator(a_value, b_value, scale)
+        ):
+            raise ValueError(
+                f"{label} dynamic adapter entry {index} has invalid shapes")
+        saved_shapes.append((int(a_value.size(0)), tuple(scale.shape)))
+
+    current_shapes = [
+        (int(a_value.size(0)), tuple(scale.shape))
+        for a_value, scale in zip(module.A_list, module.alpha)]
+    if (
+        len(module.A_list) == len(module.B_list) == len(module.alpha)
+        and current_shapes == saved_shapes
+    ):
+        module.topology_count.fill_(len(saved_shapes))
+        return 0
+
+    replaced = len(module.A_list)
+    module.A_list = nn.ParameterList()
+    module.B_list = nn.ParameterList()
+    module.alpha = nn.ParameterList()
+    reference = (
+        module.target.weight
+        if hasattr(module, "target")
+        else module.anchor_)
+    for rank, scale_shape in saved_shapes:
+        scale = torch.zeros(
+            scale_shape,
+            device=reference.device,
+            dtype=reference.dtype)
+        module.Grow(rank, init={"scale": scale}, freezeOld=True)
+    module.topology_count.fill_(len(saved_shapes))
+    return replaced
+
+
+class DynamicAdapterTopologyMixin:
+    def ValidateDynamicAdapterEntry(
+        self,
+        aValue: torch.Tensor,
+        bValue: torch.Tensor,
+        scale: torch.Tensor,) -> bool:
+        raise NotImplementedError
 
     @torch.no_grad()
     def SynchronizeCommittedTopology(
@@ -102,76 +192,12 @@ class GrowableLoRALinear(nn.Module):
         prefix: str,
         *,
         authoritative: bool,) -> int:
-        def saved_indices(field: str) -> set[int]:
-            field_prefix = f"{prefix}{field}."
-            return {
-                int(str(key)[len(field_prefix):])
-                for key in stateDict
-                if str(key).startswith(field_prefix)
-                and str(key)[len(field_prefix):].isdigit()}
-
-        a_indices = saved_indices("A_list")
-        b_indices = saved_indices("B_list")
-        alpha_indices = saved_indices("alpha")
-        if not authoritative and not (
-            a_indices or b_indices or alpha_indices
-        ):
-            return 0
-
-        label = prefix[:-1] or self.__class__.__name__
-        expected_indices = set(range(len(a_indices)))
-        if (
-            a_indices != expected_indices
-            or b_indices != expected_indices
-            or alpha_indices != expected_indices
-        ):
-            raise ValueError(
-                f"{label} has inconsistent committed LoRA topology: "
-                f"A={sorted(a_indices)}, B={sorted(b_indices)}, "
-                f"alpha={sorted(alpha_indices)}")
-
-        saved_shapes = []
-        for index in sorted(expected_indices):
-            a_value = stateDict[f"{prefix}A_list.{index}"]
-            b_value = stateDict[f"{prefix}B_list.{index}"]
-            alpha_value = stateDict[f"{prefix}alpha.{index}"]
-            if not all(torch.is_tensor(value) for value in (
-                a_value,
-                b_value,
-                alpha_value,
-            )):
-                raise TypeError(
-                    f"{label} committed LoRA entries must be tensors")
-            rank = int(a_value.size(0)) if a_value.ndim == 2 else -1
-            if (
-                tuple(a_value.shape) != (rank, self.in_f)
-                or tuple(b_value.shape) != (self.out_f, rank)
-                or alpha_value.numel() != 1
-            ):
-                raise ValueError(
-                    f"{label} committed LoRA entry {index} has invalid shapes")
-            saved_shapes.append((rank, tuple(alpha_value.shape)))
-
-        current_shapes = [
-            (int(a_value.size(0)), tuple(alpha_value.shape))
-            for a_value, alpha_value in zip(self.A_list, self.alpha)]
-        if current_shapes == saved_shapes:
-            return 0
-
-        replaced = len(self.A_list)
-        self.A_list = nn.ParameterList()
-        self.B_list = nn.ParameterList()
-        self.alpha = nn.ParameterList()
-        for rank, alpha_shape in saved_shapes:
-            alpha = torch.zeros(
-                alpha_shape,
-                device=self.target.weight.device,
-                dtype=self.target.weight.dtype)
-            self.Grow(
-                rank,
-                init={"scale": alpha},
-                freezeOld=True)
-        return replaced
+        return SynchronizeDynamicAdapterTopology(
+            self,
+            stateDict,
+            prefix,
+            self.ValidateDynamicAdapterEntry,
+            authoritative=authoritative)
 
     def _load_from_state_dict(
         self,
@@ -189,7 +215,6 @@ class GrowableLoRALinear(nn.Module):
                 authoritative=False)
         except (TypeError, ValueError) as error:
             error_msgs.append(str(error))
-
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -198,6 +223,34 @@ class GrowableLoRALinear(nn.Module):
             missing_keys,
             unexpected_keys,
             error_msgs)
+
+
+class GrowableLoRALinear(DynamicAdapterTopologyMixin, nn.Module):
+    def __init__(self, targetLinear: nn.Linear):
+        super().__init__()
+        assert isinstance(targetLinear, nn.Linear)
+        self.target = targetLinear
+        self.in_f = targetLinear.in_features
+        self.out_f = targetLinear.out_features
+
+        self.A_list = nn.ParameterList()
+        self.B_list = nn.ParameterList()
+        self.alpha = nn.ParameterList()
+        self.register_buffer(
+            "topology_count",
+            torch.zeros((), dtype=torch.int64),
+            persistent=True)
+
+    def ValidateDynamicAdapterEntry(
+        self,
+        aValue: torch.Tensor,
+        bValue: torch.Tensor,
+        scale: torch.Tensor,) -> bool:
+        rank = int(aValue.size(0)) if aValue.ndim == 2 else -1
+        return (
+            tuple(aValue.shape) == (rank, self.in_f)
+            and tuple(bValue.shape) == (self.out_f, rank)
+            and scale.numel() == 1)
 
     @torch.no_grad()
     def Grow(self, addRank: int, init: dict = None, freezeOld: bool = True):
@@ -221,6 +274,7 @@ class GrowableLoRALinear(nn.Module):
         self.A_list.append(A)
         self.B_list.append(B)
         self.alpha.append(s)
+        self.topology_count.fill_(len(self.A_list))
 
     def DeltaWeight(self) -> Optional[torch.Tensor]:
         if len(self.A_list) == 0:
@@ -240,18 +294,16 @@ class GrowableLoRALinear(nn.Module):
 
 
 @torch.no_grad()
-def SynchronizeGrowableLoRATopologyForFullLoad(
+def SynchronizeDynamicAdapterTopologiesForFullLoad(
     root: nn.Module,
     stateDict: Dict[str, Any],
     ) -> int:
-    """Make a full model artifact authoritative over committed LoRA topology."""
+    """Make a full model artifact authoritative over all committed adapters."""
     cleared = 0
     for module_name, module in root.named_modules():
-        if not isinstance(module, GrowableLoRALinear):
+        if not isinstance(module, DynamicAdapterTopologyMixin):
             continue
         prefix = f"{module_name}." if module_name else ""
-        if f"{prefix}target.weight" not in stateDict:
-            continue
         cleared += module.SynchronizeCommittedTopology(
             stateDict,
             prefix,
@@ -1164,7 +1216,9 @@ class TestFunctionToolsMTool:
             deployed = source(sample).detach()
             assert torch.allclose(deployed, expected, atol=1e-7, rtol=1e-6)
 
-            SynchronizeGrowableLoRATopologyForFullLoad(source.base, base_state)
+            SynchronizeDynamicAdapterTopologiesForFullLoad(
+                source.base,
+                base_state)
             source.base.load_state_dict(base_state, strict=True)
             source.ImportCandidateState(candidate_state)
             assert torch.equal(source(sample), expected)
@@ -1185,7 +1239,7 @@ class TestFunctionToolsMTool:
             restored = _TestOnlineBase()
             restored.adapter.Grow(1)
             assert len(restored.adapter.A_list) == 1
-            SynchronizeGrowableLoRATopologyForFullLoad(restored, saved)
+            SynchronizeDynamicAdapterTopologiesForFullLoad(restored, saved)
             restored.load_state_dict(saved, strict=True)
 
             x = torch.randn(4, 3)

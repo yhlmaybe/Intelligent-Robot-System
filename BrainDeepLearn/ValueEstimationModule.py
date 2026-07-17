@@ -36,7 +36,10 @@ class HebbianLinearFW(AGICoreModule):
         nn.init.orthogonal_(self.weight)
         nn.init.zeros_(self.bias)
 
-        self.register_buffer("H", torch.zeros(1, self.out_f, self.in_f))
+        self.register_buffer(
+            "H",
+            torch.zeros(1, self.out_f, self.in_f),
+            persistent=False)
 
         self.eta = float(eta)
         self.lam = float(lam)
@@ -46,23 +49,19 @@ class HebbianLinearFW(AGICoreModule):
         self.use_oja = bool(useOja)
 
     @torch.no_grad()
-    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
+    def EnsureB(self, B: int):
         if self.H.size(0) != B:
-            self.H = torch.zeros(B, self.out_f, self.in_f, device=device, dtype=dtype)
+            self.H = self.H.new_zeros(B, self.out_f, self.in_f)
 
     @torch.no_grad()
     def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
         if doneMask is None:
             self.H.zero_()
             return
-        if self.H.size(0) <= 0:
-            return
-        mask = doneMask.bool().view(-1)
-        n = min(int(mask.numel()), int(self.H.size(0)))
-        if n > 0:
-            rows = mask[:n].nonzero(as_tuple=False).view(-1)
-            if rows.numel() > 0:
-                self.H[rows] = 0
+        mask = doneMask.view(-1)
+        if mask.numel() != self.H.size(0):
+            raise ValueError("Value Hebbian reset mask must match its batch size")
+        self.H[mask] = 0
 
     @torch.no_grad()
     def ProjectCap(self):
@@ -75,9 +74,6 @@ class HebbianLinearFW(AGICoreModule):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         B = int(x.size(0))
-
-        device, dtype = self.device, self.dtype
-        self.EnsureB(B, device=device, dtype=dtype)
 
         W = self.weight
         b = self.bias if self.use_bias else None
@@ -127,11 +123,11 @@ class RunningEMA(AGICoreModule):
         self.register_buffer("var", torch.empty(0, dtype=torch.float32))
 
     @torch.no_grad()
-    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
+    def EnsureB(self, B: int):
         B = int(B)
         if self.mean.numel() != B:
-            self.mean = torch.zeros(B, device=device, dtype=dtype)
-            self.var = torch.ones(B, device=device, dtype=dtype)
+            self.mean = self.mean.new_zeros(B)
+            self.var = self.var.new_ones(B)
 
     @torch.no_grad()
     def ResetAll(self, doneMask: Optional[torch.Tensor] = None):
@@ -225,13 +221,13 @@ class UncertaintyCore(AGICoreModule):
 
 
     @torch.no_grad()
-    def EnsureB(self, B: int, device, dtype):
-        self.td_ema.EnsureB(B, device, dtype)
-        self.ent_ema.EnsureB(B, device, dtype)
-        self.state_ema.EnsureB(B, device, dtype)
-        self.tr_ema.EnsureB(B, device, dtype)
-        self.ph_ema.EnsureB(B, device, dtype)
-        self.ctx_ema.EnsureB(B, device, dtype)
+    def EnsureB(self, B: int):
+        self.td_ema.EnsureB(B)
+        self.ent_ema.EnsureB(B)
+        self.state_ema.EnsureB(B)
+        self.tr_ema.EnsureB(B)
+        self.ph_ema.EnsureB(B)
+        self.ctx_ema.EnsureB(B)
 
     @torch.no_grad()
     def ResetState(self, doneMask: Optional[torch.Tensor] = None):
@@ -252,7 +248,7 @@ class UncertaintyCore(AGICoreModule):
 
 
         B = int(stateCurr.size(0))
-        self.EnsureB(B, self.device, self.dtype)
+        self.EnsureB(B)
 
         H_prev = entropyPrev
         td_curr = tdCurr
@@ -1241,14 +1237,17 @@ class TemporalMicroGraph(AGICoreModule):
         self._step = 0
 
     @torch.no_grad()
-    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
+    def EnsureB(self, B: int):
         if self.anchor_value.size(0) == int(B):
             return
-        self.anchor_value = torch.zeros(B, self.max_anchors, self.value_dim, device=device, dtype=dtype)
-        self.anchor_value_next = torch.zeros(B, self.max_anchors, self.value_dim, device=device, dtype=dtype)
-        self.anchor_z = torch.zeros(B, self.max_anchors, self.z_dim, device=device, dtype=dtype)
-        self.filled = torch.zeros(B, device=device, dtype=torch.long)
-        self.ptr = torch.zeros(B, device=device, dtype=torch.long)
+        self.anchor_value = self.anchor_value.new_zeros(
+            B, self.max_anchors, self.value_dim)
+        self.anchor_value_next = self.anchor_value_next.new_zeros(
+            B, self.max_anchors, self.value_dim)
+        self.anchor_z = self.anchor_z.new_zeros(
+            B, self.max_anchors, self.z_dim)
+        self.filled = self.filled.new_zeros(B)
+        self.ptr = self.ptr.new_zeros(B)
         self._step = 0
 
     @torch.no_grad()
@@ -1276,7 +1275,7 @@ class TemporalMicroGraph(AGICoreModule):
         value: torch.Tensor,
         z: torch.Tensor,) -> Dict[str, torch.Tensor]:
         B = int(value.size(0))
-        self.EnsureB(B, value.device, value.dtype)
+        self.EnsureB(B)
 
         ar = torch.arange(self.max_anchors, device=value.device).view(1, self.max_anchors)
         valid = ar < self.filled.view(B, 1)
@@ -1323,7 +1322,7 @@ class TemporalMicroGraph(AGICoreModule):
         z: torch.Tensor,
         alive: torch.Tensor,):
         B = int(value.size(0))
-        self.EnsureB(B, value.device, value.dtype)
+        self.EnsureB(B)
         live = alive.view(B) > 0.5
         dead = ~live
         if dead.any():
@@ -1434,11 +1433,13 @@ class EmotionCore(AGICoreModule):
         self.mood[rows] = 0
 
 
-    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
+    def EnsureB(self, B: int):
         if self.h.size(0) != B:
-            self.h = torch.zeros(B, self.slowHidden, device=device, dtype=dtype)
-            self.c = torch.zeros(B, self.slowHidden, device=device, dtype=dtype)
-            self.mood = torch.zeros(B, self.emotionDim, device=device, dtype=dtype)
+            self.h = self.h.new_zeros(B, self.slowHidden)
+            self.c = self.c.new_zeros(B, self.slowHidden)
+            self.mood = self.mood.new_zeros(B, self.emotionDim)
+        self.fast_head.EnsureB(B)
+        self.slow_head.EnsureB(B)
 
     def forward(
         self,
@@ -1447,7 +1448,6 @@ class EmotionCore(AGICoreModule):
         stateCurr: torch.Tensor,) -> torch.Tensor:
 
         B = stateCurr.size(0)
-        self.EnsureB(B, self.device, self.dtype)
 
         h_prev = self.h # [B,H]
         c_prev = self.c # [B,H]
@@ -1766,12 +1766,13 @@ class ValueEstimationExtractor(AGICoreModule):
         nn.init.normal_(self.td_ot_cost_embed, mean=0.0, std=1.0 / math.sqrt(float(self.td_ot_cost_dim)))
         self.emotion_core.ResetParams()
 
-    def EnsureB(self, B: int, device: torch.device, dtype: torch.dtype):
-        self.td_out_ema.EnsureB(B, device, dtype)
-        self.micro.EnsureB(B, device, dtype)
+    def EnsureB(self, B: int):
+        self.td_out_ema.EnsureB(B)
+        self.micro.EnsureB(B)
+        self.emotion_core.EnsureB(B)
         if self.return_value_prev.shape != (B,):
-            self.return_value_prev = torch.zeros(B, device=device, dtype=dtype)
-            self.return_value_valid = torch.zeros(B, device=device, dtype=torch.bool)
+            self.return_value_prev = self.return_value_prev.new_zeros(B)
+            self.return_value_valid = self.return_value_valid.new_zeros(B)
 
         if self._last_batch_size is None:
             self._last_batch_size = int(B)
@@ -2585,7 +2586,7 @@ class ValueEstimationExtractor(AGICoreModule):
         )-> GeoTropicalOut: 
 
         B = state.size(0)
-        self.EnsureB(B, self.device, self.dtype)
+        self.EnsureB(B)
 
         if policyEntropyPrev is None:
             policyEntropyPrev = state.new_zeros(B)
@@ -2921,8 +2922,6 @@ class ValueEstimationExtractor(AGICoreModule):
     @torch.no_grad()
     def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
         self.emotion_core.ResetHebbianMemory(doneMask=doneMask)
-        if doneMask is not None:
-            self.ResetState(doneMask=doneMask)
 
     @torch.no_grad()
     def ResetState(self, doneMask: Optional[torch.Tensor] = None):
@@ -4288,6 +4287,14 @@ class TestValueEstimationMTool:
             ok &= not est.emotion_core.slow_head.use_hebbian
             ok &= torch.count_nonzero(est.emotion_core.fast_head.H).item() == 0
             ok &= torch.count_nonzero(est.emotion_core.slow_head.H).item() == 0
+            layer = HebbianLinearFW(4, 3, useHebbian=True).to(self.device)
+            layer.EnsureB(B)
+            value = torch.randn(B, 4, device=self.device)
+            expected = F.linear(value, layer.weight, layer.bias)
+            actual, _ = layer(value)
+            ok &= torch.allclose(actual, expected, atol=1e-7, rtol=1e-6)
+            ok &= torch.count_nonzero(layer.H).item() > 0
+            ok &= "H" not in layer.state_dict()
             print(f"HebbianFlag {'pass' if ok else 'fail'}")
             return bool(ok)
         except Exception as e:
@@ -4408,9 +4415,18 @@ class TestValueEstimationMTool:
                 _ = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
 
             done_mask = torch.tensor([True, False, True, False], device=self.device)
+            est.ResetState(doneMask=done_mask)
             est.ResetHebbianMemory(doneMask=done_mask)
 
             ok = True
+            ok &= torch.count_nonzero(
+                est.emotion_core.fast_head.H[done_mask]).item() == 0
+            ok &= torch.count_nonzero(
+                est.emotion_core.fast_head.H[~done_mask]).item() > 0
+            ok &= torch.count_nonzero(
+                est.emotion_core.slow_head.H[done_mask]).item() == 0
+            ok &= torch.count_nonzero(
+                est.emotion_core.slow_head.H[~done_mask]).item() > 0
             ok &= int(est.micro.filled[0].item()) == 0
             ok &= int(est.micro.filled[2].item()) == 0
             ok &= int(est.micro.filled[1].item()) > 0

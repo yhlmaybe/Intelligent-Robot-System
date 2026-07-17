@@ -239,20 +239,22 @@ class EligibilityTracePlasticityLayer(AGICoreModule):
         self.enabled = bool(enabled)
 
         self.base = nn.Parameter(torch.randn(outDim, inDim, device=self.device, dtype=self.dtype) * 0.02)
-        self.register_buffer("trace", torch.empty(0), persistent=True)
-        self.register_buffer("fast", torch.empty(0), persistent=True)
+        self.register_buffer("trace", torch.empty(0), persistent=False)
+        self.register_buffer("fast", torch.empty(0), persistent=False)
 
-    def EnsureBatch(self, B: int, device: torch.device, dtype: torch.dtype):
+    def EnsureB(self, B: int):
         if int(self.trace.size(0)) != B:
-            self.trace = torch.zeros(B, self.out_dim, self.in_dim, device=device, dtype=dtype)
-            self.fast = torch.zeros(B, self.out_dim, self.in_dim, device=device, dtype=dtype)
+            self.trace = self.base.new_zeros(B, self.out_dim, self.in_dim)
+            self.fast = self.base.new_zeros(B, self.out_dim, self.in_dim)
 
     def forward(self, x: torch.Tensor, neuromod: torch.Tensor) -> torch.Tensor:
         if not self.enabled:
             return F.linear(x, self.base)
 
         B = int(x.size(0))
-        self.EnsureBatch(B, self.device, self.dtype)
+        fast = self.fast.detach().clone()
+        w_eff = self.base.unsqueeze(0) + self.apply_scale * fast
+        out = torch.einsum("bi,boi->bo", x, w_eff)
 
         with torch.no_grad():
             mod = neuromod.detach().view(B, 1, 1)
@@ -264,14 +266,12 @@ class EligibilityTracePlasticityLayer(AGICoreModule):
                 scale = (self.max_row_norm / nrm).clamp_max(1.0)
                 self.fast = self.fast * scale.view(B, 1, 1)
 
-        w_eff = self.base.unsqueeze(0) + self.apply_scale * self.fast.detach()
-        return torch.einsum("bi,boi->bo", x, w_eff)
+        return out
 
     def Commit(self, pre: torch.Tensor, post: torch.Tensor, executeMask: torch.Tensor):
         if not self.enabled:
             return
         B = int(pre.size(0))
-        self.EnsureBatch(B, self.device, self.dtype)
         with torch.no_grad():
             outer = torch.einsum("bo,bi->boi", post.detach(), pre.detach())
             write = executeMask.view(B, 1, 1)
@@ -289,9 +289,11 @@ class EligibilityTracePlasticityLayer(AGICoreModule):
                 self.trace.zero_()
                 self.fast.zero_()
                 return
-            keep = (1.0 - doneMask.view(-1).to(self.trace.dtype)).view(-1, 1, 1)
-            self.trace.mul_(keep)
-            self.fast.mul_(keep)
+            mask = doneMask.view(-1)
+            if mask.numel() != self.trace.size(0):
+                raise ValueError("Decision Hebbian reset mask must match its batch size")
+            self.trace[mask] = 0
+            self.fast[mask] = 0
 
 
 class NeuroSymbolicConditioner(AGICoreModule):
@@ -618,6 +620,9 @@ class DecisionExtractor(AGICoreModule):
     def ClearInvalidEligibility(self, invalidMask: torch.Tensor) -> None:
         self.elig_plasticity.ClearTrace(invalidMask)
 
+    def EnsureB(self, B: int) -> None:
+        self.elig_plasticity.EnsureB(B)
+
     def forward(
         self,
         stateFeat: torch.Tensor,
@@ -640,6 +645,7 @@ class DecisionExtractor(AGICoreModule):
         deterministic: bool = False,) -> Dict[str, Any]:
 
         B = stateFeat.size(0)
+        self.EnsureB(B)
         # Preserve the critic coordinate contract when flattening for belief
         # assembly; this module does not reinterpret the remaining coordinates as
         # additional scalar returns.
@@ -803,7 +809,7 @@ class DecisionExtractor(AGICoreModule):
         baseActOut["temporal_decision"] = temporal_decision
         return baseActOut
 
-    def ResetHebbianMemory(self, value: float = 0.0, doneMask: Optional[torch.Tensor] = None):
+    def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None) -> None:
         for m in self.modules():
             if isinstance(m, EligibilityTracePlasticityLayer):
                 m.Reset(doneMask=doneMask)
@@ -1618,20 +1624,30 @@ class TestDecisionMTool:
         layer = EligibilityTracePlasticityLayer(
             3, 2, lam=0.5, eta=0.1, gamma=0.0,
             applyScale=1.0, maxRowNorm=0.0, enabled=True).to(self.device)
-        layer.EnsureBatch(2, self.device, x.dtype)
+        layer.EnsureB(2)
         layer.trace.fill_(1.0)
         layer.fast.zero_()
+        expected = F.linear(x, layer.base)
         post = layer(x, torch.tensor([1.0, 0.0], device=self.device))
         fast_after_feedback = layer.fast.detach().clone()
         layer.Commit(x, post, torch.tensor([1.0, 0.0], device=self.device))
         layer.fast[1].fill_(1.0)
         layer.ClearTrace(torch.tensor([False, True], device=self.device))
-        return bool(
+        behavior_ok = bool(
             disabled_ok
+            and torch.allclose(post, expected, atol=1e-7, rtol=1e-6)
+            and not {"trace", "fast"} & set(layer.state_dict())
             and torch.allclose(fast_after_feedback[0], torch.full_like(fast_after_feedback[0], 0.1))
             and torch.count_nonzero(fast_after_feedback[1]).item() == 0
             and torch.count_nonzero(layer.trace[1]).item() == 0
             and torch.all(layer.fast[1] == 1.0).item())
+        row_one = layer.fast[1].detach().clone()
+        layer.Reset(doneMask=torch.tensor([True, False], device=self.device))
+        reset_ok = bool(
+            torch.count_nonzero(layer.trace[0]).item() == 0
+            and torch.count_nonzero(layer.fast[0]).item() == 0
+            and torch.equal(layer.fast[1], row_one))
+        return behavior_ok and reset_ok
 
     def TestOptionSelectionChangesPhysicalAction(self) -> bool:
         torch.manual_seed(29)
