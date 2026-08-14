@@ -44,23 +44,18 @@ def Norm2d(C: int, groups: int = 32, desiredCpg: int = 16, mincpg: int = 8) -> n
     return nn.GroupNorm(num_groups=g, num_channels=C, affine=True)
 
 
-def FrobeniusCapPerSample(mem: torch.Tensor, cap: Optional[float]):
-    if cap is None:
-        return
+def FrobeniusCapPerSample(mem: torch.Tensor):
     with torch.no_grad():
         B = mem.size(0)
         flat = mem.reshape(B, -1)
         n = torch.linalg.vector_norm(flat, ord=2, dim=1)
-        scale = (cap / (n + 1e-12)).clamp(max=1.0) 
+        scale = (1.0 / (n + 1e-12)).clamp(max=1.0)
         mem.mul_(scale.view(B, *([1] * (mem.dim() - 1))))
 
 
 class GrowableLoRAConv2d(DynamicAdapterTopologyMixin, nn.Module):
     def __init__(self, targetConv: nn.Conv2d):
         super().__init__()
-        # The target convolution is owned by PerceiveExtractor.  Keeping this
-        # as a non-registered reference prevents one tensor from appearing
-        # twice under patch_embed.* and patch_adapter.target.* in state_dict.
         object.__setattr__(self, "target", targetConv)
         self.A_list = nn.ParameterList() 
         self.B_list = nn.ParameterList() 
@@ -283,34 +278,6 @@ class SheafGaugeConv2d(nn.Conv2d):
 
         self.gauge_scale = float(gauge_scale)
         self.gauge_bias_scale = float(gauge_bias_scale)
-        self._gauge_eval_active = False
-        self.RefreshGaugeExecutionFlag()
-        self.register_load_state_dict_post_hook(
-            self.RefreshGaugeExecutionAfterLoad)
-
-    @torch.no_grad()
-    def RefreshGaugeExecutionFlag(self) -> None:
-        self._gauge_eval_active = any(
-            bool(torch.count_nonzero(parameter.detach()).item())
-            for parameter in (
-                self.gauge_gamma.weight,
-                self.gauge_gamma.bias,
-                self.gauge_beta.weight,
-                self.gauge_beta.bias))
-
-    def RefreshGaugeExecutionAfterLoad(
-        self,
-        module: nn.Module,
-        incompatibleKeys: Any,
-        ) -> None:
-        del module, incompatibleKeys
-        self.RefreshGaugeExecutionFlag()
-
-    def train(self, mode: bool = True):
-        result = super().train(mode)
-        if not mode:
-            self.RefreshGaugeExecutionFlag()
-        return result
 
     def Shift(self, x: torch.Tensor, dim: int, step: int) -> torch.Tensor:
         if step == 0:
@@ -352,8 +319,6 @@ class SheafGaugeConv2d(nn.Conv2d):
         return x_cur
 
     def GaugeStep(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training and not self._gauge_eval_active:
-            return x
         mean = x.mean(dim=(-2, -1), keepdim=True)
         var = x.var(dim=(-2, -1), keepdim=True, unbiased=False)
         x_norm = (x - mean) / (var + self.eps).sqrt()
@@ -389,14 +354,7 @@ class HebbianConv2d(AGICoreModule):
         stride: int = 1,
         padding: int = 0,
         dilation: int = 1,
-        groups: int = 1,
-        hebbRate: float = 1e-3,
-        emaMomentum: float = 0.995,
-        applyScale: float = 0.25,
-        memNormCap: Optional[float] = 1.0,
-        bias: bool = False,
-        useHebbian: bool = True,
-        finiteDiagnostics: bool = False,):
+        groups: int = 1,):
         super().__init__()
         self.kernel_size = kernelSize if isinstance(kernelSize, tuple) else (kernelSize, kernelSize)
         self.stride = int(stride)
@@ -411,17 +369,7 @@ class HebbianConv2d(AGICoreModule):
             padding=self.padding,
             dilation=self.dilation,
             groups=self.groups,
-            bias=bias,)
-
-        self.hebb_rate = float(hebbRate)
-        self.ema_alpha = float(emaMomentum)
-        self.apply_scale = float(applyScale)
-        self.mem_norm_cap = memNormCap
-        self.use_hebbian = bool(useHebbian)
-        self.hebbian_capable = bool(useHebbian)
-        self.hebbian_update_period = 1
-        self._hebbian_update_step = 0
-        self.finite_diagnostics = bool(finiteDiagnostics)
+            bias=False,)
 
         self.register_buffer("hebb_memory", torch.empty(0), persistent=False)
 
@@ -451,94 +399,75 @@ class HebbianConv2d(AGICoreModule):
                 if int(mask.numel()) != int(self.hebb_memory.size(0)):
                     raise ValueError("doneMask batch size must match Hebbian convolution memory")
                 self.hebb_memory[mask] = 0
-                if bool(mask.all().item()):
-                    self._hebbian_update_step = 0
                 return
             self.hebb_memory.zero_()
-            self._hebbian_update_step = 0
-
-    def SetHebbianUpdatePeriod(self, period: int) -> None:
-        self.hebbian_update_period = max(1, int(period))
-        self._hebbian_update_step = 0
 
     def EnsureB(self, B: int):
         w = self.conv.weight
         if self.hebb_memory.size(0) != B:
             self.hebb_memory = w.new_zeros(B, *w.shape)
-            self._hebbian_update_step = 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.use_hebbian:
-            return self.conv(x)
-
         B, inC, H, W = x.shape
         w = self.conv.weight
         outC = w.size(0)
         g = self.groups
         in_per_g = inC // g
 
-        w_eff = w.unsqueeze(0) + self.apply_scale * self.hebb_memory.detach()
+        w_eff = w.unsqueeze(0) + 0.25 * self.hebb_memory.detach()
         x_big = x.reshape(1, B * inC, H, W)
         w_big = w_eff.reshape(
             B * outC,
             w.size(1),
             w.size(2),
             w.size(3))
+
         groups_total = B * g
-        b_big = (
-            None
-            if self.conv.bias is None
-            else self.conv.bias.repeat(B))
+
         out_big = F.conv2d(
             x_big,
             w_big,
-            b_big,
+            None,
             stride=self.stride,
             padding=self.padding,
             dilation=self.dilation,
             groups=groups_total,)
+
         Hout, Wout = out_big.shape[-2], out_big.shape[-1]
         out = out_big.reshape(B, outC, Hout, Wout)
-        if self.finite_diagnostics and not bool(torch.isfinite(out).all().item()):
-            raise FloatingPointError("Hebbian convolution produced non-finite output")
+        with torch.no_grad():
+            x_unfold = F.unfold(
+                x.detach(),
+                kernel_size=self.kernel_size,
+                padding=self.padding,
+                stride=self.stride,
+                dilation=self.dilation,)
 
-        should_update = (
-            self._hebbian_update_step % self.hebbian_update_period == 0)
-        self._hebbian_update_step += 1
-        if should_update:
-            with torch.no_grad():
-                x_unfold = F.unfold(
-                    x.detach(),
-                    kernel_size=self.kernel_size,
-                    padding=self.padding,
-                    stride=self.stride,
-                    dilation=self.dilation,)
+            out_unfold = out.detach().reshape(B, outC, -1)
+            L = out_unfold.size(-1)
+            N = float(L)
 
-                out_unfold = out.detach().reshape(B, outC, -1)
-                L = out_unfold.size(-1)
-                N = float(L) if L > 0 else 1.0
+            x_unfold_g = x_unfold.reshape(
+                B,
+                g,
+                in_per_g * (self.kernel_size[0] * self.kernel_size[1]),
+                L)
 
-                x_unfold_g = x_unfold.reshape(
-                    B,
-                    g,
-                    in_per_g * (self.kernel_size[0] * self.kernel_size[1]),
-                    L)
-                out_unfold_g = out_unfold.reshape(B, g, outC // g, L)
+            out_unfold_g = out_unfold.reshape(B, g, outC // g, L)
 
-                hebb_term = torch.einsum(
-                    "bgol,bgil->bgoi",
-                    out_unfold_g,
-                    x_unfold_g) / N
-                y2_mean = out_unfold_g.square().sum(dim=-1) / N
-                mem = self.hebb_memory.reshape(B, g, outC // g, -1)
-                decay = y2_mean.unsqueeze(-1) * mem
-                delta = self.hebb_rate * (hebb_term - decay)
-                delta = delta.reshape_as(self.hebb_memory)
+            hebb_term = torch.einsum(
+                "bgol,bgil->bgoi",
+                out_unfold_g,
+                x_unfold_g) / N
 
-                self.hebb_memory.mul_(self.ema_alpha).add_(
-                    delta,
-                    alpha=(1.0 - self.ema_alpha))
-                FrobeniusCapPerSample(self.hebb_memory, self.mem_norm_cap)
+            y2_mean = out_unfold_g.square().sum(dim=-1) / N
+            mem = self.hebb_memory.reshape(B, g, outC // g, -1)
+            decay_scale = 0.995 * torch.exp(
+                -(5e-6 / 0.995) * y2_mean.unsqueeze(-1))
+            mem.mul_(decay_scale)
+            mem.add_(hebb_term, alpha=5e-6)
+
+            FrobeniusCapPerSample(self.hebb_memory)
 
         return out
 
@@ -548,36 +477,13 @@ class HebbianLinear(AGICoreModule):
     def __init__(
         self,
         inFeatures: int,
-        outFeatures: int,
-        hebbRate: float = 1e-3,
-        emaMomentum: float = 0.995,
-        applyScale: float = 0.2,
-        memNormCap: Optional[float] = 1.0,
-        normalize: bool = False,  
-        weightConstraint: Optional[str] = None, 
-        bias: bool = True,
-        useHebbian: bool = True,):
+        outFeatures: int,):
         super().__init__()
         self.inFeatures = int(inFeatures)
         self.outFeatures = int(outFeatures)
-        self.use_bias = bool(bias)
 
         self.weight = nn.Parameter(torch.randn(outFeatures, inFeatures) * 0.01)
-        self.bias = (
-            nn.Parameter(torch.zeros(outFeatures))
-            if self.use_bias
-            else None)
-
-        self.hebb_rate = float(hebbRate)
-        self.ema_alpha = float(emaMomentum)
-        self.apply_scale = float(applyScale)
-        self.mem_norm_cap = memNormCap
-        self.normalize = bool(normalize)
-        self.weight_constraint = weightConstraint
-        self.use_hebbian = bool(useHebbian)
-        self.hebbian_capable = bool(useHebbian)
-        self.hebbian_update_period = 1
-        self._hebbian_update_step = 0
+        self.bias = nn.Parameter(torch.zeros(outFeatures))
 
         self.register_buffer("hebb_memory", torch.empty(0), persistent=False)
 
@@ -607,110 +513,44 @@ class HebbianLinear(AGICoreModule):
                 if int(mask.numel()) != int(self.hebb_memory.size(0)):
                     raise ValueError("doneMask batch size must match Hebbian linear memory")
                 self.hebb_memory[mask] = 0
-                if bool(mask.all().item()):
-                    self._hebbian_update_step = 0
                 return
             self.hebb_memory.zero_()
-            self._hebbian_update_step = 0
-
-    def SetHebbianUpdatePeriod(self, period: int) -> None:
-        self.hebbian_update_period = max(1, int(period))
-        self._hebbian_update_step = 0
 
     def EnsureB(self, B: int):
         if self.hebb_memory.size(0) != B:
             self.hebb_memory = self.weight.new_zeros(
                 B, self.outFeatures, self.inFeatures)
-            self._hebbian_update_step = 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.size(0)
-
-        if not self.use_hebbian:
-            y = F.linear(x, self.weight, self.bias if self.use_bias else None)
-            if not self.normalize:
-                return y
-            mean = y.mean(dim=-1, keepdim=True)
-            var = y.var(dim=-1, keepdim=True, unbiased=False)
-            return (y - mean) / torch.sqrt(var + 1e-5)
-
-        x2 = x.reshape(B, -1, self.inFeatures)  
+        x2 = x.reshape(B, -1, self.inFeatures)
         w_eff = (
             self.weight.unsqueeze(0)
-            + self.apply_scale * self.hebb_memory.detach())
+            + 0.2 * self.hebb_memory.detach())
         y2 = torch.einsum("bni,boi->bno", x2, w_eff)
-        if self.use_bias:
-            y2 = y2 + self.bias.view(1, 1, -1)
+        y2 = y2 + self.bias.view(1, 1, -1)
         y = y2.view(*x.shape[:-1], self.outFeatures)
 
-        if self.normalize:
-            mean = y.mean(dim=-1, keepdim=True)
-            var = y.var(dim=-1, keepdim=True, unbiased=False)
-            y_hat = (y - mean) / torch.sqrt(var + 1e-5)
-        else:
-            y_hat = y
+        with torch.no_grad():
+            N = float(y2.size(1))
+            hebb_term = torch.einsum("bno,bni->boi", y2, x2) / N
+            y_sq_mean = y2.square().mean(dim=1)
+            decay_scale = 0.995 * torch.exp(
+                -(5e-5 / 0.995) * y_sq_mean.unsqueeze(-1))
+            self.hebb_memory.mul_(decay_scale)
+            self.hebb_memory.add_(hebb_term, alpha=5e-5)
+            FrobeniusCapPerSample(self.hebb_memory)
 
-        should_update = (
-            self._hebbian_update_step % self.hebbian_update_period == 0)
-        self._hebbian_update_step += 1
-        if should_update:
-            with torch.no_grad():
-                yh2 = y_hat.reshape(B, -1, self.outFeatures)
-                N = float(yh2.size(1)) if yh2.size(1) > 0 else 1.0
-                hebb_term = torch.einsum("bno,bni->boi", yh2, x2) / N
-                y_sq_mean = yh2.square().mean(dim=1)
-                decay = y_sq_mean.unsqueeze(-1) * self.hebb_memory
-                delta = self.hebb_rate * (hebb_term - decay)
-
-                self.hebb_memory.mul_(self.ema_alpha).add_(
-                    delta,
-                    alpha=(1.0 - self.ema_alpha))
-
-                if self.weight_constraint == "clip":
-                    self.hebb_memory.clamp_(-1.0, 1.0)
-                elif self.weight_constraint == "norm":
-                    eps = 1e-8
-                    n = self.hebb_memory.norm(dim=-1, keepdim=True).clamp_min(eps)
-                    self.hebb_memory.div_(n)
-
-                FrobeniusCapPerSample(self.hebb_memory, self.mem_norm_cap)
-
-        return y_hat
+        return y
 
 
 
 class PerceptionRoPEMultiheadAttention(RoPEMultiheadAttention):
-    """Perception-local 2-D rotary attention; no shared module API changes."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Start from the 1-D base behavior; training can continuously introduce
-        # the 2-D spatial rotation.
-        self.rotary_2d_gain = nn.Parameter(torch.tensor(0.0))
-        self._rotary_2d_eval_active = False
-
-    @torch.no_grad()
-    def RefreshRotaryExecutionFlag(self) -> None:
-        self._rotary_2d_eval_active = bool(
-            torch.count_nonzero(self.rotary_2d_gain.detach()).item())
-
-    def train(self, mode: bool = True):
-        result = super().train(mode)
-        if not mode:
-            self.RefreshRotaryExecutionFlag()
-        return result
-
     def Apply2DRotary(
         self,
         value: torch.Tensor,
         positions: torch.Tensor,
-        spatialGain: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
-        if positions.dim() != 2 or positions.size(-1) != 2:
-            raise ValueError("rotaryPositions2D must have shape [T,2]")
-        if int(positions.size(0)) != int(value.size(-2)):
-            raise ValueError("rotaryPositions2D length must match the token sequence")
-
         rotary_dim = int(self.rope.dim)
         if rotary_dim <= 0:
             return value
@@ -728,6 +568,7 @@ class PerceptionRoPEMultiheadAttention(RoPEMultiheadAttention):
                     0,
                     device=value.device,
                     dtype=angle_dtype)
+
             inverse_frequency = 1.0 / (
                 self.rope.base ** (
                     torch.arange(
@@ -736,37 +577,23 @@ class PerceptionRoPEMultiheadAttention(RoPEMultiheadAttention):
                         2,
                         device=value.device,
                         dtype=angle_dtype) / float(dim)))
+
             angle = coordinate.to(
                 device=value.device,
                 dtype=angle_dtype).unsqueeze(1) * inverse_frequency.unsqueeze(0)
+
             return torch.repeat_interleave(angle, repeats=2, dim=-1)
 
         spatial_angle = torch.cat([
             axis_angle(row_dim, positions[:, 0]),
-            axis_angle(column_dim, positions[:, 1]),
-        ], dim=-1)
-        if spatialGain is not None:
-            sequence_coordinate = torch.arange(
-                int(value.size(-2)),
-                device=value.device,
-                dtype=angle_dtype)
-            legacy_frequency = self.rope.inv_freq.to(
-                device=value.device,
-                dtype=angle_dtype)
-            legacy_angle = torch.repeat_interleave(
-                torch.outer(sequence_coordinate, legacy_frequency),
-                repeats=2,
-                dim=-1)
-            gain = spatialGain.to(device=value.device, dtype=angle_dtype)
-            angle = legacy_angle + gain * (spatial_angle - legacy_angle)
-        else:
-            angle = spatial_angle
+            axis_angle(column_dim, positions[:, 1]),], dim=-1)
 
-        cosine = angle.cos().to(value.dtype).view(1, 1, -1, rotary_dim)
-        sine = angle.sin().to(value.dtype).view(1, 1, -1, rotary_dim)
+        cosine = spatial_angle.cos().to(value.dtype).view(1, 1, -1, rotary_dim)
+        sine = spatial_angle.sin().to(value.dtype).view(1, 1, -1, rotary_dim)
         rotary = value[..., :rotary_dim]
         rotated = rotary * cosine + self.rope.RotateHalf(rotary) * sine
         passthrough = value[..., rotary_dim:]
+
         return (
             rotated
             if passthrough.numel() == 0
@@ -777,43 +604,27 @@ class PerceptionRoPEMultiheadAttention(RoPEMultiheadAttention):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        rotaryPositions2D: torch.Tensor,
         keyPaddingMask: Optional[torch.Tensor] = None,
         needWeights: bool = True,
         attnMask: Optional[torch.Tensor] = None,
-        rotaryPositions2D: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if (
-            rotaryPositions2D is None
-            or (not self.training and not self._rotary_2d_eval_active)
-        ):
-            return super().forward(
-                query,
-                key,
-                value,
-                keyPaddingMask=keyPaddingMask,
-                needWeights=needWeights,
-                attnMask=attnMask)
-
         batch, query_length, _ = query.shape
         key_length = int(key.size(1))
-        if query_length != key_length:
-            raise ValueError("2-D rotary positions require self-attention")
 
         q_raw = self.ReshapeHeads(self.q_proj(query))
         k_raw = self.ReshapeHeads(self.k_proj(key))
         v = self.ReshapeHeads(self.v_proj(value))
-        rotary_gain = torch.tanh(self.rotary_2d_gain)
+
         q = self.Apply2DRotary(
             q_raw,
-            rotaryPositions2D,
-            spatialGain=rotary_gain)
+            rotaryPositions2D)
+
         k = self.Apply2DRotary(
             k_raw,
-            rotaryPositions2D,
-            spatialGain=rotary_gain)
+            rotaryPositions2D)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        negative_large = torch.finfo(scores.dtype).min
         if attnMask is not None:
             mask = self.PrepareMask(
                 attnMask,
@@ -821,22 +632,24 @@ class PerceptionRoPEMultiheadAttention(RoPEMultiheadAttention):
                 query_length,
                 key_length)
             scores = (
-                scores.masked_fill(mask, negative_large)
+                scores.masked_fill(mask, -torch.inf)
                 if mask.dtype == torch.bool
                 else scores + mask)
         if keyPaddingMask is not None:
             padding = keyPaddingMask.reshape(batch, 1, 1, key_length)
-            scores = scores.masked_fill(padding, negative_large)
+            scores = scores.masked_fill(padding, -torch.inf)
 
-        attention = F.softmax(scores, dim=-1)
-        attention = torch.nan_to_num(
-            attention,
+        attention_probability = F.softmax(scores, dim=-1)
+        attention_probability = torch.nan_to_num(
+            attention_probability,
             nan=0.0,
             posinf=0.0,
             neginf=0.0)
-        attention = self.attn_drop(attention)
+        attention = self.attn_drop(attention_probability)
         output = self.out_proj(self.MergeHeads(torch.matmul(attention, v)))
-        weights = attention.mean(dim=1) if needWeights else None
+        query_has_key = attention_probability.sum(dim=-1).gt(0).any(dim=1)
+        output = output.masked_fill(~query_has_key.unsqueeze(-1), 0.0)
+        weights = attention_probability.mean(dim=1) if needWeights else None
         return output, weights
 
 
@@ -859,9 +672,9 @@ class TransformerEncode(AGICoreModule):
     def forward(
         self,
         src: torch.Tensor,
+        rotaryPositions2D: torch.Tensor,
         srcMask: Optional[torch.Tensor] = None,
         srcKeyPaddingMask: Optional[torch.Tensor] = None,
-        rotaryPositions2D: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         src_norm1 = self.norm1(src)
         src2, _ = self.self_atten(
@@ -880,7 +693,7 @@ class TransformerEncode(AGICoreModule):
     
 
 class ResidualBlock(AGICoreModule):
-    def __init__(self, inChannels: int, outChannels: int, stride: int = 1, useHebbian: bool = False):
+    def __init__(self, inChannels: int, outChannels: int, stride: int = 1):
         super().__init__()
         self.use_downsample = bool(stride != 1 or inChannels != outChannels)
         self.downsample = (
@@ -895,9 +708,11 @@ class ResidualBlock(AGICoreModule):
             if self.use_downsample
             else nn.Identity())
             
-        self.conv1 = HebbianConv2d(inChannels, outChannels, 3, stride=stride, padding=1,bias=False, useHebbian=useHebbian)
+        self.conv1 = HebbianConv2d(
+            inChannels, outChannels, 3, stride=stride, padding=1)
         self.bn1 = Norm2d(outChannels)
-        self.conv2 = HebbianConv2d(outChannels, outChannels, 3, stride=1, padding=1,bias=False, useHebbian=useHebbian)
+        self.conv2 = HebbianConv2d(
+            outChannels, outChannels, 3, stride=1, padding=1)
         self.bn2 = Norm2d(outChannels)
         self.relu = nn.SiLU() 
 
@@ -1689,26 +1504,32 @@ class ProjectiveTopologyDiagnostics(AGICoreModule):
 
 
 class CNNFeatureExtractor(AGICoreModule):
-    def __init__(self, inChannels: int = 3, baseChannels: int = 64, useHebbian: bool = True):
+    def __init__(self, inChannels: int = 3, baseChannels: int = 64):
         super().__init__()
-        self.conv1 = HebbianConv2d(inChannels, baseChannels, 7, stride=2, padding=3,bias=False, useHebbian=useHebbian)
+        self.conv1 = HebbianConv2d(
+            inChannels, baseChannels, 7, stride=2, padding=3)
         
         self.bn1 = Norm2d(baseChannels)
         self.relu = nn.SiLU() 
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        self.layer1 = self.make_layer(baseChannels, baseChannels, blocks=2, stride=1, useHebbian=useHebbian)
-        self.layer2 = self.make_layer(baseChannels, baseChannels*2, blocks=2, stride=2, useHebbian=useHebbian)
-        self.layer3 = self.make_layer(baseChannels*2, baseChannels*4, blocks=2, stride=2, useHebbian=useHebbian)
-        self.layer4 = self.make_layer(baseChannels*4, baseChannels*8, blocks=2, stride=2, useHebbian=useHebbian)
+        self.layer1 = self.make_layer(
+            baseChannels, baseChannels, blocks=2, stride=1)
+        self.layer2 = self.make_layer(
+            baseChannels, baseChannels*2, blocks=2, stride=2)
+        self.layer3 = self.make_layer(
+            baseChannels*2, baseChannels*4, blocks=2, stride=2)
+        self.layer4 = self.make_layer(
+            baseChannels*4, baseChannels*8, blocks=2, stride=2)
 
-        self.conv2 = HebbianConv2d(baseChannels*8, baseChannels*16, 3, stride=1, padding=1, bias=False, useHebbian=useHebbian)
+        self.conv2 = HebbianConv2d(
+            baseChannels*8, baseChannels*16, 3, stride=1, padding=1)
         self.bn2 = Norm2d(baseChannels*16)
 
-    def make_layer(self, inC, outC, blocks, stride, useHebbian):
-        layers = [ResidualBlock(inC, outC, stride=stride, useHebbian=useHebbian)]
+    def make_layer(self, inC, outC, blocks, stride):
+        layers = [ResidualBlock(inC, outC, stride=stride)]
         for _ in range(1, blocks):
-            layers.append(ResidualBlock(outC, outC, stride=1, useHebbian=useHebbian))
+            layers.append(ResidualBlock(outC, outC, stride=1))
         return nn.Sequential(*layers)
 
     def forward(
@@ -2094,8 +1915,6 @@ class PerceiveExtractor(AGICoreModule):
         embedDim: int = 512,
         numHeads: int = 8,
         numLayers: int = 6,
-        hebbRate: float = 0.01,
-        useHebbian: bool = True,
         baseChannels: int = 64,
         dropout: float = 0.1,
         posDrop: float = 0.1,
@@ -2112,13 +1931,11 @@ class PerceiveExtractor(AGICoreModule):
         self.embed_dim = int(embedDim)
         self.integrated_dim = int(embedDim * 2)
         self.object_token_count = int(objectTokenCount)
-        self.use_hebbian = useHebbian
         self.base_channels = baseChannels
 
         self.cnn_extractor = CNNFeatureExtractor(
             inChannels=3,
-            baseChannels=baseChannels,
-            useHebbian=useHebbian)
+            baseChannels=baseChannels)
         self.perception_enhancement = PerceptionEnhancementBlock(
             stemChannels=baseChannels)
 
@@ -2191,12 +2008,12 @@ class PerceiveExtractor(AGICoreModule):
 
         layers.append(nn.Linear(embedDim, hidden_dim, bias=True))
         layers.append(nn.GELU())
-        layers.append(HebbianLinear(hidden_dim, hidden_dim, hebbRate=hebbRate, useHebbian = useHebbian))
+        layers.append(HebbianLinear(hidden_dim, hidden_dim))
         layers.append(nn.Dropout(p=dropout))
 
         layers.append(nn.Linear(hidden_dim, embedDim, bias=True))
         layers.append(nn.GELU())
-        layers.append(HebbianLinear(embedDim, embedDim, hebbRate=hebbRate, useHebbian = useHebbian))
+        layers.append(HebbianLinear(embedDim, embedDim))
         layers.append(nn.Dropout(p=dropout))
 
         self.mlp = nn.Sequential(*layers)
@@ -2351,8 +2168,6 @@ class PerceiveExtractor(AGICoreModule):
         nn.init.constant_(self.precision_head[1].bias, 0.5413)
         nn.init.zeros_(self.dense_depth_refiner.output.weight)
         nn.init.zeros_(self.dense_depth_refiner.output.bias)
-        self._jetson_edge_policy_checked = False
-        self._jetson_auto_edge_policy = False
         self._cortical_eval_active = False
         self._patch_content_eval_active = False
         self._spp_eval_active = False
@@ -2373,9 +2188,6 @@ class PerceiveExtractor(AGICoreModule):
         self._dense_refiner_eval_active = bool(
             torch.count_nonzero(self.dense_depth_refiner.output.weight.detach()).item()
             or torch.count_nonzero(self.dense_depth_refiner.output.bias.detach()).item())
-        for layer in self.transformer_layers:
-            layer.self_atten.RefreshRotaryExecutionFlag()
-
     def RefreshInferenceExecutionFlagsAfterLoad(
         self,
         module: nn.Module,
@@ -2386,50 +2198,13 @@ class PerceiveExtractor(AGICoreModule):
 
     def train(self, mode: bool = True):
         result = super().train(mode)
-        if mode and self._jetson_auto_edge_policy:
-            self.ConfigureHebbianRuntime(
-                updatePeriod=1,
-                enabledLayerNames=None)
-            self._jetson_auto_edge_policy = False
-            self._jetson_edge_policy_checked = False
         if not mode:
             self.RefreshInferenceExecutionFlags()
         return result
 
-    @staticmethod
-    def IsJetsonOrinExecution(frame: torch.Tensor) -> bool:
-        if frame.device.type != "cuda" or not torch.cuda.is_available():
-            return False
-        try:
-            device_index = (
-                torch.cuda.current_device()
-                if frame.device.index is None
-                else int(frame.device.index))
-            device_name = torch.cuda.get_device_name(device_index).lower()
-            return "orin" in device_name or "tegra" in device_name
-        except Exception:
-            return False
-
-    def MaybeConfigureJetsonEdgeHebbian(self, frame: torch.Tensor) -> None:
-        if (
-            self.training
-            or not self.use_hebbian
-            or self._jetson_edge_policy_checked
-        ):
-            return
-        is_jetson = self.IsJetsonOrinExecution(frame)
-        if frame.device.type == "cuda" or is_jetson:
-            self._jetson_edge_policy_checked = True
-        if is_jetson:
-            self.ConfigureEdgeDeploymentHebbian(updatePeriod=4)
-            self._jetson_auto_edge_policy = True
-
     def EnsureB(self, B: int) -> None:
         for module in self.modules():
-            if (
-                isinstance(module, (HebbianConv2d, HebbianLinear))
-                and module.use_hebbian
-            ):
+            if isinstance(module, (HebbianConv2d, HebbianLinear)):
                 module.EnsureB(B)
 
     def BuildAugmentedPyramid(
@@ -2444,17 +2219,6 @@ class PerceiveExtractor(AGICoreModule):
             frame,
             prevVisualState,
             prevVisualValid)
-        if self._jetson_auto_edge_policy and not self.training:
-            enhancement_auxiliary = {
-                key: (
-                    value.to(torch.float16)
-                    if value.is_floating_point()
-                    else value)
-                for key, value in enhancement_auxiliary.items()}
-            enhancement_auxiliary = {
-                key: value
-                for key, value in enhancement_auxiliary.items()
-                if key in {"CorticalFastState", "CorticalSlowState"}}
         return (
             self.cnn_extractor(frame, stemResidual=stem_residual),
             enhancement_auxiliary)
@@ -2470,10 +2234,6 @@ class PerceiveExtractor(AGICoreModule):
             applyCorrection=(
                 self.training
                 or self._dense_refiner_eval_active))
-        if self._jetson_auto_edge_policy and not self.training:
-            dense_state = {
-                key: value.to(torch.float16)
-                for key, value in dense_state.items()}
         depthState.update(dense_state)
         return depthState
 
@@ -3269,7 +3029,6 @@ class PerceiveExtractor(AGICoreModule):
         frame = x
         batch_size = int(frame.size(0))
         self.ValidatePreviousVisualMask(frame, prevVisualValid)
-        self.MaybeConfigureJetsonEdgeHebbian(frame)
         self.EnsureB(batch_size)
         pyramid, enhancement_auxiliary = self.BuildAugmentedPyramid(
             frame,
@@ -3393,59 +3152,12 @@ class PerceiveExtractor(AGICoreModule):
 
             elif isinstance(m, HebbianLinear):
                 nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                nn.init.zeros_(m.bias)
 
     def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
         for module in self.modules():
             if isinstance(module, (HebbianConv2d, HebbianLinear)):
                 module.ResetHebbianMemory(doneMask=doneMask)
-
-    def ConfigureHebbianRuntime(
-        self,
-        *,
-        updatePeriod: int = 1,
-        enabledLayerNames: Optional[Iterable[str]] = None,
-        ) -> Dict[str, bool]:
-        """Configure online plasticity without removing any trained layer."""
-        selected = (
-            None
-            if enabledLayerNames is None
-            else frozenset(str(name) for name in enabledLayerNames))
-        available = {
-            name
-            for name, module in self.named_modules()
-            if isinstance(module, (HebbianConv2d, HebbianLinear))
-            and module.hebbian_capable}
-        if selected is not None:
-            unknown = selected - available
-            if unknown:
-                raise ValueError(
-                    f"unknown or non-plastic Hebbian layers: {sorted(unknown)}")
-
-        enabled = {}
-        for name, module in self.named_modules():
-            if not isinstance(module, (HebbianConv2d, HebbianLinear)):
-                continue
-            active = bool(
-                module.hebbian_capable
-                and (selected is None or name in selected))
-            module.use_hebbian = active
-            module.SetHebbianUpdatePeriod(updatePeriod)
-            if not active:
-                module.ResetHebbianMemory()
-            enabled[name] = active
-        return enabled
-
-    def ConfigureEdgeDeploymentHebbian(
-        self,
-        updatePeriod: int = 4,
-        ) -> Dict[str, bool]:
-        # Preserve online adaptation in high-level cortical integration while
-        # avoiding all convolutional per-sample memories/unfolds on Jetson.
-        return self.ConfigureHebbianRuntime(
-            updatePeriod=updatePeriod,
-            enabledLayerNames=("mlp.2", "mlp.6"))
 
 
 
@@ -3560,7 +3272,6 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         depth_valid = kwargs["depthValid"]
         batch_size = int(frame.size(0))
         self.base.ValidatePreviousVisualMask(frame, prevVisualValid)
-        self.base.MaybeConfigureJetsonEdgeHebbian(frame)
         self.base.EnsureB(batch_size)
         camera_intrinsics = self.base.CameraIntrinsicsBatch(batch_size)
 
@@ -4278,7 +3989,6 @@ class TestPerceptionMTool:
         self,
         imgSize: int = 32,
         *,
-        useHebbian: bool = False,
         enableRecallAuxiliary: bool = True,
         ) -> PerceiveExtractor:
         return PerceiveExtractor(
@@ -4290,7 +4000,6 @@ class TestPerceptionMTool:
             numLayers=1,
             baseChannels=8,
             objectTokenCount=4,
-            useHebbian=useHebbian,
             enableRecallAuxiliary=enableRecallAuxiliary).to(self.device)
 
     def RunRegressionCheck(self, name: str, check) -> bool:
@@ -4435,7 +4144,12 @@ class TestPerceptionMTool:
 
     def TestHebbianConv2d(self):
         try:
-            conv = HebbianConv2d(inChannels=3, outChannels=16, kernelSize=3, stride=1, padding=1, useHebbian=True).to(self.device)
+            conv = HebbianConv2d(
+                inChannels=3,
+                outChannels=16,
+                kernelSize=3,
+                stride=1,
+                padding=1).to(self.device)
             x = torch.randn(4, 3, 32, 32, device=self.device)
             conv.EnsureB(int(x.size(0)))
             expected = conv.conv(x)
@@ -4458,7 +4172,9 @@ class TestPerceptionMTool:
 
     def TestHebbianLinear(self):
         try:
-            lin = HebbianLinear(inFeatures=32, outFeatures=64, useHebbian=True).to(self.device)
+            lin = HebbianLinear(
+                inFeatures=32,
+                outFeatures=64).to(self.device)
             x = torch.randn(5, 32, device=self.device)
             lin.EnsureB(int(x.size(0)))
             expected = F.linear(x, lin.weight, lin.bias)
@@ -4479,9 +4195,74 @@ class TestPerceptionMTool:
             print(f"HebbianLinear test error: {e}")
             return False
 
+    def TestHebbianDecaySignAndCorrelation(self):
+        def check():
+            conv = HebbianConv2d(2, 1, 1).to(self.device).eval()
+            conv.EnsureB(1)
+            conv_input = torch.zeros(1, 2, 1, 1, device=self.device)
+            conv_input[:, 0] = 1.0
+            with torch.no_grad():
+                conv.conv.weight.zero_()
+                conv.conv.weight[0, 0, 0, 0] = 500.0
+                conv.hebb_memory.zero_()
+                conv.hebb_memory[0, 0, 1, 0, 0] = 0.5
+                _ = conv(conv_input)
+
+            expected_conv_memory = (
+                0.5
+                * 0.995
+                * math.exp(-(5e-6 / 0.995) * 500.0 ** 2))
+            conv_memory = float(conv.hebb_memory[0, 0, 1, 0, 0].item())
+            assert conv_memory > 0.0
+            assert math.isclose(
+                conv_memory,
+                expected_conv_memory,
+                rel_tol=1e-5,
+                abs_tol=1e-7)
+
+            linear = HebbianLinear(1, 1).to(self.device).eval()
+            linear.EnsureB(1)
+            zero_input = torch.zeros(1, 1, device=self.device)
+            with torch.no_grad():
+                linear.weight.zero_()
+                linear.bias.fill_(200.0)
+                linear.hebb_memory.fill_(0.5)
+                _ = linear(zero_input)
+
+            expected_linear_memory = (
+                0.5
+                * 0.995
+                * math.exp(-(5e-5 / 0.995) * 200.0 ** 2))
+            linear_memory = float(linear.hebb_memory.item())
+            assert linear_memory > 0.0
+            assert math.isclose(
+                linear_memory,
+                expected_linear_memory,
+                rel_tol=1e-5,
+                abs_tol=1e-7)
+
+            signed_input = torch.ones(1, 1, device=self.device)
+            with torch.no_grad():
+                linear.bias.fill_(-1.0)
+                linear.hebb_memory.fill_(1e-6)
+                signed_output = linear(signed_input)
+
+            assert float(signed_output.item()) < 0.0
+            assert float(linear.hebb_memory.item()) < 0.0
+
+        return self.RunRegressionCheck(
+            "HebbianDecaySignAndCorrelation",
+            check)
+
     def TestPerceiveExtractor(self):
         try:
-            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(512), imgSize=512, patchSize=1, embedDim=512, numHeads=8, numLayers=6, useHebbian=True).to(self.device)
+            model = PerceiveExtractor(
+                cameraIntrinsics=self.MakeCameraIntrinsics(512),
+                imgSize=512,
+                patchSize=1,
+                embedDim=512,
+                numHeads=8,
+                numLayers=6).to(self.device)
             x = torch.randn(2, 3, 512, 512, device=self.device)
             out = self.PerceptionForward(model, x)
             expected_dim = 512 * 2
@@ -4507,8 +4288,7 @@ class TestPerceptionMTool:
                 patchSize=1,
                 embedDim=embed_dim,
                 numHeads=8,
-                numLayers=6,
-                useHebbian=True).to(self.device)
+                numLayers=6).to(self.device)
             x = torch.randn(batch_size, 3, img_size, img_size, device=self.device)
 
             with torch.no_grad():
@@ -4537,8 +4317,7 @@ class TestPerceptionMTool:
                 embedDim=512,
                 numHeads=8,
                 numLayers=2,
-                baseChannels=16,
-                useHebbian=True).to(self.device)
+                baseChannels=16).to(self.device)
             x = torch.randn(B, 3, 64, 64, device=self.device)
 
             with torch.no_grad():
@@ -4607,8 +4386,7 @@ class TestPerceptionMTool:
                 numHeads=8,
                 numLayers=1,
                 baseChannels=8,
-                objectTokenCount=16,
-                useHebbian=False).to(self.device)
+                objectTokenCount=16).to(self.device)
             model.train()
             frames = torch.rand(B, 3, 64, 64, device=self.device)
             sensor_depth = torch.full((B, 1, 64, 64), 1.5, device=self.device)
@@ -4656,8 +4434,7 @@ class TestPerceptionMTool:
                 numHeads=8,
                 numLayers=1,
                 baseChannels=8,
-                objectTokenCount=16,
-                useHebbian=False).to(self.device)
+                objectTokenCount=16).to(self.device)
             assert trainer.recall_heads.enable_auxiliary and hasattr(trainer.recall_heads, "global_trunk")
             targets = self.MakeSyntheticTargets(
                 frames, target_depth, target_valid, target_normal, target_semantic)
@@ -4681,8 +4458,7 @@ class TestPerceptionMTool:
                 numHeads=8,
                 numLayers=1,
                 baseChannels=8,
-                objectTokenCount=16,
-                useHebbian=False).to(self.device)
+                objectTokenCount=16).to(self.device)
             load_result = runtime_model.load_state_dict(trainer.extractor.state_dict(), strict=False)
             assert any(key.startswith("recall_heads.reconstruction_head") for key in load_result.unexpected_keys)
             assert not any(key.startswith("recall_heads.global_trunk") for key in load_result.unexpected_keys)
@@ -4770,7 +4546,7 @@ class TestPerceptionMTool:
 
     def TrainStepSmoke(self):
         try:
-            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=True).to(self.device)
+            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
             model.train()
             head = nn.Linear(64 * 2, 16).to(self.device)
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
@@ -4804,7 +4580,7 @@ class TestPerceptionMTool:
 
     def NoNanAfterManySteps(self, steps: int = 30):
         try:
-            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=True).to(self.device)
+            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
             head = nn.Linear(128, 16).to(self.device)
             model.train(); head.train()
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
@@ -4833,7 +4609,7 @@ class TestPerceptionMTool:
 
     def ParamsActuallyChange(self, steps: int = 10):
         try:
-            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=True).to(self.device)
+            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
             head = nn.Linear(128, 16).to(self.device)
             model.train(); head.train()
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
@@ -4871,7 +4647,7 @@ class TestPerceptionMTool:
 
     def TestNormalTrainingConvergence(self, steps: int = 120, logEvery: int = 30):
         try:
-            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=True).to(self.device)
+            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
             head = nn.Linear(128, 16).to(self.device)
             model.train(); head.train()
 
@@ -4911,7 +4687,7 @@ class TestPerceptionMTool:
 
     def WrapperForwardEqualWhenNoInitRank(self):
         try:
-            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
             with torch.no_grad():
                 base.perception_enhancement.residual_gain.fill_(0.1)
             base.eval()
@@ -4920,7 +4696,9 @@ class TestPerceptionMTool:
 
             x = torch.randn(3, 3, 64, 64, device=self.device)
             with torch.no_grad():
+                base.ResetHebbianMemory()
                 y_base = self.PerceptionForward(base, x)
+                base.ResetHebbianMemory()
                 y_wrap = self.PerceptionForward(wrapper, x)
 
             for name in (
@@ -4952,7 +4730,7 @@ class TestPerceptionMTool:
 
     def WrapperAPIBasics(self):
         try:
-            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
             base.eval()
             wrapper = PerceptionOnlineWrapper(base=base, initRankEach=0).to(self.device)
             wrapper.train()
@@ -4986,7 +4764,7 @@ class TestPerceptionMTool:
     def WrapperManualGrowTrainAndCommit(self):
         try:
             img_size = 64
-            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(img_size), imgSize=img_size, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(img_size), imgSize=img_size, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
             base.eval()
 
             wrapper = PerceptionOnlineWrapper(base=base, initRankEach=4).to(self.device)
@@ -5064,7 +4842,9 @@ class TestPerceptionMTool:
             base.eval(); wrapper.eval()
             x_chk = torch.randn(2, 3, img_size, img_size, device=self.device)
             with torch.no_grad():
+                base.ResetHebbianMemory()
                 y0 = self.PerceptionForward(base, x_chk)
+                base.ResetHebbianMemory()
                 y1 = self.PerceptionForward(wrapper, x_chk)
             assert torch.allclose(y0.IntegratedFeat, y1.IntegratedFeat, atol=1e-6, rtol=1e-4), "base vs wrapper mismatch after commit."
 
@@ -5080,7 +4860,7 @@ class TestPerceptionMTool:
     def WrapperAutoGrowDecreaseRank(self):
         try:
             img_size = 64
-            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(img_size), imgSize=img_size, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(img_size), imgSize=img_size, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
             base.eval()
 
             wrapper = PerceptionOnlineWrapper(base=base, initRankEach=4).to(self.device)
@@ -5106,7 +4886,7 @@ class TestPerceptionMTool:
     def WrapperPipelineCompatible(self):
         try:
             img_size = 64
-            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(img_size), imgSize=img_size, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(img_size), imgSize=img_size, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
             wrapper = PerceptionOnlineWrapper(base=base, initRankEach=4).to(self.device)
             wrapper.train(); base.eval()
 
@@ -5158,7 +4938,7 @@ class TestPerceptionMTool:
     def WrapperAdaptiveGrowAndCommit(self):
         try:
             img_size = 64
-            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(img_size), imgSize=img_size, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(img_size), imgSize=img_size, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
             base.eval()
 
             wrapper = PerceptionOnlineWrapper(base=base, initRankEach=0, autoRank=True).to(self.device)
@@ -5256,7 +5036,7 @@ class TestPerceptionMTool:
 
     def GradCoverageReport(self, min_ratio: float = 0.60):
         try:
-            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=True).to(self.device)
+            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
             head = nn.Linear(128, 16).to(self.device)
             model.train(); head.train()
             opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
@@ -5295,45 +5075,45 @@ class TestPerceptionMTool:
             print(f"GradCoverageReport error: {e}")
             return False
 
-    def LossDecreasesWithHebbToggle(self, steps: int = 80):
+    def LossDecreasesWithHebbian(self, steps: int = 80):
         try:
-            for flag in (False, True):
-                model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=flag).to(self.device)
-                head = nn.Linear(128, 16).to(self.device)
-                model.train(); head.train()
-                opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
+            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
+            head = nn.Linear(128, 16).to(self.device)
+            model.train(); head.train()
+            opt = torch.optim.Adam(list(model.parameters()) + list(head.parameters()), lr=1e-3)
 
-                B = 16
-                data_x = torch.randn(B, 3, 64, 64, device=self.device)
-                data_y = torch.randn(B, 16, device=self.device)
+            B = 16
+            data_x = torch.randn(B, 3, 64, 64, device=self.device)
+            data_y = torch.randn(B, 16, device=self.device)
 
-                with torch.no_grad():
-                    start = F.mse_loss(head(self.PerceptionForward(model, data_x).IntegratedFeat), data_y).item()
+            with torch.no_grad():
+                start = F.mse_loss(head(self.PerceptionForward(model, data_x).IntegratedFeat), data_y).item()
 
-                hist = []
-                for _ in range(steps):
-                    pred = head(self.PerceptionForward(model, data_x).IntegratedFeat)
-                    loss = F.mse_loss(pred, data_y)
-                    opt.zero_grad(set_to_none=True)
-                    loss.backward()
-                    opt.step()
-                    hist.append(loss.item())
+            hist = []
+            for _ in range(steps):
+                pred = head(self.PerceptionForward(model, data_x).IntegratedFeat)
+                loss = F.mse_loss(pred, data_y)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+                hist.append(loss.item())
 
-                end = hist[-1]
-                tail_mean = sum(hist[-10:]) / min(10, len(hist))
-                assert tail_mean <= 0.5 * start, f"Hebbian={flag} insufficient convergence: start={start:.4f}, tail_mean={tail_mean:.4f}"
-                print(f"LossDecreasesWithHebbToggle({flag}) passed. start={start:.4f} -> end={end:.4f}")
+            end = hist[-1]
+            tail_mean = sum(hist[-10:]) / min(10, len(hist))
+            assert tail_mean <= 0.5 * start, f"Hebbian insufficient convergence: start={start:.4f}, tail_mean={tail_mean:.4f}"
+            print(f"LossDecreasesWithHebbian passed. start={start:.4f} -> end={end:.4f}")
             return True
         except AssertionError as e:
-            print(f"LossDecreasesWithHebbToggle failed: {e}")
+            print(f"LossDecreasesWithHebbian failed: {e}")
             return False
         except Exception as e:
-            print(f"LossDecreasesWithHebbToggle error: {e}")
+            print(f"LossDecreasesWithHebbian error: {e}")
             return False
 
     def HebbianMemoryLifecycle(self):
         try:
-            conv = HebbianConv2d(3, 8, 3, stride=1, padding=1, useHebbian=True).to(self.device)
+            conv = HebbianConv2d(
+                3, 8, 3, stride=1, padding=1).to(self.device)
             x = torch.randn(4, 3, 32, 32, device=self.device)
             conv.EnsureB(int(x.size(0)))
             n0 = conv.hebb_memory.norm().item()
@@ -5345,7 +5125,7 @@ class TestPerceptionMTool:
             n2 = conv.hebb_memory.norm().item()
             assert n2 < 1e-12, f"Conv Hebbian memory unclear zero: now={n2:.3e}"
 
-            lin = HebbianLinear(32, 16, useHebbian=True).to(self.device)
+            lin = HebbianLinear(32, 16).to(self.device)
             z = torch.randn(6, 32, device=self.device)
             lin.EnsureB(int(z.size(0)))
             n0 = lin.hebb_memory.norm().item()
@@ -5368,7 +5148,7 @@ class TestPerceptionMTool:
 
     def WrapperKeepsBaseEval(self):
         try:
-            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16, useHebbian=False).to(self.device)
+            base = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8, numLayers=2, baseChannels=16).to(self.device)
             wrapper = PerceptionOnlineWrapper(base=base, initRankEach=0).to(self.device)
             wrapper.train()
             assert wrapper.training and (not base.training), "When wrapper.train() is used, base should be eval()"
@@ -5383,7 +5163,7 @@ class TestPerceptionMTool:
 
     def SmallBatchSafety(self):
         try:
-            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8,numLayers=2, baseChannels=16, useHebbian=True).to(self.device)
+            model = PerceiveExtractor(cameraIntrinsics=self.MakeCameraIntrinsics(64), imgSize=64, patchSize=1, embedDim=64, numHeads=8,numLayers=2, baseChannels=16).to(self.device)
             head = nn.Linear(128, 16).to(self.device)
             model.eval(); head.train()  
             x = torch.randn(1, 3, 64, 64, device=self.device)
@@ -5830,43 +5610,34 @@ class TestPerceptionMTool:
                 3,
                 4,
                 3,
-                padding=1,
-                useHebbian=True).to(self.device)
+                padding=1).to(self.device)
             conv.EnsureB(2)
             _ = conv(torch.rand(2, 3, 8, 8, device=self.device))
             assert torch.count_nonzero(conv.hebb_memory) > 0
             conv.load_state_dict(conv.state_dict(), strict=True)
             assert torch.count_nonzero(conv.hebb_memory) == 0
-            assert conv._hebbian_update_step == 0
             conv.hebb_memory.fill_(1.0)
-            conv._hebbian_update_step = 3
             conv.ResetHebbianMemory(doneMask=torch.ones(
                 2,
                 device=self.device,
                 dtype=torch.bool))
             assert torch.count_nonzero(conv.hebb_memory) == 0
-            assert conv._hebbian_update_step == 0
 
             linear = HebbianLinear(
                 8,
-                4,
-                bias=False,
-                useHebbian=True).to(self.device)
-            assert linear.bias is None
+                4).to(self.device)
+            assert linear.bias is not None
             linear.EnsureB(2)
             _ = linear(torch.rand(2, 8, device=self.device))
             assert torch.count_nonzero(linear.hebb_memory) > 0
             linear.load_state_dict(linear.state_dict(), strict=True)
             assert torch.count_nonzero(linear.hebb_memory) == 0
-            assert linear._hebbian_update_step == 0
             linear.hebb_memory.fill_(1.0)
-            linear._hebbian_update_step = 3
             linear.ResetHebbianMemory(doneMask=torch.ones(
                 2,
                 device=self.device,
                 dtype=torch.bool))
             assert torch.count_nonzero(linear.hebb_memory) == 0
-            assert linear._hebbian_update_step == 0
 
             trainer = PerceptionTrainer(
                 cameraIntrinsics=self.MakeCameraIntrinsics(32),
@@ -5876,8 +5647,7 @@ class TestPerceptionMTool:
                 numHeads=4,
                 numLayers=1,
                 baseChannels=8,
-                objectTokenCount=4,
-                useHebbian=False).to(self.device)
+                objectTokenCount=4).to(self.device)
             assert trainer.recall_heads is trainer.extractor.recall_heads
             trainer_state_keys = tuple(trainer.state_dict())
             assert not any(
@@ -5921,45 +5691,18 @@ class TestPerceptionMTool:
                 3,
                 4,
                 3,
-                padding=1,
-                useHebbian=True).to(self.device).train()
+                padding=1).to(self.device).train()
             value = torch.rand(3, 3, 8, 8, device=self.device)
             layer.EnsureB(int(value.size(0)))
-            layer.SetHebbianUpdatePeriod(4)
             _ = layer(value)
             before = layer.hebb_memory.clone()
-            update_step = layer._hebbian_update_step
             layer.ResetHebbianMemory(doneMask=torch.tensor(
                 [False, True, False],
                 device=self.device))
             assert torch.equal(layer.hebb_memory[0], before[0])
             assert torch.count_nonzero(layer.hebb_memory[1]) == 0
             assert torch.equal(layer.hebb_memory[2], before[2])
-            assert layer._hebbian_update_step == update_step
         return self.RunRegressionCheck("HebbianPartialRowReset", check)
-
-    def TestHebbianDisabledFastPath(self):
-        def check():
-            layer = HebbianConv2d(
-                3,
-                4,
-                3,
-                padding=1,
-                useHebbian=False).to(self.device)
-            value = torch.rand(
-                2,
-                3,
-                8,
-                8,
-                device=self.device,
-                requires_grad=True)
-            assert torch.allclose(
-                layer(value),
-                layer.conv(value),
-                atol=1e-6,
-                rtol=1e-5)
-            assert layer.hebb_memory.numel() == 0
-        return self.RunRegressionCheck("HebbianDisabledFastPath", check)
 
     def TestHebbianEvalPlasticity(self):
         def check():
@@ -5967,8 +5710,7 @@ class TestPerceptionMTool:
                 3,
                 4,
                 3,
-                padding=1,
-                useHebbian=True).to(self.device).eval()
+                padding=1).to(self.device).eval()
             value = torch.rand(2, 3, 8, 8, device=self.device)
             layer.EnsureB(int(value.size(0)))
             expected = layer.conv(value)
@@ -5979,69 +5721,6 @@ class TestPerceptionMTool:
             assert torch.count_nonzero(before) > 0
             assert not torch.equal(layer.hebb_memory, before)
         return self.RunRegressionCheck("HebbianEvalPlasticity", check)
-
-    def TestEdgeHebbianPolicy(self):
-        def check():
-            model = self.MakeRegressionModel(
-                useHebbian=True,
-                enableRecallAuxiliary=False)
-            enabled = model.ConfigureEdgeDeploymentHebbian(updatePeriod=4)
-            assert {
-                name for name, active in enabled.items() if active
-            } == {"mlp.2", "mlp.6"}
-            for name, module in model.named_modules():
-                if isinstance(module, HebbianConv2d):
-                    assert not module.use_hebbian
-                    assert module.hebb_memory.numel() == 0
-                if name in {"mlp.2", "mlp.6"}:
-                    assert module.use_hebbian
-                    assert module.hebbian_update_period == 4
-
-            automatic = self.MakeRegressionModel(
-                useHebbian=True,
-                enableRecallAuxiliary=False)
-            with torch.no_grad():
-                automatic.perception_enhancement.residual_gain.fill_(0.1)
-            automatic.eval()
-            automatic.IsJetsonOrinExecution = lambda frame: True
-            frame = torch.rand(1, 3, 32, 32, device=self.device)
-            depth = torch.ones(1, 1, 32, 32, device=self.device)
-            automatic_state = automatic(
-                frame,
-                topDownContext=self.MakeTopDownContext(automatic, 1),
-                depth=depth,
-                depthValid=torch.ones_like(depth, dtype=torch.bool),
-                **self.CameraTemporalInputs(frame))
-            assert automatic._jetson_auto_edge_policy
-            assert automatic_state.Auxiliary[
-                "MetricDepthFullRes"].dtype == torch.float16
-            assert automatic_state.Auxiliary[
-                "CorticalFastState"].dtype == torch.float16
-            assert automatic_state.Auxiliary[
-                "CorticalSlowState"].dtype == torch.float16
-            assert "CorticalEnergy" not in automatic_state.Auxiliary
-            continued_state = automatic(
-                frame,
-                topDownContext=self.MakeTopDownContext(automatic, 1),
-                depth=depth,
-                depthValid=torch.ones_like(depth, dtype=torch.bool),
-                prevVisualState=automatic_state,
-                **self.CameraTemporalInputs(frame, automatic_state))
-            assert continued_state.Auxiliary[
-                "CorticalFastState"].dtype == torch.float16
-            assert torch.isfinite(continued_state.IntegratedFeat).all()
-            assert all(
-                not module.use_hebbian
-                for module in automatic.modules()
-                if isinstance(module, HebbianConv2d))
-            automatic.train()
-            assert not automatic._jetson_auto_edge_policy
-            assert all(
-                module.use_hebbian
-                for module in automatic.modules()
-                if isinstance(module, HebbianConv2d)
-                and module.hebbian_capable)
-        return self.RunRegressionCheck("EdgeHebbianPolicy", check)
 
     def TestNonSquarePatchSupervision(self):
         def check():
@@ -6247,42 +5926,85 @@ class TestPerceptionMTool:
             legacy_attention = RoPEMultiheadAttention(
                 embedDim=24,
                 numHeads=4).to(self.device)
-            legacy_attention.load_state_dict({
-                name: value
-                for name, value in attention.state_dict().items()
-                if name != "rotary_2d_gain"}, strict=True)
+            legacy_attention.load_state_dict(
+                attention.state_dict(),
+                strict=True)
             legacy_output, _ = legacy_attention(
                 tokens,
                 tokens,
                 tokens)
-            assert torch.allclose(
-                attended,
-                legacy_output,
-                atol=1e-6,
-                rtol=1e-5)
-            with torch.no_grad():
-                attention.rotary_2d_gain.fill_(0.5)
-            attention.eval()
             raw_heads = attention.ReshapeHeads(attention.q_proj(tokens))
             rotated_heads = attention.Apply2DRotary(
                 raw_heads,
-                positions,
-                spatialGain=torch.tanh(attention.rotary_2d_gain))
+                positions)
             assert torch.allclose(
                 rotated_heads.norm(dim=-1),
                 raw_heads.norm(dim=-1),
                 atol=1e-5,
                 rtol=1e-5)
-            spatial_output, _ = attention(
+            adjacent_channels = torch.arange(
+                6,
+                device=self.device,
+                dtype=torch.float32)
+            assert torch.equal(
+                attention.rope.RotateHalf(adjacent_channels),
+                torch.tensor(
+                    [-1.0, 0.0, -3.0, 2.0, -5.0, 4.0],
+                    device=self.device))
+            assert not torch.allclose(
+                attended,
+                legacy_output,
+                atol=1e-7,
+                rtol=1e-6)
+
+            full_query_mask = torch.zeros(
+                7,
+                7,
+                device=self.device,
+                dtype=torch.bool)
+            full_query_mask[2] = True
+            masked_output, masked_weights = attention(
+                tokens,
+                tokens,
+                tokens,
+                rotaryPositions2D=positions,
+                attnMask=full_query_mask)
+            assert torch.count_nonzero(masked_output[:, 2]).item() == 0
+            assert torch.count_nonzero(masked_weights[:, 2]).item() == 0
+
+            full_padding_mask = torch.ones(
+                2,
+                7,
+                device=self.device,
+                dtype=torch.bool)
+            base_masked_output, base_masked_weights = legacy_attention(
+                tokens,
+                tokens,
+                tokens,
+                keyPaddingMask=full_padding_mask)
+            assert torch.count_nonzero(base_masked_output).item() == 0
+            assert torch.count_nonzero(base_masked_weights).item() == 0
+
+            dropout_attention = PerceptionRoPEMultiheadAttention(
+                embedDim=24,
+                numHeads=4,
+                dropout=0.5).to(self.device).train()
+            torch.manual_seed(1)
+            _, dropout_weights_1 = dropout_attention(
                 tokens,
                 tokens,
                 tokens,
                 rotaryPositions2D=positions)
-            assert not torch.allclose(
-                spatial_output,
-                legacy_output,
-                atol=1e-7,
-                rtol=1e-6)
+            torch.manual_seed(2)
+            _, dropout_weights_2 = dropout_attention(
+                tokens,
+                tokens,
+                tokens,
+                rotaryPositions2D=positions)
+            assert torch.equal(dropout_weights_1, dropout_weights_2)
+            assert torch.allclose(
+                dropout_weights_1.sum(dim=-1),
+                torch.ones_like(dropout_weights_1[..., 0]))
         return self.RunRegressionCheck("SPPAndAxialPositionEncoding", check)
 
     def TestProjectiveTopologyDiagnostics(self):
@@ -6638,8 +6360,8 @@ class TestPerceptionMTool:
                 "patch": 0,
                 "spp": 0,
                 "dense": 0,
-                "gauge_gamma": 0,
-                "gauge_beta": 0,}
+                "gauge_gamma": 1,
+                "gauge_beta": 1,}
         return self.RunRegressionCheck("EvalSkipsZeroGainEnhancements", check)
 
     def TestEnhancementGradientCoverage(self):
@@ -6664,7 +6386,6 @@ class TestPerceptionMTool:
                 model.perception_enhancement.residual_gain,
                 model.spp_context.residual_gain,
                 model.axial_position_gain,
-                model.transformer_layers[0].self_atten.rotary_2d_gain,
                 model.dense_depth_refiner.output.weight,
                 model.patch_content_projection.weight,):
                 assert parameter.grad is not None
@@ -6692,8 +6413,7 @@ class TestPerceptionMTool:
                 numHeads=4,
                 numLayers=1,
                 baseChannels=8,
-                objectTokenCount=4,
-                useHebbian=False).to(self.device).eval()
+                objectTokenCount=4).to(self.device).eval()
             depth = torch.ones(B, 1, H, H, device=self.device)
             depth_valid = torch.ones_like(depth, dtype=torch.bool)
             top_down = self.MakeTopDownContext(model, B)
@@ -6779,6 +6499,7 @@ class TestPerceptionMTool:
         results = {
             "HebbianConv2d": self.TestHebbianConv2d(),
             "HebbianLinear": self.TestHebbianLinear(),
+            "HebbianDecaySignAndCorrelation": self.TestHebbianDecaySignAndCorrelation(),
             "PerceiveExtractorForward": self.TestPerceiveExtractor(),
             "PerceiveExtractorIOShapes": self.TestPerceiveExtractorIOShapes(),
             "PerceiveExtractorStructuredState": self.TestPerceiveExtractorStructuredState(),
@@ -6791,9 +6512,7 @@ class TestPerceptionMTool:
             "InternalRegistrationAndTransientState": self.TestInternalRegistrationAndTransientState(),
             "PartialAdapterLoadPreservesRank": self.TestPartialAdapterLoadPreservesRank(),
             "HebbianPartialRowReset": self.TestHebbianPartialRowReset(),
-            "HebbianDisabledFastPath": self.TestHebbianDisabledFastPath(),
             "HebbianEvalPlasticity": self.TestHebbianEvalPlasticity(),
-            "EdgeHebbianPolicy": self.TestEdgeHebbianPolicy(),
             "NonSquarePatchSupervision": self.TestNonSquarePatchSupervision(),
             "AnisotropicDiffusionStability": self.TestAnisotropicDiffusionStability(),
             "CorticalGaborTemporalReset": self.TestCorticalGaborTemporalReset(),
@@ -6818,7 +6537,7 @@ class TestPerceptionMTool:
             "WrapperPipelineCompatible": self.WrapperPipelineCompatible(),
             "WrapperAdaptiveGrowAndCommit": self.WrapperAdaptiveGrowAndCommit(),
             "GradCoverageReport": self.GradCoverageReport(),
-            "LossDecreasesWithHebbToggle": self.LossDecreasesWithHebbToggle(),
+            "LossDecreasesWithHebbian": self.LossDecreasesWithHebbian(),
             "HebbianMemoryLifecycle": self.HebbianMemoryLifecycle(),
             "WrapperKeepsBaseEval": self.WrapperKeepsBaseEval(),
             "SmallBatchSafety": self.SmallBatchSafety(),

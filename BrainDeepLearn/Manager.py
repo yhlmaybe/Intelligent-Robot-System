@@ -691,13 +691,11 @@ class ManagerFunction:
 
     def InitAgentHandle(
         self,
-        useHebbian: bool = True,
         usePlanner: bool = True,):
         calibration = self.LoadCameraCalibration()
         self.camera_calibration_id = calibration.calibration_id
         self.agent_handle = AgentHandle(
             calibration=calibration,
-            plasticHebbian=useHebbian,
             usePlanner=usePlanner,
             device=self.device)
         self.active_sensor_stream_id = None
@@ -2776,7 +2774,6 @@ class ManagerFunction:
             brain = BrainCore(
                 calibration=calibration,
                 device=self.device,
-                plasticHebbian=True,
                 plasticOnlineLearning=onlineLearning,
                 enablePerceptionSupervision=True)
 
@@ -4168,7 +4165,6 @@ class ManagerFunction:
 
     def DeployModule(
         self,
-        useHebbian: bool = True,
         usePlanner: bool = True,) -> Dict[str, Any]:
         """Initialize the push-stream runtime used by AgentHandleForward(Json).
 
@@ -4177,7 +4173,6 @@ class ManagerFunction:
         """
         try:
             self.InitAgentHandle(
-                useHebbian=useHebbian,
                 usePlanner=usePlanner)
             self.controller.SetStatus(
                 "is_begin",
@@ -4204,13 +4199,11 @@ class TestManagerMTool:
             manager.controller = ModuleController()
             result = ManagerFunction.DeployModule(
                 manager,
-                useHebbian=False,
                 usePlanner=False)
             ok = (
                 result == {"ok": True}
                 and ManagerFunction.DEFAULT_OVERRIDE_CHECKPOINT_WITH_MODULE_PARAMS is False
                 and captured == {
-                    "useHebbian": False,
                     "usePlanner": False})
             print(
                 f"Manager deployment configuration routing "
@@ -5492,7 +5485,6 @@ class AgentHandle:
         brainParameterPath: str = BasicParameters.MODULEPARAMETER_PATH,
         device: Optional[Union[str, torch.device]] = None,
         seqLen: int = BasicParameters.IMAGE_SEQ_LEN,
-        plasticHebbian: bool = True,
         usePlanner: bool = True,
         prioritizeExtStr: bool = True,
         saveModuleMessagerOutput: bool = True,):
@@ -5517,7 +5509,6 @@ class AgentHandle:
             calibration=calibration,
             device=self.device,
             seqLen=seqLen,
-            plasticHebbian=plasticHebbian,
             prioritizeExtStr=prioritizeExtStr,
             plasticOnlineLearning=False,
             usePlanner=usePlanner,

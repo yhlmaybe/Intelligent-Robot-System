@@ -15,20 +15,10 @@ class HebbianLinearFW(AGICoreModule):
     def __init__(
         self,
         inFeatures: int,
-        outFeatures: int,
-        bias: bool = True,
-        useHebbian = True,
-        *,
-        eta: float = 1e-3,
-        lam: float = 0.1,
-        betaMix: float = 0.1,
-        cap: float = 1.0,
-        useOja: bool = True,):
+        outFeatures: int,):
         super().__init__()
         self.in_f = int(inFeatures)
         self.out_f = int(outFeatures)
-        self.use_hebbian = useHebbian
-        self.use_bias = bool(bias)
 
         self.weight = nn.Parameter(torch.empty(self.out_f, self.in_f))
         self.bias = nn.Parameter(torch.zeros(self.out_f))
@@ -40,13 +30,6 @@ class HebbianLinearFW(AGICoreModule):
             "H",
             torch.zeros(1, self.out_f, self.in_f),
             persistent=False)
-
-        self.eta = float(eta)
-        self.lam = float(lam)
-        self.beta_mix = float(betaMix)
-
-        self.cap = cap
-        self.use_oja = bool(useOja)
 
     @torch.no_grad()
     def EnsureB(self, B: int):
@@ -65,28 +48,15 @@ class HebbianLinearFW(AGICoreModule):
 
     @torch.no_grad()
     def ProjectCap(self):
-        if self.cap is None:
-            return
-        
         n = self.H.norm(dim=-1, keepdim=True) # [B,O,1]
-        scale = (float(self.cap) / (n + 1e-12)).clamp_max(1.0)
+        scale = (1.0 / (n + 1e-12)).clamp_max(1.0)
         self.H.mul_(scale)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        B = int(x.size(0))
-
-        W = self.weight
-        b = self.bias if self.use_bias else None
-        y_base = F.linear(x, W, b) # [B,O]
-
-        if not self.use_hebbian:
-            extras = {"use_hebb": x.new_tensor(0.0)} 
-            return y_base, extras
+        y_base = F.linear(x, self.weight, self.bias) # [B,O]
 
         y_hebb = torch.bmm(self.H.detach().clone(), x.unsqueeze(-1)).squeeze(-1) # [B,O]
-
-        beta = x.new_tensor(self.beta_mix)  
-        y = y_base + beta * y_hebb
+        y = y_base + 0.1 * y_hebb
 
         with torch.no_grad():
             pre = x
@@ -97,14 +67,10 @@ class HebbianLinearFW(AGICoreModule):
 
             dH = post_n.unsqueeze(-1) * pre_n.unsqueeze(1) # [B,O,I]
 
-            if self.use_oja:
-                post_sq = (post_n ** 2).unsqueeze(-1) # [B,O,1]
-                dH = dH - self.H * post_sq
+            post_sq = (post_n ** 2).unsqueeze(-1) # [B,O,1]
+            dH = dH - self.H * post_sq
 
-            eta_t = x.new_tensor(self.eta).view(1, 1, 1)
-            lam_t = x.new_tensor(self.lam).view(1, 1, 1)
-
-            self.H.mul_(1.0 - lam_t).add_(eta_t * dH)
+            self.H.mul_(0.9).add_(0.001 * dH)
             self.ProjectCap()
 
         extras = {"H_norm": self.H.norm(dim=(1, 2)).detach(),} # [B]
@@ -1349,8 +1315,7 @@ class EmotionCore(AGICoreModule):
         emotionDim: int = 64,
         fastHidden: int = 128,
         slowHidden: int = 128,
-        moodDecay: float = 0.95,
-        useHebbHead: bool = True):
+        moodDecay: float = 0.95,):
         super().__init__()
 
         self.stateDim = stateDim
@@ -1360,7 +1325,6 @@ class EmotionCore(AGICoreModule):
         self.fastHidden = fastHidden
         self.slowHidden = slowHidden
         self.moodDecay = float(moodDecay)
-        self.useHebbHead = useHebbHead
 
         fast_in_dim = stateDim + attnDim
         
@@ -1370,12 +1334,16 @@ class EmotionCore(AGICoreModule):
             nn.Linear(fastHidden, fastHidden),
             nn.SiLU(),)
         
-        self.fast_head = HebbianLinearFW(inFeatures=fastHidden,outFeatures=emotionDim, bias=True,useHebbian=useHebbHead, useOja=True,)
+        self.fast_head = HebbianLinearFW(
+            inFeatures=fastHidden,
+            outFeatures=emotionDim)
 
         slow_in_dim = stateDim + memoryDim + attnDim
         self.slow_cell = nn.LSTMCell(input_size=slow_in_dim, hidden_size=slowHidden)
 
-        self.slow_head = HebbianLinearFW(inFeatures=slowHidden,outFeatures=emotionDim, bias=True,useHebbian=useHebbHead, useOja=True,)
+        self.slow_head = HebbianLinearFW(
+            inFeatures=slowHidden,
+            outFeatures=emotionDim)
 
         self.register_buffer("h", torch.zeros(1, slowHidden))
         self.register_buffer("c", torch.zeros(1, slowHidden))
@@ -1497,9 +1465,8 @@ class EmotionCore(AGICoreModule):
 
     @torch.no_grad()
     def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
-        if self.useHebbHead:
-            self.slow_head.ResetHebbianMemory(doneMask=doneMask)
-            self.fast_head.ResetHebbianMemory(doneMask=doneMask)
+        self.slow_head.ResetHebbianMemory(doneMask=doneMask)
+        self.fast_head.ResetHebbianMemory(doneMask=doneMask)
 
 
 class GeoTropicalOut(NamedTuple):
@@ -1596,7 +1563,6 @@ class ValueEstimationExtractor(AGICoreModule):
         trunkResHiddenMul: float = 2.0,
         trunkResScaleInit: float = 0.25,
         useSoftTrop: bool = True, tropTemp: float = 0.2, epsA: float = 1e-3,
-        useHebb: bool = True,
         valueTensorDim: int = 512,
         microMaxAnchors: int = 64,
         microTopK: int = 4,
@@ -1637,8 +1603,6 @@ class ValueEstimationExtractor(AGICoreModule):
         self.td_geom_sob_alpha = float(tdGeomSobAlpha)
         self.td_geom_eps = float(tdGeomEps)
         self.return_discount = float(returnDiscount)
-
-        self.use_hebb = useHebb
 
         self.td_out_ema = RunningEMA(momentum=0.99)
         self.td_scale_min = 1e-3
@@ -1708,8 +1672,7 @@ class ValueEstimationExtractor(AGICoreModule):
             stateDim=stateDim,
             memoryDim=memoryDim,
             attnDim=attnDim,
-            emotionDim=emotionDim,
-            useHebbHead=useHebb)
+            emotionDim=emotionDim)
         self.emotion_to_hidden = nn.Sequential(
             nn.Linear(emotionDim, H),
             nn.LayerNorm(H),
@@ -3329,15 +3292,14 @@ class TestValueEstimationMTool:
         self.hidden = 512
         self.last_loss_report: Optional[Dict[str, float]] = None
 
-    def NewEstimator(self, *, useHebb: bool = True):
+    def NewEstimator(self):
         return ValueEstimationExtractor(
             memoryDim=self.mem_dim,
             attnDim=self.attn_dim,
             stateDim=self.state_dim,
-            hidden=self.hidden,
-            useHebb=useHebb).to(self.device)
+            hidden=self.hidden).to(self.device)
 
-    def NewSmallEstimator(self, *, useHebb: bool = False):
+    def NewSmallEstimator(self):
         return ValueEstimationExtractor(
             memoryDim=4,
             attnDim=4,
@@ -3350,8 +3312,7 @@ class TestValueEstimationMTool:
             tdOtCostDim=2,
             tdOtIters=1,
             microMaxAnchors=4,
-            microTopK=2,
-            useHebb=useHebb).to(self.device)
+            microTopK=2).to(self.device)
 
     def RandSmallBatch(self, B: int):
         return (
@@ -3478,7 +3439,7 @@ class TestValueEstimationMTool:
             mem, attn, state = self.RandBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.2)
 
-            est = self.NewEstimator(useHebb=True)
+            est = self.NewEstimator()
             est.eval()
             out_eval = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
 
@@ -3522,7 +3483,7 @@ class TestValueEstimationMTool:
             mem, attn, state = self.RandBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
 
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
 
             def print_shape(name: str, tensor: torch.Tensor):
                 print(f"{name}: {tuple(tensor.shape)}")
@@ -3572,7 +3533,7 @@ class TestValueEstimationMTool:
             mem, attn, state = self.RandBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.3)
 
-            est = self.NewEstimator(useHebb=False).eval()
+            est = self.NewEstimator().eval()
             out = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
 
             ok = True
@@ -3600,7 +3561,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(431)
             B = 2
-            est = self.NewEstimator(useHebb=False).eval()
+            est = self.NewEstimator().eval()
             mem, attn, state = self.RandBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
 
@@ -3621,9 +3582,11 @@ class TestValueEstimationMTool:
             d_ph_b[1].mul_(-4.0)
 
             est.ResetState()
+            est.ResetHebbianMemory()
             with torch.no_grad():
                 out_a = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
             est.ResetState()
+            est.ResetHebbianMemory()
             with torch.no_grad():
                 out_b = self.ForwardOnce(est, mem_b, attn_b, state_b, reward_b, entropy_b, done_b, d_tr_b, d_ph_b)
 
@@ -3651,7 +3614,7 @@ class TestValueEstimationMTool:
             reward_model = torch.full((B,), -0.5, device=self.device)
             done_model = torch.full((B,), 0.25, device=self.device)
 
-            est = self.NewEstimator(useHebb=False).eval()
+            est = self.NewEstimator().eval()
             out_model = est(
                 memoryPrev=mem,
                 attnPrev=attn,
@@ -3675,7 +3638,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(434)
             B = 4
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
             mem1, attn1, state1 = self.RandBatch(B)
             mem2, attn2, state2 = self.RandBatch(B)
             reward1, entropy1, done1, d_tr1, d_ph1 = self.RandSignals(B, doneProb=0.0)
@@ -3704,7 +3667,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(439)
             B = 5
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
             mem1, attn1, state1 = self.RandBatch(B)
             mem2, attn2, state2 = self.RandBatch(B)
             reward1, entropy1, done1, d_tr1, d_ph1 = self.RandSignals(B, doneProb=0.0)
@@ -3732,7 +3695,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(440)
             B = 3
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
             sids_a = torch.tensor([10, 20, 30], device=self.device)
             mem, attn, state = self.RandBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
@@ -3759,7 +3722,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(441)
             B = 4
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
             mem1, attn1, state1 = self.RandBatch(B)
             mem2, attn2, state2 = self.RandBatch(B)
             reward1, entropy1, done1, d_tr1, d_ph1 = self.RandSignals(B, doneProb=0.0)
@@ -3806,7 +3769,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(442)
             B = 5
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
             mem, attn, state = self.RandBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
             _ = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
@@ -3847,7 +3810,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(443)
             B = 4
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
             mem1, attn1, state1 = self.RandBatch(B)
             mem2, attn2, state2 = self.RandBatch(B)
             reward1, entropy1, done1, d_tr1, d_ph1 = self.RandSignals(B, doneProb=0.0)
@@ -3899,7 +3862,7 @@ class TestValueEstimationMTool:
             torch.manual_seed(20260514)
             B = 3
             lr = 1e-3
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
 
             mem0, attn0, state0 = self.RandBatch(B)
             reward0, entropy0, done0, d_tr0, d_ph0 = self.RandSignals(B, doneProb=0.0)
@@ -4028,7 +3991,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(444)
             B = 4
-            est = self.NewEstimator(useHebb=True).train()
+            est = self.NewEstimator().train()
             mem1, attn1, state1 = self.RandBatch(B)
             mem2, attn2, state2 = self.RandBatch(B)
             reward1, entropy1, done1, d_tr1, d_ph1 = self.RandSignals(B, doneProb=0.0)
@@ -4056,7 +4019,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(438)
             B = 4
-            est_a = self.NewEstimator(useHebb=False).train()
+            est_a = self.NewEstimator().train()
             est_b = copy.deepcopy(est_a).train()
 
             mem1, attn1, state1 = self.RandBatch(B)
@@ -4105,7 +4068,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(20260713)
             B = 4
-            est = self.NewSmallEstimator(useHebb=False).train()
+            est = self.NewSmallEstimator().train()
             mem1, attn1, state1 = self.RandSmallBatch(B)
             mem2, attn2, state2 = self.RandSmallBatch(B)
             reward1, entropy1, _, d_tr1, d_ph1 = self.RandSmallSignals(B)
@@ -4191,7 +4154,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(20260714)
             B = 4
-            est = self.NewSmallEstimator(useHebb=False).train()
+            est = self.NewSmallEstimator().train()
             mem, attn, state = self.RandSmallBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSmallSignals(B)
             _ = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
@@ -4211,7 +4174,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(20260717)
             B = 3
-            est = self.NewSmallEstimator(useHebb=False).train()
+            est = self.NewSmallEstimator().train()
             est.micro_graph_mix = 0.0
             est.transport.manifold_field_ema = 0.0
             mem, attn, state = self.RandSmallBatch(B)
@@ -4230,7 +4193,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(20260718)
             B = 2
-            est_a = self.NewSmallEstimator(useHebb=False).train()
+            est_a = self.NewSmallEstimator().train()
             est_b = copy.deepcopy(est_a).train()
             mem, attn, state = self.RandSmallBatch(B)
             reward, entropy, _, d_tr, d_ph = self.RandSmallSignals(B)
@@ -4275,37 +4238,56 @@ class TestValueEstimationMTool:
             print(f"CurrentTransitionLossMasksTerminalGeometry error: {e}")
             return False
 
-    def TestHebbianFlag(self) -> bool:
+    def TestHebbianLinearFWLifecycle(self) -> bool:
         try:
             torch.manual_seed(20260719)
             B = 3
-            est = self.NewSmallEstimator(useHebb=False).train()
-            mem, attn, state = self.RandSmallBatch(B)
-            reward, entropy, done, d_tr, d_ph = self.RandSmallSignals(B)
-            _ = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
-            ok = not est.emotion_core.fast_head.use_hebbian
-            ok &= not est.emotion_core.slow_head.use_hebbian
-            ok &= torch.count_nonzero(est.emotion_core.fast_head.H).item() == 0
-            ok &= torch.count_nonzero(est.emotion_core.slow_head.H).item() == 0
-            layer = HebbianLinearFW(4, 3, useHebbian=True).to(self.device)
+            layer = HebbianLinearFW(4, 3).to(self.device)
             layer.EnsureB(B)
             value = torch.randn(B, 4, device=self.device)
-            expected = F.linear(value, layer.weight, layer.bias)
-            actual, _ = layer(value)
-            ok &= torch.allclose(actual, expected, atol=1e-7, rtol=1e-6)
-            ok &= torch.count_nonzero(layer.H).item() > 0
+
+            with torch.no_grad():
+                base = F.linear(value, layer.weight, layer.bias)
+                first, _ = layer(value)
+                first_memory = layer.H.detach().clone()
+                expected_second = (
+                    base
+                    + 0.1
+                    * torch.bmm(
+                        first_memory,
+                        value.unsqueeze(-1)).squeeze(-1))
+                second, _ = layer(value)
+
+                layer.ResetHebbianMemory()
+                reset_cleared = torch.count_nonzero(layer.H).item() == 0
+                first_after_reset, _ = layer(value)
+
+            ok = torch.allclose(first, base, atol=1e-7, rtol=1e-6)
+            ok &= torch.count_nonzero(first_memory).item() > 0
+            ok &= torch.allclose(
+                second,
+                expected_second,
+                atol=1e-7,
+                rtol=1e-6)
+            ok &= not torch.allclose(second, base, atol=1e-9, rtol=1e-9)
+            ok &= reset_cleared
+            ok &= torch.allclose(
+                first_after_reset,
+                base,
+                atol=1e-7,
+                rtol=1e-6)
             ok &= "H" not in layer.state_dict()
-            print(f"HebbianFlag {'pass' if ok else 'fail'}")
+            print(f"HebbianLinearFWLifecycle {'pass' if ok else 'fail'}")
             return bool(ok)
         except Exception as e:
-            print(f"HebbianFlag error: {e}")
+            print(f"HebbianLinearFWLifecycle error: {e}")
             return False
 
     def TestStreamIdEpisodeReplacement(self) -> bool:
         try:
             torch.manual_seed(20260715)
             B = 2
-            est = self.NewSmallEstimator(useHebb=False).train()
+            est = self.NewSmallEstimator().train()
             mem, attn, state = self.RandSmallBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSmallSignals(B)
             stream_ids = torch.tensor([10, 20], device=self.device)
@@ -4340,7 +4322,7 @@ class TestValueEstimationMTool:
     def TestGeometricDistances(self) -> bool:
         try:
             torch.manual_seed(20260716)
-            est = self.NewSmallEstimator(useHebb=False).eval()
+            est = self.NewSmallEstimator().eval()
             x = torch.randn(3, est.value_tensor_dim, device=self.device)
             translated = est.BuresWassersteinEnergy(x, x + 0.5)
             identical_ot = est.SinkhornOTEnergy(x, x)
@@ -4408,7 +4390,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(436)
             B = 4
-            est = self.NewEstimator(useHebb=True).train()
+            est = self.NewEstimator().train()
             for _ in range(3):
                 mem, attn, state = self.RandBatch(B)
                 reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
@@ -4447,7 +4429,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(437)
             B = 5
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
             mem, attn, state = self.RandBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
             _ = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
@@ -4483,7 +4465,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(44)
             B = 7
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
 
             mem, attn, state = self.RandBatch(B)
             reward, entropy, done0, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
@@ -4513,7 +4495,7 @@ class TestValueEstimationMTool:
     def TestBatchResizeAndPredictorShapes(self) -> bool:
         try:
             torch.manual_seed(45)
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
 
             B1 = 4
             mem1, attn1, state1 = self.RandBatch(B1)
@@ -4545,7 +4527,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(46)
             B = 6
-            est = self.NewEstimator(useHebb=True).train()
+            est = self.NewEstimator().train()
 
             for _ in range(3):
                 mem, attn, state = self.RandBatch(B)
@@ -4574,10 +4556,8 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(101)
             B = 10
-            est = self.NewEstimator(useHebb=False)
+            est = self.NewEstimator()
             est.train()
-            est.emotion_core.fast_head.use_hebbian = False
-            est.emotion_core.slow_head.use_hebbian = False
             for ad in [est.fc1_adapter, est.fc2_adapter]:
                 ad.Grow(2, init=None, freezeOld=True)
 
@@ -4653,7 +4633,7 @@ class TestValueEstimationMTool:
             mem, attn, state = self.RandBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
 
-            est_ref_eval = self.NewEstimator(useHebb=True).eval()
+            est_ref_eval = self.NewEstimator().eval()
             est_wrap_eval = copy.deepcopy(est_ref_eval).eval()
             wrapper_eval = ValueEstimationOnlineWrapper(est_wrap_eval, initRankEach=0, autoRank=False).eval()
 
@@ -4673,7 +4653,7 @@ class TestValueEstimationMTool:
             ok &= torch.allclose(out_ref_eval.tdError, out_wr_eval.tdError, atol=atol, rtol=rtol)
             ok &= torch.allclose(out_ref_eval.uncertainty, out_wr_eval.uncertainty, atol=atol, rtol=rtol)
 
-            est_ref_train = self.NewEstimator(useHebb=True).train()
+            est_ref_train = self.NewEstimator().train()
             est_wrap_train = copy.deepcopy(est_ref_train).train()
             wrapper_train = ValueEstimationOnlineWrapper(est_wrap_train, initRankEach=0, autoRank=False).train()
 
@@ -4717,7 +4697,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(77)
             B = 8
-            base = self.NewEstimator(useHebb=False)
+            base = self.NewEstimator()
             wrapper = ValueEstimationOnlineWrapper(base, initRankEach=0, autoRank=False)
             wrapper.train()
 
@@ -4813,7 +4793,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(20260720)
             B = 2
-            base = self.NewSmallEstimator(useHebb=False).train()
+            base = self.NewSmallEstimator().train()
             wrapper = ValueEstimationOnlineWrapper(
                 base,
                 initRankEach=1,
@@ -4852,7 +4832,7 @@ class TestValueEstimationMTool:
             mem, attn, state = self.RandBatch(B)
             reward, entropy, done, d_tr, d_ph = self.RandSignals(B, doneProb=0.0)
 
-            base = self.NewEstimator(useHebb=False).eval()
+            base = self.NewEstimator().eval()
             wrapper = ValueEstimationOnlineWrapper(base, initRankEach=0, autoRank=False).eval()
 
             spec = wrapper.sites["qhead"]
@@ -4902,7 +4882,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(79)
             B = 8
-            base = self.NewEstimator(useHebb=False)
+            base = self.NewEstimator()
             wrapper = ValueEstimationOnlineWrapper(base, initRankEach=1, autoRank=True).train()
 
             cand_params = list(wrapper.CandParameters())
@@ -4957,7 +4937,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(88)
             B = 5
-            est1 = self.NewEstimator(useHebb=True).train()
+            est1 = self.NewEstimator().train()
 
             for _ in range(3):
                 mem, attn, state = self.RandBatch(B)
@@ -4986,7 +4966,7 @@ class TestValueEstimationMTool:
                 for items in dyn_state["pending_transitions"].values()
                 if len(items) > 0]
 
-            est2 = self.NewEstimator(useHebb=True).train()
+            est2 = self.NewEstimator().train()
             src = est1.state_dict()
             dst = est2.state_dict()
             loadable = {k: v for k, v in src.items() if (k in dst and dst[k].shape == v.shape)}
@@ -5047,14 +5027,14 @@ class TestValueEstimationMTool:
     def TestTransientTrainingGraphRoundTrip(self) -> bool:
         try:
             torch.manual_seed(20260717)
-            source = self.NewSmallEstimator(useHebb=False).train()
+            source = self.NewSmallEstimator().train()
             _ = self.ForwardOnce(
                 source,
                 *self.RandSmallBatch(2),
                 *self.RandSmallSignals(2))
 
             runtime_state = source.ExportState()
-            restored = self.NewSmallEstimator(useHebb=False).train()
+            restored = self.NewSmallEstimator().train()
             source_parameters = source.state_dict()
             restored_parameters = restored.state_dict()
             loadable = {
@@ -5085,7 +5065,7 @@ class TestValueEstimationMTool:
     def TestLossDecreases(self, steps: int = 48, batchSize: int = 8) -> bool:
         try:
             torch.manual_seed(2026)
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
             opt = torch.optim.Adam(est.parameters(), lr=5e-4)
 
             mem, attn, state = self.RandBatch(batchSize)
@@ -5163,7 +5143,7 @@ class TestValueEstimationMTool:
     def TestNoNanStress(self, steps: int = 20) -> bool:
         try:
             torch.manual_seed(2027)
-            est = self.NewEstimator(useHebb=False).train()
+            est = self.NewEstimator().train()
             opt = torch.optim.Adam(est.parameters(), lr=8e-4)
 
             for t in range(int(steps)):
@@ -5198,7 +5178,7 @@ class TestValueEstimationMTool:
             batch = self.RandSmallBatch(B)
             _, entropy, _, d_tr, d_ph = self.RandSmallSignals(B)
 
-            sign_est = self.NewSmallEstimator(useHebb=False).eval()
+            sign_est = self.NewSmallEstimator().eval()
             with torch.no_grad():
                 sign_est.return_value_head[-1].weight.zero_()
                 sign_est.return_value_head[-1].bias.zero_()
@@ -5209,6 +5189,7 @@ class TestValueEstimationMTool:
                     sign_est, *batch, torch.ones(B, device=self.device),
                     entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
                 sign_est.ResetState()
+                sign_est.ResetHebbianMemory()
                 _ = self.ForwardOnce(
                     sign_est, *batch, torch.zeros(B, device=self.device),
                     entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
@@ -5216,7 +5197,7 @@ class TestValueEstimationMTool:
                     sign_est, *batch, -torch.ones(B, device=self.device),
                     entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
 
-            terminal_est = self.NewSmallEstimator(useHebb=False).eval()
+            terminal_est = self.NewSmallEstimator().eval()
             with torch.no_grad():
                 terminal_est.return_value_head[-1].weight.zero_()
                 terminal_est.return_value_head[-1].bias.fill_(2.0)
@@ -5227,6 +5208,7 @@ class TestValueEstimationMTool:
                     terminal_est, *batch, torch.zeros(B, device=self.device),
                     entropy, torch.ones(B, device=self.device), d_tr, d_ph)
                 terminal_est.ResetState()
+                terminal_est.ResetHebbianMemory()
                 _ = self.ForwardOnce(
                     terminal_est, *batch, torch.zeros(B, device=self.device),
                     entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
@@ -5234,7 +5216,7 @@ class TestValueEstimationMTool:
                     terminal_est, *batch, torch.zeros(B, device=self.device),
                     entropy, torch.zeros(B, device=self.device), d_tr, d_ph)
 
-            train_est = self.NewSmallEstimator(useHebb=False).train()
+            train_est = self.NewSmallEstimator().train()
             with torch.no_grad():
                 train_est.return_value_head[-1].weight.zero_()
                 train_est.return_value_head[-1].bias.zero_()
@@ -5283,7 +5265,7 @@ class TestValueEstimationMTool:
         try:
             torch.manual_seed(20260719)
             B = 3
-            est = self.NewSmallEstimator(useHebb=False).train()
+            est = self.NewSmallEstimator().train()
             with torch.no_grad():
                 est.value_tensor_tail[-1].weight.zero_()
                 est.value_tensor_tail[-1].bias.zero_()
@@ -5384,7 +5366,7 @@ class TestValueEstimationMTool:
             ("ManifoldFieldEmaIsRuntimeState", self.TestManifoldFieldEmaIsRuntimeState),
             ("TransportSnapshotUsesSameRuntimeState", self.TestTransportSnapshotUsesSameRuntimeState),
             ("CurrentTransitionLossMasksTerminalGeometry", self.TestCurrentTransitionLossMasksTerminalGeometry),
-            ("HebbianFlag", self.TestHebbianFlag),
+            ("HebbianLinearFWLifecycle", self.TestHebbianLinearFWLifecycle),
             ("StreamIdEpisodeReplacement", self.TestStreamIdEpisodeReplacement),
             ("GeometricDistances", self.TestGeometricDistances),
             ("UncertaintyFloorNearEps", self.TestUncertaintyFloorNearEps),

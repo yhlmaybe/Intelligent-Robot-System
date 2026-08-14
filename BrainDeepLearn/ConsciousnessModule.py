@@ -95,10 +95,7 @@ class ConsciousHebbianLinear(AGICoreModule):
     def __init__(
         self,
         inFeatures: int,
-        outFeatures: int,
-        *,
-        hebbAlpha: float = 0.05,
-        useHebb: bool = True,):
+        outFeatures: int,):
         super().__init__()
         self.in_f = int(inFeatures)
         self.out_f = int(outFeatures)
@@ -110,9 +107,6 @@ class ConsciousHebbianLinear(AGICoreModule):
             "hebb",
             torch.zeros(1, self.out_f, self.in_f),
             persistent=False)
-
-        self.hebb_alpha = float(hebbAlpha)
-        self.use_hebbian: bool = bool(useHebb)
 
     @torch.no_grad()
     def EnsureB(self, B: int):
@@ -135,23 +129,17 @@ class ConsciousHebbianLinear(AGICoreModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, I = x.shape
 
-        if self.use_hebbian:
-            W_eff = self.weight.unsqueeze(0) + self.hebb # [B,O,I]
-        else:
-            W_eff = self.weight.unsqueeze(0).expand(B, -1, -1) # [B,O,I]
-
+        W_eff = self.weight.unsqueeze(0) + self.hebb # [B,O,I]
         y_b = torch.einsum("bi,boi->bo", x, W_eff) + self.bias.unsqueeze(0) # [B,O]
 
-        if self.use_hebbian:
-            with torch.no_grad():
-                x_n = F.normalize(x, dim=-1, eps=1e-6) # [B,I]
-                y_n = F.normalize(y_b, dim=-1, eps=1e-6) # [B,O]
+        with torch.no_grad():
+            x_n = F.normalize(x, dim=-1, eps=1e-6) # [B,I]
+            y_n = F.normalize(y_b, dim=-1, eps=1e-6) # [B,O]
 
-                d_hebb = y_n.unsqueeze(-1) * x_n.unsqueeze(1) # [B, O, I]
+            d_hebb = y_n.unsqueeze(-1) * x_n.unsqueeze(1) # [B, O, I]
 
-                a = self.hebb_alpha
-                self.hebb.mul_(1.0 - a)
-                self.hebb.add_(a * d_hebb)
+            self.hebb.mul_(0.95)
+            self.hebb.add_(0.05 * d_hebb)
 
         return y_b # [B,O]
 
@@ -163,7 +151,6 @@ class NeuroGeoControlFusion(AGICoreModule):
         selfDim: int,
         intentDim: int,
         *,
-        useHebb: bool = True,
         nCharts: int = 4,
         hiddenMul: int = 2,
         dampMin: float = 0.05,
@@ -219,12 +206,12 @@ class NeuroGeoControlFusion(AGICoreModule):
         self.chart_gate = nn.Linear(self.feat_dim, self.n_charts)
         self.chart_heads = nn.ModuleList([
             nn.Sequential(
-                ConsciousHebbianLinear(self.feat_dim, self.dev_dim, useHebb=useHebb),
+                ConsciousHebbianLinear(self.feat_dim, self.dev_dim),
                 nn.LayerNorm(self.dev_dim),
                 nn.Tanh(),) for _ in range(self.n_charts)])
 
         self.base_head = nn.Sequential(
-            ConsciousHebbianLinear(self.feat_dim, self.dev_dim, useHebb=useHebb),
+            ConsciousHebbianLinear(self.feat_dim, self.dev_dim),
             nn.LayerNorm(self.dev_dim),
             nn.Tanh(),)
         self.mix_head = nn.Sequential(
@@ -289,8 +276,7 @@ class ConsciousnessExtractor(AGICoreModule):
         topKMem: int = 128,
         randKMem: int = 64,
         topKWorld: int = 128,
-        randKWorld: int = 64,
-        useHebb: bool = True, ):
+        randKWorld: int = 64,):
         super().__init__()
 
         self.mem_item_dim = memItemDim
@@ -305,7 +291,6 @@ class ConsciousnessExtractor(AGICoreModule):
         self.rand_k_mem = randKMem
         self.top_k_world = topKWorld
         self.rand_k_world = randKWorld
-        self.use_hebbian = useHebb
 
         self.mem_type_keys: Tuple[str, ...] = ("gws", "kv", "ltm_sem", "ltm_epi", "sym")
         self.world_type_keys: Tuple[str, ...] = ("vals",)
@@ -571,7 +556,7 @@ class ConsciousnessExtractor(AGICoreModule):
 
         in_self = self.world_item_dim + self.mem_item_dim + self.dev_dim
         self.self_in = nn.Sequential(
-            ConsciousHebbianLinear(in_self,self.self_dim,useHebb=useHebb,),
+            ConsciousHebbianLinear(in_self, self.self_dim),
             nn.LayerNorm(self.self_dim),
             nn.GELU(),)
         
@@ -579,7 +564,7 @@ class ConsciousnessExtractor(AGICoreModule):
 
         in_intent = self.self_dim + self.mem_item_dim + self.dev_dim
         self.intent_in = nn.Sequential(
-            ConsciousHebbianLinear(in_intent,self.intent_dim,useHebb=useHebb,),
+            ConsciousHebbianLinear(in_intent, self.intent_dim),
             nn.LayerNorm(self.intent_dim),
             nn.GELU(),)
         
@@ -607,7 +592,6 @@ class ConsciousnessExtractor(AGICoreModule):
             devDim=self.dev_dim,
             selfDim=self.self_dim,
             intentDim=self.intent_dim,
-            useHebb=useHebb,
             nCharts=4,
             hiddenMul=2,
             dampMin=0.05,
@@ -668,7 +652,7 @@ class ConsciousnessExtractor(AGICoreModule):
             self._state_valid = self._state_valid.new_zeros(B)
             self._step = self._step.new_zeros(1)
         for module in self.modules():
-            if isinstance(module, ConsciousHebbianLinear) and module.use_hebbian:
+            if isinstance(module, ConsciousHebbianLinear):
                 module.EnsureB(B)
 
     @torch.no_grad()
@@ -1161,7 +1145,7 @@ class ConsciousnessExtractor(AGICoreModule):
         hebbian_snapshots = []
         if bool(inactive_rows.any().item()):
             for module in self.modules():
-                if isinstance(module, ConsciousHebbianLinear) and module.use_hebbian:
+                if isinstance(module, ConsciousHebbianLinear):
                     hebbian_snapshots.append((module, module.hebb.detach().clone()))
 
         arousal = self.arousal_net(self._dev_trace)
@@ -1686,7 +1670,7 @@ class TestConsciousMTool:
         self.n_intent_blocks = 3
         self.hyper_hidden = 256
 
-    def BuildModel(self, useHebb: bool = True) -> "ConsciousnessExtractor":
+    def BuildModel(self) -> "ConsciousnessExtractor":
         model = ConsciousnessExtractor(
             memItemDim=self.mem_dim,
             worldItemDim=self.world_dim,
@@ -1700,8 +1684,7 @@ class TestConsciousMTool:
             topKMem=4,
             randKMem=2,
             topKWorld=4,
-            randKWorld=2,
-            useHebb=useHebb,).to(self.device)
+            randKWorld=2,).to(self.device)
         model.train()
         return model
 
@@ -1732,7 +1715,7 @@ class TestConsciousMTool:
 
     def TestDictBankInterface(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             model.ResetState()
             mem_dict, world_dict = self.DummyBankDicts(B=4, Nm=9, Nw=6)
 
@@ -1762,7 +1745,7 @@ class TestConsciousMTool:
 
     def TestForwardShapes(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             model.ResetState()
             mem, world = self.DummyBankDicts(B=4, Nm=9, Nw=6)
 
@@ -1798,7 +1781,7 @@ class TestConsciousMTool:
 
     def TestConsciousnessExtractorIOShapes(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             model.ResetState()
 
             B = 2
@@ -1836,7 +1819,7 @@ class TestConsciousMTool:
 
     def TestStateFlow(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             model.ResetState()
 
             B = 3
@@ -1868,7 +1851,7 @@ class TestConsciousMTool:
 
     def TestEvalModeInferenceBranch(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             model.ResetState()
             model.eval()
 
@@ -1907,7 +1890,7 @@ class TestConsciousMTool:
 
     def TestColdStartNoInput(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             model.ResetState()
             model.train()
 
@@ -1953,7 +1936,7 @@ class TestConsciousMTool:
 
     def TestLowTokenFallbackBranches(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             model.ResetState()
             model.train()
 
@@ -2000,7 +1983,7 @@ class TestConsciousMTool:
 
     def TestAvailabilityAwareAuxiliaryLoss(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=False)
+            model = self.BuildModel()
             model.ResetState()
             model.train()
             hidden = int(model.z_world_head.out_features // 2)
@@ -2051,7 +2034,7 @@ class TestConsciousMTool:
                     variance,
                     variance.float().clamp_min(1e-6).to(dtype=dtype))
 
-            model = self.BuildModel(useHebb=False)
+            model = self.BuildModel()
             model.ResetState()
             model.train()
             memory, world = self.DummyBankDicts(B=2, Nm=2, Nw=1)
@@ -2069,7 +2052,7 @@ class TestConsciousMTool:
     def TestMixedRowTokenValidity(self) -> bool:
         try:
             B = 2
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             model.ResetState()
             model.train()
 
@@ -2080,7 +2063,7 @@ class TestConsciousMTool:
             hebb_before = {
                 id(module): module.hebb[1].detach().clone()
                 for module in model.modules()
-                if isinstance(module, ConsciousHebbianLinear) and module.use_hebbian}
+                if isinstance(module, ConsciousHebbianLinear)}
 
             values = torch.randn(B, 2, self.mem_dim, device=self.device, requires_grad=True)
             with torch.no_grad():
@@ -2108,7 +2091,7 @@ class TestConsciousMTool:
             assert torch.equal(next_intent[1], prev_intent[1])
             assert torch.equal(next_self[1], prev_self[1])
             for module in model.modules():
-                if isinstance(module, ConsciousHebbianLinear) and module.use_hebbian:
+                if isinstance(module, ConsciousHebbianLinear):
                     assert torch.equal(module.hebb[1], hebb_before[id(module)])
 
             model.zero_grad(set_to_none=True)
@@ -2128,7 +2111,9 @@ class TestConsciousMTool:
 
     def TestConsciousHebbianLinearLifecycle(self) -> bool:
         try:
-            lin = ConsciousHebbianLinear(inFeatures=16, outFeatures=12, hebbAlpha=0.1, useHebb=True).to(self.device)
+            lin = ConsciousHebbianLinear(
+                inFeatures=16,
+                outFeatures=12).to(self.device)
 
             x = torch.randn(5, 16, device=self.device)
             lin.EnsureB(int(x.size(0)))
@@ -2158,7 +2143,7 @@ class TestConsciousMTool:
 
     def TestModuleResetHebbianMemory(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             mem, world = self.DummyBankDicts(B=4, Nm=9, Nw=6)
 
             with torch.no_grad():
@@ -2206,7 +2191,7 @@ class TestConsciousMTool:
 
     def TrainStepSmoke(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             head = nn.Linear(self.self_dim + self.intent_dim, 32).to(self.device)
 
             model.train()
@@ -2262,7 +2247,7 @@ class TestConsciousMTool:
 
     def NormalTrainingConvergence(self, steps: int = 80, logEvery: int = 20) -> bool:
         try:
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             head = nn.Linear(self.self_dim + self.intent_dim, 32).to(self.device)
 
             model.train()
@@ -2327,7 +2312,7 @@ class TestConsciousMTool:
 
     def GradCoverageReport(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             head = nn.Linear(self.self_dim + self.intent_dim, 32).to(self.device)
             model.train()
             head.train()
@@ -2371,7 +2356,7 @@ class TestConsciousMTool:
 
     def TestParameterUpdateAfterStep(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=True)
+            model = self.BuildModel()
             head = nn.Linear(self.self_dim + self.intent_dim, 32).to(self.device)
             model.train()
             head.train()
@@ -2434,7 +2419,7 @@ class TestConsciousMTool:
 
     def QueryTopKEdgeCases(self) -> bool:
         try:
-            model = self.BuildModel(useHebb=False)
+            model = self.BuildModel()
             B = 2
             D = self.mem_dim
 

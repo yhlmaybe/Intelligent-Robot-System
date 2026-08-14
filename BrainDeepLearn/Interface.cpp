@@ -459,12 +459,12 @@ bool BrainDeepLearnInterface::TrainOCRModule(int epochs, int batchSize, double v
     });
 }
 
-bool BrainDeepLearnInterface::DeployModule(bool useHebbian, bool usePlanner)
+bool BrainDeepLearnInterface::DeployModule(bool usePlanner)
 {
-    return RunPythonAsync([this, useHebbian, usePlanner]()
+    return RunPythonAsync([this, usePlanner]()
     {
         (void)CALL_METHOD_RET_BOOL(
-            "DeployModule", "bb", useHebbian, usePlanner);
+            "DeployModule", "b", usePlanner);
     });
 }
 
@@ -593,10 +593,10 @@ bool BrainDeepLearnInterface::SetParameterReceiver(std::optional<double> reward,
     return ok;
 }
 
-bool BrainDeepLearnInterface::InitAgentHandle(bool useHebbian, bool usePlanner)
+bool BrainDeepLearnInterface::InitAgentHandle(bool usePlanner)
 {
     return CALL_METHOD_RET_BOOL(
-            "InitAgentHandle", "bb", useHebbian, usePlanner);
+            "InitAgentHandle", "b", usePlanner);
 }
 
 bool BrainDeepLearnInterface::AgentHandleForward(

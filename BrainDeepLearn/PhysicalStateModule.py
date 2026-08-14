@@ -1270,8 +1270,7 @@ class TestPhysicalStateMTool:
                 numHeads=4,
                 numLayers=1,
                 baseChannels=8,
-                objectTokenCount=K,
-                useHebbian=False).to(self.device)
+                objectTokenCount=K,).to(self.device)
             frames = torch.rand(B, 3, H, W, device=self.device)
             depth = torch.ones(B, 1, H, W, device=self.device)
             depth_valid = torch.ones_like(depth, dtype=torch.bool)

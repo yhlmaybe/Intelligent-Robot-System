@@ -221,22 +221,10 @@ class EligibilityTracePlasticityLayer(AGICoreModule):
     def __init__(
         self,
         inDim: int,
-        outDim: int,
-        lam: float = 0.9,
-        eta: float = 1e-3,
-        gamma: float = 1e-2,
-        applyScale: float = 0.25,
-        maxRowNorm: float = 2.0,
-        enabled: bool = True,):
+        outDim: int,):
         super().__init__()
         self.in_dim = int(inDim)
         self.out_dim = int(outDim)
-        self.lam = float(lam)
-        self.eta = float(eta)
-        self.gamma = float(gamma)
-        self.apply_scale = float(applyScale)
-        self.max_row_norm = float(maxRowNorm)
-        self.enabled = bool(enabled)
 
         self.base = nn.Parameter(torch.randn(outDim, inDim, device=self.device, dtype=self.dtype) * 0.02)
         self.register_buffer("trace", torch.empty(0), persistent=False)
@@ -248,37 +236,30 @@ class EligibilityTracePlasticityLayer(AGICoreModule):
             self.fast = self.base.new_zeros(B, self.out_dim, self.in_dim)
 
     def forward(self, x: torch.Tensor, neuromod: torch.Tensor) -> torch.Tensor:
-        if not self.enabled:
-            return F.linear(x, self.base)
-
         B = int(x.size(0))
         fast = self.fast.detach().clone()
-        w_eff = self.base.unsqueeze(0) + self.apply_scale * fast
+        w_eff = self.base.unsqueeze(0) + 0.25 * fast
         out = torch.einsum("bi,boi->bo", x, w_eff)
 
         with torch.no_grad():
             mod = neuromod.detach().view(B, 1, 1)
-            self.fast = (1.0 - self.gamma) * self.fast + self.eta * mod * self.trace
-
-            if self.max_row_norm > 0.0:
-                flat = self.fast.reshape(B, -1)
-                nrm = flat.norm(p=2, dim=1, keepdim=True).clamp_min(1e-8)
-                scale = (self.max_row_norm / nrm).clamp_max(1.0)
-                self.fast = self.fast * scale.view(B, 1, 1)
+            self.fast = 0.99 * self.fast + 1e-3 * mod * self.trace
+            flat = self.fast.reshape(B, -1)
+            nrm = flat.norm(p=2, dim=1, keepdim=True).clamp_min(1e-8)
+            scale = (2.0 / nrm).clamp_max(1.0)
+            self.fast = self.fast * scale.view(B, 1, 1)
 
         return out
 
     def Commit(self, pre: torch.Tensor, post: torch.Tensor, executeMask: torch.Tensor):
-        if not self.enabled:
-            return
         B = int(pre.size(0))
         with torch.no_grad():
             outer = torch.einsum("bo,bi->boi", post.detach(), pre.detach())
             write = executeMask.view(B, 1, 1)
-            self.trace = self.lam * self.trace + (1.0 - self.lam) * write * outer
+            self.trace = 0.9 * self.trace + 0.1 * write * outer
 
     def ClearTrace(self, invalidMask: torch.Tensor):
-        if not self.enabled or self.trace.numel() == 0:
+        if self.trace.numel() == 0:
             return
         with torch.no_grad():
             self.trace.masked_fill_(invalidMask.view(-1, 1, 1).bool(), 0.0)
@@ -431,7 +412,6 @@ class DecisionExtractor(AGICoreModule):
     def __init__(
         self,
         stateDim: int = 1024,
-        useHebb: bool = True,
         optionNum: int = 80,
         hiddenDim: int = 1024,
         psiDim: int = 1024,
@@ -487,8 +467,7 @@ class DecisionExtractor(AGICoreModule):
             beliefDim=self.belief_dim,)
         self.elig_plasticity = EligibilityTracePlasticityLayer(
             inDim=self.u_dim,
-            outDim=self.u_dim,
-            enabled=useHebb,)
+            outDim=self.u_dim,)
         action_ctx_dim = self.u_dim + self.dyn_dim + 2 + self.action_embed_dim
         self.action_context = nn.Sequential(
             nn.LayerNorm(action_ctx_dim),
@@ -977,7 +956,6 @@ class TestDecisionMTool:
             hiddenDim=256,
             psiDim=256,
             optionNum=8,
-            useHebb=False,
         ).to(self.device)
         out = model(
             torch.randn(B, ModuleDim.MemoryFeat, device=self.device),
@@ -1087,8 +1065,7 @@ class TestDecisionMTool:
             actionEmbedDim=4,
             hiddenDim=16,
             psiDim=4,
-            optionNum=3,
-            useHebb=False).to(self.device)
+            optionNum=3,).to(self.device)
         policy_input = torch.randn(1, 10, device=self.device)
         previous_logits = torch.tensor(
             [[12.0, -12.0, -12.0]], device=self.device)
@@ -1514,8 +1491,7 @@ class TestDecisionMTool:
             actionEmbedDim=6,
             hiddenDim=32,
             psiDim=8,
-            optionNum=3,
-            useHebb=False).to(self.device)
+            optionNum=3,).to(self.device)
         decoupler = DecisionDecouplerV2(decisionDim=32).to(self.device)
         B = 2
         out = model(
@@ -1615,15 +1591,9 @@ class TestDecisionMTool:
             and torch.isfinite(h).all().item()
             and F.softplus(core.drift_scale).item() > 0.0)
 
-    def TestEligibilityUsesOldTraceAndHonorsDisable(self) -> bool:
-        disabled = EligibilityTracePlasticityLayer(3, 2, enabled=False).to(self.device)
+    def TestEligibilityUsesOldTraceAndReset(self) -> bool:
         x = torch.ones(2, 3, device=self.device)
-        disabled(x, torch.ones(2, device=self.device))
-        disabled_ok = disabled.trace.numel() == 0 and disabled.fast.numel() == 0
-
-        layer = EligibilityTracePlasticityLayer(
-            3, 2, lam=0.5, eta=0.1, gamma=0.0,
-            applyScale=1.0, maxRowNorm=0.0, enabled=True).to(self.device)
+        layer = EligibilityTracePlasticityLayer(3, 2).to(self.device)
         layer.EnsureB(2)
         layer.trace.fill_(1.0)
         layer.fast.zero_()
@@ -1634,10 +1604,11 @@ class TestDecisionMTool:
         layer.fast[1].fill_(1.0)
         layer.ClearTrace(torch.tensor([False, True], device=self.device))
         behavior_ok = bool(
-            disabled_ok
-            and torch.allclose(post, expected, atol=1e-7, rtol=1e-6)
+            torch.allclose(post, expected, atol=1e-7, rtol=1e-6)
             and not {"trace", "fast"} & set(layer.state_dict())
-            and torch.allclose(fast_after_feedback[0], torch.full_like(fast_after_feedback[0], 0.1))
+            and torch.allclose(
+                fast_after_feedback[0],
+                torch.full_like(fast_after_feedback[0], 1e-3))
             and torch.count_nonzero(fast_after_feedback[1]).item() == 0
             and torch.count_nonzero(layer.trace[1]).item() == 0
             and torch.all(layer.fast[1] == 1.0).item())
@@ -1666,8 +1637,7 @@ class TestDecisionMTool:
             actionEmbedDim=6,
             hiddenDim=32,
             psiDim=8,
-            optionNum=2,
-            useHebb=False).to(self.device).eval()
+            optionNum=2,).to(self.device).eval()
         decoupler = DecisionDecouplerV2(decisionDim=32).to(self.device).eval()
         with torch.no_grad():
             model.option_head[-1].weight.zero_()
@@ -1845,7 +1815,6 @@ class TestDecisionMTool:
             hiddenDim=256,
             psiDim=256,
             optionNum=8,
-            useHebb=False,
         ).to(self.device)
         base = model(
             torch.randn(B, ModuleDim.MemoryFeat, device=self.device),
@@ -2303,7 +2272,7 @@ class TestDecisionMTool:
             "EndpointActionEncodingIsStateFree": self.TestEndpointActionEncodingIsStateFree(),
             "StructuralEnhancementsReceiveActionGradient": self.TestStructuralEnhancementsReceiveActionGradient(),
             "PredictiveCoreContractsForAnyPrecision": self.TestPredictiveCoreContractsForAnyPrecision(),
-            "EligibilityUsesOldTraceAndHonorsDisable": self.TestEligibilityUsesOldTraceAndHonorsDisable(),
+            "EligibilityUsesOldTraceAndReset": self.TestEligibilityUsesOldTraceAndReset(),
             "OptionSelectionChangesPhysicalAction": self.TestOptionSelectionChangesPhysicalAction(),
             "PhysicalProjectionAndSafetySemantics": self.TestPhysicalProjectionAndSafetySemantics(),
             "NeuroSymbolicRefineShapes": self.TestNeuroSymbolicRefineShapes(),

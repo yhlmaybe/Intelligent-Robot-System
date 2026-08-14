@@ -548,6 +548,133 @@ class VisualReconstructor(nn.Module):
             "loss_pred_inverse_motion": loss_inverse_motion,
             "loss_pred_inverse_total": loss_inverse_total,}
 
+class LowRankMultiplicativeFlow(AGICoreModule):
+    """Contractive low-rank multiplicative target for the recurrent S4 state.
+
+    The local ``left * right`` feature is second order in state/control coordinates.
+    It is a computational inductive bias, not a claim that the latent is a literal
+    biological dendrite or a globally identified algebraic variety.
+    """
+
+    def __init__(
+        self,
+        stateDim: int,
+        inputDim: int,
+        rank: int = 64,
+        maxMix: float = 0.10,
+        targetScale: float = 0.50,):
+        super().__init__()
+        self.state_dim = int(stateDim)
+        self.input_dim = int(inputDim)
+        self.rank = min(int(rank), self.state_dim)
+        self.max_mix = float(maxMix)
+        self.target_scale = float(targetScale)
+
+        self.left = GrowableLoRALinear(nn.Linear(self.state_dim, self.rank, bias=False))
+        self.right = GrowableLoRALinear(nn.Linear(self.state_dim, self.rank, bias=False))
+        self.context = GrowableLoRALinear(nn.Linear(self.input_dim, self.rank, bias=False))
+        self.out = GrowableLoRALinear(nn.Linear(self.rank, self.state_dim, bias=False))
+        self.selectivity = GrowableLoRALinear(nn.Linear(self.input_dim, 1, bias=True))
+        self.gain = nn.Parameter(torch.tensor(0.50))
+
+        state_anchor = self.BuildGroupedAnalysis(self.rank, self.state_dim)
+        context_anchor = self.BuildGroupedAnalysis(self.rank, self.input_dim)
+        self.register_buffer("left_anchor", state_anchor, persistent=False)
+        self.register_buffer(
+            "right_anchor",
+            torch.roll(state_anchor, shifts=max(1, self.rank // 3), dims=0),
+            persistent=False)
+        self.register_buffer("context_anchor", context_anchor, persistent=False)
+        self.register_buffer("out_anchor", state_anchor.t().contiguous(), persistent=False)
+
+        nn.init.xavier_uniform_(self.left.target.weight)
+        nn.init.xavier_uniform_(self.right.target.weight)
+        nn.init.xavier_uniform_(self.context.target.weight)
+        nn.init.xavier_uniform_(self.out.target.weight, gain=0.5)
+        nn.init.zeros_(self.selectivity.target.weight)
+        nn.init.zeros_(self.selectivity.target.bias)
+
+    @staticmethod
+    def BuildGroupedAnalysis(outDim: int, inDim: int) -> torch.Tensor:
+        matrix = torch.zeros(int(outDim), int(inDim))
+        columns = torch.arange(int(inDim))
+        matrix[columns.remainder(int(outDim)), columns] = 1.0
+        row_norm = matrix.square().sum(dim=1, keepdim=True).sqrt()
+        return matrix / torch.where(
+            row_norm > 0.0,
+            row_norm,
+            torch.ones_like(row_norm))
+
+    @staticmethod
+    def NormalizeWeight(weight: torch.Tensor) -> torch.Tensor:
+        work_weight = (
+            weight.float()
+            if weight.dtype in (torch.float16, torch.bfloat16)
+            else weight)
+        normalized = work_weight / torch.sqrt(
+            1.0 + work_weight.square().sum())
+        return normalized.to(dtype=weight.dtype)
+
+    def ProjectWeight(
+        self,
+        value: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        anchor: torch.Tensor,
+        ) -> torch.Tensor:
+        learned = F.linear(value, self.NormalizeWeight(weight), bias)
+        anchored = F.linear(value, anchor)
+        return 0.5 * (anchored + learned)
+
+    def Project(
+        self,
+        value: torch.Tensor,
+        layer: GrowableLoRALinear,
+        anchor: torch.Tensor,
+        ) -> torch.Tensor:
+        weight = layer.target.weight
+        delta = layer.DeltaWeight()
+        if delta is not None:
+            weight = weight + delta
+        return self.ProjectWeight(
+            value, weight, layer.target.bias, anchor)
+
+    def BoundedInputs(self, state: torch.Tensor, control: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.tanh(state), torch.tanh(control)
+
+    def Interaction(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        context: torch.Tensor,
+        ) -> torch.Tensor:
+        return torch.tanh(left) * torch.tanh(right + context)
+
+    def Target(self, state: torch.Tensor, drive: torch.Tensor) -> torch.Tensor:
+        return self.target_scale * (
+            torch.tanh(state) + 0.5 * torch.tanh(drive))
+
+    def Mix(self, selectivity: torch.Tensor) -> torch.Tensor:
+        gain = self.max_mix * torch.tanh(self.gain).square()
+        return gain * torch.sigmoid(selectivity)
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        control: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        bounded_state, bounded_control = self.BoundedInputs(state, control)
+        interaction = self.Interaction(
+            self.Project(bounded_state, self.left, self.left_anchor),
+            self.Project(bounded_state, self.right, self.right_anchor),
+            self.Project(bounded_control, self.context, self.context_anchor))
+        return (
+            self.Target(
+                state,
+                self.Project(interaction, self.out, self.out_anchor)),
+            self.Mix(self.selectivity(bounded_control)))
+
+
 class S4DCell(AGICoreModule):
     def __init__(self, inDim: int, deterDim: int, ssmDim: int = 512, dt: float = 1.0, dropout: float = 0.0, ffnMult: int = 4):
         super().__init__()
@@ -555,14 +682,30 @@ class S4DCell(AGICoreModule):
         self.deter_dim = int(deterDim)
         self.ssm_dim = int(ssmDim)
         self.dt = float(dt)
+        self.min_decay_rate = 0.005
+        self.max_decay_rate = 1.0
 
-        self.theta = nn.Parameter(torch.randn(self.ssm_dim) * 0.1)
+        # Stable fast/slow channels with bounded rates: no nearly undamped
+        # sign-alternating modes can appear when theta grows during training.
+        decay_rates = torch.exp(torch.linspace(
+            torch.log(torch.tensor(0.01)),
+            torch.log(torch.tensor(0.80)),
+            steps=self.ssm_dim))
+        decay_fraction = (
+            (decay_rates - self.min_decay_rate)
+            / (self.max_decay_rate - self.min_decay_rate))
+        self.theta = nn.Parameter(torch.log(
+            decay_fraction / (1.0 - decay_fraction)))
 
         self.in_to_ssm = GrowableLoRALinear(nn.Linear(self.in_dim, self.ssm_dim, bias=True))
         self.ssm_to_deter = GrowableLoRALinear(nn.Linear(self.ssm_dim, self.deter_dim, bias=True))
         self.in_to_deter = GrowableLoRALinear(nn.Linear(self.in_dim, self.deter_dim, bias=True))
         self.gate = GrowableLoRALinear(nn.Linear(self.in_dim, self.ssm_dim, bias=True))
         self.out_gate = GrowableLoRALinear(nn.Linear(self.ssm_dim, self.deter_dim, bias=True))
+        self.nonlinear_flow = LowRankMultiplicativeFlow(
+            stateDim=self.ssm_dim,
+            inputDim=self.in_dim,
+            rank=min(64, self.ssm_dim))
 
         self.ln_y = nn.LayerNorm(self.deter_dim)
         self.ln_ffn = nn.LayerNorm(self.deter_dim)
@@ -579,12 +722,43 @@ class S4DCell(AGICoreModule):
         if self.x.size(0) != B:
             self.x = self.x.new_zeros(B, self.ssm_dim)
 
+    def DecayRates(self, aDiag: torch.Tensor) -> torch.Tensor:
+        return (
+            self.min_decay_rate
+            + (self.max_decay_rate - self.min_decay_rate) * torch.sigmoid(aDiag))
+
     def CayleyStep(self, aDiag: torch.Tensor, x: torch.Tensor, Bu: torch.Tensor, dt: float):
-        A = -F.softplus(aDiag)
+        A = -self.DecayRates(aDiag)
         k = 0.5 * dt * A
         num = (1 + k) * x + dt * Bu
         denom = (1 - k).clamp_min(1e-6)
         return num / denom
+
+    def LinearStateTransition(
+        self,
+        x: torch.Tensor,
+        linearTarget: torch.Tensor,
+        ) -> torch.Tensor:
+        # Scaling the forcing by lambda makes each channel converge to the
+        # supplied target instead of amplifying it by 1 / lambda.
+        decay = self.DecayRates(self.theta)
+        return self.CayleyStep(
+            self.theta,
+            x,
+            decay * linearTarget,
+            self.dt)
+
+    def StateTransition(
+        self,
+        linearState: torch.Tensor,
+        nonlinearTarget: torch.Tensor,
+        nonlinearMix: torch.Tensor,
+        ) -> torch.Tensor:
+        # nonlinearMix depends only on the control. The target is non-expansive,
+        # so this convex interpolation preserves the Cayley core's contraction.
+        return (
+            (1.0 - nonlinearMix) * linearState
+            + nonlinearMix * nonlinearTarget)
 
     def ResetState(self, batch):
         self.x = torch.zeros(batch, self.ssm_dim, device=self.device, dtype=self.dtype)
@@ -592,9 +766,12 @@ class S4DCell(AGICoreModule):
     def Step(self, zPrev: torch.Tensor, action: torch.Tensor, *, updateState: bool = True) -> torch.Tensor:
         u = torch.cat([zPrev, action], dim=-1)
         g = torch.sigmoid(self.gate(u))
-        Bu = self.in_to_ssm(u) * g
+        linear_target = self.in_to_ssm(u) * g
 
-        x_next = self.CayleyStep(self.theta, self.x, Bu, self.dt)
+        linear_state = self.LinearStateTransition(self.x, linear_target)
+        nonlinear_target, nonlinear_mix = self.nonlinear_flow(linear_state, u)
+        x_next = self.StateTransition(
+            linear_state, nonlinear_target, nonlinear_mix)
         y_lin = self.ssm_to_deter(x_next) + self.in_to_deter(u)
         y_glu = y_lin * torch.sigmoid(self.out_gate(x_next))
         y = self.ln_y(y_glu)
@@ -607,9 +784,12 @@ class S4DCell(AGICoreModule):
     def StepWithX(self, zPrev: torch.Tensor, action: torch.Tensor, x: torch.Tensor): # zPrev: stochastic state
         u = torch.cat([zPrev, action], dim=-1)
         g = torch.sigmoid(self.gate(u))
-        Bu = self.in_to_ssm(u) * g
+        linear_target = self.in_to_ssm(u) * g
 
-        x_next = self.CayleyStep(self.theta, x, Bu, self.dt)
+        linear_state = self.LinearStateTransition(x, linear_target)
+        nonlinear_target, nonlinear_mix = self.nonlinear_flow(linear_state, u)
+        x_next = self.StateTransition(
+            linear_state, nonlinear_target, nonlinear_mix)
         y_lin = self.ssm_to_deter(x_next) + self.in_to_deter(u)
         y_glu = y_lin * torch.sigmoid(self.out_gate(x_next))
         y = self.ln_y(y_glu)
@@ -4135,14 +4315,24 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         phys = self.base.phys_refiner
         key = self.base.key_emb
         film = self.base.state_state_film
+        nonlinear_flow = self.base.s4.nonlinear_flow
 
-        def mk(name: str, inDim: int, outDim: int, maxRank: int) -> SiteSpec:
+        def mk(
+            name: str,
+            inDim: int,
+            outDim: int,
+            maxRank: int,
+            adapterStd: float = 1e-4,
+            adapterScale: float = 1e-2,
+            ) -> SiteSpec:
             inDim_i, outDim_i, maxRank_i = int(inDim), int(outDim), int(maxRank)
 
             def alloc(addRank: int, device: torch.device, dtype: torch.dtype):
-                A_ = nn.Parameter(torch.randn(addRank, inDim_i, device=device, dtype=dtype) * 1e-4) # [r,in]
-                B_ = nn.Parameter(torch.zeros(outDim_i, addRank, device=device, dtype=dtype) * 1e-4) # [out,r]
-                s_ = nn.Parameter(torch.tensor(1e-2, device=device, dtype=dtype))
+                A_ = nn.Parameter(
+                    torch.randn(addRank, inDim_i, device=device, dtype=dtype)
+                    * float(adapterStd)) # [r,in]
+                B_ = nn.Parameter(torch.zeros(outDim_i, addRank, device=device, dtype=dtype)) # [out,r]
+                s_ = nn.Parameter(torch.tensor(float(adapterScale), device=device, dtype=dtype))
                 return A_, B_, s_
 
             def compose(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
@@ -4163,6 +4353,21 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         specs["s4_in_to_deter"] = mk("s4_in_to_deter", 2 * Z, D, self.maxRank)
         specs["s4_gate"] = mk("s4_gate", 2 * Z, X, self.maxRank)
         specs["s4_out_gate"] = mk("s4_out_gate", X, D, self.maxRank)
+        specs["s4_nonlinear_left"] = mk(
+            "s4_nonlinear_left", X, nonlinear_flow.rank, self.maxRank,
+            adapterStd=X ** -0.5, adapterScale=0.5)
+        specs["s4_nonlinear_right"] = mk(
+            "s4_nonlinear_right", X, nonlinear_flow.rank, self.maxRank,
+            adapterStd=X ** -0.5, adapterScale=0.5)
+        specs["s4_nonlinear_context"] = mk(
+            "s4_nonlinear_context", 2 * Z, nonlinear_flow.rank, self.maxRank,
+            adapterStd=(2 * Z) ** -0.5, adapterScale=0.5)
+        specs["s4_nonlinear_out"] = mk(
+            "s4_nonlinear_out", nonlinear_flow.rank, X, self.maxRank,
+            adapterStd=nonlinear_flow.rank ** -0.5, adapterScale=0.5)
+        specs["s4_nonlinear_selectivity"] = mk(
+            "s4_nonlinear_selectivity", 2 * Z, 1, self.maxRankSmall,
+            adapterStd=(2 * Z) ** -0.5, adapterScale=0.5)
 
         specs["prior"] = mk("prior", D, 2 * Z, self.maxRank)
         specs["post"] = mk("post", D + Z, 2 * Z, self.maxRank)
@@ -4293,14 +4498,57 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         return self.Lin(g_in, self.base.mix_gate[0], d.get("mix_gate"))
 
 
+    def S4NonlinearFlow(
+        self,
+        x: torch.Tensor,
+        u: torch.Tensor,
+        d: Dict[str, Optional[torch.Tensor]],
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        flow = self.base.s4.nonlinear_flow
+        bounded_state, bounded_control = flow.BoundedInputs(x, u)
+        interaction = flow.Interaction(
+            flow.ProjectWeight(
+                bounded_state,
+                self.EffW(flow.left, d.get("s4_nonlinear_left")),
+                flow.left.target.bias,
+                flow.left_anchor),
+            flow.ProjectWeight(
+                bounded_state,
+                self.EffW(flow.right, d.get("s4_nonlinear_right")),
+                flow.right.target.bias,
+                flow.right_anchor),
+            flow.ProjectWeight(
+                bounded_control,
+                self.EffW(flow.context, d.get("s4_nonlinear_context")),
+                flow.context.target.bias,
+                flow.context_anchor))
+        return (
+            flow.Target(
+                x,
+                flow.ProjectWeight(
+                    interaction,
+                    self.EffW(flow.out, d.get("s4_nonlinear_out")),
+                    flow.out.target.bias,
+                    flow.out_anchor)),
+            flow.Mix(self.Lin(
+                bounded_control,
+                flow.selectivity,
+                d.get("s4_nonlinear_selectivity"))))
+
+
     def S4_Step(self, zPrev: torch.Tensor, a_t: torch.Tensor, *, updateState: bool, d: Dict[str, Optional[torch.Tensor]]) -> torch.Tensor:
         s4 = self.base.s4
         u = torch.cat([zPrev, a_t], dim=-1)  # [B,2Z]
 
         g = torch.sigmoid(self.Lin(u, s4.gate, d.get("s4_gate"))) # [B,X]
-        Bu = self.Lin(u, s4.in_to_ssm, d.get("s4_in_to_ssm")) * g # [B,X]
+        linear_target = self.Lin(
+            u, s4.in_to_ssm, d.get("s4_in_to_ssm")) * g # [B,X]
 
-        x_next = s4.CayleyStep(s4.theta, s4.x, Bu, s4.dt)
+        linear_state = s4.LinearStateTransition(s4.x, linear_target)
+        nonlinear_target, nonlinear_mix = self.S4NonlinearFlow(
+            linear_state, u, d)
+        x_next = s4.StateTransition(
+            linear_state, nonlinear_target, nonlinear_mix)
         y_lin = self.Lin(x_next, s4.ssm_to_deter, d.get("s4_ssm_to_deter")) + self.Lin(u, s4.in_to_deter, d.get("s4_in_to_deter"))
         y_glu = y_lin * torch.sigmoid(self.Lin(x_next, s4.out_gate, d.get("s4_out_gate")))
         y = s4.ln_y(y_glu)
@@ -4315,9 +4563,14 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         u = torch.cat([zPrev, a_t], dim=-1)
 
         g = torch.sigmoid(self.Lin(u, s4.gate, d.get("s4_gate")))
-        Bu = self.Lin(u, s4.in_to_ssm, d.get("s4_in_to_ssm")) * g
+        linear_target = self.Lin(
+            u, s4.in_to_ssm, d.get("s4_in_to_ssm")) * g
 
-        x_next = s4.CayleyStep(s4.theta, x, Bu, s4.dt)
+        linear_state = s4.LinearStateTransition(x, linear_target)
+        nonlinear_target, nonlinear_mix = self.S4NonlinearFlow(
+            linear_state, u, d)
+        x_next = s4.StateTransition(
+            linear_state, nonlinear_target, nonlinear_mix)
         y_lin = self.Lin(x_next, s4.ssm_to_deter, d.get("s4_ssm_to_deter")) + self.Lin(u, s4.in_to_deter, d.get("s4_in_to_deter"))
         y_glu = y_lin * torch.sigmoid(self.Lin(x_next, s4.out_gate, d.get("s4_out_gate")))
         y = s4.ln_y(y_glu)
@@ -5174,6 +5427,16 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
             self.base.s4.gate.Grow(r, init=init, freezeOld=self.freezeOldPar)
         elif site == "s4_out_gate":
             self.base.s4.out_gate.Grow(r, init=init, freezeOld=self.freezeOldPar)
+        elif site == "s4_nonlinear_left":
+            self.base.s4.nonlinear_flow.left.Grow(r, init=init, freezeOld=self.freezeOldPar)
+        elif site == "s4_nonlinear_right":
+            self.base.s4.nonlinear_flow.right.Grow(r, init=init, freezeOld=self.freezeOldPar)
+        elif site == "s4_nonlinear_context":
+            self.base.s4.nonlinear_flow.context.Grow(r, init=init, freezeOld=self.freezeOldPar)
+        elif site == "s4_nonlinear_out":
+            self.base.s4.nonlinear_flow.out.Grow(r, init=init, freezeOld=self.freezeOldPar)
+        elif site == "s4_nonlinear_selectivity":
+            self.base.s4.nonlinear_flow.selectivity.Grow(r, init=init, freezeOld=self.freezeOldPar)
 
         elif site == "prior":
             self.base.prior_net[0].Grow(r, init=init, freezeOld=self.freezeOldPar)
@@ -5416,6 +5679,347 @@ class TestWorldMTool:
             and out["pst_context"].shape == (B, wm.physical_slot_dim)
             and out["slot_binding_weight"].shape == (B, wm.physical_slots))
         print(f"PSTWorldBinder shapes {'passed' if ok else 'failed'}")
+        return bool(ok)
+
+    def TestS4NonlinearStateDynamics(self) -> bool:
+        torch.manual_seed(7)
+        cell = S4DCell(
+            inDim=128,
+            deterDim=512,
+            ssmDim=64,
+            dropout=0.0).to(self.device).eval()
+        B = 2
+        z = torch.randn(B, 64, device=self.device)
+        action = torch.randn(B, 64, device=self.device)
+        x1 = torch.randn(B, cell.ssm_dim, device=self.device)
+        x2 = torch.randn(B, cell.ssm_dim, device=self.device)
+        x0 = torch.zeros_like(x1)
+
+        def transition(state: torch.Tensor) -> torch.Tensor:
+            return cell.StepWithX(z, action, state)[1]
+
+        nonlinear_residual = (
+            transition(x1 + x2)
+            - transition(x1)
+            - transition(x2)
+            + transition(x0))
+        transition_scale = transition(x1 + x2).square().mean().sqrt()
+        nonlinear_ratio = float(
+            nonlinear_residual.square().mean().sqrt().item()
+            / transition_scale.item())
+        nonlinear = bool(
+            nonlinear_residual.abs().max().item() > 1e-3
+            and nonlinear_ratio > 1e-4)
+
+        decay = cell.DecayRates(cell.theta)
+        rho = ((1.0 - 0.5 * cell.dt * decay) / (1.0 + 0.5 * cell.dt * decay)).abs()
+        half_life = torch.log(rho.new_tensor(0.5)) / torch.log(rho)
+        multiscale = bool(
+            half_life.min().item() < 2.0
+            and half_life.max().item() > 32.0
+            and rho.max().pow(32).item() > 0.5
+            and decay.min().item() >= cell.min_decay_rate
+            and decay.max().item() <= cell.max_decay_rate)
+
+        with torch.no_grad():
+            saved_gain = cell.nonlinear_flow.gain.clone()
+            cell.nonlinear_flow.gain.zero_()
+            u = torch.cat([z, action], dim=-1)
+            linear_target = cell.in_to_ssm(u) * torch.sigmoid(cell.gate(u))
+            expected_linear = cell.LinearStateTransition(x1, linear_target)
+            nonlinear_target, _ = cell.nonlinear_flow(expected_linear, u)
+            target_ratio = float(
+                nonlinear_target.square().mean().sqrt().item()
+                / expected_linear.square().mean().sqrt().item())
+            target_strength = target_ratio > 0.10
+            recovered_linear = cell.StepWithX(z, action, x1)[1]
+            exact_linear_recovery = torch.equal(expected_linear, recovered_linear)
+            cell.nonlinear_flow.gain.copy_(saved_gain)
+
+        cell.zero_grad(set_to_none=True)
+        grad_state = x1.detach().clone().requires_grad_()
+        y, returned_state = cell.StepWithX(z, action, grad_state)
+        y.square().mean().backward()
+        detached_output = not returned_state.requires_grad
+        flow_grad = all(
+            parameter.grad is not None
+            and torch.isfinite(parameter.grad).all()
+            and parameter.grad.abs().sum().item() > 0.0
+            for parameter in cell.nonlinear_flow.parameters())
+
+        with torch.no_grad():
+            state = torch.zeros(1, cell.ssm_dim, device=self.device)
+            unit_target = torch.ones_like(state)
+            for _ in range(1024):
+                state = cell.LinearStateTransition(state, unit_target)
+            unit_dc_gain = bool((state - unit_target).abs().max().item() < 1e-3)
+
+            state = torch.zeros(B, cell.ssm_dim, device=self.device)
+            for step in range(512):
+                bounded_z = torch.sin(torch.full_like(z, step * 0.013))
+                bounded_action = torch.cos(torch.full_like(action, step * 0.017))
+                bounded_u = torch.cat([bounded_z, bounded_action], dim=-1)
+                bounded_target = (
+                    cell.in_to_ssm(bounded_u)
+                    * torch.sigmoid(cell.gate(bounded_u)))
+                linear_state = cell.LinearStateTransition(state, bounded_target)
+                nonlinear_target, nonlinear_mix = cell.nonlinear_flow(
+                    linear_state, bounded_u)
+                state = cell.StateTransition(
+                    linear_state, nonlinear_target, nonlinear_mix)
+            stable = bool(
+                torch.isfinite(state).all().item()
+                and state.abs().max().item() < 5.0)
+
+            large_half_weight = torch.full(
+                (cell.ssm_dim, cell.ssm_dim),
+                200.0,
+                device=self.device,
+                dtype=torch.float16)
+            normalized_half_weight = cell.nonlinear_flow.NormalizeWeight(
+                large_half_weight)
+            precision_safe = bool(
+                torch.isfinite(normalized_half_weight).all().item()
+                and normalized_half_weight.abs().sum().item() > 0.0)
+
+        jacobian_z = z[:1]
+        jacobian_action = action[:1]
+        jacobian_u = torch.cat([jacobian_z, jacobian_action], dim=-1)
+        jacobian_target = (
+            cell.in_to_ssm(jacobian_u)
+            * torch.sigmoid(cell.gate(jacobian_u))).detach()
+
+        def differentiable_transition(state: torch.Tensor) -> torch.Tensor:
+            linear_state = cell.LinearStateTransition(
+                state.unsqueeze(0), jacobian_target)
+            nonlinear_target, nonlinear_mix = cell.nonlinear_flow(
+                linear_state, jacobian_u)
+            return cell.StateTransition(
+                linear_state,
+                nonlinear_target,
+                nonlinear_mix).squeeze(0)
+
+        jacobian_state = x1[0].detach().requires_grad_()
+        jacobian = torch.autograd.functional.jacobian(
+            differentiable_transition, jacobian_state)
+        nominal_lipschitz = float(torch.linalg.svdvals(jacobian).max().item())
+        with torch.no_grad():
+            cell.nonlinear_flow.left.target.weight.mul_(200.0)
+            cell.nonlinear_flow.right.target.weight.mul_(200.0)
+            cell.nonlinear_flow.out.target.weight.mul_(20.0)
+        stressed_jacobian = torch.autograd.functional.jacobian(
+            differentiable_transition, jacobian_state)
+        stressed_lipschitz = float(
+            torch.linalg.svdvals(stressed_jacobian).max().item())
+        contractive = bool(
+            nominal_lipschitz < 1.0
+            and stressed_lipschitz < 1.0
+            and nominal_lipschitz ** 32 > 0.5)
+
+        ok = (
+            nonlinear
+            and target_strength
+            and multiscale
+            and exact_linear_recovery
+            and detached_output
+            and flow_grad
+            and unit_dc_gain
+            and stable
+            and precision_safe
+            and contractive)
+        print(
+            f"S4 nonlinear recurrent dynamics {'passed' if ok else 'failed'} "
+            f"| nonlinear={nonlinear}({nonlinear_ratio:.3e}), "
+            f"target={target_strength}({target_ratio:.3f}), multiscale={multiscale}, "
+            f"linear_recovery={exact_linear_recovery}, detached={detached_output}, "
+            f"flow_grad={flow_grad}, unit_dc={unit_dc_gain}, stable={stable}, fp16={precision_safe}, "
+            f"lipschitz={nominal_lipschitz:.4f}/{stressed_lipschitz:.4f}")
+        return bool(ok)
+
+    def TestS4OnlineParityAndAdaptiveSites(self) -> bool:
+        wm = self.wm
+        original_training = wm.training
+        trainability = {
+            name: parameter.requires_grad
+            for name, parameter in wm.named_parameters()}
+        try:
+            wm.eval()
+            wrapper = WorldOnlineWrapper(
+                wm, initRankEach=1, autoRank=False).to(self.device).eval()
+            B = 2
+            z = torch.randn(B, wm.stoch_dim, device=self.device)
+            action = torch.randn(B, wm.stoch_dim, device=self.device)
+            state = torch.randn(B, wm.ssm_dim, device=self.device)
+
+            base_y, base_x = wm.s4.StepWithX(z, action, state)
+            online_y, online_x = wrapper.S4StepWithX(z, action, state, {})
+            parity = torch.equal(base_y, online_y) and torch.equal(base_x, online_x)
+
+            adaptive = True
+            nonlinear_sites = tuple(
+                name for name in wrapper.sites
+                if name.startswith("s4_nonlinear_"))
+            for name in nonlinear_sites:
+                spec = wrapper.sites[name]
+                delta = (
+                    torch.randn(
+                        spec.outDim,
+                        spec.inDim,
+                        device=self.device,
+                        dtype=base_x.dtype)
+                    * 1e-2).requires_grad_()
+                candidate_y, _ = wrapper.S4StepWithX(
+                    z, action, state, {name: delta})
+                effect = (candidate_y - base_y).square().mean()
+                gradient = torch.autograd.grad(effect, delta)[0]
+                adaptive = adaptive and bool(
+                    effect.item() > 0.0
+                    and torch.isfinite(gradient).all()
+                    and gradient.abs().sum().item() > 0.0)
+
+            cold_y, _ = wrapper.S4StepWithX(
+                z, action, state, wrapper.ComposeLayerDelta(0))
+            wrapper.zero_grad(set_to_none=True)
+            cold_y.square().mean().backward()
+            cold_start_grad = all(
+                slot.grad is not None
+                and torch.isfinite(slot.grad).all()
+                and slot.grad.abs().sum().item() > 1e-9
+                for name in nonlinear_sites
+                for slot in wrapper.cand[name][0]["B"])
+            with torch.no_grad():
+                for name in nonlinear_sites:
+                    for parameter in wrapper.cand[name][0]["B"]:
+                        gradient = parameter.grad
+                        parameter.add_(
+                            -0.01 * gradient / (gradient.norm() + 1e-12))
+
+            wrapper.zero_grad(set_to_none=True)
+            adapted_y, _ = wrapper.S4StepWithX(
+                z, action, state, wrapper.ComposeLayerDelta(0))
+            adapted_y.square().mean().backward()
+            warm_start_grad = all(
+                parameter.grad is not None
+                and torch.isfinite(parameter.grad).all()
+                and parameter.grad.abs().sum().item() > 0.0
+                for name in nonlinear_sites
+                for key in ("A", "B", "s")
+                for parameter in wrapper.cand[name][0][key])
+            candidate_effect = bool(
+                (adapted_y - cold_y.detach()).abs().max().item() > 1e-8)
+
+            ok = bool(
+                parity
+                and len(nonlinear_sites) == 5
+                and adaptive
+                and cold_start_grad
+                and warm_start_grad
+                and candidate_effect)
+            print(
+                f"S4 online parity/adaptive sites {'passed' if ok else 'failed'} "
+                f"| parity={parity}, sites={len(nonlinear_sites)}, adaptive={adaptive}, "
+                f"cold_grad={cold_start_grad}, warm_grad={warm_start_grad}, "
+                f"effect={candidate_effect}")
+            return bool(ok)
+        finally:
+            wm.train(original_training)
+            for name, parameter in wm.named_parameters():
+                parameter.requires_grad_(trainability[name])
+
+    def TestS4StrictStateDictRoundTrip(self) -> bool:
+        source = S4DCell(
+            inDim=16,
+            deterDim=32,
+            ssmDim=16,
+            dropout=0.0).to(self.device).eval()
+        source_flow_layers = (
+            source.nonlinear_flow.left,
+            source.nonlinear_flow.right,
+            source.nonlinear_flow.context,
+            source.nonlinear_flow.out,
+            source.nonlinear_flow.selectivity,)
+        for layer in source_flow_layers:
+            layer.Grow(2, freezeOld=True)
+        restored = S4DCell(
+            inDim=16,
+            deterDim=32,
+            ssmDim=16,
+            dropout=0.0).to(self.device).eval()
+        restored.load_state_dict(source.state_dict(), strict=True)
+
+        z = torch.randn(2, 8, device=self.device)
+        action = torch.randn(2, 8, device=self.device)
+        state = torch.randn(2, source.ssm_dim, device=self.device)
+        with torch.no_grad():
+            source_y, source_x = source.StepWithX(z, action, state)
+            restored_y, restored_x = restored.StepWithX(z, action, state)
+        restored_flow_layers = (
+            restored.nonlinear_flow.left,
+            restored.nonlinear_flow.right,
+            restored.nonlinear_flow.context,
+            restored.nonlinear_flow.out,
+            restored.nonlinear_flow.selectivity,)
+        ok = bool(
+            all(len(layer.A_list) == 1 for layer in restored_flow_layers)
+            and torch.equal(source_y, restored_y)
+            and torch.equal(source_x, restored_x))
+        print(f"S4 strict state_dict round-trip {'passed' if ok else 'failed'}")
+        return ok
+
+    def TestS4OnlineCommitRoundTrip(self) -> bool:
+        source = self.MakeMemoryPersistenceWorld()
+        wrapper = WorldOnlineWrapper(
+            source, initRankEach=0, autoRank=False).to(self.device).eval()
+        z = torch.randn(2, source.stoch_dim, device=self.device)
+        action = torch.randn(2, source.stoch_dim, device=self.device)
+        state = torch.randn(2, source.ssm_dim, device=self.device)
+        nonlinear_sites = tuple(
+            name for name in wrapper.sites
+            if name.startswith("s4_nonlinear_"))
+
+        commit_ok = True
+        for name in nonlinear_sites:
+            spec = wrapper.sites[name]
+            adapter_a, adapter_b, adapter_scale = spec.allocFn(
+                1, wrapper.deviceRef, wrapper.dtypeRef)
+            with torch.no_grad():
+                adapter_b.normal_(std=1e-2)
+            delta = spec.composeFn(
+                adapter_a, adapter_b, adapter_scale)
+            candidate_y, candidate_x = wrapper.S4StepWithX(
+                z, action, state, {name: delta})
+            committed = wrapper.CommitOne(
+                name,
+                0,
+                adapter_a,
+                adapter_b,
+                float(adapter_scale.item()))
+            committed_y, committed_x = wrapper.S4StepWithX(
+                z, action, state, {})
+            commit_ok = commit_ok and bool(
+                committed
+                and torch.equal(candidate_y, committed_y)
+                and torch.equal(candidate_x, committed_x))
+
+        restored = self.MakeMemoryPersistenceWorld()
+        restored.load_state_dict(source.state_dict(), strict=True)
+        with torch.no_grad():
+            source_y, source_x = source.s4.StepWithX(z, action, state)
+            restored_y, restored_x = restored.s4.StepWithX(z, action, state)
+        restored_layers = (
+            restored.s4.nonlinear_flow.left,
+            restored.s4.nonlinear_flow.right,
+            restored.s4.nonlinear_flow.context,
+            restored.s4.nonlinear_flow.out,
+            restored.s4.nonlinear_flow.selectivity,)
+        round_trip = bool(
+            all(len(layer.A_list) == 1 for layer in restored_layers)
+            and torch.equal(source_y, restored_y)
+            and torch.equal(source_x, restored_x))
+        ok = commit_ok and len(nonlinear_sites) == 5 and round_trip
+        print(
+            f"S4 online commit/round-trip {'passed' if ok else 'failed'} "
+            f"| commit={commit_ok}, sites={len(nonlinear_sites)}, round_trip={round_trip}")
         return bool(ok)
 
     def TestRSSMStepPosterior(self) -> bool:
@@ -7769,6 +8373,10 @@ class TestWorldMTool:
     def RunAll(self) -> bool:
         results = {
             "PSTWorldBinderShapes": self.TestPSTWorldBinderShapes(),
+            "S4NonlinearStateDynamics": self.TestS4NonlinearStateDynamics(),
+            "S4OnlineParityAndAdaptiveSites": self.TestS4OnlineParityAndAdaptiveSites(),
+            "S4StrictStateDictRoundTrip": self.TestS4StrictStateDictRoundTrip(),
+            "S4OnlineCommitRoundTrip": self.TestS4OnlineCommitRoundTrip(),
             "RSSMStepPosterior": self.TestRSSMStepPosterior(),
             "RSSMStepPriorOnly": self.TestRSSMStepPriorOnly(),
             "StationaryCameraPriorOwnsMotionAssumption": self.TestStationaryCameraPriorOwnsMotionAssumption(),

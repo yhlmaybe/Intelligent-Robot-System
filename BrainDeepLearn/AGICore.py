@@ -307,7 +307,6 @@ class BrainCore(nn.Module):
         device: Optional[torch.device] = None,
         *,
         seqLen: int = BasicParameters.IMAGE_SEQ_LEN,
-        plasticHebbian: bool = True,
         prioritizeExtStr: bool = True,
         plasticOnlineLearning: bool = False,
         usePlanner: bool = True,
@@ -332,15 +331,12 @@ class BrainCore(nn.Module):
             imgSize=BasicParameters.IMAGE_SIZE,
             embedDim=ModuleDim.PerceptionEmbed,
             objectTokenCount=ModuleDim.PstObservedSlots,
-            useHebbian=plasticHebbian,
             enableRecallAuxiliary=enablePerceptionSupervision)
         self.perception_recall_loss = PerceptionRecallLoss() if enablePerceptionSupervision else None
         
         self.attn = AttentionExtractor(
             embedDim=ModuleDim.AttentionFeat,
             sequenceLength=seqLen, 
-            hebbianRate=(0.01 if plasticHebbian else 0.0), 
-            useHebbian=plasticHebbian,
             structuredDim=ModuleDim.PerceptionEmbed,
             goalDim=ModuleDim.IntentionFeat,
             objectTokenCount=self.perc.object_token_count)
@@ -350,8 +346,6 @@ class BrainCore(nn.Module):
             ssmStateDim=ModuleDim.MemoryItem,
             memoryDim=ModuleDim.MemoryItem,
             outputDim=ModuleDim.MemoryFeat,
-            hebbAlpha=(0.15 if plasticHebbian else 0.0), 
-            useHebbian=plasticHebbian,
             emotionDim=ModuleDim.ValueEstimationOutEmotion)
         
         self.value_tensor_dim = 512
@@ -359,7 +353,6 @@ class BrainCore(nn.Module):
             stateDim=ModuleDim.MemoryFeat,
             intentDim=ModuleDim.IntentionFeat,
             includeNoSkill=True,
-            useHebb=plasticHebbian,
             valueTensorDim=self.value_tensor_dim,
             vNextTensorDim=self.value_tensor_dim,
             beliefDim=ModuleDim.DecisionBeliefDim,
@@ -399,14 +392,12 @@ class BrainCore(nn.Module):
             attnDim=ModuleDim.AttentionFeat,
             stateDim=ModuleDim.WorldFeat,
             emotionDim=ModuleDim.ValueEstimationOutEmotion,
-            useHebb=plasticHebbian,
             valueTensorDim=self.value_tensor_dim,)
         
         self.conscious = ConsciousnessExtractor(
             memItemDim=ModuleDim.MemoryItem,
             worldItemDim=ModuleDim.WorldMemoryItem,
-            intentDim=ModuleDim.ConsciousnessState,
-            useHebb=plasticHebbian)
+            intentDim=ModuleDim.ConsciousnessState,)
 
         self.intention = IntentionExtractor(
             dimSem=ModuleDim.IntentionFeat,
@@ -1460,8 +1451,7 @@ class BrainCore(nn.Module):
             qualitySeq=quality_seq,
             predErrorSeq=pred_error_seq,
             goalBias=self.prev_goal_bias,
-            precision=precision_sig,
-            applyPlasticity=True) # [B, D_attn]
+            precision=precision_sig,) # [B, D_attn]
         saveModuleOutput("Attention", atten_out)
 
         intent_hint_for_memory = self.prev_intent_sem
@@ -2779,8 +2769,7 @@ class BrainCore(nn.Module):
                         qualitySeq=quality_seq,
                         predErrorSeq=pred_error_seq,
                         goalBias=intent_hint_list[i],
-                        precision=precision_sig,
-                        applyPlasticity=True)
+                        precision=precision_sig,)
                     memModule(
                         atten_out,
                         tdError=td_sig,
@@ -4392,8 +4381,7 @@ class TestAGICoreMTool:
                         actionEmbedDim=6,
                         hiddenDim=32,
                         psiDim=8,
-                        optionNum=3,
-                        useHebb=False)
+                        optionNum=3,)
                     self.conscious = nn.Identity()
                     self.intention = nn.Identity()
                     self.pst_builder = nn.Identity()

@@ -469,30 +469,35 @@ class RoPEMultiheadAttention(AGICoreModule):
         k = self.rope.Apply(k)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        neg_large = torch.finfo(scores.dtype).min
 
         if attnMask is not None:
             attnMaskView = self.PrepareMask(attnMask, B, Tq, Tk)
             if attnMaskView.dtype == torch.bool:
-                scores = scores.masked_fill(attnMaskView, neg_large)
+                scores = scores.masked_fill(attnMaskView, -torch.inf)
             else:
                 scores = scores + attnMaskView
 
         if keyPaddingMask is not None:
             padMask = keyPaddingMask.reshape(B, 1, 1, Tk)
-            scores = scores.masked_fill(padMask, neg_large)
+            scores = scores.masked_fill(padMask, -torch.inf)
 
-        attn = F.softmax(scores, dim=-1)
-        attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
-        attn = self.attn_drop(attn)
+        attn_probability = F.softmax(scores, dim=-1)
+        attn_probability = torch.nan_to_num(
+            attn_probability,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0)
+        attn = self.attn_drop(attn_probability)
 
         out = torch.matmul(attn, v)
         out = self.MergeHeads(out)
         out = self.out_proj(out)
+        query_has_key = attn_probability.sum(dim=-1).gt(0).any(dim=1)
+        out = out.masked_fill(~query_has_key.unsqueeze(-1), 0.0)
 
         weights = None
         if needWeights:
-            weights = attn.mean(dim=1)
+            weights = attn_probability.mean(dim=1)
         return out, weights
 
 

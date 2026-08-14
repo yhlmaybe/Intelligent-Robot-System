@@ -133,7 +133,7 @@ public:
 
     bool TrainOCRModule(int epochs = 400, int batchSize = 1, double valSplit = 0.1, bool resume = true);
 
-    bool DeployModule(bool useHebbian = true, bool usePlanner = true);
+    bool DeployModule(bool usePlanner = true);
 
     bool ExportParmFromCheckpoint(bool isOverride);
 
@@ -149,7 +149,7 @@ public:
 
     bool SetParameterReceiver(std::optional<double> reward = std::nullopt, std::optional<double> done = std::nullopt, std::optional<std::string> textExt = std::nullopt);
 
-    bool InitAgentHandle(bool useHebbian = true, bool usePlanner = true);
+    bool InitAgentHandle(bool usePlanner = true);
 
     // sensorPacketJson carries one synchronized RGB-D frame, stream_id, monotonically
     // increasing sequence_index, frame_id, calibration_id,

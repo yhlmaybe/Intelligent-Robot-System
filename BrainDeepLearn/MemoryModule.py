@@ -1326,10 +1326,7 @@ class MemoryExtractor(AGICoreModule):
         ltmSize: int = 16384,
         nsK: int = 256,
         outputDim: int = 1024,
-        hebbAlpha: float = 0.15,
-        decayFactor: float = 0.95,
         topk: int = 8,
-        useHebbian: bool = True,
         gwsSlots: int = 24,
         gwsTtl: int = 64,
         compressEvery: int = 8192,
@@ -1342,9 +1339,6 @@ class MemoryExtractor(AGICoreModule):
         self.output_dim = outputDim
         self.memory_size = memorySize
         self.topk = min(topk, memorySize)
-        self.hebb_alpha = hebbAlpha
-        self.decay = decayFactor
-        self.use_hebbian = useHebbian
 
         self.ltm_topk_sem = 6
         self.ltm_topk_epi = 4
@@ -2098,9 +2092,6 @@ class MemoryExtractor(AGICoreModule):
         b: torch.Tensor # [B]
         ) -> None:
 
-        if self.use_hebbian is False:
-            return
-
         B = int(key.size(0))
 
         key_d = key.detach()
@@ -2112,9 +2103,9 @@ class MemoryExtractor(AGICoreModule):
 
         outer = torch.bmm(key_d.unsqueeze(2), key_d.unsqueeze(1)) # [B, memory_dim, memory_dim]
 
-        update = (n3 * self.hebb_alpha) * a3 * g3 * outer # [B, memory_dim, memory_dim]
+        update = (n3 * 0.15) * a3 * g3 * outer # [B, memory_dim, memory_dim]
 
-        new_weights = self.fast_weights * self.decay * b3 + update
+        new_weights = self.fast_weights * 0.95 * b3 + update
 
         max_fro = 5.0
         flat = new_weights.reshape(B, -1)
@@ -5281,9 +5272,8 @@ class TestMemoryMTool:
             cfg = self.FilterKwargs(MemoryExtractor, cfg)
 
             mem = MemoryExtractor(**cfg).to(self.device).train()
-            mem_without_hebbian = MemoryExtractor(**cfg).to(self.device).train()
-            mem_without_hebbian.load_state_dict(mem.state_dict(), strict=True)
-            mem_without_hebbian.use_hebbian = False
+            mem_peer = MemoryExtractor(**cfg).to(self.device).train()
+            mem_peer.load_state_dict(mem.state_dict(), strict=True)
 
             B = 4
             x = torch.randn(B, cfg.get("inputDim", 32), device=self.device)
@@ -5295,15 +5285,20 @@ class TestMemoryMTool:
             first = self.CallMemForward(
                 mem, x, tdError=td, reward=rwd, emotion=emotion)
             torch.manual_seed(91)
-            first_without_hebbian = self.CallMemForward(
-                mem_without_hebbian,
+            first_peer = self.CallMemForward(
+                mem_peer,
                 x,
                 tdError=td,
                 reward=rwd,
                 emotion=emotion)
             assert torch.allclose(
                 first,
-                first_without_hebbian,
+                first_peer,
+                atol=1e-7,
+                rtol=1e-6)
+            assert torch.allclose(
+                mem.fast_weights,
+                mem_peer.fast_weights,
                 atol=1e-7,
                 rtol=1e-6)
             assert "fast_weights" not in mem.state_dict()
