@@ -15,14 +15,12 @@ class SelectiveSSM(AGICoreModule):
         embedDim: int,
         stateDim: int = 4, 
         convKernel: int = 4, 
-        useCausalConv: bool = True,
         slowDtScale: float = 0.25,):
         super().__init__()
         E = embedDim
         N = stateDim
         self.E = E
         self.N = N
-        self.use_causal_conv = bool(useCausalConv)
         self.slow_dt_scale = float(slowDtScale)
 
         self.A_log = nn.Parameter(torch.randn(E, N))
@@ -48,11 +46,9 @@ class SelectiveSSM(AGICoreModule):
         nn.init.zeros_(self.time_mix_gate.bias)
 
     def CausalDwconv(self, u: torch.Tensor) -> torch.Tensor:
-        B, S, E = u.shape
         x = u.transpose(1, 2) 
-        if self.use_causal_conv:
-            k = self.dw_conv.kernel_size[0]
-            x = F.pad(x, (k - 1, 0)) 
+        k = self.dw_conv.kernel_size[0]
+        x = F.pad(x, (k - 1, 0))
         y = self.dw_conv(x)
         y = y.transpose(1, 2)  
         return y
@@ -67,28 +63,28 @@ class SelectiveSSM(AGICoreModule):
         B, S, E = x.shape
         N = self.N
 
-        mod = torch.sigmoid(0.75 * tdError - 0.75 * uncertainty) 
+        surprise = tdError.abs()
 
         u_and_g = self.in_proj(x)
         u, g = torch.chunk(u_and_g, 2, dim=-1)
         u = F.silu(u)
+        if keyPaddingMask is not None:
+            u = u * (~keyPaddingMask).unsqueeze(-1)
 
         u = u + 0.5 * self.CausalDwconv(u)
 
-        gate_bias = (0.5 * tdError - 0.5 * uncertainty)[:, None, None]
+        gate_bias = (0.5 * surprise - 0.5 * uncertainty)[:, None, None]
         g = torch.sigmoid(g + gate_bias) 
 
-        p = self.param_proj(u) 
-        dt_raw = p[..., :E]  
-        bc = p[..., E:]  
-        B_raw, C_raw = bc.split(E * N, dim=-1)
-
-        B_t = torch.tanh(B_raw).view(B, S, E, N)  
+        p = self.param_proj(u)
+        dt_raw = p[..., :E]
+        B_raw, C_raw = p[..., E:].split(E * N, dim=-1)
+        B_t = torch.tanh(B_raw).view(B, S, E, N)
         C_t = torch.tanh(C_raw).view(B, S, E, N)
-
         dt = F.softplus(dt_raw + self.dt_bias.view(1, 1, E))
-
-        dt = dt * (0.75 + 0.50 * mod[:, None, None])
+        dt = dt * (
+            (1.0 + 0.50 * surprise[:, None, None])
+            * (1.0 - 0.25 * uncertainty[:, None, None]))
 
         A_pos = F.softplus(self.A_log) + 1e-4
 
@@ -135,7 +131,10 @@ class SelectiveSSM(AGICoreModule):
 
             y[:, t, :] = out_t
 
-        return self.out_norm(y)
+        y = self.out_norm(y)
+        if keyPaddingMask is not None:
+            y = y * (~keyPaddingMask).unsqueeze(-1)
+        return y
 
 class MultiHeadAttention(AGICoreModule):
     def __init__(
@@ -154,8 +153,8 @@ class MultiHeadAttention(AGICoreModule):
 
         self.temp_w_td = nn.Parameter(torch.tensor(0.8))
         self.temp_w_unc = nn.Parameter(torch.tensor(0.5))
-        self.bias_w_td = nn.Parameter(torch.tensor(0.4))
-        self.bias_w_unc = nn.Parameter(torch.tensor(0.6))
+        self.attention_prior_gain = nn.Parameter(
+            torch.zeros(numHeads))
 
         self.q_proj = nn.Linear(embedDim, embedDim)
         self.k_proj = nn.Linear(embedDim, embedDim)
@@ -187,8 +186,11 @@ class MultiHeadAttention(AGICoreModule):
             self.V = self.V.new_zeros(
                 B, self.num_heads, self.head_dim, 8)
 
-    def ModulateTau(self, tdError, uncertainty, B):
-        tau = 1.0 + 0.5 * torch.tanh(self.temp_w_td * tdError + self.temp_w_unc * uncertainty) 
+    def ModulateTau(self, tdError, uncertainty):
+        surprise = tdError.abs()
+        tau = torch.exp(
+            0.25 * torch.tanh(self.temp_w_unc) * uncertainty
+            - 0.25 * torch.tanh(self.temp_w_td) * surprise)
         return tau[:, None, None, None]
 
 
@@ -213,34 +215,15 @@ class MultiHeadAttention(AGICoreModule):
         self.U[mask] = 0
         self.V[mask] = 0
 
-
-    def ScaledDotAttn(
-        self,
-        q: torch.Tensor, # [B, H, Lq, D]
-        k: torch.Tensor, # [B, H, Lk, D]
-        v: torch.Tensor, # [B, H, Lk, D]
-        mask: Optional[torch.Tensor], # [B, 1, 1, Lk]
-        dropoutP: float,) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        q_attn = self.rope.Apply(q)
-        k_attn = self.rope.Apply(k)
-        d = q_attn.size(-1)
-        scores = torch.matmul(q_attn, k_attn.transpose(-2, -1)) / math.sqrt(d)
-        if mask is not None:
-            mask_value = -torch.finfo(scores.dtype).max
-            scores = scores.masked_fill(mask, mask_value)
-        weights = F.softmax(scores, dim=-1)
-        weights = F.dropout(weights, p=dropoutP, training=self.training)
-        context = torch.matmul(weights, v)
-        return context, weights
-
-
-    def ComputeNeuromodulation(self, tdError: torch.Tensor, B: int) -> torch.Tensor:
-        neuromod = 1.0 + 0.5 * tdError
+    def ComputeNeuromodulation(self, tdError: torch.Tensor) -> torch.Tensor:
+        neuromod = 1.0 + 0.25 * tdError.abs()
         return neuromod[:, None, None, None]
     
-    def ComputeHebbMod(self, tdError: torch.Tensor, uncertainty: torch.Tensor, B: int) -> torch.Tensor:
-        mod = ((tdError + 1.0) * 0.5) * (1.0 - uncertainty) # [B]
+    def ComputeHebbMod(
+        self,
+        tdError: torch.Tensor,
+        precision: torch.Tensor,) -> torch.Tensor:
+        mod = (0.25 + 0.75 * tdError.abs()) * precision
         return mod[:, None, None, None]
 
 
@@ -250,18 +233,33 @@ class MultiHeadAttention(AGICoreModule):
         q = q.detach()
 
         if keep4 is not None:
-            k = keep4.detach() 
-            v = v * k
-            q = q * k
-            denom = k.sum(dim=-2, keepdim=True).clamp_min(1.0) 
+            valid = keep4[:, 0, :, 0].bool()
+            update_rows = valid.any(dim=-1)
+            positions = torch.arange(
+                v.size(2),
+                device=v.device).unsqueeze(0)
+            current_index = positions.masked_fill(
+                ~valid,
+                0).amax(dim=-1)
+            gather_index = current_index.view(
+                v.size(0),
+                1,
+                1,
+                1).expand(-1, v.size(1), 1, v.size(3))
+            v = v.gather(2, gather_index)
+            q = q.gather(2, gather_index)
         else:
-            S_len = v.size(2)
-            denom = S_len
+            update_rows = torch.ones(
+                v.size(0),
+                device=v.device,
+                dtype=torch.bool)
+            v = v[:, :, -1:]
+            q = q[:, :, -1:]
 
         v = F.normalize(v, dim=-1, eps=1e-6)
         q = F.normalize(q, dim=-1, eps=1e-6)
 
-        hebb = torch.einsum("bhse,bhsd->bhde", v, q) / (denom + 1e-8)
+        hebb = torch.einsum("bhse,bhsd->bhde", v, q)
         hebb = torch.tanh(hebb) 
 
         def clamp_fro(x: torch.Tensor, max_norm: float):
@@ -283,32 +281,34 @@ class MultiHeadAttention(AGICoreModule):
         Ur = clamp_fro(Ur, 1.5)
         Vr = clamp_fro(Vr, 1.5)
 
+        row_mask = update_rows.view(-1, 1, 1, 1)
+        Ur = torch.where(row_mask, Ur, self.U)
+        Vr = torch.where(row_mask, Vr, self.V)
+
         self.U.copy_(Ur)
         self.V.copy_(Vr)
 
 
-    def forward(
+    def Attend(
         self,
-        query,
-        key,
-        value,
+        q_lin: torch.Tensor,
+        k_lin: torch.Tensor,
+        v_lin: torch.Tensor,
         tdError: torch.Tensor,
         uncertainty: torch.Tensor,
+        precision: torch.Tensor,
         keyPaddingMask: Optional[torch.Tensor] = None,
-        headGate: Optional[torch.Tensor] = None,):
-        B, L, _ = query.shape
+        headGate: Optional[torch.Tensor] = None,
+        attentionBias: Optional[torch.Tensor] = None,) -> torch.Tensor:
+        B, L, _ = q_lin.shape
 
         td = tdError
         unc = uncertainty
         td_eff = td * self.td_unc_scale
         unc_eff = unc * self.td_unc_scale
 
-        neuromod = self.ComputeNeuromodulation(td_eff, B)
-        hebb_mod = self.ComputeHebbMod(td_eff, unc_eff, B)
-
-        q_lin = self.q_adapter(query) 
-        k_lin = self.k_adapter(key)
-        v_lin = self.v_adapter(value) 
+        neuromod = self.ComputeNeuromodulation(td_eff)
+        hebb_mod = self.ComputeHebbMod(td_eff, precision)
 
         q = q_lin.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         k = k_lin.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
@@ -321,13 +321,13 @@ class MultiHeadAttention(AGICoreModule):
 
         U = self.U.detach().clone()
         V = self.V.detach().clone()
-        vV = torch.matmul(v, V)
-        delt = torch.matmul(vV, U.transpose(-2, -1))
+        qU = torch.matmul(q_hebb, U)
+        delt = torch.matmul(qU, V.transpose(-2, -1))
 
         delt = delt * hebb_mod
         v_fast = v + delt
 
-        tau = self.ModulateTau(td_eff, unc_eff, B)
+        tau = self.ModulateTau(td_eff, unc_eff)
         q = q / tau
 
         q_attn = self.rope.Apply(q)
@@ -335,17 +335,20 @@ class MultiHeadAttention(AGICoreModule):
 
         d = q_attn.size(-1)
         scores = torch.matmul(q_attn, k_attn.transpose(-2, -1)) / math.sqrt(d)
+        if attentionBias is not None:
+            prior_gain = F.softplus(
+                self.attention_prior_gain).view(1, self.num_heads, 1, 1)
+            scores = scores + prior_gain * attentionBias[:, None, None, :]
         if keyPaddingMask is not None:
             mask = keyPaddingMask[:, None, None, :]  # bool [B,1,1,L]
-            mask_val = -1e9 if q.dtype != torch.float16 else -1e4
-            scores = scores.masked_fill(mask, mask_val)
+            scores = scores.masked_fill(mask, -torch.inf)
 
         weights = F.softmax(scores, dim=-1)
+        if keyPaddingMask is not None:
+            weights = weights.masked_fill(mask, 0.0)
         weights = F.dropout(weights, p=self.attn_dropout_p if self.training else 0.0, training=self.training)
         context = torch.matmul(weights, v_fast)
         out = context.transpose(1, 2).reshape(B, L, self.embed_dim)
-
-        out_lin = self.o_adapter(out)
 
         alpha = 0.01 * hebb_mod
         if keyPaddingMask is not None:
@@ -354,7 +357,33 @@ class MultiHeadAttention(AGICoreModule):
         else:
             self.UpdateHebbianWeights(v, q_hebb, alpha, keep4=None)
         
-        return out_lin
+        return out
+
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        tdError: torch.Tensor,
+        uncertainty: torch.Tensor,
+        precision: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        headGate: Optional[torch.Tensor] = None,
+        attentionBias: Optional[torch.Tensor] = None,):
+        q_lin = self.q_adapter(query)
+        k_lin = self.k_adapter(key)
+        v_lin = self.v_adapter(value)
+        out = self.Attend(
+            q_lin,
+            k_lin,
+            v_lin,
+            tdError,
+            uncertainty,
+            precision,
+            keyPaddingMask,
+            headGate,
+            attentionBias)
+        return self.o_adapter(out)
 
 
 class TemporalAttention(AGICoreModule):
@@ -375,7 +404,6 @@ class TemporalAttention(AGICoreModule):
             embedDim,
             stateDim=16,
             convKernel=4,
-            useCausalConv=True,
             slowDtScale=slowDtScale)
 
         self.gamma = nn.Parameter(1e-1 * torch.ones(embedDim), requires_grad=True)
@@ -403,9 +431,11 @@ class TemporalAttention(AGICoreModule):
         x,
         tdError: torch.Tensor,
         uncertainty: torch.Tensor,
+        precision: torch.Tensor,
         keyPaddingMask: Optional[torch.Tensor]=None,
         headGate: Optional[torch.Tensor] = None,
-        channelGate: Optional[torch.Tensor] = None,):
+        channelGate: Optional[torch.Tensor] = None,
+        attentionBias: Optional[torch.Tensor] = None,):
         residual = x
         x_norm = self.norm(x)
         
@@ -416,7 +446,9 @@ class TemporalAttention(AGICoreModule):
             keyPaddingMask=keyPaddingMask,
             tdError=tdError,
             uncertainty=uncertainty,
-            headGate=headGate)
+            precision=precision,
+            headGate=headGate,
+            attentionBias=attentionBias)
 
         ssm_out = self.ssm(x_norm, keyPaddingMask=keyPaddingMask, tdError=tdError, uncertainty=uncertainty)
 
@@ -441,136 +473,358 @@ class TemporalAttention(AGICoreModule):
         return out
 
 
-class DynamicRouting(AGICoreModule):
-    def __init__(self, inCaps: int, inDim: int, outCaps: int, outDim: int, iterations: int = 3):
+class AttentionWorkspace(AGICoreModule):
+    def __init__(
+        self,
+        latentDim: int,
+        numLatents: int,
+        iterations: int,
+        temporalBasisCount: int,):
         super().__init__()
-        self.I = inCaps
-        self.O = outCaps
-        self.in_dim = inDim
-        self.out_dim = outDim
-        self.iterations = iterations
+        self.latent_dim = int(latentDim)
+        self.num_latents = int(numLatents)
+        self.iterations = int(iterations)
+        self.temporal_basis_count = int(temporalBasisCount)
 
-        self.transformation = nn.Parameter(torch.empty(inCaps, outCaps, inDim, outDim))
-        self.routing_logits = nn.Parameter(torch.randn(1, inCaps, outCaps) * 0.01)
-        self.ResetParameters()
-
-    def ResetParameters(self):
-        nn.init.kaiming_uniform_(self.transformation, a=math.sqrt(5))
-
-    def Squash(self, vectors: torch.Tensor) -> torch.Tensor:
-        squared_norm = vectors.pow(2).sum(dim=-1, keepdim=True)
-        scale = squared_norm / (1.0 + squared_norm) / (torch.sqrt(squared_norm + 1e-8))
-        return scale * vectors
+        self.latent_queries = nn.Parameter(
+            torch.randn(numLatents, latentDim) * 0.02)
+        self.goal_gain = nn.Parameter(
+            torch.randn(numLatents, latentDim) * 0.02)
+        self.temporal_transforms = nn.Parameter(torch.empty(
+            temporalBasisCount,
+            numLatents,
+            latentDim,
+            latentDim))
+        self.temporal_latent_prior = nn.Parameter(torch.zeros(
+            temporalBasisCount,
+            numLatents))
+        self.aggregation_gain = nn.Parameter(torch.empty(
+            numLatents,
+            2,
+            latentDim))
+        self.source_gain = nn.Parameter(torch.ones(
+            numLatents,
+            2,
+            latentDim))
+        self.temporal_competition_gain = nn.Parameter(torch.tensor(3.98))
+        self.object_competition_gain = nn.Parameter(torch.tensor(3.98))
+        self.query_norm = nn.LayerNorm(latentDim)
+        self.token_norm = nn.LayerNorm(latentDim)
+        self.q_proj = nn.Linear(latentDim, latentDim, bias=False)
+        self.k_proj = nn.Linear(latentDim, latentDim, bias=False)
+        self.v_proj = nn.Linear(latentDim, latentDim, bias=False)
+        self.out_proj = nn.Linear(latentDim, latentDim, bias=False)
+        self.ffn_norm = nn.LayerNorm(latentDim)
+        self.ffn = nn.Sequential(
+            nn.Linear(latentDim, 2 * latentDim),
+            nn.GELU(),
+            nn.Linear(2 * latentDim, latentDim))
+        identity = torch.eye(
+            latentDim,
+            device=self.temporal_transforms.device,
+            dtype=self.temporal_transforms.dtype)
+        with torch.no_grad():
+            self.temporal_transforms.copy_(
+                identity.view(1, 1, latentDim, latentDim)
+                + 0.02 * torch.randn_like(self.temporal_transforms))
+            self.aggregation_gain[:, 0].zero_()
+            self.aggregation_gain[:, 1].fill_(1.0)
 
     def forward(
         self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None, ) -> torch.Tensor: 
+        tokens: torch.Tensor,
+        objectCandidates: torch.Tensor,
+        objectPriority: torch.Tensor,
+        goal: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        ) -> Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor]:
+        B = tokens.size(0)
+        latents = (
+            self.latent_queries.unsqueeze(0).expand(B, -1, -1)
+            + torch.tanh(self.goal_gain).unsqueeze(0)
+            * goal.unsqueeze(1))
+        token_state = self.token_norm(tokens)
+        key = self.k_proj(token_state)
+        object_state = self.token_norm(objectCandidates)
+        object_key = self.k_proj(object_state)
+        object_value = (
+            self.v_proj(object_state)
+            + 0.25 * objectCandidates)
+        S = token_state.size(1)
+        temporal_transforms = F.interpolate(
+            self.temporal_transforms.permute(1, 2, 3, 0).reshape(
+                1,
+                self.num_latents * self.latent_dim * self.latent_dim,
+                self.temporal_basis_count),
+            size=S,
+            mode="linear",
+            align_corners=True).reshape(
+                self.num_latents,
+                self.latent_dim,
+                self.latent_dim,
+                S).permute(3, 0, 1, 2)
+        temporal_latent_prior = F.interpolate(
+            self.temporal_latent_prior.transpose(0, 1).unsqueeze(0),
+            size=S,
+            mode="linear",
+            align_corners=True).squeeze(0)
+        transformed_value = torch.einsum(
+            "bsd,sldh->bslh",
+            tokens,
+            temporal_transforms)
+        value = (
+            self.v_proj(token_state).unsqueeze(2)
+            + 0.25 * transformed_value)
 
-        B, I, D = x.shape
+        for _ in range(self.iterations):
+            query = self.q_proj(self.query_norm(latents))
+            scores = torch.matmul(
+                query,
+                key.transpose(-2, -1)) / math.sqrt(self.latent_dim)
+            scores = scores + temporal_latent_prior.unsqueeze(0)
+            scores = scores + 0.25 * torch.einsum(
+                "bld,bsld->bls",
+                query,
+                transformed_value) / math.sqrt(self.latent_dim)
+            scores = F.softplus(self.temporal_competition_gain) * scores
+            object_scores = torch.einsum(
+                "bld,bskd->blsk",
+                query,
+                object_key) / math.sqrt(self.latent_dim)
+            object_scores = (
+                F.softplus(self.object_competition_gain)
+                * object_scores)
+            if keyPaddingMask is not None:
+                scores = scores.masked_fill(
+                    keyPaddingMask.unsqueeze(1),
+                    -torch.inf)
+                object_scores = object_scores.masked_fill(
+                    keyPaddingMask[:, None, :, None],
+                    -torch.inf)
+            allocation = torch.softmax(scores, dim=1)
+            object_allocation = torch.softmax(object_scores, dim=1)
+            if keyPaddingMask is None:
+                valid_time_count = objectPriority.new_full(
+                    (B, 1, 1, 1),
+                    float(objectPriority.size(1)))
+            else:
+                valid_time_count = (~keyPaddingMask).sum(
+                    dim=-1).view(B, 1, 1, 1)
+            object_allocation = (
+                object_allocation
+                * valid_time_count
+                * objectPriority.unsqueeze(1))
+            if keyPaddingMask is not None:
+                allocation = allocation.masked_fill(
+                    keyPaddingMask.unsqueeze(1),
+                    0.0)
+                object_allocation = object_allocation.masked_fill(
+                    keyPaddingMask[:, None, :, None],
+                    0.0)
+            allocation_mass = allocation.sum(
+                dim=-1,
+                keepdim=True)
+            weights = allocation / (
+                allocation_mass
+                + allocation_mass.eq(0))
+            mean_update = torch.einsum(
+                "bls,bsld->bld",
+                weights,
+                value)
+            mass_update = torch.einsum(
+                "bls,bsld->bld",
+                allocation,
+                value)
+            temporal_update = (
+                self.aggregation_gain[:, 0].unsqueeze(0) * mean_update
+                + self.aggregation_gain[:, 1].unsqueeze(0) * mass_update)
+            object_allocation_mass = object_allocation.sum(
+                dim=(2, 3),
+                keepdim=True)
+            object_weights = object_allocation / (
+                object_allocation_mass
+                + object_allocation_mass.eq(0))
+            object_mean_update = torch.einsum(
+                "blsk,bskd->bld",
+                object_weights,
+                object_value)
+            object_mass_update = torch.einsum(
+                "blsk,bskd->bld",
+                object_allocation,
+                object_value)
+            object_update = (
+                self.aggregation_gain[:, 0].unsqueeze(0)
+                * object_mean_update
+                + self.aggregation_gain[:, 1].unsqueeze(0)
+                * object_mass_update)
+            workspace_update = (
+                self.source_gain[:, 0].unsqueeze(0) * temporal_update
+                + self.source_gain[:, 1].unsqueeze(0) * object_update)
+            latents = latents + self.out_proj(
+                workspace_update)
+            latents = latents + self.ffn(
+                self.ffn_norm(latents))
 
-        u_hat = torch.einsum("bid,iodc->bioc", x, self.transformation)
-
-        logits = self.routing_logits.expand(B, -1, -1).clone()
-
-        if mask is not None:
-            logits = logits.masked_fill(mask.unsqueeze(-1), -1e9)
-
-        for r in range(self.iterations):
-            weights = torch.softmax(logits, dim=-1)  # [B,I,O]
-
-            if mask is not None:
-                weights = weights.masked_fill(mask.unsqueeze(-1), 0.0)
-                denom = weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-                weights = weights / denom
-
-            s = torch.einsum("bioc,bio->boc", u_hat, weights)
-            v = self.Squash(s)
-
-            if r < self.iterations - 1:
-                agreement = torch.einsum("bioc,boc->bio", u_hat, v).clamp(-5.0, 5.0)
-                if mask is not None:
-                    agreement = agreement.masked_fill(mask.unsqueeze(-1), 0.0)
-                logits = logits + agreement
-                if mask is not None:
-                    logits = logits.masked_fill(mask.unsqueeze(-1), -1e9)
-
-        return v
+        source_mass = torch.stack([
+            allocation.sum(dim=(1, 2)),
+            object_allocation.sum(dim=(1, 2, 3))], dim=-1)
+        return latents, weights, object_weights, source_mass
 
 
-class HebbianFusion(AGICoreModule):
-    def __init__(self, numModes: int, embedDim: int):
+class GoalConditionedHebbianFusion(AGICoreModule):
+    def __init__(
+        self,
+        numModes: int,
+        embedDim: int,):
         super().__init__()
-        self.num_modes = numModes
-        self.embed_dim = embedDim
+        self.num_modes = int(numModes)
+        self.embed_dim = int(embedDim)
 
-        self.ctx_q = nn.Linear(self.embed_dim, 1, bias=False)
-
-        self.base_weights = nn.Parameter(torch.empty(numModes, embedDim, embedDim))
+        self.base_weights = nn.Parameter(torch.empty(
+            self.num_modes,
+            self.embed_dim,
+            self.embed_dim))
+        self.gate_head = nn.Sequential(
+            nn.Linear(5 * self.embed_dim, 2 * self.embed_dim),
+            nn.SiLU(),
+            nn.Linear(2 * self.embed_dim, 1))
         self.register_buffer(
             "hebbian_memory",
-            torch.zeros(1, numModes, embedDim, embedDim),
+            torch.zeros(
+                1,
+                self.num_modes,
+                self.embed_dim,
+                self.embed_dim),
             persistent=False)
-
         self.ResetParameters()
 
-        self.gate_head = nn.Sequential(
-            nn.Linear(4 * embedDim, 2 * embedDim),
-            nn.SiLU(),
-            nn.Linear(2 * embedDim, 1))
-        
-        for m in self.gate_head:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)   
-                nn.init.zeros_(m.bias)
-
-    def ResetParameters(self):
-        eye = torch.eye(self.embed_dim, device=self.base_weights.device).unsqueeze(0).expand(self.num_modes, -1, -1)
+    def ResetParameters(self) -> None:
+        identity = torch.eye(
+            self.embed_dim,
+            device=self.base_weights.device,
+            dtype=self.base_weights.dtype)
         with torch.no_grad():
-            self.base_weights.copy_(eye + 0.05 * torch.randn_like(eye))
+            self.base_weights.copy_(
+                identity.unsqueeze(0)
+                + 0.02 * torch.randn_like(self.base_weights))
+        for module in self.gate_head:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
         self.ResetHebbianMemory()
 
     @torch.no_grad()
-    def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
+    def EnsureB(self, B: int) -> None:
+        if self.hebbian_memory.size(0) != B:
+            self.hebbian_memory = self.hebbian_memory.new_zeros(
+                B,
+                self.num_modes,
+                self.embed_dim,
+                self.embed_dim)
+
+    @torch.no_grad()
+    def ResetHebbianMemory(
+        self,
+        doneMask: Optional[torch.Tensor] = None,
+        ) -> None:
         if doneMask is None:
             self.hebbian_memory.zero_()
             return
         mask = doneMask.view(-1)
         if mask.numel() != self.hebbian_memory.size(0):
-            raise ValueError("Attention fusion reset mask must match its batch size")
+            raise ValueError(
+                "Attention fusion reset mask must match its batch size")
         self.hebbian_memory[mask] = 0
 
-    def EnsureB(self, B: int):
-        if self.hebbian_memory.shape[0] != B:
-            self.hebbian_memory = self.hebbian_memory.new_zeros(
-                B, self.num_modes, self.embed_dim, self.embed_dim)
+    @torch.no_grad()
+    def UpdateHebbianMemory(
+        self,
+        inputs: torch.Tensor,
+        fused: torch.Tensor,
+        alpha: torch.Tensor,
+        updateRows: torch.Tensor,
+        ) -> None:
+        source = inputs.detach()
+        target = fused.detach().unsqueeze(1).expand(
+            -1,
+            self.num_modes,
+            -1)
+        hebbian = torch.einsum(
+            "bme,bmf->bmef",
+            source,
+            target) / math.sqrt(self.embed_dim)
+        update_rate = alpha.view(-1, 1, 1, 1)
+        updated = (
+            0.99 * self.hebbian_memory
+            + update_rate * hebbian)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor: # inputs:[B,M,E]
-        B, M, E = inputs.shape
+        def FrobeniusCap(x: torch.Tensor) -> torch.Tensor:
+            norm = torch.linalg.vector_norm(
+                x,
+                ord=2,
+                dim=(-2, -1),
+                keepdim=True)
+            scale = torch.minimum(
+                torch.ones_like(norm),
+                (2.0 * math.sqrt(self.embed_dim)) / (norm + 1e-8))
+            return x * scale
 
-        effW = (
-            0.9 * self.base_weights.unsqueeze(0)
-            + 0.1 * self.hebbian_memory)
-        effW = torch.clamp(effW, -3.0, 3.0)
+        updated = FrobeniusCap(updated)
+        row_mask = updateRows.view(-1, 1, 1, 1)
+        self.hebbian_memory.copy_(torch.where(
+            row_mask,
+            updated,
+            self.hebbian_memory))
 
-        weighted = torch.einsum("bme,bmef->bmf", inputs, effW) # [B,M,E]
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        goal: torch.Tensor,
+        priorLogits: torch.Tensor,
+        precision: torch.Tensor,
+        tdError: torch.Tensor,
+        updateRows: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        base = torch.einsum(
+            "bme,mef->bmf",
+            inputs,
+            self.base_weights)
+        memory = self.hebbian_memory.detach().clone()
+        fast = torch.einsum("bme,bmef->bmf", inputs, memory)
+        transformed = base + 0.10 * fast
 
-        alpha = torch.softmax(self.ctx_q(inputs).squeeze(-1) / math.sqrt(self.embed_dim), dim=1) # [B,M]
-        context = torch.einsum("bme,bm->be", inputs, alpha).unsqueeze(1).expand(-1, M, -1)   
+        prior_weights = torch.softmax(priorLogits, dim=-1)
+        context = torch.einsum("bme,bm->be", inputs, prior_weights)
+        context_modes = context.unsqueeze(1).expand(-1, self.num_modes, -1)
+        goal_modes = goal.unsqueeze(1).expand(-1, self.num_modes, -1)
+        gate_input = torch.cat([
+            inputs,
+            context_modes,
+            inputs - context_modes,
+            inputs * context_modes,
+            goal_modes], dim=-1)
+        content_logits = self.gate_head(gate_input).squeeze(-1)
+        fusion_weights = torch.softmax(
+            content_logits + priorLogits,
+            dim=-1)
+        fused = torch.einsum(
+            "bmf,bm->bf",
+            transformed,
+            fusion_weights)
 
-        gate_in = torch.cat([inputs, context, inputs - context, inputs * context], dim=-1) # [B,M,4E]
-        gate_logits = self.gate_head(gate_in).squeeze(-1) # [B,M]
-        gate_w = torch.softmax(gate_logits, dim=-1) # [B,M]
-
-        fused = torch.einsum("bmf,bm->bf", weighted, gate_w) # [B,E]
-
-        with torch.no_grad():
-            norm = math.sqrt(E)
-            hebb_term = torch.einsum("bme,bf->bmef", inputs, fused) / (norm + 1e-8)
-            mem_new = 0.99 * self.hebbian_memory + 0.01 * hebb_term
-            self.hebbian_memory.copy_(mem_new)
-
-        return fused
+        alpha = 0.01 * (
+            1.0
+            + precision * (0.25 + 0.75 * tdError.abs()))
+        self.UpdateHebbianMemory(
+            inputs,
+            fused,
+            alpha,
+            updateRows)
+        return fused, fusion_weights
 
 
 
@@ -592,7 +846,7 @@ class AttentionExtractor(AGICoreModule):
         slowDtScale: float = 0.25,):
         super().__init__()
 
-        self.num_caps = sequenceLength
+        self.sequence_length = int(sequenceLength)
         self.gradient_clip_val = gradientClipVal
         self.output_dim = embedDim
         self.num_heads = numHeads
@@ -608,26 +862,28 @@ class AttentionExtractor(AGICoreModule):
                 embedDim,
                 numHeads,
                 idx,
-                slowDtScale=slowDtScale)
+                slowDtScale=(
+                    slowDtScale ** ((idx + 1) / temporalLayers)))
             for idx in range(temporalLayers)])
 
         self.caps_in_proj = nn.Sequential(
             nn.Linear(embedDim, self.caps_dim), 
             nn.LayerNorm(self.caps_dim), 
             nn.SiLU())
-        self.routing = DynamicRouting(sequenceLength, self.caps_dim, self.routing_out_caps, self.caps_dim, iterations=routingIterations)
+        self.workspace_goal_proj = nn.Sequential(
+            nn.LayerNorm(self.goal_dim),
+            nn.Linear(self.goal_dim, self.caps_dim, bias=False))
+        self.object_workspace_proj = nn.Sequential(
+            nn.LayerNorm(self.structured_dim),
+            nn.Linear(self.structured_dim, self.caps_dim),
+            nn.SiLU())
+        nn.init.zeros_(self.object_workspace_proj[1].bias)
+        self.workspace = AttentionWorkspace(
+            latentDim=self.caps_dim,
+            numLatents=self.routing_out_caps,
+            iterations=routingIterations,
+            temporalBasisCount=sequenceLength)
         self.caps_out_proj = nn.Linear(self.caps_dim, embedDim)
-
-        self.fusion = HebbianFusion(
-            numModes=3,
-            embedDim=embedDim)
-
-        self.context_proj = nn.Sequential(nn.Linear(embedDim * 2, embedDim), nn.GELU())
-
-        self.static_mixer = nn.Sequential(
-            nn.Linear(embedDim, embedDim),
-            nn.GELU(),
-            nn.Linear(embedDim, numHeads * 3))
 
         self.output_proj = nn.Sequential(
             nn.Linear(embedDim, embedDim * 2),
@@ -637,14 +893,61 @@ class AttentionExtractor(AGICoreModule):
             nn.LayerNorm(embedDim))
 
         self.object_pool_norm = nn.LayerNorm(self.structured_dim)
-        self.object_pool_key = nn.Linear(self.structured_dim, self.structured_dim)
-        self.object_pool_query = nn.Parameter(torch.randn(self.structured_dim) * 0.02)
-        self.object_seq_proj = nn.Sequential(nn.LayerNorm(self.structured_dim), nn.Linear(self.structured_dim, embedDim), nn.GELU())
-        self.motion_seq_proj = nn.Sequential(nn.LayerNorm(self.structured_dim), nn.Linear(self.structured_dim, embedDim), nn.GELU())
-        self.quality_seq_proj = nn.Sequential(nn.LayerNorm(self.structured_dim), nn.Linear(self.structured_dim, embedDim), nn.GELU())
-        self.pred_error_seq_proj = nn.Sequential(nn.LayerNorm(self.structured_dim), nn.Linear(self.structured_dim, embedDim), nn.GELU())
-        self.goal_bias_proj = nn.Sequential(nn.LayerNorm(self.goal_dim), nn.Linear(self.goal_dim, embedDim), nn.GELU())
-        self.precision_bias = nn.Linear(1, embedDim)
+        self.object_pool_key = nn.Linear(
+            self.structured_dim,
+            self.structured_dim)
+        nn.init.zeros_(self.object_pool_key.bias)
+        self.goal_object_query = nn.Sequential(
+            nn.LayerNorm(self.goal_dim),
+            nn.Linear(
+                self.goal_dim,
+                self.structured_dim,
+                bias=False))
+        self.quality_reliability = nn.Sequential(
+            nn.LayerNorm(self.structured_dim),
+            nn.Linear(self.structured_dim, 1))
+        nn.init.zeros_(self.quality_reliability[-1].weight)
+        nn.init.zeros_(self.quality_reliability[-1].bias)
+
+        self.motion_salience_head = nn.Sequential(
+            nn.LayerNorm(self.structured_dim),
+            nn.Linear(self.structured_dim, 1, bias=False))
+        self.prediction_salience_head = nn.Sequential(
+            nn.LayerNorm(self.structured_dim),
+            nn.Linear(self.structured_dim, 1, bias=False))
+        self.quality_channel_reliability = nn.Sequential(
+            nn.LayerNorm(self.structured_dim),
+            nn.Linear(self.structured_dim, embedDim))
+        nn.init.zeros_(self.quality_channel_reliability[-1].bias)
+        self.motion_salience_gain = nn.Parameter(torch.tensor(0.0))
+        self.prediction_salience_gain = nn.Parameter(torch.tensor(0.0))
+        self.novelty_gain = nn.Parameter(torch.tensor(0.0))
+        self.quality_log_gain = nn.Parameter(torch.tensor(0.0))
+        self.presence_gain = nn.Parameter(torch.tensor(1.85))
+
+        self.object_seq_proj = nn.Sequential(
+            nn.LayerNorm(self.structured_dim),
+            nn.Linear(self.structured_dim, embedDim),
+            nn.GELU())
+        self.motion_seq_proj = nn.Sequential(
+            nn.LayerNorm(self.structured_dim),
+            nn.Linear(self.structured_dim, embedDim),
+            nn.GELU())
+        nn.init.zeros_(self.motion_seq_proj[1].bias)
+        self.pred_error_seq_proj = nn.Sequential(
+            nn.LayerNorm(self.structured_dim),
+            nn.Linear(self.structured_dim, embedDim),
+            nn.GELU())
+        nn.init.zeros_(self.pred_error_seq_proj[1].bias)
+        self.content_gate = nn.Linear(2 * self.structured_dim, 2)
+        nn.init.zeros_(self.content_gate.weight)
+        nn.init.zeros_(self.content_gate.bias)
+
+        self.goal_bias_proj = nn.Sequential(
+            nn.LayerNorm(self.goal_dim),
+            nn.Linear(self.goal_dim, embedDim),
+            nn.GELU())
+        nn.init.zeros_(self.goal_bias_proj[1].bias)
         gate_in_dim = self.goal_dim + 3
         gate_hidden = max(32, embedDim // 2)
         self.mod_gate = nn.Sequential(
@@ -655,13 +958,28 @@ class AttentionExtractor(AGICoreModule):
         nn.init.zeros_(self.mod_gate[-1].weight)
         nn.init.zeros_(self.mod_gate[-1].bias)
 
-        self.structured_gate = nn.Sequential(
-            nn.LayerNorm(gate_in_dim),
-            nn.Linear(gate_in_dim, gate_hidden),
-            nn.SiLU(),
-            nn.Linear(gate_hidden, 4))
-        nn.init.zeros_(self.structured_gate[-1].weight)
-        nn.init.zeros_(self.structured_gate[-1].bias)
+        self.scene_query = nn.Parameter(
+            torch.randn(embedDim) * 0.02)
+        self.readout_query = nn.Linear(
+            embedDim,
+            embedDim,
+            bias=False)
+        self.readout_key = nn.Linear(
+            embedDim,
+            embedDim,
+            bias=False)
+        self.readout_value = nn.Linear(
+            embedDim,
+            embedDim,
+            bias=False)
+        self.readout_gate = nn.Sequential(
+            nn.LayerNorm(embedDim),
+            nn.Linear(embedDim, 3))
+        nn.init.zeros_(self.readout_gate[-1].weight)
+        nn.init.zeros_(self.readout_gate[-1].bias)
+        self.readout_fusion = GoalConditionedHebbianFusion(
+            numModes=3,
+            embedDim=embedDim)
             
 
     def ClipGrads(self):
@@ -679,8 +997,6 @@ class AttentionExtractor(AGICoreModule):
             tdError = x.new_zeros(B)
         if uncertainty is None:
             uncertainty = x.new_zeros(B)
-        if precision is None:
-            precision = x.new_ones(B)
 
         return tdError, uncertainty, precision
 
@@ -704,16 +1020,13 @@ class AttentionExtractor(AGICoreModule):
         channel_gate = 1.0 + 0.25 * torch.tanh(channel_logits).view(B, 1, self.output_dim)
         return head_gate, channel_gate
 
-    def ObjectAttentionPool(self, objectSeq: torch.Tensor) -> torch.Tensor:
-        y = self.object_pool_norm(objectSeq)
-        B, S, K, D = y.shape
-        keys = self.object_pool_key(y.reshape(B * S * K, D)).reshape(B, S, K, D)
-        scale = max(float(keys.size(-1)) ** 0.5, 1.0)
-        scores = torch.einsum("bskd,d->bsk", keys, self.object_pool_query) / scale
-        weights = F.softmax(scores, dim=2)
-        return (objectSeq * weights.unsqueeze(-1)).sum(dim=2)
+    def ObjectEvidence(self, objectSeq: torch.Tensor) -> torch.Tensor:
+        return torch.linalg.vector_norm(
+            objectSeq,
+            ord=2,
+            dim=-1) / math.sqrt(float(objectSeq.size(-1)))
 
-    def BuildStructuredFusion(
+    def BuildObjectTimeCompetition(
         self,
         objectSeq: torch.Tensor,
         motionSeq: torch.Tensor,
@@ -722,32 +1035,371 @@ class AttentionExtractor(AGICoreModule):
         goalBias: torch.Tensor,
         precision: torch.Tensor,
         tdError: torch.Tensor,
-        uncertainty: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
-        def project_seq(sig: torch.Tensor, proj: nn.Module) -> torch.Tensor:
-            y = sig
-            if y.dim() == 4:
-                y = self.ObjectAttentionPool(y)
-            return proj(y)
+        keyPaddingMask: Optional[torch.Tensor],
+        ) -> Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor]:
+        object_evidence = self.ObjectEvidence(objectSeq)
+        objects = self.object_pool_norm(objectSeq)
+        keys = self.object_pool_key(objects)
+        goal_query = self.goal_object_query(goalBias)
+        goal_scores = torch.einsum(
+            "bd,bskd->bsk",
+            goal_query,
+            keys) / math.sqrt(self.structured_dim)
 
-        terms = torch.stack([
-            project_seq(objectSeq, self.object_seq_proj),
-            project_seq(motionSeq, self.motion_seq_proj),
-            project_seq(qualitySeq, self.quality_seq_proj),
-            project_seq(predErrorSeq, self.pred_error_seq_proj)], dim=2) # [B,S,4,E]
+        novelty_tail = torch.log1p(
+            (objects[:, 1:] - objects[:, :-1]).square().mean(dim=-1))
+        if keyPaddingMask is not None:
+            pair_valid = (
+                ~keyPaddingMask[:, 1:]
+                & ~keyPaddingMask[:, :-1])
+            novelty_tail = novelty_tail * pair_valid.unsqueeze(-1)
+        novelty = torch.cat([
+            novelty_tail.new_zeros(
+                novelty_tail.size(0),
+                1,
+                novelty_tail.size(2)),
+            novelty_tail], dim=1)
 
-        gate_in = torch.cat([
+        motion_salience = F.softplus(
+            self.motion_salience_head(motionSeq).squeeze(-1))
+        prediction_salience = F.softplus(
+            self.prediction_salience_head(predErrorSeq).squeeze(-1))
+        reliability_logit = self.quality_reliability(
+            qualitySeq).squeeze(-1)
+        reliability = torch.sigmoid(reliability_logit)
+        log_reliability = F.logsigmoid(reliability_logit)
+
+        salience = (
+            F.softplus(self.motion_salience_gain) * motion_salience
+            + F.softplus(self.prediction_salience_gain)
+            * (1.0 + tdError.abs().unsqueeze(-1))
+            * prediction_salience)
+        K = objectSeq.size(2)
+        log_object_count = math.log(float(K))
+        presence_logit = F.softplus(self.presence_gain) * (
+            torch.log1p(float(K) * object_evidence)
+            - log_object_count)
+        presence_bias = F.logsigmoid(presence_logit) + math.log(2.0)
+        real_object_logits = (
+            goal_scores
+            + F.softplus(self.novelty_gain) * novelty
+            + presence_bias)
+        object_logits = torch.cat([
+            real_object_logits,
+            real_object_logits.new_zeros(
+                real_object_logits.size(0),
+                real_object_logits.size(1),
+                1)], dim=-1)
+        joint_logits = (
+            object_logits
+            + salience.unsqueeze(-1)
+            + F.softplus(self.quality_log_gain)
+            * log_reliability.unsqueeze(-1))
+
+        if keyPaddingMask is not None:
+            joint_logits = joint_logits.masked_fill(
+                keyPaddingMask.unsqueeze(-1),
+                -torch.inf)
+
+        B, S, candidate_count = joint_logits.shape
+        joint_attention = torch.softmax(
+            joint_logits.reshape(B, S * candidate_count),
+            dim=-1).reshape(B, S, candidate_count)
+        if keyPaddingMask is not None:
+            joint_attention = joint_attention.masked_fill(
+                keyPaddingMask.unsqueeze(-1),
+                0.0)
+
+        object_attention = torch.softmax(object_logits, dim=-1)
+        if keyPaddingMask is not None:
+            object_attention = object_attention * (
+                ~keyPaddingMask).unsqueeze(-1)
+        real_object_attention = object_attention[..., :K]
+        object_summary = (
+            objectSeq
+            * real_object_attention.unsqueeze(-1)).sum(dim=2)
+        object_content_evidence = (
+            real_object_attention * object_evidence).sum(dim=-1)
+
+        temporal_logits = torch.logsumexp(joint_logits, dim=-1)
+        temporal_log_attention = F.log_softmax(
+            temporal_logits,
+            dim=-1)
+        if keyPaddingMask is not None:
+            temporal_log_attention = temporal_log_attention.masked_fill(
+                keyPaddingMask,
+                0.0)
+        temporal_attention = temporal_log_attention.exp()
+        if keyPaddingMask is not None:
+            temporal_attention = temporal_attention.masked_fill(
+                keyPaddingMask,
+                0.0)
+        attention_bias = (
+            temporal_log_attention * precision.unsqueeze(-1))
+
+        content_weights = torch.softmax(
+            self.content_gate(torch.cat([
+                object_summary,
+                motionSeq], dim=-1)),
+            dim=-1)
+        content_terms = torch.stack([
+            self.object_seq_proj(object_summary)
+            * object_content_evidence.unsqueeze(-1),
+            self.motion_seq_proj(motionSeq)], dim=2)
+        content = (
+            content_terms
+            * content_weights.unsqueeze(-1)).sum(dim=2) * 2.0
+
+        event_gate = prediction_salience / (1.0 + prediction_salience)
+        event_content = (
+            self.pred_error_seq_proj(predErrorSeq)
+            * event_gate.unsqueeze(-1))
+        channel_reliability = 2.0 * torch.sigmoid(
+            self.quality_channel_reliability(qualitySeq))
+        structured = (
+            (content + event_content) * channel_reliability) * (
+                reliability * precision.unsqueeze(-1)).unsqueeze(-1)
+        return (
+            structured,
+            content_weights,
+            joint_attention,
+            object_attention,
+            temporal_attention,
+            attention_bias,
+            reliability)
+
+    def PrepareAttentionSequence(
+        self,
+        x: torch.Tensor,
+        objectSeq: torch.Tensor,
+        motionSeq: torch.Tensor,
+        qualitySeq: torch.Tensor,
+        predErrorSeq: torch.Tensor,
+        goalBias: torch.Tensor,
+        precision: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor],
+        tdError: Optional[torch.Tensor],
+        uncertainty: Optional[torch.Tensor],
+        ) -> Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+            torch.Tensor,
+            torch.Tensor,
+            Dict[str, Any]]:
+        B = x.size(0)
+        self.EnsureB(B)
+        tdError, uncertainty, precision = self.SanitizeModulators(
+            tdError,
+            uncertainty,
+            precision,
+            B,
+            x)
+        head_gate, channel_gate = self.ComputeDistributedGates(
             goalBias,
-            precision[:, None],
-            tdError[:, None],
-            uncertainty[:, None]], dim=-1)
-        weights = torch.softmax(self.structured_gate(gate_in), dim=-1) # [B,4]
-        fused = (terms * weights[:, None, :, None]).sum(dim=2) * float(terms.size(2))
-        return fused, weights
+            precision,
+            tdError,
+            uncertainty)
+
+        (
+            structured,
+            content_weights,
+            joint_attention,
+            object_attention,
+            temporal_attention,
+            attention_bias,
+            reliability,
+        ) = self.BuildObjectTimeCompetition(
+            objectSeq,
+            motionSeq,
+            qualitySeq,
+            predErrorSeq,
+            goalBias,
+            precision,
+            tdError,
+            keyPaddingMask)
+
+        x = x + 0.0625 * structured
+        goal_term = self.goal_bias_proj(goalBias)
+        x = x + 0.10 * goal_term.unsqueeze(1)
+        if keyPaddingMask is not None:
+            x = x * (~keyPaddingMask).unsqueeze(-1)
+
+        attention_mass_square = joint_attention.square().sum(
+            dim=(1, 2))
+        effective_capacity = torch.where(
+            attention_mass_square > 0,
+            attention_mass_square.reciprocal(),
+            attention_mass_square)
+        attention_transfer = 0.5 * (
+            object_attention[:, 1:]
+            - object_attention[:, :-1]).abs().sum(dim=-1)
+        if keyPaddingMask is None:
+            attention_transfer_rate = attention_transfer.mean(dim=-1)
+        else:
+            transfer_valid = (
+                ~keyPaddingMask[:, 1:]
+                & ~keyPaddingMask[:, :-1])
+            transfer_mass = transfer_valid.sum(dim=-1)
+            attention_transfer_rate = (
+                attention_transfer * transfer_valid).sum(dim=-1) / (
+                    transfer_mass
+                    + transfer_mass.eq(0))
+        extras: Dict[str, Any] = {
+            "structured_terms": x.new_tensor(3.0),
+            "structured_weights": content_weights,
+            "object_time_attention": joint_attention,
+            "object_attention": object_attention,
+            "temporal_attention_prior": temporal_attention,
+            "frame_reliability": reliability,
+            "background_attention": object_attention[..., -1],
+            "effective_attention_capacity": effective_capacity,
+            "attention_transfer_rate": attention_transfer_rate,
+            "goal_bias_norm": goal_term.detach().norm(dim=-1),
+            "precision": precision.detach(),}
+        if head_gate is not None:
+            extras["head_gate_mean"] = head_gate.detach().mean(
+                dim=(1, 2, 3))
+            extras["channel_gate_mean"] = channel_gate.detach().mean(
+                dim=(1, 2))
+        return (
+            x,
+            tdError,
+            uncertainty,
+            precision,
+            head_gate,
+            channel_gate,
+            goal_term,
+            attention_bias,
+            extras)
+
+    def GoalConditionedReadout(
+        self,
+        x: torch.Tensor,
+        objectSeq: torch.Tensor,
+        goalBias: torch.Tensor,
+        goalTerm: torch.Tensor,
+        precision: torch.Tensor,
+        tdError: torch.Tensor,
+        attentionBias: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor],
+        extras: Dict[str, Any],
+        ) -> torch.Tensor:
+        object_evidence = self.ObjectEvidence(objectSeq)
+        object_candidates = (
+            self.object_workspace_proj(objectSeq)
+            * object_evidence.unsqueeze(-1))
+        (
+            workspace_latents,
+            workspace_time_attention,
+            workspace_object_attention,
+            workspace_source_mass,
+        ) = self.workspace(
+            self.caps_in_proj(x),
+            object_candidates,
+            extras["object_time_attention"][..., :-1],
+            self.workspace_goal_proj(goalBias),
+            keyPaddingMask)
+        workspace_tokens = F.layer_norm(
+            self.caps_out_proj(workspace_latents),
+            (self.output_dim,))
+
+        query = (
+            self.scene_query.unsqueeze(0)
+            + self.readout_query(goalTerm))
+        temporal_scores = torch.einsum(
+            "bd,bsd->bs",
+            query,
+            self.readout_key(x)) / math.sqrt(self.output_dim)
+        temporal_scores = temporal_scores + attentionBias
+        if keyPaddingMask is not None:
+            temporal_scores = temporal_scores.masked_fill(
+                keyPaddingMask,
+                -torch.inf)
+        temporal_weights = torch.softmax(temporal_scores, dim=-1)
+        if keyPaddingMask is not None:
+            temporal_weights = temporal_weights.masked_fill(
+                keyPaddingMask,
+                0.0)
+        temporal_readout = torch.einsum(
+            "bs,bsd->bd",
+            temporal_weights,
+            self.readout_value(x))
+
+        workspace_scores = torch.einsum(
+            "bd,bld->bl",
+            query,
+            self.readout_key(workspace_tokens)) / math.sqrt(self.output_dim)
+        workspace_weights = torch.softmax(workspace_scores, dim=-1)
+        workspace_readout = torch.einsum(
+            "bl,bld->bd",
+            workspace_weights,
+            self.readout_value(workspace_tokens))
+
+        if keyPaddingMask is None:
+            current_token = x[:, -1]
+        else:
+            positions = torch.arange(
+                x.size(1),
+                device=x.device).unsqueeze(0)
+            current_index = positions.masked_fill(
+                keyPaddingMask,
+                0).amax(dim=-1)
+            current_token = x[
+                torch.arange(x.size(0), device=x.device),
+                current_index]
+        current_readout = self.readout_value(current_token)
+
+        readout_context = (
+            goalTerm
+            + temporal_readout
+            + workspace_readout
+            + current_readout)
+        readout_logits = self.readout_gate(readout_context)
+        readout_weights = torch.softmax(readout_logits, dim=-1)
+        readout_terms = torch.stack([
+            temporal_readout,
+            workspace_readout,
+            current_readout], dim=1)
+        if keyPaddingMask is None:
+            update_rows = torch.ones(
+                x.size(0),
+                dtype=torch.bool,
+                device=x.device)
+        else:
+            update_rows = (~keyPaddingMask).any(dim=-1)
+        out, fusion_weights = self.readout_fusion(
+            readout_terms,
+            goalTerm,
+            readout_logits,
+            precision,
+            tdError,
+            update_rows)
+
+        extras["temporal_readout_attention"] = temporal_weights
+        extras["workspace_time_attention"] = workspace_time_attention
+        extras["workspace_object_attention"] = (
+            workspace_object_attention)
+        extras["workspace_source_mass"] = workspace_source_mass
+        extras["workspace_readout_attention"] = workspace_weights
+        extras["readout_weights"] = readout_weights
+        extras["fusion_weights"] = fusion_weights
+        return self.output_proj(out)
 
     def EnsureB(self, B: int) -> None:
         for block in self.temporal_blocks:
             block.mhsa.EnsureB(B)
-        self.fusion.EnsureB(B)
+        self.readout_fusion.EnsureB(B)
 
     def forward(
         self,
@@ -762,48 +1414,27 @@ class AttentionExtractor(AGICoreModule):
         tdError: Optional[torch.Tensor] = None, # [-1 ,1] [B]
         uncertainty: Optional[torch.Tensor]=None, # [0 ,1] [B]
         returnExtras: bool = False,) -> torch.Tensor: # [B] or scalar
-        B, S, E = x.shape
-        self.EnsureB(B)
-
-        tdError, uncertainty, precision = self.SanitizeModulators(tdError, uncertainty, precision, B, x)
-        head_gate, channel_gate = self.ComputeDistributedGates(goalBias, precision, tdError, uncertainty)
-
-        extras: Dict[str, Any] = {}
-
-        structured_sum, structured_weights = self.BuildStructuredFusion(
+        (
+            x,
+            tdError,
+            uncertainty,
+            precision,
+            head_gate,
+            channel_gate,
+            goal_term,
+            attention_bias,
+            extras,
+        ) = self.PrepareAttentionSequence(
+            x,
             objectSeq,
             motionSeq,
             qualitySeq,
             predErrorSeq,
             goalBias,
             precision,
+            keyPaddingMask,
             tdError,
             uncertainty)
-        x = x + 0.0625 * structured_sum
-        extras["structured_terms"] = x.new_tensor(4.0)
-        extras["structured_weights"] = structured_weights.detach()
-
-        goal_term = self.goal_bias_proj(goalBias)
-        x = x + 0.10 * goal_term.unsqueeze(1)
-        extras["goal_bias_norm"] = goal_term.detach().norm(dim=-1)
-
-        x = x * (0.75 + 0.50 * precision[:, None, None])
-        x = x + 0.05 * self.precision_bias(precision[:, None]).unsqueeze(1)
-        extras["precision"] = precision.detach()
-        if head_gate is not None:
-            extras["head_gate_mean"] = head_gate.detach().mean(dim=(1, 2, 3))
-            extras["channel_gate_mean"] = channel_gate.detach().mean(dim=(1, 2))
-
-        if S % self.num_caps != 0:
-            pad_len = self.num_caps - (S % self.num_caps)
-            x = F.pad(x, (0,0,0,pad_len))
-            if keyPaddingMask is not None:
-                keyPaddingMask = F.pad(keyPaddingMask, (0,pad_len), value=True)
-            S = x.size(1)
-
-        if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).unsqueeze(-1)
-            x = x * keep
         
         for blk in self.temporal_blocks:
             x = blk(
@@ -811,54 +1442,21 @@ class AttentionExtractor(AGICoreModule):
                 keyPaddingMask=keyPaddingMask,
                 tdError=tdError,
                 uncertainty=uncertainty,
+                precision=precision,
                 headGate=head_gate,
-                channelGate=channel_gate)
+                channelGate=channel_gate,
+                attentionBias=attention_bias)
 
-        chunk = S // self.num_caps
-
-        if keyPaddingMask is not None:
-            seg_mask = keyPaddingMask.reshape(B, self.num_caps, chunk) # [B,I,chunk]
-        else:
-            seg_mask = x.new_zeros(B, self.num_caps, chunk, dtype=torch.bool)
-
-        valid = (~seg_mask)                                  
-        valid_cnt = valid.sum(dim=2, keepdim=True) # [B,I,1]
-        valid_cnt_safe = valid_cnt.clamp_min(1.0)
-
-        h_seg = x.reshape(B, self.num_caps, chunk, E) # [B,I,chunk,E]
-        caps = (h_seg * valid.unsqueeze(-1)).sum(dim=2) / valid_cnt_safe # [B,I,E] masked mean
-        caps_mask = (valid_cnt.squeeze(-1) == 0)                      
-
-        cap_in = self.caps_in_proj(caps)
-        routed = self.routing(cap_in, caps_mask) # [B,routingOutCaps,capsDim]
-        routed = self.caps_out_proj(routed)
-        routed = F.layer_norm(routed, (E,))
-
-        routed_mean = routed.mean(dim=1) # [B,E]
-        
-        if keyPaddingMask is not None:
-            denom = keep.sum(dim=1, keepdim=True).clamp_min(1.0) # [B,1,1]
-            temp_mean = (x * keep).sum(dim=1) / denom.squeeze(-1)  
-        else:
-            temp_mean = x.mean(dim=1)
-        
-        fusion_in = torch.stack([
-            temp_mean, 
-            routed_mean, 
-            temp_mean + routed_mean], dim=1)  # [B,3,E]
-        
-        fused = self.fusion(fusion_in)  # [B,E]
-
-        context = self.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))  # [B,E]
-
-        logits = self.static_mixer(context).view(B, self.num_heads, 3)
-        strat_w = torch.softmax(logits, dim=-1)  #[B,H,3]
-
-        feats = torch.stack([temp_mean, routed_mean, fused], dim=1)  # [B,3,E]
-        mixed_per_head = torch.einsum("bhs,bse->bhe", strat_w, feats)  # [B,H,E]
-        out = mixed_per_head.mean(dim=1)  # [B,E]
-
-        out = self.output_proj(out)
+        out = self.GoalConditionedReadout(
+            x,
+            objectSeq,
+            goalBias,
+            goal_term,
+            precision,
+            tdError,
+            attention_bias,
+            keyPaddingMask,
+            extras)
         if returnExtras:
             return out, extras
         return out
@@ -867,12 +1465,12 @@ class AttentionExtractor(AGICoreModule):
     def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None) -> None:
         for block in self.temporal_blocks:
             block.mhsa.ResetHebbianMemory(doneMask=doneMask)
-        self.fusion.ResetHebbianMemory(doneMask=doneMask)
+        self.readout_fusion.ResetHebbianMemory(doneMask=doneMask)
 
     @torch.no_grad()
     def ExportState(self) -> dict:
         st = {
-            "fusion_hebb": self.fusion.hebbian_memory.detach().clone(),
+            "fusion": self.readout_fusion.hebbian_memory.detach().clone(),
             "mhsa": []}
         
         for blk in self.temporal_blocks:
@@ -885,8 +1483,8 @@ class AttentionExtractor(AGICoreModule):
 
     @torch.no_grad()
     def ImportState(self, st: dict):
-        self.EnsureB(int(st["fusion_hebb"].size(0)))
-        self.fusion.hebbian_memory.copy_(st["fusion_hebb"])
+        self.EnsureB(int(st["fusion"].size(0)))
+        self.readout_fusion.hebbian_memory.copy_(st["fusion"])
         for block, saved in zip(self.temporal_blocks, st["mhsa"]):
             mhsa = block.mhsa
             mhsa.U.copy_(saved["U"])
@@ -953,52 +1551,27 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         precision: torch.Tensor,
         returnExtras: bool = False,
         **kwargs,) -> torch.Tensor:
-        B, S, E = x.shape
-        self.base.EnsureB(B)
-
-        tdError, uncertainty, precision = self.base.SanitizeModulators(tdError, uncertainty, precision, B, x)
-        head_gate, channel_gate = self.base.ComputeDistributedGates(goalBias, precision, tdError, uncertainty)
-
-        extras: Dict[str, Any] = {}
-
-        structured_sum, structured_weights = self.base.BuildStructuredFusion(
+        (
+            h,
+            tdError,
+            uncertainty,
+            precision,
+            head_gate,
+            channel_gate,
+            goal_term,
+            attention_bias,
+            extras,
+        ) = self.base.PrepareAttentionSequence(
+            x,
             objectSeq,
             motionSeq,
             qualitySeq,
             predErrorSeq,
             goalBias,
             precision,
+            keyPaddingMask,
             tdError,
             uncertainty)
-        x = x + 0.0625 * structured_sum
-        extras["structured_terms"] = x.new_tensor(4.0)
-        extras["structured_weights"] = structured_weights.detach()
-
-        goal_term = self.base.goal_bias_proj(goalBias)
-        x = x + 0.10 * goal_term.unsqueeze(1)
-        extras["goal_bias_norm"] = goal_term.detach().norm(dim=-1)
-
-        x = x * (0.75 + 0.50 * precision[:, None, None])
-        x = x + 0.05 * self.base.precision_bias(precision[:, None]).unsqueeze(1)
-        extras["precision"] = precision.detach()
-        if head_gate is not None:
-            extras["head_gate_mean"] = head_gate.detach().mean(dim=(1, 2, 3))
-            extras["channel_gate_mean"] = channel_gate.detach().mean(dim=(1, 2))
-
-        num_caps = int(self.base.num_caps)
-
-        if S % num_caps != 0:
-            pad_len = num_caps - (S % num_caps)
-            x = F.pad(x, (0, 0, 0, pad_len))
-            if keyPaddingMask is not None:
-                keyPaddingMask = F.pad(keyPaddingMask, (0, pad_len), value=True)
-            S = x.size(1)
-
-        if keyPaddingMask is not None:
-            keep0 = (~keyPaddingMask).unsqueeze(-1)
-            h = x * keep0
-        else:
-            h = x
 
         for layerIdx, blk in enumerate(self.base.temporal_blocks):
             h = self.ForwardBlockWithDeltas(
@@ -1007,47 +1580,22 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
                 keyPaddingMask=keyPaddingMask,
                 tdError=tdError,
                 uncertainty=uncertainty,
+                precision=precision,
                 delta=deltasPerLayer[layerIdx],
                 headGate=head_gate,
-                channelGate=channel_gate)
+                channelGate=channel_gate,
+                attentionBias=attention_bias)
 
-        chunk = S // num_caps
-        if keyPaddingMask is not None:
-            seg_mask = keyPaddingMask.reshape(B, num_caps, chunk)
-        else:
-            seg_mask = h.new_zeros(B, num_caps, chunk, dtype=torch.bool)
-
-        valid = (~seg_mask)
-        valid_cnt = valid.sum(dim=2, keepdim=True).clamp_min(1.0)
-        h_seg = h.reshape(B, num_caps, chunk, E)
-        caps = (h_seg * valid.unsqueeze(-1)).sum(dim=2) / valid_cnt
-        caps_mask = (valid_cnt.squeeze(-1) == 0)
-
-        cap_in = self.base.caps_in_proj(caps) 
-        routed = self.base.routing(cap_in, caps_mask)
-        routed = self.base.caps_out_proj(routed) 
-        routed = F.layer_norm(routed, (E,))
-
-        routed_mean = routed.mean(dim=1)
-        if keyPaddingMask is not None:
-            denom = keep0.sum(dim=1, keepdim=True).clamp_min(1.0)
-            temp_mean = (h * keep0).sum(dim=1) / denom.squeeze(-1)
-        else:
-            temp_mean = h.mean(dim=1)
-
-        fusion_in = torch.stack([temp_mean, routed_mean, temp_mean + routed_mean], dim=1)  # [B,3,E]
-        fused = self.base.fusion(fusion_in)
-
-        context = self.base.context_proj(torch.cat([temp_mean, routed_mean], dim=-1))  # [B,E]
-
-        logits = self.base.static_mixer(context).view(B, self.base.num_heads, 3)
-        strat_w = torch.softmax(logits, dim=-1)
-
-        feats = torch.stack([temp_mean, routed_mean, fused], dim=1)  # [B,3,E]
-        mixed_per_head = torch.einsum("bhs,bse->bhe", strat_w, feats)
-        out = mixed_per_head.mean(dim=1)
-
-        out = self.base.output_proj(out)
+        out = self.base.GoalConditionedReadout(
+            h,
+            objectSeq,
+            goalBias,
+            goal_term,
+            precision,
+            tdError,
+            attention_bias,
+            keyPaddingMask,
+            extras)
         if returnExtras:
             return out, extras
         return out
@@ -1084,12 +1632,13 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         keyPaddingMask: torch.Tensor,
         tdError: torch.Tensor,
         uncertainty: torch.Tensor,
+        precision: torch.Tensor,
         delta: Dict[str, Optional[torch.Tensor]],
         headGate: Optional[torch.Tensor] = None,
-        channelGate: Optional[torch.Tensor] = None,) -> torch.Tensor:
+        channelGate: Optional[torch.Tensor] = None,
+        attentionBias: Optional[torch.Tensor] = None,) -> torch.Tensor:
 
         mhsa = blk.mhsa
-        B, S, E = x.shape
 
         residual0 = x
         x_norm = blk.norm(x)
@@ -1108,55 +1657,20 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         Wv = eff_linear(mhsa.v_proj.weight, mhsa.v_adapter, delta.get("v"))
         Wo = eff_linear(mhsa.out_proj.weight, mhsa.o_adapter, delta.get("o"))
 
-        td_eff  = tdError * mhsa.td_unc_scale
-        unc_eff = uncertainty * mhsa.td_unc_scale
-
-        neuromod = mhsa.ComputeNeuromodulation(td_eff, B) 
-        tau = mhsa.ModulateTau(td_eff, unc_eff, B) 
-        hebb_mod = mhsa.ComputeHebbMod(td_eff, unc_eff, B)
-
         q_lin = F.linear(x_norm, Wq, mhsa.q_proj.bias)
         k_lin = F.linear(x_norm, Wk, mhsa.k_proj.bias)
         v_lin = F.linear(x_norm, Wv, mhsa.v_proj.bias)
-
-        q = q_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2) 
-        k = k_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
-        v = v_lin.view(B, S, mhsa.num_heads, mhsa.head_dim).transpose(1, 2)
-        q_hebb = q
-
-        q = q * neuromod
-        if headGate is not None:
-            q = q * headGate
-        q = q / tau
-
-        U = mhsa.U.detach().clone()
-        V = mhsa.V.detach().clone()
-        v_proj = torch.einsum("bhsd,bhdr->bhsr", v, V)
-        delt = torch.einsum(
-            "bhsr,bhrd->bhsd",
-            v_proj,
-            U.transpose(-2, -1))
-
-        delt = delt * hebb_mod
-        v_fast = v + delt
-
-        q_attn = mhsa.rope.Apply(q)
-        k_attn = mhsa.rope.Apply(k)
-
-        d = q_attn.size(-1)
-        scores = torch.matmul(q_attn, k_attn.transpose(-2, -1)) / math.sqrt(d)
-
-        if keyPaddingMask is not None:
-            mask = keyPaddingMask[:, None, None, :] 
-            mask_val = -1e9 if q.dtype != torch.float16 else -1e4
-            scores = scores.masked_fill(mask, mask_val)
-
-        weights = F.softmax(scores, dim=-1)
-        weights = F.dropout(weights, p=mhsa.attn_dropout_p if mhsa.training else 0.0,training=mhsa.training)
-        context = torch.matmul(weights, v_fast) 
-        out = context.transpose(1, 2).reshape(B, S, mhsa.embed_dim) 
-
-        mhsa_out = F.linear(out, Wo, mhsa.out_proj.bias)
+        attended = mhsa.Attend(
+            q_lin,
+            k_lin,
+            v_lin,
+            tdError,
+            uncertainty,
+            precision,
+            keyPaddingMask,
+            headGate,
+            attentionBias)
+        mhsa_out = F.linear(attended, Wo, mhsa.out_proj.bias)
 
         ssm_out = blk.ssm(x_norm, keyPaddingMask=keyPaddingMask,tdError=tdError, uncertainty=uncertainty)
 
@@ -1175,13 +1689,6 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         if keyPaddingMask is not None:
             keep = (~keyPaddingMask).unsqueeze(-1)
             out2 = out2 * keep
-
-        alpha = 0.01 * hebb_mod
-        if keyPaddingMask is not None:
-            keep4 = (~keyPaddingMask).view(B, 1, S, 1)
-            mhsa.UpdateHebbianWeights(v, q_hebb, alpha, keep4=keep4)
-        else:
-            mhsa.UpdateHebbianWeights(v, q_hebb, alpha, keep4=None)
 
         return out2
 
@@ -1252,7 +1759,8 @@ class TestAttentionMTool:
         return delta
 
     def AttentionStateMaxAbsDiff(self, a: Dict[str, Any], b: Dict[str, Any]) -> float:
-        vals = [(a["fusion_hebb"] - b["fusion_hebb"]).abs().max().item()]
+        vals = [
+            (a["fusion"] - b["fusion"]).abs().max().item()]
         for x, y in zip(a["mhsa"], b["mhsa"]):
             vals.append((x["U"] - y["U"]).abs().max().item())
             vals.append((x["V"] - y["V"]).abs().max().item())
@@ -1274,14 +1782,16 @@ class TestAttentionMTool:
                 first = attn(
                     x, x, x,
                     tdError=td,
-                    uncertainty=unc)
+                    uncertainty=unc,
+                    precision=torch.ones_like(td))
                 assert attn.U.norm().item() > 1e-8
                 assert attn.V.norm().item() > 1e-8
 
                 second = attn(
                     x, x, x,
                     tdError=td,
-                    uncertainty=unc)
+                    uncertainty=unc,
+                    precision=torch.ones_like(td))
                 assert not torch.allclose(
                     first,
                     second,
@@ -1292,7 +1802,8 @@ class TestAttentionMTool:
                 replay = attn(
                     x, x, x,
                     tdError=td,
-                    uncertainty=unc)
+                    uncertainty=unc,
+                    precision=torch.ones_like(td))
                 assert torch.allclose(
                     first,
                     replay,
@@ -1334,15 +1845,18 @@ class TestAttentionMTool:
                 assert self.AttentionStateMaxAbsDiff(st0, st_false) < 1e-12, "all-false doneMask changed state"
 
                 model.ResetHebbianMemory(doneMask=torch.tensor([True, False], device=self.device))
+                fusion_now = model.readout_fusion.hebbian_memory
+                assert fusion_now[0].abs().max().item() < 1e-12, "done row fusion memory not cleared"
+                assert torch.allclose(
+                    fusion_now[1],
+                    st0["fusion"][1]), "non-done fusion memory changed"
                 for blk_idx, s in enumerate(st0["mhsa"]):
                     mhsa_now = model.temporal_blocks[blk_idx].mhsa
                     assert mhsa_now.U[0].abs().max().item() < 1e-12 and mhsa_now.V[0].abs().max().item() < 1e-12, "done row U/V not cleared"
                     assert torch.allclose(mhsa_now.U[1], s["U"][1]) and torch.allclose(mhsa_now.V[1], s["V"][1]), "non-done row U/V changed"
-                assert model.fusion.hebbian_memory[0].abs().max().item() < 1e-12, "done row fusion memory not cleared"
-                assert torch.allclose(model.fusion.hebbian_memory[1], st0["fusion_hebb"][1]), "non-done fusion row changed"
 
                 model.ResetHebbianMemory(doneMask=torch.ones(2, dtype=torch.bool, device=self.device))
-                assert model.fusion.hebbian_memory.abs().max().item() < 1e-12, "all-true doneMask did not clear fusion"
+                assert model.readout_fusion.hebbian_memory.abs().max().item() < 1e-12, "all-true doneMask did not clear fusion memory"
                 for blk in model.temporal_blocks:
                     assert blk.mhsa.U.abs().max().item() < 1e-12 and blk.mhsa.V.abs().max().item() < 1e-12, "all-true doneMask did not clear MHSA"
             print("SelectiveDoneReset passed.")
@@ -1363,9 +1877,9 @@ class TestAttentionMTool:
             td = torch.tensor([-0.5, 0.5], device=self.device)
             unc = torch.tensor([0.1, 0.7], device=self.device)
             precision = torch.tensor([0.2, 1.0], device=self.device)
-            td_raw = torch.tensor([-2.0, 2.0], device=self.device)
-            unc_raw = torch.tensor([-1.0, 2.0], device=self.device)
-            precision_raw = torch.tensor([0.0, 2.0], device=self.device)
+            td_raw = torch.tensor([-1.0, 1.0], device=self.device)
+            unc_raw = torch.tensor([0.0, 1.0], device=self.device)
+            precision_raw = torch.tensor([0.05, 1.0], device=self.device)
             td_s, unc_s, precision_s = model.SanitizeModulators(td_raw, unc_raw, precision_raw, 2, x)
             assert td_s is td_raw and unc_s is unc_raw and precision_s is precision_raw, "modulators should pass through unchanged"
             with torch.no_grad():
@@ -1385,8 +1899,8 @@ class TestAttentionMTool:
     def TestRoutingAndDistributedGates(self):
         try:
             model = AttentionExtractor(embedDim=64, sequenceLength=16, numHeads=4,temporalLayers=1,capsDim=16,routingIterations=2).to(self.device)
-            assert model.routing.O == 8, f"default routingOutCaps should be 8, got {model.routing.O}"
-            assert model.routing.transformation.numel() == 16 * 8 * 16 * 16, "routing transformation parameter count mismatch"
+            assert model.workspace.num_latents == 8
+            assert tuple(model.workspace.latent_queries.shape) == (8, 16)
             B = 3
             goal = torch.randn(B, 32, device=self.device)
             td, unc, precision = model.SanitizeModulators(
@@ -1405,13 +1919,52 @@ class TestAttentionMTool:
         except AssertionError as e:
             print(f"RoutingAndDistributedGates failed: {e}")
             return False
+
+    def TestCapacityNotReduced(self):
+        try:
+            baseline_parameter_count = 657_724_557
+            with torch.device("meta"):
+                model = AttentionExtractor()
+            parameter_count = sum(
+                parameter.numel()
+                for parameter in model.parameters())
+            assert parameter_count >= baseline_parameter_count
+            assert len(model.temporal_blocks) == 12
+            ssm = model.temporal_blocks[0].ssm
+            assert ssm.param_proj.out_features == (
+                1024 * (1 + 2 * 16))
+            assert tuple(model.workspace.temporal_transforms.shape) == (
+                32,
+                8,
+                256,
+                256)
+            assert tuple(model.readout_fusion.base_weights.shape) == (
+                3,
+                1024,
+                1024)
+            assert tuple(model.readout_fusion.hebbian_memory.shape) == (
+                1,
+                3,
+                1024,
+                1024)
+            print(
+                "CapacityNotReduced passed. "
+                f"parameters={parameter_count:,}")
+            return True
+        except AssertionError as e:
+            print(f"CapacityNotReduced failed: {e}")
+            return False
+        except Exception as e:
+            print(f"CapacityNotReduced error: {e}")
+            return False
         except Exception as e:
             print(f"RoutingAndDistributedGates error: {e}")
             return False
 
     def TestDualTimeConstantSSM(self):
         try:
-            ssm = SelectiveSSM(self.E, stateDim=4, convKernel=4, useCausalConv=True, slowDtScale=0.25).to(self.device)
+            ssm = SelectiveSSM(self.E, stateDim=4, convKernel=4, slowDtScale=0.25).to(self.device)
+            assert ssm.param_proj.out_features == self.E * (1 + 2 * 4)
             ssm.train()
             x = torch.randn(self.B, self.S, self.E, device=self.device, requires_grad=True)
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
@@ -1436,7 +1989,7 @@ class TestAttentionMTool:
 
     def TestSimpleSSM(self):
         try:
-            ssm = SelectiveSSM(self.E, stateDim=4, convKernel=4, useCausalConv=True).to(self.device)
+            ssm = SelectiveSSM(self.E, stateDim=4, convKernel=4).to(self.device)
             x = torch.randn(self.B, self.S, self.E, device=self.device)
             kpm = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device)
             kpm[:, -3:] = True
@@ -1465,7 +2018,8 @@ class TestAttentionMTool:
                 x, x, x,
                 keyPaddingMask=kpm,
                 tdError=td_unc,
-                uncertainty=td_unc)
+                uncertainty=td_unc.abs().sigmoid(),
+                precision=torch.ones_like(td_unc))
             assert y1.shape == (self.B, self.S, self.E)
             assert not {"U", "V"} & set(attn.state_dict())
             assert attn.U.size(-1) == 8
@@ -1490,7 +2044,12 @@ class TestAttentionMTool:
                 self.H,
                 layerIdx=0).to(self.device)
             ta.mhsa.EnsureB(self.B)
-            y = ta(x, keyPaddingMask=kpm, tdError=torch.randn(self.B, device=self.device), uncertainty=torch.randn(self.B, device=self.device))
+            y = ta(
+                x,
+                keyPaddingMask=kpm,
+                tdError=torch.randn(self.B, device=self.device).tanh(),
+                uncertainty=torch.rand(self.B, device=self.device),
+                precision=torch.ones(self.B, device=self.device))
             assert y.shape == (self.B, self.S, self.E)
             print("TemporalAttention test passed.")
             return True
@@ -1501,43 +2060,483 @@ class TestAttentionMTool:
             print(f"TemporalAttention test error: {e}")
             return False
 
-    def TestDynamicRouting(self):
+    def TestAttentionWorkspace(self):
         try:
             x = torch.randn(self.B, self.S, self.E, device=self.device)
             mask = torch.zeros(self.B, self.S, dtype=torch.bool, device=self.device); mask[:, -2:] = True
-            router = DynamicRouting(inCaps=self.S, inDim=self.E, outCaps=self.out_caps, outDim=self.E, iterations=3).to(self.device)
-            y = router(x, mask)
+            workspace = AttentionWorkspace(
+                latentDim=self.E,
+                numLatents=self.out_caps,
+                iterations=3,
+                temporalBasisCount=self.S).to(self.device)
+            object_candidates = torch.randn(
+                self.B,
+                self.S,
+                5,
+                self.E,
+                device=self.device)
+            object_priority = torch.softmax(
+                torch.randn(
+                    self.B,
+                    self.S,
+                    5,
+                    device=self.device).flatten(1),
+                dim=-1).view(self.B, self.S, 5)
+            y, weights, object_weights, source_mass = workspace(
+                x,
+                object_candidates,
+                object_priority,
+                torch.randn(self.B, self.E, device=self.device),
+                mask)
             assert y.shape == (self.B, self.out_caps, self.E), f"Output shape mismatch: {y.shape}"
-            print("DynamicRouting test passed.")
+            assert weights.shape == (self.B, self.out_caps, self.S)
+            assert object_weights.shape == (
+                self.B,
+                self.out_caps,
+                self.S,
+                5)
+            assert source_mass.shape == (self.B, 2)
+            assert torch.all(
+                source_mass[:, 1] <= source_mass[:, 0] + 1e-5)
+            assert torch.count_nonzero(weights[:, :, -2:]) == 0
+            assert torch.count_nonzero(object_weights[:, :, -2:]) == 0
+            assert torch.allclose(
+                weights[:, :, :-2].sum(dim=-1),
+                torch.ones(
+                    self.B,
+                    self.out_caps,
+                    device=self.device))
+            assert torch.allclose(
+                object_weights[:, :, :-2].sum(dim=(2, 3)),
+                torch.ones(
+                    self.B,
+                    self.out_caps,
+                    device=self.device))
+            normalized = F.normalize(weights[:, :, :-2], dim=-1)
+            similarity = torch.matmul(
+                normalized,
+                normalized.transpose(-2, -1))
+            off_diagonal = ~torch.eye(
+                self.out_caps,
+                dtype=torch.bool,
+                device=self.device).unsqueeze(0)
+            assert similarity.masked_select(off_diagonal).max() < 0.999
+            object_normalized = F.normalize(
+                object_weights[:, :, :-2].flatten(2),
+                dim=-1)
+            object_similarity = torch.matmul(
+                object_normalized,
+                object_normalized.transpose(-2, -1))
+            assert object_similarity.masked_select(
+                off_diagonal).max() < 0.99
+            print("AttentionWorkspace test passed.")
             return True
         except AssertionError as e:
-            print(f"DynamicRouting test failed: {e}")
+            print(f"AttentionWorkspace test failed: {e}")
             return False
         except Exception as e:
-            print(f"DynamicRouting test error: {e}")
+            print(f"AttentionWorkspace test error: {e}")
             return False
 
-    def TestHebbianFusion(self):
+    def TestObjectTimeCompetition(self):
         try:
-            fusion = HebbianFusion(
-                numModes=self.M,
-                embedDim=self.E).to(self.device)
-            inputs = torch.randn(self.B, self.M, self.E, device=self.device)
-            fusion.EnsureB(self.B)
-            expected = fusion(inputs)
-            fusion.ResetHebbianMemory()
-            y = fusion(inputs)
-            assert y.shape == (self.B, self.E), f"Output shape mismatch: {y.shape}"
-            assert torch.allclose(y, expected, atol=1e-7, rtol=1e-6)
-            assert fusion.hebbian_memory.norm().item() > 0.0
-            assert "hebbian_memory" not in fusion.state_dict()
-            print("HebbianFusion test passed.")
+            model = AttentionExtractor(
+                embedDim=64,
+                sequenceLength=8,
+                numHeads=4,
+                temporalLayers=1,
+                capsDim=16,
+                routingIterations=2).to(self.device).eval()
+            args = self.AttentionInputs(2, 8, 64)
+            td = torch.tensor([-0.5, 0.5], device=self.device)
+            mask = torch.zeros(2, 8, dtype=torch.bool, device=self.device)
+            mask[:, :2] = True
+            result = model.BuildObjectTimeCompetition(
+                args["objectSeq"],
+                args["motionSeq"],
+                args["qualitySeq"],
+                args["predErrorSeq"],
+                args["goalBias"],
+                args["precision"],
+                td,
+                mask)
+            structured, weights, joint, objects, temporal, bias, reliability = result
+            assert structured.shape == (2, 8, 64)
+            assert weights.shape == (2, 8, 2)
+            assert joint.shape == (2, 8, 17)
+            assert objects.shape == (2, 8, 17)
+            assert temporal.shape == bias.shape == reliability.shape == (2, 8)
+            assert torch.allclose(joint.sum(dim=(1, 2)), torch.ones(2, device=self.device))
+            assert torch.count_nonzero(joint[:, :2]) == 0
+            print("ObjectTimeCompetition test passed.")
             return True
         except AssertionError as e:
-            print(f"HebbianFusion test failed: {e}")
+            print(f"ObjectTimeCompetition test failed: {e}")
             return False
         except Exception as e:
-            print(f"HebbianFusion test error: {e}")
+            print(f"ObjectTimeCompetition test error: {e}")
+            return False
+
+    def TestGoalConditionedSelection(self):
+        try:
+            torch.manual_seed(446)
+            model = AttentionExtractor(
+                embedDim=64,
+                sequenceLength=8,
+                numHeads=4,
+                temporalLayers=1,
+                capsDim=16,
+                routingIterations=2).to(self.device).eval()
+            x = torch.randn(1, 8, 64, device=self.device)
+            args = self.AttentionInputs(1, 8, 64)
+            goal_a = args["goalBias"]
+            goal_b = -goal_a
+            with torch.no_grad():
+                out_a, extras_a = model(
+                    x,
+                    returnExtras=True,
+                    **args)
+                model.ResetHebbianMemory()
+                out_b, extras_b = model(
+                    x,
+                    returnExtras=True,
+                    **{**args, "goalBias": goal_b})
+            assert float((
+                extras_a["object_time_attention"]
+                - extras_b["object_time_attention"]
+            ).abs().max()) > 1e-6
+            assert float((out_a - out_b).abs().max()) > 1e-6
+            print("GoalConditionedSelection test passed.")
+            return True
+        except AssertionError as e:
+            print(f"GoalConditionedSelection test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"GoalConditionedSelection test error: {e}")
+            return False
+
+    def TestBottomUpSalienceAndReliability(self):
+        try:
+            model = AttentionExtractor(
+                embedDim=64,
+                sequenceLength=8,
+                numHeads=4,
+                temporalLayers=1,
+                capsDim=16,
+                routingIterations=2).to(self.device).eval()
+            B, S, D = 1, 8, 32
+            object_frame = torch.randn(
+                B, 1, 16, D, device=self.device)
+            objects = object_frame.expand(-1, S, -1, -1).clone()
+            direction = torch.cat([
+                torch.ones(D // 2, device=self.device),
+                -torch.ones(D // 2, device=self.device)])
+            motion = -direction.view(1, 1, D).expand(B, S, D).clone()
+            motion[:, 3] = direction
+            quality = torch.zeros(B, S, D, device=self.device)
+            quality[:, 4, 0] = 10.0
+            quality[:, 5, 0] = -10.0
+            pred_error = torch.zeros_like(motion)
+            goal = torch.zeros(B, D, device=self.device)
+            with torch.no_grad():
+                quality_head = model.quality_reliability[-1]
+                quality_head.weight.zero_()
+                quality_head.weight[:, 0] = 1.0
+                quality_head.bias.zero_()
+                salience_head = model.motion_salience_head[-1]
+                salience_head.weight.copy_(direction.view(1, D) / D)
+                result = model.BuildObjectTimeCompetition(
+                    objects,
+                    motion,
+                    quality,
+                    pred_error,
+                    goal,
+                    torch.ones(B, device=self.device),
+                    torch.zeros(B, device=self.device),
+                    None)
+            temporal = result[4]
+            reliability = result[6]
+            assert torch.allclose(
+                motion[:, 3].square().mean(),
+                motion[:, 0].square().mean())
+            assert temporal[0, 3] > temporal[0, 0]
+            assert reliability[0, 4] > reliability[0, 5]
+            assert temporal[0, 4] > temporal[0, 5]
+            print("BottomUpSalienceAndReliability test passed.")
+            return True
+        except AssertionError as e:
+            print(f"BottomUpSalienceAndReliability test failed: {e}")
+            return False
+
+    def TestObjectPresenceRejectsEmptySlots(self):
+        try:
+            K = 128
+            model = AttentionExtractor(
+                embedDim=64,
+                sequenceLength=4,
+                numHeads=4,
+                temporalLayers=1,
+                capsDim=16,
+                routingIterations=2,
+                objectTokenCount=K).to(self.device).eval()
+            B, S, D = 1, 4, 32
+            objects = torch.zeros(B, S, K, D, device=self.device)
+            objects[:, :, 0] = torch.randn(B, S, D, device=self.device)
+            objects.requires_grad_()
+            zeros = torch.zeros(B, S, D, device=self.device)
+            result = model.BuildObjectTimeCompetition(
+                objects,
+                zeros,
+                zeros,
+                zeros,
+                zeros[:, 0],
+                torch.ones(B, device=self.device),
+                torch.zeros(B, device=self.device),
+                None)
+            object_attention = result[3]
+            observed = object_attention[..., 0]
+            empty = object_attention[..., 1:K]
+            background = object_attention[..., -1]
+            assert torch.all(observed > empty.amax(dim=-1))
+            assert torch.all(empty.sum(dim=-1) < observed)
+            assert torch.all(background > empty.amax(dim=-1))
+            output = model(
+                torch.randn(B, S, 64, device=self.device),
+                objectSeq=objects,
+                motionSeq=zeros,
+                qualitySeq=zeros,
+                predErrorSeq=zeros,
+                goalBias=zeros[:, 0],
+                precision=torch.ones(B, device=self.device),
+                tdError=torch.zeros(B, device=self.device))
+            output.square().mean().backward()
+            assert objects.grad is not None
+            assert torch.isfinite(objects.grad).all()
+            print("ObjectPresenceRejectsEmptySlots passed.")
+            return True
+        except AssertionError as e:
+            print(f"ObjectPresenceRejectsEmptySlots failed: {e}")
+            return False
+        except Exception as e:
+            print(f"ObjectPresenceRejectsEmptySlots error: {e}")
+            return False
+
+    def TestAttentionMapsSupportAuxiliaryLearning(self):
+        try:
+            torch.manual_seed(448)
+            model = AttentionExtractor(
+                embedDim=64,
+                sequenceLength=8,
+                numHeads=4,
+                temporalLayers=1,
+                capsDim=16,
+                routingIterations=2).to(self.device).train()
+            x = torch.randn(2, 8, 64, device=self.device)
+            args = self.AttentionInputs(2, 8, 64)
+            _, extras = model(x, returnExtras=True, **args)
+            supervised_maps = (
+                "object_time_attention",
+                "object_attention",
+                "temporal_attention_prior",
+                "workspace_time_attention",
+                "workspace_object_attention",
+                "temporal_readout_attention",
+                "workspace_readout_attention",
+                "readout_weights",
+                "fusion_weights")
+            assert all(extras[name].requires_grad for name in supervised_maps)
+            loss = (
+                -extras["object_time_attention"][:, -1, 0].log().mean()
+                -extras["workspace_time_attention"][:, 0, -1].log().mean()
+                -extras["readout_weights"][:, 0].log().mean())
+            loss.backward()
+            assert model.goal_object_query[-1].weight.grad is not None
+            assert model.workspace.latent_queries.grad is not None
+            assert model.readout_gate[-1].weight.grad is not None
+            print("AttentionMapsSupportAuxiliaryLearning passed.")
+            return True
+        except AssertionError as e:
+            print(f"AttentionMapsSupportAuxiliaryLearning failed: {e}")
+            return False
+
+    def TestFusionPlasticityUsesPreviousState(self):
+        try:
+            torch.manual_seed(449)
+            fusion = GoalConditionedHebbianFusion(
+                numModes=3,
+                embedDim=32).to(self.device).eval()
+            fusion.EnsureB(1)
+            inputs = torch.randn(1, 3, 32, device=self.device)
+            goal = torch.randn(1, 32, device=self.device)
+            prior_logits = torch.randn(1, 3, device=self.device)
+            precision = torch.ones(1, device=self.device)
+            td = torch.ones(1, device=self.device)
+            update_rows = torch.ones(
+                1,
+                dtype=torch.bool,
+                device=self.device)
+            with torch.no_grad():
+                first, _ = fusion(
+                    inputs,
+                    goal,
+                    prior_logits,
+                    precision,
+                    td,
+                    update_rows)
+                memory_after_first = fusion.hebbian_memory.clone()
+                second, _ = fusion(
+                    inputs,
+                    goal,
+                    prior_logits,
+                    precision,
+                    td,
+                    update_rows)
+                fusion.ResetHebbianMemory()
+                replay, _ = fusion(
+                    inputs,
+                    goal,
+                    prior_logits,
+                    precision,
+                    td,
+                    update_rows)
+            assert tuple(memory_after_first.shape) == (1, 3, 32, 32)
+            assert memory_after_first.norm() > 0
+            assert not torch.allclose(first, second)
+            assert torch.allclose(first, replay, atol=1e-7, rtol=1e-6)
+            print("FusionPlasticityUsesPreviousState passed.")
+            return True
+        except AssertionError as e:
+            print(f"FusionPlasticityUsesPreviousState failed: {e}")
+            return False
+        except Exception as e:
+            print(f"FusionPlasticityUsesPreviousState error: {e}")
+            return False
+        except Exception as e:
+            print(f"AttentionMapsSupportAuxiliaryLearning error: {e}")
+            return False
+        except Exception as e:
+            print(f"BottomUpSalienceAndReliability test error: {e}")
+            return False
+
+    def TestCurrentFrameOnlyHebbianUpdate(self):
+        try:
+            torch.manual_seed(447)
+            attn = MultiHeadAttention(
+                embedDim=64,
+                numHeads=4).to(self.device).eval()
+            first = torch.randn(1, 8, 64, device=self.device)
+            second = torch.randn_like(first)
+            second[:, -1] = first[:, -1]
+            td = torch.tensor([0.5], device=self.device)
+            uncertainty = torch.tensor([0.2], device=self.device)
+            precision = torch.tensor([0.8], device=self.device)
+            attn.EnsureB(1)
+            with torch.no_grad():
+                _ = attn(
+                    first,
+                    first,
+                    first,
+                    tdError=td,
+                    uncertainty=uncertainty,
+                    precision=precision)
+                U_first = attn.U.clone()
+                V_first = attn.V.clone()
+                attn.ResetHebbianMemory()
+                _ = attn(
+                    second,
+                    second,
+                    second,
+                    tdError=td,
+                    uncertainty=uncertainty,
+                    precision=precision)
+            assert torch.allclose(attn.U, U_first)
+            assert torch.allclose(attn.V, V_first)
+            print("CurrentFrameOnlyHebbianUpdate test passed.")
+            return True
+        except AssertionError as e:
+            print(f"CurrentFrameOnlyHebbianUpdate test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"CurrentFrameOnlyHebbianUpdate test error: {e}")
+            return False
+
+    def TestAllPaddingRowFinite(self):
+        try:
+            model = AttentionExtractor(
+                embedDim=64,
+                sequenceLength=8,
+                numHeads=4,
+                temporalLayers=1,
+                capsDim=16,
+                routingIterations=2).to(self.device).eval()
+            x = torch.randn(2, 8, 64, device=self.device)
+            args = self.AttentionInputs(2, 8, 64)
+            mask = torch.zeros(2, 8, dtype=torch.bool, device=self.device)
+            mask[0] = True
+            with torch.no_grad():
+                out, extras = model(
+                    x,
+                    keyPaddingMask=mask,
+                    returnExtras=True,
+                    **args)
+            assert torch.isfinite(out).all()
+            assert torch.count_nonzero(
+                extras["object_time_attention"][0]) == 0
+            assert torch.count_nonzero(
+                extras["temporal_readout_attention"][0]) == 0
+            for saved in model.ExportState()["mhsa"]:
+                assert torch.count_nonzero(saved["U"][0]) == 0
+                assert torch.count_nonzero(saved["V"][0]) == 0
+            assert torch.count_nonzero(
+                model.ExportState()["fusion"][0]) == 0
+            print("AllPaddingRowFinite test passed.")
+            return True
+        except AssertionError as e:
+            print(f"AllPaddingRowFinite test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"AllPaddingRowFinite test error: {e}")
+            return False
+
+    def TestVariableLengthWrapperParity(self):
+        try:
+            base = AttentionExtractor(
+                embedDim=64,
+                sequenceLength=16,
+                numHeads=4,
+                temporalLayers=1,
+                capsDim=16,
+                routingIterations=2).to(self.device).eval()
+            wrapper = AttentionOnlineWrapper(
+                base=base,
+                initRankEach=0,
+                autoRank=False).to(self.device).eval()
+            x = torch.randn(2, 11, 64, device=self.device)
+            args = self.AttentionInputs(2, 11, 64)
+            mask = torch.zeros(2, 11, dtype=torch.bool, device=self.device)
+            mask[:, :3] = True
+            with torch.no_grad():
+                base_out = base(
+                    x,
+                    keyPaddingMask=mask,
+                    **args)
+                base.ResetHebbianMemory()
+                wrapper_out = wrapper(
+                    x,
+                    keyPaddingMask=mask,
+                    **args)
+            assert torch.allclose(
+                base_out,
+                wrapper_out,
+                atol=1e-6,
+                rtol=1e-5)
+            print("VariableLengthWrapperParity test passed.")
+            return True
+        except AssertionError as e:
+            print(f"VariableLengthWrapperParity test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"VariableLengthWrapperParity test error: {e}")
             return False
 
     def TestAttentionExtractor(self):
@@ -1679,7 +2678,8 @@ class TestAttentionMTool:
             with torch.no_grad():
                 key_params = {
                     "mhsa_q_proj": next(p for p in model.temporal_blocks[0].mhsa.q_proj.parameters() if p.dim() >= 2),
-                    "fusion_base": model.fusion.base_weights,
+                    "workspace_query": model.workspace.latent_queries,
+                    "object_query": model.goal_object_query[1].weight,
                     "output_proj_w": next(p for p in model.output_proj[0].parameters() if p.dim() >= 2),
                     "head_w": head.weight}
                 init_norms = {k: v.norm().item() for k, v in key_params.items()}
@@ -2018,10 +3018,20 @@ class TestAttentionMTool:
                 "temporal_blocks.0.mhsa.v_proj.weight",
                 "temporal_blocks.0.mhsa.out_proj.weight",
                 "temporal_blocks.0.ssm.in_proj.weight",
-                "routing.transformation",
-                "fusion.base_weights",
-                "context_proj.0.weight",
-                "static_mixer.0.weight",
+                "temporal_blocks.0.ssm.param_proj.weight",
+                "workspace.latent_queries",
+                "workspace.temporal_transforms",
+                "workspace.temporal_latent_prior",
+                "workspace.aggregation_gain",
+                "workspace.source_gain",
+                "object_workspace_proj.1.weight",
+                "goal_object_query.1.weight",
+                "quality_channel_reliability.1.weight",
+                "content_gate.weight",
+                "readout_query.weight",
+                "readout_gate.1.weight",
+                "readout_fusion.base_weights",
+                "readout_fusion.gate_head.0.weight",
                 "output_proj.0.weight",
                 "head.weight",]
             missing = [n for n in must_have if (n in named) and (named[n].grad is None)]
@@ -2079,25 +3089,18 @@ class TestAttentionMTool:
 
             U0 = attn.U.norm().item(); V0 = attn.V.norm().item()
             for _ in range(3):
-                _ = attn(x, x, x, tdError=torch.randn(B, device=self.device), uncertainty=torch.randn(B, device=self.device))
+                _ = attn(
+                    x,
+                    x,
+                    x,
+                    tdError=torch.randn(B, device=self.device).tanh(),
+                    uncertainty=torch.rand(B, device=self.device),
+                    precision=torch.ones(B, device=self.device))
             U1 = attn.U.norm().item(); V1 = attn.V.norm().item()
             assert U1 > U0 + 1e-8 and V1 > V0 + 1e-8, "MHSA Hebbian(U/V) not growing"
 
             attn.ResetHebbianMemory()
             assert attn.U.abs().max().item() < 1e-12 and attn.V.abs().max().item() < 1e-12, "MHSA Hebbian(U/V) not cleared"
-
-            fusion = HebbianFusion(
-                numModes=3,
-                embedDim=64).to(self.device)
-            fusion.train()
-            inputs = torch.randn(4, 3, 64, device=self.device)
-            fusion.EnsureB(int(inputs.size(0)))
-            n0 = fusion.hebbian_memory.norm().item()
-            _ = fusion(inputs)
-            n1 = fusion.hebbian_memory.norm().item()
-            assert n1 > n0 + 1e-8, "Fusion Hebbian memory not growing"
-            fusion.ResetHebbianMemory()
-            assert fusion.hebbian_memory.abs().max().item() < 1e-12, "Fusion Hebbian memory not cleared"
 
             print("HebbianMemoryLifecycleAttention passed.")
             return True
@@ -2151,8 +3154,16 @@ class TestAttentionMTool:
             "SimpleSSM": self.TestSimpleSSM(),
             "MultiHeadAttention": self.TestMultiHeadAttention(),
             "TemporalAttention": self.TestTemporalAttention(),
-            "DynamicRouting": self.TestDynamicRouting(),
-            "HebbianFusion": self.TestHebbianFusion(),
+            "AttentionWorkspace": self.TestAttentionWorkspace(),
+            "ObjectTimeCompetition": self.TestObjectTimeCompetition(),
+            "GoalConditionedSelection": self.TestGoalConditionedSelection(),
+            "BottomUpSalienceAndReliability": self.TestBottomUpSalienceAndReliability(),
+            "ObjectPresenceRejectsEmptySlots": self.TestObjectPresenceRejectsEmptySlots(),
+            "AttentionMapsSupportAuxiliaryLearning": self.TestAttentionMapsSupportAuxiliaryLearning(),
+            "CurrentFrameOnlyHebbianUpdate": self.TestCurrentFrameOnlyHebbianUpdate(),
+            "FusionPlasticityUsesPreviousState": self.TestFusionPlasticityUsesPreviousState(),
+            "AllPaddingRowFinite": self.TestAllPaddingRowFinite(),
+            "VariableLengthWrapperParity": self.TestVariableLengthWrapperParity(),
             "AttentionExtractorForward": self.TestAttentionExtractor(),
             "AttentionExtractorIOShapes": self.TestAttentionExtractorIOShapes(),
             "TrainStepSmoke": self.TrainStepSmoke(),
@@ -2172,6 +3183,7 @@ class TestAttentionMTool:
             "SelectiveDoneReset": self.TestSelectiveDoneReset(),
             "ModulatorsPassThrough": self.TestModulatorsPassThrough(),
             "RoutingAndDistributedGates": self.TestRoutingAndDistributedGates(),
+            "CapacityNotReduced": self.TestCapacityNotReduced(),
             "DualTimeConstantSSM": self.TestDualTimeConstantSSM(),
             "SmallBatchSafety": self.SmallBatchSafety(),}
         passed = sum(1 for v in results.values() if v)
