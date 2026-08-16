@@ -1128,6 +1128,8 @@ class BrainCore(nn.Module):
 
         B, dev = frame.size(0), frame.device
         if self.buf_B != B:
+            if not self.thread_end or self.extra_mem is not None:
+                self.CancelOutstandingSmoothMemoryTransaction()
             self.ResetBuffers(B=B, isOnlineLearning=self.is_online_learning, device=dev)
             self.RuntimeModule(self.world).ResetState(batchSize=B)
         # Current proprioception closes the previous transition. During offline training the
@@ -1197,7 +1199,7 @@ class BrainCore(nn.Module):
         done_ext = None if doneFlag is None else doneFlag.detach().view(B)
         
         if self.extra_mem and self.thread_end:
-            self.mem.MergeMemoryState(self.extra_mem)
+            self.mem.MergeMemoryDelta(self.extra_mem)
             self.extra_mem =None
 
 
@@ -1214,20 +1216,42 @@ class BrainCore(nn.Module):
             self.critic_copy.ImportState(critic_state)
             self.critic_copy.load_state_dict(self.critic.state_dict(), strict=True)
 
-        if self.need_trace and not isTrain and reward_ext is not None and self.history and self.thread_end:
+        terminal_smoothing_started = False
+        terminal_signal = (
+            done_ext is not None
+            and bool((done_ext > 0).any().item()))
+        if (
+            self.need_trace
+            and not isTrain
+            and terminal_signal
+            and self.history
+        ):
+            # A terminal transition must not be dropped merely because a reward
+            # replay is still running.  Finish that single queued transaction,
+            # commit its delta, then snapshot the terminal state.  Terminal
+            # transitions are rare, so explicit synchronization here is preferable
+            # to sharing the mutable shadow modules between two workers.
+            self.mem.SealPendingRows(done_ext > 0)
+            self.CompleteOutstandingSmoothMemoryTransaction()
+            self.thread_end = False
+            init_shadow_module_parms()
+            self.smooth_queue.put((
+                list(self.history), done_ext, "Done",
+                self.attn_copy, self.mem_copy, self.critic_copy,
+                self.smooth_generation))
+            terminal_smoothing_started = True
+        elif (
+            self.need_trace
+            and not isTrain
+            and reward_ext is not None
+            and self.history
+            and self.thread_end
+        ):
             self.thread_end = False
             init_shadow_module_parms()
             # Traces are detached/cloned at creation, so a shallow snapshot is enough.
             self.smooth_queue.put((
                 list(self.history), reward_ext, "Reward",
-                self.attn_copy, self.mem_copy, self.critic_copy,
-                self.smooth_generation))
-
-        if self.need_trace and not isTrain and done_ext is not None and self.history and self.thread_end:
-            self.thread_end = False
-            init_shadow_module_parms()
-            self.smooth_queue.put((
-                list(self.history), done_ext, "Done",
                 self.attn_copy, self.mem_copy, self.critic_copy,
                 self.smooth_generation))
 
@@ -2008,8 +2032,9 @@ class BrainCore(nn.Module):
             # history or identity entries from its preceding episode.
             self.slow_cache = None
             self.history.clear()
-            self.extra_mem = None
-            self.smooth_generation += 1
+            if not terminal_smoothing_started:
+                self.CompleteOutstandingSmoothMemoryTransaction()
+                self.smooth_generation += 1
             if self.perception_recall_loss is not None:
                 self.perception_recall_loss.ResetIdentityBank()
             # Row-addressable visual state remains valid for unfinished batch rows.
@@ -2408,7 +2433,23 @@ class BrainCore(nn.Module):
         self.slow_step_count = int(state["slow_step_count"])
         self.slow_cache = self.DetachRuntimeObject(
             state["slow_cache"], clone=True)
-        self.thread_end = bool(state["thread_end"])
+        # Worker queues are process-local and are not part of the snapshot.
+        self.thread_end = True
+
+    @torch.no_grad()
+    def CancelOutstandingSmoothMemoryTransaction(self) -> None:
+        self.smooth_generation += 1
+        self.smooth_queue.join()
+        self.extra_mem = None
+        self.thread_end = True
+
+    @torch.no_grad()
+    def CompleteOutstandingSmoothMemoryTransaction(self) -> None:
+        if not self.thread_end:
+            self.smooth_queue.join()
+        if self.extra_mem is not None:
+            self.mem.MergeMemoryDelta(self.extra_mem)
+            self.extra_mem = None
 
     @torch.no_grad()
     def ExportBuffers(self) -> Dict[str, Any]:
@@ -2519,6 +2560,9 @@ class BrainCore(nn.Module):
         ):
             raise ValueError("OCR runtime state fields do not match the current schema")
 
+        # The current process's worker must stop before restored runtime fields
+        # (including a completed-but-unmerged delta) replace its state.
+        self.CancelOutstandingSmoothMemoryTransaction()
         device = next(self.parameters()).device
         state = copy.deepcopy(state)
         state = self.MoveRuntimeStateToModel(state)
@@ -2663,7 +2707,10 @@ class BrainCore(nn.Module):
     def SmoothWorkerLoop(self):
         while True:
             task = self.smooth_queue.get()
-            self.SmoothWork(*task)
+            try:
+                self.SmoothWork(*task)
+            finally:
+                self.smooth_queue.task_done()
 
     def SmoothWork(
         self,
@@ -2733,16 +2780,18 @@ class BrainCore(nn.Module):
                 for i in range(1, len(smoothed_list)):
                     if signal == "Reward":
                         reward_in = smoothed_list[i]
+                        done_in = done_list[i]
                     else: # Done
                         reward_in = reward_list[i]
+                        done_in = smoothed_list[i]
 
                     value = criticModule(
                         memoryPrev=mem_list[i-1],
                         attnPrev=atten_list[i-1],
                         state=world_state_list[i],
-                        rewardModel=reward_list[i],
+                        rewardModel=reward_in,
                         policyEntropyPrev=entropy_list[i-1],
-                        doneModel=done_list[i],
+                        doneModel=done_in,
                         worldDeltaTransport=world_dtr_list[i],
                         worldDeltaPhysics=world_dph_list[i],)
 
@@ -2781,16 +2830,24 @@ class BrainCore(nn.Module):
                         uncertainty=unc_sig,
                         risk=risk_sig,
                         confidence=confidence_sig,
-                        sourceLabel=MemoryType.SRC_IMAGINE)
+                        sourceLabel=torch.full(
+                            (reward_in.size(0),),
+                            MemoryType.SRC_IMAGINE,
+                            device=reward_in.device,
+                            dtype=torch.int8))
 
                 memModule.FlushPendingWrites()
 
-            extra_state = memModule.ExportState(step=start)
-            extra_state["memory_delta_base_step"] = torch.tensor(start, device=last_ref.device, dtype=torch.long)
-            extra_state["memory_delta_new_step"] = memModule.time_step.detach().max()
-            extra_state["memory_delta_kind"] = torch.tensor(1 if signal == "Reward" else 2, device=last_ref.device, dtype=torch.long)
+            extra_memory = {
+                "state": memModule.ExportState(step=start),
+                "base_step": torch.tensor(start, device=last_ref.device, dtype=torch.long),
+                "new_step": memModule.time_step.detach().max(),
+                "kind": torch.tensor(
+                    1 if signal == "Reward" else 2,
+                    device=last_ref.device,
+                    dtype=torch.long),}
             if generation == self.smooth_generation:
-                self.extra_mem = extra_state
+                self.extra_mem = extra_memory
 
         except Exception as e:
             print("[SmoothWork] error:", repr(e))
@@ -3046,6 +3103,9 @@ class Agent:
         mem.SaveState(path)
 
     def SaveRuntimeMemories(self):
+        if self.wm_mem_path is None and self.mem_mem_path is None:
+            return
+        self.brain.CompleteOutstandingSmoothMemoryTransaction()
         if self.wm_mem_path is not None:
             if self.world_frame_id is None:
                 raise RuntimeError(
@@ -3091,6 +3151,7 @@ class Agent:
                 name: value
                 for name, value in brain_state.items()
                 if not name.startswith(auxiliary_prefixes)}
+        self.brain.CancelOutstandingSmoothMemoryTransaction()
         LoadDeploymentModelState(self.brain, brain_state)
         self.ResetOnlineCandidateState()
         self.ClearTrainableOptimizerState()
@@ -3329,6 +3390,7 @@ class Agent:
                 "bind the Agent world memory context before saving a runtime checkpoint")
         if self.world_memory_batch_size is None:
             raise RuntimeError("Agent runtime batch size is not bound")
+        self.brain.CompleteOutstandingSmoothMemoryTransaction()
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
         payload = {
@@ -3415,6 +3477,7 @@ class Agent:
         self.brain.mem.ValidateDurableState(
             payload["memory_durable"],
             expectedBatch=self.world_memory_batch_size)
+        self.brain.CancelOutstandingSmoothMemoryTransaction()
         LoadBrainModelState(self.brain, brain_state)
         self.ImportOnlineCandidateState(payload["online_candidates"])
         self.SyncTrainableOptimizers()
@@ -3444,6 +3507,8 @@ class Agent:
         if isOnlineLearning is None:
             isOnlineLearning = self.brain.is_online_learning
 
+        self.brain.CancelOutstandingSmoothMemoryTransaction()
+
         if isOnlineLearning:
             self.brain.world.base.ResetState(batchSize=B)
             self.brain.world.base.ResetPhysicalState()
@@ -3460,10 +3525,6 @@ class Agent:
         ).ResetTransientLossCache()
         self.brain.OCR.ResetTemporal()
         self.brain.ResetHebbianMemory()
-
-        self.brain.extra_mem = None
-        self.brain.thread_end = True
-        self.brain.smooth_generation += 1
 
         self.brain.ResetBuffers(B=B, isOnlineLearning=isOnlineLearning, device=self.device)
 
@@ -4568,6 +4629,9 @@ class TestAGICoreMTool:
                 def ImportBuffers(self, state):
                     return None
 
+                def CancelOutstandingSmoothMemoryTransaction(self):
+                    return None
+
             source = MinimalBrain(candidateRank=1)
             committed_result = source.world.Update("commit")
             assert committed_result["commit_stats"]["committed_triples"] == 1.0
@@ -4723,12 +4787,18 @@ class TestAGICoreMTool:
             brain.slow_step_count = 7
             brain.slow_cache = {"intent": torch.tensor([[3.0], [4.0]])}
             brain.thread_end = False
+            brain.smooth_generation = 4
+            brain.smooth_queue = queue.Queue()
+            brain.extra_mem = None
 
             state = BrainCore.ExportSlowRuntimeState(brain)
             brain.prev_failure_count.zero_()
             brain.slow_step_count = 0
             brain.slow_cache = None
             brain.thread_end = True
+            BrainCore.CancelOutstandingSmoothMemoryTransaction(brain)
+            restored_delta = {"kind": torch.tensor(2)}
+            brain.extra_mem = restored_delta
             BrainCore.ImportSlowRuntimeState(brain, state)
 
             ok = (
@@ -4737,11 +4807,200 @@ class TestAGICoreMTool:
                 and torch.equal(
                     brain.slow_cache["intent"],
                     torch.tensor([[3.0], [4.0]]))
-                and brain.thread_end is False)
+                and brain.thread_end is True
+                and brain.smooth_generation == 5
+                and brain.extra_mem is restored_delta)
             print(f"AGICore slow runtime snapshot {'passed' if ok else 'failed'}.")
             return bool(ok)
         except Exception as e:
             print(f"AGICore slow runtime snapshot error: {e}")
+            return False
+
+    def TestBusySmoothTransactionCompletesBeforeTerminal(self) -> bool:
+        try:
+            brain = object.__new__(BrainCore)
+            nn.Module.__init__(brain)
+            brain.thread_end = False
+            brain.extra_mem = None
+            brain.smooth_queue = queue.Queue()
+            merged = []
+            delta = {"terminal": torch.tensor(1)}
+            brain.mem = SimpleNamespace(
+                MergeMemoryDelta=lambda item: merged.append(item))
+
+            def finish_reward(item):
+                brain.extra_mem = item
+                brain.thread_end = True
+
+            brain.SmoothWork = finish_reward
+            worker = threading.Thread(
+                target=BrainCore.SmoothWorkerLoop,
+                args=(brain,),
+                daemon=True)
+            worker.start()
+            brain.smooth_queue.put((delta,))
+            BrainCore.CompleteOutstandingSmoothMemoryTransaction(brain)
+            ok = (
+                brain.thread_end is True
+                and brain.extra_mem is None
+                and merged == [delta]
+                and brain.smooth_queue.unfinished_tasks == 0)
+            print(
+                "AGICore busy smooth transaction completion "
+                f"{'passed' if ok else 'failed'}.")
+            return bool(ok)
+        except Exception as e:
+            print(f"AGICore busy smooth transaction completion error: {e}")
+            return False
+
+    def TestBusySmoothCancellationDrainsWorker(self) -> bool:
+        try:
+            brain = object.__new__(BrainCore)
+            nn.Module.__init__(brain)
+            brain.thread_end = False
+            brain.smooth_generation = 4
+            brain.extra_mem = None
+            brain.smooth_queue = queue.Queue()
+            delta = {"stale": torch.tensor(1)}
+
+            def finish_stale_work(item):
+                brain.extra_mem = item
+                brain.thread_end = True
+
+            brain.SmoothWork = finish_stale_work
+            worker = threading.Thread(
+                target=BrainCore.SmoothWorkerLoop,
+                args=(brain,),
+                daemon=True)
+            worker.start()
+            brain.smooth_queue.put((delta,))
+            BrainCore.CancelOutstandingSmoothMemoryTransaction(brain)
+            ok = (
+                brain.thread_end is True
+                and brain.extra_mem is None
+                and brain.smooth_generation == 5
+                and brain.smooth_queue.unfinished_tasks == 0)
+            print(
+                "AGICore busy smooth cancellation "
+                f"{'passed' if ok else 'failed'}.")
+            return bool(ok)
+        except Exception as e:
+            print(f"AGICore busy smooth cancellation error: {e}")
+            return False
+
+    def TestSmoothWorkUsesCorrectedSignal(self) -> bool:
+        try:
+            brain = object.__new__(BrainCore)
+            nn.Module.__init__(brain)
+            brain.smooth_generation = 9
+            brain.extra_mem = None
+            brain.thread_end = False
+            brain.SmoothCorrection = lambda wmSeq, extLast: wmSeq + 0.25
+            brain.BuildVisualSequenceTensors = lambda visual, **kwargs: (
+                torch.zeros(1, 1, 8),
+                torch.zeros(1, 1, 1, 8),
+                torch.zeros(1, 1, 8),
+                torch.zeros(1, 1, 8),
+                torch.zeros(1, 1, 8),
+                torch.zeros(1, 1, dtype=torch.bool),)
+
+            traces = []
+            for reward, done in ((0.1, 0.0), (0.2, 0.2), (0.3, 0.4)):
+                traces.append(SimpleNamespace(
+                    VisualBuffer=None,
+                    VisualStateNow=SimpleNamespace(),
+                    OcrSemantic=torch.zeros(1, 512),
+                    IntentHint=torch.zeros(1, 512),
+                    AttnFeat=torch.zeros(1, 8),
+                    MemFeat=torch.zeros(1, 8),
+                    WorldState=torch.zeros(1, 8),
+                    WorldDeltaTransport=torch.zeros(1, 8),
+                    WorldDeltaPhysics=torch.zeros(1, 8),
+                    Reward=torch.tensor([reward]),
+                    Done=torch.tensor([done]),
+                    ActionEntropy=torch.zeros(1),))
+
+            class FakeCritic:
+                def __init__(self):
+                    self.reward = []
+                    self.done = []
+
+                def __call__(self, **kwargs):
+                    self.reward.append(kwargs["rewardModel"].detach().clone())
+                    self.done.append(kwargs["doneModel"].detach().clone())
+                    return SimpleNamespace(
+                        tdError=torch.zeros(1),
+                        uncertainty=torch.zeros(1),
+                        precision=torch.ones(1),
+                        emotion=torch.zeros(1, 4),
+                        rComps={
+                            "risk": torch.zeros(1),
+                            "confidence": torch.ones(1),})
+
+            class FakeMemory:
+                def __init__(self):
+                    self.time_step = torch.zeros(1, dtype=torch.long)
+                    self.reward = []
+
+                def __call__(self, *args, **kwargs):
+                    self.reward.append(kwargs["reward"].detach().clone())
+                    return torch.zeros(1, 8)
+
+                def FlushPendingWrites(self):
+                    return None
+
+                def ExportState(self, step):
+                    return {"step": torch.tensor(step)}
+
+            atten = lambda *args, **kwargs: torch.zeros(1, 8)
+
+            reward_critic = FakeCritic()
+            reward_memory = FakeMemory()
+            BrainCore.SmoothWork(
+                brain,
+                traces,
+                torch.tensor([0.5]),
+                "Reward",
+                atten,
+                reward_memory,
+                reward_critic,
+                9)
+            reward_delta_kind = int(brain.extra_mem["kind"].item())
+
+            brain.extra_mem = None
+            brain.thread_end = False
+            done_critic = FakeCritic()
+            done_memory = FakeMemory()
+            BrainCore.SmoothWork(
+                brain,
+                traces,
+                torch.tensor([0.5]),
+                "Done",
+                atten,
+                done_memory,
+                done_critic,
+                9)
+            done_delta_kind = int(brain.extra_mem["kind"].item())
+
+            reward_expected = torch.tensor([0.45, 0.55])
+            done_expected = torch.tensor([0.45, 0.65])
+            reward_original = torch.tensor([0.2, 0.3])
+            done_original = torch.tensor([0.2, 0.4])
+            ok = (
+                torch.allclose(torch.cat(reward_critic.reward), reward_expected)
+                and torch.allclose(torch.cat(reward_critic.done), done_original)
+                and torch.allclose(torch.cat(reward_memory.reward), reward_expected)
+                and reward_delta_kind == 1
+                and torch.allclose(torch.cat(done_critic.reward), reward_original)
+                and torch.allclose(torch.cat(done_critic.done), done_expected)
+                and torch.allclose(torch.cat(done_memory.reward), reward_original)
+                and done_delta_kind == 2)
+            print(
+                "AGICore corrected smooth signal routing "
+                f"{'passed' if ok else 'failed'}.")
+            return bool(ok)
+        except Exception as e:
+            print(f"AGICore corrected smooth signal routing error: {e}")
             return False
 
     def TestAdaptiveRuntimeBufferSnapshotRoundTrip(self) -> bool:
@@ -5877,6 +6136,9 @@ class TestAGICoreMTool:
             "ResizeStateBuffersPreservesRuntimeDtype": self.TestResizeStateBuffersPreservesRuntimeDtype(),
             "RuntimeRestoreUsesModelDtype": self.TestRuntimeRestoreUsesModelDtype(),
             "SlowRuntimeSnapshotRoundTrip": self.TestSlowRuntimeSnapshotRoundTrip(),
+            "BusySmoothTransactionCompletesBeforeTerminal": self.TestBusySmoothTransactionCompletesBeforeTerminal(),
+            "BusySmoothCancellationDrainsWorker": self.TestBusySmoothCancellationDrainsWorker(),
+            "SmoothWorkUsesCorrectedSignal": self.TestSmoothWorkUsesCorrectedSignal(),
             "AdaptiveRuntimeBufferSnapshotRoundTrip": self.TestAdaptiveRuntimeBufferSnapshotRoundTrip(),
             "PartialBatchRuntimeMasking": self.TestPartialBatchRuntimeMasking(),
             "TrainBatchResizeResetsWorldBeforePhysicalSnapshot": self.TestTrainBatchResizeResetsWorldBeforePhysicalSnapshot(),
