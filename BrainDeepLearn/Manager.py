@@ -31,6 +31,7 @@ from OCRModule import TestOCRMTool, OCREngineExtractor, IouXyxy
 from DataPreprocess import DataPreprocessor, DataResizeMeta, OfflineGameDataset, OfflineOCRDataset, OfflineOCRRecognitionDataset
 from AGICore import (
     Agent,
+    BRAIN_RUNTIME_BUFFER_FIELDS,
     BRAIN_RUNTIME_SCHEMA_VERSION,
     BrainCore,
     ExportDeploymentModelState,
@@ -43,32 +44,45 @@ from Config import BasicParameters
 from CoreTypes import (
     AgentActInput,
     CameraCalibration,
+    ExpectedOfflineSensorManifest,
     ExpectedRobotStateWireMetadata,
-    OFFLINE_SENSOR_MANIFEST_SCHEMA_VERSION,
     ROBOT_STATE_FIELDS,
+    ROBOT_STATE_MASK_FIELDS,
+    ROBOT_STATE_SCALAR_MASK_FIELDS,
     ROBOT_STATE_WIRE_SCHEMA_VERSION,
     SENSOR_PACKET_WIRE_FIELDS,
     SENSOR_PACKET_WIRE_SCHEMA_VERSION,
     RobotState,
     ValidateOfflineSensorManifest,
     ValidateRobotStateWirePacket,
+    ValidateRobotTensorContract,
+    ValidateRobotObserverCalibration,
     TEXT_TRUST_OCR_OBSERVED,
     TEXT_TRUST_OPERATOR_COMMAND,
     TEXT_TRUST_UNSAFE_EXTERNAL)
 from ModuleMessagerManager import ModuleDim
+from RobotMorphologyModule import (
+    CompiledRobotMorphology,
+    RobotMorphologyModule)
 
 
 TRAIN_CHECKPOINT_SCHEMA_VERSION = BRAIN_RUNTIME_SCHEMA_VERSION
+OCR_CHECKPOINT_SCHEMA_VERSION = 16
+OCR_COMPATIBLE_CHECKPOINT_SCHEMA_VERSIONS = frozenset({15, 16})
 
 MODULE_PARAMETER_FIELDS = frozenset({
     "schema_version",
     "calibration_id",
+    "model_contract_id",
     "brain",
 })
 
 TRAIN_CHECKPOINT_FIELDS = frozenset({
     "schema_version",
     "calibration_id",
+    "description_id",
+    "model_contract_id",
+    "adapter_id",
     "world_frame_id",
     "epoch",
     "next_batch_index",
@@ -103,6 +117,9 @@ TRAIN_RNG_FIELDS = frozenset({
 DEPLOYMENT_MANIFEST_FIELDS = frozenset({
     "schema_version",
     "calibration_id",
+    "description_id",
+    "model_contract_id",
+    "adapter_id",
     "generation",
     "model_path",
     "world_memory_path",
@@ -326,8 +343,23 @@ class ModuleController:
 class ManagerFunction:
     DEFAULT_OVERRIDE_CHECKPOINT_WITH_MODULE_PARAMS = False
 
-    def __init__(self, device: Optional[str] = None):
+    def __init__(
+        self,
+        device: Optional[str] = None,
+        *,
+        robotUrdfPath: str = BasicParameters.ROBOT_URDF_PATH,
+        robotSrdfPath: str = BasicParameters.ROBOT_SRDF_PATH,
+        robotSemanticPath: Optional[str] = BasicParameters.ROBOT_SEMANTIC_PATH,
+        robotMorphology: Optional[CompiledRobotMorphology] = None,):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.robot_morphology = (
+            robotMorphology
+            if robotMorphology is not None
+            else self.LoadRobotMorphology(
+                robotUrdfPath,
+                robotSrdfPath,
+                robotSemanticPath))
+        ValidateRobotTensorContract(self.robot_morphology)
         self.controller = ModuleController()
 
         self.br_thread: Optional[threading.Thread] = None
@@ -354,6 +386,38 @@ class ManagerFunction:
             "intention": TestIntentionMTool(),
             "AGICore": TestAGICoreMTool(),
             "manager": TestManagerMTool(),}
+
+    @staticmethod
+    def LoadRobotMorphology(
+        urdfPath: str = BasicParameters.ROBOT_URDF_PATH,
+        srdfPath: str = BasicParameters.ROBOT_SRDF_PATH,
+        semanticPath: Optional[str] = BasicParameters.ROBOT_SEMANTIC_PATH,
+        observerFrameName: str = BasicParameters.ROBOT_OBSERVER_FRAME_NAME,
+        observerCalibrationId: str = BasicParameters.ROBOT_OBSERVER_CALIBRATION_ID,
+    ) -> CompiledRobotMorphology:
+        overlay = None
+        if semanticPath is not None and str(semanticPath).strip():
+            overlay = RobotMorphologyModule._ReadJson(str(semanticPath))
+            observer_configured = (
+                overlay.get("observer") is not None
+                or overlay.get("observer_endpoint") is not None)
+            if observer_configured:
+                expected = {
+                    "observer_frame_name": observerFrameName,
+                    "observer_calibration_id": observerCalibrationId,
+                }
+                for name, value in expected.items():
+                    if type(value) is not str or not value:
+                        raise ValueError(
+                            f"configured robot {name} must be non-empty")
+                    if overlay.get(name, value) != value:
+                        raise ValueError(
+                            f"robot semantic {name} does not match configuration")
+                    overlay[name] = value
+        return RobotMorphologyModule().FromMoveIt(
+            urdfPath,
+            srdfPath,
+            overlay)
 
     @staticmethod
     def NormalizeTrainStage(trainStage: str) -> str:
@@ -469,13 +533,23 @@ class ManagerFunction:
         for name, expected in expected_contract.items():
             if calibration[name] != expected:
                 raise ValueError(f"camera calibration {name} must be {expected!r}")
-        if calibration["coordinate_frame"] != {
-            "camera_frame": "camera_optical",
-            "handedness": "right_handed",
-            "x_axis_positive": "right",
-            "y_axis_positive": "down",
-            "z_axis_positive": "forward",
-        }:
+        coordinate_frame = calibration["coordinate_frame"]
+        if (
+            type(coordinate_frame) is not dict
+            or set(coordinate_frame) != {
+                "camera_frame",
+                "handedness",
+                "x_axis_positive",
+                "y_axis_positive",
+                "z_axis_positive",
+            }
+            or type(coordinate_frame["camera_frame"]) is not str
+            or not coordinate_frame["camera_frame"]
+            or coordinate_frame["handedness"] != "right_handed"
+            or coordinate_frame["x_axis_positive"] != "right"
+            or coordinate_frame["y_axis_positive"] != "down"
+            or coordinate_frame["z_axis_positive"] != "forward"
+        ):
             raise ValueError("camera calibration optical-frame convention is invalid")
         if calibration["pixel_convention"] != {
             "pixel_centers": "integer_coordinates",
@@ -514,6 +588,7 @@ class ManagerFunction:
         ], dtype=torch.float32)
         return CameraCalibration(
             calibration_id=calibration["calibration_id"],
+            frame_name=calibration["coordinate_frame"]["camera_frame"],
             intrinsics=camera_intrinsics)
 
     @staticmethod
@@ -521,7 +596,9 @@ class ManagerFunction:
         state: Dict[str, Any],
         device: torch.device,
         *,
-        batched: bool,) -> RobotState:
+        batched: bool,
+        robotContract: Any,) -> RobotState:
+        ValidateRobotTensorContract(robotContract)
         if type(state) is not dict or set(state) != set(ROBOT_STATE_FIELDS):
             raise ValueError(f"RobotState fields must be exactly {sorted(ROBOT_STATE_FIELDS)}")
 
@@ -530,8 +607,15 @@ class ManagerFunction:
             try:
                 value = torch.as_tensor(state[name])
             except Exception as error:
-                raise ValueError(f"RobotState {name} must contain real numbers") from error
-            if value.dtype == torch.bool or not (
+                raise ValueError(f"RobotState {name} has an invalid value") from error
+            if (
+                name in ROBOT_STATE_MASK_FIELDS
+                or name in ROBOT_STATE_SCALAR_MASK_FIELDS
+            ):
+                if value.dtype != torch.bool:
+                    raise TypeError(f"RobotState {name} must contain booleans")
+                value = value.to(device=device)
+            elif value.dtype == torch.bool or not (
                 value.is_floating_point()
                 or value.dtype in (
                     torch.uint8,
@@ -542,9 +626,9 @@ class ManagerFunction:
                 )
             ):
                 raise TypeError(f"RobotState {name} must contain real numbers")
-            if not bool(torch.isfinite(value).all().item()):
+            elif not bool(torch.isfinite(value).all().item()):
                 raise ValueError(f"RobotState {name} must contain only finite values")
-            if name == "executed_action_id":
+            elif name == "executed_action_id":
                 if bool((value < 0).any().item()) or bool(
                     (value != value.round()).any().item()
                 ):
@@ -555,36 +639,118 @@ class ManagerFunction:
                 value = value.to(device=device, dtype=torch.float32)
             tensors[name] = value
 
+        joint_dof_count = int(robotContract.joint_dof_count)
+        node_count = int(robotContract.node_count)
+        endpoint_count = int(robotContract.endpoint_count)
+        joint_shape = (
+            (None, joint_dof_count)
+            if batched else
+            (joint_dof_count,))
         endpoint_shape = (
-            (None, ModuleDim.RobotStateEndpointCount, ModuleDim.DecisionEndpointPoseDim)
+            (None, endpoint_count, ModuleDim.DecisionEndpointPoseDim)
             if batched else
-            (ModuleDim.RobotStateEndpointCount, ModuleDim.DecisionEndpointPoseDim))
-        planner_shape = (
-            (None, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim)
+            (endpoint_count, ModuleDim.DecisionEndpointPoseDim))
+        endpoint_mask_shape = (
+            (None, endpoint_count)
             if batched else
-            (ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim))
+            (endpoint_count,))
+        node_pose_shape = (None, node_count, 7) if batched else (node_count, 7)
+        node_twist_shape = (None, node_count, 6) if batched else (node_count, 6)
+        node_mask_shape = (None, node_count) if batched else (node_count,)
+        observer_pose_shape = (None, 7) if batched else (7,)
         base_orientation_shape = (None, 4) if batched else (4,)
         gravity_shape = (None, 3) if batched else (3,)
+        actual_joint_shape = tuple(tensors["joint_position"].shape)
+        actual_node_pose_shape = tuple(tensors["node_pose_world"].shape)
+        actual_node_twist_shape = tuple(tensors["node_twist_world"].shape)
         actual_endpoint_shape = tuple(tensors["endpoint_pose"].shape)
         actual_planner_shape = tuple(tensors["planner_expected_endpoint_pose"].shape)
+        actual_observer_pose_shape = tuple(
+            tensors["observer_pose_world"].shape)
         actual_base_orientation_shape = tuple(
             tensors["base_orientation_world"].shape)
         actual_gravity_shape = tuple(tensors["gravity_direction_world"].shape)
+        for name in (
+            "joint_position",
+            "joint_velocity",
+            "joint_effort",
+            "joint_observed",
+            "joint_healthy",
+            "joint_controllable",
+        ):
+            shape = tuple(tensors[name].shape)
+            if (
+                len(shape) != len(joint_shape)
+                or any(
+                    expected is not None and actual != expected
+                    for actual, expected in zip(shape, joint_shape))
+            ):
+                raise ValueError(
+                    f"RobotState {name} does not match external joint variables")
+        for name, expected_shape in (
+            ("node_pose_world", node_pose_shape),
+            ("node_twist_world", node_twist_shape),
+        ):
+            shape = tuple(tensors[name].shape)
+            if (
+                len(shape) != len(expected_shape)
+                or any(
+                    expected is not None and actual != expected
+                    for actual, expected in zip(shape, expected_shape))
+            ):
+                raise ValueError(
+                    f"RobotState {name} does not match external nodes")
+        for name in ("node_observed", "node_healthy"):
+            shape = tuple(tensors[name].shape)
+            if (
+                len(shape) != len(node_mask_shape)
+                or any(
+                    expected is not None and actual != expected
+                    for actual, expected in zip(shape, node_mask_shape))
+            ):
+                raise ValueError(
+                    f"RobotState {name} does not match external nodes")
         if (
             len(actual_endpoint_shape) != len(endpoint_shape)
             or any(
                 expected is not None and actual != expected
                 for actual, expected in zip(actual_endpoint_shape, endpoint_shape))
         ):
-            raise ValueError("RobotState endpoint_pose must have shape [B, 13, 7] or [13, 7]")
+            raise ValueError(
+                "RobotState endpoint_pose does not match external endpoints")
         if (
-            len(actual_planner_shape) != len(planner_shape)
+            len(actual_planner_shape) != len(endpoint_shape)
             or any(
                 expected is not None and actual != expected
-                for actual, expected in zip(actual_planner_shape, planner_shape))
+                for actual, expected in zip(actual_planner_shape, endpoint_shape))
         ):
             raise ValueError(
-                "RobotState planner_expected_endpoint_pose must have shape [B, 13, 7] or [13, 7]")
+                "RobotState planner_expected_endpoint_pose does not match "
+                "external endpoints")
+        for name in (
+            "endpoint_observed",
+            "endpoint_healthy",
+            "endpoint_controllable",
+        ):
+            shape = tuple(tensors[name].shape)
+            if (
+                len(shape) != len(endpoint_mask_shape)
+                or any(
+                    expected is not None and actual != expected
+                    for actual, expected in zip(shape, endpoint_mask_shape))
+            ):
+                raise ValueError(
+                    f"RobotState {name} does not match external endpoints")
+        if (
+            len(actual_observer_pose_shape) != len(observer_pose_shape)
+            or any(
+                expected is not None and actual != expected
+                for actual, expected in zip(
+                    actual_observer_pose_shape,
+                    observer_pose_shape))
+        ):
+            raise ValueError(
+                "RobotState observer_pose_world must have shape [B, 7] or [7]")
         if (
             len(actual_base_orientation_shape) != len(base_orientation_shape)
             or any(
@@ -604,25 +770,169 @@ class ManagerFunction:
             raise ValueError(
                 "RobotState gravity_direction_world must have shape [B, 3] or [3]")
 
-        scalar_shape = (actual_endpoint_shape[0],) if batched else ()
+        batch_size = actual_endpoint_shape[0] if batched else None
+        scalar_shape = (batch_size,) if batched else ()
         if any(
             tuple(tensors[name].shape) != scalar_shape
             for name in ROBOT_STATE_FIELDS
             if name not in (
+                "joint_position",
+                "joint_velocity",
+                "joint_effort",
+                "joint_observed",
+                "joint_healthy",
+                "joint_controllable",
+                "node_pose_world",
+                "node_twist_world",
+                "node_observed",
+                "node_healthy",
                 "endpoint_pose",
+                "endpoint_observed",
+                "endpoint_healthy",
+                "endpoint_controllable",
+                "observer_pose_world",
                 "base_orientation_world",
                 "gravity_direction_world",
                 "planner_expected_endpoint_pose")
         ):
             raise ValueError(f"RobotState scalar fields must have shape {scalar_shape}")
         if batched and any(
-            shape[0] != actual_endpoint_shape[0]
+            shape[0] != batch_size
             for shape in (
+                actual_joint_shape,
+                actual_node_pose_shape,
+                actual_node_twist_shape,
                 actual_planner_shape,
+                actual_observer_pose_shape,
                 actual_base_orientation_shape,
-                actual_gravity_shape)
+                actual_gravity_shape,
+                tuple(tensors["joint_observed"].shape),
+                tuple(tensors["node_observed"].shape),
+                tuple(tensors["endpoint_observed"].shape))
         ):
             raise ValueError("RobotState fields must have one batch size")
+
+        node_observed = tensors["node_observed"]
+        if bool((tensors["node_healthy"] & ~node_observed).any().item()):
+            raise ValueError("RobotState node_healthy requires node_observed")
+        node_pose = tensors["node_pose_world"]
+        node_identity = node_pose.new_zeros(node_pose.shape)
+        node_identity[..., 6] = 1.0
+        if (
+            bool((~node_observed).any().item())
+            and not torch.allclose(
+                node_pose[~node_observed],
+                node_identity[~node_observed],
+                rtol=0.0,
+                atol=1e-6)
+        ):
+            raise ValueError("RobotState unavailable node poses must be identity")
+        if (
+            bool((~node_observed).any().item())
+            and bool((tensors["node_twist_world"][~node_observed]
+                != 0.0).any().item())
+        ):
+            raise ValueError("RobotState unavailable node twists must be zero")
+        node_quaternion_norm = node_pose[..., 3:7].norm(dim=-1)
+        if not torch.allclose(
+            node_quaternion_norm[node_observed],
+            torch.ones_like(node_quaternion_norm[node_observed]),
+            rtol=1e-3,
+            atol=1e-3,
+        ):
+            raise ValueError("RobotState node pose quaternions must have unit length")
+
+        observer_pose = tensors["observer_pose_world"].reshape(-1, 7)
+        observer_pose_valid = tensors["observer_pose_valid"].reshape(-1)
+        observer_identity = observer_pose.new_zeros(observer_pose.shape)
+        observer_identity[..., 6] = 1.0
+        if (
+            not robotContract.observer_valid
+            and bool(observer_pose_valid.any().item())
+        ):
+            raise ValueError(
+                "RobotState observer pose cannot be valid without an observer")
+        observer_unavailable = ~observer_pose_valid
+        if (
+            bool(observer_unavailable.any().item())
+            and not torch.allclose(
+                observer_pose[observer_unavailable],
+                observer_identity[observer_unavailable],
+                rtol=0.0,
+                atol=1e-6)
+        ):
+            raise ValueError(
+                "RobotState unavailable observer pose must be identity")
+        observer_quaternion_norm = observer_pose[..., 3:7].norm(dim=-1)
+        if not torch.allclose(
+            observer_quaternion_norm[observer_pose_valid],
+            torch.ones_like(observer_quaternion_norm[observer_pose_valid]),
+            rtol=1e-3,
+            atol=1e-3,
+        ):
+            raise ValueError(
+                "RobotState observer pose quaternion must have unit length")
+        if (
+            robotContract.observer_valid
+            and robotContract.observer_attachment_kind == "link"
+            and robotContract.observer_frame_name
+            == robotContract.observer_attachment_name
+        ):
+            attachment_pose = node_pose[..., robotContract.observer_node_index, :]
+            attachment_valid = node_observed[
+                ..., robotContract.observer_node_index]
+            comparable = observer_pose_valid & attachment_valid.reshape(-1)
+            if (
+                bool(comparable.any().item())
+                and not torch.allclose(
+                    observer_pose[comparable],
+                    attachment_pose.reshape(-1, 7)[comparable],
+                    rtol=0.0,
+                    atol=1e-5)
+            ):
+                raise ValueError(
+                    "RobotState observer and attachment node poses are inconsistent")
+
+        joint_observed = tensors["joint_observed"]
+        if bool((tensors["joint_healthy"] & ~joint_observed).any().item()):
+            raise ValueError("RobotState joint_healthy requires joint_observed")
+        for name in ("joint_position", "joint_velocity", "joint_effort"):
+            if bool((tensors[name][~joint_observed] != 0.0).any().item()):
+                raise ValueError(
+                    f"RobotState unobserved {name} values must be zero")
+        static_joint_controllable = robotContract.joint_variable_commandable.to(
+            device=device)
+        if batched:
+            static_joint_controllable = static_joint_controllable.unsqueeze(0)
+        if bool((tensors["joint_controllable"] &
+            ~static_joint_controllable).any().item()):
+            raise ValueError(
+                "RobotState joint_controllable activates a passive joint")
+        endpoint_observed = tensors["endpoint_observed"]
+        if bool((tensors["endpoint_healthy"] & ~endpoint_observed).any().item()):
+            raise ValueError(
+                "RobotState endpoint_healthy requires endpoint_observed")
+        endpoint_identity = tensors["endpoint_pose"].new_zeros(
+            tensors["endpoint_pose"].shape)
+        endpoint_identity[..., 6] = 1.0
+        if (
+            bool((~endpoint_observed).any().item())
+            and not torch.allclose(
+                tensors["endpoint_pose"][~endpoint_observed],
+                endpoint_identity[~endpoint_observed],
+                rtol=0.0,
+                atol=1e-6)
+        ):
+            raise ValueError(
+                "RobotState unobserved endpoint poses must be identity")
+        static_endpoint_controllable = robotContract.endpoint_task_mask.any(
+            dim=-1).to(device=device)
+        if batched:
+            static_endpoint_controllable = static_endpoint_controllable.unsqueeze(0)
+        if bool((tensors["endpoint_controllable"] &
+            ~static_endpoint_controllable).any().item()):
+            raise ValueError(
+                "RobotState endpoint_controllable lacks a task contract")
 
         for name in (
             "planner_progress",
@@ -660,15 +970,26 @@ class ManagerFunction:
             raise ValueError(
                 "RobotState model_command_executed and executed_action_id must "
                 "identify the same executed model command")
-        for name in ("endpoint_pose", "planner_expected_endpoint_pose"):
-            quaternion_norm = tensors[name][..., 3:7].norm(dim=-1)
-            if not torch.allclose(
-                quaternion_norm,
-                torch.ones_like(quaternion_norm),
-                rtol=1e-3,
-                atol=1e-3,
-            ):
-                raise ValueError(f"RobotState {name} quaternions must have unit length")
+        endpoint_quaternion_norm = tensors["endpoint_pose"][..., 3:7].norm(
+            dim=-1)
+        if not torch.allclose(
+            endpoint_quaternion_norm[endpoint_observed],
+            torch.ones_like(endpoint_quaternion_norm[endpoint_observed]),
+            rtol=1e-3,
+            atol=1e-3,
+        ):
+            raise ValueError(
+                "RobotState endpoint_pose quaternions must have unit length")
+        planner_quaternion_norm = tensors[
+            "planner_expected_endpoint_pose"][..., 3:7].norm(dim=-1)
+        if not torch.allclose(
+            planner_quaternion_norm,
+            torch.ones_like(planner_quaternion_norm),
+            rtol=1e-3,
+            atol=1e-3,
+        ):
+            raise ValueError(
+                "RobotState planner endpoint quaternions must have unit length")
         base_orientation_norm = tensors["base_orientation_world"].norm(dim=-1)
         if not torch.allclose(
             base_orientation_norm,
@@ -696,6 +1017,7 @@ class ManagerFunction:
         self.camera_calibration_id = calibration.calibration_id
         self.agent_handle = AgentHandle(
             calibration=calibration,
+            robotMorphology=self.robot_morphology,
             usePlanner=usePlanner,
             device=self.device)
         self.active_sensor_stream_id = None
@@ -739,7 +1061,8 @@ class ManagerFunction:
         robot_state = self.TensorizeRobotState(
             robotState,
             self.device,
-            batched=True)
+            batched=True,
+            robotContract=self.robot_morphology)
         batch_size = int(converted["frames"].size(0))
         self.agent_handle.agent.BindWorldMemoryContext(
             requestProvenance["world_frame_id"],
@@ -792,7 +1115,8 @@ class ManagerFunction:
             raise RuntimeError("agent_handle has not been initialized")
         ValidateRobotStateWirePacket(
             robot_packet,
-            self.camera_calibration_id)
+            self.camera_calibration_id,
+            self.robot_morphology)
         if sensor_packet["calibration_id"] != self.camera_calibration_id:
             raise ValueError("sensor packet calibration_id does not match configured K")
         if type(sensor_packet["stream_id"]) is not str or not sensor_packet["stream_id"]:
@@ -865,6 +1189,9 @@ class ManagerFunction:
                 "frame_id": sensor_packet["frame_id"],
                 "calibration_id": sensor_packet["calibration_id"],
                 "world_frame_id": robot_packet["world_frame_id"],
+                "description_id": self.robot_morphology.description_id,
+                "model_contract_id": self.robot_morphology.model_contract_id,
+                "adapter_id": self.robot_morphology.adapter_id,
             })
         self.active_sensor_stream_id = sensor_packet["stream_id"]
         self.active_world_frame_id = robot_packet["world_frame_id"]
@@ -1185,7 +1512,9 @@ class ManagerFunction:
                 sensor_manifest_path.read_text(encoding="utf-8"))
             ValidateOfflineSensorManifest(
                 sensor_manifest,
-                calibration.calibration_id)
+                calibration.calibration_id,
+                self.robot_morphology,
+                calibration.frame_name)
         except (OSError, TypeError, ValueError):
             return False
 
@@ -1486,7 +1815,9 @@ class ManagerFunction:
         cls,
         modelPath: Union[str, Path],
         *,
-        calibrationId: str,) -> Tuple[str, str, str]:
+        calibrationId: str,
+        robotContract: CompiledRobotMorphology,) -> Tuple[str, str, str]:
+        ValidateRobotTensorContract(robotContract)
         manifest_path = cls.DeploymentManifestPath(modelPath)
         if not manifest_path.exists():
             raise FileNotFoundError(
@@ -1498,6 +1829,15 @@ class ManagerFunction:
             raise ValueError("deployment manifest schema is unsupported")
         if manifest["calibration_id"] != calibrationId:
             raise ValueError("deployment manifest calibration_id does not match configured K")
+        if manifest["description_id"] != robotContract.description_id:
+            raise ValueError(
+                "deployment manifest description_id does not match the robot")
+        if manifest["model_contract_id"] != robotContract.model_contract_id:
+            raise ValueError(
+                "deployment manifest model_contract_id does not match the foundation")
+        if manifest["adapter_id"] != robotContract.adapter_id:
+            raise ValueError(
+                "deployment manifest adapter_id does not match the robot")
         for field in ("generation", "model_path", "world_memory_path", "memory_path"):
             if type(manifest[field]) is not str or not manifest[field]:
                 raise TypeError(f"deployment manifest {field} must be a non-empty string")
@@ -1528,6 +1868,7 @@ class ManagerFunction:
         self.AtomicTorchSave({
             "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
             "calibration_id": brain.calibration_id,
+            "model_contract_id": brain.robot_model_contract_id,
             "brain": brain_state,}, out_path)
 
     def SaveOCRParameters(self, engine: OCREngineExtractor, path: str) -> None:
@@ -1536,7 +1877,7 @@ class ManagerFunction:
 
         ocr_state = {k: v.detach().cpu() for k, v in engine.state_dict().items()}
         self.AtomicTorchSave({
-            "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+            "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
             "ocr": ocr_state,
             "ocr_meta": self.CurrentOcrMetadata(engine),}, out_path)
 
@@ -1546,7 +1887,7 @@ class ManagerFunction:
 
         rec_state = {k: v.detach().cpu() for k, v in engine.recognizer.state_dict().items()}
         self.AtomicTorchSave({
-            "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+            "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
             "recognizer": rec_state,
             "ocr_meta": self.CurrentOcrMetadata(engine),}, out_path)
 
@@ -1729,6 +2070,9 @@ class ManagerFunction:
         if payload["calibration_id"] != brain.calibration_id:
             raise ValueError(
                 "brain parameter calibration_id does not match configured K")
+        if payload["model_contract_id"] != brain.robot_model_contract_id:
+            raise ValueError(
+                "brain parameter model_contract_id does not match the foundation")
         brain_state = payload["brain"]
         if type(brain_state) is not dict:
             raise TypeError("brain model state must be a dictionary")
@@ -1782,7 +2126,7 @@ class ManagerFunction:
             raise ValueError("OCR parameter fields do not match the current schema")
         if (
             type(payload["schema_version"]) is not int
-            or payload["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
+            or payload["schema_version"] not in OCR_COMPATIBLE_CHECKPOINT_SCHEMA_VERSIONS
         ):
             raise ValueError("OCR parameter schema is unsupported")
         self.ValidateOcrMetadata(engine, payload["ocr_meta"])
@@ -1799,7 +2143,7 @@ class ManagerFunction:
                 "OCR recognizer parameter fields do not match the current schema")
         if (
             type(payload["schema_version"]) is not int
-            or payload["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
+            or payload["schema_version"] not in OCR_COMPATIBLE_CHECKPOINT_SCHEMA_VERSIONS
         ):
             raise ValueError("OCR recognizer parameter schema is unsupported")
         self.ValidateOcrMetadata(engine, payload["ocr_meta"])
@@ -1826,7 +2170,7 @@ class ManagerFunction:
             raise ValueError("OCR checkpoint fields do not match the current schema")
         if (
             type(ckpt["schema_version"]) is not int
-            or ckpt["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
+            or ckpt["schema_version"] not in OCR_COMPATIBLE_CHECKPOINT_SCHEMA_VERSIONS
         ):
             raise ValueError("OCR checkpoint schema is unsupported")
         if (
@@ -1872,7 +2216,7 @@ class ManagerFunction:
                 "OCR recognizer checkpoint fields do not match the current schema")
         if (
             type(ckpt["schema_version"]) is not int
-            or ckpt["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
+            or ckpt["schema_version"] not in OCR_COMPATIBLE_CHECKPOINT_SCHEMA_VERSIONS
         ):
             raise ValueError("OCR recognizer checkpoint schema is unsupported")
         self.ValidateTrainingRngState(ckpt["rng"])
@@ -2099,7 +2443,7 @@ class ManagerFunction:
 
             def BuildOCRCheckpointPayload(epochValue: int) -> Dict[str, Any]:
                 return {
-                    "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                    "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
                     "epoch": int(epochValue),
                     "best_val": best_val,
                     "ocr": engine.state_dict(),
@@ -2561,7 +2905,7 @@ class ManagerFunction:
 
             def BuildOCRRecognizerCheckpointPayload(epochValue: int) -> Dict[str, Any]:
                 return {
-                    "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                    "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
                     "epoch": int(epochValue),
                     "best_val": best_val,
                     "recognizer": engine.recognizer.state_dict(),
@@ -2769,10 +3113,13 @@ class ManagerFunction:
             calibration = self.LoadCameraCalibration()
             ds = OfflineGameDataset(
                 calibrationId=calibration.calibration_id,
+                robotMorphology=self.robot_morphology,
+                sensorFrameName=calibration.frame_name,
                 isTest=isTest)
 
             brain = BrainCore(
                 calibration=calibration,
+                robotMorphology=self.robot_morphology,
                 device=self.device,
                 plasticOnlineLearning=onlineLearning,
                 enablePerceptionSupervision=True)
@@ -2785,7 +3132,8 @@ class ManagerFunction:
                     initial_memory_path,
                 ) = self.ResolveDeploymentArtifactPaths(
                     outPath,
-                    calibrationId=calibration.calibration_id)
+                    calibrationId=calibration.calibration_id,
+                    robotContract=self.robot_morphology)
             else:
                 deployment_model_path = str(outPath)
                 initial_world_memory_path = worldMemPath
@@ -2882,9 +3230,14 @@ class ManagerFunction:
                 *,
                 nextBatchIndex: int,
                 epochLossSum: float,) -> Dict[str, Any]:
+                buffers = brain.ExportBuffers()
+                world_memory = agent.GetRuntimeWorld().ExportMemoryPayload()
                 return {
                     "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                     "calibration_id": calibration.calibration_id,
+                    "description_id": brain.robot_description_id,
+                    "model_contract_id": brain.robot_model_contract_id,
+                    "adapter_id": brain.robot_adapter_id,
                     "world_frame_id": ds.world_frame_id,
                     "epoch": int(epochValue),
                     "next_batch_index": int(nextBatchIndex),
@@ -2904,8 +3257,8 @@ class ManagerFunction:
                     "test_indices": list(test_ds.indices),
                     "processed_sample_count_total": processed_sample_count_total,
                     "rng": self.CaptureRngState(),
-                    "buffers": brain.ExportBuffers(),
-                    "world_memory": agent.GetRuntimeWorld().ExportMemoryPayload(),
+                    "buffers": buffers,
+                    "world_memory": world_memory,
                     "memory_durable": brain.mem.ExportDurableState(),}
 
             def SaveTrainArtifacts(
@@ -2945,15 +3298,18 @@ class ManagerFunction:
                             if memMemPath
                             else "memory.pth")
                         generation_dir.mkdir(parents=True, exist_ok=False)
-                        agent.GetRuntimeWorld().SaveMemory(
+                        agent.SaveWorldMemory(
                             str(generation_world_path))
-                        brain.mem.SaveState(str(generation_memory_path))
+                        agent.SaveAgentMemory(str(generation_memory_path))
                         self.SaveModuleParameters(
                             brain,
                             str(generation_model_path))
                         self.AtomicJsonSave({
                             "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                             "calibration_id": calibration.calibration_id,
+                            "description_id": brain.robot_description_id,
+                            "model_contract_id": brain.robot_model_contract_id,
+                            "adapter_id": brain.robot_adapter_id,
                             "generation": generation,
                             "model_path": str(generation_model_path.resolve()),
                             "world_memory_path": str(generation_world_path.resolve()),
@@ -3032,7 +3388,8 @@ class ManagerFunction:
                     robot_state_t = self.TensorizeRobotState(
                         robot_state_b,
                         self.device,
-                        batched=True)
+                        batched=True,
+                        robotContract=self.robot_morphology)
                     perception_targets = dict(synthetic_targets_t)
                     perception_targets.update({
                         "rgb": frames,
@@ -3248,7 +3605,8 @@ class ManagerFunction:
                             v_robot_state_t = self.TensorizeRobotState(
                                 robot_state_b,
                                 self.device,
-                                batched=True)
+                                batched=True,
+                                robotContract=self.robot_morphology)
                             v_perception_targets = dict(v_synthetic_targets_t)
                             v_perception_targets.update({
                                 "rgb": v_frames,
@@ -3361,6 +3719,7 @@ class ManagerFunction:
         params = {
             "schema_version": raw["schema_version"],
             "calibration_id": raw["calibration_id"],
+            "model_contract_id": raw["model_contract_id"],
             "brain": raw["brain"],}
         runtime_keys = sorted(
             name for name in params["brain"]
@@ -3414,6 +3773,15 @@ class ManagerFunction:
         if ckpt["calibration_id"] != brain.calibration_id:
             raise ValueError(
                 "training checkpoint calibration_id does not match configured K")
+        if ckpt["description_id"] != brain.robot_description_id:
+            raise ValueError(
+                "training checkpoint description_id does not match the robot")
+        if ckpt["model_contract_id"] != brain.robot_model_contract_id:
+            raise ValueError(
+                "training checkpoint model_contract_id does not match the foundation")
+        if ckpt["adapter_id"] != brain.robot_adapter_id:
+            raise ValueError(
+                "training checkpoint adapter_id does not match the robot")
         if ckpt["world_frame_id"] != dataset.world_frame_id:
             raise ValueError(
                 "training checkpoint world_frame_id does not match the dataset")
@@ -3482,7 +3850,16 @@ class ManagerFunction:
         brain.mem.ValidateDurableState(
             ckpt["memory_durable"],
             expectedBatch=batchSize)
-
+        buffer_state = ckpt["buffers"]
+        if type(buffer_state) is not dict or set(buffer_state) != BRAIN_RUNTIME_BUFFER_FIELDS:
+            raise ValueError(
+                "training checkpoint brain runtime buffer fields are invalid")
+        if (
+            type(buffer_state["schema_version"]) is not int
+            or buffer_state["schema_version"] != BRAIN_RUNTIME_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "training checkpoint brain runtime schema is invalid")
         self.ImportTrainingCheckpointState(
             brain,
             agent,
@@ -3637,32 +4014,46 @@ class ManagerFunction:
 
                 H, W = BasicParameters.IMAGE_SIZE, BasicParameters.IMAGE_SIZE
                 calibration = self.LoadCameraCalibration()
-                sensor_manifest = {
-                    "schema_version": OFFLINE_SENSOR_MANIFEST_SCHEMA_VERSION,
-                    "calibration_id": calibration.calibration_id,
-                    "rgb_encoding": "rgb8",
-                    "depth_unit": "meter",
-                    "depth_representation": "optical_axis_z",
-                    "rgb_depth_alignment": "registered_to_rgb",
-                    "rectification": "rectified",
-                    "synchronization": "synchronized_exposure",
-                    "object_motion_frame": "current_camera_optical",
-                    "object_motion_representation": "se3_spatial_delta",
-                    "object_motion_reference": (
-                        "previous_to_current_after_camera_egomotion_compensation"),
-                    "object_motion_translation_unit": "meter",
-                    "object_motion_quaternion_order": "xyzw",}
+                sensor_manifest = ExpectedOfflineSensorManifest(
+                    calibration.calibration_id,
+                    self.robot_morphology,
+                    calibration.frame_name)
                 (root / "sensor_manifest.json").write_text(
                     json.dumps(sensor_manifest),
                     encoding="utf-8")
 
                 endpoint_pose = np.zeros((
-                    ModuleDim.RobotStateEndpointCount,
+                    self.robot_morphology.endpoint_count,
                     ModuleDim.DecisionEndpointPoseDim), dtype=np.float32)
                 endpoint_pose[..., 6] = 1.0
+                joint_state = np.zeros(
+                    self.robot_morphology.joint_dof_count,
+                    dtype=np.float32)
+                joint_observed = np.ones(
+                    self.robot_morphology.joint_dof_count,
+                    dtype=np.bool_)
+                joint_controllable = (
+                    self.robot_morphology.joint_variable_commandable.cpu().numpy())
+                node_pose = np.zeros(
+                    (self.robot_morphology.node_count, 7),
+                    dtype=np.float32)
+                node_pose[..., 6] = 1.0
+                node_twist = np.zeros(
+                    (self.robot_morphology.node_count, 6),
+                    dtype=np.float32)
+                node_observed = np.zeros(
+                    self.robot_morphology.node_count,
+                    dtype=np.bool_)
+                endpoint_observed = np.ones(
+                    self.robot_morphology.endpoint_count,
+                    dtype=np.bool_)
+                endpoint_controllable = (
+                    self.robot_morphology.endpoint_task_mask.any(
+                        dim=-1).cpu().numpy())
                 base_orientation_world = np.zeros(4, dtype=np.float32)
                 base_orientation_world[3] = 1.0
-                robot_metadata = ExpectedRobotStateWireMetadata()
+                robot_metadata = ExpectedRobotStateWireMetadata(
+                    self.robot_morphology)
 
                 templates = ["move left", "move right", "move forward", "move back",
                             "use skill", "defend", "attack", "pickup item",
@@ -3693,11 +4084,26 @@ class ManagerFunction:
                         "calibration_id": calibration.calibration_id,
                         "world_frame_id": "test_world",
                         **robot_metadata,
+                        "joint_position": joint_state.tolist(),
+                        "joint_velocity": joint_state.tolist(),
+                        "joint_effort": joint_state.tolist(),
+                        "joint_observed": joint_observed.tolist(),
+                        "joint_healthy": joint_observed.tolist(),
+                        "joint_controllable": joint_controllable.tolist(),
+                        "node_pose_world": node_pose.tolist(),
+                        "node_twist_world": node_twist.tolist(),
+                        "node_observed": node_observed.tolist(),
+                        "node_healthy": node_observed.tolist(),
                         "endpoint_pose": endpoint_pose.tolist(),
+                        "endpoint_observed": endpoint_observed.tolist(),
+                        "endpoint_healthy": endpoint_observed.tolist(),
+                        "endpoint_controllable": endpoint_controllable.tolist(),
+                        "observer_pose_world": [
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                        "observer_pose_valid": False,
                         "base_orientation_world": base_orientation_world.tolist(),
                         "gravity_direction_world": [0.0, 0.0, -1.0],
-                        "planner_expected_endpoint_pose": endpoint_pose[
-                            ModuleDim.RobotStateControlledEndpointSlice].tolist(),
+                        "planner_expected_endpoint_pose": endpoint_pose.tolist(),
                         "planner_progress": 0.0,
                         "planner_tracking_error": 0.0,
                         "planner_executing": 0.0,
@@ -4186,6 +4592,10 @@ class ManagerFunction:
             raise
 
 class TestManagerMTool:
+    @staticmethod
+    def MakeRobotMorphology() -> CompiledRobotMorphology:
+        return ManagerFunction.LoadRobotMorphology()
+
     def TestDeploymentConfigurationRouting(self) -> bool:
         try:
             manager = object.__new__(ManagerFunction)
@@ -4365,6 +4775,7 @@ class TestManagerMTool:
             import tempfile as tempfile_module
 
             manager = ManagerFunction.__new__(ManagerFunction)
+            robot_morphology = self.MakeRobotMorphology()
             with tempfile_module.TemporaryDirectory() as directory:
                 root = Path(directory)
                 configured_model = root / "model.pth"
@@ -4374,7 +4785,8 @@ class TestManagerMTool:
                 try:
                     manager.ResolveDeploymentArtifactPaths(
                         configured_model,
-                        calibrationId="calibration-a")
+                        calibrationId="calibration-a",
+                        robotContract=robot_morphology)
                 except FileNotFoundError:
                     missing_manifest_rejected = True
 
@@ -4387,6 +4799,9 @@ class TestManagerMTool:
                 manager.AtomicJsonSave({
                     "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                     "calibration_id": "calibration-a",
+                    "description_id": robot_morphology.description_id,
+                    "model_contract_id": robot_morphology.model_contract_id,
+                    "adapter_id": robot_morphology.adapter_id,
                     "generation": "generation-1",
                     "model_path": str(model),
                     "world_memory_path": str(world),
@@ -4394,12 +4809,14 @@ class TestManagerMTool:
                 }, manager.DeploymentManifestPath(configured_model))
                 resolved = manager.ResolveDeploymentArtifactPaths(
                     configured_model,
-                    calibrationId="calibration-a")
+                    calibrationId="calibration-a",
+                    robotContract=robot_morphology)
                 mismatch_rejected = False
                 try:
                     manager.ResolveDeploymentArtifactPaths(
                         configured_model,
-                        calibrationId="calibration-b")
+                        calibrationId="calibration-b",
+                        robotContract=robot_morphology)
                 except ValueError:
                     mismatch_rejected = True
                 mixed_generation = dict(json.loads(
@@ -4413,7 +4830,8 @@ class TestManagerMTool:
                 try:
                     manager.ResolveDeploymentArtifactPaths(
                         configured_model,
-                        calibrationId="calibration-a")
+                        calibrationId="calibration-a",
+                        robotContract=robot_morphology)
                     mixed_generation_rejected = False
                 except ValueError:
                     mixed_generation_rejected = True
@@ -4457,6 +4875,9 @@ class TestManagerMTool:
                 def __init__(self):
                     super().__init__()
                     self.calibration_id = "test-calibration"
+                    self.robot_description_id = "test-robot"
+                    self.robot_model_contract_id = "test-model-contract"
+                    self.robot_adapter_id = "test-adapter"
                     self.register_buffer("buffer", torch.zeros(2))
                     self.mem = FakeMemory()
 
@@ -4506,6 +4927,9 @@ class TestManagerMTool:
             checkpoint = {
                 "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                 "calibration_id": "test-calibration",
+                "description_id": "test-robot",
+                "model_contract_id": "test-model-contract",
+                "adapter_id": "test-adapter",
                 "world_frame_id": "test-world",
                 "epoch": 3,
                 "next_batch_index": 0,
@@ -4525,7 +4949,9 @@ class TestManagerMTool:
                 "test_indices": [2],
                 "processed_sample_count_total": 9,
                 "rng": manager.CaptureRngState(),
-                "buffers": {},
+                "buffers": {
+                    **{name: None for name in BRAIN_RUNTIME_BUFFER_FIELDS},
+                    "schema_version": BRAIN_RUNTIME_SCHEMA_VERSION,},
                 "world_memory": {"batch_size": 1},
                 "memory_durable": {"batch_size": 1},}
             payload = io.BytesIO()
@@ -4567,6 +4993,26 @@ class TestManagerMTool:
                 extra_rejected = False
             except ValueError:
                 extra_rejected = True
+
+            malformed_buffers = dict(checkpoint)
+            malformed_buffers["buffers"] = dict(checkpoint["buffers"])
+            malformed_buffers["buffers"]["legacy_text_state"] = {
+                "batch_size": 2}
+            events.clear()
+            try:
+                manager.LoadCheckpoint(
+                    FakeBrain(),
+                    FakeAgent(),
+                    dataset,
+                    serialized(malformed_buffers),
+                    batchSize=1,
+                    trainStage="full",
+                    onlineLearning=False)
+                malformed_buffers_rejected_before_load = False
+            except ValueError:
+                malformed_buffers_rejected_before_load = not any(
+                    event.startswith("brain_load")
+                    for event in events)
 
             class FailingOptimizer(FakeOptimizer):
                 def load_state_dict(self, state):
@@ -4637,6 +5083,7 @@ class TestManagerMTool:
                 and resume_state.no_improve == 2
                 and missing_rejected
                 and extra_rejected
+                and malformed_buffers_rejected_before_load
                 and optimizer_error_propagated
                 and rng_error_propagated
                 and mismatch_rejected_before_load)
@@ -4656,6 +5103,8 @@ class TestManagerMTool:
                 def __init__(self):
                     super().__init__()
                     self.calibration_id = "test-calibration"
+                    self.robot_description_id = "test-robot"
+                    self.robot_model_contract_id = "test-model-contract"
                     self.adapter = GrowableLoRALinear(nn.Linear(2, 2))
                     self.adapter.Grow(1)
 
@@ -4675,6 +5124,7 @@ class TestManagerMTool:
             manager.LoadTorchPayload = lambda path: {
                 "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION - 1,
                 "calibration_id": "test-calibration",
+                "model_contract_id": "test-model-contract",
                 "brain": {}}
             old_schema_rejected = False
             try:
@@ -4685,6 +5135,7 @@ class TestManagerMTool:
             manager.LoadTorchPayload = lambda path: {
                 "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                 "calibration_id": "other-calibration",
+                "model_contract_id": "test-model-contract",
                 "brain": {}}
             calibration_mismatch_rejected = False
             try:
@@ -4695,9 +5146,22 @@ class TestManagerMTool:
             manager.LoadTorchPayload = lambda path: {
                 "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                 "calibration_id": "test-calibration",
+                "model_contract_id": "other-model-contract",
+                "brain": {}}
+            model_mismatch_rejected = False
+            try:
+                manager.LoadBrainWeights(brain, "unused.pth")
+            except ValueError:
+                model_mismatch_rejected = True
+
+            manager.LoadTorchPayload = lambda path: {
+                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                "calibration_id": "test-calibration",
+                "model_contract_id": "test-model-contract",
                 "brain": {
                     "adapter.target.weight": torch.randn_like(brain.adapter.target.weight),
-                    "adapter.target.bias": torch.randn_like(brain.adapter.target.bias)}}
+                    "adapter.target.bias": torch.randn_like(brain.adapter.target.bias),
+                    "adapter.topology_count": torch.zeros((), dtype=torch.long)}}
             manager.LoadBrainWeights(
                 brain,
                 "unused.pth",
@@ -4705,6 +5169,7 @@ class TestManagerMTool:
             ok = (
                 old_schema_rejected
                 and calibration_mismatch_rejected
+                and model_mismatch_rejected
                 and events == [
                     "load:False",
                     "reset_candidates",
@@ -4795,14 +5260,26 @@ class TestManagerMTool:
 
     def TestOcrCheckpointStrictContract(self) -> bool:
         caller_rng = None
+        runtime_schema_version = TRAIN_CHECKPOINT_SCHEMA_VERSION
         try:
             import io
+
+            strict_loads: List[Tuple[str, bool]] = []
+
+            class FakeRecognizer(nn.Linear):
+                def load_state_dict(self, state_dict, strict=True):
+                    strict_loads.append(("recognizer", strict))
+                    return super().load_state_dict(state_dict, strict=strict)
 
             class FakeOcrEngine(nn.Module):
                 def __init__(self):
                     super().__init__()
                     self.backbone_weight = nn.Parameter(torch.ones(2))
-                    self.recognizer = nn.Linear(2, 2)
+                    self.recognizer = FakeRecognizer(2, 2)
+
+                def load_state_dict(self, state_dict, strict=True):
+                    strict_loads.append(("ocr", strict))
+                    return super().load_state_dict(state_dict, strict=strict)
 
                 def OcrMetadata(self):
                     return {
@@ -4825,8 +5302,35 @@ class TestManagerMTool:
             engine = FakeOcrEngine()
             optimizer = torch.optim.AdamW(engine.parameters(), lr=1e-3)
             caller_rng = manager.CaptureRngState()
+            globals()["TRAIN_CHECKPOINT_SCHEMA_VERSION"] = (
+                OCR_CHECKPOINT_SCHEMA_VERSION + 1)
+            saved_payloads: Dict[str, Any] = {}
+            manager.AtomicTorchSave = lambda payload, path: saved_payloads.__setitem__(
+                str(path), payload)
+            manager.SaveOCRParameters(engine, "ocr-parameters.pth")
+            manager.SaveOCRRecognizerParameters(
+                engine,
+                "ocr-recognizer-parameters.pth")
+            manager.LoadOCRWeightsIntoEngine(
+                engine,
+                serialized(saved_payloads["ocr-parameters.pth"]))
+            manager.LoadRecognizerWeightsIntoEngine(
+                engine,
+                serialized(saved_payloads["ocr-recognizer-parameters.pth"]))
+            legacy_ocr_parameters = dict(
+                saved_payloads["ocr-parameters.pth"])
+            legacy_ocr_parameters["schema_version"] = 15
+            legacy_recognizer_parameters = dict(
+                saved_payloads["ocr-recognizer-parameters.pth"])
+            legacy_recognizer_parameters["schema_version"] = 15
+            manager.LoadOCRWeightsIntoEngine(
+                engine,
+                serialized(legacy_ocr_parameters))
+            manager.LoadRecognizerWeightsIntoEngine(
+                engine,
+                serialized(legacy_recognizer_parameters))
             checkpoint = {
-                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
                 "epoch": 2,
                 "best_val": 0.25,
                 "ocr": engine.state_dict(),
@@ -4844,6 +5348,15 @@ class TestManagerMTool:
                 optimizer,
                 dataset,
                 serialized(checkpoint),
+                trainDetection=True,
+                trainRecognition=True)
+            legacy_checkpoint = dict(checkpoint)
+            legacy_checkpoint["schema_version"] = 15
+            legacy_restored = manager.LoadOCRCheckpoint(
+                engine,
+                optimizer,
+                dataset,
+                serialized(legacy_checkpoint),
                 trainDetection=True,
                 trainRecognition=True)
 
@@ -4886,11 +5399,22 @@ class TestManagerMTool:
             except ValueError:
                 legacy_parameter_rejected = True
 
+            runtime_schema_parameter = dict(saved_payloads["ocr-parameters.pth"])
+            runtime_schema_parameter["schema_version"] = (
+                TRAIN_CHECKPOINT_SCHEMA_VERSION)
+            try:
+                manager.LoadOCRWeightsIntoEngine(
+                    engine,
+                    serialized(runtime_schema_parameter))
+                runtime_schema_parameter_rejected = False
+            except ValueError:
+                runtime_schema_parameter_rejected = True
+
             recognizer_optimizer = torch.optim.AdamW(
                 engine.recognizer.parameters(),
                 lr=1e-3)
             recognizer_checkpoint = {
-                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
+                "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
                 "epoch": 3,
                 "best_val": 0.1,
                 "recognizer": engine.recognizer.state_dict(),
@@ -4906,15 +5430,41 @@ class TestManagerMTool:
                 recognizer_optimizer,
                 dataset,
                 serialized(recognizer_checkpoint))
+            legacy_recognizer_checkpoint = dict(recognizer_checkpoint)
+            legacy_recognizer_checkpoint["schema_version"] = 15
+            legacy_recognizer_restored = manager.LoadOCRRecognizerCheckpoint(
+                engine,
+                recognizer_optimizer,
+                dataset,
+                serialized(legacy_recognizer_checkpoint))
 
             ok = (
                 restored[0:3] == (2, 0.25, 12)
                 and [list(split.indices) for split in restored[3:]]
                 == [[0, 1], [2, 3], [4, 5]]
                 and recognizer_restored[0:3] == (3, 0.1, 18)
+                and legacy_restored[0:3] == (2, 0.25, 12)
+                and legacy_recognizer_restored[0:3] == (3, 0.1, 18)
                 and missing_rejected
                 and mode_mismatch_rejected
-                and legacy_parameter_rejected)
+                and legacy_parameter_rejected
+                and runtime_schema_parameter_rejected
+                and TRAIN_CHECKPOINT_SCHEMA_VERSION
+                == OCR_CHECKPOINT_SCHEMA_VERSION + 1
+                and saved_payloads["ocr-parameters.pth"]["schema_version"]
+                == OCR_CHECKPOINT_SCHEMA_VERSION
+                and saved_payloads[
+                    "ocr-recognizer-parameters.pth"]["schema_version"]
+                == OCR_CHECKPOINT_SCHEMA_VERSION
+                and strict_loads == [
+                    ("ocr", True),
+                    ("recognizer", True),
+                    ("ocr", True),
+                    ("recognizer", True),
+                    ("ocr", True),
+                    ("ocr", True),
+                    ("recognizer", True),
+                    ("recognizer", True),])
             print(
                 f"Manager OCR strict checkpoint contract "
                 f"{'passed' if ok else 'failed'}")
@@ -4923,6 +5473,7 @@ class TestManagerMTool:
             print(f"Manager OCR strict checkpoint contract error: {e}")
             return False
         finally:
+            globals()["TRAIN_CHECKPOINT_SCHEMA_VERSION"] = runtime_schema_version
             if caller_rng is not None:
                 manager.RestoreRngState(caller_rng)
 
@@ -4963,6 +5514,7 @@ class TestManagerMTool:
         try:
             manager = object.__new__(ManagerFunction)
             manager.device = torch.device("cpu")
+            manager.robot_morphology = self.MakeRobotMorphology()
             manager.camera_calibration_id = "test-camera"
             manager.active_sensor_stream_id = None
             manager.active_world_frame_id = None
@@ -4976,12 +5528,29 @@ class TestManagerMTool:
 
             manager._ForwardValidatedBatch = capture_forward
             endpoint_pose = torch.zeros(
-                ModuleDim.RobotStateEndpointCount,
+                manager.robot_morphology.endpoint_count,
                 ModuleDim.DecisionEndpointPoseDim)
             endpoint_pose[..., 6] = 1.0
-            planner_pose = endpoint_pose[
-                ModuleDim.RobotStateControlledEndpointSlice].clone()
+            planner_pose = endpoint_pose.clone()
             base_orientation_world = torch.tensor([0.0, 0.0, 0.0, 1.0])
+            joint_state = torch.zeros(
+                manager.robot_morphology.joint_dof_count)
+            joint_observed = torch.ones(
+                manager.robot_morphology.joint_dof_count,
+                dtype=torch.bool)
+            node_pose = torch.zeros(
+                manager.robot_morphology.node_count,
+                7)
+            node_pose[..., 6] = 1.0
+            node_twist = torch.zeros(
+                manager.robot_morphology.node_count,
+                6)
+            node_observed = torch.zeros(
+                manager.robot_morphology.node_count,
+                dtype=torch.bool)
+            endpoint_observed = torch.ones(
+                manager.robot_morphology.endpoint_count,
+                dtype=torch.bool)
             robot_packet = {
                 "schema_version": ROBOT_STATE_WIRE_SCHEMA_VERSION,
                 "stream_id": "stream-1",
@@ -4989,17 +5558,27 @@ class TestManagerMTool:
                 "frame_id": "frame-1",
                 "calibration_id": "test-camera",
                 "world_frame_id": "map-v1",
-                "endpoint_names": list(ModuleDim.RobotStateEndpointNames),
-                "controlled_endpoint_names": list(ModuleDim.DecisionEndpointNames),
-                "pose_frame": "world",
-                "pose_convention": "T_world_endpoint",
-                "pose_time_reference": "sensor_frame_exposure",
-                "pose_unit": "meter",
-                "quaternion_order": "xyzw",
-                "pose_handedness": "right_handed",
-                "base_orientation_convention": "q_world_base_xyzw",
-                "gravity_convention": "unit_acceleration_direction_world",
+                **ExpectedRobotStateWireMetadata(manager.robot_morphology),
+                "joint_position": joint_state.tolist(),
+                "joint_velocity": joint_state.tolist(),
+                "joint_effort": joint_state.tolist(),
+                "joint_observed": joint_observed.tolist(),
+                "joint_healthy": joint_observed.tolist(),
+                "joint_controllable": (
+                    manager.robot_morphology.joint_variable_commandable.tolist()),
+                "node_pose_world": node_pose.tolist(),
+                "node_twist_world": node_twist.tolist(),
+                "node_observed": node_observed.tolist(),
+                "node_healthy": node_observed.tolist(),
                 "endpoint_pose": endpoint_pose.tolist(),
+                "endpoint_observed": endpoint_observed.tolist(),
+                "endpoint_healthy": endpoint_observed.tolist(),
+                "endpoint_controllable": (
+                    manager.robot_morphology.endpoint_task_mask.any(
+                        dim=-1).tolist()),
+                "observer_pose_world": [
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                "observer_pose_valid": False,
                 "base_orientation_world": base_orientation_world.tolist(),
                 "gravity_direction_world": [0.0, 0.0, -1.0],
                 "planner_expected_endpoint_pose": planner_pose.tolist(),
@@ -5097,10 +5676,16 @@ class TestManagerMTool:
                 result == "ok"
                 and captured["args"] == (sensor_packet["rgb"], 0.5, 0.0)
                 and tuple(torch.as_tensor(robot_state["endpoint_pose"]).shape)
-                == (1, ModuleDim.RobotStateEndpointCount, ModuleDim.DecisionEndpointPoseDim)
+                == (
+                    1,
+                    manager.robot_morphology.endpoint_count,
+                    ModuleDim.DecisionEndpointPoseDim)
                 and tuple(torch.as_tensor(
                     robot_state["planner_expected_endpoint_pose"]).shape)
-                == (1, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim)
+                == (
+                    1,
+                    manager.robot_morphology.endpoint_count,
+                    ModuleDim.DecisionEndpointPoseDim)
                 and tuple(torch.as_tensor(
                     robot_state["base_orientation_world"]).shape) == (1, 4)
                 and tuple(torch.as_tensor(
@@ -5122,6 +5707,10 @@ class TestManagerMTool:
                     "frame_id": "frame-1",
                     "calibration_id": "test-camera",
                     "world_frame_id": "map-v1",
+                    "description_id": manager.robot_morphology.description_id,
+                    "model_contract_id": (
+                        manager.robot_morphology.model_contract_id),
+                    "adapter_id": manager.robot_morphology.adapter_id,
                 }
                 and duplicate_rejected
                 and gap_rejected
@@ -5138,22 +5727,65 @@ class TestManagerMTool:
 
     def TestRobotStatePhysicalReferenceContract(self) -> bool:
         try:
+            robot_morphology = self.MakeRobotMorphology()
             batch_size = 2
             endpoint_pose = torch.zeros(
                 batch_size,
-                ModuleDim.RobotStateEndpointCount,
+                robot_morphology.endpoint_count,
                 ModuleDim.DecisionEndpointPoseDim)
             endpoint_pose[..., 6] = 1.0
             base_orientation_world = torch.zeros(batch_size, 4)
             base_orientation_world[..., 3] = 1.0
             scalar = torch.zeros(batch_size)
+            joint_state = torch.zeros(
+                batch_size,
+                robot_morphology.joint_dof_count)
+            joint_observed = torch.ones_like(joint_state, dtype=torch.bool)
+            node_pose = torch.zeros(
+                batch_size,
+                robot_morphology.node_count,
+                7)
+            node_pose[..., 6] = 1.0
+            node_twist = torch.zeros(
+                batch_size,
+                robot_morphology.node_count,
+                6)
+            node_observed = torch.zeros(
+                batch_size,
+                robot_morphology.node_count,
+                dtype=torch.bool)
+            endpoint_observed = torch.ones(
+                batch_size,
+                robot_morphology.endpoint_count,
+                dtype=torch.bool)
+            observer_pose_world = torch.zeros(batch_size, 7)
+            observer_pose_world[..., 6] = 1.0
             state = {
+                "joint_position": joint_state,
+                "joint_velocity": joint_state.clone(),
+                "joint_effort": joint_state.clone(),
+                "joint_observed": joint_observed,
+                "joint_healthy": joint_observed.clone(),
+                "joint_controllable": robot_morphology.joint_variable_commandable.unsqueeze(
+                    0).expand(
+                        batch_size, -1).clone(),
+                "node_pose_world": node_pose,
+                "node_twist_world": node_twist,
+                "node_observed": node_observed,
+                "node_healthy": node_observed.clone(),
                 "endpoint_pose": endpoint_pose,
+                "endpoint_observed": endpoint_observed,
+                "endpoint_healthy": endpoint_observed.clone(),
+                "endpoint_controllable": robot_morphology.endpoint_task_mask.any(
+                    dim=-1).unsqueeze(0).expand(
+                        batch_size, -1).clone(),
+                "observer_pose_world": observer_pose_world,
+                "observer_pose_valid": torch.zeros(
+                    batch_size, dtype=torch.bool),
                 "base_orientation_world": base_orientation_world,
                 "gravity_direction_world": torch.tensor(
                     [[0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]),
-                "planner_expected_endpoint_pose": endpoint_pose[
-                    :, ModuleDim.RobotStateControlledEndpointSlice].clone(),
+                "planner_expected_endpoint_pose": endpoint_pose.clone(),
                 "planner_progress": scalar,
                 "planner_tracking_error": scalar,
                 "planner_executing": scalar,
@@ -5164,7 +5796,60 @@ class TestManagerMTool:
             converted = ManagerFunction.TensorizeRobotState(
                 state,
                 torch.device("cpu"),
-                batched=True)
+                batched=True,
+                robotContract=robot_morphology)
+            unbatched_state = {
+                name: value[0]
+                for name, value in state.items()}
+            converted_unbatched = ManagerFunction.TensorizeRobotState(
+                unbatched_state,
+                torch.device("cpu"),
+                batched=False,
+                robotContract=robot_morphology)
+
+            node_state = dict(state)
+            node_state["node_pose_world"] = node_pose.clone()
+            node_state["node_twist_world"] = node_twist.clone()
+            node_state["node_observed"] = node_observed.clone()
+            node_state["node_healthy"] = node_observed.clone()
+            node_state["node_pose_world"][0, 0, 0] = 0.25
+            node_state["node_twist_world"][0, 0, 1] = 0.5
+            node_state["node_observed"][0, 0] = True
+            node_state["node_healthy"][0, 0] = True
+            converted_node_state = ManagerFunction.TensorizeRobotState(
+                node_state,
+                torch.device("cpu"),
+                batched=True,
+                robotContract=robot_morphology)
+
+            observer_morphology = RobotMorphologyModule().FromMoveIt(
+                    BasicParameters.ROBOT_URDF_PATH,
+                    BasicParameters.ROBOT_SRDF_PATH,
+                    {
+                        "sensors": [{
+                            "name": "head_camera",
+                            "type": "rgbd",
+                            "link": "base_link",
+                        }],
+                        "observer": {"sensor": "head_camera"},
+                        "observer_frame_name": "camera_optical",
+                        "observer_calibration_id": "observer-calibration",
+                    })
+            ValidateRobotObserverCalibration(
+                observer_morphology,
+                "observer-calibration",
+                "camera_optical")
+            observer_state = dict(state)
+            observer_state["observer_pose_world"] = observer_pose_world.clone()
+            observer_state["observer_pose_world"][0, :3] = torch.tensor(
+                [0.1, 0.2, 0.3])
+            observer_state["observer_pose_valid"] = torch.tensor(
+                [True, False])
+            converted_observer_state = ManagerFunction.TensorizeRobotState(
+                observer_state,
+                torch.device("cpu"),
+                batched=True,
+                robotContract=observer_morphology)
 
             missing_rejected = False
             missing = dict(state)
@@ -5173,7 +5858,8 @@ class TestManagerMTool:
                 ManagerFunction.TensorizeRobotState(
                     missing,
                     torch.device("cpu"),
-                    batched=True)
+                    batched=True,
+                    robotContract=robot_morphology)
             except ValueError:
                 missing_rejected = True
 
@@ -5185,7 +5871,8 @@ class TestManagerMTool:
                 ManagerFunction.TensorizeRobotState(
                     bad_base,
                     torch.device("cpu"),
-                    batched=True)
+                    batched=True,
+                    robotContract=robot_morphology)
             except ValueError:
                 base_quaternion_rejected = True
 
@@ -5197,7 +5884,8 @@ class TestManagerMTool:
                 ManagerFunction.TensorizeRobotState(
                     bad_gravity,
                     torch.device("cpu"),
-                    batched=True)
+                    batched=True,
+                    robotContract=robot_morphology)
             except ValueError:
                 gravity_rejected = True
 
@@ -5209,7 +5897,8 @@ class TestManagerMTool:
                 ManagerFunction.TensorizeRobotState(
                     bad_bool,
                     torch.device("cpu"),
-                    batched=True)
+                    batched=True,
+                    robotContract=robot_morphology)
             except TypeError:
                 bool_rejected = True
 
@@ -5220,7 +5909,8 @@ class TestManagerMTool:
                 ManagerFunction.TensorizeRobotState(
                     bad_range,
                     torch.device("cpu"),
-                    batched=True)
+                    batched=True,
+                    robotContract=robot_morphology)
             except ValueError:
                 planner_range_rejected = True
 
@@ -5231,7 +5921,8 @@ class TestManagerMTool:
                 ManagerFunction.TensorizeRobotState(
                     bad_flag,
                     torch.device("cpu"),
-                    batched=True)
+                    batched=True,
+                    robotContract=robot_morphology)
             except ValueError:
                 fractional_flag_rejected = True
 
@@ -5243,7 +5934,8 @@ class TestManagerMTool:
                 ManagerFunction.TensorizeRobotState(
                     bad_status,
                     torch.device("cpu"),
-                    batched=True)
+                    batched=True,
+                    robotContract=robot_morphology)
             except ValueError:
                 planner_conflict_rejected = True
 
@@ -5254,33 +5946,167 @@ class TestManagerMTool:
                 ManagerFunction.TensorizeRobotState(
                     bad_action_id,
                     torch.device("cpu"),
-                    batched=True)
+                    batched=True,
+                    robotContract=robot_morphology)
             except ValueError:
                 action_provenance_rejected = True
 
-            sensor_manifest = {
-                "schema_version": OFFLINE_SENSOR_MANIFEST_SCHEMA_VERSION,
-                "calibration_id": "calibration-a",
-                "rgb_encoding": "rgb8",
-                "depth_unit": "meter",
-                "depth_representation": "optical_axis_z",
-                "rgb_depth_alignment": "registered_to_rgb",
-                "rectification": "rectified",
-                "synchronization": "synchronized_exposure",
-                "object_motion_frame": "current_camera_optical",
-                "object_motion_representation": "se3_spatial_delta",
-                "object_motion_reference": (
-                    "previous_to_current_after_camera_egomotion_compensation"),
-                "object_motion_translation_unit": "meter",
-                "object_motion_quaternion_order": "xyzw",}
+            endpoint_shape_rejected = False
+            bad_endpoint_shape = dict(state)
+            bad_endpoint_shape["planner_expected_endpoint_pose"] = (
+                state["planner_expected_endpoint_pose"][:, :-1].clone())
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_endpoint_shape,
+                    torch.device("cpu"),
+                    batched=True,
+                    robotContract=robot_morphology)
+            except ValueError:
+                endpoint_shape_rejected = True
+
+            mask_dtype_rejected = False
+            bad_mask_dtype = dict(state)
+            bad_mask_dtype["joint_observed"] = torch.ones_like(joint_state)
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_mask_dtype,
+                    torch.device("cpu"),
+                    batched=True,
+                    robotContract=robot_morphology)
+            except TypeError:
+                mask_dtype_rejected = True
+
+            invalid_joint_health_rejected = False
+            bad_joint_health = dict(state)
+            bad_joint_health["joint_observed"] = joint_observed.clone()
+            bad_joint_health["joint_healthy"] = joint_observed.clone()
+            bad_joint_health["joint_observed"][0, 0] = False
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_joint_health,
+                    torch.device("cpu"),
+                    batched=True,
+                    robotContract=robot_morphology)
+            except ValueError:
+                invalid_joint_health_rejected = True
+
+            invalid_endpoint_observation_rejected = False
+            bad_endpoint_observation = dict(state)
+            bad_endpoint_observation["endpoint_observed"] = (
+                endpoint_observed.clone())
+            bad_endpoint_observation["endpoint_healthy"] = (
+                endpoint_observed.clone())
+            bad_endpoint_observation["endpoint_observed"][0, 0] = False
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_endpoint_observation,
+                    torch.device("cpu"),
+                    batched=True,
+                    robotContract=robot_morphology)
+            except ValueError:
+                invalid_endpoint_observation_rejected = True
+
+            unavailable_node_pose_rejected = False
+            bad_node_pose = dict(state)
+            bad_node_pose["node_pose_world"] = node_pose.clone()
+            bad_node_pose["node_pose_world"][0, 0, 0] = 1.0
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_node_pose,
+                    torch.device("cpu"),
+                    batched=True,
+                    robotContract=robot_morphology)
+            except ValueError:
+                unavailable_node_pose_rejected = True
+
+            unavailable_node_twist_rejected = False
+            bad_node_twist = dict(state)
+            bad_node_twist["node_twist_world"] = node_twist.clone()
+            bad_node_twist["node_twist_world"][0, 0, 0] = 1.0
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_node_twist,
+                    torch.device("cpu"),
+                    batched=True,
+                    robotContract=robot_morphology)
+            except ValueError:
+                unavailable_node_twist_rejected = True
+
+            invalid_node_observation_rejected = False
+            bad_node_observation = dict(state)
+            bad_node_observation["node_observed"] = node_observed.clone()
+            bad_node_observation["node_healthy"] = node_observed.clone()
+            bad_node_observation["node_healthy"][0, 0] = True
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_node_observation,
+                    torch.device("cpu"),
+                    batched=True,
+                    robotContract=robot_morphology)
+            except ValueError:
+                invalid_node_observation_rejected = True
+
+            absent_observer_valid_rejected = False
+            bad_absent_observer_valid = dict(state)
+            bad_absent_observer_valid["observer_pose_valid"] = torch.tensor(
+                [True, False])
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_absent_observer_valid,
+                    torch.device("cpu"),
+                    batched=True,
+                    robotContract=robot_morphology)
+            except ValueError:
+                absent_observer_valid_rejected = True
+
+            unavailable_observer_pose_rejected = False
+            bad_observer_pose = dict(observer_state)
+            bad_observer_pose["observer_pose_world"] = observer_pose_world.clone()
+            bad_observer_pose["observer_pose_world"][1, 0] = 1.0
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    bad_observer_pose,
+                    torch.device("cpu"),
+                    batched=True,
+                    robotContract=observer_morphology)
+            except ValueError:
+                unavailable_observer_pose_rejected = True
+
+            observer_calibration_rejected = False
+            try:
+                ValidateRobotObserverCalibration(
+                    observer_morphology,
+                    "wrong-calibration",
+                    "camera_optical")
+            except ValueError:
+                observer_calibration_rejected = True
+
+            observer_frame_rejected = False
+            try:
+                ValidateRobotObserverCalibration(
+                    observer_morphology,
+                    "observer-calibration",
+                    "wrong-frame")
+            except ValueError:
+                observer_frame_rejected = True
+
+            sensor_frame_name = "sensor-frame-a"
+            sensor_manifest = ExpectedOfflineSensorManifest(
+                "calibration-a",
+                robot_morphology,
+                sensor_frame_name)
             ValidateOfflineSensorManifest(
                 sensor_manifest,
-                "calibration-a")
+                "calibration-a",
+                robot_morphology,
+                sensor_frame_name)
             calibration_mismatch_rejected = False
             try:
                 ValidateOfflineSensorManifest(
                     sensor_manifest,
-                    "calibration-b")
+                    "calibration-b",
+                    robot_morphology,
+                    sensor_frame_name)
             except ValueError:
                 calibration_mismatch_rejected = True
 
@@ -5290,13 +6116,94 @@ class TestManagerMTool:
             try:
                 ValidateOfflineSensorManifest(
                     wrong_motion_frame,
-                    "calibration-a")
+                    "calibration-a",
+                    robot_morphology,
+                    sensor_frame_name)
             except ValueError:
                 motion_frame_rejected = True
+
+            old_manifest_rejected = False
+            old_manifest = dict(sensor_manifest)
+            old_manifest["schema_version"] = 2
+            try:
+                ValidateOfflineSensorManifest(
+                    old_manifest,
+                    "calibration-a",
+                    robot_morphology,
+                    sensor_frame_name)
+            except ValueError:
+                old_manifest_rejected = True
+
+            ontology_order_rejected = False
+            wrong_ontology_order = dict(sensor_manifest)
+            wrong_ontology_order["entity_realm_names"] = list(reversed(
+                sensor_manifest["entity_realm_names"]))
+            try:
+                ValidateOfflineSensorManifest(
+                    wrong_ontology_order,
+                    "calibration-a",
+                    robot_morphology,
+                    sensor_frame_name)
+            except ValueError:
+                ontology_order_rejected = True
 
             ok = (
                 tuple(converted["base_orientation_world"].shape)
                 == (batch_size, 4)
+                and tuple(converted["endpoint_pose"].shape) == (
+                    batch_size,
+                    robot_morphology.endpoint_count,
+                    ModuleDim.DecisionEndpointPoseDim)
+                and tuple(converted["joint_position"].shape) == (
+                    batch_size,
+                    robot_morphology.joint_dof_count)
+                and tuple(converted["joint_observed"].shape) == (
+                    batch_size,
+                    robot_morphology.joint_dof_count)
+                and tuple(converted["node_pose_world"].shape) == (
+                    batch_size,
+                    robot_morphology.node_count,
+                    7)
+                and tuple(converted["node_twist_world"].shape) == (
+                    batch_size,
+                    robot_morphology.node_count,
+                    6)
+                and tuple(converted["node_observed"].shape) == (
+                    batch_size,
+                    robot_morphology.node_count)
+                and tuple(converted_unbatched["node_pose_world"].shape)
+                == (robot_morphology.node_count, 7)
+                and tuple(converted_unbatched["node_twist_world"].shape)
+                == (robot_morphology.node_count, 6)
+                and tuple(converted_unbatched["observer_pose_world"].shape)
+                == (7,)
+                and tuple(converted_unbatched["observer_pose_valid"].shape)
+                == ()
+                and not bool(converted["node_observed"].any().item())
+                and torch.all(converted["node_pose_world"][..., 6]
+                    == 1.0).item()
+                and torch.count_nonzero(
+                    converted["node_pose_world"][..., :6]).item() == 0
+                and torch.count_nonzero(
+                    converted["node_twist_world"]).item() == 0
+                and converted_node_state["node_observed"][0, 0].item()
+                and converted_node_state["node_pose_world"][0, 0, 0].item()
+                == 0.25
+                and converted_node_state["node_twist_world"][0, 0, 1].item()
+                == 0.5
+                and tuple(converted["observer_pose_world"].shape)
+                == (batch_size, 7)
+                and tuple(converted["observer_pose_valid"].shape)
+                == (batch_size,)
+                and not bool(converted["observer_pose_valid"].any().item())
+                and converted_observer_state["observer_pose_valid"][0].item()
+                and not converted_observer_state[
+                    "observer_pose_valid"][1].item()
+                and torch.allclose(
+                    converted_observer_state["observer_pose_world"][0, :3],
+                    torch.tensor([0.1, 0.2, 0.3]))
+                and observer_morphology.observer_valid
+                and not observer_morphology.observer_controllable
                 and tuple(converted["gravity_direction_world"].shape)
                 == (batch_size, 3)
                 and converted["executed_action_id"].dtype == torch.long
@@ -5308,14 +6215,193 @@ class TestManagerMTool:
                 and fractional_flag_rejected
                 and planner_conflict_rejected
                 and action_provenance_rejected
+                and endpoint_shape_rejected
+                and mask_dtype_rejected
+                and invalid_joint_health_rejected
+                and invalid_endpoint_observation_rejected
+                and unavailable_node_pose_rejected
+                and unavailable_node_twist_rejected
+                and invalid_node_observation_rejected
+                and absent_observer_valid_rejected
+                and unavailable_observer_pose_rejected
+                and observer_calibration_rejected
+                and observer_frame_rejected
+                and robot_morphology.joint_dof_count == 22
+                and not robot_morphology.observer_valid
                 and calibration_mismatch_rejected
-                and motion_frame_rejected)
+                and motion_frame_rejected
+                and old_manifest_rejected
+                and ontology_order_rejected)
             print(
                 f"Manager RobotState physical reference contract "
                 f"{'passed' if ok else 'failed'}")
             return bool(ok)
         except Exception as e:
             print(f"Manager RobotState physical reference contract error: {e}")
+            return False
+
+    def TestVirtualJointStateTensorization(self) -> bool:
+        try:
+            fixed = self.MakeRobotMorphology()
+            variants = {"fixed": fixed}
+            for joint_type in ("planar", "floating"):
+                source = fixed.ToJson()
+                source["srdf"]["virtual_joints"][0]["type"] = joint_type
+                variants[joint_type] = RobotMorphologyModule().FromJson(source)
+
+            def make_state(contract: CompiledRobotMorphology) -> Dict[str, torch.Tensor]:
+                joint_state = torch.arange(
+                    contract.joint_dof_count,
+                    dtype=torch.float32)
+                joint_observed = torch.ones(
+                    contract.joint_dof_count,
+                    dtype=torch.bool)
+                node_pose = torch.zeros(contract.node_count, 7)
+                node_pose[..., 6] = 1.0
+                node_observed = torch.zeros(
+                    contract.node_count,
+                    dtype=torch.bool)
+                endpoint_pose = torch.zeros(
+                    contract.endpoint_count,
+                    ModuleDim.DecisionEndpointPoseDim)
+                endpoint_pose[..., 6] = 1.0
+                endpoint_observed = torch.zeros(
+                    contract.endpoint_count,
+                    dtype=torch.bool)
+                return {
+                    "joint_position": joint_state,
+                    "joint_velocity": joint_state.clone(),
+                    "joint_effort": joint_state.clone(),
+                    "joint_observed": joint_observed,
+                    "joint_healthy": joint_observed.clone(),
+                    "joint_controllable": (
+                        contract.joint_variable_commandable.clone()),
+                    "node_pose_world": node_pose,
+                    "node_twist_world": torch.zeros(contract.node_count, 6),
+                    "node_observed": node_observed,
+                    "node_healthy": node_observed.clone(),
+                    "endpoint_pose": endpoint_pose,
+                    "endpoint_observed": endpoint_observed,
+                    "endpoint_healthy": endpoint_observed.clone(),
+                    "endpoint_controllable": endpoint_observed.clone(),
+                    "observer_pose_world": torch.tensor([
+                        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+                    "observer_pose_valid": torch.tensor(False),
+                    "base_orientation_world": torch.tensor([
+                        0.0, 0.0, 0.0, 1.0]),
+                    "gravity_direction_world": torch.tensor([
+                        0.0, 0.0, -1.0]),
+                    "planner_expected_endpoint_pose": endpoint_pose.clone(),
+                    "planner_progress": torch.tensor(0.0),
+                    "planner_tracking_error": torch.tensor(0.0),
+                    "planner_executing": torch.tensor(0.0),
+                    "planner_reached": torch.tensor(0.0),
+                    "planner_failed": torch.tensor(0.0),
+                    "model_command_executed": torch.tensor(0.0),
+                    "executed_action_id": torch.tensor(0),
+                }
+
+            converted = {
+                name: ManagerFunction.TensorizeRobotState(
+                    make_state(contract),
+                    torch.device("cpu"),
+                    batched=False,
+                    robotContract=contract)
+                for name, contract in variants.items()
+            }
+            floating_state = make_state(variants["floating"])
+            floating_metadata = ExpectedRobotStateWireMetadata(
+                variants["floating"])
+            floating_packet = {
+                "schema_version": ROBOT_STATE_WIRE_SCHEMA_VERSION,
+                "stream_id": "floating-stream",
+                "sequence_index": 0,
+                "frame_id": "floating-frame",
+                "calibration_id": "test-camera",
+                "world_frame_id": "world",
+                **floating_metadata,
+                **{
+                    name: value.tolist()
+                    for name, value in floating_state.items()},
+            }
+            ValidateRobotStateWirePacket(
+                floating_packet,
+                "test-camera",
+                variants["floating"])
+            truncated_packet = dict(floating_packet)
+            truncated_packet["joint_position"] = floating_packet[
+                "joint_position"][1:]
+            truncated_wire_rejected = False
+            try:
+                ValidateRobotStateWirePacket(
+                    truncated_packet,
+                    "test-camera",
+                    variants["floating"])
+            except ValueError:
+                truncated_wire_rejected = True
+            missing_virtual_state = make_state(variants["floating"])
+            for name in (
+                "joint_position",
+                "joint_velocity",
+                "joint_effort",
+                "joint_observed",
+                "joint_healthy",
+                "joint_controllable",
+            ):
+                missing_virtual_state[name] = missing_virtual_state[name][6:]
+            missing_virtual_state_rejected = False
+            try:
+                ManagerFunction.TensorizeRobotState(
+                    missing_virtual_state,
+                    torch.device("cpu"),
+                    batched=False,
+                    robotContract=variants["floating"])
+            except ValueError:
+                missing_virtual_state_rejected = True
+            missing_observer_contract = dict(vars(fixed))
+            missing_observer_contract.pop("observer_attachment_name")
+            missing_observer_contract_rejected = False
+            try:
+                ValidateRobotTensorContract(SimpleNamespace(
+                    **missing_observer_contract))
+            except TypeError:
+                missing_observer_contract_rejected = True
+            ok = (
+                fixed.joint_count == fixed.node_count
+                and fixed.joint_dof_count == 22
+                and variants["planar"].joint_dof_count == 25
+                and variants["floating"].joint_dof_count == 28
+                and len({
+                    fixed.model_contract_id,
+                    variants["planar"].model_contract_id,
+                    variants["floating"].model_contract_id,
+                }) == 3
+                and tuple(converted["fixed"]["joint_position"].shape) == (22,)
+                and tuple(converted["planar"]["joint_position"].shape) == (25,)
+                and tuple(converted["floating"]["joint_position"].shape) == (28,)
+                and floating_metadata["joint_names"][0] == "virtual_joint"
+                and floating_metadata["joint_type"][0]
+                == ModuleDim.RobotJointTypeNames.index("floating")
+                and floating_metadata["joint_parent_node"][0] == -1
+                and floating_metadata["joint_child_node"][0] == 0
+                and floating_metadata["joint_variable_local_index"][:6]
+                == list(range(6))
+                and torch.equal(
+                    converted["floating"]["joint_position"][:6],
+                    torch.arange(6, dtype=torch.float32))
+                and bool(converted["floating"]["joint_observed"][:6].all().item())
+                and bool(converted["floating"]["joint_healthy"][:6].all().item())
+                and not bool(converted["floating"][
+                    "joint_controllable"][:6].any().item())
+                and truncated_wire_rejected
+                and missing_virtual_state_rejected
+                and missing_observer_contract_rejected)
+            print(
+                f"Manager virtual joint state tensorization "
+                f"{'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Manager virtual joint state tensorization error: {e}")
             return False
 
     def TestSingleFramePreprocessContract(self) -> bool:
@@ -5469,6 +6555,7 @@ class TestManagerMTool:
             "OcrCheckpointStrictContract": self.TestOcrCheckpointStrictContract(),
             "SequentialLoaderRejectsEmptyRecurrentSplit": self.TestSequentialLoaderRejectsEmptyRecurrentSplit(),
             "RobotStatePhysicalReferenceContract": self.TestRobotStatePhysicalReferenceContract(),
+            "VirtualJointStateTensorization": self.TestVirtualJointStateTensorization(),
             "CppDecisionWireContract": self.TestCppDecisionWireContract(),
             "SingleFramePreprocessContract": self.TestSingleFramePreprocessContract(),
             "OfflinePreprocessStrictContract": self.TestOfflinePreprocessStrictContract(),}
@@ -5482,6 +6569,10 @@ class AgentHandle:
         self,
         calibration: CameraCalibration,
         *,
+        robotMorphology: Optional[CompiledRobotMorphology] = None,
+        robotUrdfPath: str = BasicParameters.ROBOT_URDF_PATH,
+        robotSrdfPath: str = BasicParameters.ROBOT_SRDF_PATH,
+        robotSemanticPath: Optional[str] = BasicParameters.ROBOT_SEMANTIC_PATH,
         brainParameterPath: str = BasicParameters.MODULEPARAMETER_PATH,
         device: Optional[Union[str, torch.device]] = None,
         seqLen: int = BasicParameters.IMAGE_SEQ_LEN,
@@ -5489,6 +6580,20 @@ class AgentHandle:
         prioritizeExtStr: bool = True,
         saveModuleMessagerOutput: bool = True,):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.robot_morphology = (
+            robotMorphology
+            if robotMorphology is not None
+            else ManagerFunction.LoadRobotMorphology(
+                robotUrdfPath,
+                robotSrdfPath,
+                robotSemanticPath,
+                observerFrameName=calibration.frame_name,
+                observerCalibrationId=calibration.calibration_id))
+        ValidateRobotTensorContract(self.robot_morphology)
+        ValidateRobotObserverCalibration(
+            self.robot_morphology,
+            calibration.calibration_id,
+            calibration.frame_name)
 
         parameter_path = str(brainParameterPath).strip()
         if parameter_path == "":
@@ -5500,13 +6605,15 @@ class AgentHandle:
             resolved_memory_path,
         ) = ManagerFunction.ResolveDeploymentArtifactPaths(
             parameter_path,
-            calibrationId=calibration.calibration_id)
+            calibrationId=calibration.calibration_id,
+            robotContract=self.robot_morphology)
         resolved_path = Path(resolved_model_path)
         if not resolved_path.exists():
             raise FileNotFoundError(f"brain parameter file not found: {resolved_path}")
 
         self.brain = BrainCore(
             calibration=calibration,
+            robotMorphology=self.robot_morphology,
             device=self.device,
             seqLen=seqLen,
             prioritizeExtStr=prioritizeExtStr,

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace, MethodType
 from FunctionTools import AGICoreModule
 from ModuleMessagerManager import ModuleDim
+from RobotMorphologyModule import Realm, Agency
 import numpy as np
 import torch
 import torch.nn as nn
@@ -42,6 +43,28 @@ class MemoryType:
     SRC_REAL: int = 0 
     SRC_IMAGINE: int = 1 
     SRC_MIXED: int = 2
+
+
+def UnknownEpisodicTypeMetadata(
+    realm: torch.Tensor,
+    *,
+    dtype: torch.dtype,) -> Dict[str, torch.Tensor]:
+    B = int(realm.size(0))
+    return {
+        "agency_id": torch.full(
+            (B,), int(Agency.UNKNOWN), device=realm.device, dtype=torch.int8),
+        "motion_layer_prob": torch.zeros(
+            B, 5, device=realm.device, dtype=dtype),
+        "observed_surface_parent_index": torch.full(
+            (B,), -1, device=realm.device, dtype=torch.long),
+        "surface_uv": torch.zeros(
+            B, 2, device=realm.device, dtype=dtype),
+        "surface_uv_confidence": torch.zeros(
+            B, device=realm.device, dtype=dtype),
+        "verification": torch.zeros(
+            B, device=realm.device, dtype=dtype),
+        "content_change": torch.zeros(
+            B, device=realm.device, dtype=dtype),}
 
 
 def SourceConfidence(
@@ -851,6 +874,12 @@ class SemanticLTM(AGICoreModule):
         self.register_buffer("prototype_variance", torch.zeros(B0, capacity, dim))
         self.register_buffer("source", torch.zeros(B0, capacity, dtype=torch.int8))
         self.register_buffer("source_confidence", torch.zeros(B0, capacity))
+        self.register_buffer(
+            "realm",
+            torch.full(
+                (B0, capacity),
+                int(Realm.UNKNOWN),
+                dtype=torch.int8))
         self.register_buffer("filled", torch.zeros(B0, dtype=torch.long))
         self.register_buffer("global_step", torch.zeros(B0, dtype=torch.long))
 
@@ -872,6 +901,9 @@ class SemanticLTM(AGICoreModule):
         self.prototype_variance = self.prototype_variance.new_zeros(B, self.capacity, self.dim)
         self.source = self.source.new_zeros(B, self.capacity)
         self.source_confidence = self.source_confidence.new_zeros(B, self.capacity)
+        self.realm = self.realm.new_full(
+            (B, self.capacity),
+            int(Realm.UNKNOWN))
         self.filled = self.filled.new_zeros(B)
         self.global_step = self.global_step.new_zeros(B)
 
@@ -889,7 +921,9 @@ class SemanticLTM(AGICoreModule):
         source: Optional[torch.Tensor] = None,
         writeMask: Optional[torch.Tensor] = None,
         sourceConfidence: Optional[torch.Tensor] = None,
-        consolidated: bool = False):
+        consolidated: bool = False,
+        *,
+        realm: torch.Tensor):
 
         B = int(key.size(0))
         self.EnsureB(B)
@@ -909,6 +943,9 @@ class SemanticLTM(AGICoreModule):
             match = -1
             if n > 0:
                 similarity = torch.mv(self.keys[b, :n], key[b])
+                similarity = similarity.masked_fill(
+                    self.realm[b, :n] != realm[b],
+                    -torch.inf)
                 best_similarity, best_index = similarity.max(dim=0)
                 if float(best_similarity.item()) >= 0.85:
                     match = int(best_index.item())
@@ -965,6 +1002,7 @@ class SemanticLTM(AGICoreModule):
             self.prototype_variance[b, idx] = 0
             self.source[b, idx] = source[b]
             self.source_confidence[b, idx] = sourceConfidence[b]
+            self.realm[b, idx] = realm[b]
 
     def Retrieve(
         self, 
@@ -1045,6 +1083,36 @@ class EpisodicLTM(AGICoreModule):
         self.register_buffer("touch", torch.zeros(B0, capacity, dtype=torch.long))
         self.register_buffer("source", torch.zeros(B0, capacity, dtype=torch.int8))
         self.register_buffer("source_confidence", torch.zeros(B0, capacity))
+        self.register_buffer(
+            "realm",
+            torch.full(
+                (B0, capacity),
+                int(Realm.UNKNOWN),
+                dtype=torch.int8))
+        self.register_buffer(
+            "agency_id",
+            torch.full(
+                (B0, capacity),
+                int(Agency.UNKNOWN),
+                dtype=torch.int8))
+        self.register_buffer(
+            "motion_layer_prob",
+            torch.zeros(B0, capacity, 5))
+        self.register_buffer(
+            "observed_surface_parent_index",
+            torch.full((B0, capacity), -1, dtype=torch.long))
+        self.register_buffer(
+            "surface_uv",
+            torch.zeros(B0, capacity, 2))
+        self.register_buffer(
+            "surface_uv_confidence",
+            torch.zeros(B0, capacity))
+        self.register_buffer(
+            "verification",
+            torch.zeros(B0, capacity))
+        self.register_buffer(
+            "content_change",
+            torch.zeros(B0, capacity))
         self.register_buffer("episode_id", torch.full((B0, capacity), -1, dtype=torch.long))
         self.register_buffer("event_id", torch.full((B0, capacity), -1, dtype=torch.long))
         self.register_buffer("prev_index", torch.full((B0, capacity), -1, dtype=torch.long))
@@ -1080,6 +1148,22 @@ class EpisodicLTM(AGICoreModule):
         self.touch = self.touch.new_zeros(B, self.capacity)
         self.source = self.source.new_zeros(B, self.capacity)
         self.source_confidence = self.source_confidence.new_zeros(B, self.capacity)
+        self.realm = self.realm.new_full(
+            (B, self.capacity),
+            int(Realm.UNKNOWN))
+        self.agency_id = self.agency_id.new_full(
+            (B, self.capacity),
+            int(Agency.UNKNOWN))
+        self.motion_layer_prob = self.motion_layer_prob.new_zeros(
+            B, self.capacity, 5)
+        self.observed_surface_parent_index = (
+            self.observed_surface_parent_index.new_full(
+                (B, self.capacity), -1))
+        self.surface_uv = self.surface_uv.new_zeros(B, self.capacity, 2)
+        self.surface_uv_confidence = (
+            self.surface_uv_confidence.new_zeros(B, self.capacity))
+        self.verification = self.verification.new_zeros(B, self.capacity)
+        self.content_change = self.content_change.new_zeros(B, self.capacity)
         self.episode_id = self.episode_id.new_full((B, self.capacity), -1)
         self.event_id = self.event_id.new_full((B, self.capacity), -1)
         self.prev_index = self.prev_index.new_full((B, self.capacity), -1)
@@ -1104,7 +1188,10 @@ class EpisodicLTM(AGICoreModule):
         stateKey: Optional[torch.Tensor] = None,
         sourceConfidence: Optional[torch.Tensor] = None,
         episodeId: Optional[torch.Tensor] = None,
-        eventId: Optional[torch.Tensor] = None):
+        eventId: Optional[torch.Tensor] = None,
+        *,
+        realm: torch.Tensor,
+        typedMetadata: Dict[str, torch.Tensor]):
         B = int(key.size(0))
         self.EnsureB(B)
 
@@ -1168,6 +1255,18 @@ class EpisodicLTM(AGICoreModule):
             self.touch[b, idx] = 1
             self.source[b, idx] = source[b]
             self.source_confidence[b, idx] = sourceConfidence[b]
+            self.realm[b, idx] = realm[b]
+            self.agency_id[b, idx] = typedMetadata["agency_id"][b]
+            self.motion_layer_prob[b, idx] = typedMetadata[
+                "motion_layer_prob"][b]
+            self.observed_surface_parent_index[b, idx] = typedMetadata[
+                "observed_surface_parent_index"][b]
+            self.surface_uv[b, idx] = typedMetadata["surface_uv"][b]
+            self.surface_uv_confidence[b, idx] = typedMetadata[
+                "surface_uv_confidence"][b]
+            self.verification[b, idx] = typedMetadata["verification"][b]
+            self.content_change[b, idx] = typedMetadata[
+                "content_change"][b]
             self.episode_id[b, idx] = episodeId[b]
             self.event_id[b, idx] = eventId[b]
             self.prev_index[b, idx] = previous if valid_previous else -1
@@ -1364,7 +1463,11 @@ class EpisodicLTM(AGICoreModule):
         return self.current_episode_id
 
     @torch.no_grad()
-    def VerifyWithRealEvidence(self, key: torch.Tensor, realMask: torch.Tensor):
+    def VerifyWithRealEvidence(
+        self,
+        key: torch.Tensor,
+        realMask: torch.Tensor,
+        realm: torch.Tensor,):
         B = int(key.size(0))
         source_branch_changed = False
         for b in range(B):
@@ -1376,6 +1479,7 @@ class EpisodicLTM(AGICoreModule):
             hypothesis = (
                 (self.source[b, :n] == MemoryType.SRC_IMAGINE)
                 | (self.source[b, :n] == MemoryType.SRC_MIXED))
+            hypothesis = hypothesis & (self.realm[b, :n] == realm[b])
             if not bool(hypothesis.any().item()):
                 continue
             similarity = torch.mv(self.keys[b, :n], key[b]).masked_fill(
@@ -1498,6 +1602,7 @@ class LongTermMemory(AGICoreModule):
         self.semantic.prototype_variance.zero_()
         self.semantic.source.zero_()
         self.semantic.source_confidence.zero_()
+        self.semantic.realm.fill_(int(Realm.UNKNOWN))
         self.semantic.filled.zero_()
         self.semantic.global_step.zero_()
 
@@ -1514,6 +1619,14 @@ class LongTermMemory(AGICoreModule):
         self.episodic.touch.zero_()
         self.episodic.source.zero_()
         self.episodic.source_confidence.zero_()
+        self.episodic.realm.fill_(int(Realm.UNKNOWN))
+        self.episodic.agency_id.fill_(int(Agency.UNKNOWN))
+        self.episodic.motion_layer_prob.zero_()
+        self.episodic.observed_surface_parent_index.fill_(-1)
+        self.episodic.surface_uv.zero_()
+        self.episodic.surface_uv_confidence.zero_()
+        self.episodic.verification.zero_()
+        self.episodic.content_change.zero_()
         self.episodic.episode_id.fill_(-1)
         self.episodic.event_id.fill_(-1)
         self.episodic.prev_index.fill_(-1)
@@ -1787,7 +1900,7 @@ class ObjectUsageBank(AGICoreModule):
 
 class MemoryExtractor(AGICoreModule):
     DURABLE_MEMORY_ARTIFACT_TYPE = "MemoryExtractorDurableMemory"
-    DURABLE_MEMORY_SCHEMA_VERSION = 3
+    DURABLE_MEMORY_SCHEMA_VERSION = 6
     DURABLE_MEMORY_STATE_FIELDS = (
         "time_step",
         "memory_filled",
@@ -1804,6 +1917,7 @@ class MemoryExtractor(AGICoreModule):
         "memory_emotion",
         "memory_source",
         "memory_source_confidence",
+        "memory_realm",
         "memory_reward_abs",
         "episode_id",
         "event_id",
@@ -1821,6 +1935,7 @@ class MemoryExtractor(AGICoreModule):
         "ltm_sem_filled",
         "ltm_sem_source",
         "ltm_sem_source_confidence",
+        "ltm_sem_realm",
         "ltm_epi_global_step",
         "ltm_epi_keys",
         "ltm_epi_state_keys",
@@ -1836,6 +1951,14 @@ class MemoryExtractor(AGICoreModule):
         "ltm_epi_filled",
         "ltm_epi_source",
         "ltm_epi_source_confidence",
+        "ltm_epi_realm",
+        "ltm_epi_agency_id",
+        "ltm_epi_motion_layer_prob",
+        "ltm_epi_observed_surface_parent_index",
+        "ltm_epi_surface_uv",
+        "ltm_epi_surface_uv_confidence",
+        "ltm_epi_verification",
+        "ltm_epi_content_change",
         "ltm_epi_episode_id",
         "ltm_epi_event_id",
         "ltm_epi_prev_index",
@@ -1877,6 +2000,7 @@ class MemoryExtractor(AGICoreModule):
         "previous_intent",
         "previous_object_summary",
         "previous_motion_token",
+        "previous_ontology_context",
         "event_age",
         "has_previous_event",
         "gws_global_step",
@@ -1966,6 +2090,12 @@ class MemoryExtractor(AGICoreModule):
         self.register_buffer("memory_merge_count", torch.zeros(B0, memorySize, dtype=torch.long))
         self.register_buffer("memory_source", torch.zeros(B0, memorySize, dtype=torch.int8))
         self.register_buffer("memory_source_confidence", torch.zeros(B0, memorySize))
+        self.register_buffer(
+            "memory_realm",
+            torch.full(
+                (B0, memorySize),
+                int(Realm.UNKNOWN),
+                dtype=torch.int8))
         self.register_buffer("memory_reward_abs", torch.zeros(B0, memorySize))
         self.register_buffer("memory_version", torch.zeros((), dtype=torch.long))
         self.register_buffer(
@@ -2215,10 +2345,57 @@ class MemoryExtractor(AGICoreModule):
             nn.Linear(64, 1),)
         nn.init.zeros_(self.event_boundary_net[-1].weight)
         nn.init.constant_(self.event_boundary_net[-1].bias, -2.0)
+        self.ontology_feature_dim = (
+            69 + ModuleDim.PstSelfPartSemanticDim)
+        self.ontology_context_encoder = nn.Sequential(
+            nn.LayerNorm(self.ontology_feature_dim),
+            nn.Linear(self.ontology_feature_dim, memoryDim * 2),
+            nn.SiLU(),
+            nn.Linear(memoryDim * 2, memoryDim),
+            nn.LayerNorm(memoryDim),)
+        self.event_ontology_residual = nn.Sequential(
+            nn.LayerNorm(memoryDim * 2),
+            nn.Linear(memoryDim * 2, memoryDim * 2),
+            nn.SiLU(),
+            nn.Linear(memoryDim * 2, memoryDim),)
+        self.event_ontology_gain = nn.Parameter(torch.tensor(-2.944439))
+        self.entity_text_feature_dim = 515
+        self.entity_text_object_encoder = nn.Sequential(
+            nn.LayerNorm(self.entity_text_feature_dim),
+            nn.Linear(self.entity_text_feature_dim, memoryDim * 2),
+            nn.SiLU(),
+            nn.Linear(memoryDim * 2, memoryDim),
+            nn.LayerNorm(memoryDim),)
+        self.entity_text_event_encoder = nn.Sequential(
+            nn.LayerNorm(self.entity_text_feature_dim),
+            nn.Linear(self.entity_text_feature_dim, memoryDim * 2),
+            nn.SiLU(),
+            nn.Linear(memoryDim * 2, memoryDim),
+            nn.LayerNorm(memoryDim),)
+        self.event_text_residual = nn.Sequential(
+            nn.LayerNorm(memoryDim * 2),
+            nn.Linear(memoryDim * 2, memoryDim * 2),
+            nn.SiLU(),
+            nn.Linear(memoryDim * 2, memoryDim),)
+        self.entity_text_object_gain = nn.Parameter(torch.tensor(-2.944439))
+        self.entity_text_event_gain = nn.Parameter(torch.tensor(-2.944439))
+        nn.init.zeros_(self.event_text_residual[-1].weight)
+        nn.init.zeros_(self.event_text_residual[-1].bias)
+        self.ontology_boundary_net = nn.Sequential(
+            nn.Linear(6, 128),
+            nn.SiLU(),
+            nn.Linear(128, 64),
+            nn.SiLU(),
+            nn.Linear(64, 1),)
+        nn.init.zeros_(self.ontology_boundary_net[-1].weight)
+        nn.init.constant_(self.ontology_boundary_net[-1].bias, -2.0)
         self.register_buffer("previous_attention", torch.zeros(B0, inputDim))
         self.register_buffer("previous_intent", torch.zeros(B0, 512))
         self.register_buffer("previous_object_summary", torch.zeros(B0, 512))
         self.register_buffer("previous_motion_token", torch.zeros(B0, 512))
+        self.register_buffer(
+            "previous_ontology_context",
+            torch.zeros(B0, self.ontology_feature_dim))
         self.register_buffer("event_age", torch.zeros(B0, dtype=torch.long))
         self.register_buffer("event_id", torch.zeros(B0, dtype=torch.long))
         self.register_buffer("episode_id", torch.zeros(B0, dtype=torch.long))
@@ -2248,6 +2425,17 @@ class MemoryExtractor(AGICoreModule):
             nn.Linear(inputDim, memoryDim),
             nn.SiLU(),
             nn.Linear(memoryDim, memoryDim),)
+        self.ontology_focus_key = nn.Sequential(
+            nn.LayerNorm(512),
+            nn.Linear(512, memoryDim),
+            nn.SiLU(),
+            nn.Linear(memoryDim, memoryDim),)
+        self.ontology_object_encoder = nn.Sequential(
+            nn.LayerNorm(self.ontology_feature_dim),
+            nn.Linear(self.ontology_feature_dim, memoryDim * 2),
+            nn.SiLU(),
+            nn.Linear(memoryDim * 2, memoryDim),)
+        self.ontology_object_gain = nn.Parameter(torch.tensor(-2.944439))
         self.object_attention_anchor = nn.Linear(
             inputDim,
             memoryDim,
@@ -2297,6 +2485,9 @@ class MemoryExtractor(AGICoreModule):
         self.memory_merge_count = self.memory_merge_count.new_zeros(B, self.memory_size)
         self.memory_source = self.memory_source.new_zeros(B, self.memory_size)
         self.memory_source_confidence = self.memory_source_confidence.new_zeros(B, self.memory_size)
+        self.memory_realm = self.memory_realm.new_full(
+            (B, self.memory_size),
+            int(Realm.UNKNOWN))
         self.memory_reward_abs = self.memory_reward_abs.new_zeros(
             B, self.memory_size)
 
@@ -2313,6 +2504,10 @@ class MemoryExtractor(AGICoreModule):
         self.previous_intent = self.previous_intent.new_zeros(B, 512)
         self.previous_object_summary = self.previous_object_summary.new_zeros(B, 512)
         self.previous_motion_token = self.previous_motion_token.new_zeros(B, 512)
+        self.previous_ontology_context = (
+            self.previous_ontology_context.new_zeros(
+                B,
+                self.ontology_feature_dim))
         self.event_age = self.event_age.new_zeros(B)
         self.event_id = self.event_id.new_zeros(B)
         self.episode_id = self.episode_id.new_zeros(B)
@@ -2553,6 +2748,183 @@ class MemoryExtractor(AGICoreModule):
             self.pattern_usage.mul_(0.995).add_(activity, alpha=0.005)
         return F.normalize(sparse, dim=-1)
 
+    def BuildOntologyObjectContext(
+        self,
+        attended: torch.Tensor,
+        visualState: Any,) -> Dict[str, torch.Tensor]:
+        auxiliary = visualState.Auxiliary
+        realm = auxiliary["RealmProb"]
+        agency = auxiliary["AgencyProb"]
+        motion_layer = auxiliary["MotionLayerProb"]
+        layer_agency = auxiliary["LayerAgencyProb"].flatten(-2)
+        body_membership = auxiliary["BodyMembershipProb"].unsqueeze(-1)
+        self_part = auxiliary["SelfPartSemantic"]
+        physical_interaction = auxiliary[
+            "PhysicalInteractionProb"].unsqueeze(-1)
+        surface_uv = auxiliary["SurfaceUV"]
+        surface_uv_confidence = auxiliary[
+            "SurfaceUVConfidence"].unsqueeze(-1)
+        surface_uv_evidence = surface_uv * surface_uv_confidence
+        verification = auxiliary["VerificationConfidence"].unsqueeze(-1)
+        content_motion = auxiliary["ContentMotionUV"]
+        content_change = auxiliary["ContentChangeProb"].unsqueeze(-1)
+
+        surface_parent = auxiliary["SurfaceParentProb"]
+        surface_parent_summary = torch.stack([
+            surface_parent[..., :-1].amax(dim=-1),
+            surface_parent[..., -1],
+        ], dim=-1)
+        relations = auxiliary["OntologyRelationProb"]
+        outgoing_relations = relations.amax(dim=2)
+        incoming_relations = relations.amax(dim=1)
+
+        object_features = torch.cat([
+            realm,
+            agency,
+            motion_layer,
+            layer_agency,
+            body_membership,
+            self_part,
+            physical_interaction,
+            surface_uv_evidence,
+            surface_uv_confidence,
+            verification,
+            content_motion,
+            content_change,
+            surface_parent_summary,
+            outgoing_relations,
+            incoming_relations,
+        ], dim=-1)
+
+        presence = visualState.Auxiliary["PerceptualPresence"]
+        valid = presence > 0.05
+        any_valid = valid.any(dim=1)
+        query = self.object_query_proj(attended)
+        object_key = self.ontology_focus_key(visualState.ObjectTokens)
+        focus_logits = torch.einsum(
+            "bd,bkd->bk",
+            query,
+            object_key) / math.sqrt(float(self.memory_dim))
+        focus_logits = focus_logits + torch.log(presence + 1e-6)
+        focus_logits = focus_logits.masked_fill(~valid, -torch.inf)
+        focus_logits = torch.where(
+            any_valid.unsqueeze(1),
+            focus_logits,
+            torch.zeros_like(focus_logits))
+        weights = F.softmax(focus_logits, dim=1)
+        weights = torch.where(
+            any_valid.unsqueeze(1),
+            weights,
+            torch.zeros_like(weights))
+        context = torch.einsum("bk,bkd->bd", weights, object_features)
+
+        realm_posterior = torch.einsum("bk,bkr->br", weights, realm)
+        unknown = F.one_hot(
+            torch.full(
+                (attended.size(0),),
+                int(Realm.UNKNOWN),
+                device=attended.device),
+            num_classes=5).to(realm_posterior.dtype)
+        realm_posterior = torch.where(
+            any_valid.unsqueeze(1),
+            realm_posterior,
+            unknown)
+        focused_realm = realm_posterior.argmax(dim=-1).to(torch.int8)
+
+        physical_realm = (
+            realm[..., int(Realm.SELF_BODY)]
+            + realm[..., int(Realm.EXTERNAL_PHYSICAL)])
+        physical_layer = motion_layer[..., 1] + motion_layer[..., 2]
+        physical_motion = torch.einsum(
+            "bk,bk->b",
+            weights,
+            physical_realm * physical_layer)
+        content_change_score = torch.einsum(
+            "bk,bk->b",
+            weights,
+            content_change.squeeze(-1))
+        verification_score = torch.einsum(
+            "bk,bk->b",
+            weights,
+            verification.squeeze(-1))
+        virtual_effect = (
+            realm_posterior[:, int(Realm.VIRTUAL_CONTENT)]
+            + realm_posterior[:, int(Realm.VISUAL_EFFECT)])
+        realm_entropy = -(
+            realm_posterior.clamp_min(1e-8)
+            * realm_posterior.clamp_min(1e-8).log()).sum(dim=-1)
+        realm_entropy = realm_entropy / math.log(5.0)
+        focus_index = weights.argmax(dim=1)
+        batch_index = torch.arange(
+            attended.size(0),
+            device=attended.device)
+        selected_agency = agency[batch_index, focus_index].argmax(
+            dim=-1).to(torch.int8)
+        selected_motion_layer = motion_layer[batch_index, focus_index]
+        selected_parent_class = surface_parent[
+            batch_index,
+            focus_index].argmax(dim=-1)
+        selected_parent = torch.where(
+            any_valid & (selected_parent_class < surface_parent.size(-1) - 1),
+            selected_parent_class,
+            torch.full_like(selected_parent_class, -1))
+        selected_surface_uv = surface_uv[batch_index, focus_index]
+        selected_surface_uv_confidence = surface_uv_confidence[
+            batch_index,
+            focus_index,
+            0]
+        selected_verification = verification[
+            batch_index,
+            focus_index,
+            0]
+        selected_content_change = content_change[
+            batch_index,
+            focus_index,
+            0]
+        selected_agency = torch.where(
+            any_valid,
+            selected_agency,
+            torch.full_like(selected_agency, int(Agency.UNKNOWN)))
+        selected_motion_layer = torch.where(
+            any_valid.unsqueeze(-1),
+            selected_motion_layer,
+            torch.zeros_like(selected_motion_layer))
+        selected_surface_uv = torch.where(
+            any_valid.unsqueeze(-1),
+            selected_surface_uv,
+            torch.zeros_like(selected_surface_uv))
+        selected_surface_uv_confidence = torch.where(
+            any_valid,
+            selected_surface_uv_confidence,
+            torch.zeros_like(selected_surface_uv_confidence))
+        selected_verification = torch.where(
+            any_valid,
+            selected_verification,
+            torch.zeros_like(selected_verification))
+        selected_content_change = torch.where(
+            any_valid,
+            selected_content_change,
+            torch.zeros_like(selected_content_change))
+        return {
+            "object_features": object_features,
+            "weights": weights,
+            "context": context,
+            "realm_posterior": realm_posterior,
+            "realm_id": focused_realm,
+            "physical_motion": physical_motion,
+            "content_change": content_change_score,
+            "verification": verification_score,
+            "virtual_effect": virtual_effect,
+            "realm_entropy": realm_entropy,
+            "episodic_metadata": {
+                "agency_id": selected_agency,
+                "motion_layer_prob": selected_motion_layer,
+                "observed_surface_parent_index": selected_parent,
+                "surface_uv": selected_surface_uv,
+                "surface_uv_confidence": selected_surface_uv_confidence,
+                "verification": selected_verification,
+                "content_change": selected_content_change,},}
+
     def DetectEventBoundary(
         self,
         attended: torch.Tensor,
@@ -2561,8 +2933,9 @@ class MemoryExtractor(AGICoreModule):
         tdError: torch.Tensor,
         risk: torch.Tensor,
         uncertainty: torch.Tensor,
-        confidence: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
-        presence = F.softmax(visualState.SemanticNodes["node_logits"], dim=-1)[..., 1]
+        confidence: torch.Tensor,
+        ontology: Dict[str, torch.Tensor],) -> Tuple[torch.Tensor, torch.Tensor]:
+        presence = visualState.Auxiliary["PerceptualPresence"]
         valid_object = presence > 0.05
         object_weight = presence * valid_object.to(presence.dtype)
         object_summary = torch.einsum(
@@ -2573,7 +2946,7 @@ class MemoryExtractor(AGICoreModule):
             valid_object.any(dim=1, keepdim=True),
             object_summary,
             torch.zeros_like(object_summary))
-        content_change = torch.linalg.vector_norm(
+        attention_change = torch.linalg.vector_norm(
             attended - self.previous_attention, dim=-1) / math.sqrt(self.input_dim)
         intent_change = torch.linalg.vector_norm(
             intentHint - self.previous_intent, dim=-1) / math.sqrt(512.0)
@@ -2585,7 +2958,7 @@ class MemoryExtractor(AGICoreModule):
         prediction_error = torch.linalg.vector_norm(
             visualState.PredErrorToken, dim=-1) / math.sqrt(float(visualState.PredErrorToken.size(-1)))
         features = torch.stack([
-            content_change,
+            attention_change,
             intent_change,
             object_change,
             motion,
@@ -2593,12 +2966,61 @@ class MemoryExtractor(AGICoreModule):
             tdError.abs(),
             risk,
             uncertainty + (1.0 - confidence),], dim=-1)
-        probability = torch.sigmoid(self.event_boundary_net(features).squeeze(-1))
+        learned_probability = torch.sigmoid(
+            self.event_boundary_net(features).squeeze(-1))
+        ontology_delta = torch.linalg.vector_norm(
+            ontology["context"] - self.previous_ontology_context,
+            dim=-1) / math.sqrt(float(self.ontology_feature_dim))
+        ontology_features = torch.stack([
+            ontology_delta,
+            ontology["content_change"],
+            ontology["physical_motion"],
+            ontology["verification"],
+            ontology["virtual_effect"],
+            ontology["realm_entropy"],
+        ], dim=-1)
+        ontology_probability = torch.sigmoid(
+            self.ontology_boundary_net(ontology_features).squeeze(-1))
+        probability = 1.0 - (
+            (1.0 - learned_probability)
+            * (1.0 - ontology_probability))
+        physical_realm = (
+            ontology["realm_posterior"][:, int(Realm.SELF_BODY)]
+            + ontology["realm_posterior"][:, int(Realm.EXTERNAL_PHYSICAL)])
+        screen_dominant = ontology["virtual_effect"] > physical_realm
+        text_change = ontology.get(
+            "text_change",
+            ontology["content_change"].new_zeros(
+                ontology["content_change"].shape))
+        stable_screen_content = (
+            screen_dominant
+            & (ontology["content_change"] < 0.50)
+            & (text_change < 0.50)
+            & (intent_change < 0.35)
+            & (tdError.abs() < 0.60)
+            & (risk < 0.70))
+        probability = torch.where(
+            stable_screen_content,
+            probability * ontology["content_change"],
+            probability)
+        age_boundary = (
+            (self.event_age >= 7)
+            & (
+                (ontology["content_change"] > 0.35)
+                | (ontology["physical_motion"] > 0.50)
+                | (intent_change > 0.35)
+                | ((attention_change > 0.75) & ~screen_dominant)))
+        object_boundary = (
+            (object_change > 0.75)
+            & (~screen_dominant | (ontology["content_change"] > 0.50)))
         heuristic = (
             ~self.has_previous_event
-            | (self.event_age >= 7)
-            | (content_change > 0.75)
-            | (object_change > 0.75)
+            | age_boundary
+            | ((attention_change > 0.75) & ~stable_screen_content)
+            | object_boundary
+            | (ontology["content_change"] > 0.70)
+            | (text_change > 0.70)
+            | ((ontology_delta > 0.50) & ~stable_screen_content)
             | (intent_change > 0.75)
             | (tdError.abs() > 0.60)
             | (risk > 0.70))
@@ -2611,6 +3033,7 @@ class MemoryExtractor(AGICoreModule):
             self.previous_intent.copy_(intentHint)
             self.previous_object_summary.copy_(object_summary)
             self.previous_motion_token.copy_(visualState.MotionToken)
+            self.previous_ontology_context.copy_(ontology["context"])
             self.event_age.copy_(torch.where(boundary, torch.zeros_like(self.event_age), self.event_age + 1))
             self.event_id.add_(boundary.long())
             self.has_previous_event.fill_(True)
@@ -2626,12 +3049,15 @@ class MemoryExtractor(AGICoreModule):
         tdError: torch.Tensor,
         uncertainty: torch.Tensor,
         risk: torch.Tensor,
-        confidence: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
+        confidence: torch.Tensor,
+        ontologyContext: torch.Tensor,
+        entityTextContext: Optional[torch.Tensor] = None,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
         vis = torch.cat([
             visualState.IntegratedFeat,
             visualState.MotionToken,
             visualState.PredErrorToken], dim=-1)
-        raw = self.event_context_proj(torch.cat([
+        base = self.event_context_proj(torch.cat([
             x,
             vis,
             ocrSemantic,
@@ -2641,15 +3067,71 @@ class MemoryExtractor(AGICoreModule):
             uncertainty.view(-1, 1),
             risk.view(-1, 1),
             confidence.view(-1, 1),], dim=-1))
+        ontology_code = self.ontology_context_encoder(ontologyContext)
+        residual = self.event_ontology_residual(torch.cat([
+            base,
+            ontology_code,
+        ], dim=-1))
+        raw = base + 0.25 * torch.sigmoid(
+            self.event_ontology_gain) * residual
+        if entityTextContext is not None:
+            text_code = self.entity_text_event_encoder(entityTextContext)
+            text_residual = self.event_text_residual(torch.cat([
+                raw,
+                text_code,], dim=-1))
+            raw = raw + 0.25 * torch.sigmoid(
+                self.entity_text_event_gain) * text_residual
         return raw, self.PatternSeparate(raw)
+
+    def BuildEntityTextContext(
+        self,
+        visualState: Any,
+        weights: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        auxiliary = visualState.Auxiliary
+        required = (
+            "EntityTextSemantic",
+            "EntityTextConfidence",
+            "EntityTextRevision",
+            "EntityTextChanged",)
+        if any(name not in auxiliary for name in required):
+            B, K = weights.shape
+            return {
+                "context": weights.new_zeros(B, self.entity_text_feature_dim),
+                "object_code": weights.new_zeros(B, K, self.memory_dim),
+                "change": weights.new_zeros(B),}
+        confidence = auxiliary["EntityTextConfidence"].unsqueeze(-1)
+        revision = torch.tanh(
+            auxiliary["EntityTextRevision"].to(weights.dtype).unsqueeze(-1)
+            / 16.0)
+        changed = auxiliary["EntityTextChanged"].to(
+            weights.dtype).unsqueeze(-1)
+        features = torch.cat([
+            auxiliary["EntityTextSemantic"].to(weights.dtype),
+            confidence,
+            revision,
+            changed,], dim=-1)
+        context = torch.einsum("bk,bkd->bd", weights, features)
+        object_code = self.entity_text_object_encoder(features)
+        object_code = object_code * confidence
+        change = torch.einsum(
+            "bk,bk->b",
+            weights,
+            changed.squeeze(-1))
+        return {
+            "context": context,
+            "object_code": object_code,
+            "change": change,}
 
     def BuildEmbodiedMemory(
         self,
         attended: torch.Tensor,
-        visualState: Any,) -> torch.Tensor:
+        visualState: Any,
+        ontologyObjectFeatures: torch.Tensor,
+        entityTextObjectCode: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
         objects = visualState.ObjectTokens
-        presence = F.softmax(
-            visualState.SemanticNodes["node_logits"], dim=-1)[..., 1]
+        presence = visualState.Auxiliary["PerceptualPresence"]
         pose = visualState.SemanticNodes["pose_camera"]
         bbox = visualState.SemanticNodes["bbox_2d"]
         semantic_identity = torch.cat([
@@ -2672,7 +3154,18 @@ class MemoryExtractor(AGICoreModule):
         any_valid = valid.any(dim=1)
         safe_valid = valid.clone()
         safe_valid[~any_valid, 0] = True
-        object_code = self.object_relational_proj(object_input) * valid.unsqueeze(-1)
+        base_object_code = self.object_relational_proj(object_input)
+        ontology_object_code = self.ontology_object_encoder(
+            ontologyObjectFeatures)
+        object_code = (
+            base_object_code
+            + 0.25 * torch.sigmoid(self.ontology_object_gain)
+            * ontology_object_code) * valid.unsqueeze(-1)
+        if entityTextObjectCode is not None:
+            object_code = object_code + (
+                0.25 * torch.sigmoid(self.entity_text_object_gain)
+                * entityTextObjectCode
+                * valid.unsqueeze(-1))
         relational_code, _ = self.object_relation_attention(
             object_code,
             object_code,
@@ -2754,6 +3247,15 @@ class MemoryExtractor(AGICoreModule):
         self.FlushPendingWrites()
         next_pending = []
 
+        ontology = self.BuildOntologyObjectContext(
+            attended_x,
+            visualState)
+        entity_text = self.BuildEntityTextContext(
+            visualState,
+            ontology["weights"])
+        ontology["text_change"] = entity_text["change"]
+        focused_realm = ontology["realm_id"]
+
         x = self.FuseExternalContext(
             attended_x,
             visualState=visualState,
@@ -2783,7 +3285,9 @@ class MemoryExtractor(AGICoreModule):
             tdError=td_memory,
             uncertainty=uncertainty_eff,
             risk=risk_eff,
-            confidence=confidence_eff)
+            confidence=confidence_eff,
+            ontologyContext=ontology["context"],
+            entityTextContext=entity_text["context"])
         _, event_boundary = self.DetectEventBoundary(
             attended_x,
             visualState,
@@ -2791,7 +3295,8 @@ class MemoryExtractor(AGICoreModule):
             td_memory,
             risk_eff,
             uncertainty_eff,
-            confidence_eff)
+            confidence_eff,
+            ontology)
 
         emo_emb = self.emo_write_proj(emotion_eff) # [B, memoryDim]
 
@@ -2869,7 +3374,7 @@ class MemoryExtractor(AGICoreModule):
         mem_state = self.mem_film_norm(mem_recall * s2 + b2) * mem_evidence
 
         next_pending.append(("kv",
-                             (key.detach(),val.detach(),importance_eff.detach(),emotion_eff.detach(),reward_abs_eff.detach(),src_all.detach(),source_reliability.detach(),event_boundary.detach())))
+                             (key.detach(),val.detach(),importance_eff.detach(),emotion_eff.detach(),reward_abs_eff.detach(),src_all.detach(),source_reliability.detach(),focused_realm.detach(),event_boundary.detach())))
 
         gws_val, gws_mod_signal = self.BuildGwsValue(h_new, y_ssm, val, td_memory, risk_eff, confidence_eff) # [B, memoryDim]
 
@@ -2952,7 +3457,11 @@ class MemoryExtractor(AGICoreModule):
                                sem_in.detach(),epi_in.detach(),
                                importance_eff.detach(),td_memory.detach(),reward_eff.detach(),src_all.detach(),
                                uncertainty_eff.detach(),risk_eff.detach(),confidence_eff.detach(),
-                               source_reliability.detach(),event_boundary.detach(),self.episode_id.detach().clone(),self.event_id.detach().clone())))
+                               source_reliability.detach(),focused_realm.detach(),event_boundary.detach(),self.episode_id.detach().clone(),self.event_id.detach().clone(),
+                               {
+                                   name: value.detach()
+                                   for name, value in ontology[
+                                       "episodic_metadata"].items()})))
 
         ltm_fused = self.ltm.fuser(sem_state, epi_state)
         ltm_evidence = 1.0 - (
@@ -2974,7 +3483,11 @@ class MemoryExtractor(AGICoreModule):
         sym_recall = self.sym_mem.Retrieve(Qsym, topK=8) 
 
         sym_vec = self.sym_embed(P_post, sym_recall) # [B, memoryDim]
-        embodied_memory = self.BuildEmbodiedMemory(attended_x, visualState)
+        embodied_memory = self.BuildEmbodiedMemory(
+            attended_x,
+            visualState,
+            ontology["object_features"],
+            entity_text["object_code"])
 
         fused_state = self.fusion(torch.cat([mem_state, gws_state, ltm_fused, sym_vec], dim=-1)) # [B, outputDim]
         embodied_output = self.embodied_output_proj(embodied_memory)
@@ -3052,6 +3565,8 @@ class MemoryExtractor(AGICoreModule):
         source: torch.Tensor, # [B]
         sourceConfidence: torch.Tensor, # [B]
         writeMask: torch.Tensor, # [B]
+        *,
+        realm: torch.Tensor,
         ) -> None:
         B = int(key.size(0))
         M = int(self.memory_size)
@@ -3063,6 +3578,9 @@ class MemoryExtractor(AGICoreModule):
             merge_index = -1
             if n > 0:
                 key_similarity = torch.mv(self.memory_keys[b, :n], key[b])
+                key_similarity = key_similarity.masked_fill(
+                    self.memory_realm[b, :n] != realm[b],
+                    -torch.inf)
                 best_similarity, best_index = key_similarity.max(dim=0)
                 best_value_similarity = F.cosine_similarity(
                     self.memory_values[b, best_index].unsqueeze(0),
@@ -3125,6 +3643,7 @@ class MemoryExtractor(AGICoreModule):
             self.memory_reward_abs[b, idx] = rewardAbs[b]
             self.memory_source[b, idx] = source[b]
             self.memory_source_confidence[b, idx] = sourceConfidence[b]
+            self.memory_realm[b, idx] = realm[b]
             wrote = True
         if wrote:
             self.memory_version.add_(1)
@@ -3141,6 +3660,8 @@ class MemoryExtractor(AGICoreModule):
         tdError: torch.Tensor, # [B]
         reward: torch.Tensor, # [B] [-10, 10]
         sourceLabel: torch.Tensor,
+        realm: torch.Tensor,
+        episodicMetadata: Dict[str, torch.Tensor],
         uncertainty: torch.Tensor,
         risk: torch.Tensor,
         confidence: torch.Tensor,
@@ -3171,14 +3692,19 @@ class MemoryExtractor(AGICoreModule):
 
         epi.VerifyWithRealEvidence(
             keyEpi,
-            (sourceLabel == MemoryType.SRC_REAL) & eventMask)
+            (sourceLabel == MemoryType.SRC_REAL) & eventMask,
+            realm)
 
         probability_real = SourceProbabilityReal(sourceLabel, sourceConfidence)
-        semantic_mask = mask & (probability_real >= 0.55)
+        semantic_mask = (
+            mask
+            & (probability_real >= 0.55)
+            & (realm != int(Realm.VISUAL_EFFECT)))
         sem.Store(
             key=keySem,
             value=valSem,
             score=salience,
+            realm=realm,
             source=sourceLabel,
             writeMask=semantic_mask,
             sourceConfidence=sourceConfidence)
@@ -3187,12 +3713,14 @@ class MemoryExtractor(AGICoreModule):
             value=valEpi,
             reward=reward,
             score=salience,
+            realm=realm,
             source=sourceLabel,
             writeMask=mask,
             stateKey=keyEpiState,
             sourceConfidence=sourceConfidence,
             episodeId=episodeId,
-            eventId=eventId)
+            eventId=eventId,
+            typedMetadata=episodicMetadata)
         self.memory_version.add_(1)
 
     def Retrieve(
@@ -3374,6 +3902,7 @@ class MemoryExtractor(AGICoreModule):
         self.memory_merge_count.copy_(reorder(self.memory_merge_count))
         self.memory_source.copy_(reorder(self.memory_source))
         self.memory_source_confidence.copy_(reorder(self.memory_source_confidence))
+        self.memory_realm.copy_(reorder(self.memory_realm))
         self.memory_reward_abs.copy_(reorder(self.memory_reward_abs))
         self.last_compress_step.copy_(self.time_step)
         self.memory_version.add_(1)
@@ -3412,9 +3941,14 @@ class MemoryExtractor(AGICoreModule):
         vals = torch.gather(epi.vals, 1, idx3)
         src = torch.gather(epi.source, 1, top_idx)
         src_conf = torch.gather(epi.source_confidence, 1, top_idx)
+        realm = torch.gather(epi.realm, 1, top_idx)
         score = top_score.to(dtype=dtype)
         probability_real = SourceProbabilityReal(src, src_conf)
-        keep = torch.isfinite(score) & (score > 0) & (probability_real >= 0.55)
+        keep = (
+            torch.isfinite(score)
+            & (score > 0)
+            & (probability_real >= 0.55)
+            & (realm != int(Realm.VISUAL_EFFECT)))
         if not bool(keep.any().item()):
             return
 
@@ -3423,6 +3957,7 @@ class MemoryExtractor(AGICoreModule):
                 key=keys[:, j],
                 value=vals[:, j],
                 score=score[:, j],
+                realm=realm[:, j],
                 source=src[:, j],
                 writeMask=keep[:, j],
                 sourceConfidence=src_conf[:, j],
@@ -3463,7 +3998,7 @@ class MemoryExtractor(AGICoreModule):
                     writeMask=write_mask)
 
             elif kind == "kv":
-                key, val, imp, emo, rew_abs, src, src_conf, write_mask = payload
+                key, val, imp, emo, rew_abs, src, src_conf, realm, write_mask = payload
                 self.KvWrite(
                     key=key,
                     val=val,
@@ -3472,10 +4007,11 @@ class MemoryExtractor(AGICoreModule):
                     rewardAbs=rew_abs,
                     source=src,
                     sourceConfidence=src_conf,
+                    realm=realm,
                     writeMask=write_mask)
 
             elif kind == "ltm":
-                key_sem, key_epi, key_epi_state, sem, epi, imp, td, rwd, src, unc, risk, conf, src_conf, event_mask, episode_id, event_id = payload
+                key_sem, key_epi, key_epi_state, sem, epi, imp, td, rwd, src, unc, risk, conf, src_conf, realm, event_mask, episode_id, event_id, episodic_metadata = payload
                 self.LtmOnlineStore(
                     keySem=key_sem,
                     keyEpi=key_epi,
@@ -3486,6 +4022,8 @@ class MemoryExtractor(AGICoreModule):
                     tdError=td,
                     reward=rwd,
                     sourceLabel=src,
+                    realm=realm,
+                    episodicMetadata=episodic_metadata,
                     uncertainty=unc,
                     risk=risk,
                     confidence=conf,
@@ -3516,7 +4054,7 @@ class MemoryExtractor(AGICoreModule):
                     done,
                     torch.maximum(fields[2], torch.ones_like(fields[2])),
                     fields[2])
-                fields[7] = fields[7] | done
+                fields[8] = fields[8] | done
                 payload = tuple(fields)
             elif kind == "gws":
                 fields = list(payload)
@@ -3532,20 +4070,20 @@ class MemoryExtractor(AGICoreModule):
                     done,
                     torch.maximum(fields[5], torch.full_like(fields[5], 1.5)),
                     fields[5])
-                already_an_event = fields[13]
+                already_an_event = fields[14]
                 allocate_terminal_event = done & ~already_an_event
                 next_event_id = torch.maximum(
-                    fields[15],
+                    fields[16],
                     self.event_id) + 1
-                fields[15] = torch.where(
+                fields[16] = torch.where(
                     allocate_terminal_event,
                     next_event_id,
-                    fields[15])
+                    fields[16])
                 self.event_id.copy_(torch.where(
                     allocate_terminal_event,
                     next_event_id,
-                    torch.maximum(self.event_id, fields[15])))
-                fields[13] = fields[13] | done
+                    torch.maximum(self.event_id, fields[16])))
+                fields[14] = fields[14] | done
                 payload = tuple(fields)
             elif kind == "ns":
                 fields = list(payload)
@@ -3582,6 +4120,7 @@ class MemoryExtractor(AGICoreModule):
         self.previous_intent.zero_()
         self.previous_object_summary.zero_()
         self.previous_motion_token.zero_()
+        self.previous_ontology_context.zero_()
         self.event_age.zero_()
         self.event_id.zero_()
         next_episode = self.ltm.episodic.StartNewEpisode(done)
@@ -3616,6 +4155,7 @@ class MemoryExtractor(AGICoreModule):
         self.previous_intent[done] = 0
         self.previous_object_summary[done] = 0
         self.previous_motion_token[done] = 0
+        self.previous_ontology_context[done] = 0
         self.event_age[done] = 0
         self.event_id[done] = 0
         self.has_previous_event[done] = False
@@ -3639,6 +4179,7 @@ class MemoryExtractor(AGICoreModule):
         self.memory_emotion.zero_()
         self.memory_source.zero_()
         self.memory_source_confidence.zero_()
+        self.memory_realm.fill_(int(Realm.UNKNOWN))
         self.memory_reward_abs.zero_()
         self.merged_delta_signature.fill_(-1)
 
@@ -3657,6 +4198,7 @@ class MemoryExtractor(AGICoreModule):
         self.previous_intent.zero_()
         self.previous_object_summary.zero_()
         self.previous_motion_token.zero_()
+        self.previous_ontology_context.zero_()
         self.event_age.zero_()
         self.event_id.zero_()
         self.episode_id.zero_()
@@ -3745,6 +4287,7 @@ class MemoryExtractor(AGICoreModule):
             "memory_emotion": self.memory_emotion,
             "memory_source": self.memory_source,
             "memory_source_confidence": self.memory_source_confidence,
+            "memory_realm": self.memory_realm,
             "memory_reward_abs": self.memory_reward_abs,
             "episode_id": self.episode_id,
             "event_id": self.event_id,
@@ -3762,6 +4305,7 @@ class MemoryExtractor(AGICoreModule):
             "ltm_sem_filled": sem.filled,
             "ltm_sem_source": sem.source,
             "ltm_sem_source_confidence": sem.source_confidence,
+            "ltm_sem_realm": sem.realm,
             "ltm_epi_global_step": epi.global_step,
             "ltm_epi_keys": epi.keys,
             "ltm_epi_state_keys": epi.state_keys,
@@ -3777,6 +4321,15 @@ class MemoryExtractor(AGICoreModule):
             "ltm_epi_filled": epi.filled,
             "ltm_epi_source": epi.source,
             "ltm_epi_source_confidence": epi.source_confidence,
+            "ltm_epi_realm": epi.realm,
+            "ltm_epi_agency_id": epi.agency_id,
+            "ltm_epi_motion_layer_prob": epi.motion_layer_prob,
+            "ltm_epi_observed_surface_parent_index": (
+                epi.observed_surface_parent_index),
+            "ltm_epi_surface_uv": epi.surface_uv,
+            "ltm_epi_surface_uv_confidence": epi.surface_uv_confidence,
+            "ltm_epi_verification": epi.verification,
+            "ltm_epi_content_change": epi.content_change,
             "ltm_epi_episode_id": epi.episode_id,
             "ltm_epi_event_id": epi.event_id,
             "ltm_epi_prev_index": epi.prev_index,
@@ -3850,6 +4403,7 @@ class MemoryExtractor(AGICoreModule):
             "memory_emotion": (batch_size, self.memory_size, self.emotion_dim),
             "memory_source": (batch_size, self.memory_size),
             "memory_source_confidence": (batch_size, self.memory_size),
+            "memory_realm": (batch_size, self.memory_size),
             "memory_reward_abs": (batch_size, self.memory_size),
             "episode_id": (batch_size,),
             "event_id": (batch_size,),
@@ -3867,6 +4421,7 @@ class MemoryExtractor(AGICoreModule):
             "ltm_sem_filled": (batch_size,),
             "ltm_sem_source": (batch_size, self.ltm.semantic.capacity),
             "ltm_sem_source_confidence": (batch_size, self.ltm.semantic.capacity),
+            "ltm_sem_realm": (batch_size, self.ltm.semantic.capacity),
             "ltm_epi_global_step": (batch_size,),
             "ltm_epi_keys": (batch_size, self.ltm.episodic.capacity, self.memory_dim),
             "ltm_epi_state_keys": (batch_size, self.ltm.episodic.capacity, self.memory_dim),
@@ -3882,6 +4437,18 @@ class MemoryExtractor(AGICoreModule):
             "ltm_epi_filled": (batch_size,),
             "ltm_epi_source": (batch_size, self.ltm.episodic.capacity),
             "ltm_epi_source_confidence": (batch_size, self.ltm.episodic.capacity),
+            "ltm_epi_realm": (batch_size, self.ltm.episodic.capacity),
+            "ltm_epi_agency_id": (batch_size, self.ltm.episodic.capacity),
+            "ltm_epi_motion_layer_prob": (
+                batch_size, self.ltm.episodic.capacity, 5),
+            "ltm_epi_observed_surface_parent_index": (
+                batch_size, self.ltm.episodic.capacity),
+            "ltm_epi_surface_uv": (
+                batch_size, self.ltm.episodic.capacity, 2),
+            "ltm_epi_surface_uv_confidence": (
+                batch_size, self.ltm.episodic.capacity),
+            "ltm_epi_verification": (batch_size, self.ltm.episodic.capacity),
+            "ltm_epi_content_change": (batch_size, self.ltm.episodic.capacity),
             "ltm_epi_episode_id": (batch_size, self.ltm.episodic.capacity),
             "ltm_epi_event_id": (batch_size, self.ltm.episodic.capacity),
             "ltm_epi_prev_index": (batch_size, self.ltm.episodic.capacity),
@@ -3937,6 +4504,59 @@ class MemoryExtractor(AGICoreModule):
                 raise ValueError(
                     f"durable-memory field {field} is outside its capacity")
 
+        realm_fields = (
+            ("memory_realm", "memory_filled"),
+            ("ltm_sem_realm", "ltm_sem_filled"),
+            ("ltm_epi_realm", "ltm_epi_filled"),)
+        for realm_field, filled_field in realm_fields:
+            values = state[realm_field]
+            slots = torch.arange(
+                values.size(1),
+                device=values.device).view(1, -1)
+            valid = slots < state[filled_field].view(-1, 1)
+            invalid_realm = (
+                (values < int(Realm.SELF_BODY))
+                | (values > int(Realm.UNKNOWN)))
+            if bool((invalid_realm & valid).any().item()):
+                raise ValueError(
+                    f"durable-memory field {realm_field} contains an "
+                    "invalid entity realm")
+
+        epi_slots = torch.arange(
+            self.ltm.episodic.capacity,
+            device=state["ltm_epi_filled"].device).view(1, -1)
+        epi_valid = epi_slots < state["ltm_epi_filled"].view(-1, 1)
+        agency_id = state["ltm_epi_agency_id"]
+        if bool((epi_valid & (
+            (agency_id < int(Agency.SELF_CAUSED))
+            | (agency_id > int(Agency.UNKNOWN))
+        )).any().item()):
+            raise ValueError("durable episodic agency_id is invalid")
+        observed_parent = state[
+            "ltm_epi_observed_surface_parent_index"]
+        if bool((epi_valid & (observed_parent < -1)).any().item()):
+            raise ValueError(
+                "durable episodic observed surface-parent index is invalid")
+        for field in (
+            "ltm_epi_motion_layer_prob",
+            "ltm_epi_surface_uv_confidence",
+            "ltm_epi_verification",
+            "ltm_epi_content_change",):
+            value = state[field]
+            valid = epi_valid.unsqueeze(-1) if value.dim() == 3 else epi_valid
+            if bool((valid & (
+                ~torch.isfinite(value)
+                | (value < 0.0)
+                | (value > 1.0)
+            )).any().item()):
+                raise ValueError(
+                    f"durable episodic field {field} is not a probability")
+        if bool((
+            epi_valid.unsqueeze(-1)
+            & ~torch.isfinite(state["ltm_epi_surface_uv"])
+        ).any().item()):
+            raise ValueError("durable episodic surface_uv is not finite")
+
     @torch.no_grad()
     def ImportDurableState(self, state: Dict[str, torch.Tensor]) -> None:
         self.ValidateDurableState(state)
@@ -3958,6 +4578,7 @@ class MemoryExtractor(AGICoreModule):
         self.previous_intent.zero_()
         self.previous_object_summary.zero_()
         self.previous_motion_token.zero_()
+        self.previous_ontology_context.zero_()
         self.event_age.zero_()
         self.has_previous_event.zero_()
         self.last_compress_step.copy_(self.time_step)
@@ -4059,6 +4680,7 @@ class MemoryExtractor(AGICoreModule):
             meta["kv"] = {
                 "score": GatherMeta(scores, idx, self.memory_steps),
                 "source": GatherMeta(self.memory_source.float(), idx, self.memory_steps),
+                "realm": GatherMeta(self.memory_realm.float(), idx, self.memory_steps),
                 "confidence": GatherMeta(self.memory_source_confidence, idx, self.memory_steps),
                 "age": GatherMeta(age, idx, self.memory_steps),
                 "touch": GatherMeta(self.memory_touch.float(), idx, self.memory_steps),
@@ -4081,6 +4703,7 @@ class MemoryExtractor(AGICoreModule):
             meta["ltm_sem"] = {
                 "score": GatherMeta(scores, idx, sem.step),
                 "source": GatherMeta(sem.source.float(), idx, sem.step),
+                "realm": GatherMeta(sem.realm.float(), idx, sem.step),
                 "confidence": GatherMeta(sem.source_confidence, idx, sem.step),
                 "age": GatherMeta(age, idx, sem.step),
                 "touch": GatherMeta(sem.touch.float(), idx, sem.step),
@@ -4103,6 +4726,23 @@ class MemoryExtractor(AGICoreModule):
             meta["ltm_epi"] = {
                 "score": GatherMeta(scores, idx, epi.step),
                 "source": GatherMeta(epi.source.float(), idx, epi.step),
+                "realm": GatherMeta(epi.realm.float(), idx, epi.step),
+                "agency_id": GatherMeta(
+                    epi.agency_id.float(), idx, epi.step),
+                "motion_layer_prob": GatherTopkLatestFirst(
+                    epi.motion_layer_prob, idx, epi.step),
+                "observed_surface_parent_index": GatherMeta(
+                    epi.observed_surface_parent_index.float(),
+                    idx,
+                    epi.step),
+                "surface_uv": GatherTopkLatestFirst(
+                    epi.surface_uv, idx, epi.step),
+                "surface_uv_confidence": GatherMeta(
+                    epi.surface_uv_confidence, idx, epi.step),
+                "verification": GatherMeta(
+                    epi.verification, idx, epi.step),
+                "content_change": GatherMeta(
+                    epi.content_change, idx, epi.step),
                 "confidence": GatherMeta(epi.source_confidence, idx, epi.step),
                 "age": GatherMeta(age, idx, epi.step),
                 "touch": GatherMeta(epi.touch.float(), idx, epi.step),
@@ -4134,6 +4774,77 @@ class MemoryExtractor(AGICoreModule):
         if includeMeta and meta:
             out["meta"] = meta
         return out
+
+    def ExportConsciousBank(
+        self,
+        topk: int = 1024,
+    ) -> Dict[str, torch.Tensor]:
+        B = int(self.memory_filled.size(0))
+        budget = max(0, int(topk))
+        if budget == 0:
+            return {
+                "tokens": torch.zeros(
+                    B, 0, self.memory_dim,
+                    device=self.device, dtype=self.dtype),
+                "valid": torch.zeros(
+                    B, 0,
+                    device=self.device, dtype=torch.bool),}
+        bank = self.ExportMemoryBank(
+            topk=budget,
+            perTypeBudget={
+                name: budget
+                for name in ("gws", "kv", "ltm_sem", "ltm_epi", "sym")},
+            includeMeta=True)
+        if bank is None:
+            return {
+                "tokens": torch.zeros(
+                    B, 0, self.memory_dim,
+                    device=self.device, dtype=self.dtype),
+                "valid": torch.zeros(
+                    B, 0,
+                    device=self.device, dtype=torch.bool),}
+        tokens: List[torch.Tensor] = []
+        valid: List[torch.Tensor] = []
+        scores: List[torch.Tensor] = []
+        for name in ("gws", "kv", "ltm_sem", "ltm_epi", "sym"):
+            if name not in bank:
+                continue
+            value = bank[name]
+            if name == "sym":
+                value = self.sym_embed(value)
+            if value.size(-1) != self.memory_dim:
+                raise RuntimeError(
+                    f"memory conscious token {name!r} has invalid width "
+                    f"{value.size(-1)}")
+            tokens.append(value)
+            item_valid = bank[f"{name}_valid"]
+            valid.append(item_valid)
+            scores.append(
+                bank["meta"][name]["score"].masked_fill(
+                    ~item_valid, -torch.inf))
+        if not tokens:
+            return {
+                "tokens": torch.zeros(
+                    B, 0, self.memory_dim,
+                    device=self.device, dtype=self.dtype),
+                "valid": torch.zeros(
+                    B, 0,
+                    device=self.device, dtype=torch.bool),}
+        merged_tokens = torch.cat(tokens, dim=1)
+        merged_valid = torch.cat(valid, dim=1)
+        merged_scores = torch.cat(scores, dim=1)
+        count = min(budget, int(merged_tokens.size(1)))
+        _, indices = torch.topk(merged_scores, k=count, dim=1)
+        merged_tokens = torch.gather(
+            merged_tokens,
+            1,
+            indices.unsqueeze(-1).expand(B, count, self.memory_dim))
+        merged_valid = torch.gather(merged_valid, 1, indices)
+        merged_tokens = merged_tokens * merged_valid.unsqueeze(-1).to(
+            merged_tokens.dtype)
+        return {
+            "tokens": merged_tokens,
+            "valid": merged_valid,}
     
 
     @torch.no_grad()
@@ -4150,6 +4861,7 @@ class MemoryExtractor(AGICoreModule):
             "previous_intent": self.previous_intent.detach().clone(),
             "previous_object_summary": self.previous_object_summary.detach().clone(),
             "previous_motion_token": self.previous_motion_token.detach().clone(),
+            "previous_ontology_context": self.previous_ontology_context.detach().clone(),
             "event_age": self.event_age.detach().clone(),
             "has_previous_event": self.has_previous_event.detach().clone(),
             "gws_global_step": self.gws.global_step.detach().clone(),
@@ -4225,6 +4937,12 @@ class MemoryExtractor(AGICoreModule):
         state["memory_merge_count"] = torch.gather(state["memory_merge_count"], 1, idx) * new_valid.long()
         state["memory_source"] = torch.where(new_valid,torch.gather(state["memory_source"], 1, idx),torch.zeros_like(state["memory_source"]),)
         state["memory_source_confidence"] = torch.gather(state["memory_source_confidence"], 1, idx) * new_valid.float()
+        state["memory_realm"] = torch.where(
+            new_valid,
+            torch.gather(state["memory_realm"], 1, idx),
+            torch.full_like(
+                state["memory_realm"],
+                int(Realm.UNKNOWN)))
         state["memory_reward_abs"] = torch.gather(state["memory_reward_abs"], 1, idx) * new_valid.float()
 
         state["memory_filled"] = keep_cnt # [B]
@@ -4262,6 +4980,12 @@ class MemoryExtractor(AGICoreModule):
             state["ltm_sem_prototype_variance"], 1, idxS3) * new_validS.unsqueeze(-1).float()
         state["ltm_sem_source"] = torch.where(new_validS,torch.gather(state["ltm_sem_source"], 1, idxS),torch.zeros_like(state["ltm_sem_source"]),)
         state["ltm_sem_source_confidence"] = torch.gather(state["ltm_sem_source_confidence"], 1, idxS) * new_validS.float()
+        state["ltm_sem_realm"] = torch.where(
+            new_validS,
+            torch.gather(state["ltm_sem_realm"], 1, idxS),
+            torch.full_like(
+                state["ltm_sem_realm"],
+                int(Realm.UNKNOWN)))
         state["ltm_sem_filled"] = keepS
 
         CapE = int(epi.capacity)
@@ -4308,6 +5032,45 @@ class MemoryExtractor(AGICoreModule):
         state["ltm_epi_next_generation"].fill_(-1)
         state["ltm_epi_last_event_index"].fill_(-1)
         state["ltm_epi_source"] = torch.where(new_validE,torch.gather(state["ltm_epi_source"], 1, idxEpi),torch.zeros_like(state["ltm_epi_source"]),)
+        state["ltm_epi_realm"] = torch.where(
+            new_validE,
+            torch.gather(state["ltm_epi_realm"], 1, idxEpi),
+            torch.full_like(
+                state["ltm_epi_realm"],
+                int(Realm.UNKNOWN)))
+        state["ltm_epi_agency_id"] = torch.where(
+            new_validE,
+            torch.gather(state["ltm_epi_agency_id"], 1, idxEpi),
+            torch.full_like(
+                state["ltm_epi_agency_id"],
+                int(Agency.UNKNOWN)))
+        state["ltm_epi_observed_surface_parent_index"] = torch.where(
+            new_validE,
+            torch.gather(
+                state["ltm_epi_observed_surface_parent_index"],
+                1,
+                idxEpi),
+            torch.full_like(
+                state["ltm_epi_observed_surface_parent_index"],
+                -1))
+        idxE5 = idxEpi.unsqueeze(-1).expand(B, CapE, 5)
+        idxE2 = idxEpi.unsqueeze(-1).expand(B, CapE, 2)
+        state["ltm_epi_motion_layer_prob"] = torch.gather(
+            state["ltm_epi_motion_layer_prob"],
+            1,
+            idxE5) * new_validE.unsqueeze(-1)
+        state["ltm_epi_surface_uv"] = torch.gather(
+            state["ltm_epi_surface_uv"],
+            1,
+            idxE2) * new_validE.unsqueeze(-1)
+        for field in (
+            "ltm_epi_surface_uv_confidence",
+            "ltm_epi_verification",
+            "ltm_epi_content_change",):
+            state[field] = torch.gather(
+                state[field],
+                1,
+                idxEpi) * new_validE
         state["ltm_epi_filled"] = keepE
 
         cap_sym = int(sym.capacity)
@@ -4409,6 +5172,7 @@ class MemoryExtractor(AGICoreModule):
             "memory_merge_count",
             "memory_source",
             "memory_source_confidence",
+            "memory_realm",
             "memory_reward_abs",):
             require_shape(state[field].shape == (B_src, M_src), f"{field} must be [B,M]")
         require_shape(
@@ -4432,7 +5196,8 @@ class MemoryExtractor(AGICoreModule):
             "ltm_sem_consolidation_count",
             "ltm_sem_prototype_count",
             "ltm_sem_source",
-            "ltm_sem_source_confidence",):
+            "ltm_sem_source_confidence",
+            "ltm_sem_realm",):
             require_shape(state[field].shape == (B_src, C_sem), f"{field} must be [B,C]")
         require_shape(
             state["ltm_sem_prototype_variance"].shape == sem_keys.shape,
@@ -4455,10 +5220,21 @@ class MemoryExtractor(AGICoreModule):
             "ltm_epi_step", "ltm_epi_last_access_step",
             "ltm_epi_last_rehearsal_step", "ltm_epi_consolidation_count",
             "ltm_epi_touch", "ltm_epi_source", "ltm_epi_source_confidence",
+            "ltm_epi_realm",
+            "ltm_epi_agency_id",
+            "ltm_epi_observed_surface_parent_index",
+            "ltm_epi_surface_uv_confidence", "ltm_epi_verification",
+            "ltm_epi_content_change",
             "ltm_epi_episode_id", "ltm_epi_event_id", "ltm_epi_prev_index",
             "ltm_epi_next_index", "ltm_epi_slot_generation",
             "ltm_epi_prev_generation", "ltm_epi_next_generation",):
             require_shape(state[field].shape == (B_src, C_epi), f"{field} must be [B,C]")
+        require_shape(
+            state["ltm_epi_motion_layer_prob"].shape == (B_src, C_epi, 5),
+            "ltm_epi_motion_layer_prob must be [B,C,5]")
+        require_shape(
+            state["ltm_epi_surface_uv"].shape == (B_src, C_epi, 2),
+            "ltm_epi_surface_uv must be [B,C,2]")
         for field in ("ltm_epi_last_event_index", "ltm_epi_current_episode_id"):
             require_shape(state[field].shape == (B_src,), f"{field} must be [B]")
         require_shape(
@@ -4491,6 +5267,56 @@ class MemoryExtractor(AGICoreModule):
             if bool(((filled < 0) | (filled > capacity)).any().item()):
                 raise ValueError(
                     f"{field} is outside the source memory capacity")
+
+        for realm_field, filled_field in (
+            ("memory_realm", "memory_filled"),
+            ("ltm_sem_realm", "ltm_sem_filled"),
+            ("ltm_epi_realm", "ltm_epi_filled"),):
+            values = state[realm_field]
+            slots = torch.arange(
+                values.size(1),
+                device=values.device).view(1, -1)
+            valid = slots < state[filled_field].view(-1, 1)
+            invalid = (
+                (values < int(Realm.SELF_BODY))
+                | (values > int(Realm.UNKNOWN)))
+            if bool((invalid & valid).any().item()):
+                raise ValueError(
+                    f"{realm_field} contains an invalid entity realm")
+
+        epi_slots = torch.arange(
+            C_epi,
+            device=state["ltm_epi_filled"].device).view(1, C_epi)
+        epi_valid = epi_slots < state["ltm_epi_filled"].view(-1, 1)
+        agency_id = state["ltm_epi_agency_id"]
+        if bool((epi_valid & (
+            (agency_id < int(Agency.SELF_CAUSED))
+            | (agency_id > int(Agency.UNKNOWN))
+        )).any().item()):
+            raise ValueError("ltm_epi_agency_id contains an invalid agency")
+        observed_parent = state[
+            "ltm_epi_observed_surface_parent_index"]
+        if bool((epi_valid & (observed_parent < -1)).any().item()):
+            raise ValueError(
+                "ltm_epi_observed_surface_parent_index is invalid")
+        for field in (
+            "ltm_epi_motion_layer_prob",
+            "ltm_epi_surface_uv_confidence",
+            "ltm_epi_verification",
+            "ltm_epi_content_change",):
+            value = state[field]
+            valid = epi_valid.unsqueeze(-1) if value.dim() == 3 else epi_valid
+            if bool((valid & (
+                ~torch.isfinite(value)
+                | (value < 0.0)
+                | (value > 1.0)
+            )).any().item()):
+                raise ValueError(f"{field} is not a finite probability")
+        if bool((
+            epi_valid.unsqueeze(-1)
+            & ~torch.isfinite(state["ltm_epi_surface_uv"])
+        ).any().item()):
+            raise ValueError("ltm_epi_surface_uv is not finite")
 
         if mergeGws:
             gws_keys = state["gws_keys"]
@@ -4746,6 +5572,9 @@ class MemoryExtractor(AGICoreModule):
         emo_src = state["memory_emotion"].to(device=device, dtype=dtype)
         src_src = state["memory_source"].to(device=device, dtype=torch.int8)
         src_conf_src = state["memory_source_confidence"].to(device=device, dtype=dtype)
+        realm_src = state["memory_realm"].to(
+            device=self.memory_realm.device,
+            dtype=torch.int8)
         rew_abs_src = state["memory_reward_abs"].to(device=device, dtype=dtype)
         step_src = state["memory_steps"].to(device=device, dtype=torch.long)  # [B, M]
         access_src = state["memory_last_access_steps"].to(device=device, dtype=torch.long)
@@ -4765,7 +5594,9 @@ class MemoryExtractor(AGICoreModule):
                 n = int(self.memory_filled[b].item())
                 target = -1
                 if n > 0 and sourceBaseStep is not None:
-                    same_created = self.memory_steps[b, :n] == mapped_created
+                    same_created = (
+                        (self.memory_steps[b, :n] == mapped_created)
+                        & (self.memory_realm[b, :n] == realm_src[b, t]))
                     candidates = same_created.nonzero(as_tuple=False).flatten()
                     if candidates.numel() > 0:
                         similarities = F.cosine_similarity(
@@ -4832,6 +5663,7 @@ class MemoryExtractor(AGICoreModule):
                     self.memory_keys[b, target] = k_src[b, t]
                     self.memory_values[b, target] = v_src[b, t]
                     self.memory_emotion[b, target] = emo_src[b, t]
+                    self.memory_realm[b, target] = realm_src[b, t]
                 self.memory_importance[b, target] = (
                     torch.maximum(self.memory_importance[b, target], imp_src[b, t])
                     if target_existed else imp_src[b, t])
@@ -4873,6 +5705,9 @@ class MemoryExtractor(AGICoreModule):
         pr_src = state["ltm_sem_prio"].to(device=sem.prio.device, dtype=sem.prio.dtype)
         src_src = state["ltm_sem_source"].to(device=sem.source.device, dtype=torch.int8)
         conf_src = state["ltm_sem_source_confidence"].to(device=sem.source_confidence.device, dtype=sem.source_confidence.dtype)
+        realm_sem_src = state["ltm_sem_realm"].to(
+            device=sem.realm.device,
+            dtype=torch.int8)
         touch_src = state["ltm_sem_touch"].to(device=sem.touch.device, dtype=torch.long)
         step_sem_src = state["ltm_sem_step"].to(device=sem.step.device, dtype=torch.long)
         access_sem_src = state["ltm_sem_last_access_step"].to(device=sem.last_access_step.device, dtype=torch.long)
@@ -4895,7 +5730,8 @@ class MemoryExtractor(AGICoreModule):
                 target = -1
                 if n > 0 and sourceBaseStep is not None:
                     candidates = (
-                        sem.step[b, :n] == mapped_created
+                        (sem.step[b, :n] == mapped_created)
+                        & (sem.realm[b, :n] == realm_sem_src[b, t])
                     ).nonzero(as_tuple=False).flatten()
                     if candidates.numel() > 0:
                         similarities = F.cosine_similarity(
@@ -4960,6 +5796,7 @@ class MemoryExtractor(AGICoreModule):
                     sem.vals[b, target] = v_src[b, t]
                     sem.prototype_count[b, target] = prototype_count_src[b, t]
                     sem.prototype_variance[b, target] = prototype_variance_src[b, t]
+                    sem.realm[b, target] = realm_sem_src[b, t]
                 sem.prio[b, target] = (
                     torch.maximum(sem.prio[b, target], pr_src[b, t])
                     if target_existed else pr_src[b, t])
@@ -5000,6 +5837,32 @@ class MemoryExtractor(AGICoreModule):
         rw_abs_src = state["ltm_epi_rew_abs"].to(device=epi.rew_abs.device, dtype=epi.rew_abs.dtype)
         src_src = state["ltm_epi_source"].to(device=epi.source.device, dtype=torch.int8)
         conf_epi_src = state["ltm_epi_source_confidence"].to(device=epi.source_confidence.device, dtype=epi.source_confidence.dtype)
+        realm_epi_src = state["ltm_epi_realm"].to(
+            device=epi.realm.device,
+            dtype=torch.int8)
+        agency_epi_src = state["ltm_epi_agency_id"].to(
+            device=epi.agency_id.device,
+            dtype=torch.int8)
+        motion_layer_epi_src = state["ltm_epi_motion_layer_prob"].to(
+            device=epi.motion_layer_prob.device,
+            dtype=epi.motion_layer_prob.dtype)
+        surface_parent_epi_src = state[
+            "ltm_epi_observed_surface_parent_index"].to(
+                device=epi.observed_surface_parent_index.device,
+                dtype=torch.long)
+        surface_uv_epi_src = state["ltm_epi_surface_uv"].to(
+            device=epi.surface_uv.device,
+            dtype=epi.surface_uv.dtype)
+        surface_uv_confidence_epi_src = state[
+            "ltm_epi_surface_uv_confidence"].to(
+                device=epi.surface_uv_confidence.device,
+                dtype=epi.surface_uv_confidence.dtype)
+        verification_epi_src = state["ltm_epi_verification"].to(
+            device=epi.verification.device,
+            dtype=epi.verification.dtype)
+        content_change_epi_src = state["ltm_epi_content_change"].to(
+            device=epi.content_change.device,
+            dtype=epi.content_change.dtype)
         touch_epi_src = state["ltm_epi_touch"].to(device=epi.touch.device, dtype=torch.long)
         step_epi_src = state["ltm_epi_step"].to(device=epi.step.device, dtype=torch.long)
         access_epi_src = state["ltm_epi_last_access_step"].to(device=epi.last_access_step.device, dtype=torch.long)
@@ -5040,7 +5903,8 @@ class MemoryExtractor(AGICoreModule):
                 if n > 0 and sourceBaseStep is not None:
                     same_event = (
                         (epi.episode_id[b, :n] == incoming_episode)
-                        & (epi.event_id[b, :n] == incoming_event))
+                        & (epi.event_id[b, :n] == incoming_event)
+                        & (epi.realm[b, :n] == realm_epi_src[b, t]))
                     is_existing_delta = (
                         sourceBaseStep is not None
                         and created <= int(sourceBaseStep))
@@ -5102,6 +5966,18 @@ class MemoryExtractor(AGICoreModule):
                     epi.state_keys[b, target] = ks_src[b, t]
                     epi.vals[b, target] = v_src[b, t]
                     epi.rew[b, target] = rw_src[b, t]
+                    epi.realm[b, target] = realm_epi_src[b, t]
+                    epi.agency_id[b, target] = agency_epi_src[b, t]
+                    epi.motion_layer_prob[b, target] = (
+                        motion_layer_epi_src[b, t])
+                    epi.observed_surface_parent_index[b, target] = (
+                        surface_parent_epi_src[b, t])
+                    epi.surface_uv[b, target] = surface_uv_epi_src[b, t]
+                    epi.surface_uv_confidence[b, target] = (
+                        surface_uv_confidence_epi_src[b, t])
+                    epi.verification[b, target] = verification_epi_src[b, t]
+                    epi.content_change[b, target] = (
+                        content_change_epi_src[b, t])
                 epi.prio[b, target] = (
                     torch.maximum(epi.prio[b, target], pr_src[b, t])
                     if target_existed else pr_src[b, t])
@@ -5397,6 +6273,7 @@ class MemoryExtractor(AGICoreModule):
                 ("previous_intent", self.previous_intent),
                 ("previous_object_summary", self.previous_object_summary),
                 ("previous_motion_token", self.previous_motion_token),
+                ("previous_ontology_context", self.previous_ontology_context),
                 ("event_age", self.event_age),
                 ("has_previous_event", self.has_previous_event),
                 ("gws_global_step", self.gws.global_step),
@@ -5619,6 +6496,43 @@ class TestMemoryMTool:
 
     def MakeVisualState(self, B: int, device: torch.device, dtype: torch.dtype = torch.float32):
         K = 8
+        realm = torch.zeros(B, K, 5, device=device, dtype=dtype)
+        realm[..., int(Realm.EXTERNAL_PHYSICAL)] = 1.0
+        agency = torch.zeros(B, K, 5, device=device, dtype=dtype)
+        agency[..., 1] = 1.0
+        layer_agency = torch.zeros(B, K, 5, 5, device=device, dtype=dtype)
+        layer_agency[..., 4] = 1.0
+        self_part = torch.zeros(
+            B, K, ModuleDim.PstSelfPartSemanticDim,
+            device=device, dtype=dtype)
+        surface_parent = torch.zeros(B, K, K + 1, device=device, dtype=dtype)
+        surface_parent[..., -1] = 1.0
+        auxiliary = {
+            "PerceptualPresence": torch.ones(
+                B, K, device=device, dtype=dtype),
+            "RealmProb": realm,
+            "AgencyProb": agency,
+            "MotionLayerProb": torch.zeros(B, K, 5, device=device, dtype=dtype),
+            "LayerAgencyProb": layer_agency,
+            "BodyMembershipProb": torch.zeros(B, K, device=device, dtype=dtype),
+            "SelfPartSemantic": self_part,
+            "PhysicalInteractionProb": torch.ones(B, K, device=device, dtype=dtype),
+            "SurfaceParentProb": surface_parent,
+            "SurfaceUV": torch.zeros(B, K, 2, device=device, dtype=dtype),
+            "SurfaceUVConfidence": torch.ones(
+                B, K, device=device, dtype=dtype),
+            "VerificationConfidence": torch.ones(B, K, device=device, dtype=dtype),
+            "OntologyRelationProb": torch.zeros(B, K, K, 9, device=device, dtype=dtype),
+            "ContentMotionUV": torch.zeros(B, K, 2, device=device, dtype=dtype),
+            "ContentChangeProb": torch.zeros(B, K, device=device, dtype=dtype),
+            "EntityTextSemantic": torch.randn(
+                B, K, 512, device=device, dtype=dtype),
+            "EntityTextConfidence": torch.ones(
+                B, K, device=device, dtype=dtype),
+            "EntityTextRevision": torch.ones(
+                B, K, device=device, dtype=torch.long),
+            "EntityTextChanged": torch.ones(
+                B, K, device=device, dtype=torch.bool),}
         return SimpleNamespace(
             IntegratedFeat=torch.randn(B, 1024, device=device, dtype=dtype),
             MotionToken=torch.randn(B, 512, device=device, dtype=dtype),
@@ -5635,7 +6549,8 @@ class TestMemoryMTool:
                 "identity_embed": F.normalize(torch.randn(
                     B, K, ModuleDim.PstIdentityDim, device=device, dtype=dtype), dim=-1),
                 "pose_camera": torch.randn(B, K, 7, device=device, dtype=dtype),
-                "bbox_2d": torch.randn(B, K, 4, device=device, dtype=dtype),},)
+                "bbox_2d": torch.randn(B, K, 4, device=device, dtype=dtype),},
+            Auxiliary=auxiliary,)
 
     def CallMemForward(
         self,
@@ -5839,17 +6754,29 @@ class TestMemoryMTool:
             state_key2[0, 3] = 1.0
             val2 = torch.zeros(B, dim, device=self.device)
             val2[0, 4] = 3.0
+            realm = torch.full(
+                (B,),
+                int(Realm.EXTERNAL_PHYSICAL),
+                device=self.device,
+                dtype=torch.int8)
 
             ltm.semantic.Store(key=key, value=val, score=torch.tensor([0.9], device=self.device),
-                              source=torch.tensor([MemoryType.SRC_REAL], device=self.device, dtype=torch.int8))
+                              source=torch.tensor([MemoryType.SRC_REAL], device=self.device, dtype=torch.int8),
+                              realm=realm)
             ltm.episodic.Store(key=key, value=val, reward=torch.tensor([-1.0], device=self.device),
                                score=torch.tensor([0.8], device=self.device),
                                source=torch.tensor([MemoryType.SRC_REAL], device=self.device, dtype=torch.int8),
-                               stateKey=state_key)
+                               stateKey=state_key,
+                               realm=realm,
+                               typedMetadata=UnknownEpisodicTypeMetadata(
+                                   realm, dtype=key.dtype))
             ltm.episodic.Store(key=key2, value=val2, reward=torch.tensor([2.0], device=self.device),
                                score=torch.tensor([1.0], device=self.device),
                                source=torch.tensor([MemoryType.SRC_REAL], device=self.device, dtype=torch.int8),
-                               stateKey=state_key2)
+                               stateKey=state_key2,
+                               realm=realm,
+                               typedMetadata=UnknownEpisodicTypeMetadata(
+                                   realm, dtype=key2.dtype))
 
             ltm.StepTick()
             sem_out, epi_out = ltm.Retrieve(key, topkSem=4, topkEpi=2)
@@ -5885,12 +6812,20 @@ class TestMemoryMTool:
             def store_with(i, prio, rew):
                 k = torch.zeros(1, dim, device=self.device); k[0, i] = 1.0
                 v = torch.randn(1, dim, device=self.device)
+                realm = torch.full(
+                    (1,),
+                    int(Realm.EXTERNAL_PHYSICAL),
+                    device=self.device,
+                    dtype=torch.int8)
                 epi.Store(
                     key=k,
                     value=v,
                     reward=torch.tensor([rew], device=self.device),
                     score=torch.tensor([prio], device=self.device),
-                    source=torch.tensor([MemoryType.SRC_REAL], device=self.device, dtype=torch.int8),)
+                    source=torch.tensor([MemoryType.SRC_REAL], device=self.device, dtype=torch.int8),
+                    realm=realm,
+                    typedMetadata=UnknownEpisodicTypeMetadata(
+                        realm, dtype=k.dtype),)
 
             store_with(0, prio=1.0, rew=0.0)
             store_with(1, prio=1.0, rew=0.0)
@@ -5930,12 +6865,20 @@ class TestMemoryMTool:
             def store_with(i, prio, rew):
                 k = torch.zeros(1, dim, device=self.device); k[0, i] = 1.0
                 v = torch.randn(1, dim, device=self.device)
+                realm = torch.full(
+                    (1,),
+                    int(Realm.EXTERNAL_PHYSICAL),
+                    device=self.device,
+                    dtype=torch.int8)
                 epi.Store(
                     key=k,
                     value=v,
                     reward=torch.tensor([rew], device=self.device),
                     score=torch.tensor([prio], device=self.device),
-                    source=torch.tensor([MemoryType.SRC_REAL], device=self.device, dtype=torch.int8),)
+                    source=torch.tensor([MemoryType.SRC_REAL], device=self.device, dtype=torch.int8),
+                    realm=realm,
+                    typedMetadata=UnknownEpisodicTypeMetadata(
+                        realm, dtype=k.dtype),)
 
             store_with(0, prio=1.0, rew=-10.0)
             store_with(1, prio=1.0, rew=0.0)
@@ -6106,6 +7049,54 @@ class TestMemoryMTool:
             return False
         except Exception as e:
             print(f"ExportMemoryBank mixed-row validity test error: {e}")
+            return False
+
+    def TestExportConsciousBank(self):
+        try:
+            cfg = self.FilterKwargs(MemoryExtractor, dict(
+                inputDim=16,
+                ssmStateDim=16,
+                memoryDim=8,
+                memorySize=4,
+                symSize=8,
+                ltmSize=4,
+                nsK=4,
+                outputDim=8,
+                gwsSlots=2,
+                gwsTtl=4,
+                compressEvery=100,
+                emotionDim=4,))
+            mem = MemoryExtractor(**cfg).to(self.device).eval()
+            mem.EnsureB(2)
+            mem.ResetAll()
+            with torch.no_grad():
+                mem.memory_filled.copy_(
+                    torch.tensor([2, 1], device=self.device))
+                mem.memory_importance[:, :2] = torch.tensor(
+                    [[2.0, 1.0], [2.0, 0.0]],
+                    device=self.device,
+                    dtype=mem.dtype)
+                mem.memory_steps[:, :2] = torch.tensor(
+                    [[2, 1], [2, 0]],
+                    device=self.device)
+                mem.memory_values[0, 0, 0] = 3.0
+                mem.memory_values[1, 0, 0] = 4.0
+            bank = mem.ExportConsciousBank(topk=2)
+            assert set(bank) == {"tokens", "valid"}
+            assert bank["tokens"].shape == (2, 2, mem.memory_dim)
+            assert bank["valid"].shape == (2, 2)
+            assert bank["valid"].dtype == torch.bool
+            assert bank["valid"].tolist() == [[True, True], [True, False]]
+            assert bool(torch.isfinite(bank["tokens"]).all().item())
+            assert int(torch.count_nonzero(
+                bank["tokens"][1, 1]).item()) == 0
+            print("ExportConsciousBank test passed.")
+            return True
+        except AssertionError as e:
+            print(f"ExportConsciousBank test failed: {e}")
+            return False
+        except Exception as e:
+            print(f"ExportConsciousBank test error: {e}")
             return False
 
     def TestDurableStatePreservesBatchLanes(self):
@@ -6466,10 +7457,10 @@ class TestMemoryMTool:
             B = 2
             x0 = torch.randn(1, cfg["inputDim"], device=self.device)
             x = x0.expand(B, -1).clone()
-            visual = SimpleNamespace(
-                IntegratedFeat=torch.zeros(B, 1024, device=self.device),
-                MotionToken=torch.zeros(B, 512, device=self.device),
-                PredErrorToken=torch.zeros(B, 512, device=self.device),)
+            visual = self.MakeVisualState(B, self.device)
+            visual.IntegratedFeat.zero_()
+            visual.MotionToken.zero_()
+            visual.PredErrorToken.zero_()
             visual.IntegratedFeat[1, 0] = 5.0
             visual.MotionToken[1, 0] = -3.0
             ocr = torch.zeros(B, 512, device=self.device)
@@ -6483,6 +7474,7 @@ class TestMemoryMTool:
             risk = torch.tensor([0.0, 0.4], device=self.device)
             confidence = torch.tensor([1.0, 0.8], device=self.device)
 
+            ontology = mem.BuildOntologyObjectContext(x, visual)
             dense, event_key = mem.BuildEventCode(
                 x,
                 visualState=visual,
@@ -6492,7 +7484,8 @@ class TestMemoryMTool:
                 tdError=td,
                 uncertainty=uncertainty,
                 risk=risk,
-                confidence=confidence,)
+                confidence=confidence,
+                ontologyContext=ontology["context"],)
             assert dense.shape == (B, cfg["memoryDim"])
             assert event_key.shape == (B, cfg["memoryDim"])
             assert torch.isfinite(dense).all() and torch.isfinite(event_key).all()
@@ -7222,10 +8215,16 @@ class TestMemoryMTool:
             key = torch.zeros(1, 8, device=self.device); key[0, 0] = 1.0
             value = torch.zeros(1, 8, device=self.device); value[0, 1] = 1.0
             source = torch.zeros(1, device=self.device, dtype=torch.int8)
+            realm = torch.full_like(
+                source,
+                int(Realm.EXTERNAL_PHYSICAL))
             emotion = torch.zeros(1, 4, device=self.device)
             mem.time_step.fill_(7)
             mem.KvWrite(
-                key, value, one, emotion, one, source, one, mask)
+                key, value, one, emotion, one, source, one, mask,
+                realm=torch.full_like(
+                    source,
+                    int(Realm.EXTERNAL_PHYSICAL)))
             snapshot = mem.ExportState()
 
             malformed = dict(snapshot)
@@ -7578,6 +8577,11 @@ class TestMemoryMTool:
                     torch.zeros(2, device=self.device, dtype=mem.dtype),
                     torch.zeros(2, device=self.device, dtype=torch.int8),
                     torch.ones(2, device=self.device, dtype=mem.dtype),
+                    torch.full(
+                        (2,),
+                        int(Realm.EXTERNAL_PHYSICAL),
+                        device=self.device,
+                        dtype=torch.int8),
                     torch.ones(2, device=self.device, dtype=torch.bool),))
             mem.pending = [pending_write]
 
@@ -7804,6 +8808,18 @@ class TestMemoryMTool:
             base = F.mse_loss(out, target)
             total = self.AttachAllInternalLosses(mem, base)
 
+            opt.zero_grad(set_to_none=True)
+            total.backward()
+            opt.step()
+
+            out = self.CallMemForward(
+                mem,
+                x2,
+                tdError=td2,
+                reward=rwd2,
+                emotion=emotion2)
+            base = F.mse_loss(out, target)
+            total = self.AttachAllInternalLosses(mem, base)
             opt.zero_grad(set_to_none=True)
             total.backward()
 
@@ -8038,14 +9054,32 @@ class TestMemoryMTool:
             confidence = torch.ones(1, device=self.device)
 
             sem = SemanticLTM(D, 4).to(self.device)
-            sem.Store(key, value, score, source, sourceConfidence=confidence)
+            realm = torch.full_like(
+                source,
+                int(Realm.EXTERNAL_PHYSICAL))
+            sem.Store(
+                key,
+                value,
+                score,
+                source,
+                sourceConfidence=confidence,
+                realm=realm)
             sem.StepTick(); created_sem = sem.step.clone()
             sem.Retrieve(key, topk=1)
             assert torch.equal(sem.step, created_sem)
             assert int(sem.last_access_step[0, 0].item()) == int(sem.global_step[0].item())
 
             epi = EpisodicLTM(D, 4).to(self.device)
-            epi.Store(key, value, score, score, source, sourceConfidence=confidence)
+            epi.Store(
+                key,
+                value,
+                score,
+                score,
+                source,
+                sourceConfidence=confidence,
+                realm=realm,
+                typedMetadata=UnknownEpisodicTypeMetadata(
+                    realm, dtype=key.dtype))
             epi.StepTick(); created_epi = epi.step.clone()
             epi.Retrieve(key, topk=1)
             assert torch.equal(epi.step, created_epi)
@@ -8135,16 +9169,23 @@ class TestMemoryMTool:
             emotion_a = torch.zeros(1, 4, device=self.device)
             emotion_b = torch.full((1, 4), 2.0, device=self.device)
             mask = torch.ones(1, device=self.device, dtype=torch.bool)
+            realm = torch.full(
+                (1,),
+                int(Realm.EXTERNAL_PHYSICAL),
+                device=self.device,
+                dtype=torch.int8)
             mem.time_step.fill_(1)
             mem.KvWrite(key, value_a, torch.ones(1, device=self.device), emotion_a,
                         torch.ones(1, device=self.device),
                         torch.zeros(1, device=self.device, dtype=torch.int8),
-                        torch.full((1,), 0.9, device=self.device), mask)
+                        torch.full((1,), 0.9, device=self.device), mask,
+                        realm=realm)
             mem.time_step.fill_(2)
             mem.KvWrite(key, value_b, torch.ones(1, device=self.device), emotion_b,
                         torch.full((1,), 5.0, device=self.device),
                         torch.ones(1, device=self.device, dtype=torch.int8),
-                        torch.full((1,), 0.1, device=self.device), mask)
+                        torch.full((1,), 0.1, device=self.device), mask,
+                        realm=realm)
             assert int(mem.memory_filled[0].item()) == 1
             assert int(mem.memory_source[0, 0].item()) == MemoryType.SRC_MIXED
             assert torch.allclose(mem.memory_emotion[0, 0], torch.ones(4, device=self.device))
@@ -8162,7 +9203,8 @@ class TestMemoryMTool:
                 torch.zeros(1, device=self.device),
                 torch.zeros(1, device=self.device, dtype=torch.int8),
                 torch.ones(1, device=self.device),
-                mask)
+                mask,
+                realm=realm)
             assert int(mem.memory_filled[0].item()) == 2
 
             original_bmm = torch.bmm
@@ -8190,10 +9232,16 @@ class TestMemoryMTool:
             intent = torch.zeros(1, 512, device=self.device)
             zero = torch.zeros(1, device=self.device)
             one = torch.ones(1, device=self.device)
-            _, first = mem.DetectEventBoundary(attended, visual, intent, zero, zero, zero, one)
-            _, repeated = mem.DetectEventBoundary(attended, visual, intent, zero, zero, zero, one)
+            ontology = mem.BuildOntologyObjectContext(attended, visual)
+            _, first = mem.DetectEventBoundary(
+                attended, visual, intent, zero, zero, zero, one, ontology)
+            ontology = mem.BuildOntologyObjectContext(attended, visual)
+            _, repeated = mem.DetectEventBoundary(
+                attended, visual, intent, zero, zero, zero, one, ontology)
+            ontology = mem.BuildOntologyObjectContext(attended, visual)
             _, risk_boundary = mem.DetectEventBoundary(
-                attended, visual, intent, zero, torch.ones_like(zero), zero, one)
+                attended, visual, intent, zero, torch.ones_like(zero), zero, one,
+                ontology)
             assert bool(first.item())
             assert not bool(repeated.item())
             assert bool(risk_boundary.item())
@@ -8208,6 +9256,9 @@ class TestMemoryMTool:
             epi = EpisodicLTM(dim=8, capacity=8).to(self.device)
             source = torch.zeros(1, device=self.device, dtype=torch.int8)
             confidence = torch.ones(1, device=self.device)
+            realm = torch.full_like(
+                source,
+                int(Realm.EXTERNAL_PHYSICAL))
             for event in range(3):
                 key = torch.zeros(1, 8, device=self.device); key[0, event] = 1.0
                 value = torch.zeros(1, 8, device=self.device); value[0, event] = float(event + 1)
@@ -8218,7 +9269,10 @@ class TestMemoryMTool:
                     source=source,
                     sourceConfidence=confidence,
                     episodeId=torch.zeros(1, device=self.device, dtype=torch.long),
-                    eventId=torch.tensor([event], device=self.device))
+                    eventId=torch.tensor([event], device=self.device),
+                    realm=realm,
+                    typedMetadata=UnknownEpisodicTypeMetadata(
+                        realm, dtype=key.dtype))
                 epi.StepTick()
             sequence, valid = epi.RetrieveSequence(torch.tensor([1], device=self.device))
             assert valid.tolist() == [[True, True, True]]
@@ -8229,7 +9283,10 @@ class TestMemoryMTool:
             key = torch.zeros(1, 8, device=self.device); key[0, 4] = 1.0
             epi.Store(key, key, torch.zeros(1, device=self.device),
                       torch.ones(1, device=self.device), source,
-                      sourceConfidence=confidence, eventId=torch.tensor([4], device=self.device))
+                      sourceConfidence=confidence, eventId=torch.tensor([4], device=self.device),
+                      realm=realm,
+                      typedMetadata=UnknownEpisodicTypeMetadata(
+                          realm, dtype=key.dtype))
             assert int(epi.prev_index[0, 3].item()) == -1
             print("Episodic sequence-link test passed.")
             return True
@@ -8245,6 +9302,9 @@ class TestMemoryMTool:
                 MemoryType.SRC_IMAGINE,
                 device=self.device,
                 dtype=torch.int8)
+            realm = torch.full_like(
+                imagined,
+                int(Realm.EXTERNAL_PHYSICAL))
             for event in range(3):
                 key = torch.zeros(1, 8, device=self.device)
                 key[0, event] = 1.0
@@ -8256,7 +9316,10 @@ class TestMemoryMTool:
                     source=imagined,
                     sourceConfidence=torch.full((1,), 0.1, device=self.device),
                     episodeId=torch.zeros(1, device=self.device, dtype=torch.long),
-                    eventId=torch.tensor([event], device=self.device))
+                    eventId=torch.tensor([event], device=self.device),
+                    realm=realm,
+                    typedMetadata=UnknownEpisodicTypeMetadata(
+                        realm, dtype=key.dtype))
                 epi.StepTick()
             _, before = epi.RetrieveSequence(torch.tensor([1], device=self.device))
             assert before.tolist() == [[True, True, True]]
@@ -8264,7 +9327,8 @@ class TestMemoryMTool:
             middle_key[0, 1] = 1.0
             epi.VerifyWithRealEvidence(
                 middle_key,
-                torch.ones(1, device=self.device, dtype=torch.bool))
+                torch.ones(1, device=self.device, dtype=torch.bool),
+                realm)
             _, after = epi.RetrieveSequence(torch.tensor([1], device=self.device))
             assert int(epi.source[0, 1].item()) == MemoryType.SRC_MIXED
             assert after.tolist() == [[False, True, False]]
@@ -8285,8 +9349,17 @@ class TestMemoryMTool:
             score = torch.ones(1, device=self.device)
             source = torch.zeros(1, device=self.device, dtype=torch.int8)
             confidence = torch.ones(1, device=self.device)
-            sem.Store(key_a, value_a, score, source, sourceConfidence=confidence)
-            sem.Store(key_b, value_b, score, source, sourceConfidence=confidence)
+            realm = torch.full_like(
+                source,
+                int(Realm.EXTERNAL_PHYSICAL))
+            sem.Store(
+                key_a, value_a, score, source,
+                sourceConfidence=confidence,
+                realm=realm)
+            sem.Store(
+                key_b, value_b, score, source,
+                sourceConfidence=confidence,
+                realm=realm)
             assert int(sem.filled[0].item()) == 1
             assert float(sem.prototype_count[0, 0].item()) == 2.0
             assert torch.allclose(sem.vals[0, 0, 2], torch.tensor(2.0, device=self.device))
@@ -8297,6 +9370,266 @@ class TestMemoryMTool:
             return True
         except Exception as e:
             print(f"Semantic prototype-abstraction test failed: {e}")
+            return False
+
+    def TestOntologyTypedMemoryIsolation(self):
+        try:
+            mem = self.MakeTinyMemory()
+            key = torch.zeros(1, 8, device=self.device)
+            key[0, 0] = 1.0
+            value = torch.zeros(1, 8, device=self.device)
+            value[0, 1] = 1.0
+            one = torch.ones(1, device=self.device)
+            mask = torch.ones(1, device=self.device, dtype=torch.bool)
+            emotion = torch.zeros(1, 4, device=self.device)
+            real = torch.full(
+                (1,),
+                MemoryType.SRC_REAL,
+                device=self.device,
+                dtype=torch.int8)
+            imagined = torch.full(
+                (1,),
+                MemoryType.SRC_IMAGINE,
+                device=self.device,
+                dtype=torch.int8)
+            physical = torch.full(
+                (1,),
+                int(Realm.EXTERNAL_PHYSICAL),
+                device=self.device,
+                dtype=torch.int8)
+            virtual = torch.full(
+                (1,),
+                int(Realm.VIRTUAL_CONTENT),
+                device=self.device,
+                dtype=torch.int8)
+
+            mem.KvWrite(
+                key, value, one, emotion, one, real, one, mask,
+                realm=physical)
+            mem.KvWrite(
+                key, value, one, emotion, one, imagined, one, mask,
+                realm=virtual)
+            assert int(mem.memory_filled[0].item()) == 2
+            assert mem.memory_realm[0, :2].tolist() == [
+                int(Realm.EXTERNAL_PHYSICAL),
+                int(Realm.VIRTUAL_CONTENT)]
+            assert mem.memory_source[0, :2].tolist() == [
+                MemoryType.SRC_REAL,
+                MemoryType.SRC_IMAGINE]
+
+            semantic = mem.ltm.semantic
+            semantic.Store(
+                key, value, one, real,
+                sourceConfidence=one,
+                realm=physical)
+            semantic.Store(
+                key, value, one, imagined,
+                sourceConfidence=one,
+                realm=virtual)
+            assert int(semantic.filled[0].item()) == 2
+            assert semantic.prototype_count[0, :2].tolist() == [1.0, 1.0]
+            assert semantic.realm[0, :2].tolist() == [
+                int(Realm.EXTERNAL_PHYSICAL),
+                int(Realm.VIRTUAL_CONTENT)]
+
+            policy_memory = self.MakeTinyMemory()
+            visual_effect = torch.full(
+                (1,),
+                int(Realm.VISUAL_EFFECT),
+                device=self.device,
+                dtype=torch.int8)
+            effect_metadata = UnknownEpisodicTypeMetadata(
+                visual_effect,
+                dtype=key.dtype)
+            effect_metadata["agency_id"].fill_(int(Agency.AUTONOMOUS))
+            effect_metadata["motion_layer_prob"][0, 4] = 1.0
+            effect_metadata["surface_uv"][0] = torch.tensor(
+                [0.25, 0.75], device=self.device)
+            effect_metadata["surface_uv_confidence"].fill_(0.8)
+            effect_metadata["verification"].fill_(0.9)
+            effect_metadata["content_change"].fill_(0.7)
+            policy_memory.LtmOnlineStore(
+                keySem=key,
+                keyEpi=key,
+                keyEpiState=key,
+                valSem=value,
+                valEpi=value,
+                importance=torch.full(
+                    (1,), 1.5, device=self.device),
+                tdError=one,
+                reward=torch.zeros(1, device=self.device),
+                sourceLabel=real,
+                realm=visual_effect,
+                episodicMetadata=effect_metadata,
+                uncertainty=torch.zeros(1, device=self.device),
+                risk=torch.zeros(1, device=self.device),
+                confidence=one,
+                sourceConfidence=one,
+                eventMask=mask,
+                episodeId=torch.zeros(
+                    1, device=self.device, dtype=torch.long),
+                eventId=torch.ones(
+                    1, device=self.device, dtype=torch.long))
+            assert int(policy_memory.ltm.semantic.filled[0].item()) == 0
+            assert int(policy_memory.ltm.episodic.filled[0].item()) == 1
+            assert int(policy_memory.ltm.episodic.realm[0, 0].item()) == int(
+                Realm.VISUAL_EFFECT)
+            assert int(policy_memory.ltm.episodic.agency_id[0, 0].item()) == int(
+                Agency.AUTONOMOUS)
+            assert torch.equal(
+                policy_memory.ltm.episodic.motion_layer_prob[0, 0],
+                effect_metadata["motion_layer_prob"][0])
+            assert torch.equal(
+                policy_memory.ltm.episodic.surface_uv[0, 0],
+                effect_metadata["surface_uv"][0])
+            assert torch.equal(
+                policy_memory.ltm.episodic.surface_uv_confidence[0, 0],
+                effect_metadata["surface_uv_confidence"][0])
+            policy_memory.ConsolidateMemory(topk=1)
+            assert int(policy_memory.ltm.semantic.filled[0].item()) == 0
+
+            state = mem.ExportDurableState()
+            assert mem.DURABLE_MEMORY_SCHEMA_VERSION == 6
+            restored = self.MakeTinyMemory()
+            restored.ImportDurableState(state)
+            assert torch.equal(restored.memory_realm, mem.memory_realm)
+            assert torch.equal(restored.ltm.semantic.realm, semantic.realm)
+            policy_state = policy_memory.ExportDurableState()
+            restored.ImportDurableState(policy_state)
+            assert torch.equal(
+                restored.ltm.episodic.surface_uv_confidence,
+                policy_memory.ltm.episodic.surface_uv_confidence)
+            assert torch.equal(
+                restored.ltm.episodic.motion_layer_prob,
+                policy_memory.ltm.episodic.motion_layer_prob)
+            print("Ontology-typed memory isolation test passed.")
+            return True
+        except Exception as e:
+            print(f"Ontology-typed memory isolation test failed: {e}")
+            return False
+
+    def TestOntologyContextAndScreenBoundary(self):
+        try:
+            mem = MemoryExtractor(**self.FilterKwargs(MemoryExtractor, dict(
+                inputDim=16, ssmStateDim=16, memoryDim=8, memorySize=4,
+                symSize=2, ltmSize=2, nsK=4, outputDim=8,
+                gwsSlots=2, emotionDim=4))).to(self.device).eval()
+            visual = self.MakeVisualState(1, self.device)
+            visual.SemanticNodes["node_logits"][..., 0] = -10.0
+            visual.SemanticNodes["node_logits"][..., 1] = 10.0
+            realm = visual.Auxiliary["RealmProb"]
+            realm.zero_()
+            realm[..., int(Realm.VIRTUAL_CONTENT)] = 1.0
+            visual.Auxiliary["PhysicalInteractionProb"].zero_()
+            visual.Auxiliary["ContentChangeProb"].zero_()
+            attended = torch.zeros(1, 16, device=self.device)
+            intent = torch.zeros(1, 512, device=self.device)
+            zero = torch.zeros(1, device=self.device)
+            one = torch.ones(1, device=self.device)
+
+            ontology = mem.BuildOntologyObjectContext(attended, visual)
+            assert int(ontology["realm_id"][0].item()) == int(
+                Realm.VIRTUAL_CONTENT)
+            _, first = mem.DetectEventBoundary(
+                attended, visual, intent, zero, zero, zero, one, ontology)
+            assert bool(first.item())
+
+            for step in range(10):
+                visual.ObjectTokens.mul_(-1.0)
+                visual.MotionToken.fill_(float(step + 1))
+                visual.Auxiliary["ContentMotionUV"].fill_(
+                    float(step + 1))
+                ontology = mem.BuildOntologyObjectContext(attended, visual)
+                _, boundary = mem.DetectEventBoundary(
+                    attended, visual, intent, zero, zero, zero, one, ontology)
+                assert not bool(boundary.item()), step
+
+            visual.Auxiliary["ContentChangeProb"].fill_(1.0)
+            ontology = mem.BuildOntologyObjectContext(attended, visual)
+            _, changed = mem.DetectEventBoundary(
+                attended, visual, intent, zero, zero, zero, one, ontology)
+            assert bool(changed.item())
+            print("Ontology context/screen-boundary test passed.")
+            return True
+        except Exception as e:
+            print(f"Ontology context/screen-boundary test failed: {e}")
+            return False
+
+    def TestForwardFlushPersistsFocusedEpisodicMetadata(self):
+        try:
+            mem = self.MakeTinyMemory().eval()
+            visual = self.MakeVisualState(1, self.device)
+            auxiliary = visual.Auxiliary
+            auxiliary["PerceptualPresence"].zero_()
+            auxiliary["PerceptualPresence"][0, 0] = 1.0
+            auxiliary["RealmProb"].zero_()
+            auxiliary["RealmProb"][
+                0, 0, int(Realm.VIRTUAL_CONTENT)] = 1.0
+            auxiliary["AgencyProb"].zero_()
+            auxiliary["AgencyProb"][
+                0, 0, int(Agency.AUTONOMOUS)] = 1.0
+            auxiliary["MotionLayerProb"].zero_()
+            auxiliary["MotionLayerProb"][0, 0, 3] = 1.0
+            auxiliary["BodyMembershipProb"].zero_()
+            auxiliary["SurfaceParentProb"].zero_()
+            auxiliary["SurfaceParentProb"][0, :, -1] = 1.0
+            auxiliary["SurfaceParentProb"][0, 0, -1] = 0.0
+            auxiliary["SurfaceParentProb"][0, 0, 1] = 1.0
+            auxiliary["SurfaceUV"][0, 0] = torch.tensor(
+                [0.2, 0.8], device=self.device)
+            auxiliary["SurfaceUVConfidence"][0, 0] = 0.63
+            auxiliary["VerificationConfidence"][0, 0] = 0.91
+            auxiliary["ContentChangeProb"][0, 0] = 0.82
+
+            x = torch.randn(1, mem.input_dim, device=self.device)
+            td_error = torch.ones(1, device=self.device)
+            emotion = torch.zeros(1, mem.emotion_dim, device=self.device)
+            ocr = torch.zeros(1, 512, device=self.device)
+            intent = torch.zeros(1, 512, device=self.device)
+            forward_args = dict(
+                tdError=td_error,
+                emotion=emotion,
+                reward=torch.zeros(1, device=self.device),
+                visualState=visual,
+                ocrSemantic=ocr,
+                intentHint=intent,
+                uncertainty=torch.zeros(1, device=self.device),
+                risk=torch.zeros(1, device=self.device),
+                confidence=torch.ones(1, device=self.device))
+            mem(x, **forward_args)
+            ltm_pending = [
+                payload for kind, payload in mem.pending if kind == "ltm"]
+            assert len(ltm_pending) == 1
+            pending_metadata = ltm_pending[0][17]
+            assert torch.equal(
+                pending_metadata["surface_uv_confidence"],
+                torch.tensor([0.63], device=self.device))
+
+            mem(x, **forward_args)
+            episodic = mem.ltm.episodic
+            assert int(episodic.filled[0].item()) == 1
+            assert int(episodic.realm[0, 0].item()) == int(
+                Realm.VIRTUAL_CONTENT)
+            assert int(episodic.source[0, 0].item()) == MemoryType.SRC_REAL
+            assert int(episodic.agency_id[0, 0].item()) == int(
+                Agency.AUTONOMOUS)
+            assert int(episodic.observed_surface_parent_index[0, 0].item()) == 1
+            assert torch.allclose(
+                episodic.surface_uv[0, 0],
+                torch.tensor([0.2, 0.8], device=self.device))
+            assert torch.allclose(
+                episodic.surface_uv_confidence[0, 0],
+                torch.tensor(0.63, device=self.device))
+            assert torch.allclose(
+                episodic.verification[0, 0],
+                torch.tensor(0.91, device=self.device))
+            assert torch.allclose(
+                episodic.content_change[0, 0],
+                torch.tensor(0.82, device=self.device))
+            print("Forward/flush typed episodic-metadata test passed.")
+            return True
+        except Exception as e:
+            print(f"Forward/flush typed episodic-metadata test failed: {e}")
             return False
 
     def TestObjectUsagePosteriorAndUnknown(self):
@@ -8344,11 +9677,12 @@ class TestMemoryMTool:
             with torch.no_grad():
                 visual.SemanticNodes["node_logits"][..., 0] = 100.0
                 visual.SemanticNodes["node_logits"][..., 1] = -100.0
+                visual.Auxiliary["PerceptualPresence"].zero_()
             attended = torch.randn(
                 2, mem.input_dim, device=self.device, requires_grad=True)
             differentiable_inputs = [
                 visual.ObjectTokens,
-                visual.SemanticNodes["node_logits"],
+                visual.Auxiliary["PerceptualPresence"],
                 visual.SemanticNodes["level_logits"],
                 visual.SemanticNodes["object_class_logits"],
                 visual.SemanticNodes["part_class_logits"],
@@ -8357,7 +9691,11 @@ class TestMemoryMTool:
                 visual.SemanticNodes["bbox_2d"],]
             for value in differentiable_inputs:
                 value.requires_grad_(True)
-            embodied = mem.BuildEmbodiedMemory(attended, visual)
+            ontology = mem.BuildOntologyObjectContext(attended, visual)
+            embodied = mem.BuildEmbodiedMemory(
+                attended,
+                visual,
+                ontology["object_features"])
             assert torch.isfinite(embodied).all()
             assert torch.count_nonzero(embodied).item() == 0
             embodied.square().sum().backward()
@@ -8377,6 +9715,7 @@ class TestMemoryMTool:
             with torch.no_grad():
                 visual.SemanticNodes["node_logits"][..., 0] = 5.0
                 visual.SemanticNodes["node_logits"][..., 1] = 0.0
+                visual.Auxiliary["PerceptualPresence"].zero_()
                 visual.ObjectTokens.fill_(100.0)
                 visual.MotionToken.zero_()
                 visual.PredErrorToken.zero_()
@@ -8387,6 +9726,9 @@ class TestMemoryMTool:
                 mem.event_age.zero_()
                 mem.has_previous_event.fill_(True)
             zeros = torch.zeros(1, device=self.device)
+            ontology = mem.BuildOntologyObjectContext(
+                torch.zeros(1, mem.input_dim, device=self.device),
+                visual)
             probability_a, boundary_a = mem.DetectEventBoundary(
                 torch.zeros(1, mem.input_dim, device=self.device),
                 visual,
@@ -8394,9 +9736,13 @@ class TestMemoryMTool:
                 zeros,
                 zeros,
                 zeros,
-                torch.ones(1, device=self.device))
+                torch.ones(1, device=self.device),
+                ontology)
             with torch.no_grad():
                 visual.ObjectTokens.fill_(-100.0)
+            ontology = mem.BuildOntologyObjectContext(
+                torch.zeros(1, mem.input_dim, device=self.device),
+                visual)
             probability_b, boundary_b = mem.DetectEventBoundary(
                 torch.zeros(1, mem.input_dim, device=self.device),
                 visual,
@@ -8404,7 +9750,8 @@ class TestMemoryMTool:
                 zeros,
                 zeros,
                 zeros,
-                torch.ones(1, device=self.device))
+                torch.ones(1, device=self.device),
+                ontology)
             assert torch.count_nonzero(mem.previous_object_summary).item() == 0
             assert torch.allclose(probability_a, probability_b)
             assert not bool(boundary_a.any().item())
@@ -8423,6 +9770,11 @@ class TestMemoryMTool:
                 gwsSlots=2, emotionDim=4))).to(self.device).eval()
             key = torch.zeros(1, 8, device=self.device); key[0, 0] = 1.0
             value = torch.zeros(1, 8, device=self.device); value[0, 1] = 1.0
+            realm = torch.full(
+                (1,),
+                int(Realm.EXTERNAL_PHYSICAL),
+                device=self.device,
+                dtype=torch.int8)
             common = dict(
                 keySem=key, keyEpi=key, keyEpiState=key,
                 valSem=value, valEpi=value,
@@ -8432,6 +9784,9 @@ class TestMemoryMTool:
                 uncertainty=torch.zeros(1, device=self.device),
                 risk=torch.zeros(1, device=self.device),
                 confidence=torch.ones(1, device=self.device),
+                realm=realm,
+                episodicMetadata=UnknownEpisodicTypeMetadata(
+                    realm, dtype=key.dtype),
                 eventMask=torch.ones(1, device=self.device, dtype=torch.bool),
                 episodeId=torch.zeros(1, device=self.device, dtype=torch.long),
                 eventId=torch.ones(1, device=self.device, dtype=torch.long))
@@ -8507,19 +9862,25 @@ class TestMemoryMTool:
             one = torch.ones(1, device=self.device)
             mask = torch.ones(1, device=self.device, dtype=torch.bool)
             source = torch.zeros(1, device=self.device, dtype=torch.int8)
+            realm = torch.full_like(
+                source,
+                int(Realm.EXTERNAL_PHYSICAL))
             emotion = torch.zeros(1, 4, device=self.device)
 
             destination.time_step.fill_(10)
             destination.KvWrite(
-                key_old, value_old, one, emotion, one, source, one, mask)
+                key_old, value_old, one, emotion, one, source, one, mask,
+                realm=realm)
             shadow = self.MakeTinyMemory()
             shadow.ImportState(destination.ExportState())
             shadow.time_step.fill_(11)
             shadow.KvWrite(
-                key_new, value_new, one, emotion, one, source, one, mask)
+                key_new, value_new, one, emotion, one, source, one, mask,
+                realm=realm)
             shadow.time_step.fill_(12)
             shadow.KvWrite(
-                key_old, 2.0 * value_old, one, emotion, one, source, one, mask)
+                key_old, 2.0 * value_old, one, emotion, one, source, one, mask,
+                realm=realm)
             envelope = self.MemoryDeltaEnvelope(shadow, 10, 12)
 
             destination.time_step.fill_(100)
@@ -8599,16 +9960,24 @@ class TestMemoryMTool:
             value_b = torch.zeros(1, 8, device=self.device); value_b[0, 2] = 3.0
             one = torch.ones(1, device=self.device)
             source = torch.zeros(1, device=self.device, dtype=torch.int8)
+            realm = torch.full_like(
+                source,
+                int(Realm.EXTERNAL_PHYSICAL))
+            realm = torch.full_like(
+                source,
+                int(Realm.EXTERNAL_PHYSICAL))
             base.ltm.semantic.global_step.fill_(10)
             base.ltm.semantic.Store(
-                key_a, value_a, one, source, sourceConfidence=one)
+                key_a, value_a, one, source, sourceConfidence=one,
+                realm=realm)
 
             shadow = self.MakeTinyMemory()
             shadow.ImportState(base.ExportState())
             shadow.time_step.fill_(12)
             shadow.ltm.semantic.global_step.fill_(12)
             shadow.ltm.semantic.Store(
-                key_b, value_b, one, source, sourceConfidence=one)
+                key_b, value_b, one, source, sourceConfidence=one,
+                realm=realm)
             envelope = self.MemoryDeltaEnvelope(shadow, 10, 12)
 
             base.time_step.fill_(100)
@@ -8632,7 +10001,8 @@ class TestMemoryMTool:
             concurrent.ltm.semantic.global_step.fill_(100)
             value_c = torch.zeros_like(value_a); value_c[0, 2] = 5.0
             concurrent.ltm.semantic.Store(
-                key_b, value_c, one, source, sourceConfidence=one)
+                key_b, value_c, one, source, sourceConfidence=one,
+                realm=realm)
             before = {
                 "key": concurrent.ltm.semantic.keys[0, 0].clone(),
                 "value": concurrent.ltm.semantic.vals[0, 0].clone(),
@@ -8667,13 +10037,20 @@ class TestMemoryMTool:
                 device=self.device,
                 dtype=torch.int8)
             emotion = torch.zeros(1, 4, device=self.device)
+            realm = torch.full(
+                (1,),
+                int(Realm.EXTERNAL_PHYSICAL),
+                device=self.device,
+                dtype=torch.int8)
 
             base.time_step.fill_(10)
             base.ltm.semantic.global_step.fill_(10)
             base.KvWrite(
-                key, base_value, one, emotion, one, real, one, mask)
+                key, base_value, one, emotion, one, real, one, mask,
+                realm=realm)
             base.ltm.semantic.Store(
-                key, base_value, one, real, sourceConfidence=one)
+                key, base_value, one, real, sourceConfidence=one,
+                realm=realm)
             fork_state = base.ExportState()
 
             shadow = self.MakeTinyMemory()
@@ -8682,10 +10059,12 @@ class TestMemoryMTool:
             shadow.ltm.semantic.global_step.fill_(12)
             shadow.KvWrite(
                 key, shadow_value, one, emotion, one,
-                imagined, one, mask)
+                imagined, one, mask,
+                realm=realm)
             shadow.ltm.semantic.Store(
                 key, shadow_value, one, imagined,
-                sourceConfidence=one)
+                sourceConfidence=one,
+                realm=realm)
             envelope = self.MemoryDeltaEnvelope(shadow, 10, 12)
 
             main = self.MakeTinyMemory()
@@ -8693,9 +10072,11 @@ class TestMemoryMTool:
             main.time_step.fill_(100)
             main.ltm.semantic.global_step.fill_(100)
             main.KvWrite(
-                key, main_value, one, emotion, one, real, one, mask)
+                key, main_value, one, emotion, one, real, one, mask,
+                realm=realm)
             main.ltm.semantic.Store(
-                key, main_value, one, real, sourceConfidence=one)
+                key, main_value, one, real, sourceConfidence=one,
+                realm=realm)
             main.MergeMemoryDelta(envelope)
 
             expected = torch.tensor(3.0, device=self.device)
@@ -8728,6 +10109,24 @@ class TestMemoryMTool:
                 confidence = torch.tensor([
                     0.2 if event == 1 else 1.0],
                     device=self.device)
+                realm = torch.full(
+                    (1,),
+                    int(Realm.EXTERNAL_PHYSICAL),
+                    device=self.device,
+                    dtype=torch.int8)
+                typed_metadata = UnknownEpisodicTypeMetadata(
+                    realm,
+                    dtype=key.dtype)
+                typed_metadata["agency_id"].fill_(
+                    int(Agency.EXTERNAL_CAUSED))
+                typed_metadata["motion_layer_prob"][0, event % 5] = 1.0
+                typed_metadata["observed_surface_parent_index"].fill_(event)
+                typed_metadata["surface_uv"][0] = torch.tensor(
+                    [0.1 * event, 0.2 * event], device=self.device)
+                typed_metadata["surface_uv_confidence"].fill_(
+                    0.5 + 0.1 * event)
+                typed_metadata["verification"].fill_(0.6 + 0.1 * event)
+                typed_metadata["content_change"].fill_(0.2 * event)
                 epi.Store(
                     key,
                     value,
@@ -8736,7 +10135,9 @@ class TestMemoryMTool:
                     source,
                     sourceConfidence=confidence,
                     episodeId=torch.tensor([7], device=self.device),
-                    eventId=torch.tensor([100 + event], device=self.device))
+                    eventId=torch.tensor([100 + event], device=self.device),
+                    realm=realm,
+                    typedMetadata=typed_metadata)
 
             sym = destination.sym_mem
             sym.global_step.fill_(10)
@@ -8752,7 +10153,13 @@ class TestMemoryMTool:
             middle_key = torch.zeros(1, 8, device=self.device); middle_key[0, 1] = 1.0
             shadow.ltm.episodic.VerifyWithRealEvidence(
                 middle_key,
-                torch.ones(1, device=self.device, dtype=torch.bool))
+                torch.ones(1, device=self.device, dtype=torch.bool),
+                realm)
+            shadow.ltm.episodic.surface_uv[0, 1] = torch.tensor(
+                [0.35, 0.65], device=self.device)
+            shadow.ltm.episodic.surface_uv_confidence[0, 1] = 0.77
+            shadow.ltm.episodic.verification[0, 1] = 0.88
+            shadow.ltm.episodic.content_change[0, 1] = 0.93
             shadow.sym_mem.global_step.fill_(20)
             shadow.sym_mem.P_vals[0, 0].add_(1.0)
             shadow.sym_mem.prio[0, 0] = 0.8
@@ -8780,6 +10187,18 @@ class TestMemoryMTool:
                 epi.source_confidence[0, middle],
                 torch.tensor(0.6, device=self.device))
             assert int(epi.last_rehearsal_step[0, middle].item()) == 100
+            assert torch.allclose(
+                epi.surface_uv[0, middle],
+                torch.tensor([0.35, 0.65], device=self.device))
+            assert torch.allclose(
+                epi.surface_uv_confidence[0, middle],
+                torch.tensor(0.77, device=self.device))
+            assert torch.allclose(
+                epi.verification[0, middle],
+                torch.tensor(0.88, device=self.device))
+            assert torch.allclose(
+                epi.content_change[0, middle],
+                torch.tensor(0.93, device=self.device))
             sequence, valid = epi.RetrieveSequence(
                 torch.tensor([middle], device=self.device))
             assert valid.tolist() == [[True, True, True]]
@@ -8814,6 +10233,9 @@ class TestMemoryMTool:
             emotion = torch.zeros(B, 4, device=self.device)
             reward = torch.zeros(B, device=self.device)
             source = torch.zeros(B, device=self.device, dtype=torch.int8)
+            realm = torch.full_like(
+                source,
+                int(Realm.EXTERNAL_PHYSICAL))
             confidence = torch.ones(B, device=self.device)
             write_mask = torch.tensor([False, True], device=self.device)
             ttl = torch.full((B,), 4, device=self.device, dtype=torch.long)
@@ -8822,14 +10244,16 @@ class TestMemoryMTool:
             memory.pending = [
                 ("kv", (
                     key, value, importance, emotion, reward, source,
-                    confidence, write_mask)),
+                    confidence, realm, write_mask)),
                 ("gws", (
                     key, value, importance, ttl, source,
                     confidence, write_mask)),
                 ("ltm", (
                     key, key, key, value, value, importance,
                     reward, reward, source, reward, reward, confidence,
-                    confidence, write_mask, episode, event)),
+                    confidence, realm, write_mask, episode, event,
+                    UnknownEpisodicTypeMetadata(
+                        realm, dtype=key.dtype))),
                 ("ns", (
                     torch.zeros(B, 4, device=self.device),
                     torch.zeros(B, 4, device=self.device),
@@ -8841,9 +10265,9 @@ class TestMemoryMTool:
             memory.SealPendingRows(done)
             by_kind = {kind: payload for kind, payload in memory.pending}
             for kind, priority_index, mask_index, floor in (
-                ("kv", 2, 7, 1.0),
+                ("kv", 2, 8, 1.0),
                 ("gws", 2, 6, 1.0),
-                ("ltm", 5, 13, 1.5),
+                ("ltm", 5, 14, 1.5),
                 ("ns", 2, 5, 1.0),):
                 payload = by_kind[kind]
                 assert torch.allclose(
@@ -8853,17 +10277,19 @@ class TestMemoryMTool:
                     payload[priority_index][1],
                     torch.tensor(0.3, device=self.device))
                 assert payload[mask_index].tolist() == [True, True]
-            assert by_kind["ltm"][15].tolist() == [8, 9]
+            assert by_kind["ltm"][16].tolist() == [8, 9]
 
             memory.FlushPendingWrites()
             second_mask = torch.zeros(B, device=self.device, dtype=torch.bool)
             memory.pending = [("ltm", (
                 key, key, key, value, value, importance,
                 reward, reward, source, reward, reward, confidence,
-                confidence, second_mask, episode,
-                memory.event_id.detach().clone()))]
+                confidence, realm, second_mask, episode,
+                memory.event_id.detach().clone(),
+                UnknownEpisodicTypeMetadata(
+                    realm, dtype=key.dtype)))]
             memory.SealPendingRows(done)
-            assert memory.pending[0][1][15].tolist() == [9, 9]
+            assert memory.pending[0][1][16].tolist() == [9, 9]
             memory.FlushPendingWrites()
             epi = memory.ltm.episodic
             lane_zero_events = epi.event_id[0, :epi.filled[0]]
@@ -8885,6 +10311,9 @@ class TestMemoryMTool:
             value = torch.zeros(1, 8, device=self.device); value[0, 3] = 1.0
             one = torch.ones(1, device=self.device)
             source = torch.zeros(1, device=self.device, dtype=torch.int8)
+            realm = torch.full_like(
+                source,
+                int(Realm.EXTERNAL_PHYSICAL))
 
             semantic = SemanticLTM(8, 4).to(self.device)
             semantic.Store(
@@ -8892,7 +10321,8 @@ class TestMemoryMTool:
                 value,
                 one,
                 source,
-                sourceConfidence=one)
+                sourceConfidence=one,
+                realm=realm)
             touch_before = semantic.touch.clone()
             rejected = semantic.Retrieve(query, topk=1)
             assert torch.equal(semantic.touch, touch_before)
@@ -8908,7 +10338,10 @@ class TestMemoryMTool:
                 torch.zeros(1, device=self.device),
                 one,
                 source,
-                sourceConfidence=one)
+                sourceConfidence=one,
+                realm=realm,
+                typedMetadata=UnknownEpisodicTypeMetadata(
+                    realm, dtype=opposite.dtype))
             assert int(episodic.RetrieveSeedIndex(query)[0].item()) == -1
             assert int(episodic.RetrieveSeedIndex(opposite)[0].item()) == 0
             print("Null-memory contradictory-cue rejection test passed.")
@@ -9156,6 +10589,7 @@ class TestMemoryMTool:
             "EpisodicEvictAbsReward": self.TestEpisodicEvictionAbsRewardForNegative(),
             "ExportMemoryBankLatestFirst": self.TestExportMemoryBankLatestFirstOrder(),
             "ExportMemoryBankMixedRowValidity": self.TestExportMemoryBankMixedRowValidity(),
+            "ExportConsciousBank": self.TestExportConsciousBank(),
             "DurableStatePreservesBatchLanes": self.TestDurableStatePreservesBatchLanes(),
             "DurableStateRejectsNonCurrentSchema": self.TestDurableStateRejectsNonCurrentSchema(),
             "GlobalWorkspaceLaneIsolation": self.TestGlobalWorkspaceLaneIsolation(),
@@ -9173,6 +10607,10 @@ class TestMemoryMTool:
             "EpisodicSequenceLinks": self.TestEpisodicSequenceLinks(),
             "VerifiedEpisodicSourceRelinksSequence": self.TestVerifiedEpisodicSourceRelinksSequence(),
             "SemanticPrototypeAbstraction": self.TestSemanticPrototypeAbstraction(),
+            "OntologyTypedMemoryIsolation": self.TestOntologyTypedMemoryIsolation(),
+            "OntologyContextAndScreenBoundary": self.TestOntologyContextAndScreenBoundary(),
+            "ForwardFlushPersistsFocusedEpisodicMetadata": (
+                self.TestForwardFlushPersistsFocusedEpisodicMetadata()),
             "ObjectUsagePosteriorAndUnknown": self.TestObjectUsagePosteriorAndUnknown(),
             "EmptyObjectRelationalMemoryFinite": self.TestEmptyObjectRelationalMemoryFinite(),
             "LowPresenceObjectsDoNotTriggerBoundary": self.TestLowPresenceObjectsDoNotTriggerBoundary(),

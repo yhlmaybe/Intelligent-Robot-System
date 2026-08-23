@@ -25,18 +25,18 @@ class ReferenceWeights:
 def BuildReferenceWeights(
     physicalState: Dict[str, torch.Tensor],
     currentStep: torch.Tensor,
+    referenceStrength: torch.Tensor,
     *,
     memoryScale,
     memoryDecayHorizon: float,) -> ReferenceWeights:
-    m_phys = physicalState["MphysRaw"]
     observed = physicalState["Observed"].float() # [B, K_world]
     memory_age = (currentStep - physicalState["LastSeen"].float()).clamp_min(0.0)
     memory_recency = torch.exp(-memory_age / float(memoryDecayHorizon))
-    observed_weight = m_phys * observed
+    observed_weight = referenceStrength * observed
 
     memory_weight = (
         memoryScale
-        * m_phys
+        * referenceStrength
         * physicalState["SlotPresence"]
         * (1.0 - observed)
         * memory_recency)
@@ -50,8 +50,9 @@ def BuildReferenceWeights(
 
 def BuildReferenceScaleContext(
     observedPst: Dict[str, torch.Tensor],
-    demandQuery: torch.Tensor) -> torch.Tensor:
-    observed_strength = observedPst["ObservedSlotMask"] * observedPst["MphysRaw"]
+    demandQuery: torch.Tensor,
+    referenceStrength: torch.Tensor,) -> torch.Tensor:
+    observed_strength = observedPst["ObservedSlotMask"] * referenceStrength
 
     demand = F.normalize(demandQuery, dim=-1, eps=1e-6) # [B, D]
     slot = F.normalize(observedPst["SlotState"], dim=-1, eps=1e-6) # [B, K_obs, D]

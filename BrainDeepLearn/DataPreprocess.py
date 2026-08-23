@@ -5,6 +5,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -16,8 +17,10 @@ from Config import BasicParameters
 from CoreTypes import (
     ROBOT_STATE_FIELDS,
     ValidateOfflineSensorManifest,
+    ValidateRobotTensorContract,
     ValidateRobotStateWirePacket)
 from ModuleMessagerManager import ModuleDim
+from RobotMorphologyModule import EntityAgency, EntityRealm
 
 try:
     import imageio.v3 as iio
@@ -37,6 +40,7 @@ def LoadImageFirstFrame(path: Union[str, Path]) -> np.ndarray:
 
 DEPTH_FILE_SUFFIXES = (".npy", ".npz", ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 ARRAY_FILE_SUFFIXES = DEPTH_FILE_SUFFIXES
+SYNTHETIC_SUPERVISION_SCHEMA_VERSION = 4
 
 
 def ListDepthFiles(path: Union[str, Path]) -> List[Path]:
@@ -83,8 +87,20 @@ def ListJsonFiles(path: Union[str, Path]) -> List[Path]:
 
 
 class OfflineGameDataset(Dataset):
-    def __init__(self, *, calibrationId: str, isTest: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        calibrationId: str,
+        robotMorphology: Any,
+        sensorFrameName: str,
+        isTest: bool = False,
+    ) -> None:
+        ValidateRobotTensorContract(robotMorphology)
+        if type(sensorFrameName) is not str or not sensorFrameName:
+            raise ValueError("sensorFrameName must be a non-empty string")
         self.calibration_id = calibrationId
+        self.robot_morphology = robotMorphology
+        self.sensor_frame_name = sensorFrameName
         if isTest:
             p = Path(BasicParameters.DATA_ROOT_PATH_TEST)
             sensor_manifest_path = Path(
@@ -116,7 +132,11 @@ class OfflineGameDataset(Dataset):
 
         sensor_manifest = json.loads(
             sensor_manifest_path.read_text(encoding="utf-8"))
-        ValidateOfflineSensorManifest(sensor_manifest, calibrationId)
+        ValidateOfflineSensorManifest(
+            sensor_manifest,
+            calibrationId,
+            self.robot_morphology,
+            self.sensor_frame_name)
 
         if not (
             len(self.imgs)
@@ -171,7 +191,10 @@ class OfflineGameDataset(Dataset):
             frame_ids,
             self.robot_states)):
             payload = json.loads(state_path.read_text(encoding="utf-8"))
-            ValidateRobotStateWirePacket(payload, self.calibration_id)
+            ValidateRobotStateWirePacket(
+                payload,
+                self.calibration_id,
+                self.robot_morphology)
             if payload["frame_id"] != frame_id:
                 raise ValueError(
                     "offline RobotState frame_id must match the RGB-D frame identifier")
@@ -241,6 +264,7 @@ class OfflineGameDataset(Dataset):
                 normal_tensor,
                 semantic_segmentation,
                 instance_segmentation,
+                robotMorphology=self.robot_morphology,
                 maxNodes=ModuleDim.PstObservedSlots,
                 textDim=ModuleDim.PstTextDim,
                 stateDim=ModuleDim.PstStateDim,
@@ -589,6 +613,28 @@ class DataPreprocessor:
         return torch.where(valid_t, depth_t, torch.zeros_like(depth_t)), valid_t
 
     @staticmethod
+    def ExpectedSyntheticOntologyVocabularyContract(
+        robotMorphology: Any,
+    ) -> Dict[str, Any]:
+        ValidateRobotTensorContract(robotMorphology)
+        node_count = robotMorphology.node_count
+        return {
+            "realm_names": list(ModuleDim.PstRealmNames),
+            "agency_names": list(ModuleDim.PstAgencyNames),
+            "motion_layer_names": list(ModuleDim.PstMotionLayerNames),
+            "ontology_relation_names": list(
+                ModuleDim.PstOntologyRelationNames),
+            "description_id": robotMorphology.description_id,
+            "model_contract_id": robotMorphology.model_contract_id,
+            "adapter_id": robotMorphology.adapter_id,
+            "self_part_names": list(robotMorphology.node_names),
+            "self_part_parent_indices": (
+                robotMorphology.parent_index.detach().cpu().tolist()),
+            "self_part_count": node_count,
+            "observed_slot_capacity": ModuleDim.PstObservedSlots,
+            "virtual_slot_capacity": ModuleDim.PstVirtualSlots,}
+
+    @staticmethod
     def TensorizeSyntheticSupervision(
         annotation: Dict[str, Any],
         rgb: torch.Tensor,
@@ -598,6 +644,7 @@ class DataPreprocessor:
         semanticSegmentation: torch.Tensor,
         instanceSegmentation: torch.Tensor,
         *,
+        robotMorphology: Any,
         maxNodes: int = 256,
         numGlobalLabels: int = 8,
         textDim: int = 4,
@@ -605,28 +652,43 @@ class DataPreprocessor:
         attrDim: int = 32,
         affordanceDim: int = 8,
         relationClasses: int = 32,) -> Dict[str, torch.Tensor]:
-        """Tensorize labels under the coordinate contract in the dataset manifest.
-
-        ``motion`` is an SE(3) spatial delta from the previous object state to
-        the current state after camera-egomotion compensation, expressed in the
-        current camera-optical axes (metres plus an XYZW quaternion).
-        """
         dtype = rgb.dtype
         device = rgb.device
         height, width = rgb.shape[-2:]
+        if (
+            type(annotation["schema_version"]) is not int
+            or annotation["schema_version"]
+            != SYNTHETIC_SUPERVISION_SCHEMA_VERSION
+        ):
+            raise ValueError("unsupported synthetic supervision schema")
+        ontology_vocabulary = annotation["ontology_vocabulary"]
+        expected_vocabulary = (
+            DataPreprocessor.ExpectedSyntheticOntologyVocabularyContract(
+                robotMorphology))
+        if (
+            type(ontology_vocabulary) is not dict
+            or ontology_vocabulary != expected_vocabulary
+        ):
+            raise ValueError(
+                "synthetic ontology vocabulary/body schema does not match "
+                "the deployed model contract")
         coverage = annotation["coverage"]
         if type(coverage) is not dict or set(coverage) != {
             "relations_exhaustive",
             "contact_events_exhaustive",
+            "ontology_relations_exhaustive",
         }:
             raise ValueError(
-                "synthetic coverage must declare exhaustive relation and contact labels")
+                "synthetic coverage fields do not match schema v3")
         if (
             coverage["relations_exhaustive"] is not True
             or coverage["contact_events_exhaustive"] is not True
         ):
             raise ValueError(
                 "relation/contact negatives require exhaustive synthetic annotations")
+        if type(coverage["ontology_relations_exhaustive"]) is not bool:
+            raise TypeError(
+                "coverage.ontology_relations_exhaustive must be boolean")
         temporal = annotation["temporal"]
         if type(temporal["kind_valid"]) is not bool or type(
             temporal["duration_valid"]
@@ -666,7 +728,11 @@ class DataPreprocessor:
         part_classes = torch.zeros(N, device=device, dtype=torch.long)
         track_id = torch.zeros(N, device=device, dtype=torch.long)
         pose_camera = torch.zeros(N, 7, device=device, dtype=dtype)
+        pose_camera[:, 6] = 1.0
         pose_world = torch.zeros(N, 7, device=device, dtype=dtype)
+        pose_world[:, 6] = 1.0
+        pose_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        geometry_valid = torch.zeros(N, device=device, dtype=torch.bool)
         size_3d = torch.zeros(N, 3, device=device, dtype=dtype)
         bbox_2d = torch.zeros(N, 4, device=device, dtype=dtype)
         node_instance_masks = torch.zeros(N, height, width, device=device, dtype=torch.bool)
@@ -679,6 +745,54 @@ class DataPreprocessor:
         has_text = torch.zeros(N, device=device, dtype=torch.long)
         text_embed = torch.zeros(N, textDim, device=device, dtype=dtype)
         symbol_type = torch.zeros(N, device=device, dtype=torch.long)
+        physical_entity = torch.zeros(N, device=device, dtype=dtype)
+        physical_entity_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        physical_interaction = torch.zeros(N, device=device, dtype=dtype)
+        physical_interaction_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        realm = torch.full(
+            (N,), int(EntityRealm.UNKNOWN), device=device, dtype=torch.long)
+        realm_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        motion_layer_multi_hot = torch.zeros(
+            N, ModuleDim.PstMotionLayerClasses, device=device, dtype=dtype)
+        motion_layer_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        agency_by_layer = torch.full(
+            (N, ModuleDim.PstMotionLayerClasses),
+            int(EntityAgency.UNKNOWN),
+            device=device,
+            dtype=torch.long)
+        agency_by_layer_valid = torch.zeros(
+            N, ModuleDim.PstMotionLayerClasses,
+            device=device,
+            dtype=torch.bool)
+        body_membership = torch.zeros(N, device=device, dtype=dtype)
+        body_membership_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        self_part_id = torch.zeros(N, device=device, dtype=torch.long)
+        self_part_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        display_surface = torch.zeros(N, device=device, dtype=dtype)
+        display_surface_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        surface_parent_index = torch.full(
+            (N,), -1, device=device, dtype=torch.long)
+        surface_parent_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        surface_uv = torch.zeros(N, 2, device=device, dtype=dtype)
+        surface_uv_valid = torch.zeros(N, device=device, dtype=torch.bool)
+        verification_confidence = torch.zeros(N, device=device, dtype=dtype)
+        verification_confidence_valid = torch.zeros(
+            N, device=device, dtype=torch.bool)
+        carrier_motion = torch.zeros(N, 7, device=device, dtype=dtype)
+        carrier_motion[:, 6] = 1.0
+        carrier_motion_valid = torch.zeros(
+            N, device=device, dtype=torch.bool)
+        articulation_motion = torch.zeros(N, 7, device=device, dtype=dtype)
+        articulation_motion[:, 6] = 1.0
+        articulation_motion_valid = torch.zeros(
+            N, device=device, dtype=torch.bool)
+        content_motion_uv = torch.zeros(N, 2, device=device, dtype=dtype)
+        content_motion_uv_valid = torch.zeros(
+            N, device=device, dtype=torch.bool)
+        content_change = torch.zeros(N, device=device, dtype=dtype)
+        content_change_valid = torch.zeros(
+            N, device=device, dtype=torch.bool)
+        surface_parent_node_ids: List[Optional[int]] = [None] * N
         node_lookup: Dict[int, int] = {}
 
         def validated_pose(value: Any, *, field: str) -> torch.Tensor:
@@ -694,6 +808,67 @@ class DataPreprocessor:
                 raise ValueError(f"{field} quaternion must have unit length")
             return pose
 
+        def validated_flag(value: Any, *, field: str) -> bool:
+            if type(value) is not bool:
+                raise TypeError(f"{field} must be boolean")
+            return value
+
+        def validated_vector(
+            value: Any,
+            shape: Tuple[int, ...],
+            *,
+            field: str,
+        ) -> torch.Tensor:
+            vector = torch.as_tensor(value, device=device, dtype=dtype)
+            if (
+                tuple(vector.shape) != shape
+                or not bool(torch.isfinite(vector).all().item())
+            ):
+                raise ValueError(
+                    f"{field} must be a finite tensor with shape {shape}")
+            return vector
+
+        def validated_binary_target(
+            value: Any,
+            valid: bool,
+            *,
+            field: str,
+        ) -> float:
+            if not valid:
+                if value is not None:
+                    raise ValueError(
+                        f"{field} must be null when its validity is false")
+                return 0.0
+            if type(value) not in (int, float) or float(value) not in (0.0, 1.0):
+                raise ValueError(f"{field} must be exactly 0 or 1")
+            return float(value)
+
+        def validated_confidence_target(
+            value: Any,
+            valid: bool,
+            *,
+            field: str,
+        ) -> float:
+            if not valid:
+                if value is not None:
+                    raise ValueError(
+                        f"{field} must be null when its validity is false")
+                return 0.0
+            if (
+                type(value) not in (int, float)
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= 1.0
+            ):
+                raise ValueError(f"{field} must be finite and in [0, 1]")
+            return float(value)
+
+        realm_to_id = {
+            name: index for index, name in enumerate(ModuleDim.PstRealmNames)}
+        agency_to_id = {
+            name: index for index, name in enumerate(ModuleDim.PstAgencyNames)}
+        self_part_to_id = {
+            name: index for index, name in enumerate(robotMorphology.node_names)}
+
         for index, (node, parent) in enumerate(nodes):
             level = int(node["level"])
             current_node_id = int(node["node_id"])
@@ -704,18 +879,36 @@ class DataPreprocessor:
             node_level[index] = level
             parent_index[index] = int(parent)
             track_id[index] = int(annotation["episode_id"]) * 1000000 + int(node["identity_id"])
-            pose_camera[index] = validated_pose(
-                node["pose_camera"], field=f"node {current_node_id} pose_camera")
-            pose_world[index] = validated_pose(
-                node["pose_world"], field=f"node {current_node_id} pose_world")
-            node_size = torch.as_tensor(node["size_3d"], device=device, dtype=dtype)
-            if (
-                tuple(node_size.shape) != (3,)
-                or not bool(torch.isfinite(node_size).all().item())
-                or bool((node_size <= 0.0).any().item())
-            ):
-                raise ValueError(f"node {current_node_id} size_3d must be finite and positive")
-            size_3d[index] = node_size
+            node_pose_valid = validated_flag(
+                node["pose_valid"],
+                field=f"node {current_node_id} pose_valid")
+            pose_valid[index] = node_pose_valid
+            if node_pose_valid:
+                pose_camera[index] = validated_pose(
+                    node["pose_camera"],
+                    field=f"node {current_node_id} pose_camera")
+                pose_world[index] = validated_pose(
+                    node["pose_world"],
+                    field=f"node {current_node_id} pose_world")
+            elif node["pose_camera"] is not None or node["pose_world"] is not None:
+                raise ValueError(
+                    f"node {current_node_id} poses must be null when pose_valid is false")
+            node_geometry_valid = validated_flag(
+                node["geometry_valid"],
+                field=f"node {current_node_id} geometry_valid")
+            geometry_valid[index] = node_geometry_valid
+            if node_geometry_valid:
+                node_size = validated_vector(
+                    node["size_3d"],
+                    (3,),
+                    field=f"node {current_node_id} size_3d")
+                if bool((node_size <= 0.0).any().item()):
+                    raise ValueError(
+                        f"node {current_node_id} size_3d must be positive")
+                size_3d[index] = node_size
+            elif node["size_3d"] is not None:
+                raise ValueError(
+                    f"node {current_node_id} size_3d must be null when geometry_valid is false")
             xyxy = torch.tensor(node["bbox_2d"], device=device, dtype=dtype)
             if (
                 tuple(xyxy.shape) != (4,)
@@ -750,7 +943,324 @@ class DataPreprocessor:
                 symbol_type[index] = int(node["symbol_type"])
                 if int(node["has_text"]) == 1:
                     text_embed[index] = torch.tensor(node["text_embed"], device=device, dtype=dtype)
+
+            node_physical_valid = validated_flag(
+                node["physical_entity_valid"],
+                field=f"node {current_node_id} physical_entity_valid")
+            physical_entity_valid[index] = node_physical_valid
+            physical_entity[index] = validated_binary_target(
+                node["physical_entity"],
+                node_physical_valid,
+                field=f"node {current_node_id} physical_entity")
+
+            node_interaction_valid = validated_flag(
+                node["physical_interaction_valid"],
+                field=(
+                    f"node {current_node_id} physical_interaction_valid"))
+            physical_interaction_valid[index] = node_interaction_valid
+            physical_interaction[index] = validated_binary_target(
+                node["physical_interaction"],
+                node_interaction_valid,
+                field=f"node {current_node_id} physical_interaction")
+
+            node_realm_valid = validated_flag(
+                node["realm_valid"],
+                field=f"node {current_node_id} realm_valid")
+            realm_valid[index] = node_realm_valid
+            node_realm = node["realm"]
+            if node_realm_valid:
+                if type(node_realm) is not str or node_realm not in realm_to_id:
+                    raise ValueError(
+                        f"node {current_node_id} realm is outside the vocabulary")
+                realm[index] = realm_to_id[node_realm]
+            elif node_realm is not None:
+                raise ValueError(
+                    f"node {current_node_id} realm must be null when realm_valid is false")
+
+            node_layer_valid = validated_flag(
+                node["motion_layer_valid"],
+                field=f"node {current_node_id} motion_layer_valid")
+            motion_layer_valid[index] = node_layer_valid
+            node_layers = node["motion_layer_multi_hot"]
+            if node_layer_valid:
+                if (
+                    type(node_layers) is not list
+                    or len(node_layers) != ModuleDim.PstMotionLayerClasses
+                    or any(
+                        type(value) not in (int, float)
+                        or float(value) not in (0.0, 1.0)
+                        for value in node_layers)
+                ):
+                    raise ValueError(
+                        f"node {current_node_id} motion_layer_multi_hot must "
+                        f"contain exactly {ModuleDim.PstMotionLayerClasses} binary values")
+                motion_layer_multi_hot[index] = torch.tensor(
+                    node_layers, device=device, dtype=dtype)
+            elif node_layers is not None:
+                raise ValueError(
+                    f"node {current_node_id} motion_layer_multi_hot must be "
+                    "null when motion_layer_valid is false")
+
+            node_agency_valid = node["agency_by_layer_valid"]
+            node_agency = node["agency_by_layer"]
+            if (
+                type(node_agency_valid) is not list
+                or len(node_agency_valid) != ModuleDim.PstMotionLayerClasses
+                or any(type(value) is not bool for value in node_agency_valid)
+                or type(node_agency) is not list
+                or len(node_agency) != ModuleDim.PstMotionLayerClasses
+            ):
+                raise ValueError(
+                    f"node {current_node_id} agency-by-layer fields must each "
+                    f"contain {ModuleDim.PstMotionLayerClasses} entries")
+            for layer_index, (agency_name, valid) in enumerate(zip(
+                node_agency,
+                node_agency_valid,
+            )):
+                agency_by_layer_valid[index, layer_index] = valid
+                if valid:
+                    if (
+                        type(agency_name) is not str
+                        or agency_name not in agency_to_id
+                    ):
+                        raise ValueError(
+                            f"node {current_node_id} agency_by_layer[{layer_index}] "
+                            "is outside the vocabulary")
+                    agency_by_layer[index, layer_index] = (
+                        agency_to_id[agency_name])
+                elif agency_name is not None:
+                    raise ValueError(
+                        f"node {current_node_id} agency_by_layer[{layer_index}] "
+                        "must be null when invalid")
+            if node_layer_valid:
+                for layer_index, active in enumerate(node_layers):
+                    if bool(active) != node_agency_valid[layer_index]:
+                        raise ValueError(
+                            f"node {current_node_id} motion layer {layer_index} "
+                            "and agency validity must agree")
+            elif any(node_agency_valid):
+                raise ValueError(
+                    f"node {current_node_id} cannot supervise agency when "
+                    "motion layers are invalid")
+
+            node_body_valid = validated_flag(
+                node["body_membership_valid"],
+                field=f"node {current_node_id} body_membership_valid")
+            body_membership_valid[index] = node_body_valid
+            body_membership[index] = validated_binary_target(
+                node["body_membership"],
+                node_body_valid,
+                field=f"node {current_node_id} body_membership")
+
+            node_self_part_valid = validated_flag(
+                node["self_part_valid"],
+                field=f"node {current_node_id} self_part_valid")
+            self_part_valid[index] = node_self_part_valid
+            node_self_part = node["self_part"]
+            if node_self_part_valid:
+                if (
+                    type(node_self_part) is not str
+                    or node_self_part not in self_part_to_id
+                ):
+                    raise ValueError(
+                        f"node {current_node_id} self_part is outside the "
+                        "active robot morphology")
+                self_part_id[index] = self_part_to_id[node_self_part]
+            elif node_self_part is not None:
+                raise ValueError(
+                    f"node {current_node_id} self_part must be null when invalid")
+
+            node_carrier_valid = validated_flag(
+                node["carrier_motion_valid"],
+                field=f"node {current_node_id} carrier_motion_valid")
+            carrier_motion_valid[index] = node_carrier_valid
+            if node_carrier_valid:
+                carrier_motion[index] = validated_pose(
+                    node["carrier_motion"],
+                    field=f"node {current_node_id} carrier_motion")
+            elif node["carrier_motion"] is not None:
+                raise ValueError(
+                    f"node {current_node_id} carrier_motion must be null when invalid")
+
+            node_articulation_valid = validated_flag(
+                node["articulation_motion_valid"],
+                field=f"node {current_node_id} articulation_motion_valid")
+            articulation_motion_valid[index] = node_articulation_valid
+            if node_articulation_valid:
+                articulation_motion[index] = validated_pose(
+                    node["articulation_motion"],
+                    field=f"node {current_node_id} articulation_motion")
+            elif node["articulation_motion"] is not None:
+                raise ValueError(
+                    f"node {current_node_id} articulation_motion must be null when invalid")
+
+            node_content_motion_valid = validated_flag(
+                node["content_motion_uv_valid"],
+                field=f"node {current_node_id} content_motion_uv_valid")
+            content_motion_uv_valid[index] = node_content_motion_valid
+            if node_content_motion_valid:
+                content_motion_uv[index] = validated_vector(
+                    node["content_motion_uv"],
+                    (2,),
+                    field=f"node {current_node_id} content_motion_uv")
+            elif node["content_motion_uv"] is not None:
+                raise ValueError(
+                    f"node {current_node_id} content_motion_uv must be null when invalid")
+
+            node_content_change_valid = validated_flag(
+                node["content_change_valid"],
+                field=f"node {current_node_id} content_change_valid")
+            content_change_valid[index] = node_content_change_valid
+            content_change[index] = validated_binary_target(
+                node["content_change"],
+                node_content_change_valid,
+                field=f"node {current_node_id} content_change")
+
+            node_display_valid = validated_flag(
+                node["display_surface_valid"],
+                field=f"node {current_node_id} display_surface_valid")
+            display_surface_valid[index] = node_display_valid
+            display_surface[index] = validated_binary_target(
+                node["display_surface"],
+                node_display_valid,
+                field=f"node {current_node_id} display_surface")
+
+            node_surface_parent_valid = validated_flag(
+                node["surface_parent_valid"],
+                field=f"node {current_node_id} surface_parent_valid")
+            surface_parent_valid[index] = node_surface_parent_valid
+            node_surface_parent = node["surface_parent_node_id"]
+            if node_surface_parent_valid:
+                if (
+                    node_surface_parent is not None
+                    and type(node_surface_parent) is not int
+                ):
+                    raise TypeError(
+                        f"node {current_node_id} surface_parent_node_id must "
+                        "be an integer node_id or null")
+                surface_parent_node_ids[index] = node_surface_parent
+            elif node_surface_parent is not None:
+                raise ValueError(
+                    f"node {current_node_id} surface_parent_node_id must be "
+                    "null when surface_parent_valid is false")
+
+            node_surface_uv_valid = validated_flag(
+                node["surface_uv_valid"],
+                field=f"node {current_node_id} surface_uv_valid")
+            surface_uv_valid[index] = node_surface_uv_valid
+            if node_surface_uv_valid:
+                node_uv = validated_vector(
+                    node["surface_uv"],
+                    (2,),
+                    field=f"node {current_node_id} surface_uv")
+                if bool(((node_uv < 0.0) | (node_uv > 1.0)).any().item()):
+                    raise ValueError(
+                        f"node {current_node_id} surface_uv must be in [0, 1]")
+                surface_uv[index] = node_uv
+            elif node["surface_uv"] is not None:
+                raise ValueError(
+                    f"node {current_node_id} surface_uv must be null when invalid")
+
+            node_verification_valid = validated_flag(
+                node["verification_confidence_valid"],
+                field=(
+                    f"node {current_node_id} verification_confidence_valid"))
+            verification_confidence_valid[index] = node_verification_valid
+            verification_confidence[index] = validated_confidence_target(
+                node["verification_confidence"],
+                node_verification_valid,
+                field=f"node {current_node_id} verification_confidence")
+
+            if (
+                node_interaction_valid
+                and physical_interaction[index].item() == 1.0
+                and (
+                    not node_physical_valid
+                    or physical_entity[index].item() != 1.0)
+            ):
+                raise ValueError(
+                    f"node {current_node_id} physical interaction requires a "
+                    "verified physical entity")
+            if node_realm_valid and node_realm != "unknown":
+                expected_physical = float(node_realm in (
+                    "self_body", "external_physical"))
+                if (
+                    not node_physical_valid
+                    or physical_entity[index].item() != expected_physical
+                ):
+                    raise ValueError(
+                        f"node {current_node_id} realm and physical_entity conflict")
+            if (
+                node_realm_valid
+                and node_realm in ("virtual_content", "visual_effect")
+                and (node_pose_valid or node_geometry_valid)
+            ):
+                raise ValueError(
+                    f"node {current_node_id} virtual/effect realm cannot own "
+                    "an independent 3D pose or collision geometry")
+            if node_realm_valid and node_body_valid:
+                expected_body = float(node_realm == "self_body")
+                if body_membership[index].item() != expected_body:
+                    raise ValueError(
+                        f"node {current_node_id} realm and body_membership conflict")
+            if node_body_valid and body_membership[index].item() == 1.0:
+                if (
+                    not node_realm_valid
+                    or node_realm != "self_body"
+                    or not node_self_part_valid
+                ):
+                    raise ValueError(
+                        f"node {current_node_id} body member requires self_body "
+                        "realm and a morphology self_part label")
+            elif node_self_part_valid:
+                raise ValueError(
+                    f"node {current_node_id} self_part requires positive body membership")
             node_lookup[current_node_id] = index
+
+        virtual_or_effect = (
+            realm_valid
+            & (
+                realm.eq(int(EntityRealm.VIRTUAL_CONTENT))
+                | realm.eq(int(EntityRealm.VISUAL_EFFECT))))
+        if int(virtual_or_effect.sum().item()) > ModuleDim.PstVirtualSlots:
+            raise ValueError(
+                "synthetic annotation exceeds the fixed virtual/effect slot capacity")
+
+        for index, surface_parent_node_id in enumerate(
+            surface_parent_node_ids[:len(nodes)]
+        ):
+            if surface_parent_node_id is None:
+                continue
+            if surface_parent_node_id not in node_lookup:
+                raise ValueError(
+                    f"node {int(node_id[index].item())} surface parent references "
+                    f"unknown node_id {surface_parent_node_id}")
+            parent_slot = node_lookup[surface_parent_node_id]
+            if parent_slot == index:
+                raise ValueError("a node cannot be its own display-surface parent")
+            if not (
+                bool(display_surface_valid[parent_slot].item())
+                and display_surface[parent_slot].item() == 1.0
+            ):
+                raise ValueError(
+                    f"surface parent node_id {surface_parent_node_id} is not "
+                    "labelled as a display surface")
+            if not (
+                bool(realm_valid[index].item())
+                and int(realm[index].item()) in (
+                    int(EntityRealm.VIRTUAL_CONTENT),
+                    int(EntityRealm.VISUAL_EFFECT),
+                )
+            ):
+                raise ValueError(
+                    "only virtual-content or visual-effect nodes may have a "
+                    "display-surface parent")
+            surface_parent_index[index] = parent_slot
+        for index in range(len(nodes)):
+            if bool(surface_uv_valid[index].item()) and surface_parent_index[index] < 0:
+                raise ValueError(
+                    f"node {int(node_id[index].item())} surface_uv requires a "
+                    "display-surface parent")
 
         relation_type = torch.zeros(N, N, device=device, dtype=torch.long)
         relation_valid = node_valid.unsqueeze(1) & node_valid.unsqueeze(0)
@@ -769,6 +1279,120 @@ class DataPreprocessor:
                 relation_type[node_lookup[subject], node_lookup[obj]] = relation_id
             else:
                 external_relation[node_lookup[subject], relation_id] = 1.0
+
+        ontology_relation_multi_hot = torch.zeros(
+            N,
+            N,
+            ModuleDim.PstOntologyRelationClasses,
+            device=device,
+            dtype=dtype)
+        if coverage["ontology_relations_exhaustive"]:
+            ontology_relation_valid = (
+                node_valid.unsqueeze(1) & node_valid.unsqueeze(0))
+            ontology_relation_valid = (
+                ontology_relation_valid
+                & ~torch.eye(N, device=device, dtype=torch.bool))
+        else:
+            ontology_relation_valid = torch.zeros(
+                N, N, device=device, dtype=torch.bool)
+        ontology_relation_to_id = {
+            name: index
+            for index, name in enumerate(ModuleDim.PstOntologyRelationNames)}
+        labelled_ontology_pairs = set()
+        for relation in annotation["ontology_relations"]:
+            if type(relation) is not dict or set(relation) != {
+                "subject_node_id",
+                "object_node_id",
+                "relation_types",
+            }:
+                raise ValueError(
+                    "each ontology relation must declare subject_node_id, "
+                    "object_node_id and relation_types")
+            subject = relation["subject_node_id"]
+            obj = relation["object_node_id"]
+            relation_names = relation["relation_types"]
+            if type(subject) is not int or subject not in node_lookup:
+                raise ValueError(
+                    f"ontology relation references unknown subject node_id {subject}")
+            if type(obj) is not int or obj not in node_lookup:
+                raise ValueError(
+                    f"ontology relation references unknown object node_id {obj}")
+            if subject == obj:
+                raise ValueError("ontology self-relations are not supervised")
+            pair = (node_lookup[subject], node_lookup[obj])
+            if pair in labelled_ontology_pairs:
+                raise ValueError(
+                    f"duplicate ontology relation pair ({subject}, {obj})")
+            labelled_ontology_pairs.add(pair)
+            if (
+                type(relation_names) is not list
+                or len(relation_names) != len(set(relation_names))
+                or any(
+                    type(name) is not str
+                    or name not in ontology_relation_to_id
+                    for name in relation_names)
+            ):
+                raise ValueError(
+                    f"ontology relation pair ({subject}, {obj}) contains "
+                    "invalid or duplicate relation names")
+            ontology_relation_valid[pair] = True
+            for relation_name in relation_names:
+                ontology_relation_multi_hot[
+                    pair[0],
+                    pair[1],
+                    ontology_relation_to_id[relation_name],
+                ] = 1.0
+                source_realm = int(realm[pair[0]].item())
+                target_is_self = (
+                    bool(body_membership_valid[pair[1]].item())
+                    and body_membership[pair[1]].item() == 1.0)
+                target_is_display = (
+                    bool(display_surface_valid[pair[1]].item())
+                    and display_surface[pair[1]].item() == 1.0)
+                if relation_name in (
+                    "displayed_on",
+                    "inside_display_region",
+                ) and not (
+                    bool(realm_valid[pair[0]].item())
+                    and source_realm == int(EntityRealm.VIRTUAL_CONTENT)
+                    and target_is_display
+                ):
+                    raise ValueError(
+                        f"{relation_name} requires virtual-content subject "
+                        "and display-surface object")
+                if relation_name in (
+                    "held_by",
+                    "attached_to_self",
+                ) and not (
+                    bool(realm_valid[pair[0]].item())
+                    and source_realm == int(EntityRealm.EXTERNAL_PHYSICAL)
+                    and target_is_self
+                ):
+                    raise ValueError(
+                        f"{relation_name} requires external-physical subject "
+                        "and self-body object")
+                if relation_name == "contacting_self" and not target_is_self:
+                    raise ValueError(
+                        "contacting_self requires a self-body object")
+                if relation_name == "shadow_of" and not (
+                    bool(realm_valid[pair[0]].item())
+                    and source_realm == int(EntityRealm.VISUAL_EFFECT)
+                ):
+                    raise ValueError(
+                        "shadow_of requires a visual-effect subject")
+        moving_with_id = ontology_relation_to_id["moving_with"]
+        moving_with = ontology_relation_multi_hot[..., moving_with_id].bool()
+        for source, target in torch.nonzero(
+            moving_with,
+            as_tuple=False,
+        ).tolist():
+            if not (
+                bool(ontology_relation_valid[target, source].item())
+                and bool(moving_with[target, source].item())
+            ):
+                raise ValueError(
+                    "moving_with is symmetric and must be explicitly labelled "
+                    "in both directions")
 
         motion = torch.zeros(N, 7, device=device, dtype=dtype)
         motion[:, 6] = 1.0
@@ -859,6 +1483,8 @@ class DataPreprocessor:
             "track_id": track_id,
             "pose_camera": pose_camera,
             "pose_world": pose_world,
+            "pose_valid": pose_valid,
+            "geometry_valid": geometry_valid,
             "size_3d": size_3d,
             "bbox_2d": bbox_2d,
             "node_instance_masks": node_instance_masks,
@@ -871,6 +1497,40 @@ class DataPreprocessor:
             "has_text": has_text,
             "text_embed": text_embed,
             "symbol_type": symbol_type,
+            "physical_entity": physical_entity,
+            "physical_entity_valid": physical_entity_valid,
+            "physical_interaction": physical_interaction,
+            "physical_interaction_valid": physical_interaction_valid,
+            "realm": realm,
+            "realm_valid": realm_valid,
+            "motion_layer_multi_hot": motion_layer_multi_hot,
+            "motion_layer_valid": motion_layer_valid,
+            "agency_by_layer": agency_by_layer,
+            "agency_by_layer_valid": agency_by_layer_valid,
+            "body_membership": body_membership,
+            "body_membership_valid": body_membership_valid,
+            "self_part_id": self_part_id,
+            "self_part_valid": self_part_valid,
+            "carrier_motion": carrier_motion,
+            "carrier_motion_valid": carrier_motion_valid,
+            "articulation_motion": articulation_motion,
+            "articulation_motion_valid": articulation_motion_valid,
+            "content_motion_uv": content_motion_uv,
+            "content_motion_uv_valid": content_motion_uv_valid,
+            "content_change": content_change,
+            "content_change_valid": content_change_valid,
+            "display_surface": display_surface,
+            "display_surface_valid": display_surface_valid,
+            "surface_parent_index": surface_parent_index,
+            "surface_parent_valid": surface_parent_valid,
+            "surface_uv": surface_uv,
+            "surface_uv_valid": surface_uv_valid,
+            "verification_confidence": verification_confidence,
+            "verification_confidence_valid": (
+                verification_confidence_valid),
+            "ontology_relation_multi_hot": (
+                ontology_relation_multi_hot),
+            "ontology_relation_valid": ontology_relation_valid,
             "relation_type": relation_type,
             "relation_valid": relation_valid,
             "external_relation": external_relation,
@@ -1449,3 +2109,446 @@ class DataPreprocessor:
             "target_lengths": target_lengths,
             "norm_text": norm_text,
             "ignore": ignore,}
+
+
+class TestDataPreprocessor:
+    @staticmethod
+    def MakeRobotMorphology(
+        nodeNames: Tuple[str, ...],
+    ) -> Any:
+        node_count = len(nodeNames)
+        parent_index = torch.full(
+            (node_count,), -1, dtype=torch.long)
+        if node_count > 1:
+            parent_index[1:node_count] = torch.arange(node_count - 1)
+        joint_count = node_count - 1
+        return SimpleNamespace(
+            description_id=f"test-description-{node_count}",
+            model_contract_id=(
+                "test-contract-" + "-".join(nodeNames)),
+            adapter_id=(
+                "test-adapter-" + "-".join(nodeNames)),
+            node_names=nodeNames,
+            joint_names=tuple(
+                f"fixed_joint_{index}" for index in range(joint_count)),
+            group_names=(),
+            endpoint_names=(),
+            joint_variable_names=(),
+            gripper_names=(),
+            sensor_names=(),
+            sensor_types=(),
+            node_count=node_count,
+            joint_count=joint_count,
+            group_count=0,
+            endpoint_count=0,
+            joint_dof_count=0,
+            commandable_joint_dof_count=0,
+            task_control_coordinate_count=0,
+            gripper_count=0,
+            sensor_count=0,
+            group_dof_count=(),
+            parent_index=parent_index,
+            joint_parent_node=torch.full(
+                (joint_count,), -1, dtype=torch.long)
+                if joint_count == 0 else torch.arange(
+                    joint_count, dtype=torch.long),
+            joint_child_node=torch.full(
+                (joint_count,), -1, dtype=torch.long)
+                if joint_count == 0 else torch.arange(
+                    1, node_count, dtype=torch.long),
+            joint_type=torch.full(
+                (joint_count,),
+                ModuleDim.RobotJointTypeNames.index("fixed"),
+                dtype=torch.long),
+            endpoint_to_node=torch.full(
+                (0,), -1, dtype=torch.long),
+            endpoint_task_mask=torch.zeros(
+                0,
+                ModuleDim.RobotControlAxisDim,
+                dtype=torch.bool),
+            joint_variable_commandable=torch.zeros(
+                0, dtype=torch.bool),
+            joint_variable_joint_index=torch.full(
+                (0,), -1, dtype=torch.long),
+            joint_variable_child_node=torch.full(
+                (0,), -1, dtype=torch.long),
+            joint_variable_local_index=torch.full(
+                (0,), -1, dtype=torch.long),
+            joint_lower=torch.full(
+                (0,), -torch.inf),
+            joint_upper=torch.full(
+                (0,), torch.inf),
+            joint_effort_limit=torch.full(
+                (0,), torch.inf),
+            joint_velocity_limit=torch.full(
+                (0,), torch.inf),
+            joint_variable_command_delta_scale=torch.zeros(
+                0, dtype=torch.float32),
+            joint_variable_unit=(),
+            joint_variable_command_representation=(
+                "normalized_position_delta"),
+            joint_variable_command_reference=(
+                "current_measured_position_at_sensor_frame_exposure"),
+            joint_variable_command_range=(-1.0, 1.0),
+            joint_variable_command_limit_policy=(
+                "clamp_finite_limits_wrap_unbounded_rotation"),
+            group_node_mask=torch.zeros(
+                0,
+                node_count,
+                dtype=torch.bool),
+            group_joint_mask=torch.zeros(
+                0,
+                joint_count,
+                dtype=torch.bool),
+            node_role=torch.full(
+                (node_count,),
+                ModuleDim.RobotBodyRoleNames.index("other"),
+                dtype=torch.long),
+            node_side=torch.full(
+                (node_count,),
+                ModuleDim.RobotBodySideNames.index("none"),
+                dtype=torch.long),
+            node_capability=torch.zeros(
+                node_count,
+                ModuleDim.RobotBodyCapabilityDim,
+                dtype=torch.bool),
+            group_role=torch.full(
+                (0,), -1, dtype=torch.long),
+            group_side=torch.full(
+                (0,), -1, dtype=torch.long),
+            group_capability=torch.zeros(
+                0,
+                ModuleDim.RobotBodyCapabilityDim,
+                dtype=torch.bool),
+            gripper_endpoint_index=torch.full(
+                (0,), -1, dtype=torch.long),
+            endpoint_role=torch.full(
+                (0,), -1, dtype=torch.long),
+            endpoint_side=torch.full(
+                (0,), -1, dtype=torch.long),
+            endpoint_capability=torch.zeros(
+                0,
+                ModuleDim.RobotBodyCapabilityDim,
+                dtype=torch.bool),
+            sensor_to_node=torch.full(
+                (0,), -1, dtype=torch.long),
+            sensor_role=torch.full(
+                (0,), -1, dtype=torch.long),
+            sensor_side=torch.full(
+                (0,), -1, dtype=torch.long),
+            sensor_capability=torch.zeros(
+                0,
+                ModuleDim.RobotBodyCapabilityDim,
+                dtype=torch.bool),
+            observer_valid=False,
+            observer_controllable=False,
+            observer_attachment_name="",
+            observer_frame_name="",
+            observer_calibration_id="",
+            observer_attachment_kind="none",
+            observer_attachment_index=-1,
+            observer_node_index=-1,
+            observer_sensor_index=-1,
+            observer_endpoint_index=-1,
+            observer_control_joint_indices=torch.zeros(
+                0, dtype=torch.long),
+            observer_control_group_index=-1)
+
+    @staticmethod
+    def MakeOntologyNode(
+        nodeId: int,
+        instanceId: int,
+        realm: str,
+        physicalEntity: int,
+        *,
+        poseValid: bool,
+        geometryValid: bool,
+        displaySurface: int,
+        surfaceParentNodeId: Optional[int],
+        surfaceUV: Optional[List[float]],
+        motionLayerIndex: int,
+    ) -> Dict[str, Any]:
+        identity_pose = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        motion_layers = [0] * ModuleDim.PstMotionLayerClasses
+        motion_layers[motionLayerIndex] = 1
+        agency_by_layer: List[Optional[str]] = (
+            [None] * ModuleDim.PstMotionLayerClasses)
+        agency_by_layer[motionLayerIndex] = "autonomous"
+        agency_valid = [False] * ModuleDim.PstMotionLayerClasses
+        agency_valid[motionLayerIndex] = True
+        return {
+            "level": 0,
+            "node_id": nodeId,
+            "identity_id": nodeId,
+            "parts": [],
+            "pose_valid": poseValid,
+            "pose_camera": identity_pose if poseValid else None,
+            "pose_world": identity_pose if poseValid else None,
+            "geometry_valid": geometryValid,
+            "size_3d": [0.2, 0.1, 0.1] if geometryValid else None,
+            "bbox_2d": [0, 0, 2, 2] if nodeId == 1 else [2, 2, 4, 4],
+            "instance_id": instanceId,
+            "visible_ratio": 1.0,
+            "occlusion_ratio": 0.0,
+            "object_class": 1,
+            "object_state": [0.0] * ModuleDim.PstStateDim,
+            "object_attributes": [0.0] * ModuleDim.PstAttrDim,
+            "physical_entity_valid": True,
+            "physical_entity": physicalEntity,
+            "physical_interaction_valid": True,
+            "physical_interaction": physicalEntity,
+            "realm_valid": True,
+            "realm": realm,
+            "motion_layer_valid": True,
+            "motion_layer_multi_hot": motion_layers,
+            "agency_by_layer_valid": agency_valid,
+            "agency_by_layer": agency_by_layer,
+            "body_membership_valid": True,
+            "body_membership": 0,
+            "self_part_valid": False,
+            "self_part": None,
+            "carrier_motion_valid": poseValid,
+            "carrier_motion": identity_pose if poseValid else None,
+            "articulation_motion_valid": False,
+            "articulation_motion": None,
+            "content_motion_uv_valid": surfaceUV is not None,
+            "content_motion_uv": [0.1, 0.0] if surfaceUV is not None else None,
+            "content_change_valid": True,
+            "content_change": int(surfaceUV is not None),
+            "display_surface_valid": True,
+            "display_surface": displaySurface,
+            "surface_parent_valid": True,
+            "surface_parent_node_id": surfaceParentNodeId,
+            "surface_uv_valid": surfaceUV is not None,
+            "surface_uv": surfaceUV,
+            "verification_confidence_valid": True,
+            "verification_confidence": 1.0,}
+
+    @staticmethod
+    def MakeOntologyAnnotation(robotMorphology: Any) -> Dict[str, Any]:
+        display = TestDataPreprocessor.MakeOntologyNode(
+            1,
+            1,
+            "external_physical",
+            1,
+            poseValid=True,
+            geometryValid=True,
+            displaySurface=1,
+            surfaceParentNodeId=None,
+            surfaceUV=None,
+            motionLayerIndex=1)
+        virtual = TestDataPreprocessor.MakeOntologyNode(
+            2,
+            2,
+            "virtual_content",
+            0,
+            poseValid=False,
+            geometryValid=False,
+            displaySurface=0,
+            surfaceParentNodeId=1,
+            surfaceUV=[0.5, 0.5],
+            motionLayerIndex=3)
+        return {
+            "schema_version": SYNTHETIC_SUPERVISION_SCHEMA_VERSION,
+            "ontology_vocabulary": (
+                DataPreprocessor.ExpectedSyntheticOntologyVocabularyContract(
+                    robotMorphology)),
+            "coverage": {
+                "relations_exhaustive": True,
+                "contact_events_exhaustive": True,
+                "ontology_relations_exhaustive": True,},
+            "episode_id": 1,
+            "temporal": {
+                "kind": 0,
+                "duration_ms": 0.0,
+                "kind_valid": True,
+                "duration_valid": False,},
+            "objects": [display, virtual],
+            "relations": [],
+            "ontology_relations": [{
+                "subject_node_id": 2,
+                "object_node_id": 1,
+                "relation_types": [
+                    "displayed_on",
+                    "inside_display_region",],}],
+            "motion": {"object_motions_from_prev": []},
+            "interaction": {
+                "affordance_targets": [],
+                "contact_events": [],},
+            "scene": {
+                "scene_class": 0,
+                "global_labels": [0.0] * ModuleDim.PstGlobalLabels,},}
+
+    @staticmethod
+    def MakeTensorizerInputs() -> Tuple[torch.Tensor, ...]:
+        rgb = torch.zeros(3, 4, 4)
+        depth = torch.zeros(1, 4, 4)
+        depth_valid = torch.zeros(1, 4, 4, dtype=torch.bool)
+        normal = torch.zeros(3, 4, 4)
+        semantic = torch.zeros(4, 4, dtype=torch.long)
+        instance = torch.tensor([
+            [1, 1, 0, 0],
+            [1, 1, 0, 0],
+            [0, 0, 2, 2],
+            [0, 0, 2, 2],])
+        return (
+            rgb,
+            depth,
+            depth_valid,
+            normal,
+            semantic,
+            instance,)
+
+    def TestEntityMotionTargetsAndVirtual2DNode(self) -> bool:
+        robot_morphology = self.MakeRobotMorphology((
+            "chassis_link",
+            "sensor_mount_link",
+            "tool_link",
+        ))
+        targets = DataPreprocessor.TensorizeSyntheticSupervision(
+            self.MakeOntologyAnnotation(robot_morphology),
+            *self.MakeTensorizerInputs(),
+            robotMorphology=robot_morphology,
+            maxNodes=4,
+            textDim=ModuleDim.PstTextDim,
+            stateDim=ModuleDim.PstStateDim,
+            attrDim=ModuleDim.PstAttrDim,
+            affordanceDim=ModuleDim.PstAffordanceDim,
+            relationClasses=ModuleDim.PstRelationClasses)
+        required_targets = {
+            "pose_valid", "geometry_valid",
+            "physical_entity", "physical_entity_valid",
+            "physical_interaction", "physical_interaction_valid",
+            "realm", "realm_valid",
+            "motion_layer_multi_hot", "motion_layer_valid",
+            "agency_by_layer", "agency_by_layer_valid",
+            "body_membership", "body_membership_valid",
+            "self_part_id", "self_part_valid",
+            "carrier_motion", "carrier_motion_valid",
+            "articulation_motion", "articulation_motion_valid",
+            "content_motion_uv", "content_motion_uv_valid",
+            "content_change", "content_change_valid",
+            "display_surface", "display_surface_valid",
+            "surface_parent_index", "surface_parent_valid",
+            "surface_uv", "surface_uv_valid",
+            "verification_confidence", "verification_confidence_valid",
+            "ontology_relation_multi_hot", "ontology_relation_valid",}
+        return bool(
+            required_targets.issubset(targets)
+            and targets["pose_valid"][:2].tolist() == [True, False]
+            and targets["geometry_valid"][:2].tolist() == [True, False]
+            and int(targets["realm"][1].item())
+            == int(EntityRealm.VIRTUAL_CONTENT)
+            and int(targets["surface_parent_index"][1].item()) == 0
+            and tuple(targets["motion_layer_multi_hot"].shape) == (4, 5)
+            and tuple(targets["agency_by_layer"].shape) == (4, 5)
+            and tuple(targets["ontology_relation_multi_hot"].shape)
+            == (4, 4, 9)
+            and targets["ontology_relation_multi_hot"][1, 0].sum().item()
+            == 2.0)
+
+    def TestStrictSchemaAndNullInvalidGeometry(self) -> bool:
+        robot_morphology = self.MakeRobotMorphology((
+            "chassis_link",
+            "sensor_mount_link",
+            "tool_link",
+        ))
+        wrong_version = self.MakeOntologyAnnotation(robot_morphology)
+        wrong_version["schema_version"] = 1
+        try:
+            DataPreprocessor.TensorizeSyntheticSupervision(
+                wrong_version,
+                *self.MakeTensorizerInputs(),
+                robotMorphology=robot_morphology,
+                maxNodes=4)
+            return False
+        except ValueError:
+            pass
+        fake_virtual_pose = self.MakeOntologyAnnotation(robot_morphology)
+        fake_virtual_pose["objects"][1]["pose_camera"] = [
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        try:
+            DataPreprocessor.TensorizeSyntheticSupervision(
+                fake_virtual_pose,
+                *self.MakeTensorizerInputs(),
+                robotMorphology=robot_morphology,
+                maxNodes=4)
+            return False
+        except ValueError:
+            pass
+        fake_virtual_geometry = self.MakeOntologyAnnotation(robot_morphology)
+        virtual = fake_virtual_geometry["objects"][1]
+        virtual["pose_valid"] = True
+        virtual["pose_camera"] = [
+            0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        virtual["pose_world"] = [
+            0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        virtual["geometry_valid"] = True
+        virtual["size_3d"] = [0.2, 0.2, 0.01]
+        try:
+            DataPreprocessor.TensorizeSyntheticSupervision(
+                fake_virtual_geometry,
+                *self.MakeTensorizerInputs(),
+                robotMorphology=robot_morphology,
+                maxNodes=4)
+            return False
+        except ValueError:
+            return True
+
+    def TestMorphologyBoundSelfPartContract(self) -> bool:
+        robot_morphology = self.MakeRobotMorphology((
+            "mobile_base",
+            "neck_link",
+            "inspection_link",
+            "tool_tip",
+        ))
+        vocabulary = (
+            DataPreprocessor.ExpectedSyntheticOntologyVocabularyContract(
+                robot_morphology))
+        annotation = self.MakeOntologyAnnotation(robot_morphology)
+        body_node = annotation["objects"][0]
+        body_node["realm"] = "self_body"
+        body_node["body_membership"] = 1
+        body_node["self_part_valid"] = True
+        body_node["self_part"] = "tool_tip"
+        targets = DataPreprocessor.TensorizeSyntheticSupervision(
+            annotation,
+            *self.MakeTensorizerInputs(),
+            robotMorphology=robot_morphology,
+            maxNodes=4)
+        incompatible = self.MakeRobotMorphology((
+            "mobile_base",
+            "different_link",
+        ))
+        try:
+            DataPreprocessor.TensorizeSyntheticSupervision(
+                annotation,
+                *self.MakeTensorizerInputs(),
+                robotMorphology=incompatible,
+                maxNodes=4)
+            return False
+        except ValueError:
+            pass
+        try:
+            DataPreprocessor.ExpectedSyntheticOntologyVocabularyContract(None)
+            return False
+        except TypeError:
+            pass
+        return bool(
+            vocabulary["description_id"]
+            == robot_morphology.description_id
+            and vocabulary["self_part_names"]
+            == list(robot_morphology.node_names)
+            and vocabulary["self_part_parent_indices"] == [-1, 0, 1, 2]
+            and vocabulary["self_part_count"] == 4
+            and int(targets["self_part_id"][0].item()) == 3
+            and bool(targets["self_part_valid"][0].item()))
+
+    def RunAll(self) -> Dict[str, bool]:
+        return {
+            "EntityMotionTargetsAndVirtual2DNode": (
+                self.TestEntityMotionTargetsAndVirtual2DNode()),
+            "StrictSchemaAndNullInvalidGeometry": (
+                self.TestStrictSchemaAndNullInvalidGeometry()),
+            "MorphologyBoundSelfPartContract": (
+                self.TestMorphologyBoundSelfPartContract()),}

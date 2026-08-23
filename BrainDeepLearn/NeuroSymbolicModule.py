@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from FunctionTools import AGICoreModule, BuildReferenceWeights, BuildReferenceScaleContext
+from FunctionTools import AGICoreModule
 from ModuleMessagerManager import ModuleDim
-from DecisionDecoupler import FlattenActiveDecisionTensor
+from RobotMorphologyModule import Realm
 
 
 PREDICATES: Tuple[str, ...] = (
@@ -99,6 +100,59 @@ FAILURE_CAUSES: Tuple[str, ...] = (
     "handover_failed",)
 
 
+REALM_SELF_BODY = int(Realm.SELF_BODY)
+REALM_EXTERNAL_PHYSICAL = int(Realm.EXTERNAL_PHYSICAL)
+REALM_VIRTUAL_CONTENT = int(Realm.VIRTUAL_CONTENT)
+
+
+def ResolveActuationReferenceWeights(
+    pst: Dict[str, torch.Tensor],
+    semanticReference: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    K = int(semanticReference.size(1))
+    realm = pst["RealmProb"]
+    verification = pst["VerificationConfidence"]
+    interaction = pst["PhysicalInteractionProb"]
+    presence = pst["PerceptualPresence"]
+
+    direct_reference = (
+        semanticReference
+        * realm[..., REALM_EXTERNAL_PHYSICAL]
+        * presence
+        * interaction
+        * verification)
+
+    uv_confidence = pst["SurfaceUVConfidence"]
+    virtual_child_reference = (
+        semanticReference
+        * realm[..., REALM_VIRTUAL_CONTENT]
+        * presence
+        * verification
+        * uv_confidence)
+    physical_parent_mass = (
+        realm[..., REALM_SELF_BODY]
+        + realm[..., REALM_EXTERNAL_PHYSICAL])
+    parent_eligibility = (
+        presence
+        * physical_parent_mass
+        * interaction
+        * verification
+        * pst["DisplaySurfaceProb"])
+    verified_parent_path = (
+        pst["SurfaceParentProb"][..., :K]
+        * parent_eligibility.unsqueeze(1))
+    surface_reference = torch.einsum(
+        "bk,bkj->bj",
+        virtual_child_reference,
+        verified_parent_path)
+    return {
+        "direct_reference": direct_reference,
+        "surface_reference": surface_reference,
+        "actuation_reference": direct_reference,
+        "virtual_child_reference": virtual_child_reference,
+        "verified_parent_path": verified_parent_path,}
+
+
 @dataclass
 class SymbolicFact:
     name: str
@@ -160,33 +214,231 @@ class NeuroSymbolicOutput:
     redispatch_guard_score: torch.Tensor
 
 
+def _NeuroEndpointContract(
+    robotMorphology: Any,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if robotMorphology is None:
+        raise TypeError("robot morphology is required")
+    endpoint_count = int(robotMorphology.endpoint_count)
+    node_count = int(robotMorphology.node_count)
+    if endpoint_count < 0 or node_count < 1:
+        raise ValueError("robot morphology counts are invalid")
+    if not hasattr(robotMorphology, "EndpointSemanticDescriptor"):
+        raise TypeError("robot morphology endpoint descriptor is required")
+    action_dim = int(ModuleDim.RobotControlAxisDim)
+    role_classes = int(ModuleDim.RobotBodyRoleClasses)
+    side_classes = int(ModuleDim.RobotBodySideClasses)
+    capability_dim = int(ModuleDim.RobotBodyCapabilityDim)
+    endpoint_task_mask = torch.as_tensor(
+        robotMorphology.endpoint_task_mask, dtype=torch.bool).detach().cpu()
+    if tuple(endpoint_task_mask.shape) != (endpoint_count, action_dim):
+        raise ValueError("robot morphology task mask does not match endpoint count")
+    semantic = robotMorphology.EndpointSemanticDescriptor()
+    required = (
+        "controllable",
+        "parent_node_index",
+        "topology_depth",
+        "task_mask",
+        "role",
+        "side",
+        "capability",
+        "node_role",
+        "node_side",
+        "node_capability",
+        "parent_role",
+        "parent_side",
+        "parent_capability",
+        "group_role_membership",
+        "group_side_membership",
+        "group_capability",
+    )
+    missing = tuple(name for name in required if name not in semantic)
+    if missing:
+        raise TypeError(
+            "robot morphology endpoint descriptor is incomplete: "
+            + ", ".join(missing))
+
+    def vector(name: str, dtype: torch.dtype) -> torch.Tensor:
+        value = torch.as_tensor(
+            semantic[name], dtype=dtype).detach().cpu()
+        if tuple(value.shape) != (endpoint_count,):
+            raise ValueError(
+                f"endpoint descriptor {name} shape is invalid")
+        return value
+
+    def matrix(
+        name: str,
+        width: int,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        value = torch.as_tensor(
+            semantic[name], dtype=dtype).detach().cpu()
+        if tuple(value.shape) != (endpoint_count, int(width)):
+            raise ValueError(
+                f"endpoint descriptor {name} shape is invalid")
+        return value
+
+    role = {
+        name: vector(name, torch.long)
+        for name in ("role", "node_role", "parent_role")}
+    side = {
+        name: vector(name, torch.long)
+        for name in ("side", "node_side", "parent_side")}
+    parent_index = vector("parent_node_index", torch.long)
+    if bool(((parent_index < -1) | (parent_index >= node_count)).any().item()):
+        raise ValueError("endpoint parent node index is invalid")
+    parent_valid = parent_index.ge(0)
+    for name in ("role", "node_role"):
+        if bool(((role[name] < 0) | (role[name] >= role_classes)).any().item()):
+            raise ValueError("endpoint role semantic is invalid")
+    for name in ("side", "node_side"):
+        if bool(((side[name] < 0) | (side[name] >= side_classes)).any().item()):
+            raise ValueError("endpoint side semantic is invalid")
+    if bool((
+        ((role["parent_role"] < 0) | (role["parent_role"] >= role_classes))
+        & parent_valid
+    ).any().item()):
+        raise ValueError("endpoint parent role semantic is invalid")
+    if bool((
+        ((side["parent_side"] < 0) | (side["parent_side"] >= side_classes))
+        & parent_valid
+    ).any().item()):
+        raise ValueError("endpoint parent side semantic is invalid")
+    semantic_task_mask = matrix(
+        "task_mask", action_dim, torch.bool)
+    if not torch.equal(semantic_task_mask, endpoint_task_mask):
+        raise ValueError("endpoint task mask semantics are inconsistent")
+    controllable = vector("controllable", torch.bool)
+    if not torch.equal(controllable, endpoint_task_mask.any(dim=-1)):
+        raise ValueError("endpoint controllability semantics are inconsistent")
+    parent_valid_f = parent_valid.to(torch.float32).unsqueeze(-1)
+    topology_depth = vector("topology_depth", torch.float32)
+    descriptor = torch.cat([
+        F.one_hot(role["role"], num_classes=role_classes).to(torch.float32),
+        F.one_hot(side["side"], num_classes=side_classes).to(torch.float32),
+        matrix("capability", capability_dim),
+        F.one_hot(
+            role["node_role"], num_classes=role_classes).to(torch.float32),
+        F.one_hot(
+            side["node_side"], num_classes=side_classes).to(torch.float32),
+        matrix("node_capability", capability_dim),
+        F.one_hot(
+            role["parent_role"].clamp(0, role_classes - 1),
+            num_classes=role_classes).to(torch.float32) * parent_valid_f,
+        F.one_hot(
+            side["parent_side"].clamp(0, side_classes - 1),
+            num_classes=side_classes).to(torch.float32) * parent_valid_f,
+        matrix("parent_capability", capability_dim) * parent_valid_f,
+        matrix("group_role_membership", role_classes),
+        matrix("group_side_membership", side_classes),
+        matrix("group_capability", capability_dim),
+        (topology_depth / float(node_count)).unsqueeze(-1),
+        endpoint_task_mask.to(torch.float32),
+        controllable.to(torch.float32).unsqueeze(-1),
+    ], dim=-1)
+    if not bool(torch.isfinite(descriptor).all().item()):
+        raise ValueError("endpoint descriptor is non-finite")
+    return endpoint_task_mask, descriptor
+
+
 class NeuroSymbolicRobotStateEncoder(AGICoreModule):
     """Neuro-symbolic private latent; never a shared RobotState input field."""
 
     def __init__(
         self,
-        bodyPoseDim: int = (
-            ModuleDim.DecisionBodyEndpointCount
-            * ModuleDim.DecisionEndpointPoseDim),
+        poseDim: int = ModuleDim.DecisionEndpointPoseDim,
         physicalReferenceDim: int = ModuleDim.RobotPhysicalReferenceDim,
         outDim: int = ModuleDim.PstSlotDim,
-        hidden: int = 256,):
+        hidden: int = 256,
+        *,
+        robotMorphology: Any,):
         super().__init__()
-        in_dim = int(bodyPoseDim) + int(physicalReferenceDim)
-        self.net = nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, hidden),
+        if robotMorphology is None:
+            raise TypeError("robot morphology is required")
+        self.endpoint_count = int(robotMorphology.endpoint_count)
+        self.pose_dim = int(poseDim)
+        self.physical_reference_dim = int(physicalReferenceDim)
+        _, descriptor = _NeuroEndpointContract(
+            robotMorphology)
+        self.register_buffer(
+            "endpoint_descriptor",
+            descriptor.unsqueeze(0),
+            persistent=False)
+        token_dim = int(outDim)
+        self.token_net = nn.Sequential(
+            nn.LayerNorm(self.pose_dim + int(descriptor.size(1))),
+            nn.Linear(self.pose_dim + int(descriptor.size(1)), hidden),
             nn.SiLU(),
-            nn.Linear(hidden, int(outDim)),
-            nn.LayerNorm(int(outDim)),)
+            nn.Linear(hidden, token_dim),
+            nn.LayerNorm(token_dim),)
+        self.summary_net = nn.Sequential(
+            nn.LayerNorm(2 * token_dim + self.physical_reference_dim),
+            nn.Linear(2 * token_dim + self.physical_reference_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, token_dim),
+            nn.LayerNorm(token_dim),)
 
     def forward(
         self,
         bodyProprioception: torch.Tensor,
-        robotPhysicalReference: torch.Tensor,) -> torch.Tensor:
-        return self.net(torch.cat([
-            bodyProprioception.flatten(1),
-            robotPhysicalReference], dim=-1))
+        robotPhysicalReference: torch.Tensor,
+        endpointStateValid: Optional[torch.Tensor] = None,) -> torch.Tensor:
+        if bodyProprioception.dim() != 3 or tuple(
+            bodyProprioception.shape[1:]
+        ) != (self.endpoint_count, self.pose_dim):
+            raise ValueError("body proprioception does not match endpoint count")
+        if robotPhysicalReference.dim() != 2 or int(
+            robotPhysicalReference.size(1)
+        ) != self.physical_reference_dim:
+            raise ValueError("robot physical reference has invalid shape")
+        batch_size = int(bodyProprioception.size(0))
+        if int(robotPhysicalReference.size(0)) != batch_size:
+            raise ValueError("robot physical reference batch does not match")
+        expected_mask_shape = (batch_size, self.endpoint_count)
+        if self.endpoint_count and endpointStateValid is None:
+            raise ValueError("endpoint state validity is required")
+        if endpointStateValid is not None and tuple(
+            endpointStateValid.shape
+        ) != expected_mask_shape:
+            raise ValueError("endpoint state validity does not match count")
+        runtime_valid = (
+            torch.zeros(
+                expected_mask_shape,
+                device=bodyProprioception.device,
+                dtype=torch.bool)
+            if endpointStateValid is None
+            else endpointStateValid.to(
+                device=bodyProprioception.device, dtype=torch.bool))
+        safe_pose = torch.where(
+            runtime_valid.unsqueeze(-1),
+            torch.nan_to_num(bodyProprioception),
+            torch.zeros_like(bodyProprioception))
+        descriptor = self.endpoint_descriptor.to(
+            device=bodyProprioception.device,
+            dtype=bodyProprioception.dtype).expand(batch_size, -1, -1)
+        valid_f = runtime_valid.to(
+            dtype=bodyProprioception.dtype).unsqueeze(-1)
+        tokens = self.token_net(torch.cat([
+            safe_pose,
+            descriptor,], dim=-1)) * valid_f
+        count = valid_f.sum(dim=1).clamp_min(1.0)
+        mean = tokens.sum(dim=1) / count
+        variance = (
+            (tokens - mean.unsqueeze(1)).square()
+            * valid_f).sum(dim=1) / count
+        reference_valid = torch.nan_to_num(
+            robotPhysicalReference[:, -1:],
+            nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+        effective_reference = torch.cat([
+            torch.nan_to_num(robotPhysicalReference[:, :-1])
+            * reference_valid,
+            reference_valid], dim=-1)
+        summary = self.summary_net(torch.cat([
+            mean,
+            variance,
+            effective_reference,], dim=-1))
+        return summary * runtime_valid.any(
+            dim=1, keepdim=True).to(dtype=summary.dtype)
 
 
 class NeuroSymbolicControlFeedbackEncoder(AGICoreModule):
@@ -195,23 +447,128 @@ class NeuroSymbolicControlFeedbackEncoder(AGICoreModule):
     def __init__(
         self,
         outDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
-        hidden: int = 256,):
+        hidden: int = 256,
+        *,
+        robotMorphology: Any,):
         super().__init__()
-        in_dim = 2 * ModuleDim.DecisionActiveDofCount
-        self.net = nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, hidden),
+        if robotMorphology is None:
+            raise TypeError("robot morphology is required")
+        self.endpoint_count = int(robotMorphology.endpoint_count)
+        self.action_dim = int(ModuleDim.RobotControlAxisDim)
+        action_mask, descriptor = _NeuroEndpointContract(
+            robotMorphology)
+        self.register_buffer(
+            "action_mask",
+            action_mask.view(
+                1,
+                self.endpoint_count,
+                self.action_dim),
+            persistent=False)
+        self.register_buffer(
+            "endpoint_descriptor",
+            descriptor.unsqueeze(0),
+            persistent=False)
+        token_dim = int(outDim)
+        self.token_net = nn.Sequential(
+            nn.LayerNorm(2 * self.action_dim + int(descriptor.size(1))),
+            nn.Linear(2 * self.action_dim + int(descriptor.size(1)), hidden),
             nn.SiLU(),
-            nn.Linear(hidden, int(outDim)),
-            nn.LayerNorm(int(outDim)),)
+            nn.Linear(hidden, token_dim),
+            nn.LayerNorm(token_dim),)
+        self.summary_net = nn.Sequential(
+            nn.LayerNorm(2 * token_dim),
+            nn.Linear(2 * token_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, token_dim),
+            nn.LayerNorm(token_dim),)
+
+    def RuntimeMask(
+        self,
+        batchSize: int,
+        device: torch.device,
+        endpointStateValid: Optional[torch.Tensor],
+        endpointControllable: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        expected_shape = (int(batchSize), self.endpoint_count)
+        if self.endpoint_count and (
+            endpointStateValid is None or endpointControllable is None
+        ):
+            raise ValueError("endpoint runtime masks are required")
+        if endpointStateValid is not None and tuple(
+            endpointStateValid.shape
+        ) != expected_shape:
+            raise ValueError("endpoint state validity does not match count")
+        if endpointControllable is not None and tuple(
+            endpointControllable.shape
+        ) != expected_shape:
+            raise ValueError("endpoint controllability does not match count")
+        state_valid = (
+            torch.zeros(
+                expected_shape,
+                device=device,
+                dtype=torch.bool)
+            if endpointStateValid is None
+            else endpointStateValid.to(device=device, dtype=torch.bool))
+        static_controllable = self.action_mask.any(dim=-1).to(
+            device=device).expand(int(batchSize), -1)
+        controllable = (
+            static_controllable
+            if endpointControllable is None
+            else endpointControllable.to(device=device, dtype=torch.bool)
+                & static_controllable)
+        runtime_valid = state_valid & controllable
+        action_mask = (
+            self.action_mask.to(device=device)
+            & runtime_valid.unsqueeze(-1))
+        return runtime_valid, action_mask
 
     def forward(
         self,
         targetTrackingError: torch.Tensor,
-        plannerTrackingError: torch.Tensor,) -> torch.Tensor:
-        return self.net(torch.cat([
-            FlattenActiveDecisionTensor(targetTrackingError),
-            FlattenActiveDecisionTensor(plannerTrackingError)], dim=-1))
+        plannerTrackingError: torch.Tensor,
+        endpointStateValid: Optional[torch.Tensor] = None,
+        endpointControllable: Optional[torch.Tensor] = None,) -> torch.Tensor:
+        expected_shape = (
+            int(targetTrackingError.size(0)),
+            self.endpoint_count,
+            self.action_dim)
+        if tuple(targetTrackingError.shape) != expected_shape:
+            raise ValueError("target tracking error does not match endpoint count")
+        if tuple(plannerTrackingError.shape) != expected_shape:
+            raise ValueError("planner tracking error does not match endpoint count")
+        runtime_valid, action_mask = self.RuntimeMask(
+            targetTrackingError.size(0),
+            targetTrackingError.device,
+            endpointStateValid,
+            endpointControllable)
+        safe_target = torch.where(
+            action_mask,
+            torch.nan_to_num(targetTrackingError),
+            torch.zeros_like(targetTrackingError))
+        safe_planner = torch.where(
+            action_mask,
+            torch.nan_to_num(plannerTrackingError),
+            torch.zeros_like(plannerTrackingError))
+        descriptor = self.endpoint_descriptor.to(
+            device=targetTrackingError.device,
+            dtype=targetTrackingError.dtype).expand(
+                targetTrackingError.size(0), -1, -1)
+        valid_f = runtime_valid.to(
+            dtype=targetTrackingError.dtype).unsqueeze(-1)
+        tokens = self.token_net(torch.cat([
+            safe_target,
+            safe_planner,
+            descriptor,], dim=-1)) * valid_f
+        count = valid_f.sum(dim=1).clamp_min(1.0)
+        mean = tokens.sum(dim=1) / count
+        variance = (
+            (tokens - mean.unsqueeze(1)).square()
+            * valid_f).sum(dim=1) / count
+        summary = self.summary_net(torch.cat([
+            mean,
+            variance,], dim=-1))
+        return summary * runtime_valid.any(
+            dim=1, keepdim=True).to(dtype=summary.dtype)
 
 
 class PredicateGrounder(AGICoreModule):
@@ -293,17 +650,21 @@ class PredicateGrounder(AGICoreModule):
         referenceSlotIndex: torch.Tensor,
         referenceConfidence: torch.Tensor,
         memoryScale: torch.Tensor,) -> torch.Tensor:
-        m = pst["MphysRaw"]
+        m = pst["PerceptualPresence"]
         current_step = pst["Step"].view(-1, 1).float()
-        reference_weights = BuildReferenceWeights(
-            pst,
-            current_step,
-            memoryScale=memoryScale,
-            memoryDecayHorizon=32.0)
-        observed_weight = reference_weights.observed_weight
-        memory_weight = reference_weights.memory_weight
-        memory_recency = reference_weights.memory_recency
-        slot_context_weight = reference_weights.slot_weight
+        observed = pst["Observed"].float()
+        memory_age = (
+            current_step - pst["LastSeen"].float()
+        ).clamp_min(0.0)
+        memory_recency = torch.exp(-memory_age / 32.0)
+        observed_weight = m * observed
+        memory_weight = (
+            memoryScale
+            * m
+            * pst["SlotPresence"]
+            * (1.0 - observed)
+            * memory_recency)
+        slot_context_weight = observed_weight + memory_weight
         target_weight = m * referenced
 
         slot_input = torch.cat([
@@ -340,8 +701,8 @@ class PredicateGrounder(AGICoreModule):
             valid_summary,], dim=-1))
 
     def ReferenceSlotIndex(self, pst: Dict[str, torch.Tensor], referenced: torch.Tensor) -> torch.Tensor:
-        score = pst["MphysRaw"] * referenced
-        return score.argmax(dim=1)
+        resolved = ResolveActuationReferenceWeights(pst, referenced)
+        return resolved["actuation_reference"].argmax(dim=1)
 
     def ReferencedPose(
         self,
@@ -369,8 +730,16 @@ class PredicateGrounder(AGICoreModule):
         satisfactionProb: torch.Tensor,
         referenceConfidence: torch.Tensor,
         noSlotProb: torch.Tensor,) -> Dict[str, torch.Tensor]:
-        reference_slot_idx = self.ReferenceSlotIndex(pst, referenced)
-        ref_pose = self.ReferencedPose(pst, reference_slot_idx, referenceConfidence)
+        resolved_reference = ResolveActuationReferenceWeights(pst, referenced)
+        actuation_reference = resolved_reference["actuation_reference"]
+        actuation_confidence = actuation_reference.sum(dim=-1)
+        reference_slot_idx = actuation_reference.argmax(dim=1)
+        semantic_slot_idx = (
+            pst["PerceptualPresence"] * referenced).argmax(dim=1)
+        ref_pose = self.ReferencedPose(
+            pst,
+            reference_slot_idx,
+            actuation_confidence)
 
         scalar = torch.stack([
             uncertainty,
@@ -387,16 +756,38 @@ class PredicateGrounder(AGICoreModule):
             robotPhysicalState,
             ref_pose,
             scalar,], dim=-1)
-        reference_context = BuildReferenceScaleContext(
-            observedPst,
-            self.summary_query(summary_context))
+        observed_strength = (
+            observedPst["ObservedSlotMask"]
+            * observedPst["PerceptualPresence"])
+        demand = F.normalize(
+            self.summary_query(summary_context), dim=-1, eps=1e-6)
+        observed_slot = F.normalize(
+            observedPst["SlotState"], dim=-1, eps=1e-6)
+        demand_match = torch.einsum(
+            "bkd,bd->bk", observed_slot, demand).add(1.0).mul(0.5)
+        matched_strength = observed_strength * demand_match
+        unmatched_strength = observed_strength * (1.0 - demand_match)
+        top_match = torch.topk(matched_strength, k=2, dim=1).values
+        observed_total = observed_strength.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        observed_max = observed_strength.amax(dim=1, keepdim=True)
+        best_match = top_match[:, :1]
+        second_match = top_match[:, 1:2]
+        reference_context = torch.cat([
+            observed_strength.mean(dim=1, keepdim=True),
+            observed_max,
+            best_match,
+            matched_strength.sum(dim=1, keepdim=True) / observed_total,
+            1.0 - best_match,
+            1.0 - observed_max,
+            second_match / best_match.clamp_min(1e-6),
+            unmatched_strength.sum(dim=1, keepdim=True) / observed_total,], dim=-1)
         memory_scale = torch.sigmoid(self.reference_memory_scale_head(torch.cat([summary_context, reference_context], dim=-1)))
 
         slot_summary = self.SlotSummary(
             pst,
             summary_context,
             referenced,
-            reference_slot_idx,
+            semantic_slot_idx,
             referenceConfidence,
             memory_scale)
 
@@ -512,6 +903,148 @@ class OperatorLibrary(AGICoreModule):
 
         self.register_buffer("precondition_mask", precond, persistent=False)
         self.register_buffer("effect_mask", effect, persistent=False)
+
+        operator_index = {name: i for i, name in enumerate(OPERATORS)}
+
+        def OperatorMask(*names: str) -> torch.Tensor:
+            mask = torch.zeros(len(OPERATORS), dtype=torch.bool)
+            for name in names:
+                mask[operator_index[name]] = True
+            return mask
+
+        always_legal = OperatorMask(
+            "observe",
+            "reobserve",
+            "wait",
+            "cancel_execute",
+            "failsafe_stop",)
+        surface_legal = always_legal | OperatorMask(
+            "approach",
+            "align",
+            "reach",
+            "contact",
+            "press",
+            "retreat",
+            "recover",
+            "continue_execute",
+            "redispatch",)
+        self_body_legal = always_legal | OperatorMask(
+            "retreat",
+            "recover",
+            "continue_execute",
+            "redispatch",)
+        self.register_buffer(
+            "always_legal_operator_mask", always_legal, persistent=False)
+        self.register_buffer(
+            "surface_legal_operator_mask", surface_legal, persistent=False)
+        self.register_buffer(
+            "self_body_legal_operator_mask", self_body_legal, persistent=False)
+        self.register_buffer(
+            "direct_physical_operator_mask",
+            torch.ones(len(OPERATORS), dtype=torch.bool),
+            persistent=False)
+
+    def RealmAwareLegality(
+        self,
+        pst: Dict[str, torch.Tensor],
+        referenced: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        B, K = referenced.shape
+        reference_mass = referenced.sum(dim=-1)
+        semantic_weight = referenced / (reference_mass.unsqueeze(-1) + 1e-8)
+        target_realm_prob = torch.einsum(
+            "bk,bkr->br",
+            semantic_weight,
+            pst["RealmProb"])
+        target_realm = target_realm_prob.argmax(dim=-1)
+        reference_present = reference_mass > 0.5
+
+        resolved = ResolveActuationReferenceWeights(pst, referenced)
+        direct_confidence = resolved["direct_reference"].sum(dim=-1)
+        direct_physical = (
+            reference_present
+            & (target_realm == REALM_EXTERNAL_PHYSICAL)
+            & (direct_confidence > 0.5))
+
+        virtual_slot_score = (
+            semantic_weight
+            * pst["RealmProb"][..., REALM_VIRTUAL_CONTENT])
+        virtual_slot_index = virtual_slot_score.argmax(dim=-1)
+        batch_index = torch.arange(B, device=referenced.device)
+        child_parent_prob = pst["SurfaceParentProb"][
+            batch_index, virtual_slot_index]
+        physical_parent_prob = child_parent_prob[..., :K]
+        parent_probability, parent_index = physical_parent_prob.max(dim=-1)
+        no_parent_probability = child_parent_prob[..., K]
+
+        child_verification = pst["VerificationConfidence"][
+            batch_index, virtual_slot_index]
+        child_presence = pst["PerceptualPresence"][
+            batch_index, virtual_slot_index]
+        uv_valid = (
+            pst["SurfaceUVConfidence"][batch_index, virtual_slot_index]
+            > 0.5)
+
+        parent_realm = pst["RealmProb"][
+            batch_index, parent_index].argmax(dim=-1)
+        parent_is_physical = (
+            (parent_realm == REALM_SELF_BODY)
+            | (parent_realm == REALM_EXTERNAL_PHYSICAL))
+        parent_valid = (
+            (pst["PerceptualPresence"][batch_index, parent_index] > 0.5)
+            & (pst["PhysicalInteractionProb"][batch_index, parent_index] > 0.5)
+            & (pst["VerificationConfidence"][batch_index, parent_index] > 0.5)
+            & (pst["DisplaySurfaceProb"][batch_index, parent_index] > 0.5))
+        verified_surface = (
+            reference_present
+            & (target_realm == REALM_VIRTUAL_CONTENT)
+            & (child_presence > 0.5)
+            & (child_verification > 0.5)
+            & uv_valid
+            & (parent_probability > 0.5)
+            & (parent_probability > no_parent_probability)
+            & parent_is_physical
+            & parent_valid)
+
+        self_body_target = (
+            reference_present
+            & (target_realm == REALM_SELF_BODY))
+        legality = self.always_legal_operator_mask.view(1, -1).expand(B, -1).clone()
+        legality = legality | (
+            direct_physical.unsqueeze(-1)
+            & self.direct_physical_operator_mask.view(1, -1))
+        legality = legality | (
+            verified_surface.unsqueeze(-1)
+            & self.surface_legal_operator_mask.view(1, -1))
+        legality = legality | (
+            self_body_target.unsqueeze(-1)
+            & self.self_body_legal_operator_mask.view(1, -1))
+        return {
+            "operator_legality": legality,
+            "target_realm_prob": target_realm_prob,
+            "target_realm": target_realm,
+            "direct_physical": direct_physical,
+            "verified_surface": verified_surface,
+            "reference_present": reference_present,
+            "surface_parent_index": parent_index,}
+
+    def ApplyRealmAwareLegality(
+        self,
+        operatorLogits: torch.Tensor,
+        pst: Dict[str, torch.Tensor],
+        referenced: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        legality = self.RealmAwareLegality(pst, referenced)
+        row_min = operatorLogits.amin(dim=-1, keepdim=True)
+        row_span = (
+            operatorLogits.amax(dim=-1, keepdim=True) - row_min)
+        illegal_floor = (row_min - row_span - 1.0).detach()
+        return (
+            torch.where(
+                legality["operator_legality"],
+                operatorLogits,
+                illegal_floor),
+            legality,)
 
     def Scores(
         self,
@@ -1039,6 +1572,8 @@ class SymbolicFeatureMixer(AGICoreModule):
 class NeuroSymbolicExtractor(AGICoreModule):
     def __init__(
         self,
+        *,
+        robotMorphology: Any,
         slotDim: int = ModuleDim.PstSlotDim,
         goalDim: int = ModuleDim.GoalShortDim,
         worldDim: int = ModuleDim.WorldOutHState + ModuleDim.WorldOutZState + ModuleDim.WorldOutXState,
@@ -1057,9 +1592,11 @@ class NeuroSymbolicExtractor(AGICoreModule):
         self.control_feedback_dim = int(
             ModuleDim.DecisionEndpointPoseFeatDim)
         self.robot_state_encoder = NeuroSymbolicRobotStateEncoder(
-            outDim=self.robot_physical_state_dim)
+            outDim=self.robot_physical_state_dim,
+            robotMorphology=robotMorphology)
         self.control_feedback_encoder = NeuroSymbolicControlFeedbackEncoder(
-            outDim=self.control_feedback_dim)
+            outDim=self.control_feedback_dim,
+            robotMorphology=robotMorphology)
 
         self.predicate_grounder = PredicateGrounder(
             slotDim=slotDim,
@@ -1358,13 +1895,18 @@ class NeuroSymbolicExtractor(AGICoreModule):
         referenceConfidence: torch.Tensor,
         noSlotProb: torch.Tensor,
         temporalContextFeat: torch.Tensor,
+        endpointStateValid: Optional[torch.Tensor] = None,
+        endpointControllable: Optional[torch.Tensor] = None,
         returnExplain: bool = False,) -> NeuroSymbolicOutput:
         robot_physical_state = self.robot_state_encoder(
             bodyProprioception,
-            robotPhysicalReference)
+            robotPhysicalReference,
+            endpointStateValid=endpointStateValid)
         control_feedback_state = self.control_feedback_encoder(
             targetTrackingError,
-            plannerTrackingError)
+            plannerTrackingError,
+            endpointStateValid=endpointStateValid,
+            endpointControllable=endpointControllable)
         scalar = torch.stack([
             uncertainty,
             novelty,
@@ -1409,7 +1951,10 @@ class NeuroSymbolicExtractor(AGICoreModule):
 
         goal_predicate_need = torch.sigmoid(self.goal_predicate_head(ranker_in))
         operator_scores = self.operator_library.Scores(predicate_prob, goal_predicate_need)
-        operator_logits = ranked["operator_logits"] + operator_scores["symbolic_score"]
+        operator_logits, _ = self.operator_library.ApplyRealmAwareLegality(
+            ranked["operator_logits"] + operator_scores["symbolic_score"],
+            pst,
+            referenced)
         plan_latent = self.plan_ranker.RefinePlan(ranked["plan_seed"], operator_logits)
         subgoal_feature = self.BuildSubgoalFeature(
             plan_latent,
@@ -1440,11 +1985,28 @@ class NeuroSymbolicExtractor(AGICoreModule):
 
         risk_cause_logits = risk_cause_raw_logits + failure_gate_logits.unsqueeze(-1)
 
+        _, runtime_action_mask = self.control_feedback_encoder.RuntimeMask(
+            targetTrackingError.size(0),
+            targetTrackingError.device,
+            endpointStateValid,
+            endpointControllable)
+        safe_target_error = torch.where(
+            runtime_action_mask,
+            torch.nan_to_num(targetTrackingError),
+            torch.zeros_like(targetTrackingError))
+        safe_planner_error = torch.where(
+            runtime_action_mask,
+            torch.nan_to_num(plannerTrackingError),
+            torch.zeros_like(plannerTrackingError))
+        control_coordinate_count = runtime_action_mask.sum(
+            dim=(1, 2)).clamp_min(1).to(dtype=targetTrackingError.dtype)
         control_error_evidence = torch.stack([
-            FlattenActiveDecisionTensor(
-                targetTrackingError).square().mean(dim=-1).sqrt(),
-            FlattenActiveDecisionTensor(
-                plannerTrackingError).square().mean(dim=-1).sqrt()], dim=-1)
+            torch.linalg.vector_norm(
+                safe_target_error, dim=(1, 2))
+            / control_coordinate_count.sqrt(),
+            torch.linalg.vector_norm(
+                safe_planner_error, dim=(1, 2))
+            / control_coordinate_count.sqrt(),], dim=-1)
         invoke_mask = torch.sigmoid(self.invoke_head(torch.cat([
             scalar,
             control_error_evidence], dim=-1))).squeeze(-1)
@@ -1561,14 +2123,178 @@ class TestNeuroSymbolicMTool:
     def __init__(self, device: Optional[torch.device] = None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         torch.manual_seed(42)
+        self.robot_morphology = self.MakeRobotMorphology(3, 5)
+
+    def EndpointDescriptor(
+        self,
+        morphology: SimpleNamespace,
+    ) -> Dict[str, torch.Tensor]:
+        node_index = morphology.endpoint_to_node
+        parent_index = morphology.parent_index.index_select(0, node_index)
+        parent_valid = parent_index.ge(0)
+        parent_role = torch.full_like(morphology.endpoint_role, -1)
+        parent_side = torch.full_like(morphology.endpoint_side, -1)
+        parent_capability = torch.zeros_like(morphology.endpoint_capability)
+        parent_role[parent_valid] = morphology.node_role[
+            parent_index[parent_valid]]
+        parent_side[parent_valid] = morphology.node_side[
+            parent_index[parent_valid]]
+        parent_capability[parent_valid] = morphology.node_capability[
+            parent_index[parent_valid]]
+        return {
+            "controllable": morphology.endpoint_task_mask.any(dim=-1),
+            "parent_node_index": parent_index,
+            "topology_depth": torch.ones(morphology.endpoint_count),
+            "task_mask": morphology.endpoint_task_mask.clone(),
+            "role": morphology.endpoint_role.clone(),
+            "side": morphology.endpoint_side.clone(),
+            "capability": morphology.endpoint_capability.clone(),
+            "node_role": morphology.node_role.index_select(0, node_index),
+            "node_side": morphology.node_side.index_select(0, node_index),
+            "node_capability": morphology.node_capability.index_select(
+                0, node_index),
+            "parent_role": parent_role,
+            "parent_side": parent_side,
+            "parent_capability": parent_capability,
+            "group_role_membership": torch.zeros(
+                morphology.endpoint_count,
+                ModuleDim.RobotBodyRoleClasses,
+                dtype=torch.bool),
+            "group_side_membership": torch.zeros(
+                morphology.endpoint_count,
+                ModuleDim.RobotBodySideClasses,
+                dtype=torch.bool),
+            "group_capability": torch.zeros(
+                morphology.endpoint_count,
+                ModuleDim.RobotBodyCapabilityDim,
+                dtype=torch.bool),}
+
+    def MakeRobotMorphology(
+        self,
+        endpointCount: int,
+        nodeCount: int,
+    ) -> SimpleNamespace:
+        endpoint_count = int(endpointCount)
+        node_count = int(nodeCount)
+        if endpoint_count < 1 or node_count <= endpoint_count:
+            raise ValueError("synthetic morphology counts are invalid")
+        observer_index = endpoint_count - 1
+        endpoint_task_mask = torch.zeros(
+            endpoint_count,
+            ModuleDim.RobotControlAxisDim,
+            dtype=torch.bool)
+        endpoint_task_mask[:observer_index] = True
+        endpoint_task_mask[observer_index, 3:6] = True
+        endpoint_to_node = torch.arange(1, endpoint_count + 1)
+        endpoint_role = torch.empty(endpoint_count, dtype=torch.long)
+        endpoint_side = torch.empty(endpoint_count, dtype=torch.long)
+        endpoint_capability = torch.zeros(
+            endpoint_count,
+            ModuleDim.RobotBodyCapabilityDim)
+        node_role = torch.full(
+            (node_count,),
+            ModuleDim.RobotBodyRoleNames.index("other"),
+            dtype=torch.long)
+        node_side = torch.full(
+            (node_count,),
+            ModuleDim.RobotBodySideNames.index("none"),
+            dtype=torch.long)
+        node_capability = torch.zeros(
+            node_count,
+            ModuleDim.RobotBodyCapabilityDim)
+        role_cycle = ("arm", "hand", "sensor", "leg", "foot", "head")
+        side_cycle = ("left", "right", "center")
+        for index in range(endpoint_count):
+            endpoint_role[index] = ModuleDim.RobotBodyRoleNames.index(
+                role_cycle[index % len(role_cycle)])
+            endpoint_side[index] = ModuleDim.RobotBodySideNames.index(
+                side_cycle[index % len(side_cycle)])
+            endpoint_capability[
+                index,
+                index % ModuleDim.RobotBodyCapabilityDim] = 1.0
+        node_role[0] = ModuleDim.RobotBodyRoleNames.index("root")
+        node_side[0] = ModuleDim.RobotBodySideNames.index("center")
+        node_role[endpoint_to_node] = endpoint_role
+        node_side[endpoint_to_node] = endpoint_side
+        node_capability[endpoint_to_node] = endpoint_capability
+        parent_index = torch.full((node_count,), -1, dtype=torch.long)
+        parent_index[1:] = 0
+        morphology = SimpleNamespace(
+            endpoint_to_node=endpoint_to_node,
+            endpoint_task_mask=endpoint_task_mask,
+            endpoint_role=endpoint_role,
+            endpoint_side=endpoint_side,
+            endpoint_capability=endpoint_capability,
+            parent_index=parent_index,
+            node_role=node_role,
+            node_side=node_side,
+            node_capability=node_capability,
+            observer_valid=True,
+            observer_endpoint_index=observer_index,
+            endpoint_names=tuple(
+                f"endpoint_{index}" for index in range(endpoint_count)),
+            endpoint_count=endpoint_count,
+            node_count=node_count)
+        morphology.EndpointSemanticDescriptor = (
+            lambda morphology=morphology: self.EndpointDescriptor(morphology))
+        return morphology
+
+    def MakeExtractor(
+        self,
+        morphology: Optional[SimpleNamespace] = None,
+    ) -> NeuroSymbolicExtractor:
+        return NeuroSymbolicExtractor(
+            robotMorphology=(
+                self.robot_morphology if morphology is None else morphology)
+        ).to(self.device)
+
+    def PermuteEndpointMorphology(
+        self,
+        permutation: torch.Tensor,
+    ) -> SimpleNamespace:
+        values = dict(vars(self.robot_morphology))
+        values.pop("EndpointSemanticDescriptor", None)
+        for name in (
+                "endpoint_to_node",
+                "endpoint_task_mask",
+                "endpoint_role",
+                "endpoint_side",
+                "endpoint_capability"):
+            values[name] = values[name].index_select(0, permutation).clone()
+        names = tuple(values["endpoint_names"])
+        values["endpoint_names"] = tuple(
+            names[int(index)]
+            for index in permutation.tolist())
+        observer_index = int(values["observer_endpoint_index"])
+        values["observer_endpoint_index"] = int(
+            torch.nonzero(
+                permutation == observer_index,
+                as_tuple=False).flatten()[0].item())
+        morphology = SimpleNamespace(**values)
+        morphology.EndpointSemanticDescriptor = (
+            lambda morphology=morphology: self.EndpointDescriptor(morphology))
+        return morphology
 
     def AssertFinite(self, value: torch.Tensor, name: str) -> None:
         assert torch.isfinite(value).all(), f"{name} contains non-finite values"
 
-    def MakePst(self, B: int = 2, K: int = 4) -> Dict[str, torch.Tensor]:
+    def MakePst(
+        self,
+        B: int = 2,
+        K: int = 4,
+        morphology: Optional[SimpleNamespace] = None,
+    ) -> Dict[str, torch.Tensor]:
+        morphology = (
+            self.robot_morphology if morphology is None else morphology)
         pose = torch.randn(B, K, ModuleDim.PstPoseDim, device=self.device) * 0.1
         pose[..., 6] = 1.0
         mask = torch.ones(B, K, device=self.device)
+        realm = torch.zeros(B, K, 5, device=self.device)
+        realm[..., REALM_EXTERNAL_PHYSICAL] = 1.0
+        agency = torch.zeros(B, K, 5, device=self.device)
+        agency[..., 4] = 1.0
+        surface_parent = torch.zeros(B, K, K + 1, device=self.device)
+        surface_parent[..., K] = 1.0
         return {
             "MphysRaw": mask.clone(),
             "Observed": torch.ones(B, K, device=self.device, dtype=torch.bool),
@@ -1577,13 +2303,35 @@ class TestNeuroSymbolicMTool:
             "SlotPresence": mask.clone(),
             "ObservedSlotMask": mask.clone(),
             "SlotState": torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
-            "PoseCamera": pose,}
+            "PoseCamera": pose,
+            "PerceptualPresence": mask.clone(),
+            "PhysicalInteractionProb": mask.clone(),
+            "RealmProb": realm,
+            "MotionLayerProb": torch.zeros(B, K, 5, device=self.device),
+            "LayerAgencyProb": torch.zeros(B, K, 5, 5, device=self.device),
+            "AgencyProb": agency,
+            "BodyMembershipProb": torch.zeros(B, K, device=self.device),
+            "SelfPartProb": torch.zeros(
+                B, K, morphology.node_count, device=self.device),
+            "SurfaceParentProb": surface_parent,
+            "SurfaceUV": torch.full((B, K, 2), 0.5, device=self.device),
+            "SurfaceUVConfidence": mask.clone(),
+            "DisplaySurfaceProb": mask.clone(),
+            "VerificationConfidence": mask.clone(),}
 
-    def MakeExtractorInputs(self, B: int = 2, K: int = 4) -> Dict[str, torch.Tensor]:
+    def MakeExtractorInputs(
+        self,
+        B: int = 2,
+        K: int = 4,
+        morphology: Optional[SimpleNamespace] = None,
+    ) -> Dict[str, torch.Tensor]:
+        morphology = (
+            self.robot_morphology if morphology is None else morphology)
+        endpoint_count = int(morphology.endpoint_count)
         referenced = F.softmax(torch.randn(B, K, device=self.device), dim=-1)
         body_proprioception = torch.zeros(
             B,
-            ModuleDim.DecisionBodyEndpointCount,
+            endpoint_count,
             ModuleDim.DecisionEndpointPoseDim,
             device=self.device)
         body_proprioception[..., 6] = 1.0
@@ -1591,9 +2339,11 @@ class TestNeuroSymbolicMTool:
             B, ModuleDim.RobotPhysicalReferenceDim, device=self.device)
         robot_physical_reference[:, 3] = 1.0
         robot_physical_reference[:, 6] = -1.0
+        robot_physical_reference[:, 7] = 1.0
         return {
-            "pst": self.MakePst(B=B, K=K),
-            "observedPst": self.MakePst(B=B, K=K),
+            "pst": self.MakePst(B=B, K=K, morphology=morphology),
+            "observedPst": self.MakePst(
+                B=B, K=K, morphology=morphology),
             "goalEmbed": torch.randn(B, ModuleDim.GoalShortDim, device=self.device),
             "worldBelief": torch.randn(
                 B,
@@ -1604,14 +2354,18 @@ class TestNeuroSymbolicMTool:
             "robotPhysicalReference": robot_physical_reference,
             "targetTrackingError": torch.zeros(
                 B,
-                ModuleDim.DecisionEndpointCount,
-                ModuleDim.DecisionActionDim,
+                endpoint_count,
+                ModuleDim.RobotControlAxisDim,
                 device=self.device),
             "plannerTrackingError": torch.zeros(
                 B,
-                ModuleDim.DecisionEndpointCount,
-                ModuleDim.DecisionActionDim,
+                endpoint_count,
+                ModuleDim.RobotControlAxisDim,
                 device=self.device),
+            "endpointStateValid": torch.ones(
+                B, endpoint_count, device=self.device, dtype=torch.bool),
+            "endpointControllable": torch.ones(
+                B, endpoint_count, device=self.device, dtype=torch.bool),
             "uncertainty": torch.rand(B, device=self.device),
             "novelty": torch.rand(B, device=self.device),
             "recentFailure": torch.rand(B, device=self.device),
@@ -1684,6 +2438,68 @@ class TestNeuroSymbolicMTool:
             return True
         except Exception as e:
             print(f"OperatorLibrary score test failed: {type(e).__name__}: {e}")
+            return False
+
+    def TestRealmAwareOperatorLegality(self) -> bool:
+        try:
+            B, K = 6, 4
+            library = OperatorLibrary().to(self.device)
+            pst = self.MakePst(B=B, K=K)
+            referenced = torch.zeros(B, K, device=self.device)
+            referenced[0, 0] = 1.0
+            referenced[1, 1] = 1.0
+            referenced[2, 1] = 1.0
+            referenced[3, 2] = 1.0
+            referenced[4, 1] = 1.0
+            referenced[5, 1] = 1.0
+
+            for row in (1, 2, 4, 5):
+                pst["RealmProb"][row, 1].zero_()
+                pst["RealmProb"][row, 1, REALM_VIRTUAL_CONTENT] = 1.0
+                pst["PhysicalInteractionProb"][row, 1] = 0.0
+            pst["SurfaceParentProb"][1, 1].zero_()
+            pst["SurfaceParentProb"][1, 1, 0] = 1.0
+            pst["SurfaceParentProb"][4, 1].zero_()
+            pst["SurfaceParentProb"][4, 1, 0] = 1.0
+            pst["SurfaceUVConfidence"][4, 1] = 0.0
+            pst["SurfaceParentProb"][5, 1].zero_()
+            pst["SurfaceParentProb"][5, 1, 0] = 1.0
+            pst["DisplaySurfaceProb"][5, 0] = 0.0
+            pst["RealmProb"][3, 2].zero_()
+            pst["RealmProb"][3, 2, int(Realm.VISUAL_EFFECT)] = 1.0
+            pst["PhysicalInteractionProb"][3, 2] = 0.0
+
+            result = library.RealmAwareLegality(pst, referenced)
+            legality = result["operator_legality"]
+            op = {name: i for i, name in enumerate(OPERATORS)}
+            for name in (
+                    "observe", "reobserve", "wait",
+                    "cancel_execute", "failsafe_stop"):
+                assert bool(legality[:, op[name]].all().item())
+            assert bool(legality[0, op["grasp"]].item())
+            assert not bool(legality[1:, op["grasp"]].any().item())
+            assert bool(legality[1, op["press"]].item())
+            assert not bool(legality[2, op["press"]].item())
+            assert not bool(legality[3, op["press"]].item())
+            assert torch.equal(
+                result["verified_surface"],
+                torch.tensor(
+                    [False, True, False, False, False, False],
+                    device=self.device))
+
+            logits = torch.randn(B, len(OPERATORS), device=self.device)
+            masked, _ = library.ApplyRealmAwareLegality(
+                logits, pst, referenced)
+            legal_min = torch.stack([
+                masked[row, legality[row]].amin()
+                for row in range(B)])
+            assert bool((masked[1:, op["grasp"]] < legal_min[1:]).all().item())
+            assert torch.isfinite(masked[:, op["observe"]]).all()
+            assert torch.isfinite(masked).all()
+            print("RealmAwareOperatorLegality passed.")
+            return True
+        except Exception as e:
+            print(f"RealmAwareOperatorLegality failed: {type(e).__name__}: {e}")
             return False
 
     def TestPlanRankerShapes(self) -> bool:
@@ -1799,7 +2615,7 @@ class TestNeuroSymbolicMTool:
     def TestNeuroSymbolicExtractorForwardAndExplainSwitch(self) -> bool:
         try:
             B, K = 2, 4
-            model = NeuroSymbolicExtractor().to(self.device)
+            model = self.MakeExtractor()
             model.eval()
             inputs = self.MakeExtractorInputs(B=B, K=K)
             with torch.no_grad():
@@ -1813,6 +2629,13 @@ class TestNeuroSymbolicMTool:
             assert tuple(out_no_explain.temporal_logits.shape) == (B, ModuleDim.TemporalPrimitiveCount)
             assert tuple(out_no_explain.temporal_reason_logits.shape) == (B, ModuleDim.TemporalReasonDim)
             assert tuple(out_no_explain.reference_drift.shape) == (B,)
+            assert not any(
+                name.endswith((
+                    "endpoint_valid",
+                    "action_mask",
+                    "decision_action_mask",
+                ))
+                for name in model.state_dict())
             assert len(out_no_explain.facts) == 0
             assert len(out_no_explain.plan_steps) == 0
             assert len(out_no_explain.operator_rationales) == 0
@@ -1838,14 +2661,16 @@ class TestNeuroSymbolicMTool:
             from inspect import signature
 
             B, K = 2, 4
-            model = NeuroSymbolicExtractor().to(self.device).eval()
+            model = self.MakeExtractor().eval()
             inputs = self.MakeExtractorInputs(B=B, K=K)
             forward_parameters = set(signature(model.forward).parameters)
             assert {
                 "bodyProprioception",
                 "robotPhysicalReference",
                 "targetTrackingError",
-                "plannerTrackingError",} <= forward_parameters
+                "plannerTrackingError",
+                "endpointStateValid",
+                "endpointControllable",} <= forward_parameters
             assert forward_parameters.isdisjoint({
                 "robotPhysicalState",
                 "robotSelfState",
@@ -1924,19 +2749,21 @@ class TestNeuroSymbolicMTool:
                 planner_physical, planner_control, planner_output = (
                     EncodeThroughExtractor(plannerTrackingError=changed_planner))
 
-                inactive_camera_error = inputs["targetTrackingError"].clone()
-                inactive_camera_error[
-                    :, ModuleDim.DecisionCameraEndpointIndex, 0] = 5.0
-                inactive_physical, inactive_control, inactive_output = (
+                observer_index = (
+                    self.robot_morphology.observer_endpoint_index)
+                changed_masked_observer = inputs["targetTrackingError"].clone()
+                changed_masked_observer[:, observer_index, 0] = 23.0
+                masked_observer_physical, masked_observer_control, _ = (
                     EncodeThroughExtractor(
-                        targetTrackingError=inactive_camera_error))
+                        targetTrackingError=changed_masked_observer))
 
-                camera_rotation_error = inputs["targetTrackingError"].clone()
-                camera_rotation_error[
-                    :, ModuleDim.DecisionCameraEndpointIndex, 5] = 2.0
-                camera_physical, camera_control, camera_output = (
+                changed_observer_rotation = (
+                    inputs["targetTrackingError"].clone())
+                changed_observer_rotation[:, observer_index, 5] = 5.0
+                observer_physical, observer_control, observer_output = (
                     EncodeThroughExtractor(
-                        targetTrackingError=camera_rotation_error))
+                        targetTrackingError=changed_observer_rotation))
+
             finally:
                 physical_handle.remove()
                 control_handle.remove()
@@ -1961,22 +2788,13 @@ class TestNeuroSymbolicMTool:
                 assert bool((per_sample_delta > 1e-7).all().item())
             assert torch.equal(baseline_physical, target_physical)
             assert torch.equal(baseline_physical, planner_physical)
-            assert torch.equal(baseline_physical, inactive_physical)
-            assert torch.equal(baseline_physical, camera_physical)
-            assert torch.equal(baseline_control, inactive_control)
-            assert torch.equal(
-                baseline_output.subgoal_feature,
-                inactive_output.subgoal_feature)
-            assert torch.equal(
-                baseline_output.constraint_tokens,
-                inactive_output.constraint_tokens)
-            assert torch.equal(
-                baseline_output.invoke_mask,
-                inactive_output.invoke_mask)
+            assert torch.equal(baseline_physical, masked_observer_physical)
+            assert torch.equal(baseline_physical, observer_physical)
+            assert torch.equal(baseline_control, masked_observer_control)
             for latent in (
                     target_control,
                     planner_control,
-                    camera_control):
+                    observer_control):
                 per_sample_delta = (
                     latent - baseline_control).abs().amax(dim=-1)
                 assert bool((per_sample_delta > 1e-7).all().item())
@@ -1984,7 +2802,7 @@ class TestNeuroSymbolicMTool:
             for changed_output in (
                     target_output,
                     planner_output,
-                    camera_output):
+                    observer_output):
                 output_delta = (
                     (changed_output.subgoal_feature - baseline_output.subgoal_feature)
                     .abs().sum()
@@ -1993,6 +2811,150 @@ class TestNeuroSymbolicMTool:
                     + (changed_output.invoke_mask - baseline_output.invoke_mask)
                     .abs().sum())
                 assert bool((output_delta > 1e-7).item())
+
+            no_endpoint = torch.zeros(
+                B,
+                self.robot_morphology.endpoint_count,
+                device=self.device,
+                dtype=torch.bool)
+            with torch.no_grad():
+                zero_physical = model.robot_state_encoder(
+                    inputs["bodyProprioception"],
+                    inputs["robotPhysicalReference"],
+                    endpointStateValid=no_endpoint)
+                zero_control = model.control_feedback_encoder(
+                    inputs["targetTrackingError"],
+                    inputs["plannerTrackingError"],
+                    endpointStateValid=no_endpoint,
+                    endpointControllable=no_endpoint)
+            assert torch.equal(
+                zero_physical,
+                torch.zeros_like(zero_physical))
+            assert torch.equal(
+                zero_control,
+                torch.zeros_like(zero_control))
+
+            physical_input = torch.randn_like(
+                inputs["bodyProprioception"], requires_grad=True)
+            one_endpoint = no_endpoint.clone()
+            one_endpoint[:, 0] = True
+            physical_loss = model.robot_state_encoder(
+                physical_input,
+                inputs["robotPhysicalReference"],
+                endpointStateValid=one_endpoint).square().sum()
+            physical_loss.backward()
+            assert physical_input.grad is not None
+            assert int(torch.count_nonzero(
+                physical_input.grad[:, 1:]).item()) == 0
+
+            target_input = torch.randn_like(
+                inputs["targetTrackingError"], requires_grad=True)
+            planner_input = torch.randn_like(
+                inputs["plannerTrackingError"], requires_grad=True)
+            runtime_endpoint = torch.ones(
+                B,
+                self.robot_morphology.endpoint_count,
+                device=self.device,
+                dtype=torch.bool)
+            control_loss = model.control_feedback_encoder(
+                target_input,
+                planner_input,
+                endpointStateValid=runtime_endpoint,
+                endpointControllable=runtime_endpoint).square().sum()
+            control_loss.backward()
+            _, runtime_action_mask = (
+                model.control_feedback_encoder.RuntimeMask(
+                    B,
+                    self.device,
+                    runtime_endpoint,
+                    runtime_endpoint))
+            assert target_input.grad is not None
+            assert planner_input.grad is not None
+            assert int(torch.count_nonzero(
+                target_input.grad.masked_select(
+                    ~runtime_action_mask)).item()) == 0
+            assert int(torch.count_nonzero(
+                planner_input.grad.masked_select(
+                    ~runtime_action_mask)).item()) == 0
+
+            permutation = torch.arange(
+                self.robot_morphology.endpoint_count,
+                dtype=torch.long).roll(1)
+            permuted_morphology = self.PermuteEndpointMorphology(permutation)
+            permuted_model = NeuroSymbolicExtractor(
+                robotMorphology=permuted_morphology).to(self.device).eval()
+            permuted_model.load_state_dict(model.state_dict())
+            permutation_device = permutation.to(self.device)
+            permutation_body = torch.randn_like(
+                inputs["bodyProprioception"])
+            permutation_target = torch.randn_like(
+                inputs["targetTrackingError"])
+            permutation_planner = torch.randn_like(
+                inputs["plannerTrackingError"])
+            with torch.no_grad():
+                original_physical = model.robot_state_encoder(
+                    permutation_body,
+                    inputs["robotPhysicalReference"],
+                    endpointStateValid=inputs["endpointStateValid"])
+                original_control = model.control_feedback_encoder(
+                    permutation_target,
+                    permutation_planner,
+                    endpointStateValid=inputs["endpointStateValid"],
+                    endpointControllable=inputs["endpointControllable"])
+                synchronized_physical = (
+                    permuted_model.robot_state_encoder(
+                        permutation_body.index_select(
+                            1, permutation_device),
+                        inputs["robotPhysicalReference"],
+                        endpointStateValid=inputs[
+                            "endpointStateValid"].index_select(
+                                1, permutation_device)))
+                synchronized_control = (
+                    permuted_model.control_feedback_encoder(
+                        permutation_target.index_select(
+                            1, permutation_device),
+                        permutation_planner.index_select(
+                            1, permutation_device),
+                        endpointStateValid=inputs[
+                            "endpointStateValid"].index_select(
+                                1, permutation_device),
+                        endpointControllable=inputs[
+                            "endpointControllable"].index_select(
+                                1, permutation_device)))
+                unsynchronized_physical = model.robot_state_encoder(
+                    permutation_body.index_select(
+                        1, permutation_device),
+                    inputs["robotPhysicalReference"],
+                    endpointStateValid=inputs[
+                        "endpointStateValid"].index_select(
+                            1, permutation_device))
+                unsynchronized_control = model.control_feedback_encoder(
+                    permutation_target.index_select(
+                        1, permutation_device),
+                    permutation_planner.index_select(
+                        1, permutation_device),
+                    endpointStateValid=inputs[
+                        "endpointStateValid"].index_select(
+                            1, permutation_device),
+                    endpointControllable=inputs[
+                        "endpointControllable"].index_select(
+                            1, permutation_device))
+            assert torch.allclose(
+                original_physical,
+                synchronized_physical,
+                atol=1e-6,
+                rtol=1e-5)
+            assert torch.allclose(
+                original_control,
+                synchronized_control,
+                atol=1e-6,
+                rtol=1e-5)
+            assert bool((
+                original_physical - unsynchronized_physical
+            ).abs().amax().item() > 1e-7)
+            assert bool((
+                original_control - unsynchronized_control
+            ).abs().amax().item() > 1e-7)
 
             print(
                 "NeuroSymbolicExtractor physical/control input separation test passed.")
@@ -2003,10 +2965,48 @@ class TestNeuroSymbolicMTool:
                 f"test failed: {type(e).__name__}: {e}")
             return False
 
+    def TestNeuroSymbolicActualTopologyShapes(self) -> bool:
+        try:
+            morphologies = (
+                self.MakeRobotMorphology(2, 4),
+                self.MakeRobotMorphology(5, 8),)
+            models = tuple(
+                self.MakeExtractor(morphology).eval()
+                for morphology in morphologies)
+            models[1].load_state_dict(models[0].state_dict())
+            for morphology, model in zip(morphologies, models):
+                B, K = 2, 3
+                inputs = self.MakeExtractorInputs(
+                    B=B,
+                    K=K,
+                    morphology=morphology)
+                with torch.no_grad():
+                    output = model(**inputs, returnExplain=False)
+                endpoint_count = int(morphology.endpoint_count)
+                assert model.robot_state_encoder.endpoint_count == endpoint_count
+                assert model.control_feedback_encoder.endpoint_count == endpoint_count
+                assert tuple(inputs["bodyProprioception"].shape) == (
+                    B, endpoint_count, ModuleDim.DecisionEndpointPoseDim)
+                assert tuple(inputs["targetTrackingError"].shape) == (
+                    B, endpoint_count, ModuleDim.RobotControlAxisDim)
+                self.AssertFinite(
+                    output.subgoal_feature,
+                    "NeuroSymbolic actual topology subgoal feature")
+                self.AssertFinite(
+                    output.constraint_tokens,
+                    "NeuroSymbolic actual topology constraint tokens")
+            print("NeuroSymbolicExtractor actual topology shape test passed.")
+            return True
+        except Exception as e:
+            print(
+                "NeuroSymbolicExtractor actual topology shape test failed: "
+                f"{type(e).__name__}: {e}")
+            return False
+
     def TestNeuroSymbolicContinuityAndReset(self) -> bool:
         try:
             B, K = 2, 4
-            model = NeuroSymbolicExtractor().to(self.device)
+            model = self.MakeExtractor()
             model.eval()
             inputs = self.MakeExtractorInputs(B=B, K=K)
             with torch.no_grad():
@@ -2032,7 +3032,7 @@ class TestNeuroSymbolicMTool:
     def TestReferenceDriftRespondsToBindingChange(self) -> bool:
         try:
             B, K = 2, 4
-            model = NeuroSymbolicExtractor().to(self.device)
+            model = self.MakeExtractor()
             model.eval()
             inputs = self.MakeExtractorInputs(B=B, K=K)
             with torch.no_grad():
@@ -2051,13 +3051,13 @@ class TestNeuroSymbolicMTool:
     def TestPlanStateExportImportRoundTrip(self) -> bool:
         try:
             B, K = 2, 4
-            model = NeuroSymbolicExtractor().to(self.device)
+            model = self.MakeExtractor()
             model.eval()
             inputs = self.MakeExtractorInputs(B=B, K=K)
             with torch.no_grad():
                 _ = model(**inputs, returnExplain=False)
                 state = model.ExportPlanState()
-            restored = NeuroSymbolicExtractor().to(self.device)
+            restored = self.MakeExtractor()
             restored.ImportPlanState(state)
             assert torch.equal(restored.last_operator.cpu(), state["last_operator"].cpu())
             assert torch.allclose(restored.last_operator_prob.cpu(), state["last_operator_prob"].cpu())
@@ -2071,7 +3071,7 @@ class TestNeuroSymbolicMTool:
 
     def TestPlanStateStrictSchema(self) -> bool:
         try:
-            model = NeuroSymbolicExtractor().to(self.device)
+            model = self.MakeExtractor()
             try:
                 model.ImportPlanState({
                     "last_operator": torch.zeros(2, dtype=torch.long, device=self.device),
@@ -2121,12 +3121,14 @@ class TestNeuroSymbolicMTool:
         results = {
             "PredicateGrounderShapes": self.TestPredicateGrounderShapes(),
             "OperatorLibraryScores": self.TestOperatorLibraryScores(),
+            "RealmAwareOperatorLegality": self.TestRealmAwareOperatorLegality(),
             "PlanRankerShapes": self.TestPlanRankerShapes(),
             "FailureExplainerShapes": self.TestFailureExplainerShapes(),
             "TemporalSymbolicHeadShapes": self.TestTemporalSymbolicHeadShapes(),
             "SymbolicFeatureMixerShapes": self.TestSymbolicFeatureMixerShapes(),
             "NeuroSymbolicExtractorForwardAndExplainSwitch": self.TestNeuroSymbolicExtractorForwardAndExplainSwitch(),
             "NeuroSymbolicPhysicalAndControlInputSeparation": self.TestNeuroSymbolicPhysicalAndControlInputSeparation(),
+            "NeuroSymbolicActualTopologyShapes": self.TestNeuroSymbolicActualTopologyShapes(),
             "NeuroSymbolicContinuityAndReset": self.TestNeuroSymbolicContinuityAndReset(),
             "ReferenceDriftRespondsToBindingChange": self.TestReferenceDriftRespondsToBindingChange(),
             "PlanStateExportImportRoundTrip": self.TestPlanStateExportImportRoundTrip(),

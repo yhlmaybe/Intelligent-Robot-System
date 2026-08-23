@@ -1,11 +1,12 @@
 from __future__ import annotations
-from typing import Dict
+from typing import Dict, Tuple
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from FunctionTools import AGICoreModule, BuildReferenceWeights, BuildReferenceScaleContext
+from FunctionTools import AGICoreModule
 from ModuleMessagerManager import ModuleDim
+from RobotMorphologyModule import Realm
 
 
 class CodebookGoalHead(AGICoreModule):
@@ -77,6 +78,10 @@ class CodebookGoalHead(AGICoreModule):
 
 
 class GoalGrounding(AGICoreModule):
+    REALM_SELF_BODY = int(Realm.SELF_BODY)
+    REALM_EXTERNAL_PHYSICAL = int(Realm.EXTERNAL_PHYSICAL)
+    REALM_VIRTUAL_CONTENT = int(Realm.VIRTUAL_CONTENT)
+
     def __init__(
         self,
         goalDim: int = ModuleDim.GoalShortDim,
@@ -111,6 +116,46 @@ class GoalGrounding(AGICoreModule):
             nn.Linear(self.slot_dim, self.slot_dim),
             nn.LayerNorm(self.slot_dim),)
 
+        ontology_dim = (
+            5
+            + 5
+            + 5 * 5
+            + 5
+            + 1
+            + ModuleDim.PstSelfPartSemanticDim
+            + 1
+            + 1
+            + 2
+            + 1
+            + 2
+            + 1)
+        self.ontology_slot_encoder = nn.Sequential(
+            nn.LayerNorm(ontology_dim),
+            nn.Linear(ontology_dim, self.slot_dim),
+            nn.SiLU(),
+            nn.Linear(self.slot_dim, self.slot_dim),
+            nn.LayerNorm(self.slot_dim),)
+        self.ontology_slot_gain = nn.Parameter(torch.tensor(-2.944439))
+        self.entity_text_feature_dim = 515
+        self.entity_text_slot_encoder = nn.Sequential(
+            nn.LayerNorm(self.entity_text_feature_dim),
+            nn.Linear(self.entity_text_feature_dim, self.slot_dim * 2),
+            nn.SiLU(),
+            nn.Linear(self.slot_dim * 2, self.slot_dim),
+            nn.LayerNorm(self.slot_dim),)
+        self.entity_text_slot_residual = nn.Sequential(
+            nn.LayerNorm(self.slot_dim * 2),
+            nn.Linear(self.slot_dim * 2, self.slot_dim * 2),
+            nn.SiLU(),
+            nn.Linear(self.slot_dim * 2, self.slot_dim),)
+        self.entity_text_slot_gate = nn.Sequential(
+            nn.LayerNorm(self.slot_dim * 2),
+            nn.Linear(self.slot_dim * 2, self.slot_dim),
+            nn.Sigmoid(),)
+        self.entity_text_slot_gain = nn.Parameter(torch.tensor(-2.944439))
+        nn.init.zeros_(self.entity_text_slot_residual[-1].weight)
+        nn.init.zeros_(self.entity_text_slot_residual[-1].bias)
+
         self.ground_attn = nn.MultiheadAttention(self.slot_dim, int(numHeads), batch_first=True)
         self.grounded_query_norm = nn.LayerNorm(self.slot_dim)
         self.no_slot_token = nn.Parameter(torch.randn(1, 1, self.slot_dim) * 0.02)
@@ -132,6 +177,220 @@ class GoalGrounding(AGICoreModule):
         self.slot_head = nn.Linear(self.slot_dim, 1)
         self.param_head = nn.Linear(self.slot_dim, int(paramDim))
 
+    def BuildSemanticReferenceWeights(
+        self,
+        physicalState: Dict[str, torch.Tensor],
+        memoryScale: torch.Tensor,
+        memoryDecayHorizon: float = 32.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        presence = physicalState["PerceptualPresence"]
+        observed = physicalState["Observed"].float()
+        current_step = physicalState["Step"].view(-1, 1).float()
+        memory_age = (
+            current_step - physicalState["LastSeen"].float()
+        ).clamp_min(0.0)
+        memory_recency = torch.exp(-memory_age / float(memoryDecayHorizon))
+        observed_weight = presence * observed
+        memory_weight = (
+            memoryScale
+            * presence
+            * physicalState["SlotPresence"]
+            * (1.0 - observed)
+            * memory_recency)
+        return (
+            observed_weight,
+            memory_weight,
+            observed_weight + memory_weight,
+            memory_recency,)
+
+    def BuildSemanticScaleContext(
+        self,
+        observedPhysicalState: Dict[str, torch.Tensor],
+        demandQuery: torch.Tensor,
+    ) -> torch.Tensor:
+        observed_strength = (
+            observedPhysicalState["ObservedSlotMask"]
+            * observedPhysicalState["PerceptualPresence"])
+        demand = F.normalize(demandQuery, dim=-1, eps=1e-6)
+        slot = F.normalize(
+            observedPhysicalState["SlotState"], dim=-1, eps=1e-6)
+        demand_match = torch.einsum("bkd,bd->bk", slot, demand).add(1.0).mul(0.5)
+        matched_strength = observed_strength * demand_match
+        unmatched_strength = observed_strength * (1.0 - demand_match)
+        top_match = torch.topk(matched_strength, k=2, dim=1).values
+        observed_total = observed_strength.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        observed_max = observed_strength.amax(dim=1, keepdim=True)
+        best_match = top_match[:, :1]
+        second_match = top_match[:, 1:2]
+        mean_match = matched_strength.sum(dim=1, keepdim=True) / observed_total
+        ambiguity = second_match / best_match.clamp_min(1e-6)
+        unresolved = unmatched_strength.sum(dim=1, keepdim=True) / observed_total
+        return torch.cat([
+            observed_strength.mean(dim=1, keepdim=True),
+            observed_max,
+            best_match,
+            mean_match,
+            1.0 - best_match,
+            1.0 - observed_max,
+            ambiguity,
+            unresolved,], dim=-1)
+
+    def BuildOntologySlotContext(
+        self,
+        physicalState: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        K = int(physicalState["SlotState"].size(1))
+        surface_parent = physicalState["SurfaceParentProb"]
+        parent_summary = torch.stack([
+            surface_parent[..., :K].amax(dim=-1),
+            surface_parent[..., K],], dim=-1)
+        ontology = torch.cat([
+            physicalState["RealmProb"],
+            physicalState["MotionLayerProb"],
+            physicalState["LayerAgencyProb"].flatten(-2),
+            physicalState["AgencyProb"],
+            physicalState["BodyMembershipProb"].unsqueeze(-1),
+            physicalState["SelfPartSemantic"],
+            physicalState["PhysicalInteractionProb"].unsqueeze(-1),
+            physicalState["VerificationConfidence"].unsqueeze(-1),
+            physicalState["SurfaceUV"],
+            physicalState["SurfaceUVConfidence"].unsqueeze(-1),
+            parent_summary,
+            physicalState["PerceptualPresence"].unsqueeze(-1),], dim=-1)
+        return self.ontology_slot_encoder(ontology)
+
+    def BuildEntityTextSlotContext(
+        self,
+        physicalState: Dict[str, torch.Tensor],
+        slotTensor: torch.Tensor,
+    ) -> torch.Tensor:
+        required = (
+            "EntityTextSemantic",
+            "EntityTextConfidence",
+            "EntityTextRevision",
+            "EntityTextChanged",)
+        if any(name not in physicalState for name in required):
+            return torch.zeros_like(slotTensor)
+        confidence = physicalState["EntityTextConfidence"].unsqueeze(-1)
+        revision = torch.tanh(
+            physicalState["EntityTextRevision"].to(slotTensor.dtype).unsqueeze(-1)
+            / 16.0)
+        changed = physicalState["EntityTextChanged"].to(
+            slotTensor.dtype).unsqueeze(-1)
+        features = torch.cat([
+            physicalState["EntityTextSemantic"].to(slotTensor.dtype),
+            confidence,
+            revision,
+            changed,], dim=-1)
+        code = self.entity_text_slot_encoder(features)
+        joint = torch.cat([slotTensor, code], dim=-1)
+        residual = self.entity_text_slot_residual(joint)
+        gate = self.entity_text_slot_gate(joint)
+        return 0.25 * confidence * torch.sigmoid(
+            self.entity_text_slot_gain) * gate * residual
+
+    def ResolveActuationReference(
+        self,
+        physicalState: Dict[str, torch.Tensor],
+        semanticReference: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        K = int(semanticReference.size(1))
+        realm = physicalState["RealmProb"]
+        verification = physicalState["VerificationConfidence"]
+        interaction = physicalState["PhysicalInteractionProb"]
+        presence = physicalState["PerceptualPresence"]
+
+        external_mass = realm[..., self.REALM_EXTERNAL_PHYSICAL]
+        physical_parent_mass = (
+            realm[..., self.REALM_SELF_BODY]
+            + realm[..., self.REALM_EXTERNAL_PHYSICAL])
+        direct_reference = (
+            semanticReference
+            * external_mass
+            * presence
+            * interaction
+            * verification)
+
+        uv = physicalState["SurfaceUV"]
+        uv_confidence = physicalState["SurfaceUVConfidence"]
+        virtual_child_reference = (
+            semanticReference
+            * realm[..., self.REALM_VIRTUAL_CONTENT]
+            * presence
+            * verification
+            * uv_confidence)
+        parent_eligibility = (
+            presence
+            * physical_parent_mass
+            * interaction
+            * verification
+            * physicalState["DisplaySurfaceProb"])
+        surface_parent = physicalState["SurfaceParentProb"][..., :K]
+        verified_parent_path = (
+            surface_parent * parent_eligibility.unsqueeze(1))
+        surface_reference = torch.einsum(
+            "bk,bkj->bj",
+            virtual_child_reference,
+            verified_parent_path)
+
+        actuation_reference = direct_reference
+        actuation_confidence = actuation_reference.sum(dim=-1)
+        no_actuation_prob = 1.0 - actuation_confidence
+        actuation_distribution = torch.cat([
+            actuation_reference,
+            no_actuation_prob.unsqueeze(-1),], dim=-1)
+
+        actuation_slot_index = actuation_reference.argmax(dim=-1)
+        batch_index = torch.arange(
+            actuation_reference.size(0), device=actuation_reference.device)
+        selected_parent_pose = physicalState["PoseCamera"][
+            batch_index, actuation_slot_index]
+        actuation_pose = torch.where(
+            (actuation_confidence > 0.0).unsqueeze(-1),
+            selected_parent_pose,
+            torch.zeros_like(selected_parent_pose))
+
+        surface_parent_slot_index = surface_reference.argmax(dim=-1)
+        selected_parent_path = torch.gather(
+            verified_parent_path,
+            2,
+            surface_parent_slot_index.view(-1, 1, 1).expand(-1, K, 1),
+        ).squeeze(-1)
+        resolved_child_mass = (
+            virtual_child_reference * selected_parent_path)
+        selected_surface_confidence = resolved_child_mass.sum(dim=-1)
+        surface_uv = torch.einsum(
+            "bk,bkd->bd",
+            resolved_child_mass,
+            uv) / (selected_surface_confidence.unsqueeze(-1) + 1e-8)
+        direct_confidence = direct_reference.sum(dim=-1)
+        surface_binding_confidence = surface_reference.sum(dim=-1)
+        surface_parent_pose = physicalState["PoseCamera"][
+            batch_index, surface_parent_slot_index]
+        surface_parent_pose = torch.where(
+            (surface_binding_confidence > 0.0).unsqueeze(-1),
+            surface_parent_pose,
+            torch.zeros_like(surface_parent_pose))
+        binding_kind_prob = torch.stack([
+            direct_confidence,
+            surface_binding_confidence,
+            1.0 - direct_confidence - surface_binding_confidence,], dim=-1)
+
+        return {
+            "actuation_reference_probs": actuation_reference,
+            "actuation_reference_distribution": actuation_distribution,
+            "actuation_reference_confidence": actuation_confidence,
+            "no_actuation_prob": no_actuation_prob,
+            "actuation_slot_index": actuation_slot_index,
+            "actuation_pose_camera": actuation_pose,
+            "actuation_surface_uv": surface_uv,
+            "actuation_binding_kind_prob": binding_kind_prob,
+            "surface_binding_reference_probs": surface_reference,
+            "surface_binding_confidence": surface_binding_confidence,
+            "surface_parent_slot_index": surface_parent_slot_index,
+            "surface_parent_pose_camera": surface_parent_pose,
+            "surface_binding_uv": surface_uv,}
+
     def forward(
         self,
         goalEmbed: torch.Tensor,
@@ -139,25 +398,22 @@ class GoalGrounding(AGICoreModule):
         physicalState: Dict[str, torch.Tensor],
         observedPhysicalState: Dict[str, torch.Tensor],) -> Dict[str, torch.Tensor]:
         slot_tensor = physicalState["SlotState"]
-        current_step = physicalState["Step"].view(-1, 1).float()
         goal_intent = torch.cat([goalEmbed, intentEmbed], dim=-1)
         query_vec = self.goal_intent_proj(goal_intent)
-        reference_context = BuildReferenceScaleContext(
+        reference_context = self.BuildSemanticScaleContext(
             observedPhysicalState,
             query_vec) # [B, 8]
 
         memory_scale = torch.sigmoid(self.reference_memory_scale_head(torch.cat([goal_intent, reference_context], dim=-1)))
 
-        reference_weights = BuildReferenceWeights(
+        (
+            observed_weight,
+            memory_weight,
+            slot_weight,
+            memory_recency,
+        ) = self.BuildSemanticReferenceWeights(
             physicalState,
-            current_step,
-            memoryScale=memory_scale,
-            memoryDecayHorizon=32.0)
-
-        observed_weight = reference_weights.observed_weight
-        memory_weight = reference_weights.memory_weight
-        memory_recency = reference_weights.memory_recency
-        slot_weight = reference_weights.slot_weight
+            memory_scale)
 
         slot_input = torch.cat([
             slot_tensor,
@@ -167,7 +423,13 @@ class GoalGrounding(AGICoreModule):
             slot_weight.unsqueeze(-1),
             memory_recency.unsqueeze(-1),], dim=-1)
 
-        slot_embed = self.slot_ground_encoder(slot_input) # [B, K, D]
+        slot_embed = (
+            self.slot_ground_encoder(slot_input)
+            + torch.sigmoid(self.ontology_slot_gain)
+            * self.BuildOntologySlotContext(physicalState))
+        slot_embed = slot_embed + self.BuildEntityTextSlotContext(
+            physicalState,
+            slot_embed)
         B, _, _ = slot_embed.shape
         no_slot_token = self.no_slot_token.expand(B, 1, self.slot_dim)
         memory_tokens = torch.cat([slot_embed, no_slot_token], dim=1) # [B, K + 1, D]
@@ -241,7 +503,10 @@ class GoalGrounding(AGICoreModule):
 
         reference_confidence = referenced.sum(dim=-1)
 
-        return {
+        actuation = self.ResolveActuationReference(
+            physicalState,
+            referenced)
+        output = {
             "referenced_object_probs": referenced,
             "reference_distribution": reference_distribution,
             "query_reference_distribution": query_reference_distribution,
@@ -249,7 +514,32 @@ class GoalGrounding(AGICoreModule):
             "grounding_consistency_loss": grounding_consistency_loss,
             "referenced_slot_summary": referenced_slot_summary,
             "reference_confidence": reference_confidence,
-            "no_slot_prob": no_slot_prob,}
+            "no_slot_prob": no_slot_prob,
+            "semantic_reference_probs": referenced,
+            "semantic_reference_distribution": reference_distribution,
+            "semantic_reference_confidence": reference_confidence,}
+        if "EntityId" in physicalState and "SlotGeneration" in physicalState:
+            selected_slot = referenced.argmax(dim=-1)
+            batch_index = torch.arange(
+                B,
+                device=selected_slot.device)
+            selected_entity = physicalState["EntityId"][
+                batch_index,
+                selected_slot]
+            selected_generation = physicalState["SlotGeneration"][
+                batch_index,
+                selected_slot]
+            has_reference = reference_confidence > no_slot_prob
+            output["referenced_entity_id"] = torch.where(
+                has_reference,
+                selected_entity,
+                torch.full_like(selected_entity, -1))
+            output["referenced_slot_generation"] = torch.where(
+                has_reference,
+                selected_generation,
+                torch.full_like(selected_generation, -1))
+        output.update(actuation)
+        return output
 
 
 class TemporalGoalHead(AGICoreModule):
@@ -473,6 +763,54 @@ class TestGoalMTool:
             "pstSummary": torch.randn(B, ModuleDim.PstSlotDim, device=self.device),
             "intentEmbed": torch.randn(B, ModuleDim.IntentionFeat, device=self.device),}
 
+    def MakeGroundingState(self, B: int, K: int) -> Dict[str, torch.Tensor]:
+        realm = torch.zeros(B, K, 5, device=self.device)
+        realm[..., GoalGrounding.REALM_EXTERNAL_PHYSICAL] = 1.0
+        agency = torch.zeros(B, K, 5, device=self.device)
+        agency[..., 4] = 1.0
+        motion_layer = torch.zeros(B, K, 5, device=self.device)
+        layer_agency = torch.zeros(B, K, 5, 5, device=self.device)
+        layer_agency[..., 4] = 1.0
+        self_part = torch.zeros(
+            B, K, ModuleDim.PstSelfPartSemanticDim, device=self.device)
+        surface_parent = torch.zeros(B, K, K + 1, device=self.device)
+        surface_parent[..., K] = 1.0
+        pose = torch.zeros(B, K, ModuleDim.PstPoseDim, device=self.device)
+        pose[..., 6] = 1.0
+        return {
+            "SlotState": torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
+            "U": torch.randn(B, K, ModuleDim.PstUsageDim, device=self.device),
+            "MphysRaw": torch.ones(B, K, device=self.device),
+            "Observed": torch.ones(B, K, device=self.device),
+            "LastSeen": torch.full((B, K), 4, device=self.device),
+            "Step": torch.full((B,), 4, device=self.device, dtype=torch.long),
+            "SlotPresence": torch.ones(B, K, device=self.device),
+            "ObservedSlotMask": torch.ones(B, K, device=self.device),
+            "PoseCamera": pose,
+            "PerceptualPresence": torch.ones(B, K, device=self.device),
+            "PhysicalInteractionProb": torch.ones(B, K, device=self.device),
+            "RealmProb": realm,
+            "MotionLayerProb": motion_layer,
+            "LayerAgencyProb": layer_agency,
+            "AgencyProb": agency,
+            "BodyMembershipProb": torch.zeros(B, K, device=self.device),
+            "SelfPartSemantic": self_part,
+            "SurfaceParentProb": surface_parent,
+            "SurfaceUV": torch.full((B, K, 2), 0.5, device=self.device),
+            "SurfaceUVConfidence": torch.ones(B, K, device=self.device),
+            "DisplaySurfaceProb": torch.ones(B, K, device=self.device),
+            "VerificationConfidence": torch.ones(B, K, device=self.device),
+            "EntityTextSemantic": torch.randn(B, K, 512, device=self.device),
+            "EntityTextConfidence": torch.ones(B, K, device=self.device),
+            "EntityTextRevision": torch.ones(
+                B, K, device=self.device, dtype=torch.long),
+            "EntityTextChanged": torch.ones(
+                B, K, device=self.device, dtype=torch.bool),
+            "EntityId": torch.arange(
+                K, device=self.device, dtype=torch.long).view(1, K).expand(B, K),
+            "SlotGeneration": torch.ones(
+                B, K, device=self.device, dtype=torch.long),}
+
     def AssertFinite(self, value: torch.Tensor, name: str) -> None:
         assert torch.isfinite(value).all(), f"{name} contains non-finite values"
 
@@ -589,15 +927,13 @@ class TestGoalMTool:
             grounding = GoalGrounding().to(self.device).eval()
             goal = torch.randn(B, ModuleDim.GoalShortDim, device=self.device)
             intent = torch.randn(B, ModuleDim.IntentionFeat, device=self.device)
-            physical_state = {
-                "SlotState": torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
-                "U": torch.randn(B, K, ModuleDim.PstUsageDim, device=self.device),
-                "MphysRaw": torch.ones(B, K, device=self.device),
-                "Observed": torch.tensor([[1, 1, 0, 0], [1, 0, 1, 0]], device=self.device),
-                "LastSeen": torch.tensor([[8, 8, 4, 0], [8, 3, 8, 0]], device=self.device),
-                "Step": torch.full((B,), 8, device=self.device, dtype=torch.long),
-                "SlotPresence": torch.ones(B, K, device=self.device),
-                "ObservedSlotMask": torch.ones(B, K, device=self.device),}
+            physical_state = self.MakeGroundingState(B, K)
+            physical_state["Observed"] = torch.tensor(
+                [[1, 1, 0, 0], [1, 0, 1, 0]], device=self.device)
+            physical_state["LastSeen"] = torch.tensor(
+                [[8, 8, 4, 0], [8, 3, 8, 0]], device=self.device)
+            physical_state["Step"] = torch.full(
+                (B,), 8, device=self.device, dtype=torch.long)
             with torch.no_grad():
                 out = grounding(goal, intent, physical_state, physical_state)
             assert tuple(out["referenced_object_probs"].shape) == (B, K)
@@ -605,6 +941,10 @@ class TestGoalMTool:
             assert tuple(out["referenced_slot_summary"].shape) == (B, ModuleDim.PstSlotDim)
             assert tuple(out["reference_confidence"].shape) == (B,)
             assert tuple(out["no_slot_prob"].shape) == (B,)
+            assert tuple(out["actuation_reference_probs"].shape) == (B, K)
+            assert tuple(out["actuation_reference_distribution"].shape) == (B, K + 1)
+            assert tuple(out["actuation_pose_camera"].shape) == (B, ModuleDim.PstPoseDim)
+            assert tuple(out["actuation_surface_uv"].shape) == (B, 2)
             for name, value in out.items():
                 self.AssertFinite(value, f"GoalGrounding {name}")
             print("GoalGrounding shape test passed.")
@@ -676,15 +1016,7 @@ class TestGoalMTool:
         try:
             B, K = 2, 4
             grounding = GoalGrounding().to(self.device).train()
-            physical_state = {
-                "SlotState": torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
-                "U": torch.randn(B, K, ModuleDim.PstUsageDim, device=self.device),
-                "MphysRaw": torch.ones(B, K, device=self.device),
-                "Observed": torch.ones(B, K, device=self.device),
-                "LastSeen": torch.full((B, K), 4, device=self.device),
-                "Step": torch.full((B,), 4, device=self.device, dtype=torch.long),
-                "SlotPresence": torch.ones(B, K, device=self.device),
-                "ObservedSlotMask": torch.ones(B, K, device=self.device),}
+            physical_state = self.MakeGroundingState(B, K)
             out = grounding(
                 torch.randn(B, ModuleDim.GoalShortDim, device=self.device),
                 torch.randn(B, ModuleDim.IntentionFeat, device=self.device),
@@ -705,6 +1037,7 @@ class TestGoalMTool:
             no_slot_state["Observed"] = torch.zeros(B, K, device=self.device)
             no_slot_state["SlotPresence"] = torch.zeros(B, K, device=self.device)
             no_slot_state["ObservedSlotMask"] = torch.zeros(B, K, device=self.device)
+            no_slot_state["PerceptualPresence"] = torch.zeros(B, K, device=self.device)
             no_slot = grounding(
                 torch.randn(B, ModuleDim.GoalShortDim, device=self.device),
                 torch.randn(B, ModuleDim.IntentionFeat, device=self.device),
@@ -734,6 +1067,91 @@ class TestGoalMTool:
             print(f"GroundingConsistencyGradient failed: {type(e).__name__}: {e}")
             return False
 
+    def TestEntityTextGrounding(self) -> bool:
+        try:
+            B, K = 2, 4
+            grounding = GoalGrounding().to(self.device).train()
+            state = self.MakeGroundingState(B, K)
+            state["EntityTextConfidence"][:, 0] = 0.0
+            slot_tensor = state["SlotState"]
+            optimizer = torch.optim.SGD(grounding.parameters(), lr=1e-2)
+            neutral = grounding.BuildEntityTextSlotContext(state, slot_tensor)
+            assert torch.count_nonzero(neutral).item() == 0
+            optimizer.zero_grad(set_to_none=True)
+            neutral.sum().backward()
+            optimizer.step()
+
+            grounding.zero_grad(set_to_none=True)
+            enriched = grounding.BuildEntityTextSlotContext(state, slot_tensor)
+            assert torch.count_nonzero(enriched[:, 0]).item() == 0
+            assert torch.count_nonzero(enriched[:, 1:]).item() > 0
+            enriched[:, 1:].square().mean().backward()
+            assert grounding.entity_text_slot_encoder[1].weight.grad is not None
+            assert grounding.entity_text_slot_residual[1].weight.grad is not None
+            assert grounding.entity_text_slot_gate[1].weight.grad is not None
+            assert grounding.entity_text_slot_gain.grad is not None
+            output = grounding(
+                torch.randn(B, ModuleDim.GoalShortDim, device=self.device),
+                torch.randn(B, ModuleDim.IntentionFeat, device=self.device),
+                state,
+                state)
+            assert output["referenced_entity_id"].shape == (B,)
+            assert output["referenced_slot_generation"].shape == (B,)
+            print("EntityTextGrounding passed.")
+            return True
+        except Exception as e:
+            print(f"EntityTextGrounding failed: {type(e).__name__}: {e}")
+            return False
+
+    def TestSemanticToActuationReference(self) -> bool:
+        try:
+            B, K = 3, 4
+            grounding = GoalGrounding().to(self.device).eval()
+            state = self.MakeGroundingState(B, K)
+            realm = state["RealmProb"]
+            realm[1, 1].zero_()
+            realm[1, 1, GoalGrounding.REALM_VIRTUAL_CONTENT] = 1.0
+            realm[2, 2].zero_()
+            realm[2, 2, int(Realm.VISUAL_EFFECT)] = 1.0
+            state["PhysicalInteractionProb"][1, 1] = 0.0
+            state["PhysicalInteractionProb"][2, 2] = 0.0
+            state["SurfaceParentProb"][1, 1].zero_()
+            state["SurfaceParentProb"][1, 1, 0] = 1.0
+            state["SurfaceUV"][1, 1] = torch.tensor(
+                [0.25, 0.75], device=self.device)
+            semantic = torch.zeros(B, K, device=self.device)
+            semantic[0, 0] = 1.0
+            semantic[1, 1] = 1.0
+            semantic[2, 2] = 1.0
+            with torch.no_grad():
+                out = grounding.ResolveActuationReference(state, semantic)
+            assert out["actuation_reference_probs"][0, 0] == 1.0
+            assert out["actuation_reference_confidence"][1] == 0.0
+            assert out["surface_binding_reference_probs"][1, 0] == 1.0
+            assert out["surface_binding_confidence"][1] == 1.0
+            assert out["actuation_reference_confidence"][2] == 0.0
+            assert out["no_actuation_prob"][2] == 1.0
+            assert torch.allclose(
+                out["actuation_surface_uv"][1],
+                torch.tensor([0.25, 0.75], device=self.device))
+            invalid_uv_state = {
+                name: value.clone() for name, value in state.items()}
+            invalid_uv_state["SurfaceUVConfidence"][1, 1] = 0.0
+            invalid_uv = grounding.ResolveActuationReference(
+                invalid_uv_state, semantic)
+            assert invalid_uv["surface_binding_confidence"][1] == 0.0
+            non_surface_state = {
+                name: value.clone() for name, value in state.items()}
+            non_surface_state["DisplaySurfaceProb"][1, 0] = 0.0
+            non_surface = grounding.ResolveActuationReference(
+                non_surface_state, semantic)
+            assert non_surface["surface_binding_confidence"][1] == 0.0
+            print("SemanticToActuationReference passed.")
+            return True
+        except Exception as e:
+            print(f"SemanticToActuationReference failed: {type(e).__name__}: {e}")
+            return False
+
     def RunAll(self) -> Dict[str, bool]:
         results = {
             "FourLevelForwardShapes": self.TestFourLevelForwardShapes(),
@@ -741,8 +1159,10 @@ class TestGoalMTool:
             "TemporalGoalShapes": self.TestTemporalGoalShapes(),
             "TemporalTimeoutGradientSemantics": self.TestTemporalTimeoutGradientSemantics(),
             "GoalGroundingShapes": self.TestGoalGroundingShapes(),
+            "SemanticToActuationReference": self.TestSemanticToActuationReference(),
             "HardCodebookCollapsePenalty": self.TestHardCodebookCollapsePenalty(),
             "GroundingConsistencyGradient": self.TestGroundingConsistencyGradient(),
+            "EntityTextGrounding": self.TestEntityTextGrounding(),
             "GoalManagerBackward": self.TestGoalManagerBackward(),}
         passed = sum(1 for value in results.values() if value)
         print(f"\n[GoalModule Tests] {passed}/{len(results)} passed.")

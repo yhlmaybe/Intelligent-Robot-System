@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Tuple, List, Dict, Any, Optional, Union
+from typing import Tuple, List, Dict, Any, Optional, TYPE_CHECKING, Union
 import threading
 import queue
 import random
@@ -8,6 +8,7 @@ import json
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import traceback
 import os
 import math
@@ -32,16 +33,18 @@ from CoreTypes import (
     DECISION_REQUEST_PROVENANCE_FIELDS,
     DECISION_WIRE_SCHEMA_VERSION,
     ExecutionStage,
+    ExpectedRobotCommandContract,
     PerceptionPhysicalStage,
     RobotState,
     TEXT_TRUST_OPERATOR_COMMAND,
     TEXT_TRUST_UNSAFE_EXTERNAL,
+    ValidateRobotTensorContract,
     ValueMemoryWorldStage)
 from PerceptionModule import PerceiveExtractor, PerceptionOnlineWrapper, PerceptionRecallLoss, TopDownContext, VisualState
 from AttentionModule import AttentionExtractor, AttentionOnlineWrapper
 from MemoryModule import MemoryExtractor, MemoryType
 from DecisionModule import DecisionExtractor, DecisionPlannerExtractor
-from DecisionDecoupler import ApplyPoseDelta, CanonicalizeQuaternion, DecoupledDecision, DecisionActionMask, DecisionDecouplerV2, EndpointControlEncoder, EndpointPoseEncoder, FlattenActiveDecisionTensor, MotionCommand, NormalizePose, QuatConjugate, QuatMultiply, QuatRotate, RelativePose, RelativePoseError, SAFETY_MARGIN_NAMES
+from DecisionDecoupler import ApplyPoseDelta, CanonicalizeQuaternion, DecoupledDecision, DecisionActionMask, DecisionDecouplerV2, EndpointPoseEncoder, MotionCommand, NormalizePose, QuatConjugate, QuatMultiply, QuatRotate, RelativePose, RelativePoseError, SAFETY_MARGIN_NAMES
 from WorldModule import (
     KLDiagNormal,
     RSSMWorldModel,
@@ -64,10 +67,28 @@ from TemporalExecutionModule import (
     TemporalExecutionGateExtractor)
 from ModuleMessagerManager import ModuleDim, ModuleMessagerManager
 from FunctionTools import SynchronizeDynamicAdapterTopologiesForFullLoad
- 
 
-BRAIN_RUNTIME_SCHEMA_VERSION = 15
+if TYPE_CHECKING:
+    from RobotMorphologyModule import CompiledRobotMorphology
 
+BRAIN_RUNTIME_SCHEMA_VERSION = 21
+WORLD_MEMORY_ARTIFACT_SCHEMA_VERSION = 1
+AGENT_MEMORY_SCHEMA_VERSION = 1
+AGENT_MEMORY_FIELDS = frozenset({
+    "artifact_type",
+    "schema_version",
+    "description_id",
+    "model_contract_id",
+    "adapter_id",
+    "batch_size",
+    "state",})
+WORLD_MEMORY_ARTIFACT_FIELDS = frozenset({
+    "artifact_type",
+    "schema_version",
+    "description_id",
+    "model_contract_id",
+    "adapter_id",
+    "world",})
 BRAIN_RUNTIME_BUFFER_FIELDS = frozenset({
     "schema_version",
     "prev_mem",
@@ -78,8 +99,16 @@ BRAIN_RUNTIME_BUFFER_FIELDS = frozenset({
     "prev_latent_control",
     "prev_target_endpoint_pose",
     "prev_target_endpoint_valid",
+    "prev_target_endpoint_controllable",
     "prev_measured_endpoint_pose",
     "prev_measured_endpoint_valid",
+    "prev_measured_endpoint_state_valid",
+    "prev_target_joint_variable_command",
+    "prev_target_joint_variable_command_mask",
+    "prev_measured_joint_position",
+    "prev_measured_joint_state_valid",
+    "prev_observer_pose_world",
+    "prev_observer_pose_valid",
     "active_option_policy_input",
     "active_option_prior_logit",
     "active_option_goal_mid",
@@ -125,6 +154,9 @@ BRAIN_RUNTIME_BUFFER_FIELDS = frozenset({
 AGENT_RUNTIME_CHECKPOINT_FIELDS = frozenset({
     "schema_version",
     "calibration_id",
+    "description_id",
+    "model_contract_id",
+    "adapter_id",
     "world_frame_id",
     "batch_size",
     "online_learning",
@@ -301,9 +333,52 @@ class BrainStepTrace:
 
 
 class BrainCore(nn.Module):
+    @staticmethod
+    def BuildEndpointReferenceIndex(
+        robotMorphology: CompiledRobotMorphology,) -> torch.Tensor:
+        endpoint_count = int(robotMorphology.endpoint_count)
+        reference = torch.arange(endpoint_count, dtype=torch.long)
+        endpoint_to_node = robotMorphology.endpoint_to_node.detach().cpu().long()
+        parent_index = robotMorphology.parent_index.detach().cpu().long()
+        node_to_endpoints: Dict[int, List[int]] = {}
+        active_endpoints = list(range(endpoint_count))
+        observer_endpoint_available = bool(
+            robotMorphology.observer_valid
+            and robotMorphology.observer_attachment_kind == "endpoint"
+            and int(robotMorphology.observer_endpoint_index) >= 0)
+        anchor_index = (
+            int(robotMorphology.observer_endpoint_index)
+            if observer_endpoint_available
+            else (int(active_endpoints[0]) if active_endpoints else -1))
+        for endpoint_index in active_endpoints:
+            node_index = int(endpoint_to_node[endpoint_index].item())
+            node_to_endpoints.setdefault(node_index, []).append(endpoint_index)
+        for endpoint_index in active_endpoints:
+            if endpoint_index == anchor_index:
+                continue
+            node_index = int(endpoint_to_node[endpoint_index].item())
+            visited = set()
+            ancestor_found = False
+            while 0 <= node_index < parent_index.numel():
+                if node_index in visited:
+                    raise ValueError("morphology parent graph contains a cycle")
+                visited.add(node_index)
+                node_index = int(parent_index[node_index].item())
+                if node_index < 0:
+                    break
+                ancestors = node_to_endpoints.get(node_index, ())
+                if ancestors:
+                    reference[endpoint_index] = int(ancestors[0])
+                    ancestor_found = True
+                    break
+            if not ancestor_found and anchor_index >= 0:
+                reference[endpoint_index] = anchor_index
+        return reference
+
     def __init__(
         self,
         calibration: CameraCalibration,
+        robotMorphology: CompiledRobotMorphology,
         device: Optional[torch.device] = None,
         *,
         seqLen: int = BasicParameters.IMAGE_SEQ_LEN,
@@ -316,6 +391,69 @@ class BrainCore(nn.Module):
         needTrace: bool = True,
         slowPeriod: int = 4,):
         super().__init__()
+        ValidateRobotTensorContract(robotMorphology)
+        self.robot_description_id = str(robotMorphology.description_id)
+        self.robot_model_contract_id = str(
+            robotMorphology.model_contract_id)
+        self.robot_adapter_id = str(robotMorphology.adapter_id)
+        self.robot_command_contract = ExpectedRobotCommandContract(
+            robotMorphology)
+        self.robot_endpoint_names = tuple(robotMorphology.endpoint_names)
+        self.robot_joint_variable_names = tuple(
+            robotMorphology.joint_variable_names)
+        self.robot_gripper_names = tuple(robotMorphology.gripper_names)
+        self.robot_node_count = int(robotMorphology.node_count)
+        self.robot_endpoint_count = int(robotMorphology.endpoint_count)
+        self.robot_joint_dof_count = int(robotMorphology.joint_dof_count)
+        self.register_buffer(
+            "robot_endpoint_task_mask",
+            robotMorphology.endpoint_task_mask.detach().clone().bool(),
+            persistent=False)
+        self.register_buffer(
+            "robot_endpoint_action_available",
+            robotMorphology.endpoint_task_mask.detach().clone().bool().any(),
+            persistent=False)
+        self.register_buffer(
+            "robot_joint_variable_commandable",
+            robotMorphology.joint_variable_commandable.detach().clone().bool(),
+            persistent=False)
+        observer_control_joint_mask = torch.zeros(
+            self.robot_joint_dof_count,
+            dtype=torch.bool)
+        observer_control_joint_indices = torch.as_tensor(
+            robotMorphology.observer_control_joint_indices,
+            dtype=torch.long)
+        if observer_control_joint_indices.numel():
+            observer_control_joint_mask[
+                observer_control_joint_indices] = True
+        self.register_buffer(
+            "robot_observer_control_joint_mask",
+            observer_control_joint_mask,
+            persistent=False)
+        self.register_buffer(
+            "robot_joint_action_available",
+            robotMorphology.joint_variable_commandable.detach().clone().bool().any(),
+            persistent=False)
+        self.register_buffer(
+            "robot_gripper_endpoint_index",
+            robotMorphology.gripper_endpoint_index.detach().clone().long(),
+            persistent=False)
+        self.register_buffer(
+            "robot_actuation_available",
+            torch.tensor(bool(
+                robotMorphology.endpoint_task_mask.detach().bool().any().item()
+                or robotMorphology.joint_variable_commandable.detach().bool().any().item()
+                or robotMorphology.gripper_count > 0),
+                dtype=torch.bool),
+            persistent=False)
+        self.register_buffer(
+            "robot_observer_valid",
+            torch.tensor(bool(robotMorphology.observer_valid), dtype=torch.bool),
+            persistent=False)
+        self.register_buffer(
+            "robot_endpoint_reference_index",
+            self.BuildEndpointReferenceIndex(robotMorphology),
+            persistent=False)
         self.SEQ_LEN = seqLen
         self.slow_period = int(slowPeriod)
         self.is_online_learning = plasticOnlineLearning
@@ -385,7 +523,8 @@ class BrainCore(nn.Module):
             physicalStateDim=ModuleDim.PstStateDim,
             physicalAffordanceDim=ModuleDim.PstAffordanceDim,
             physicalTextDim=ModuleDim.PstTextDim,
-            physicalSymbolDim=ModuleDim.PstSymbolClasses)
+            physicalSymbolDim=ModuleDim.PstSymbolClasses,
+            robotMorphology=robotMorphology)
 
         self.critic = ValueEstimationExtractor(
             memoryDim=ModuleDim.MemoryFeat,
@@ -407,7 +546,8 @@ class BrainCore(nn.Module):
 
         # Embodied-AGI v2: tensorized physical state, hierarchical goals, coarse-to-fine.
         self.pst_builder = PhysicalStateExtractor(
-            inObjectDim=ModuleDim.PerceptionEmbed)
+            inObjectDim=ModuleDim.PerceptionEmbed,
+            robotMorphology=robotMorphology)
         self.pst_loss = PhysicalStateLoss()
         world_latent_dim = ModuleDim.WorldOutHState + ModuleDim.WorldOutZState + ModuleDim.WorldOutXState
         self.goal_manager = FourLevelGoalManager(
@@ -415,9 +555,46 @@ class BrainCore(nn.Module):
             pstSummaryDim=ModuleDim.PstSlotDim,
             intentDim=ModuleDim.IntentionFeat)
         self.goal_grounding = GoalGrounding()
-        self.decision_decoupler = DecisionDecouplerV2(decisionDim=ModuleDim.DecisionBeliefDim)
-        self.neuro_symbolic = NeuroSymbolicExtractor()
-        self.temporal_gate = TemporalExecutionGateExtractor()
+        self.decision_decoupler = DecisionDecouplerV2(
+            decisionDim=ModuleDim.DecisionBeliefDim,
+            robotMorphology=robotMorphology)
+        self.realized_action_agency_encoder = nn.Sequential(
+            nn.LayerNorm(ModuleDim.EndpointActionEmbedDim * 3 + 4),
+            nn.Linear(
+                ModuleDim.EndpointActionEmbedDim * 3 + 4,
+                ModuleDim.EndpointActionEmbedDim * 2),
+            nn.SiLU(),
+            nn.Linear(
+                ModuleDim.EndpointActionEmbedDim * 2,
+                ModuleDim.EndpointActionEmbedDim),
+            nn.LayerNorm(ModuleDim.EndpointActionEmbedDim))
+        self.realized_action_agency_gain = nn.Parameter(torch.tensor(-2.944439))
+        self.pst_layer_agency_fuser = nn.Sequential(
+            nn.LayerNorm(
+                ModuleDim.PstSlotDim
+                + ModuleDim.EndpointActionEmbedDim
+                + ModuleDim.PstLayerAgencyDim),
+            nn.Linear(
+                ModuleDim.PstSlotDim
+                + ModuleDim.EndpointActionEmbedDim
+                + ModuleDim.PstLayerAgencyDim,
+                ModuleDim.PstSlotDim * 2),
+            nn.SiLU(),
+            nn.Linear(
+                ModuleDim.PstSlotDim * 2,
+                ModuleDim.PstLayerAgencyDim))
+        self.pst_layer_agency_gain = nn.Parameter(torch.tensor(-2.944439))
+        self.pst_entity_summary_fuser = nn.Sequential(
+            nn.LayerNorm(ModuleDim.PstSlotDim * 2),
+            nn.Linear(ModuleDim.PstSlotDim * 2, ModuleDim.PstSlotDim * 2),
+            nn.SiLU(),
+            nn.Linear(ModuleDim.PstSlotDim * 2, ModuleDim.PstSlotDim),
+            nn.LayerNorm(ModuleDim.PstSlotDim))
+        self.pst_entity_summary_gain = nn.Parameter(torch.tensor(-2.944439))
+        self.neuro_symbolic = NeuroSymbolicExtractor(
+            robotMorphology=robotMorphology)
+        self.temporal_gate = TemporalExecutionGateExtractor(
+            robotMorphology=robotMorphology)
         self.execution_satisfaction_threshold = 0.5
 
         self.OCR = OCREngineExtractor()
@@ -435,7 +612,6 @@ class BrainCore(nn.Module):
         if self.use_planner or self.planner_teacher_mode:
             self.planner = DecisionPlannerExtractor().BuildPlanner(
                 worldModel=self.world,
-                wmIsOnlineWrapper=plasticOnlineLearning,
                 decisionDecoupler=self.decision_decoupler,
                 N=64, elite=8, iters=3,
                 temperature=1.0, momentum=0.15,
@@ -482,7 +658,9 @@ class BrainCore(nn.Module):
         physicalState: Dict[str, torch.Tensor],
         actionEnc: torch.Tensor,
         robotPhysicalState: torch.Tensor,
-        cameraMotion: torch.Tensor,) -> Dict[str, torch.Tensor]:
+        cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
         # Prospective inference must retain online candidate deltas when a wrapper is active.
         return self.world.StepPriorOnly(
             hPrev=hPrev,
@@ -492,11 +670,14 @@ class BrainCore(nn.Module):
             actionEnc=actionEnc,
             robotPhysicalState=robotPhysicalState,
             cameraMotion=cameraMotion,
+            observerMotionValid=observerMotionValid,
             sample=False)
 
-    def ExportRuntimeWorldMemoryBank(self, topk: int) -> Optional[Dict[str, torch.Tensor]]:
-        # Durable memory belongs to the base world model, not its transient online wrapper.
-        return self.RuntimeModule(self.world).ExportWorldMemoryBank(topk=topk)
+    def ExportRuntimeWorldConsciousBank(
+        self,
+        topk: int,
+    ) -> Dict[str, torch.Tensor]:
+        return self.RuntimeModule(self.world).ExportConsciousBank(topk=topk)
 
     def RunWorldTrainingStep(
         self,
@@ -508,6 +689,7 @@ class BrainCore(nn.Module):
         robotPhysicalState: torch.Tensor,
         transitionRobotPhysicalState: torch.Tensor,
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         reward: Optional[torch.Tensor],
         done: Optional[torch.Tensor],) -> Dict[str, torch.Tensor]:
         update_runtime_memory = bool(self.training)
@@ -520,6 +702,7 @@ class BrainCore(nn.Module):
             "robotPhysicalState": robotPhysicalState,
             "transitionRobotPhysicalState": transitionRobotPhysicalState,
             "cameraMotion": cameraMotion,
+            "observerMotionValid": observerMotionValid,
             "sample": update_runtime_memory,
             "updateMemory": update_runtime_memory,}
         if self.is_online_learning:
@@ -544,6 +727,7 @@ class BrainCore(nn.Module):
         actionEnc: torch.Tensor,
         robotPhysicalState: torch.Tensor,
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         targetVisualState: VisualState,
         precision: torch.Tensor,
         aliveMask: torch.Tensor,) -> Dict[str, torch.Tensor]:
@@ -558,6 +742,7 @@ class BrainCore(nn.Module):
             actionEnc=actionEnc,
             robotPhysicalState=robotPhysicalState,
             cameraMotion=cameraMotion,
+            observerMotionValid=observerMotionValid,
             sample=False,)
         return self.world.ComputePredictionLoss(
             predictedVisual=prediction["predicted_visual"],
@@ -722,6 +907,7 @@ class BrainCore(nn.Module):
         measuredActionEnc: torch.Tensor,
         transitionRobotPhysicalState: torch.Tensor,
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         transitionValid: torch.Tensor,) -> Optional[Dict[str, torch.Tensor]]:
         valid = transitionValid.view(-1).bool()
         if not bool(valid.any().item()):
@@ -734,6 +920,7 @@ class BrainCore(nn.Module):
             actionEnc=measuredActionEnc,
             robotPhysicalState=transitionRobotPhysicalState,
             cameraMotion=cameraMotion,
+            observerMotionValid=observerMotionValid,
             sample=False,)["reconstructed_visual_state"]
         prior = self.DetachRuntimeObject(prediction)
         confidence = prior["PriorConfidence"]
@@ -834,14 +1021,45 @@ class BrainCore(nn.Module):
         self.active_motion_command = None
         # Last frame's committed target pose. Next frame the measured endpoint pose is compared
         # against it to expose command-vs-achieved tracking error.
-        self.prev_target_endpoint_pose = z(ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim)
+        self.prev_target_endpoint_pose = z(
+            self.robot_endpoint_count,
+            ModuleDim.DecisionEndpointPoseDim)
         self.prev_target_endpoint_pose[..., 6] = 1.0
         self.prev_target_endpoint_valid = torch.zeros(B, device=device, dtype=torch.bool)
+        self.prev_target_endpoint_controllable = torch.zeros(
+            B,
+            self.robot_endpoint_count,
+            device=device,
+            dtype=torch.bool)
         self.prev_measured_endpoint_pose = z(
-            ModuleDim.RobotStateEndpointCount,
+            self.robot_endpoint_count,
             ModuleDim.DecisionEndpointPoseDim)
         self.prev_measured_endpoint_pose[..., 6] = 1.0
         self.prev_measured_endpoint_valid = torch.zeros(B, device=device, dtype=torch.bool)
+        self.prev_measured_endpoint_state_valid = torch.zeros(
+            B,
+            self.robot_endpoint_count,
+            device=device,
+            dtype=torch.bool)
+        self.prev_target_joint_variable_command = z(
+            self.robot_joint_dof_count)
+        self.prev_target_joint_variable_command_mask = torch.zeros(
+            B,
+            self.robot_joint_dof_count,
+            device=device,
+            dtype=torch.bool)
+        self.prev_measured_joint_position = z(
+            self.robot_joint_dof_count)
+        self.prev_measured_joint_state_valid = torch.zeros(
+            B,
+            self.robot_joint_dof_count,
+            device=device,
+            dtype=torch.bool)
+        self.prev_observer_pose_world = z(
+            ModuleDim.DecisionEndpointPoseDim)
+        self.prev_observer_pose_world[..., 6] = 1.0
+        self.prev_observer_pose_valid = torch.zeros(
+            B, device=device, dtype=torch.bool)
 
         self.prev_entropy = z()
 
@@ -867,18 +1085,14 @@ class BrainCore(nn.Module):
 
         self.buf_B = B
 
-    def RelativeCameraMotion(
+    def RelativeObserverMotion(
         self,
         prevPose: torch.Tensor,
         curPose: torch.Tensor,
         prevValid: torch.Tensor) -> torch.Tensor:
-        """Derive rotation-only inter-frame camera motion for the fixed robot."""
-        motion = CanonicalizeQuaternion(
-            QuatMultiply(
-                QuatConjugate(prevPose[:, 3:7]),
-                curPose[:, 3:7]))
+        motion = RelativePose(prevPose, curPose)
         identity = motion.new_zeros(motion.shape)
-        identity[:, 3] = 1.0
+        identity[:, 6] = 1.0
         return torch.where(prevValid.view(-1, 1), motion, identity)
 
     def HasTrustedExternalText(
@@ -951,44 +1165,566 @@ class BrainCore(nn.Module):
 
     def BuildExecutedActionFeedback(
         self,
-        endpointPose: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
+        endpointPose: torch.Tensor,
+        jointPosition: torch.Tensor,
+        jointStateValid: torch.Tensor,
+        endpointStateValid: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B = int(endpointPose.size(0))
-        measured_valid = self.prev_measured_endpoint_valid.view(B, 1, 1)
-        decision_endpoint_pose = endpointPose[
-            :, ModuleDim.RobotStateControlledEndpointSlice]
-        previous_decision_endpoint_pose = self.prev_measured_endpoint_pose[
-            :, ModuleDim.RobotStateControlledEndpointSlice]
+        current_valid = endpointStateValid.to(
+            device=endpointPose.device, dtype=torch.bool)
+        if tuple(current_valid.shape) != (B, self.robot_endpoint_count):
+            raise ValueError(
+                "runtime endpoint validity does not match robot morphology")
+        measured_endpoint_valid = (
+            self.prev_measured_endpoint_state_valid.to(
+                device=endpointPose.device)
+            & current_valid)
+        measured_valid = measured_endpoint_valid.unsqueeze(-1)
         executed_decision_tensor = self.decision_decoupler.MaskDecisionTensor(
             RelativePoseError(
-                previous_decision_endpoint_pose,
-                decision_endpoint_pose)) * measured_valid
-        feedback = self.decision_decoupler.EncodeEndpointAction(
-            executed_decision_tensor)
-        feedback = feedback * self.prev_measured_endpoint_valid.view(B, 1)
-        return executed_decision_tensor, feedback
+                self.prev_measured_endpoint_pose,
+            endpointPose)) * measured_valid
+        measured_joint_valid = (
+            self.prev_measured_joint_state_valid.to(
+                device=jointPosition.device)
+            & jointStateValid.to(
+                device=jointPosition.device, dtype=torch.bool))
+        executed_joint_command = self.decision_decoupler.NormalizeMeasuredJointDelta(
+            self.prev_measured_joint_position,
+            jointPosition,
+            measured_joint_valid)
+        executed_joint_mask = measured_joint_valid
+        feedback = self.decision_decoupler.EncodeMeasuredAction(
+            executed_decision_tensor,
+            executed_joint_command,
+            executed_joint_mask)
+        measured_action_valid = (
+            measured_endpoint_valid.any(dim=-1)
+            | executed_joint_mask.any(dim=-1))
+        feedback = feedback * measured_action_valid.view(-1, 1).to(
+            feedback.dtype)
+        return (
+            executed_decision_tensor,
+            executed_joint_command,
+            executed_joint_mask,
+            feedback)
+
+    def BuildRealizedActionAgencyEvidence(
+        self,
+        executedDecisionTensor: torch.Tensor,
+        executedJointCommand: torch.Tensor,
+        executedJointMask: torch.Tensor,
+        measuredFeedback: torch.Tensor,
+        modelCommandExecuted: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = int(executedDecisionTensor.size(0))
+        command_endpoint_valid = (
+            self.prev_target_endpoint_controllable
+            & self.prev_measured_endpoint_state_valid
+            & modelCommandExecuted.view(B, 1))
+        command_valid = command_endpoint_valid.unsqueeze(-1)
+        commanded_decision = self.decision_decoupler.MaskDecisionTensor(
+            RelativePoseError(
+                self.prev_measured_endpoint_pose,
+            self.prev_target_endpoint_pose)) * command_valid
+        command_joint_valid = (
+            self.prev_target_joint_variable_command_mask
+            & self.prev_measured_joint_state_valid
+            & modelCommandExecuted.view(B, 1))
+        commanded_joint = self.decision_decoupler.MaskJointVariableCommand(
+            self.prev_target_joint_variable_command,
+            command_joint_valid)
+        commanded_feedback = self.decision_decoupler.EncodeAction(
+            commanded_decision,
+            commanded_joint,
+            command_joint_valid)
+        commanded_feedback *= (
+            command_endpoint_valid.any(dim=-1)
+            | command_joint_valid.any(dim=-1)).view(-1, 1).to(
+                measuredFeedback.dtype)
+        mismatch_decision = self.decision_decoupler.MaskDecisionTensor(
+            executedDecisionTensor - commanded_decision)
+        mismatch_joint_mask = executedJointMask | command_joint_valid
+        mismatch_joint = torch.nan_to_num(
+            executedJointCommand - commanded_joint).clamp(-1.0, 1.0)
+        mismatch_feedback = self.decision_decoupler.EncodeMeasuredAction(
+            mismatch_decision,
+            mismatch_joint,
+            mismatch_joint_mask)
+        action_coordinate_mask = self.robot_endpoint_task_mask.to(
+            device=mismatch_decision.device,
+            dtype=mismatch_decision.dtype)
+        active_coordinate_count = action_coordinate_mask.sum().clamp_min(1.0)
+        mismatch_magnitude = torch.linalg.vector_norm(
+            mismatch_decision,
+            dim=(1, 2)) / active_coordinate_count.sqrt()
+        mismatch_magnitude = mismatch_magnitude * (
+            self.robot_endpoint_action_available.to(
+                device=mismatch_magnitude.device,
+                dtype=mismatch_magnitude.dtype))
+        active_joint_count = mismatch_joint_mask.sum(
+            dim=-1).clamp_min(1).to(mismatch_joint.dtype)
+        joint_mismatch_magnitude = torch.linalg.vector_norm(
+            mismatch_joint,
+            dim=-1) / active_joint_count.sqrt()
+        mismatch_magnitude = torch.sqrt(
+            mismatch_magnitude.square()
+            + joint_mismatch_magnitude.square())
+        measured_action_valid = (
+            self.prev_measured_endpoint_state_valid.any(dim=-1)
+            | self.prev_measured_joint_state_valid.any(dim=-1))
+        target_action_valid = (
+            self.prev_target_endpoint_controllable.any(dim=-1)
+            | self.prev_target_joint_variable_command_mask.any(dim=-1))
+        provenance = torch.stack([
+            modelCommandExecuted.to(measuredFeedback.dtype),
+            measured_action_valid.to(measuredFeedback.dtype),
+            target_action_valid.to(measuredFeedback.dtype),
+            mismatch_magnitude,], dim=-1)
+        agency_evidence = self.realized_action_agency_encoder(torch.cat([
+            measuredFeedback,
+            commanded_feedback,
+            mismatch_feedback,
+            provenance,], dim=-1))
+        evidence_valid = (
+            measured_action_valid
+            & (self.robot_endpoint_action_available
+               | self.robot_joint_action_available)).to(
+            device=agency_evidence.device,
+            dtype=agency_evidence.dtype).unsqueeze(-1)
+        agency_evidence = agency_evidence * evidence_valid
+        realized_feedback = (
+            measuredFeedback
+            + torch.sigmoid(self.realized_action_agency_gain)
+            * agency_evidence) * evidence_valid
+        return realized_feedback, agency_evidence
+
+    def RefinePSTLayerAgency(
+        self,
+        physicalState: Dict[str, torch.Tensor],
+        actionAgencyEvidence: torch.Tensor,
+    ) -> None:
+        B, K = physicalState["SlotState"].shape[:2]
+        current = physicalState["LayerAgencyProb"]
+        evidence_valid = (
+            (self.prev_measured_endpoint_state_valid.any(dim=-1)
+             | self.prev_measured_joint_state_valid.any(dim=-1))
+            & (self.robot_endpoint_action_available
+               | self.robot_joint_action_available)).view(B, 1, 1, 1)
+        evidence = actionAgencyEvidence.unsqueeze(1).expand(-1, K, -1)
+        delta = self.pst_layer_agency_fuser(torch.cat([
+            physicalState["SlotState"],
+            evidence,
+            current.flatten(-2),], dim=-1)).view(
+                B,
+                K,
+                ModuleDim.PstMotionLayerClasses,
+                ModuleDim.PstAgencyClasses)
+        refined = torch.softmax(
+            torch.log(current + 1e-8)
+            + torch.sigmoid(self.pst_layer_agency_gain) * torch.tanh(delta),
+            dim=-1)
+        refined = torch.where(evidence_valid, refined, current)
+        physicalState["LayerAgencyProb"] = refined
+        layer_weight = physicalState["MotionLayerProb"]
+        layer_mass = layer_weight.sum(dim=-1, keepdim=True)
+        marginal = (
+            layer_weight.unsqueeze(-1) * refined
+        ).sum(dim=-2) / (layer_mass + 1e-8)
+        unknown = torch.zeros_like(marginal)
+        unknown[..., -1] = 1.0
+        updated_marginal = torch.where(
+            layer_mass > 1e-6,
+            marginal,
+            unknown)
+        physicalState["AgencyProb"] = torch.where(
+            evidence_valid.squeeze(-1),
+            updated_marginal,
+            physicalState["AgencyProb"])
+
+    @staticmethod
+    def AttachEntityOntology(
+        visualState: VisualState,
+        observedPst: Dict[str, torch.Tensor],
+    ) -> None:
+        auxiliary = visualState.Auxiliary
+        auxiliary["PerceptualObjectAgencyProb"] = auxiliary["ObjectAgencyProb"]
+        auxiliary["PerceptualMotionLayerProb"] = auxiliary["ObjectMotionLayerProb"]
+        auxiliary["PerceptualLayerAgencyProb"] = auxiliary["LayerAgencyProb"]
+        auxiliary["PerceptualDisplaySurfaceProb"] = auxiliary["DisplaySurfaceProb"]
+        auxiliary["PerceptualSurfaceUV"] = auxiliary["SurfaceUV"]
+        auxiliary["PerceptualSurfaceUVConfidence"] = auxiliary["SurfaceUVConfidence"]
+        auxiliary["PerceptualContentMotionUV"] = auxiliary["ContentMotionUV"]
+        auxiliary["PerceptualContentChangeProb"] = auxiliary["ContentChangeProb"]
+        for name in (
+            "PerceptualPresence",
+            "GeometryValidMask",
+            "MphysRaw",
+            "PhysicalEntityProb",
+            "PhysicalInteractionProb",
+            "RealmProb",
+            "MotionLayerProb",
+            "LayerAgencyProb",
+            "AgencyProb",
+            "BodyMembershipProb",
+            "SelfPartProb",
+            "SelfPartSemantic",
+            "CarrierMotionCameraRaw",
+            "ArticulationMotionCameraRaw",
+            "ContentMotionUV",
+            "ContentChangeProb",
+            "DisplaySurfaceProb",
+            "SurfaceParentProb",
+            "SurfaceUV",
+            "SurfaceUVConfidence",
+            "VerificationConfidence",
+            "OntologyRelationProb",):
+            auxiliary[name] = observedPst[name]
+        auxiliary["EntityRealmProb"] = observedPst["RealmProb"]
+        auxiliary["ObjectAgencyProb"] = observedPst["AgencyProb"]
+        auxiliary["ObjectMotionLayerProb"] = observedPst["MotionLayerProb"]
+
+    @torch.no_grad()
+    def BindOcrToWorldEntities(
+        self,
+        ocrItems: List[List[Dict[str, Any]]],
+        observedPst: Dict[str, torch.Tensor],
+        persistentPst: Dict[str, torch.Tensor],
+        associations: Dict[str, torch.Tensor],
+        *,
+        imageHeight: int,
+        imageWidth: int,
+        fresh: bool,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        mapping = associations["ObservedToWorldSlot"].to(dtype=torch.long)
+        world_entity_id = associations["WorldEntityId"].to(dtype=torch.long)
+        world_generation = associations["WorldSlotGeneration"].to(
+            dtype=torch.long)
+        B, Kobs = mapping.shape
+        Kworld = int(world_entity_id.size(1))
+        semantic = persistentPst["EntityTextSemantic"].detach().clone()
+        confidence = persistentPst["EntityTextConfidence"].detach().clone()
+        revision = persistentPst["EntityTextRevision"].detach().clone()
+        changed = torch.zeros(
+            B, Kworld, device=semantic.device, dtype=torch.bool)
+        if len(ocrItems) != B:
+            raise ValueError("OCR batch size does not match physical state")
+        if imageHeight < 1 or imageWidth < 1:
+            raise ValueError("image dimensions must be positive")
+        if tuple(observedPst["BBox2D"].shape) != (B, Kobs, 4):
+            raise ValueError("observed BBox2D shape does not match associations")
+        presence = observedPst["PerceptualPresence"].to(
+            device=semantic.device,
+            dtype=semantic.dtype)
+        boxes = observedPst["BBox2D"].to(
+            device=semantic.device,
+            dtype=semantic.dtype)
+        mapping = mapping.to(device=semantic.device)
+        world_entity_id = world_entity_id.to(device=semantic.device)
+        world_generation = world_generation.to(device=semantic.device)
+        accumulated = torch.zeros_like(semantic)
+        mass = torch.zeros_like(confidence)
+        texts: List[str] = []
+        targets: List[Tuple[int, int, float]] = []
+        if fresh:
+            scale = semantic.new_tensor([
+                float(imageWidth),
+                float(imageHeight),
+                float(imageWidth),
+                float(imageHeight)])
+            for batch_index, items in enumerate(ocrItems):
+                for item in items:
+                    text_value = str(item["text"]).strip()
+                    if not text_value:
+                        continue
+                    line_box = torch.as_tensor(
+                        item["box"],
+                        device=semantic.device,
+                        dtype=semantic.dtype) / scale
+                    x1, y1, x2, y2 = line_box.unbind()
+                    area = (x2 - x1).clamp_min(0.0) * (
+                        y2 - y1).clamp_min(0.0)
+                    if float(area.item()) <= 0.0:
+                        continue
+                    object_boxes = boxes[batch_index]
+                    intersection = (
+                        (
+                            torch.minimum(object_boxes[:, 2], x2)
+                            - torch.maximum(object_boxes[:, 0], x1)
+                        ).clamp_min(0.0)
+                        * (
+                            torch.minimum(object_boxes[:, 3], y2)
+                            - torch.maximum(object_boxes[:, 1], y1)
+                        ).clamp_min(0.0))
+                    center_x = 0.5 * (x1 + x2)
+                    center_y = 0.5 * (y1 + y2)
+                    center_inside = (
+                        (center_x >= object_boxes[:, 0])
+                        & (center_x <= object_boxes[:, 2])
+                        & (center_y >= object_boxes[:, 1])
+                        & (center_y <= object_boxes[:, 3]))
+                    candidate = (
+                        center_inside
+                        & (mapping[batch_index] >= 0)
+                        & (presence[batch_index] > 0.0))
+                    score = (
+                        intersection / area
+                        * presence[batch_index]
+                        * candidate.to(semantic.dtype))
+                    best_score, observed_index = score.max(dim=0)
+                    if float(best_score.item()) <= 0.0:
+                        continue
+                    world_index = int(
+                        mapping[batch_index, observed_index].item())
+                    ocr_confidence = min(
+                        1.0,
+                        max(0.0, float(item["score"])))
+                    weight = float(best_score.item()) * ocr_confidence
+                    if weight <= 0.0:
+                        continue
+                    texts.append(text_value)
+                    targets.append((batch_index, world_index, weight))
+        if texts:
+            intention = self.RuntimeModule(self.intention)
+            line_semantic, _, _ = intention.EncodeStringsWithSlots(
+                texts,
+                device=semantic.device)
+            line_semantic = F.normalize(
+                line_semantic.to(semantic.dtype),
+                dim=-1,
+                eps=1e-6)
+            for line_index, (batch_index, world_index, weight) in enumerate(
+                targets
+            ):
+                accumulated[batch_index, world_index].add_(
+                    line_semantic[line_index],
+                    alpha=weight)
+                mass[batch_index, world_index].add_(weight)
+        current_valid = mass > 0.0
+        current_semantic = F.normalize(
+            accumulated / mass.unsqueeze(-1).clamp_min(1e-6),
+            dim=-1,
+            eps=1e-6)
+        previous_valid = confidence > 0.0
+        similarity = F.cosine_similarity(
+            semantic,
+            current_semantic,
+            dim=-1,
+            eps=1e-6)
+        changed = current_valid & (
+            (~previous_valid) | (similarity < 0.99))
+        semantic = torch.where(
+            current_valid.unsqueeze(-1),
+            current_semantic,
+            semantic)
+        current_confidence = 1.0 - torch.exp(-mass)
+        confidence = torch.where(
+            current_valid,
+            torch.maximum(confidence, current_confidence),
+            confidence)
+        revision = revision + changed.to(revision.dtype)
+        live = world_entity_id >= 0
+        semantic = torch.where(
+            live.unsqueeze(-1),
+            semantic,
+            torch.zeros_like(semantic))
+        confidence = torch.where(
+            live,
+            confidence,
+            torch.zeros_like(confidence))
+        revision = torch.where(
+            live,
+            revision,
+            torch.zeros_like(revision))
+        changed &= live
+        world = {
+            "EntityTextSemantic": semantic,
+            "EntityTextConfidence": confidence,
+            "EntityTextRevision": revision,
+            "EntityTextChanged": changed,
+            "EntityId": world_entity_id,
+            "SlotGeneration": world_generation,}
+        mapping_valid = (mapping >= 0) & (mapping < Kworld)
+        safe_mapping = mapping.clamp(0, max(Kworld - 1, 0))
+
+        def gather_world(value: torch.Tensor) -> torch.Tensor:
+            tail = value.shape[2:]
+            index = safe_mapping.view(
+                B,
+                Kobs,
+                *([1] * len(tail))).expand(B, Kobs, *tail)
+            return torch.gather(value, 1, index)
+
+        observed_valid = mapping_valid & gather_world(
+            live.unsqueeze(-1)).squeeze(-1)
+        observed = {
+            "EntityTextSemantic": torch.where(
+                observed_valid.unsqueeze(-1),
+                gather_world(semantic),
+                torch.zeros(
+                    B,
+                    Kobs,
+                    semantic.size(-1),
+                    device=semantic.device,
+                    dtype=semantic.dtype)),
+            "EntityTextConfidence": torch.where(
+                observed_valid,
+                gather_world(confidence.unsqueeze(-1)).squeeze(-1),
+                torch.zeros(B, Kobs, device=semantic.device, dtype=semantic.dtype)),
+            "EntityTextRevision": torch.where(
+                observed_valid,
+                gather_world(revision.unsqueeze(-1)).squeeze(-1),
+                torch.zeros(B, Kobs, device=semantic.device, dtype=torch.long)),
+            "EntityTextChanged": (
+                gather_world(changed.unsqueeze(-1)).squeeze(-1)
+                & observed_valid),
+            "EntityId": torch.where(
+                mapping_valid,
+                gather_world(world_entity_id.unsqueeze(-1)).squeeze(-1),
+                torch.full((B, Kobs), -1, device=semantic.device, dtype=torch.long)),
+            "SlotGeneration": torch.where(
+                mapping_valid,
+                gather_world(world_generation.unsqueeze(-1)).squeeze(-1),
+                torch.full((B, Kobs), -1, device=semantic.device, dtype=torch.long)),}
+        return observed, world
+
+    def BuildEntityTextAuxSequence(
+        self,
+        visualStates: List[VisualState],
+        *,
+        batchSize: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        recent = visualStates[-self.SEQ_LEN:]
+        T = len(recent)
+        start = self.SEQ_LEN - T
+        K = self.RuntimeModule(self.perc).object_token_count
+        sequence = {
+            "EntityTextSemantic": torch.zeros(
+                batchSize, self.SEQ_LEN, K, 512,
+                device=device, dtype=dtype),
+            "EntityTextConfidence": torch.zeros(
+                batchSize, self.SEQ_LEN, K,
+                device=device, dtype=dtype),
+            "EntityTextRevision": torch.zeros(
+                batchSize, self.SEQ_LEN, K,
+                device=device, dtype=torch.long),
+            "EntityTextChanged": torch.zeros(
+                batchSize, self.SEQ_LEN, K,
+                device=device, dtype=dtype),}
+        for index, state in enumerate(recent, start=start):
+            auxiliary = state.Auxiliary
+            for name in sequence:
+                if name in auxiliary:
+                    sequence[name][:, index] = auxiliary[name].to(
+                        device=device,
+                        dtype=sequence[name].dtype)
+        return sequence
+
+    def BuildOntologyAuxSequence(
+        self,
+        visualStates: List[VisualState],
+        *,
+        batchSize: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        recent = visualStates[-self.SEQ_LEN:]
+        T = len(recent)
+        start = self.SEQ_LEN - T
+        K = self.RuntimeModule(self.perc).object_token_count
+        shapes = {
+            "PerceptualPresence": (),
+            "EntityRealmProb": (ModuleDim.PstRealmClasses,),
+            "ObjectAgencyProb": (ModuleDim.PstAgencyClasses,),
+            "ObjectMotionLayerProb": (ModuleDim.PstMotionLayerClasses,),
+            "LayerAgencyProb": (
+                ModuleDim.PstMotionLayerClasses,
+                ModuleDim.PstAgencyClasses),
+            "BodyMembershipProb": (),
+            "PhysicalInteractionProb": (),
+            "SelfPartSemantic": (ModuleDim.PstSelfPartSemanticDim,),
+            "ContentMotionUV": (2,),
+            "ContentChangeProb": (),}
+        sequence = {
+            name: torch.zeros(
+                batchSize,
+                self.SEQ_LEN,
+                K,
+                *tail,
+                device=device,
+                dtype=dtype)
+            for name, tail in shapes.items()}
+        for index, state in enumerate(recent, start=start):
+            auxiliary = state.Auxiliary
+            sequence["PerceptualPresence"][:, index] = auxiliary[
+                "PerceptualPresence"]
+            sequence["EntityRealmProb"][:, index] = auxiliary["RealmProb"]
+            sequence["ObjectAgencyProb"][:, index] = auxiliary["AgencyProb"]
+            sequence["ObjectMotionLayerProb"][:, index] = auxiliary["MotionLayerProb"]
+            sequence["LayerAgencyProb"][:, index] = auxiliary["LayerAgencyProb"]
+            sequence["BodyMembershipProb"][:, index] = auxiliary["BodyMembershipProb"]
+            sequence["PhysicalInteractionProb"][:, index] = auxiliary["PhysicalInteractionProb"]
+            sequence["SelfPartSemantic"][:, index] = auxiliary[
+                "SelfPartSemantic"]
+            sequence["ContentMotionUV"][:, index] = auxiliary["PerceptualContentMotionUV"]
+            sequence["ContentChangeProb"][:, index] = auxiliary["PerceptualContentChangeProb"]
+        return sequence
 
     def MaterializeMotionCommand(
         self,
         decision: DecoupledDecision,
-        currentEndpointPoseWorld: torch.Tensor,) -> MotionCommand:
-        """Cross the execution seam from local learned action to a world target."""
+        currentEndpointPoseWorld: torch.Tensor,
+        endpointPermission: torch.Tensor,) -> MotionCommand:
         decision_tensor = self.decision_decoupler.MaskDecisionTensor(
             decision.decision_tensor)
+        endpoint_permission = endpointPermission.to(
+            device=decision_tensor.device, dtype=torch.bool)
+        if tuple(endpoint_permission.shape) != (
+            decision_tensor.size(0), self.robot_endpoint_count
+        ):
+            raise ValueError("endpoint permission does not match robot morphology")
+        decision_tensor = decision_tensor * endpoint_permission.unsqueeze(
+            -1).to(decision_tensor.dtype)
+        axis_mask = (
+            self.decision_decoupler.action_projector.action_mask.bool()
+            & endpoint_permission.unsqueeze(-1))
+        gripper_endpoint = self.robot_gripper_endpoint_index.to(
+            device=decision_tensor.device).view(1, -1).expand(
+                decision_tensor.size(0), -1)
+        safe_gripper_endpoint = gripper_endpoint.clamp(
+            0, max(0, self.robot_endpoint_count - 1))
+        gripper_endpoint_permission = torch.gather(
+            endpoint_permission, 1, safe_gripper_endpoint)
+        gripper_permission = (
+            gripper_endpoint.ge(0)
+            & gripper_endpoint_permission)
+        joint_variable_command_mask = (
+            decision.joint_variable_command_mask.to(
+                device=decision_tensor.device, dtype=torch.bool)
+            & self.robot_joint_variable_commandable.view(1, -1))
+        joint_variable_command = (
+            self.decision_decoupler.MaskJointVariableCommand(
+                decision.joint_variable_command,
+                joint_variable_command_mask))
         return MotionCommand(
             decision_tensor=decision_tensor,
             target_endpoint_pose=ApplyPoseDelta(
                 currentEndpointPoseWorld,
                 decision_tensor),
-            endpoint_names=tuple(ModuleDim.DecisionEndpointNames),
-            decision_dof_mask=(
-                self.decision_decoupler.action_projector.action_mask
-                .expand(decision_tensor.size(0), -1, -1).bool()),
+            endpoint_names=self.robot_endpoint_names,
+            decision_dof_mask=axis_mask,
             gripper_cmd=decision.gripper_cmd,
-            gripper_valid=decision.gripper_valid,
+            gripper_valid=decision.gripper_valid & gripper_permission,
             mode_logits=decision.mode_logits,
             mode_valid=decision.mode_valid,
             safety_scores=decision.safety_scores,
-            safety_names=SAFETY_MARGIN_NAMES,)
+            safety_names=SAFETY_MARGIN_NAMES,
+            joint_variable_command=joint_variable_command,
+            joint_variable_command_mask=joint_variable_command_mask,
+            joint_variable_names=self.robot_joint_variable_names,)
 
     def RebaseWorldMotionCommand(
         self,
@@ -997,7 +1733,6 @@ class BrainCore(nn.Module):
         risk: torch.Tensor,
         confidence: torch.Tensor,
         precision: torch.Tensor,) -> MotionCommand:
-        """Express an already materialized world target from the current endpoint pose."""
         remaining_decision = self.decision_decoupler.MaskDecisionTensor(
             RelativePoseError(
                 currentEndpointPoseWorld,
@@ -1015,30 +1750,364 @@ class BrainCore(nn.Module):
                 confidence,
                 precision))
 
-    @staticmethod
-    def BodyEndpointPoseRelative(endpointPose: torch.Tensor) -> torch.Tensor:
-        body_pose = endpointPose[:, ModuleDim.RobotStateBodyEndpointSlice]
-        reference_pose = endpointPose[
-            :,
-            ModuleDim.DecisionEndpointReferenceRobotStateIndices]
-        return RelativePose(reference_pose, body_pose)
+    def ApplyFinalOperatorLegality(
+        self,
+        decision: DecoupledDecision,
+        operatorLogits: torch.Tensor,
+        grounding: Dict[str, torch.Tensor],
+        physicalState: Dict[str, torch.Tensor],
+        risk: torch.Tensor,
+        confidence: torch.Tensor,
+        precision: torch.Tensor,
+        endpointRuntimeControllable: torch.Tensor,
+        jointRuntimeControllable: torch.Tensor,
+    ) -> Tuple[
+        DecoupledDecision,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        (
+            endpoint_permission,
+            joint_permission,
+            body_allowed,
+            operator_allowed,
+        ) = (
+            self.BuildFinalOperatorPermission(
+                operatorLogits,
+                grounding,
+                physicalState,
+                endpointRuntimeControllable,
+                jointRuntimeControllable))
 
-    @staticmethod
-    def CameraPhysicalReference(
-        cameraPoseWorld: torch.Tensor,
+        legal_tensor = (
+            decision.decision_tensor
+            * endpoint_permission.unsqueeze(-1).to(
+                decision.decision_tensor.dtype))
+        legal_decision = self.decision_decoupler.ReplaceAction(
+            decision,
+            decision.decision_latent,
+            legal_tensor,
+            risk,
+            confidence,
+            precision)
+        legal_decision = replace(
+            legal_decision,
+            gripper_valid=(
+                decision.gripper_valid & body_allowed.unsqueeze(-1)),
+            mode_valid=(
+                decision.mode_valid & body_allowed),
+            joint_variable_command=(
+                self.decision_decoupler.MaskJointVariableCommand(
+                    decision.joint_variable_command,
+                    decision.joint_variable_command_mask
+                    & joint_permission)),
+            joint_variable_command_mask=(
+                decision.joint_variable_command_mask
+                & joint_permission))
+        return (
+            legal_decision,
+            ~operator_allowed,
+            endpoint_permission,
+            joint_permission,
+            body_allowed)
+
+    def BuildFinalOperatorPermission(
+        self,
+        operatorLogits: torch.Tensor,
+        grounding: Dict[str, torch.Tensor],
+        physicalState: Dict[str, torch.Tensor],
+        endpointRuntimeControllable: torch.Tensor,
+        jointRuntimeControllable: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        selected = operatorLogits.argmax(dim=-1)
+
+        def is_operator(*names: str) -> torch.Tensor:
+            mask = torch.zeros_like(selected, dtype=torch.bool)
+            for name in names:
+                mask = mask | selected.eq(OPERATORS.index(name))
+            return mask
+
+        observe_operator = is_operator("observe", "reobserve")
+        stop_operator = is_operator(
+            "wait", "cancel_execute", "failsafe_stop")
+        self_recovery_operator = is_operator(
+            "retreat",
+            "recover",
+            "continue_execute",
+            "redispatch")
+
+        referenced = grounding["referenced_object_probs"]
+        reference_mass = referenced.sum(dim=-1, keepdim=True)
+        semantic_weight = referenced / (reference_mass + 1e-8)
+        target_realm = torch.einsum(
+            "bk,bkr->br",
+            semantic_weight,
+            physicalState["RealmProb"]).argmax(dim=-1)
+        self_target = target_realm.eq(0) & reference_mass.squeeze(-1).gt(0.5)
+        actuation_valid = grounding[
+            "actuation_reference_confidence"].gt(0.5)
+
+        body_allowed = (
+            ~observe_operator
+            & ~stop_operator
+            & (actuation_valid | (self_target & self_recovery_operator))
+            & self.robot_actuation_available)
+        if tuple(endpointRuntimeControllable.shape) != (
+            selected.size(0), self.robot_endpoint_count
+        ):
+            raise ValueError(
+                "runtime endpoint controllability does not match robot morphology")
+        endpoint_controllable = (
+            self.robot_endpoint_task_mask.any(dim=-1).view(1, -1)
+            & endpointRuntimeControllable.to(
+                device=selected.device, dtype=torch.bool))
+        endpoint_permission = (
+            body_allowed.view(-1, 1) & endpoint_controllable)
+        if tuple(jointRuntimeControllable.shape) != (
+            selected.size(0), self.robot_joint_dof_count
+        ):
+            raise ValueError(
+                "runtime joint controllability does not match robot morphology")
+        joint_controllable = (
+            self.robot_joint_variable_commandable.view(1, -1)
+            & jointRuntimeControllable.to(
+                device=selected.device,
+                dtype=torch.bool))
+        observer_joint_permission = (
+            observe_operator.view(-1, 1)
+            & self.robot_observer_control_joint_mask.view(1, -1))
+        joint_permission = joint_controllable & (
+            body_allowed.view(-1, 1) | observer_joint_permission)
+        operator_allowed = (
+            stop_operator
+            | observe_operator
+            | (~observe_operator & ~stop_operator
+               & self.robot_actuation_available))
+        return (
+            endpoint_permission,
+            joint_permission,
+            body_allowed,
+            operator_allowed)
+
+    def ApplyMotionCommandPermission(
+        self,
+        command: MotionCommand,
+        currentEndpointPoseWorld: torch.Tensor,
+        endpointPermission: torch.Tensor,
+        jointPermission: torch.Tensor,
+        bodyPermission: torch.Tensor,
+        risk: torch.Tensor,
+        confidence: torch.Tensor,
+        precision: torch.Tensor,
+    ) -> MotionCommand:
+        legal_tensor = self.decision_decoupler.MaskDecisionTensor(
+            command.decision_tensor
+            * endpointPermission.unsqueeze(-1).to(
+                command.decision_tensor.dtype))
+        joint_mask = command.joint_variable_command_mask
+        if tuple(jointPermission.shape) != tuple(joint_mask.shape):
+            raise ValueError(
+                "joint permission does not match robot morphology")
+        joint_mask = (
+            joint_mask
+            & jointPermission.to(
+                device=joint_mask.device, dtype=torch.bool))
+        joint_command = self.decision_decoupler.MaskJointVariableCommand(
+            command.joint_variable_command,
+            joint_mask)
+        return replace(
+            command,
+            decision_tensor=legal_tensor,
+            target_endpoint_pose=ApplyPoseDelta(
+                currentEndpointPoseWorld,
+                legal_tensor),
+            gripper_valid=(
+                command.gripper_valid
+                & bodyPermission.unsqueeze(-1)
+                & torch.gather(
+                    endpointPermission,
+                    1,
+                    self.robot_gripper_endpoint_index.to(
+                        device=endpointPermission.device).view(
+                            1, -1).expand(endpointPermission.size(0), -1)
+                        .clamp(0, max(0, self.robot_endpoint_count - 1)))
+                & self.robot_gripper_endpoint_index.view(1, -1).ge(0)),
+            decision_dof_mask=(
+                command.decision_dof_mask
+                & endpointPermission.unsqueeze(-1)),
+            mode_valid=command.mode_valid & bodyPermission,
+            joint_variable_command=joint_command,
+            joint_variable_command_mask=joint_mask,
+            safety_scores=self.decision_decoupler.SafetyScores(
+                legal_tensor,
+                risk,
+                confidence,
+                precision))
+
+    def MaskEndpointPose(
+        self,
+        endpointPose: torch.Tensor,
+        endpointStateValid: torch.Tensor,) -> torch.Tensor:
+        expected = (
+            self.robot_endpoint_count,
+            ModuleDim.DecisionEndpointPoseDim)
+        if not torch.is_tensor(endpointPose) or not endpointPose.is_floating_point():
+            raise TypeError("endpoint pose must be a floating-point tensor")
+        if tuple(endpointPose.shape[1:]) != expected:
+            raise ValueError("endpoint pose tensor does not match robot morphology")
+        if not bool(torch.isfinite(endpointPose).all().item()):
+            raise ValueError("endpoint pose tensor must contain finite values")
+        quaternion_norm = endpointPose[..., 3:7].norm(dim=-1)
+        runtime_valid = endpointStateValid.to(
+            device=endpointPose.device, dtype=torch.bool)
+        if tuple(runtime_valid.shape) != (
+            endpointPose.size(0), self.robot_endpoint_count
+        ):
+            raise ValueError(
+                "runtime endpoint validity does not match robot morphology")
+        active_invalid = runtime_valid & quaternion_norm.le(1e-6)
+        if bool(active_invalid.any().item()):
+            raise ValueError("active endpoint pose quaternion must be nonzero")
+        normalized = NormalizePose(endpointPose)
+        identity = torch.zeros_like(normalized)
+        identity[..., 6] = 1.0
+        return torch.where(
+            runtime_valid.unsqueeze(-1),
+            normalized,
+            identity)
+
+    def NormalizeNodeState(
+        self,
+        nodePoseWorld: torch.Tensor,
+        nodeTwistWorld: torch.Tensor,
+        nodeObserved: torch.Tensor,
+        nodeHealthy: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = nodePoseWorld.size(0)
+        if tuple(nodePoseWorld.shape) != (
+            batch_size,
+            self.robot_node_count,
+            ModuleDim.DecisionEndpointPoseDim,
+        ):
+            raise ValueError("node pose tensor does not match robot morphology")
+        if tuple(nodeTwistWorld.shape) != (
+            batch_size,
+            self.robot_node_count,
+            6,
+        ):
+            raise ValueError("node twist tensor does not match robot morphology")
+        expected_mask_shape = (batch_size, self.robot_node_count)
+        if (
+            tuple(nodeObserved.shape) != expected_mask_shape
+            or tuple(nodeHealthy.shape) != expected_mask_shape
+        ):
+            raise ValueError("node state masks do not match robot morphology")
+        if (
+            not bool(torch.isfinite(nodePoseWorld).all().item())
+            or not bool(torch.isfinite(nodeTwistWorld).all().item())
+        ):
+            raise ValueError("node state must contain finite values")
+        state_valid = (
+            nodeObserved.to(device=nodePoseWorld.device, dtype=torch.bool)
+            & nodeHealthy.to(device=nodePoseWorld.device, dtype=torch.bool))
+        quaternion_norm = nodePoseWorld[..., 3:7].norm(dim=-1)
+        if bool((state_valid & quaternion_norm.le(1e-6)).any().item()):
+            raise ValueError("observed node pose quaternion must be nonzero")
+        normalized_pose = NormalizePose(nodePoseWorld)
+        identity_pose = torch.zeros_like(normalized_pose)
+        identity_pose[..., 6] = 1.0
+        return (
+            torch.where(
+                state_valid.unsqueeze(-1),
+                normalized_pose,
+                identity_pose),
+            nodeTwistWorld * state_valid.unsqueeze(-1).to(
+                dtype=nodeTwistWorld.dtype),
+            state_valid)
+
+    def ObserverPoseWorld(
+        self,
+        observerPoseWorld: torch.Tensor,
+        observerPoseValid: torch.Tensor,) -> torch.Tensor:
+        if tuple(observerPoseWorld.shape) != (
+            observerPoseValid.size(0), ModuleDim.DecisionEndpointPoseDim
+        ):
+            raise ValueError("observer pose does not match batch")
+        if tuple(observerPoseValid.shape) != (observerPoseWorld.size(0),):
+            raise ValueError("observer pose validity does not match batch")
+        if not bool(torch.isfinite(observerPoseWorld).all().item()):
+            raise ValueError("observer pose must contain finite values")
+        valid = (
+            observerPoseValid.to(
+                device=observerPoseWorld.device, dtype=torch.bool)
+            & self.robot_observer_valid.to(device=observerPoseWorld.device))
+        quaternion_norm = observerPoseWorld[..., 3:7].norm(dim=-1)
+        if bool((valid & quaternion_norm.le(1e-6)).any().item()):
+            raise ValueError("observed observer pose quaternion must be nonzero")
+        normalized = NormalizePose(observerPoseWorld)
+        identity = observerPoseWorld.new_zeros(
+            observerPoseWorld.size(0), ModuleDim.DecisionEndpointPoseDim)
+        identity[..., 6] = 1.0
+        return torch.where(valid.unsqueeze(-1), normalized, identity)
+
+    def EndpointPoseRelative(
+        self,
+        endpointPose: torch.Tensor,
+        endpointStateValid: torch.Tensor,) -> torch.Tensor:
+        reference_index = self.robot_endpoint_reference_index.to(
+            device=endpointPose.device)
+        reference_pose = endpointPose.index_select(1, reference_index)
+        relative = RelativePose(reference_pose, endpointPose)
+        valid = endpointStateValid.to(
+            device=endpointPose.device, dtype=torch.bool)
+        if tuple(valid.shape) != (
+            endpointPose.size(0), self.robot_endpoint_count
+        ):
+            raise ValueError(
+                "runtime endpoint validity does not match robot morphology")
+        identity = torch.zeros_like(relative)
+        identity[..., 6] = 1.0
+        return torch.where(valid.unsqueeze(-1), relative, identity)
+
+    def ObserverPhysicalReference(
+        self,
+        observerPoseWorld: torch.Tensor,
         baseOrientationWorld: torch.Tensor,
-        gravityDirectionWorld: torch.Tensor,) -> torch.Tensor:
-        """Build gauge-free camera rotation and gravity without fixed translation."""
-        camera_orientation_world = cameraPoseWorld[..., 3:7]
-        world_orientation_camera = QuatConjugate(camera_orientation_world)
-        base_orientation_camera = CanonicalizeQuaternion(
+        gravityDirectionWorld: torch.Tensor,
+        observerStateValid: torch.Tensor,) -> torch.Tensor:
+        observer_valid = self.robot_observer_valid.to(
+            device=observerPoseWorld.device).expand(
+                observerPoseWorld.size(0))
+        if tuple(observerStateValid.shape) != tuple(observer_valid.shape):
+            raise ValueError(
+                "runtime observer validity does not match batch")
+        observer_valid = observer_valid & observerStateValid.to(
+            device=observerPoseWorld.device, dtype=torch.bool)
+        reference_orientation_world = torch.where(
+            observer_valid.unsqueeze(-1),
+            observerPoseWorld[..., 3:7],
+            baseOrientationWorld)
+        world_orientation_reference = QuatConjugate(
+            reference_orientation_world)
+        base_orientation_reference = CanonicalizeQuaternion(
             QuatMultiply(
-                world_orientation_camera,
+                world_orientation_reference,
                 baseOrientationWorld))
-        gravity_camera = QuatRotate(
-            world_orientation_camera,
+        gravity_reference = QuatRotate(
+            world_orientation_reference,
             gravityDirectionWorld)
-        return torch.cat([base_orientation_camera, gravity_camera], dim=-1)
+        return torch.cat([
+            base_orientation_reference,
+            gravity_reference,
+            torch.ones_like(observer_valid, dtype=observerPoseWorld.dtype)
+                .unsqueeze(-1)], dim=-1)
 
     @torch.no_grad()
     def ResetDecisionRuntimeRows(
@@ -1083,9 +2152,22 @@ class BrainCore(nn.Module):
         self.prev_target_endpoint_pose.mul_(keep_pose)
         self.prev_target_endpoint_pose[..., 6].add_(1.0 - keep.view(-1, 1))
         self.prev_target_endpoint_valid.logical_and_(~doneMask)
+        self.prev_target_endpoint_controllable.logical_and_(
+            (~doneMask).unsqueeze(-1))
         self.prev_measured_endpoint_pose.mul_(keep_pose)
         self.prev_measured_endpoint_pose[..., 6].add_(1.0 - keep.view(-1, 1))
         self.prev_measured_endpoint_valid.logical_and_(~doneMask)
+        self.prev_measured_endpoint_state_valid.logical_and_(
+            (~doneMask).unsqueeze(-1))
+        self.prev_target_joint_variable_command.mul_(keep_feature)
+        self.prev_target_joint_variable_command_mask.logical_and_(
+            (~doneMask).unsqueeze(-1))
+        self.prev_measured_joint_position.mul_(keep_feature)
+        self.prev_measured_joint_state_valid.logical_and_(
+            (~doneMask).unsqueeze(-1))
+        self.prev_observer_pose_world.mul_(keep_feature)
+        self.prev_observer_pose_world[..., 6].add_(1.0 - keep)
+        self.prev_observer_pose_valid.logical_and_(~doneMask)
 
         if allDone is None:
             allDone = bool(doneMask.all().item())
@@ -1132,27 +2214,84 @@ class BrainCore(nn.Module):
                 self.CancelOutstandingSmoothMemoryTransaction()
             self.ResetBuffers(B=B, isOnlineLearning=self.is_online_learning, device=dev)
             self.RuntimeModule(self.world).ResetState(batchSize=B)
-        # Current proprioception closes the previous transition. During offline training the
-        # recorded endpoint poses are executed behavior, never the model's counterfactual command.
-        endpoint_pose = robotState["endpoint_pose"]
-        camera_pose_world = endpoint_pose[
-            :, ModuleDim.RobotStateCameraEndpointIndex]
-        robot_physical_reference = self.CameraPhysicalReference(
-            camera_pose_world,
+        endpoint_state_valid = (
+            robotState["endpoint_observed"].to(
+                device=dev, dtype=torch.bool)
+            & robotState["endpoint_healthy"].to(
+                device=dev, dtype=torch.bool))
+        endpoint_runtime_controllable = (
+            endpoint_state_valid
+            & robotState["endpoint_controllable"].to(
+                device=dev, dtype=torch.bool)
+            & self.robot_endpoint_task_mask.any(dim=-1).view(1, -1))
+        joint_state_valid = (
+            robotState["joint_observed"].to(
+                device=dev, dtype=torch.bool)
+            & robotState["joint_healthy"].to(
+                device=dev, dtype=torch.bool))
+        joint_runtime_controllable = (
+            joint_state_valid
+            & robotState["joint_controllable"].to(
+                device=dev, dtype=torch.bool)
+            & self.robot_joint_variable_commandable.view(1, -1))
+        node_pose_world, node_twist_world, node_state_valid = (
+            self.NormalizeNodeState(
+                robotState["node_pose_world"],
+                robotState["node_twist_world"],
+                robotState["node_observed"],
+                robotState["node_healthy"]))
+        observer_state_valid = (
+            robotState["observer_pose_valid"].to(
+                device=dev, dtype=torch.bool).view(B)
+            & self.robot_observer_valid)
+        endpoint_pose = self.MaskEndpointPose(
+            robotState["endpoint_pose"], endpoint_state_valid)
+        observer_pose_world = self.ObserverPoseWorld(
+            robotState["observer_pose_world"],
+            observer_state_valid)
+        body_node_pose_camera = RelativePose(
+            observer_pose_world.unsqueeze(1).expand(
+                -1, self.robot_node_count, -1),
+            node_pose_world)
+        body_node_camera_valid = (
+            node_state_valid
+            & observer_state_valid.view(B, 1))
+        body_node_identity = torch.zeros_like(body_node_pose_camera)
+        body_node_identity[..., 6] = 1.0
+        body_node_pose_camera = torch.where(
+            body_node_camera_valid.unsqueeze(-1),
+            body_node_pose_camera,
+            body_node_identity)
+        planner_expected_endpoint_pose = self.MaskEndpointPose(
+            robotState["planner_expected_endpoint_pose"],
+            endpoint_state_valid)
+        robot_physical_reference = self.ObserverPhysicalReference(
+            observer_pose_world,
             robotState["base_orientation_world"],
-            robotState["gravity_direction_world"])
-        prev_camera_pose_world = self.prev_measured_endpoint_pose[
-            :, ModuleDim.RobotStateCameraEndpointIndex]
-        camera_motion_from_prev = self.RelativeCameraMotion(
-            prev_camera_pose_world,
-            camera_pose_world,
-            self.prev_measured_endpoint_valid)
-        decision_endpoint_pose = endpoint_pose[
-            :, ModuleDim.RobotStateControlledEndpointSlice]
-        body_endpoint_pose_relative = self.BodyEndpointPoseRelative(endpoint_pose)
-        planner_expected_endpoint_pose = robotState["planner_expected_endpoint_pose"]
-        executed_decision_tensor, world_action_feedback = self.BuildExecutedActionFeedback(
-            endpoint_pose)
+            robotState["gravity_direction_world"],
+            observer_state_valid)
+        prev_observer_pose_world = self.prev_observer_pose_world
+        observer_motion_valid_from_prev = (
+            self.prev_observer_pose_valid
+            & observer_state_valid
+            & self.robot_observer_valid)
+        camera_motion_from_prev = self.RelativeObserverMotion(
+            prev_observer_pose_world,
+            observer_pose_world,
+            observer_motion_valid_from_prev)
+        decision_endpoint_pose = endpoint_pose
+        endpoint_pose_relative = self.EndpointPoseRelative(
+            endpoint_pose, endpoint_state_valid)
+        (
+            executed_decision_tensor,
+            executed_joint_variable_command,
+            executed_joint_variable_mask,
+            world_action_feedback,
+        ) = self.BuildExecutedActionFeedback(
+            endpoint_pose,
+            robotState["joint_position"],
+            joint_state_valid,
+            endpoint_state_valid)
         reported_model_command_executed = (
             robotState["model_command_executed"].view(B).eq(1.0))
         executed_action_id = robotState["executed_action_id"].view(B)
@@ -1171,28 +2310,67 @@ class BrainCore(nn.Module):
                 RelativePoseError(
                     self.prev_target_endpoint_pose,
                     decision_endpoint_pose))
-            * (self.prev_target_endpoint_valid & model_command_executed).view(B, 1, 1))
+            * (
+                self.prev_target_endpoint_controllable
+                & endpoint_state_valid
+                & model_command_executed.view(B, 1)
+            ).unsqueeze(-1))
         planner_endpoint_tracking_error = (
             self.decision_decoupler.MaskDecisionTensor(
                 RelativePoseError(
                     planner_expected_endpoint_pose,
                     decision_endpoint_pose))
-            * robotState["planner_executing"].view(B, 1, 1))
+            * (
+                endpoint_state_valid
+                & robotState["planner_executing"].view(B, 1).bool()
+            ).unsqueeze(-1))
+        world_action_feedback, action_agency_evidence = (
+            self.BuildRealizedActionAgencyEvidence(
+                executed_decision_tensor,
+                executed_joint_variable_command,
+                executed_joint_variable_mask,
+                world_action_feedback,
+                model_command_executed))
         decision_robot_state_encoding = self.decision_decoupler.EncodeRobotState(
-            body_endpoint_pose_relative,
+            endpoint_pose_relative,
             endpoint_tracking_error,
-            planner_endpoint_tracking_error)
+            planner_endpoint_tracking_error,
+            jointPosition=robotState["joint_position"],
+            jointVelocity=robotState["joint_velocity"],
+            jointEffort=robotState["joint_effort"],
+            jointObserved=robotState["joint_observed"],
+            jointHealthy=robotState["joint_healthy"],
+            jointControllable=robotState["joint_controllable"],
+            endpointStateValid=endpoint_state_valid,
+            endpointControllable=endpoint_runtime_controllable)
         decision_action_feedback = self.decision_decoupler.EncodeDecisionFeedback(
             executed_decision_tensor,
             decision_robot_state_encoding,
-            robot_physical_reference)
+            robot_physical_reference,
+            executed_joint_variable_command,
+            executed_joint_variable_mask)
         decision_action_feedback = decision_action_feedback * (
-            self.prev_measured_endpoint_valid.view(B, 1))
+            (
+                self.prev_measured_endpoint_valid
+                | self.prev_measured_joint_state_valid.any(dim=-1)
+            ).view(B, 1))
         # Candidate commands remain prospective; only measured behavior explains this frame.
         world_runtime = self.RuntimeModule(self.world)
         world_robot_physical_encoding = world_runtime.EncodeRobotPhysicalState(
-            body_endpoint_pose_relative,
-            robot_physical_reference)
+            endpoint_pose_relative,
+            robot_physical_reference,
+            jointPosition=robotState["joint_position"],
+            jointVelocity=robotState["joint_velocity"],
+            jointEffort=robotState["joint_effort"],
+            jointObserved=robotState["joint_observed"],
+            jointHealthy=robotState["joint_healthy"],
+            jointControllable=robotState["joint_controllable"],
+            nodePoseWorld=node_pose_world,
+            nodeTwistWorld=node_twist_world,
+            nodeObserved=robotState["node_observed"],
+            nodeHealthy=robotState["node_healthy"],
+            endpointStateValid=endpoint_state_valid,
+            endpointControllable=endpoint_runtime_controllable)
 
         # External feedback was strictly validated at the preprocessing seam.
         reward_ext = None if rewardExt is None else rewardExt.detach().view(B)
@@ -1271,7 +2449,7 @@ class BrainCore(nn.Module):
         prev_done_for_prediction = self.prev_done_flag.detach().clone()
         prev_physical_state_for_prediction = world_runtime.BuildModelPhysicalState(
             world_runtime.ExportPhysicalState(),
-            prev_camera_pose_world)
+            prev_observer_pose_world)
         prev_world_robot_physical_encoding_for_prediction = (
             world_runtime.ExportRobotPhysicalState()["RobotPhysicalState"])
 
@@ -1284,9 +2462,12 @@ class BrainCore(nn.Module):
             transitionRobotPhysicalState=(
                 prev_world_robot_physical_encoding_for_prediction),
             cameraMotion=camera_motion_from_prev,
+            observerMotionValid=observer_motion_valid_from_prev,
             transitionValid=(
                 ~prev_done_for_prediction
-                & self.prev_measured_endpoint_valid),)
+                & (
+                    self.prev_measured_endpoint_valid
+                    | self.prev_measured_joint_state_valid.any(dim=-1))),)
         top_down = self.BuildTopDownContext(realized_visual_prior)
         previous_visual_state = self.prev_visual_state
         previous_visual_valid = self.prev_visual_valid
@@ -1297,7 +2478,8 @@ class BrainCore(nn.Module):
             topDownContext=top_down,
             depth=depth,
             depthValid=depthValid,
-            cameraMotion=camera_motion_from_prev)
+            cameraMotion=camera_motion_from_prev,
+            observerMotionValid=observer_motion_valid_from_prev)
         perc_feats = visual_state.IntegratedFeat # [B, D_perc]
         # Slow/fast split: OCR, consciousness, intention and the long/mid goal stack run
         # every slow_period steps; an external text command forces an immediate refresh.
@@ -1319,7 +2501,8 @@ class BrainCore(nn.Module):
         else:
             ocr_items = self.slow_cache["ocr_items"]
             fuse_ocr = self.slow_cache["fuse_ocr"]
-            ocr_semantic = self.slow_cache["ocr_semantic"]
+            ocr_semantic = torch.zeros_like(
+                self.slow_cache["ocr_semantic"])
 
         visual_seq_src = self.visual_state_buffer + [visual_state]
         visual_valid_src = self.visual_state_valid_buffer + [
@@ -1368,21 +2551,55 @@ class BrainCore(nn.Module):
             visual_state.Auxiliary["ObjectMotion"],
             visual_state.Auxiliary["ObjectGeometry"],
             node_mask,
-            geometry_valid)
+            geometry_valid,
+            bodyNodePoseCamera=body_node_pose_camera,
+            bodyNodeObserved=(
+                robotState["node_observed"].to(
+                    device=dev, dtype=torch.bool)
+                & observer_state_valid.view(B, 1)),
+            bodyNodeHealthy=robotState["node_healthy"].to(
+                device=dev, dtype=torch.bool))
+        self.RefinePSTLayerAgency(
+            physical_out,
+            action_agency_evidence)
         observed_pst = {
             **physical_out,
             **semantic_view,
             "ObservedSlotMask": physical_out["ObservationMask"]}
+        self.AttachEntityOntology(visual_state, observed_pst)
+        visual_seq_src[-1] = visual_state
+        ontology_aux_seq = self.BuildOntologyAuxSequence(
+            visual_seq_src,
+            batchSize=B,
+            device=dev,
+            dtype=frame.dtype)
+        object_seq = self.RuntimeModule(
+            self.attn).EncodeOntologyObjectSequence(
+                object_seq,
+                ontology_aux_seq)
+        self.visual_state_buffer[-1] = self.DetachVisualState(visual_state)
+        self.prev_visual_state = self.DetachVisualState(visual_state)
         pst = world_runtime.UpdatePhysicalState(
             observed_pst,
-            cameraPoseWorld=camera_pose_world,
-            robotPhysicalState=world_robot_physical_encoding)
+            cameraPoseWorld=observer_pose_world,
+            robotPhysicalState=world_robot_physical_encoding,
+            observerValid=observer_state_valid)
         pst["U"] = self.mem.usage_bank.SlotReadout(
             pst["IdentityKey"],
             pst["ARaw"],
             pst["SlotPresence"] * pst["MphysRaw"]) * pst["SlotPresence"].unsqueeze(-1)
         active_physical_mask = pst["SlotPresence"] * pst["MphysRaw"]
-        pst_summary = self.pst_builder.SlotSummary(pst["SlotState"], active_physical_mask)
+        physical_summary = self.pst_builder.SlotSummary(
+            pst["SlotState"], active_physical_mask)
+        entity_mask = pst["SlotPresence"] * pst["PerceptualPresence"]
+        entity_summary = self.pst_builder.SlotSummary(
+            pst["SlotState"], entity_mask)
+        pst_summary = (
+            physical_summary
+            + torch.sigmoid(self.pst_entity_summary_gain)
+            * self.pst_entity_summary_fuser(torch.cat([
+                physical_summary,
+                entity_summary,], dim=-1)))
         perception_physical_stage = self.RunPerceptionPhysicalStage(
             visual_state=visual_state,
             perc_feats=perc_feats,
@@ -1410,7 +2627,8 @@ class BrainCore(nn.Module):
             physicalState=prev_physical_state_for_prediction,
             actionEnc=world_action_feedback,
             robotPhysicalState=prev_world_robot_physical_encoding_for_prediction,
-            cameraMotion=camera_motion_from_prev)
+            cameraMotion=camera_motion_from_prev,
+            observerMotionValid=observer_motion_valid_from_prev)
         saveModuleOutput("WorldPreview", w_preview)
 
         s_t = w_preview["s_next"] # [B, D_world]
@@ -1438,6 +2656,9 @@ class BrainCore(nn.Module):
                                      computeLoss=isTrain and compute_critic_loss,
                                      policyEntropyPrev=self.prev_entropy,
                                      worldDeltaTransport=d_tr,worldDeltaPhysics=d_ph,)
+        critic_out = self.RuntimeModule(self.critic).RefineEntityOntologyRisk(
+            critic_out,
+            pst)
         saveModuleOutput("ValueEstimation", critic_out)
 
         value_current = critic_out.value
@@ -1462,6 +2683,36 @@ class BrainCore(nn.Module):
             perception_physical_stage.fuse_ocr = fuse_ocr
             perception_physical_stage.ocr_semantic = ocr_semantic
             perception_physical_stage.slow_refresh = True
+
+        associations = world_runtime.ExportPhysicalAssociations()
+        (
+            observed_text_state,
+            world_text_state,
+        ) = self.BindOcrToWorldEntities(
+            ocr_items if slow_refresh else [[] for _ in range(B)],
+            observed_pst,
+            pst,
+            associations,
+            imageHeight=int(frame.size(-2)),
+            imageWidth=int(frame.size(-1)),
+            fresh=slow_refresh)
+        world_runtime.UpdateEntityTextState(world_text_state)
+        observed_pst.update(observed_text_state)
+        pst.update(world_text_state)
+        for name, value in observed_text_state.items():
+            visual_state.Auxiliary[name] = value
+        visual_seq_src[-1] = visual_state
+        text_aux_seq = self.BuildEntityTextAuxSequence(
+            visual_seq_src,
+            batchSize=B,
+            device=dev,
+            dtype=frame.dtype)
+        object_seq = self.RuntimeModule(
+            self.attn).EncodeTextEntityObjectSequence(
+                object_seq,
+                text_aux_seq)
+        self.visual_state_buffer[-1] = self.DetachVisualState(visual_state)
+        self.prev_visual_state = self.DetachVisualState(visual_state)
 
         self.prev_precision = precision_sig.detach()
 
@@ -1502,6 +2753,7 @@ class BrainCore(nn.Module):
                 robotPhysicalState=world_robot_physical_encoding,
                 transitionRobotPhysicalState=prev_world_robot_physical_encoding_for_prediction,
                 cameraMotion=camera_motion_from_prev,
+                observerMotionValid=observer_motion_valid_from_prev,
                 reward=reward_ext,
                 done=done_ext)
         else:
@@ -1512,6 +2764,7 @@ class BrainCore(nn.Module):
                                              robotPhysicalState=world_robot_physical_encoding,
                                              transitionRobotPhysicalState=prev_world_robot_physical_encoding_for_prediction,
                                              cameraMotion=camera_motion_from_prev,
+                                             observerMotionValid=observer_motion_valid_from_prev,
                                              sample=False)
         saveModuleOutput("World", w_out)
 
@@ -1537,10 +2790,10 @@ class BrainCore(nn.Module):
         self.prev_done_flag = done_now.detach()
 
         if slow_refresh:
-            memory_bank = self.mem.ExportMemoryBank(
-                topk=BasicParameters.CONSCIOUSNESSTEM,
-                includeMeta=False) # Optional[Dict[str, Tensor]]
-            world_bank = self.ExportRuntimeWorldMemoryBank(topk=BasicParameters.CONSCIOUSNESSTEM) # Optional[Dict[str, Tensor]]
+            memory_bank = self.mem.ExportConsciousBank(
+                topk=BasicParameters.CONSCIOUSNESSTEM)
+            world_bank = self.ExportRuntimeWorldConsciousBank(
+                topk=BasicParameters.CONSCIOUSNESSTEM)
 
             conscious_out = self.conscious(memoryBank=memory_bank, worldBank=world_bank) # self_sem/intention_sem: [B, D_cons]
 
@@ -1568,7 +2821,6 @@ class BrainCore(nn.Module):
         saveModuleOutput("OCR", {
             "items": ocr_items,
             "texts": fuse_ocr,})
-
         intention_texts = [] if intention_extras is None else intention_extras.get("recall_texts", [])
         saveModuleOutput("Intention", {
             "intent_sem": intent_sem,
@@ -1634,6 +2886,17 @@ class BrainCore(nn.Module):
 
         saveModuleOutput("PhysicalState", {
             "PoseCamera": pst["PoseCamera"], "ARaw": pst["ARaw"], "SlotPresence": pst["SlotPresence"], "MphysRaw": pst["MphysRaw"], "PairwiseRelationCamera": pst["PairwiseRelationCamera"], "U": pst["U"],
+            "PerceptualPresence": pst["PerceptualPresence"],
+            "PhysicalInteractionProb": pst["PhysicalInteractionProb"],
+            "RealmProb": pst["RealmProb"],
+            "AgencyProb": pst["AgencyProb"],
+            "MotionLayerProb": pst["MotionLayerProb"],
+            "BodyMembershipProb": pst["BodyMembershipProb"],
+            "SelfPartProb": pst["SelfPartProb"],
+            "SelfPartSemantic": pst["SelfPartSemantic"],
+            "DisplaySurfaceProb": pst["DisplaySurfaceProb"],
+            "SurfaceUV": pst["SurfaceUV"],
+            "VerificationConfidence": pst["VerificationConfidence"],
             "LevelProb": pst["LevelProb"],
             "ObjectClassProb": pst["ObjectClassProb"],
             "PartClassProb": pst["PartClassProb"],
@@ -1649,7 +2912,8 @@ class BrainCore(nn.Module):
             "WorldRobotPhysicalEncoding": world_robot_physical_encoding,
             "pst_binding": w_out["pst_binding"], "summary": pst_summary,
             "slot_presence_mask": pst["SlotPresence"],
-            "physical_entity_mask": active_physical_mask})
+            "physical_entity_mask": active_physical_mask,
+            "perceptual_entity_mask": entity_mask})
         saveModuleOutput("Goals", {
             "g_ultimate": goals["g_ultimate"],
             "g_long": goals["g_long"],
@@ -1660,7 +2924,17 @@ class BrainCore(nn.Module):
             "referenced_slot_summary": grounding["referenced_slot_summary"],
             "reference_confidence": grounding["reference_confidence"],
             "no_slot_prob": grounding["no_slot_prob"],
-            "reference_distribution": grounding["reference_distribution"]})
+            "reference_distribution": grounding["reference_distribution"],
+            "actuation_reference_probs": grounding["actuation_reference_probs"],
+            "actuation_reference_confidence": grounding["actuation_reference_confidence"],
+            "no_actuation_prob": grounding["no_actuation_prob"],
+            "actuation_surface_uv": grounding["actuation_surface_uv"],
+            "actuation_binding_kind_prob": grounding["actuation_binding_kind_prob"],
+            "surface_binding_reference_probs": grounding["surface_binding_reference_probs"],
+            "surface_binding_confidence": grounding["surface_binding_confidence"],
+            "surface_parent_slot_index": grounding["surface_parent_slot_index"],
+            "surface_parent_pose_camera": grounding["surface_parent_pose_camera"],
+            "surface_binding_uv": grounding["surface_binding_uv"]})
 
         self.RuntimeModule(self.actor).ClearInvalidEligibility(~credit_option_valid)
         aug_actor_kwargs = {
@@ -1743,7 +3017,7 @@ class BrainCore(nn.Module):
             goalEmbed=goals["goal_symbolic"],
             worldBelief=world_hzx_now,
             decisionBelief=belief_feat,
-            bodyProprioception=body_endpoint_pose_relative,
+            bodyProprioception=endpoint_pose_relative,
             robotPhysicalReference=robot_physical_reference,
             targetTrackingError=endpoint_tracking_error,
             plannerTrackingError=planner_endpoint_tracking_error,
@@ -1756,6 +3030,8 @@ class BrainCore(nn.Module):
             referenceConfidence=grounding["reference_confidence"],
             noSlotProb=grounding["no_slot_prob"],
             temporalContextFeat=temporal_context.feat,
+            endpointStateValid=endpoint_state_valid,
+            endpointControllable=endpoint_runtime_controllable,
             returnExplain=self.save_module_messager_output,)
         act_out = self.actor.RefineWithNeuroSymbolic(
             base_act_out,
@@ -1764,13 +3040,30 @@ class BrainCore(nn.Module):
             world_abstract["pst_summary"],
             goals["goal_decision"],
             temporal_goal,
-            decision_robot_state_encoding.body_pose.body_pose_feat,
+            decision_robot_state_encoding.endpoint_pose.endpoint_pose_feat,
             decision_robot_state_encoding.endpoint_control.control_feedback_feat,
             robot_physical_reference,)
         saveModuleOutput("Decision", act_out)
 
+        network_decision_feature = act_out["decision_feature"]
+        planner_prior = None
+        if self.planner is not None:
+            with torch.no_grad():
+                planner_h0, planner_z0, planner_x0 = self.PlannerInitialState(w_out)
+                planner_prior = self.planner.Plan(
+                    decisionFeature=network_decision_feature.detach(),
+                    h0=planner_h0,
+                    z0=planner_z0,
+                    x0=planner_x0,
+                    physicalState=pst,
+                    worldRobotPhysicalEncoding=world_robot_physical_encoding,
+                    returnDiagnostics=self.planner_teacher_mode,)
+        selected_decision_feature = network_decision_feature
+        if planner_prior is not None and self.use_planner:
+            selected_decision_feature = planner_prior[
+                "decision_feature"].detach()
         decoupled_decision = self.decision_decoupler(
-            decisionBackbone=act_out["decision_feature"],
+            decisionBackbone=selected_decision_feature,
             planLatent=act_out["decoder_plan_latent"],
             subgoalFeature=act_out["decoder_subgoal_feature"],
             constraintTokens=act_out["decoder_constraint_tokens"],
@@ -1779,35 +3072,40 @@ class BrainCore(nn.Module):
             risk=risk_sig,
             confidence=confidence_sig,
             precision=precision_sig,)
-
-        # Kept before the planner override so the CEM elites can supervise the network heads.
-        network_decision_tensor = decoupled_decision.decision_tensor
-        planner_prior = None
-        if self.planner is not None:
-            with torch.no_grad():
-                planner_h0, planner_z0, planner_x0 = self.PlannerInitialState(w_out)
-                planner_prior = self.planner.Plan(
-                    decisionLatent=decoupled_decision.decision_latent.detach(),
-                    h0=planner_h0,
-                    z0=planner_z0,
-                    x0=planner_x0,
-                    physicalState=pst,
-                    worldRobotPhysicalEncoding=world_robot_physical_encoding,
-                    returnDiagnostics=self.planner_teacher_mode,)
-            if self.use_planner:
-                planned_decision_latent = planner_prior["decision_latent"].detach()
-                planned_decision_tensor = planner_prior["decision_tensor"].detach()
-                planner_prior["decision_tensor"] = planned_decision_tensor
-                decoupled_decision = self.decision_decoupler.ReplaceAction(
-                    decoupled_decision,
-                    planned_decision_latent,
-                    planned_decision_tensor,
-                    risk_sig,
-                    confidence_sig,
-                    precision_sig,)
+        (
+            decoupled_decision,
+            final_legality_stop,
+            endpoint_permission,
+            joint_permission,
+            body_permission,
+        ) = (
+            self.ApplyFinalOperatorLegality(
+                decoupled_decision,
+                neuro_symbolic_out.operator_logits,
+                grounding,
+                pst,
+                risk_sig,
+                confidence_sig,
+                precision_sig,
+                endpoint_runtime_controllable,
+                joint_runtime_controllable))
+        if revalidated_active_command is not None:
+            revalidated_active_command = self.ApplyMotionCommandPermission(
+                revalidated_active_command,
+                decision_endpoint_pose,
+                endpoint_permission,
+                joint_permission,
+                body_permission,
+                risk_sig,
+                confidence_sig,
+                precision_sig)
+            active_safety_risk = (
+                1.0
+                - revalidated_active_command.safety_scores.amin(dim=-1))
         candidate_motion_command = self.MaterializeMotionCommand(
             decoupled_decision,
-            decision_endpoint_pose)
+            decision_endpoint_pose,
+            endpoint_permission)
         candidate_safety_risk = 1.0 - decoupled_decision.safety_scores.amin(dim=-1)
         execution_safety_risk = torch.where(
             self.temporal_active_mask > 0.5,
@@ -1824,7 +3122,9 @@ class BrainCore(nn.Module):
             interruptRisk=torch.maximum(act_out["temporal_decision"]["p_interrupt"], risk_sig),
             observationFreshness=1.0 - grounding["no_slot_prob"].detach(),
             canInterrupt=torch.ones_like(risk_sig),
-            hardStop=hard_stop,
+            hardStop=torch.maximum(
+                hard_stop,
+                final_legality_stop.to(hard_stop.dtype)),
             plannerProgress=robotState["planner_progress"],
             plannerTrackingError=robotState["planner_tracking_error"],
             plannerExecuting=robotState["planner_executing"],
@@ -1849,8 +3149,10 @@ class BrainCore(nn.Module):
             self.temporal_action_epoch,
             invoke_drift,)
         motion_command = temporal_envelope.motion_command
-        prospective_action_embed = self.decision_decoupler.EncodeEndpointAction(
-            motion_command.decision_tensor)
+        prospective_action_embed = self.decision_decoupler.EncodeAction(
+            motion_command.decision_tensor,
+            motion_command.joint_variable_command,
+            motion_command.joint_variable_command_mask)
         prospective_camera_motion = (
             self.decision_decoupler.CameraMotionFromDecisionTensor(
                 motion_command.decision_tensor))
@@ -1862,6 +3164,8 @@ class BrainCore(nn.Module):
             actionEnc=prospective_action_embed,
             robotPhysicalState=world_robot_physical_encoding,
             cameraMotion=prospective_camera_motion,
+            observerMotionValid=torch.zeros(
+                B, device=dev, dtype=torch.bool),
             sample=False,)["reconstructed_visual_state"]
         done_single = B == 1 and bool(done_now.item())
         if done_single:
@@ -1910,7 +3214,16 @@ class BrainCore(nn.Module):
         self.temporal_active_kind = kind_id.detach()
         self.active_motion_command = self.DetachRuntimeObject(motion_command, clone=True)
         self.prev_target_endpoint_pose = motion_command.target_endpoint_pose.detach().clone()
-        self.prev_target_endpoint_valid = ~done_now
+        self.prev_target_endpoint_controllable = (
+            endpoint_runtime_controllable
+            & (~done_now).unsqueeze(-1)).detach().clone()
+        self.prev_target_endpoint_valid = (
+            self.prev_target_endpoint_controllable.any(dim=-1))
+        self.prev_target_joint_variable_command = (
+            motion_command.joint_variable_command.detach().clone())
+        self.prev_target_joint_variable_command_mask = (
+            motion_command.joint_variable_command_mask
+            & (~done_now).unsqueeze(-1)).detach().clone()
 
         option_policy_input = act_out["option"]["policy_input"].detach()
         option_prior_logit = act_out["option"]["prior_logits"].detach()
@@ -1975,7 +3288,7 @@ class BrainCore(nn.Module):
             neuro_symbolic_out=neuro_symbolic_out,
             decoupled_decision=decoupled_decision,
             planner_prior=planner_prior,
-            network_decision_tensor=network_decision_tensor,
+            network_decision_feature=network_decision_feature,
             prospective_action_embed=prospective_action_embed,
             temporal_goal=temporal_goal,
             world_abstract=world_abstract,
@@ -2009,7 +3322,19 @@ class BrainCore(nn.Module):
         self.prev_mapper_hidden = act_out["mapper"]["hidden_next"].clone()
         self.prev_td_error = td_sig.detach().clone()
         self.prev_measured_endpoint_pose = endpoint_pose.detach().clone()
-        self.prev_measured_endpoint_valid = ~done_now
+        self.prev_measured_endpoint_state_valid = (
+            endpoint_state_valid
+            & (~done_now).unsqueeze(-1)).detach().clone()
+        self.prev_measured_endpoint_valid = (
+            self.prev_measured_endpoint_state_valid.any(dim=-1))
+        self.prev_measured_joint_position = robotState[
+            "joint_position"].detach().clone()
+        self.prev_measured_joint_state_valid = (
+            joint_state_valid
+            & (~done_now).unsqueeze(-1)).detach().clone()
+        self.prev_observer_pose_world = observer_pose_world.detach().clone()
+        self.prev_observer_pose_valid = (
+            observer_state_valid & ~done_now).detach().clone()
         self.prev_visual_valid.logical_and_(~done_now)
         done_count = int(done_single) if B == 1 else int(done_now.sum().item())
         if done_count > 0:
@@ -2124,7 +3449,8 @@ class BrainCore(nn.Module):
                     depthTargetValid=perceptionTargets["depth_valid"],
                     prevVisualState=previous_visual_state,
                     prevVisualValid=previous_visual_valid,
-                    cameraMotion=camera_motion_from_prev)
+                    cameraMotion=camera_motion_from_prev,
+                    observerMotionValid=observer_motion_valid_from_prev)
                 if self.perception_recall_loss is not None and "node_valid" in perceptionTargets:
                     recall_out = self.RuntimeModule(self.perc).recall_heads(visual_state)
                     perception_recall_losses = self.perception_recall_loss(recall_out, perceptionTargets)
@@ -2143,6 +3469,7 @@ class BrainCore(nn.Module):
                 actionEnc=world_action_feedback,
                 robotPhysicalState=prev_world_robot_physical_encoding_for_prediction,
                 cameraMotion=camera_motion_from_prev,
+                observerMotionValid=observer_motion_valid_from_prev,
                 targetVisualState=visual_state,
                 precision=precision_sig,
                 aliveMask=alive_prediction_mask,)
@@ -2197,14 +3524,14 @@ class BrainCore(nn.Module):
             planner_distill_loss = world_loss.new_zeros(())
             decision_energy_loss = world_loss.new_zeros(())
             if planner_prior is not None and self.planner_teacher_mode:
+                planner_teacher_feature = planner_prior[
+                    "decision_feature"].detach()
                 planner_distill_per_row = nn.functional.smooth_l1_loss(
-                    FlattenActiveDecisionTensor(network_decision_tensor),
-                    FlattenActiveDecisionTensor(
-                        planner_prior["decision_tensor"].detach()),
+                    network_decision_feature,
+                    planner_teacher_feature,
                     reduction="none").mean(dim=-1)
-                planner_std = planner_prior["diagnostics"]["std"]
-                planner_convergence = torch.exp(
-                    -planner_std.detach().mean(dim=-1))
+                planner_std = planner_prior["diagnostics"]["std"].detach()
+                planner_convergence = torch.exp(-planner_std.mean(dim=-1))
                 teacher_weight = (
                     (~done_now).float()
                     * precision_sig.detach()
@@ -2473,8 +3800,16 @@ class BrainCore(nn.Module):
             "prev_latent_control": self.prev_latent_control.detach().clone(),
             "prev_target_endpoint_pose": self.prev_target_endpoint_pose.detach().clone(),
             "prev_target_endpoint_valid": self.prev_target_endpoint_valid.detach().clone(),
+            "prev_target_endpoint_controllable": self.prev_target_endpoint_controllable.detach().clone(),
             "prev_measured_endpoint_pose": self.prev_measured_endpoint_pose.detach().clone(),
             "prev_measured_endpoint_valid": self.prev_measured_endpoint_valid.detach().clone(),
+            "prev_measured_endpoint_state_valid": self.prev_measured_endpoint_state_valid.detach().clone(),
+            "prev_target_joint_variable_command": self.prev_target_joint_variable_command.detach().clone(),
+            "prev_target_joint_variable_command_mask": self.prev_target_joint_variable_command_mask.detach().clone(),
+            "prev_measured_joint_position": self.prev_measured_joint_position.detach().clone(),
+            "prev_measured_joint_state_valid": self.prev_measured_joint_state_valid.detach().clone(),
+            "prev_observer_pose_world": self.prev_observer_pose_world.detach().clone(),
+            "prev_observer_pose_valid": self.prev_observer_pose_valid.detach().clone(),
             "active_option_policy_input": self.active_option_policy_input.detach().clone(),
             "active_option_prior_logit": self.active_option_prior_logit.detach().clone(),
             "active_option_goal_mid": self.active_option_goal_mid.detach().clone(),
@@ -2559,7 +3894,8 @@ class BrainCore(nn.Module):
             }
         ):
             raise ValueError("OCR runtime state fields do not match the current schema")
-
+        if not torch.is_tensor(state["prev_mem"]) or state["prev_mem"].ndim != 2:
+            raise ValueError("prev_mem must have shape [B,D]")
         # The current process's worker must stop before restored runtime fields
         # (including a completed-but-unmerged delta) replace its state.
         self.CancelOutstandingSmoothMemoryTransaction()
@@ -2582,8 +3918,22 @@ class BrainCore(nn.Module):
         self.prev_latent_control = state["prev_latent_control"]
         self.prev_target_endpoint_pose = state["prev_target_endpoint_pose"]
         self.prev_target_endpoint_valid = state["prev_target_endpoint_valid"]
+        self.prev_target_endpoint_controllable = state[
+            "prev_target_endpoint_controllable"]
         self.prev_measured_endpoint_pose = state["prev_measured_endpoint_pose"]
         self.prev_measured_endpoint_valid = state["prev_measured_endpoint_valid"]
+        self.prev_measured_endpoint_state_valid = state[
+            "prev_measured_endpoint_state_valid"]
+        self.prev_target_joint_variable_command = state[
+            "prev_target_joint_variable_command"]
+        self.prev_target_joint_variable_command_mask = state[
+            "prev_target_joint_variable_command_mask"]
+        self.prev_measured_joint_position = state[
+            "prev_measured_joint_position"]
+        self.prev_measured_joint_state_valid = state[
+            "prev_measured_joint_state_valid"]
+        self.prev_observer_pose_world = state["prev_observer_pose_world"]
+        self.prev_observer_pose_valid = state["prev_observer_pose_valid"]
         self.active_option_policy_input = state["active_option_policy_input"]
         self.active_option_prior_logit = state["active_option_prior_logit"]
         self.active_option_goal_mid = state["active_option_goal_mid"]
@@ -2910,7 +4260,7 @@ class Agent:
             self.brain.goal_grounding,
             self.brain.decision_decoupler,
             self.brain.neuro_symbolic,
-            self.brain.temporal_gate)
+            self.brain.temporal_gate,)
 
     def WorldOptimizerModules(self) -> Tuple[nn.Module, ...]:
         return (self.brain.world,)
@@ -3061,9 +4411,18 @@ class Agent:
         world.BindMemoryContext(self.brain.calibration_id, worldFrameId)
         self.world_frame_id = worldFrameId
         self.world_memory_batch_size = batchSize
+        if self.brain.buf_B != batchSize:
+            if not self.brain.thread_end or self.brain.extra_mem is not None:
+                self.brain.CancelOutstandingSmoothMemoryTransaction()
+            self.brain.ResetBuffers(
+                B=batchSize,
+                isOnlineLearning=self.brain.is_online_learning,
+                device=self.device)
+            self.brain.RuntimeModule(
+                self.brain.world).ResetState(batchSize=batchSize)
         if self.wm_mem_path is not None:
             world._use_memory = True
-            world._mem_path = self.wm_mem_path
+            world._mem_path = None
             if loadPersistent:
                 self.LoadWorldMemory(self.wm_mem_path)
             else:
@@ -3082,25 +4441,133 @@ class Agent:
                 "bind the Agent world memory context before loading WorldMemory")
         world = self.GetRuntimeWorld()
         world._use_memory = True
-        world._mem_path = path
+        world._mem_path = None
         if os.path.exists(path):
-            world.LoadMemory(
+            payload = torch.load(
                 path,
-                batchSize=self.world_memory_batch_size,
-                mapLocation=None)
+                map_location=self.device,
+                weights_only=False)
+            if (
+                type(payload) is not dict
+                or set(payload) != WORLD_MEMORY_ARTIFACT_FIELDS
+            ):
+                raise ValueError(
+                    "world memory artifact fields do not match the current schema")
+            if (
+                payload["artifact_type"] != "agent_world_memory"
+                or payload["schema_version"]
+                != WORLD_MEMORY_ARTIFACT_SCHEMA_VERSION
+            ):
+                raise ValueError("unsupported world memory artifact schema")
+            if payload["description_id"] != self.brain.robot_description_id:
+                raise ValueError(
+                    "world memory description_id does not match the robot")
+            if payload["model_contract_id"] != self.brain.robot_model_contract_id:
+                raise ValueError(
+                    "world memory model_contract_id does not match the foundation")
+            if payload["adapter_id"] != self.brain.robot_adapter_id:
+                raise ValueError(
+                    "world memory adapter_id does not match the robot mapping")
+            world.ImportMemoryPayload(
+                payload["world"],
+                batchSize=self.world_memory_batch_size)
         else:
             world.EnsureB(self.world_memory_batch_size)
-            world.SaveMemory(path)
+            self.SaveWorldMemory(path)
 
+    def SaveWorldMemory(self, path: str) -> None:
+        payload = {
+            "artifact_type": "agent_world_memory",
+            "schema_version": WORLD_MEMORY_ARTIFACT_SCHEMA_VERSION,
+            "description_id": self.brain.robot_description_id,
+            "model_contract_id": self.brain.robot_model_contract_id,
+            "adapter_id": self.brain.robot_adapter_id,
+            "world": self.GetRuntimeWorld().ExportMemoryPayload(),}
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".tmp",
+            dir=directory or ".")
+        os.close(fd)
+        try:
+            torch.save(payload, temporary_path)
+            os.replace(temporary_path, path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+    def CommitPendingWorldAutosave(self) -> None:
+        if self.wm_mem_path is None:
+            return
+        world = self.GetRuntimeWorld()
+        if world.HasMemoryAutosaveRequest():
+            self.SaveWorldMemory(self.wm_mem_path)
+            world.AcknowledgeMemoryAutosaveRequest()
     def LoadAgentMemory(self, path: str, *, batchSize: int):
         mem = self.brain.mem
         if os.path.exists(path) and os.path.getsize(path) > 0:
-            mem.LoadState(path, expectedBatch=batchSize)
+            payload = torch.load(
+                path,
+                map_location=self.device,
+                weights_only=True)
+            if type(payload) is not dict or set(payload) != AGENT_MEMORY_FIELDS:
+                raise ValueError(
+                    "agent memory fields do not match the current schema")
+            if (
+                payload["artifact_type"] != "agent_memory"
+                or payload["schema_version"] != AGENT_MEMORY_SCHEMA_VERSION
+            ):
+                raise ValueError("unsupported agent memory schema")
+            if payload["description_id"] != self.brain.robot_description_id:
+                raise ValueError(
+                    "agent memory description_id does not match the robot")
+            if payload["model_contract_id"] != self.brain.robot_model_contract_id:
+                raise ValueError(
+                    "agent memory model_contract_id does not match the foundation")
+            if payload["adapter_id"] != self.brain.robot_adapter_id:
+                raise ValueError(
+                    "agent memory adapter_id does not match the robot mapping")
+            if payload["batch_size"] != batchSize:
+                raise ValueError(
+                    "agent memory batch_size does not match the runtime")
+            mem.ValidateDurableState(
+                payload["state"],
+                expectedBatch=batchSize)
+            mem.ImportDurableState(payload["state"])
             return
 
         self.EnsureFile(path)
         mem.EnsureB(batchSize)
-        mem.SaveState(path)
+        self.SaveAgentMemory(path)
+
+    def SaveAgentMemory(self, path: str) -> None:
+        mem = self.brain.mem
+        mem.FlushPendingWrites()
+        state = mem.ExportDurableState()
+        payload = {
+            "artifact_type": "agent_memory",
+            "schema_version": AGENT_MEMORY_SCHEMA_VERSION,
+            "description_id": self.brain.robot_description_id,
+            "model_contract_id": self.brain.robot_model_contract_id,
+            "adapter_id": self.brain.robot_adapter_id,
+            "batch_size": int(state["memory_filled"].size(0)),
+            "state": state,}
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".tmp",
+            dir=directory or ".")
+        os.close(fd)
+        try:
+            torch.save(payload, temporary_path)
+            os.replace(temporary_path, path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
 
     def SaveRuntimeMemories(self):
         if self.wm_mem_path is None and self.mem_mem_path is None:
@@ -3112,18 +4579,22 @@ class Agent:
                     "bind the Agent world memory context before saving WorldMemory")
             world = self.GetRuntimeWorld()
             world._use_memory = True
-            world._mem_path = self.wm_mem_path
-            world.SaveMemory(self.wm_mem_path)
+            world._mem_path = None
+            self.SaveWorldMemory(self.wm_mem_path)
 
         if self.mem_mem_path is not None:
-            self.brain.mem.SaveState(self.mem_mem_path)
+            self.SaveAgentMemory(self.mem_mem_path)
 
     def LoadTorchPayload(self, path: str):
         return torch.load(path, map_location=self.device, weights_only=True)
 
     def LoadBrainWeights(self, path: str):
         payload = self.LoadTorchPayload(path)
-        expected_fields = {"schema_version", "calibration_id", "brain"}
+        expected_fields = {
+            "schema_version",
+            "calibration_id",
+            "model_contract_id",
+            "brain"}
         if type(payload) is not dict or set(payload) != expected_fields:
             raise TypeError(
                 f"checkpoint {path} brain-weight fields do not match the current schema")
@@ -3136,6 +4607,9 @@ class Agent:
         if payload["calibration_id"] != self.brain.calibration_id:
             raise ValueError(
                 "brain parameter calibration_id does not match configured K")
+        if payload["model_contract_id"] != self.brain.robot_model_contract_id:
+            raise ValueError(
+                "brain parameter model_contract_id does not match the foundation")
         brain_state = payload["brain"]
         if type(brain_state) is not dict:
             raise TypeError("brain model state must be a dictionary")
@@ -3179,6 +4653,7 @@ class Agent:
             compute_critic_loss=request.compute_critic_loss)
         if self.is_train:
             step_out = self.brain.Step(brain_step)
+            self.CommitPendingWorldAutosave()
             motion_command = step_out.decision["motion_command"]
             return AgentActOutput(
                 motion_command=motion_command,
@@ -3197,6 +4672,7 @@ class Agent:
         else:
             with torch.no_grad():
                 step_out = self.brain.Step(brain_step)
+                self.CommitPendingWorldAutosave()
                 motion_command = step_out.decision["motion_command"]
                 return AgentActOutput(
                     motion_command=motion_command,
@@ -3223,6 +4699,9 @@ class Agent:
             "frame_id",
             "calibration_id",
             "world_frame_id",
+            "description_id",
+            "model_contract_id",
+            "adapter_id",
         ):
             if (
                 type(requestProvenance[field_name]) is not str
@@ -3230,6 +4709,18 @@ class Agent:
             ):
                 raise ValueError(
                     f"decision request {field_name} must be a non-empty string")
+        if requestProvenance["description_id"] != self.brain.robot_description_id:
+            raise ValueError(
+                "decision request description_id does not match the robot contract")
+        if (
+            requestProvenance["model_contract_id"]
+            != self.brain.robot_model_contract_id
+        ):
+            raise ValueError(
+                "decision request model_contract_id does not match the foundation")
+        if requestProvenance["adapter_id"] != self.brain.robot_adapter_id:
+            raise ValueError(
+                "decision request adapter_id does not match the robot mapping")
         if (
             type(requestProvenance["sequence_index"]) is not int
             or requestProvenance["sequence_index"] < 0
@@ -3263,13 +4754,24 @@ class Agent:
             return value
 
         motion_command = {
-            "decision_tensor": to_json_scalar_or_list(motion_command_value.decision_tensor),
-            "target_endpoint_pose": to_json_scalar_or_list(motion_command_value.target_endpoint_pose),
+            "decision_tensor": to_json_scalar_or_list(
+                motion_command_value.decision_tensor),
+            "target_endpoint_pose": to_json_scalar_or_list(
+                motion_command_value.target_endpoint_pose),
             "endpoint_names": list(motion_command_value.endpoint_names),
             "decision_dof_mask": to_json_scalar_or_list(
                 motion_command_value.decision_dof_mask),
-            "gripper_cmd": to_json_scalar_or_list(motion_command_value.gripper_cmd),
-            "gripper_valid": to_json_scalar_or_list(motion_command_value.gripper_valid),
+            "gripper_cmd": to_json_scalar_or_list(
+                motion_command_value.gripper_cmd),
+            "gripper_valid": to_json_scalar_or_list(
+                motion_command_value.gripper_valid),
+            "gripper_names": list(self.brain.robot_gripper_names),
+            "joint_variable_command": to_json_scalar_or_list(
+                motion_command_value.joint_variable_command),
+            "joint_variable_command_mask": to_json_scalar_or_list(
+                motion_command_value.joint_variable_command_mask),
+            "joint_variable_names": list(
+                motion_command_value.joint_variable_names),
             "mode_logits": to_json_scalar_or_list(motion_command_value.mode_logits),
             "mode_valid": to_json_scalar_or_list(motion_command_value.mode_valid),
             "safety_scores": to_json_scalar_or_list(motion_command_value.safety_scores),
@@ -3341,6 +4843,7 @@ class Agent:
                 decision_value["expected_previous_action_id"]),}
 
         command_contract = {
+            **self.brain.robot_command_contract,
             "authority": "proposal",
             "physical_execution_ready": False,
             "repository_motion_bridge": "not_connected",
@@ -3393,16 +4896,21 @@ class Agent:
         self.brain.CompleteOutstandingSmoothMemoryTransaction()
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
+        buffers = self.brain.ExportBuffers()
+        world_memory = self.GetRuntimeWorld().ExportMemoryPayload()
         payload = {
             "schema_version": BRAIN_RUNTIME_SCHEMA_VERSION,
             "calibration_id": self.brain.calibration_id,
+            "description_id": self.brain.robot_description_id,
+            "model_contract_id": self.brain.robot_model_contract_id,
+            "adapter_id": self.brain.robot_adapter_id,
             "world_frame_id": self.world_frame_id,
             "batch_size": self.world_memory_batch_size,
             "online_learning": bool(self.brain.is_online_learning),
             "brain": ExportBrainModelState(self.brain),
             "online_candidates": self.ExportOnlineCandidateState(),
-            "buffers": self.brain.ExportBuffers(),
-            "world_memory": self.GetRuntimeWorld().ExportMemoryPayload(),
+            "buffers": buffers,
+            "world_memory": world_memory,
             "memory_durable": self.brain.mem.ExportDurableState(),
             "rng_py": random.getstate(),
             "rng_np": np.random.get_state(),
@@ -3451,6 +4959,15 @@ class Agent:
         if payload["calibration_id"] != self.brain.calibration_id:
             raise ValueError(
                 "agent checkpoint calibration_id does not match configured K")
+        if payload["description_id"] != self.brain.robot_description_id:
+            raise ValueError(
+                "agent checkpoint description_id does not match the robot")
+        if payload["model_contract_id"] != self.brain.robot_model_contract_id:
+            raise ValueError(
+                "agent checkpoint model_contract_id does not match the foundation")
+        if payload["adapter_id"] != self.brain.robot_adapter_id:
+            raise ValueError(
+                "agent checkpoint adapter_id does not match the robot mapping")
         if self.world_frame_id is None:
             raise RuntimeError(
                 "bind the Agent world memory context before loading a runtime checkpoint")
@@ -3477,6 +4994,16 @@ class Agent:
         self.brain.mem.ValidateDurableState(
             payload["memory_durable"],
             expectedBatch=self.world_memory_batch_size)
+        buffer_state = payload["buffers"]
+        if type(buffer_state) is not dict or set(buffer_state) != BRAIN_RUNTIME_BUFFER_FIELDS:
+            raise ValueError(
+                "brain runtime buffer fields do not match the current schema")
+        if (
+            type(buffer_state["schema_version"]) is not int
+            or buffer_state["schema_version"] != BRAIN_RUNTIME_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "agent checkpoint brain runtime schema is invalid")
         self.brain.CancelOutstandingSmoothMemoryTransaction()
         LoadBrainModelState(self.brain, brain_state)
         self.ImportOnlineCandidateState(payload["online_candidates"])
@@ -3642,18 +5169,211 @@ class Agent:
 
 class TestAGICoreMTool:
     @staticmethod
+    def MakeRobotMorphology(observer: bool = True) -> Any:
+        from RobotMorphologyModule import (
+            ROBOT_MORPHOLOGY_SCHEMA_VERSION,
+            RobotMorphologyModule)
+
+        joint_specs = []
+        for name, child in (
+            ("tool_a_yaw", "tool_a_link"),
+            ("camera_pan", "camera_link"),
+            ("tool_b_yaw", "tool_b_link"),
+        ):
+            joint_specs.append({
+                "name": name,
+                "type": "revolute",
+                "parent": "root",
+                "child": child,
+                "origin_xyz": [0.0, 0.0, 0.0],
+                "origin_rpy": [0.0, 0.0, 0.0],
+                "axis": [0.0, 0.0, 1.0],
+                "limit": {
+                    "lower": -1.0,
+                    "upper": 1.0,
+                    "effort": 2.0,
+                    "velocity": 1.0,},
+                "mimic": None,})
+        groups = [
+            {
+                "name": name,
+                "joints": [joint],
+                "links": [],
+                "subgroups": [],
+                "chains": [],}
+            for name, joint in (
+                ("tool_a_group", "tool_a_yaw"),
+                ("camera_group", "camera_pan"),
+                ("tool_b_group", "tool_b_yaw"),)]
+        end_effectors = [
+            {
+                "name": name,
+                "parent_link": link,
+                "group": group,
+                "parent_group": None,}
+            for name, link, group in (
+                ("tool_a", "tool_a_link", "tool_a_group"),
+                ("sensor_mount", "camera_link", "camera_group"),
+                ("tool_b", "tool_b_link", "tool_b_group"),)]
+        control = {
+            "nodes": [
+                {
+                    "name": "tool_a_link",
+                    "role": "hand",
+                    "side": "left",
+                    "capabilities": ["manipulation", "grasp"],},
+                {
+                    "name": "camera_link",
+                    "role": "sensor",
+                    "side": "center",
+                    "capabilities": ["observe"],},
+                {
+                    "name": "tool_b_link",
+                    "role": "hand",
+                    "side": "right",
+                    "capabilities": ["manipulation", "grasp"],},],
+            "groups": [
+                {
+                    "name": "tool_a_group",
+                    "role": "arm",
+                    "side": "left",
+                    "capabilities": ["manipulation"],},
+                {
+                    "name": "camera_group",
+                    "role": "head",
+                    "side": "center",
+                    "capabilities": ["observe"],},
+                {
+                    "name": "tool_b_group",
+                    "role": "arm",
+                    "side": "right",
+                    "capabilities": ["manipulation"],},],
+            "endpoints": [
+                {
+                    "name": "tool_a",
+                    "task_mask": [False, False, False, False, False, True],},
+                {
+                    "name": "sensor_mount",
+                    "task_mask": [False, False, False, False, False, False],},
+                {
+                    "name": "tool_b",
+                    "task_mask": [False, False, False, False, False, True],},],
+            "grippers": [
+                {"name": "grip_a", "endpoint": "tool_a"},
+                {"name": "grip_b", "endpoint": "tool_b"},],}
+        if observer:
+            control.update({
+                "sensors": [{
+                    "name": "camera",
+                    "type": "rgbd",
+                    "link": "camera_link",}],
+                "observer": {
+                    "sensor": "camera",
+                    "control_group": "camera_group",},
+                "observer_frame_name": "synthetic_observer",
+                "observer_calibration_id": "synthetic_calibration",})
+        return RobotMorphologyModule().FromJson({
+            "schema_version": ROBOT_MORPHOLOGY_SCHEMA_VERSION,
+            "urdf": {
+                "name": "synthetic_robot",
+                "links": [
+                    {"name": "root"},
+                    {"name": "tool_a_link"},
+                    {"name": "camera_link"},
+                    {"name": "tool_b_link"},],
+                "joints": joint_specs,},
+            "srdf": {
+                "name": "synthetic_robot",
+                "groups": groups,
+                "passive_joints": [],
+                "end_effectors": end_effectors,
+                "virtual_joints": [],
+                "group_states": [],
+                "disabled_collisions": [],},
+            "control": control,})
+
+    @staticmethod
+    def ConfigureBrainMorphology(
+        brain: BrainCore,
+        morphology: Any,) -> BrainCore:
+        brain.robot_description_id = morphology.description_id
+        brain.robot_model_contract_id = morphology.model_contract_id
+        brain.robot_adapter_id = morphology.adapter_id
+        brain.robot_command_contract = ExpectedRobotCommandContract(
+            morphology)
+        brain.robot_endpoint_names = tuple(morphology.endpoint_names)
+        brain.robot_joint_variable_names = tuple(
+            morphology.joint_variable_names)
+        brain.robot_gripper_names = tuple(morphology.gripper_names)
+        brain.robot_node_count = int(morphology.node_count)
+        brain.robot_endpoint_count = int(morphology.endpoint_count)
+        brain.robot_joint_dof_count = int(morphology.joint_dof_count)
+        brain.robot_endpoint_task_mask = morphology.endpoint_task_mask.clone()
+        brain.robot_joint_variable_commandable = (
+            morphology.joint_variable_commandable.clone())
+        brain.robot_gripper_endpoint_index = (
+            morphology.gripper_endpoint_index.clone())
+        observer_joint_mask = torch.zeros(
+            morphology.joint_dof_count,
+            dtype=torch.bool)
+        if morphology.observer_control_joint_indices.numel():
+            observer_joint_mask[
+                morphology.observer_control_joint_indices] = True
+        brain.robot_observer_control_joint_mask = observer_joint_mask
+        brain.robot_observer_valid = torch.tensor(
+            morphology.observer_valid,
+            dtype=torch.bool)
+        brain.robot_endpoint_action_available = (
+            morphology.endpoint_task_mask.any())
+        brain.robot_joint_action_available = (
+            morphology.joint_variable_commandable.any())
+        brain.robot_actuation_available = torch.tensor(bool(
+            morphology.endpoint_task_mask.any().item()
+            or morphology.joint_variable_commandable.any().item()
+            or morphology.gripper_count > 0))
+        brain.robot_endpoint_reference_index = (
+            BrainCore.BuildEndpointReferenceIndex(morphology))
+        return brain
+
+    @staticmethod
+    def RobotPhysicalRuntimeState(
+        morphology: Any,
+        batchSize: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Dict[str, torch.Tensor]:
+        B = int(batchSize)
+        Q = int(morphology.joint_dof_count)
+        L = int(morphology.node_count)
+        node_pose = torch.zeros(B, L, 7, device=device, dtype=dtype)
+        node_pose[..., 6] = 1.0
+        return {
+            "jointPosition": torch.zeros(B, Q, device=device, dtype=dtype),
+            "jointVelocity": torch.zeros(B, Q, device=device, dtype=dtype),
+            "jointEffort": torch.zeros(B, Q, device=device, dtype=dtype),
+            "jointObserved": torch.zeros(B, Q, device=device, dtype=torch.bool),
+            "jointHealthy": torch.zeros(B, Q, device=device, dtype=torch.bool),
+            "jointControllable": torch.zeros(B, Q, device=device, dtype=torch.bool),
+            "nodePoseWorld": node_pose,
+            "nodeTwistWorld": torch.zeros(B, L, 6, device=device, dtype=dtype),
+            "nodeObserved": torch.zeros(B, L, device=device, dtype=torch.bool),
+            "nodeHealthy": torch.zeros(B, L, device=device, dtype=torch.bool),}
+
+    @staticmethod
     def MakeRobotPhysicalEncodingWorld(
-        bodyPoseDim: int = (
-            ModuleDim.DecisionBodyEndpointCount
-            * ModuleDim.DecisionEndpointPoseDim),
-        outDim: int = ModuleDim.PstSlotDim,) -> RSSMWorldModel:
+        outDim: int = ModuleDim.PstSlotDim,
+        robotMorphology: Optional[Any] = None,) -> RSSMWorldModel:
         from WorldModule import WorldRobotPhysicalEncoder
 
+        morphology = (
+            TestAGICoreMTool.MakeRobotMorphology()
+            if robotMorphology is None
+            else robotMorphology)
         world = object.__new__(RSSMWorldModel)
         nn.Module.__init__(world)
         world.robot_physical_encoder = WorldRobotPhysicalEncoder(
-            bodyPoseDim=bodyPoseDim,
-            outDim=outDim)
+            outDim=outDim,
+            robotMorphology=morphology)
         return world
 
     def TestDataclassContracts(self) -> bool:
@@ -3692,11 +5412,15 @@ class TestAGICoreMTool:
     def TestWorldRobotPhysicalEncodingExcludesControlFeedback(self) -> bool:
         try:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            control_encoder = EndpointControlEncoder().to(device).eval()
-            world = self.MakeRobotPhysicalEncodingWorld().to(device).eval()
+            morphology = self.MakeRobotMorphology()
+            control_encoder = DecisionDecouplerV2(
+                robotMorphology=morphology).endpoint_control_encoder.to(
+                    device).eval()
+            world = self.MakeRobotPhysicalEncodingWorld(
+                robotMorphology=morphology).to(device).eval()
             endpoint_pose = torch.zeros(
                 2,
-                ModuleDim.DecisionBodyEndpointCount,
+                morphology.endpoint_count,
                 ModuleDim.DecisionEndpointPoseDim,
                 device=device)
             endpoint_pose[..., 6] = 1.0
@@ -3704,44 +5428,77 @@ class TestAGICoreMTool:
                 2, ModuleDim.RobotPhysicalReferenceDim, device=device)
             physical_reference[:, 3] = 1.0
             physical_reference[:, 6] = -1.0
+            physical_reference[:, 7] = 1.0
+            endpoint_state_valid = torch.ones(
+                2, morphology.endpoint_count,
+                device=device, dtype=torch.bool)
+            endpoint_controllable = endpoint_state_valid.clone()
+            runtime_state = self.RobotPhysicalRuntimeState(
+                morphology, 2, device, endpoint_pose.dtype)
             state0 = world.EncodeRobotPhysicalState(
                 endpoint_pose,
-                physical_reference)
+                physical_reference,
+                endpointStateValid=endpoint_state_valid,
+                endpointControllable=endpoint_controllable,
+                **runtime_state)
             zero_error = torch.zeros(
                 2,
-                ModuleDim.DecisionEndpointCount,
+                morphology.endpoint_count,
                 ModuleDim.DecisionActionDim,
                 device=device)
-            control0 = control_encoder(zero_error, zero_error)
+            control0 = control_encoder(
+                zero_error,
+                zero_error,
+                endpoint_state_valid,
+                endpoint_controllable)
             changed_error = zero_error.clone()
-            changed_error[:, 0, 0] = 0.25
-            control1 = control_encoder(changed_error, zero_error)
+            changed_error[:, 1, 5] = 0.25
+            control1 = control_encoder(
+                changed_error,
+                zero_error,
+                endpoint_state_valid,
+                endpoint_controllable)
             state_from_changed_control = world.EncodeRobotPhysicalState(
                 endpoint_pose,
-                physical_reference)
+                physical_reference,
+                endpointStateValid=endpoint_state_valid,
+                endpointControllable=endpoint_controllable,
+                **runtime_state)
             changed_pose = endpoint_pose.clone()
             changed_pose[:, 0, 0] = 0.25
             state1 = world.EncodeRobotPhysicalState(
                 changed_pose,
-                physical_reference)
+                physical_reference,
+                endpointStateValid=endpoint_state_valid,
+                endpointControllable=endpoint_controllable,
+                **runtime_state)
             changed_reference = physical_reference.clone()
             changed_reference[:, 0] = 0.5
             state2 = world.EncodeRobotPhysicalState(
                 endpoint_pose,
-                changed_reference)
+                changed_reference,
+                endpointStateValid=endpoint_state_valid,
+                endpointControllable=endpoint_controllable,
+                **runtime_state)
             rotated_reference = physical_reference.clone()
             sqrt_half = math.sqrt(0.5)
             rotated_reference[:, 0:4] = rotated_reference.new_tensor([
                 0.0, 0.0, sqrt_half, sqrt_half])
             state_rotation = world.EncodeRobotPhysicalState(
                 endpoint_pose,
-                rotated_reference)
+                rotated_reference,
+                endpointStateValid=endpoint_state_valid,
+                endpointControllable=endpoint_controllable,
+                **runtime_state)
             changed_gravity = physical_reference.clone()
             changed_gravity[:, 4:7] = changed_gravity.new_tensor([
                 0.0, -1.0, 0.0])
             state_gravity = world.EncodeRobotPhysicalState(
                 endpoint_pose,
-                changed_gravity)
+                changed_gravity,
+                endpointStateValid=endpoint_state_valid,
+                endpointControllable=endpoint_controllable,
+                **runtime_state)
             ok = (
                 tuple(state0.shape) == (2, ModuleDim.PstSlotDim)
                 and torch.equal(state0, state_from_changed_control)
@@ -3760,15 +5517,20 @@ class TestAGICoreMTool:
             print(f"AGICore world robot physical encoding error: {e}")
             return False
 
-    def TestCameraPhysicalReferenceGaugeInvariance(self) -> bool:
+    def TestObserverPhysicalReferenceGaugeInvariance(self) -> bool:
         try:
+            morphology = self.MakeRobotMorphology()
+            brain = object.__new__(BrainCore)
+            nn.Module.__init__(brain)
+            self.ConfigureBrainMorphology(brain, morphology)
             sqrt_half = math.sqrt(0.5)
-            camera_world = torch.tensor([[
+            observer_world = torch.tensor([[
                 0.3, -0.2, 1.1,
                 0.0, 0.0, sqrt_half, sqrt_half]])
             base_world = torch.tensor([[0.1, 0.4, 0.2, 0.0, sqrt_half, 0.0, sqrt_half]])
             gravity_world = torch.tensor([[0.0, 0.0, -1.0]])
             world_gauge = torch.tensor([[1.2, -0.7, 0.5, sqrt_half, 0.0, 0.0, sqrt_half]])
+            observer_valid = torch.ones(1, dtype=torch.bool)
 
             def compose(parent: torch.Tensor, child: torch.Tensor) -> torch.Tensor:
                 return NormalizePose(torch.cat([
@@ -3777,36 +5539,41 @@ class TestAGICoreMTool:
                     QuatMultiply(
                         parent[..., 3:7], child[..., 3:7])], dim=-1))
 
-            reference = BrainCore.CameraPhysicalReference(
-                camera_world,
+            reference = brain.ObserverPhysicalReference(
+                observer_world,
                 base_world[..., 3:7],
-                gravity_world)
-            transformed_reference = BrainCore.CameraPhysicalReference(
-                compose(world_gauge, camera_world),
+                gravity_world,
+                observer_valid)
+            transformed_reference = brain.ObserverPhysicalReference(
+                compose(world_gauge, observer_world),
                 compose(world_gauge, base_world)[..., 3:7],
-                QuatRotate(world_gauge[..., 3:7], gravity_world))
+                QuatRotate(world_gauge[..., 3:7], gravity_world),
+                observer_valid)
 
-            camera_sign_flipped = camera_world.clone()
-            camera_sign_flipped[..., 3:7] *= -1.0
-            camera_sign_reference = BrainCore.CameraPhysicalReference(
-                camera_sign_flipped,
+            observer_sign_flipped = observer_world.clone()
+            observer_sign_flipped[..., 3:7] *= -1.0
+            observer_sign_reference = brain.ObserverPhysicalReference(
+                observer_sign_flipped,
                 base_world[..., 3:7],
-                gravity_world)
-            base_sign_reference = BrainCore.CameraPhysicalReference(
-                camera_world,
+                gravity_world,
+                observer_valid)
+            base_sign_reference = brain.ObserverPhysicalReference(
+                observer_world,
                 -base_world[..., 3:7],
-                gravity_world)
-            translated_camera = camera_world.clone()
-            translated_camera[..., :3] += torch.tensor([3.0, -2.0, 1.0])
-            translated_reference = BrainCore.CameraPhysicalReference(
-                translated_camera,
+                gravity_world,
+                observer_valid)
+            translated_observer = observer_world.clone()
+            translated_observer[..., :3] += torch.tensor([3.0, -2.0, 1.0])
+            translated_reference = brain.ObserverPhysicalReference(
+                translated_observer,
                 base_world[..., 3:7],
-                gravity_world)
+                gravity_world,
+                observer_valid)
             reconstructed_base_orientation = QuatMultiply(
-                camera_world[..., 3:7],
+                observer_world[..., 3:7],
                 reference[..., :4])
             reconstructed_gravity_world = QuatRotate(
-                camera_world[..., 3:7],
+                observer_world[..., 3:7],
                 reference[..., 4:7])
             reconstructed_base_quaternion_match = (
                 reconstructed_base_orientation
@@ -3823,25 +5590,41 @@ class TestAGICoreMTool:
 
             endpoint_system = torch.zeros(
                 1,
-                ModuleDim.RobotStateEndpointCount,
+                morphology.endpoint_count,
                 ModuleDim.DecisionEndpointPoseDim)
             endpoint_system[..., 6] = 1.0
             endpoint_system[..., 0] = torch.linspace(
-                -0.3, 0.3, ModuleDim.RobotStateEndpointCount)
-            endpoint_system[:, ModuleDim.RobotStateCameraEndpointIndex] = camera_world
+                -0.3, 0.3, morphology.endpoint_count)
+            endpoint_system[:, 0] = (
+                observer_world)
             transformed_endpoint_system = compose(
                 world_gauge.unsqueeze(1),
                 endpoint_system)
-            body_relative = BrainCore.BodyEndpointPoseRelative(endpoint_system)
-            transformed_body_relative = BrainCore.BodyEndpointPoseRelative(
-                transformed_endpoint_system)
-            world = self.MakeRobotPhysicalEncodingWorld().eval()
+            endpoint_valid = torch.ones(
+                1, morphology.endpoint_count, dtype=torch.bool)
+            runtime_state = self.RobotPhysicalRuntimeState(
+                morphology,
+                1,
+                endpoint_system.device,
+                endpoint_system.dtype)
+            endpoint_relative = brain.EndpointPoseRelative(
+                endpoint_system, endpoint_valid)
+            transformed_endpoint_relative = brain.EndpointPoseRelative(
+                transformed_endpoint_system, endpoint_valid)
+            world = self.MakeRobotPhysicalEncodingWorld(
+                robotMorphology=morphology).eval()
             physical_state = world.EncodeRobotPhysicalState(
-                body_relative,
-                reference)
+                endpoint_relative,
+                reference,
+                endpointStateValid=endpoint_valid,
+                endpointControllable=endpoint_valid,
+                **runtime_state)
             transformed_physical_state = world.EncodeRobotPhysicalState(
-                transformed_body_relative,
-                transformed_reference)
+                transformed_endpoint_relative,
+                transformed_reference,
+                endpointStateValid=endpoint_valid,
+                endpointControllable=endpoint_valid,
+                **runtime_state)
 
             ok = (
                 torch.allclose(
@@ -3851,7 +5634,7 @@ class TestAGICoreMTool:
                     rtol=1e-5)
                 and torch.allclose(
                     reference,
-                    camera_sign_reference,
+                    observer_sign_reference,
                     atol=1e-5,
                     rtol=1e-5)
                 and torch.allclose(
@@ -3878,8 +5661,8 @@ class TestAGICoreMTool:
                     atol=1e-5,
                     rtol=1e-5)
                 and torch.allclose(
-                    body_relative,
-                    transformed_body_relative,
+                    endpoint_relative,
+                    transformed_endpoint_relative,
                     atol=1e-5,
                     rtol=1e-5)
                 and torch.allclose(
@@ -3893,16 +5676,20 @@ class TestAGICoreMTool:
                     atol=1e-5,
                     rtol=1e-5))
             print(
-                f"AGICore camera physical reference gauge invariance "
+                f"AGICore observer physical reference gauge invariance "
                 f"{'passed' if ok else 'failed'}.")
             return bool(ok)
         except Exception as e:
             print(
-                f"AGICore camera physical reference gauge invariance error: {e}")
+                f"AGICore observer physical reference gauge invariance error: {e}")
             return False
 
-    def TestBodyEndpointReferenceMapping(self) -> bool:
+    def TestEndpointReferenceMapping(self) -> bool:
         try:
+            morphology = self.MakeRobotMorphology()
+            brain = object.__new__(BrainCore)
+            nn.Module.__init__(brain)
+            self.ConfigureBrainMorphology(brain, morphology)
             sqrt_half = math.sqrt(0.5)
 
             def compose(parent: torch.Tensor, child: torch.Tensor) -> torch.Tensor:
@@ -3911,66 +5698,45 @@ class TestAGICoreMTool:
                     QuatMultiply(parent[..., 3:7], child[..., 3:7]),
                 ], dim=-1))
 
-            endpoint_pose = torch.zeros(
-                1,
-                ModuleDim.RobotStateEndpointCount,
-                ModuleDim.DecisionEndpointPoseDim)
-            endpoint_pose[..., 6] = 1.0
-            camera = torch.tensor([[
+            observer = torch.tensor([[
                 0.7, -0.4, 1.2,
                 0.0, sqrt_half, 0.0, sqrt_half]])
-            left_wrist_camera = torch.tensor([[
+            local_a = torch.tensor([[
                 0.25, -0.10, 0.35,
                 0.0, 0.0, sqrt_half, sqrt_half]])
-            right_wrist_camera = torch.tensor([[
+            local_b = torch.tensor([[
                 -0.20, 0.15, 0.40,
                 sqrt_half, 0.0, 0.0, sqrt_half]])
-            left_wrist = compose(camera, left_wrist_camera)
-            right_wrist = compose(camera, right_wrist_camera)
-            endpoint_pose[:, ModuleDim.DecisionLeftWristEndpointIndex] = left_wrist
-            endpoint_pose[:, ModuleDim.DecisionRightWristEndpointIndex] = right_wrist
-            endpoint_pose[:, ModuleDim.RobotStateCameraEndpointIndex] = camera
-
-            left_local = torch.zeros(1, 5, 7)
-            left_local[..., 6] = 1.0
-            left_local[0, :, :3] = torch.tensor([
-                [0.10, 0.01, 0.02],
-                [0.20, 0.02, 0.01],
-                [0.30, 0.03, 0.00],
-                [0.40, 0.04, -0.01],
-                [0.50, 0.05, -0.02]])
-            left_local[..., 3:7] = torch.tensor([
-                0.0, sqrt_half, 0.0, sqrt_half])
-            right_local = torch.zeros(1, 5, 7)
-            right_local[..., 6] = 1.0
-            right_local[0, :, :3] = torch.tensor([
-                [0.01, 0.10, -0.02],
-                [0.02, 0.20, -0.01],
-                [0.03, 0.30, 0.00],
-                [0.04, 0.40, 0.01],
-                [0.05, 0.50, 0.02]])
-            right_local[..., 3:7] = torch.tensor([
-                0.0, 0.0, sqrt_half, sqrt_half])
-            endpoint_pose[:, :5] = compose(
-                left_wrist.unsqueeze(1), left_local)
-            endpoint_pose[:, 5:10] = compose(
-                right_wrist.unsqueeze(1), right_local)
-
-            body_relative = BrainCore.BodyEndpointPoseRelative(endpoint_pose)
-            expected = torch.cat([
-                left_local,
-                right_local,
-                left_wrist_camera.unsqueeze(1),
-                right_wrist_camera.unsqueeze(1),
-            ], dim=1)
+            endpoint_pose = torch.zeros(
+                1,
+                morphology.endpoint_count,
+                ModuleDim.DecisionEndpointPoseDim)
+            endpoint_pose[..., 6] = 1.0
+            endpoint_pose[:, 0] = observer
+            endpoint_pose[:, 1] = compose(observer, local_a)
+            endpoint_pose[:, 2] = compose(observer, local_b)
+            endpoint_relative = brain.EndpointPoseRelative(
+                endpoint_pose,
+                torch.ones(
+                    1, morphology.endpoint_count, dtype=torch.bool))
+            expected = torch.zeros_like(endpoint_relative)
+            expected[..., 6] = 1.0
+            expected[:, 1] = local_a
+            expected[:, 2] = local_b
             quaternion_match = (
-                body_relative[..., 3:7]
+                endpoint_relative[..., 3:7]
                 * expected[..., 3:7]
             ).sum(dim=-1).abs()
             ok = (
-                tuple(body_relative.shape) == (1, 12, 7)
+                tuple(endpoint_relative.shape) == (
+                    1,
+                    morphology.endpoint_count,
+                    ModuleDim.DecisionEndpointPoseDim)
+                and tuple(
+                    brain.robot_endpoint_reference_index.tolist())
+                == (0, 0, 0)
                 and torch.allclose(
-                    body_relative[..., :3],
+                    endpoint_relative[..., :3],
                     expected[..., :3],
                     atol=1e-5,
                     rtol=1e-5)
@@ -3980,14 +5746,14 @@ class TestAGICoreMTool:
                     atol=1e-5,
                     rtol=1e-5))
             print(
-                f"AGICore body endpoint reference mapping "
+                f"AGICore endpoint reference mapping "
                 f"{'passed' if ok else 'failed'}.")
             return bool(ok)
         except Exception as e:
-            print(f"AGICore body endpoint reference mapping error: {e}")
+            print(f"AGICore endpoint reference mapping error: {e}")
             return False
 
-    def TestCameraMotionConvention(self) -> bool:
+    def TestObserverMotionConvention(self) -> bool:
         try:
             sqrt_half = math.sqrt(0.5)
 
@@ -4003,24 +5769,21 @@ class TestAGICoreMTool:
             current = torch.tensor([[
                 0.4, -0.3, 0.8,
                 0.0, sqrt_half, 0.0, sqrt_half]])
-            motion = BrainCore.RelativeCameraMotion(
+            motion = BrainCore.RelativeObserverMotion(
                 object.__new__(BrainCore),
                 previous,
                 current,
                 torch.tensor([True]))
-            first_frame_motion = BrainCore.RelativeCameraMotion(
+            first_frame_motion = BrainCore.RelativeObserverMotion(
                 object.__new__(BrainCore),
                 previous,
                 current,
                 torch.tensor([False]))
-            expected_motion = CanonicalizeQuaternion(
-                QuatMultiply(
-                    QuatConjugate(previous[:, 3:7]),
-                    current[:, 3:7]))
+            expected_motion = RelativePose(previous, current)
             world_gauge = torch.tensor([[
                 -0.6, 0.9, 0.2,
                 0.0, 0.0, sqrt_half, sqrt_half]])
-            gauged_motion = BrainCore.RelativeCameraMotion(
+            gauged_motion = BrainCore.RelativeObserverMotion(
                 object.__new__(BrainCore),
                 compose(world_gauge, previous),
                 compose(world_gauge, current),
@@ -4029,25 +5792,27 @@ class TestAGICoreMTool:
             previous_sign_flipped[:, 3:7] *= -1.0
             current_sign_flipped = current.clone()
             current_sign_flipped[:, 3:7] *= -1.0
-            previous_sign_motion = BrainCore.RelativeCameraMotion(
+            previous_sign_motion = BrainCore.RelativeObserverMotion(
                 object.__new__(BrainCore),
                 previous_sign_flipped,
                 current,
                 torch.tensor([True]))
-            current_sign_motion = BrainCore.RelativeCameraMotion(
+            current_sign_motion = BrainCore.RelativeObserverMotion(
                 object.__new__(BrainCore),
                 previous,
                 current_sign_flipped,
                 torch.tensor([True]))
             translated_current = current.clone()
             translated_current[:, :3] += torch.tensor([2.0, -1.0, 4.0])
-            translated_motion = BrainCore.RelativeCameraMotion(
+            translated_motion = BrainCore.RelativeObserverMotion(
                 object.__new__(BrainCore),
                 previous,
                 translated_current,
                 torch.tensor([True]))
             point_current = torch.tensor([[0.2, -0.4, 0.7]])
-            point_previous = QuatRotate(motion, point_current)
+            point_previous = (
+                QuatRotate(motion[:, 3:7], point_current)
+                + motion[:, :3])
             point_world = (
                 QuatRotate(current[:, 3:7], point_current)
                 + current[:, :3])
@@ -4055,6 +5820,7 @@ class TestAGICoreMTool:
                 QuatConjugate(previous[:, 3:7]),
                 point_world - previous[:, :3])
             expected_identity = torch.tensor([[
+                0.0, 0.0, 0.0,
                 0.0, 0.0, 0.0, 1.0]])
             ok = (
                 torch.allclose(
@@ -4071,7 +5837,7 @@ class TestAGICoreMTool:
                     motion, previous_sign_motion, atol=1e-6, rtol=1e-6)
                 and torch.allclose(
                     motion, current_sign_motion, atol=1e-6, rtol=1e-6)
-                and torch.equal(motion, translated_motion)
+                and not torch.equal(motion, translated_motion)
                 and torch.allclose(
                     point_previous,
                     expected_point_previous,
@@ -4079,15 +5845,16 @@ class TestAGICoreMTool:
                     rtol=1e-6)
                 and torch.equal(first_frame_motion, expected_identity))
             print(
-                f"AGICore camera motion convention "
+                f"AGICore observer motion convention "
                 f"{'passed' if ok else 'failed'}.")
             return bool(ok)
         except Exception as e:
-            print(f"AGICore camera motion convention error: {e}")
+            print(f"AGICore observer motion convention error: {e}")
             return False
 
     def TestMotionCommandWorldBoundary(self) -> bool:
         try:
+            morphology = self.MakeRobotMorphology()
             sqrt_half = math.sqrt(0.5)
 
             def compose(parent: torch.Tensor, child: torch.Tensor) -> torch.Tensor:
@@ -4097,16 +5864,19 @@ class TestAGICoreMTool:
                 ], dim=-1))
 
             class FakeDecoupler:
-                def __init__(self):
+                def __init__(self, actionMask: torch.Tensor):
                     self.last_remaining = None
                     self.action_projector = SimpleNamespace(
-                        action_mask=DecisionActionMask().view(
+                        action_mask=actionMask.view(
                             1,
-                            ModuleDim.DecisionEndpointCount,
+                            morphology.endpoint_count,
                             ModuleDim.DecisionActionDim))
 
                 def MaskDecisionTensor(self, decisionTensor):
                     return decisionTensor * self.action_projector.action_mask
+
+                def MaskJointVariableCommand(self, command, commandMask):
+                    return command * commandMask.to(command.dtype)
 
                 def SafetyScores(self, remaining, risk, confidence, precision):
                     self.last_remaining = remaining
@@ -4115,44 +5885,56 @@ class TestAGICoreMTool:
             B = 1
             current = torch.zeros(
                 B,
-                ModuleDim.DecisionEndpointCount,
+                morphology.endpoint_count,
                 ModuleDim.DecisionEndpointPoseDim)
             current[..., 6] = 1.0
             current[..., :3] = torch.linspace(
                 -0.25,
                 0.30,
-                ModuleDim.DecisionEndpointCount).view(1, -1, 1) * torch.tensor([
+                morphology.endpoint_count).view(1, -1, 1) * torch.tensor([
                     1.0, -0.5, 0.25])
             current[..., 3:7] = torch.tensor([
                 0.0, 0.0, sqrt_half, sqrt_half])
             local_action = torch.zeros(
                 B,
-                ModuleDim.DecisionEndpointCount,
+                morphology.endpoint_count,
                 ModuleDim.DecisionActionDim)
             local_action[..., 0] = 0.03
             local_action[..., 1] = torch.linspace(
-                -0.02, 0.02, ModuleDim.DecisionEndpointCount)
+                -0.02, 0.02, morphology.endpoint_count)
             local_action[..., 3] = 0.05
             local_action[..., 4] = -0.03
             local_action[..., 5] = 0.04
             decision = SimpleNamespace(
                 decision_tensor=local_action,
-                gripper_cmd=torch.zeros(B, ModuleDim.ArmCount, 1),
-                gripper_valid=torch.ones(B, dtype=torch.bool),
+                gripper_cmd=torch.zeros(
+                    B, morphology.gripper_count, 1),
+                gripper_valid=torch.ones(
+                    B, morphology.gripper_count, dtype=torch.bool),
                 mode_logits=torch.zeros(B, ModuleDim.ActTypeDim),
                 mode_valid=torch.ones(B, dtype=torch.bool),
-                safety_scores=torch.ones(B, len(SAFETY_MARGIN_NAMES)))
+                safety_scores=torch.ones(B, len(SAFETY_MARGIN_NAMES)),
+                joint_variable_command=torch.zeros(
+                    B, morphology.joint_dof_count),
+                joint_variable_command_mask=(
+                    morphology.joint_variable_commandable.view(
+                        1, -1).expand(B, -1)))
             brain = object.__new__(BrainCore)
             nn.Module.__init__(brain)
-            brain.decision_decoupler = FakeDecoupler()
+            self.ConfigureBrainMorphology(brain, morphology)
+            brain.decision_decoupler = FakeDecoupler(
+                DecisionActionMask(robotMorphology=morphology))
 
             command = BrainCore.MaterializeMotionCommand(
                 brain,
                 decision,
-                current)
-            expected_mask = DecisionActionMask().view(
+                current,
+                torch.ones(
+                    B, morphology.endpoint_count, dtype=torch.bool))
+            expected_mask = DecisionActionMask(
+                robotMorphology=morphology).view(
                 1,
-                ModuleDim.DecisionEndpointCount,
+                morphology.endpoint_count,
                 ModuleDim.DecisionActionDim)
             expected_action = local_action * expected_mask
             expected_target = ApplyPoseDelta(current, expected_action)
@@ -4187,14 +5969,12 @@ class TestAGICoreMTool:
                 risk=torch.zeros(B),
                 confidence=torch.ones(B),
                 precision=torch.ones(B))
-            camera_index = ModuleDim.DecisionCameraEndpointIndex
-            camera_delta = RelativePoseError(
-                current[:, camera_index],
-                command.target_endpoint_pose[:, camera_index])
+            sensor_endpoint_index = morphology.endpoint_names.index(
+                "sensor_mount")
             ok = (
                 tuple(command.decision_tensor.shape) == (
                     B,
-                    ModuleDim.DecisionEndpointCount,
+                    morphology.endpoint_count,
                     ModuleDim.DecisionActionDim)
                 and torch.allclose(
                     command.decision_tensor,
@@ -4206,24 +5986,18 @@ class TestAGICoreMTool:
                     expected_target,
                     atol=1e-6,
                     rtol=1e-6)
-                and command.endpoint_names == tuple(ModuleDim.DecisionEndpointNames)
+                and command.endpoint_names == morphology.endpoint_names
                 and torch.equal(
                     command.decision_dof_mask,
                     expected_mask.expand(B, -1, -1).bool())
                 and torch.allclose(
-                    command.target_endpoint_pose[:, camera_index, :3],
-                    current[:, camera_index, :3],
+                    command.target_endpoint_pose[:, sensor_endpoint_index],
+                    current[:, sensor_endpoint_index],
                     atol=1e-7,
                     rtol=1e-7)
-                and torch.allclose(
-                    camera_delta,
-                    expected_action[:, camera_index],
-                    atol=1e-6,
-                    rtol=1e-6)
                 and torch.count_nonzero(
-                    camera_delta[:, [3, 4, 5]]).item() == 3
-                and torch.count_nonzero(
-                    camera_delta[:, [0, 1, 2]]).item() == 0
+                    command.decision_tensor[:, sensor_endpoint_index]).item()
+                == 0
                 and torch.allclose(
                     rebased.target_endpoint_pose,
                     expected_reachable_target,
@@ -4248,7 +6022,7 @@ class TestAGICoreMTool:
                     rtol=1e-5)
                 and torch.count_nonzero(
                     rebased.decision_tensor[
-                        :, camera_index, [0, 1, 2]]).item() == 0
+                        :, sensor_endpoint_index]).item() == 0
                 and not torch.allclose(
                     rebased.decision_tensor,
                     command.decision_tensor,
@@ -4276,43 +6050,303 @@ class TestAGICoreMTool:
             print(f"AGICore motion-command world boundary error: {e}")
             return False
 
-    def TestEndpointIdentitySurvivesPooling(self) -> bool:
+    def TestObserverMorphologyContract(self) -> bool:
+        try:
+            morphology = self.MakeRobotMorphology(observer=True)
+            no_observer_morphology = self.MakeRobotMorphology(observer=False)
+            brain = object.__new__(BrainCore)
+            nn.Module.__init__(brain)
+            self.ConfigureBrainMorphology(brain, morphology)
+            no_observer_brain = object.__new__(BrainCore)
+            nn.Module.__init__(no_observer_brain)
+            self.ConfigureBrainMorphology(
+                no_observer_brain,
+                no_observer_morphology)
+            B = 2
+            endpoint_pose = torch.zeros(
+                B,
+                morphology.endpoint_count,
+                ModuleDim.DecisionEndpointPoseDim)
+            endpoint_pose[..., 6] = 1.0
+            measured_observer_pose = torch.zeros(
+                B, ModuleDim.DecisionEndpointPoseDim)
+            measured_observer_pose[..., 6] = 1.0
+            measured_observer_pose[..., :3] = torch.tensor([
+                [0.1, -0.2, 0.3],
+                [1.0, 2.0, 3.0]])
+            observer_pose = brain.ObserverPoseWorld(
+                measured_observer_pose,
+                torch.ones(B, dtype=torch.bool))
+            implicit_pose = brain.ObserverPoseWorld(
+                measured_observer_pose,
+                torch.zeros(B, dtype=torch.bool))
+            absent_pose = no_observer_brain.ObserverPoseWorld(
+                measured_observer_pose,
+                torch.ones(B, dtype=torch.bool))
+            base_orientation = torch.tensor([
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 1.0]])
+            gravity = torch.tensor([
+                [0.0, 0.0, -1.0],
+                [0.0, 0.0, -1.0]])
+            absent_reference = (
+                no_observer_brain.ObserverPhysicalReference(
+                    absent_pose,
+                    base_orientation,
+                    gravity,
+                    torch.ones(B, dtype=torch.bool)))
+            decision = torch.zeros(
+                B,
+                morphology.endpoint_count,
+                ModuleDim.RobotControlAxisDim)
+            decision[:, -1, 5] = 0.2
+            observer_decoupler = DecisionDecouplerV2(
+                robotMorphology=morphology)
+            absent_decoupler = DecisionDecouplerV2(
+                robotMorphology=no_observer_morphology)
+            observer_motion = (
+                observer_decoupler.CameraMotionFromDecisionTensor(decision))
+            absent_motion = (
+                absent_decoupler.CameraMotionFromDecisionTensor(decision))
+            identity_pose = torch.zeros_like(absent_pose)
+            identity_pose[..., 6] = 1.0
+            identity_motion = torch.zeros_like(absent_motion)
+            identity_motion[..., 6] = 1.0
+            identity_quaternion = torch.zeros(B, 4)
+            identity_quaternion[..., 3] = 1.0
+            ok = bool(
+                morphology.observer_attachment_kind == "sensor"
+                and morphology.observer_endpoint_index == -1
+                and morphology.observer_control_joint_indices.tolist() == [0]
+                and torch.equal(
+                    observer_pose,
+                    measured_observer_pose)
+                and torch.equal(implicit_pose, identity_pose)
+                and torch.equal(absent_pose, identity_pose)
+                and torch.equal(
+                    absent_reference[:, :4],
+                    identity_quaternion)
+                and torch.equal(
+                    absent_reference[:, 4:7],
+                    gravity)
+                and torch.equal(
+                    absent_reference[:, 7],
+                    torch.ones(B))
+                and torch.equal(absent_motion, identity_motion)
+                and torch.equal(observer_motion, identity_motion))
+            print(
+                "AGICore observer morphology contract "
+                f"{'passed' if ok else 'failed'}.")
+            return ok
+        except Exception as e:
+            print(f"AGICore observer morphology contract error: {e}")
+            return False
+
+    def TestEndpointPermutationEquivariance(self) -> bool:
         try:
             torch.manual_seed(7)
+            descriptor = torch.tensor([
+                [1.0, 0.0, 0.0, 0.25],
+                [0.0, 1.0, 0.0, 0.50],
+                [0.0, 0.0, 1.0, 0.75],
+            ])
             encoder = EndpointPoseEncoder(
                 endpointCount=3,
                 poseDim=7,
                 embedDim=16,
-                hidden=32).eval()
+                hidden=32,
+                endpointDescriptor=descriptor).eval()
             endpoint_pose = torch.zeros(2, 3, 7)
             endpoint_pose[..., 6] = 1.0
             endpoint_pose[:, 0, 0] = 0.25
             endpoint_pose[:, 1, 1] = -0.5
-            original = encoder(endpoint_pose)
+            endpoint_valid = torch.ones(2, 3, dtype=torch.bool)
+            original = encoder(endpoint_pose, endpoint_valid)
             permutation = torch.tensor([1, 0, 2])
-            permuted = encoder(endpoint_pose[:, permutation])
+            permuted_encoder = EndpointPoseEncoder(
+                endpointCount=3,
+                poseDim=7,
+                embedDim=16,
+                hidden=32,
+                endpointDescriptor=descriptor[permutation]).eval()
+            permuted_encoder.load_state_dict(encoder.state_dict())
+            permuted = permuted_encoder(
+                endpoint_pose[:, permutation],
+                endpoint_valid[:, permutation])
             ok = (
                 tuple(original.endpoint_pose_tokens.shape) == (2, 3, 16)
-                and tuple(original.body_pose_feat.shape) == (2, 16)
-                and not torch.allclose(
-                    original.body_pose_feat,
-                    permuted.body_pose_feat,
+                and tuple(original.endpoint_pose_feat.shape) == (2, 16)
+                and torch.allclose(
+                    original.endpoint_pose_feat,
+                    permuted.endpoint_pose_feat,
+                    atol=1e-6,
+                    rtol=1e-5)
+                and torch.allclose(
+                    original.endpoint_pose_tokens[:, permutation],
+                    permuted.endpoint_pose_tokens,
                     atol=1e-6,
                     rtol=1e-5))
-            print(f"AGICore endpoint identity pooling {'passed' if ok else 'failed'}.")
+            print(f"AGICore endpoint permutation equivariance {'passed' if ok else 'failed'}.")
             return bool(ok)
         except Exception as e:
-            print(f"AGICore endpoint identity pooling error: {e}")
+            print(f"AGICore endpoint permutation equivariance error: {e}")
+            return False
+
+    def TestFinalOperatorPermissionFiltersActiveCommand(self) -> bool:
+        try:
+            class FakeDecoupler:
+                def __init__(self, morphology: Any):
+                    self.action_mask = DecisionActionMask(
+                        robotMorphology=morphology).view(
+                        1,
+                        morphology.endpoint_count,
+                        ModuleDim.DecisionActionDim)
+
+                def MaskDecisionTensor(self, value):
+                    return value * self.action_mask
+
+                def MaskJointVariableCommand(self, value, valueMask):
+                    return value * valueMask.to(value.dtype)
+
+                def SafetyScores(
+                    self, value, risk, confidence, precision):
+                    del value
+                    return torch.stack([
+                        torch.ones_like(risk),
+                        torch.ones_like(risk),
+                        1.0 - risk,
+                        confidence,
+                        precision,], dim=-1)
+
+            B, K = 3, 1
+            morphology = self.MakeRobotMorphology()
+            brain = object.__new__(BrainCore)
+            nn.Module.__init__(brain)
+            self.ConfigureBrainMorphology(brain, morphology)
+            brain.decision_decoupler = FakeDecoupler(morphology)
+            operator_logits = torch.full((B, len(OPERATORS)), -1.0)
+            operator_logits[0, OPERATORS.index("observe")] = 1.0
+            operator_logits[1, OPERATORS.index("wait")] = 1.0
+            operator_logits[2, OPERATORS.index("press")] = 1.0
+            grounding = {
+                "referenced_object_probs": torch.ones(B, K),
+                "actuation_reference_confidence": torch.tensor(
+                    [0.0, 0.0, 1.0]),}
+            realm = torch.zeros(B, K, ModuleDim.PstRealmClasses)
+            realm[..., 1] = 1.0
+            physical_state = {"RealmProb": realm}
+            (
+                endpoint_permission,
+                joint_permission,
+                body_allowed,
+                operator_allowed,
+            ) = (
+                brain.BuildFinalOperatorPermission(
+                    operator_logits,
+                    grounding,
+                    physical_state,
+                    torch.ones(
+                        B, morphology.endpoint_count, dtype=torch.bool),
+                    torch.ones(
+                        B, morphology.joint_dof_count, dtype=torch.bool)))
+
+            current = torch.zeros(
+                B,
+                morphology.endpoint_count,
+                ModuleDim.DecisionEndpointPoseDim)
+            current[..., 6] = 1.0
+            action = torch.full(
+                (
+                    B,
+                    morphology.endpoint_count,
+                    ModuleDim.DecisionActionDim),
+                0.02) * DecisionActionMask(
+                    robotMorphology=morphology).view(
+                    1,
+                    morphology.endpoint_count,
+                    ModuleDim.DecisionActionDim)
+            command = MotionCommand(
+                decision_tensor=action,
+                target_endpoint_pose=ApplyPoseDelta(current, action),
+                endpoint_names=morphology.endpoint_names,
+                decision_dof_mask=DecisionActionMask(
+                    robotMorphology=morphology).view(
+                    1,
+                    morphology.endpoint_count,
+                    ModuleDim.DecisionActionDim).expand(B, -1, -1).bool(),
+                gripper_cmd=torch.ones(
+                    B, morphology.gripper_count, 1),
+                gripper_valid=torch.ones(
+                    B, morphology.gripper_count, dtype=torch.bool),
+                mode_logits=torch.ones(B, ModuleDim.ActTypeDim),
+                mode_valid=torch.ones(B, dtype=torch.bool),
+                safety_scores=torch.ones(B, len(SAFETY_MARGIN_NAMES)),
+                safety_names=SAFETY_MARGIN_NAMES,
+                joint_variable_command=torch.ones(
+                    B, morphology.joint_dof_count),
+                joint_variable_command_mask=(
+                    morphology.joint_variable_commandable.view(
+                        1, -1).expand(B, -1).clone()),
+                joint_variable_names=morphology.joint_variable_names)
+            filtered = BrainCore.ApplyMotionCommandPermission(
+                brain,
+                command,
+                current,
+                endpoint_permission,
+                joint_permission,
+                body_allowed,
+                torch.zeros(B),
+                torch.ones(B),
+                torch.ones(B))
+            expected_action = action * endpoint_permission.unsqueeze(-1)
+            expected_gripper_valid = torch.zeros_like(
+                command.gripper_valid)
+            expected_gripper_valid[2] = True
+            expected_joint_mask = torch.zeros(
+                B, morphology.joint_dof_count, dtype=torch.bool)
+            expected_joint_mask[
+                0,
+                morphology.observer_control_joint_indices] = True
+            expected_joint_mask[2] = morphology.joint_variable_commandable
+            ok = bool(
+                body_allowed.tolist() == [False, False, True]
+                and operator_allowed.tolist() == [True, True, True]
+                and torch.equal(filtered.decision_tensor, expected_action)
+                and torch.equal(
+                    filtered.target_endpoint_pose,
+                    ApplyPoseDelta(current, expected_action))
+                and torch.count_nonzero(filtered.decision_tensor[
+                    0]).item() == 0
+                and torch.count_nonzero(
+                    filtered.decision_tensor[1]).item() == 0
+                and torch.equal(
+                    filtered.joint_variable_command_mask,
+                    expected_joint_mask)
+                and torch.equal(
+                    filtered.joint_variable_command,
+                    expected_joint_mask.to(torch.float32))
+                and torch.equal(
+                    filtered.gripper_valid,
+                    expected_gripper_valid)
+                and torch.equal(
+                    filtered.mode_valid,
+                    torch.tensor([False, False, True])))
+            print(
+                "AGICore active-command final operator permission "
+                f"{'passed' if ok else 'failed'}.")
+            return ok
+        except Exception as e:
+            print(
+                "AGICore active-command final operator permission error: "
+                f"{e}")
             return False
 
     def TestEquivalentQuaternionEncoding(self) -> bool:
         try:
             torch.manual_seed(11)
-            encoder = EndpointPoseEncoder(
-                endpointCount=3,
-                poseDim=7,
-                embedDim=16,
-                hidden=32).eval()
+            morphology = self.MakeRobotMorphology()
+            encoder = DecisionDecouplerV2(
+                robotMorphology=morphology).endpoint_pose_encoder.eval()
             endpoint_pose = torch.randn(2, 3, 7)
             endpoint_pose[..., 3:7] = torch.nn.functional.normalize(
                 endpoint_pose[..., 3:7],
@@ -4321,8 +6355,10 @@ class TestAGICoreMTool:
             equivalent_pose[:, 1, 3:7] = -equivalent_pose[:, 1, 3:7]
             normalized = NormalizePose(endpoint_pose)
             equivalent_normalized = NormalizePose(equivalent_pose)
-            original = encoder(endpoint_pose)
-            equivalent = encoder(equivalent_pose)
+            endpoint_valid = torch.ones(
+                2, morphology.endpoint_count, dtype=torch.bool)
+            original = encoder(endpoint_pose, endpoint_valid)
+            equivalent = encoder(equivalent_pose, endpoint_valid)
             canonical_index = normalized[..., 3:7].abs().argmax(dim=-1, keepdim=True)
             canonical_component = torch.gather(
                 normalized[..., 3:7],
@@ -4337,8 +6373,8 @@ class TestAGICoreMTool:
                     atol=1e-6,
                     rtol=1e-5)
                 and torch.allclose(
-                    original.body_pose_feat,
-                    equivalent.body_pose_feat,
+                    original.endpoint_pose_feat,
+                    equivalent.endpoint_pose_feat,
                     atol=1e-6,
                     rtol=1e-5))
             print(f"AGICore equivalent quaternion encoding {'passed' if ok else 'failed'}.")
@@ -4349,6 +6385,7 @@ class TestAGICoreMTool:
 
     def TestWorldRobotPhysicalEncoderOptimizerOwnership(self) -> bool:
         try:
+            morphology = self.MakeRobotMorphology()
             class MinimalBrain(nn.Module):
                 def __init__(self):
                     super().__init__()
@@ -4366,8 +6403,8 @@ class TestAGICoreMTool:
                     self.temporal_gate = nn.Identity()
                     self.critic = nn.Linear(1, 1)
                     self.world = TestAGICoreMTool.MakeRobotPhysicalEncodingWorld(
-                        bodyPoseDim=8,
-                        outDim=4)
+                        outDim=4,
+                        robotMorphology=morphology)
 
                 def ResetHebbianMemory(self):
                     return None
@@ -4386,15 +6423,29 @@ class TestAGICoreMTool:
                 for param in group["params"]}
 
             before = [param.detach().clone() for param in robot_params]
-            body_pose = torch.randn(3, 8)
+            endpoint_pose = torch.randn(
+                3,
+                morphology.endpoint_count,
+                ModuleDim.DecisionEndpointPoseDim)
             physical_reference = torch.randn(
                 3, ModuleDim.RobotPhysicalReferenceDim)
+            physical_reference[:, -1] = 1.0
             target = torch.randn(3, 4)
+            runtime_state = self.RobotPhysicalRuntimeState(
+                morphology,
+                3,
+                endpoint_pose.device,
+                endpoint_pose.dtype)
             agent.opt_world.zero_grad(set_to_none=True)
             loss = torch.nn.functional.mse_loss(
                 brain.world.EncodeRobotPhysicalState(
-                    body_pose,
-                    physical_reference),
+                    endpoint_pose,
+                    physical_reference,
+                    endpointStateValid=torch.ones(
+                        3, morphology.endpoint_count, dtype=torch.bool),
+                    endpointControllable=torch.ones(
+                        3, morphology.endpoint_count, dtype=torch.bool),
+                    **runtime_state),
                 target)
             loss.backward()
             had_grad = any(param.grad is not None for param in robot_params)
@@ -4421,6 +6472,7 @@ class TestAGICoreMTool:
 
     def TestDecisionStructureOptimizerOwnership(self) -> bool:
         try:
+            morphology = self.MakeRobotMorphology()
             class MinimalBrain(nn.Module):
                 def __init__(self):
                     super().__init__()
@@ -4449,8 +6501,10 @@ class TestAGICoreMTool:
                     self.goal_manager = nn.Identity()
                     self.goal_grounding = nn.Identity()
                     self.decision_decoupler = DecisionDecouplerV2(
-                        decisionDim=32)
-                    self.neuro_symbolic = NeuroSymbolicRobotStateEncoder()
+                        decisionDim=32,
+                        robotMorphology=morphology)
+                    self.neuro_symbolic = NeuroSymbolicRobotStateEncoder(
+                        robotMorphology=morphology)
                     self.temporal_gate = nn.Identity()
                     self.critic = nn.Linear(1, 1)
                     self.world = nn.Linear(1, 1)
@@ -4560,6 +6614,7 @@ class TestAGICoreMTool:
         try:
             import io
             from FunctionTools import _TestOnlineBase, _TestOnlineWrapper
+            morphology = self.MakeRobotMorphology()
 
             class DirectHeadBase(_TestOnlineBase):
                 def __init__(self):
@@ -4607,6 +6662,10 @@ class TestAGICoreMTool:
                     super().__init__()
                     self.is_online_learning = True
                     self.calibration_id = "test-calibration"
+                    self.robot_description_id = morphology.description_id
+                    self.robot_model_contract_id = (
+                        morphology.model_contract_id)
+                    self.robot_adapter_id = morphology.adapter_id
                     self.perc = MinimalPerception()
                     self.attn = nn.Identity()
                     self.mem = MinimalMemory()
@@ -4688,6 +6747,7 @@ class TestAGICoreMTool:
             agent.LoadTorchPayload = lambda path: {
                 "schema_version": BRAIN_RUNTIME_SCHEMA_VERSION,
                 "calibration_id": brain.calibration_id,
+                "model_contract_id": brain.robot_model_contract_id,
                 "brain": deployment_state}
             agent.LoadBrainWeights("unused.pth")
             weights_path_ok = (
@@ -4697,17 +6757,24 @@ class TestAGICoreMTool:
 
             sync_calls = 0
             seed_stale_optimizer_state()
+            buffer_state = {
+                name: None
+                for name in BRAIN_RUNTIME_BUFFER_FIELDS}
+            buffer_state["schema_version"] = BRAIN_RUNTIME_SCHEMA_VERSION
             payload = io.BytesIO()
             torch.save({
                 "schema_version": BRAIN_RUNTIME_SCHEMA_VERSION,
                 "calibration_id": brain.calibration_id,
+                "description_id": brain.robot_description_id,
+                "model_contract_id": brain.robot_model_contract_id,
+                "adapter_id": brain.robot_adapter_id,
                 "world_frame_id": "test-world",
                 "batch_size": 1,
                 "online_learning": True,
                 "brain": checkpoint_state,
                 "online_candidates": {
                     "world": source.world.ExportCandidateState()},
-                "buffers": {},
+                "buffers": buffer_state,
                 "world_memory": {"batch_size": 1},
                 "memory_durable": {"batch_size": 1},
                 "rng_py": random.getstate(),
@@ -5056,6 +7123,7 @@ class TestAGICoreMTool:
                 _tracks_by_bi=[])
             brain.neuro_symbolic = SimpleNamespace(
                 ExportPlanState=lambda: {})
+            morphology = self.MakeRobotMorphology()
 
             tensor_state_names = (
                 "prev_mem", "prev_attn", "prev_option_logit", "prev_entropy",
@@ -5075,6 +7143,21 @@ class TestAGICoreMTool:
             for name in tensor_state_names:
                 setattr(brain, name, torch.zeros(1))
             brain.prev_measured_endpoint_valid = torch.tensor([False, True])
+            brain.prev_target_endpoint_controllable = torch.zeros(
+                2, morphology.endpoint_count, dtype=torch.bool)
+            brain.prev_measured_endpoint_state_valid = torch.zeros(
+                2, morphology.endpoint_count, dtype=torch.bool)
+            brain.prev_target_joint_variable_command = torch.zeros(
+                2, morphology.joint_dof_count)
+            brain.prev_target_joint_variable_command_mask = torch.zeros(
+                2, morphology.joint_dof_count, dtype=torch.bool)
+            brain.prev_measured_joint_position = torch.zeros(
+                2, morphology.joint_dof_count)
+            brain.prev_measured_joint_state_valid = torch.zeros(
+                2, morphology.joint_dof_count, dtype=torch.bool)
+            brain.prev_observer_pose_world = torch.zeros(2, 7)
+            brain.prev_observer_pose_world[..., 6] = 1.0
+            brain.prev_observer_pose_valid = torch.tensor([False, True])
             brain.prev_visual_valid = torch.tensor([True, False])
             brain.active_motion_command = None
             brain.prev_visual_state = None
@@ -5153,16 +7236,16 @@ class TestAGICoreMTool:
                 {"value": torch.tensor([[1.0], [2.0]])},
                 done)
 
-            previous_camera = torch.zeros(2, 7)
-            previous_camera[:, 6] = 1.0
-            current_camera = previous_camera.clone()
+            previous_observer = torch.zeros(2, 7)
+            previous_observer[:, 6] = 1.0
+            current_observer = previous_observer.clone()
             sqrt_half = math.sqrt(0.5)
-            current_camera[1, 5] = sqrt_half
-            current_camera[1, 6] = sqrt_half
-            camera_motion = BrainCore.RelativeCameraMotion(
+            current_observer[1, 5] = sqrt_half
+            current_observer[1, 6] = sqrt_half
+            observer_motion = BrainCore.RelativeObserverMotion(
                 brain,
-                previous_camera,
-                current_camera,
+                previous_observer,
+                current_observer,
                 torch.tensor([False, True]))
 
             def visual(value: float) -> VisualState:
@@ -5191,11 +7274,15 @@ class TestAGICoreMTool:
             ok = (
                 torch.equal(cleared["value"], torch.tensor([[0.0], [2.0]]))
                 and torch.equal(
-                    camera_motion[0],
-                    torch.tensor([0.0, 0.0, 0.0, 1.0]))
+                    observer_motion[0],
+                    torch.tensor([
+                        0.0, 0.0, 0.0,
+                        0.0, 0.0, 0.0, 1.0]))
                 and torch.allclose(
-                    camera_motion[1],
-                    torch.tensor([0.0, 0.0, sqrt_half, sqrt_half]))
+                    observer_motion[1],
+                    torch.tensor([
+                        0.0, 0.0, 0.0,
+                        0.0, 0.0, sqrt_half, sqrt_half]))
                 and torch.equal(padding_mask, expected_padding))
             print(f"AGICore partial-batch runtime masking {'passed' if ok else 'failed'}.")
             return bool(ok)
@@ -5221,7 +7308,9 @@ class TestAGICoreMTool:
                 def EncodeRobotPhysicalState(
                     self,
                     bodyEndpointPoseRelative: torch.Tensor,
-                    robotPhysicalReference: torch.Tensor,) -> torch.Tensor:
+                    robotPhysicalReference: torch.Tensor,
+                    **runtimeState: torch.Tensor,) -> torch.Tensor:
+                    del runtimeState
                     return torch.zeros(
                         bodyEndpointPoseRelative.size(0),
                         ModuleDim.PstSlotDim)
@@ -5239,6 +7328,8 @@ class TestAGICoreMTool:
 
             brain = object.__new__(BrainCore)
             nn.Module.__init__(brain)
+            morphology = self.MakeRobotMorphology()
+            self.ConfigureBrainMorphology(brain, morphology)
             brain.device = torch.device("cpu")
             brain.is_online_learning = False
             brain.actor = SimpleNamespace(
@@ -5247,6 +7338,9 @@ class TestAGICoreMTool:
                 u_dim=4,
                 mapper_hidden_dim=5)
             brain.world = BatchAwareWorld()
+            brain.decision_decoupler = DecisionDecouplerV2(
+                decisionDim=ModuleDim.DecisionBeliefDim,
+                robotMorphology=morphology)
             brain.history_len = 2
             brain.need_trace = False
             brain.extra_mem = None
@@ -5257,26 +7351,73 @@ class TestAGICoreMTool:
                 B=2,
                 isOnlineLearning=False,
                 device=brain.device)
-            brain.BuildExecutedActionFeedback = lambda endpointPose: (
-                torch.zeros(3, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionActionDim),
+            brain.BuildExecutedActionFeedback = lambda endpointPose, jointPosition, jointStateValid, endpointStateValid: (
+                torch.zeros(
+                    3,
+                    morphology.endpoint_count,
+                    ModuleDim.DecisionActionDim),
+                torch.zeros(3, morphology.joint_dof_count),
+                torch.zeros(
+                    3, morphology.joint_dof_count, dtype=torch.bool),
                 torch.zeros(3, ModuleDim.EndpointActionEmbedDim))
+            brain.BuildRealizedActionAgencyEvidence = (
+                lambda executedDecisionTensor, executedJointCommand, executedJointMask, measuredFeedback, modelCommandExecuted: (
+                    measuredFeedback,
+                    torch.zeros(
+                        measuredFeedback.size(0),
+                        ModuleDim.EndpointActionEmbedDim)))
 
             endpoint_pose = torch.zeros(
                 3,
-                ModuleDim.RobotStateEndpointCount,
+                morphology.endpoint_count,
                 ModuleDim.DecisionEndpointPoseDim)
             endpoint_pose[..., 6] = 1.0
             planner_expected = endpoint_pose[
-                :, ModuleDim.RobotStateControlledEndpointSlice].clone()
+                :, :].clone()
             robot_state = {
+                "joint_position": torch.zeros(
+                    3, morphology.joint_dof_count),
+                "joint_velocity": torch.zeros(
+                    3, morphology.joint_dof_count),
+                "joint_effort": torch.zeros(
+                    3, morphology.joint_dof_count),
+                "joint_observed": torch.ones(
+                    3, morphology.joint_dof_count, dtype=torch.bool),
+                "joint_healthy": torch.ones(
+                    3, morphology.joint_dof_count, dtype=torch.bool),
+                "joint_controllable": morphology.joint_variable_commandable.view(
+                    1, -1).expand(3, -1),
+                "node_pose_world": torch.cat([
+                    torch.zeros(3, morphology.node_count, 6),
+                    torch.ones(3, morphology.node_count, 1)], dim=-1),
+                "node_twist_world": torch.zeros(
+                    3, morphology.node_count, 6),
+                "node_observed": torch.ones(
+                    3, morphology.node_count, dtype=torch.bool),
+                "node_healthy": torch.ones(
+                    3, morphology.node_count, dtype=torch.bool),
                 "endpoint_pose": endpoint_pose,
+                "endpoint_observed": torch.ones(
+                    3, morphology.endpoint_count, dtype=torch.bool),
+                "endpoint_healthy": torch.ones(
+                    3, morphology.endpoint_count, dtype=torch.bool),
+                "endpoint_controllable": morphology.endpoint_task_mask.any(
+                    dim=-1).view(1, -1).expand(3, -1),
+                "observer_pose_world": torch.cat([
+                    torch.zeros(3, 6),
+                    torch.ones(3, 1)], dim=-1),
+                "observer_pose_valid": torch.ones(3, dtype=torch.bool),
                 "base_orientation_world": endpoint_pose[:, 0, 3:7].clone(),
                 "gravity_direction_world": torch.tensor(
                     [[0.0, 0.0, -1.0]]).expand(3, -1).clone(),
                 "planner_expected_endpoint_pose": planner_expected,
                 "model_command_executed": torch.zeros(3),
                 "executed_action_id": torch.zeros(3, dtype=torch.long),
-                "planner_executing": torch.zeros(3),}
+                "planner_progress": torch.zeros(3),
+                "planner_tracking_error": torch.zeros(3),
+                "planner_executing": torch.zeros(3),
+                "planner_reached": torch.zeros(3),
+                "planner_failed": torch.zeros(3),}
             request = BrainStepInput(
                 frame=torch.zeros(3, 3, 1, 1),
                 text_ext=None,
@@ -5327,7 +7468,7 @@ class TestAGICoreMTool:
                 def StepPriorOnly(self, *args, **kwargs):
                     raise AssertionError("preview bypassed the online wrapper")
 
-                def ExportWorldMemoryBank(self, topk):
+                def ExportConsciousBank(self, topk):
                     self.memory_exports += 1
                     return {"topk": torch.tensor(topk)}
 
@@ -5377,9 +7518,10 @@ class TestAGICoreMTool:
                 actionEnc=endpoint_action,
                 robotPhysicalState=world_robot_physical_encoding,
                 cameraMotion=torch.tensor([
-                    [0.0, 0.0, 0.0, 1.0],
-                    [0.0, 0.0, 0.0, 1.0]]))
-            bank = BrainCore.ExportRuntimeWorldMemoryBank(brain, topk=5)
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]]),
+                observerMotionValid=torch.ones(2, dtype=torch.bool))
+            bank = BrainCore.ExportRuntimeWorldConsciousBank(brain, topk=5)
             posterior_physical_state = {
                 "SlotPresence": torch.ones(2, 1)}
             transition_physical_state = {
@@ -5396,8 +7538,9 @@ class TestAGICoreMTool:
                 transitionRobotPhysicalState=(
                     transition_robot_physical_encoding),
                 cameraMotion=torch.tensor([
-                    [0.0, 0.0, 0.0, 1.0],
-                    [0.0, 0.0, 0.0, 1.0]]),
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]]),
+                observerMotionValid=torch.ones(2, dtype=torch.bool),
                 reward=torch.zeros(2),
                 done=torch.zeros(2))
             kwargs = brain.world.forward_kwargs
@@ -5486,8 +7629,9 @@ class TestAGICoreMTool:
                 actionEnc=torch.zeros(2, 1),
                 robotPhysicalState=torch.zeros(2, 1),
                 cameraMotion=torch.tensor([
-                    [0.0, 0.0, 0.0, 1.0],
-                    [0.0, 0.0, 0.0, 1.0]]),
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]]),
+                observerMotionValid=torch.ones(2, dtype=torch.bool),
                 targetVisualState=object(),
                 precision=torch.ones(2),
                 aliveMask=torch.tensor([False, True]))
@@ -5531,8 +7675,9 @@ class TestAGICoreMTool:
             measured_action = torch.tensor([[4.0, 5.0], [6.0, 7.0]])
             robot = torch.full((2, 6), 8.0)
             camera_motion = torch.tensor([
-                [0.2, 0.0, 0.0, 0.9797959],
-                [0.0, 0.3, 0.0, 0.9539392]])
+                [0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.9797959],
+                [0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.9539392]])
+            observer_motion_valid = torch.tensor([True, False])
             realized = BrainCore.BuildRealizedVisualPrior(
                 brain,
                 prevWorldH=h,
@@ -5542,6 +7687,7 @@ class TestAGICoreMTool:
                 measuredActionEnc=measured_action,
                 transitionRobotPhysicalState=robot,
                 cameraMotion=camera_motion,
+                observerMotionValid=observer_motion_valid,
                 transitionValid=torch.tensor([True, False]))
             top_down = BrainCore.BuildTopDownContext(brain, realized)
             args, kwargs = brain.world.calls[0]
@@ -5554,6 +7700,7 @@ class TestAGICoreMTool:
                 measuredActionEnc=measured_action,
                 transitionRobotPhysicalState=robot,
                 cameraMotion=camera_motion,
+                observerMotionValid=observer_motion_valid,
                 transitionValid=torch.tensor([False, False]))
             ok = (
                 len(brain.world.calls) == 1
@@ -5579,65 +7726,92 @@ class TestAGICoreMTool:
 
     def TestExecutedFeedbackUsesMeasuredTransition(self) -> bool:
         try:
-            class FakeDecoupler:
-                def __init__(self):
-                    self.action_mask = DecisionActionMask().view(
-                        1,
-                        ModuleDim.DecisionEndpointCount,
-                        ModuleDim.DecisionActionDim)
-
-                def MaskDecisionTensor(self, decisionTensor):
-                    return decisionTensor * self.action_mask
-
-                def EncodeEndpointAction(self, decisionTensor):
-                    return FlattenActiveDecisionTensor(decisionTensor)
-
             brain = object.__new__(BrainCore)
             nn.Module.__init__(brain)
-            brain.decision_decoupler = FakeDecoupler()
+            morphology = self.MakeRobotMorphology()
+            self.ConfigureBrainMorphology(brain, morphology)
+            brain.decision_decoupler = DecisionDecouplerV2(
+                robotMorphology=morphology).eval()
             B = 2
-            previous = torch.zeros(B, ModuleDim.RobotStateEndpointCount, ModuleDim.DecisionEndpointPoseDim)
+            previous = torch.zeros(
+                B,
+                morphology.endpoint_count,
+                ModuleDim.DecisionEndpointPoseDim)
             previous[..., 6] = 1.0
             measured_delta = torch.zeros(
                 B,
-                ModuleDim.DecisionEndpointCount,
+                morphology.endpoint_count,
                 ModuleDim.DecisionActionDim)
-            measured_delta[1, :, 0] = torch.linspace(
-                0.01,
-                0.13,
-                ModuleDim.DecisionEndpointCount)
-            measured_delta[1, :, 1] = -0.02
-            measured_delta[1, :, 2] = 0.03
-            measured_delta[1, :, 3] = 0.04
-            measured_delta[1, :, 4] = -0.03
             measured_delta[1, :, 5] = 0.06
             current = ApplyPoseDelta(previous, measured_delta)
             brain.prev_measured_endpoint_pose = previous
             brain.prev_measured_endpoint_valid = torch.tensor([False, True])
-            brain.prev_target_endpoint_pose = previous[
-                :, ModuleDim.RobotStateControlledEndpointSlice].clone()
+            brain.prev_measured_endpoint_state_valid = torch.tensor([
+                [False] * morphology.endpoint_count,
+                [True] * morphology.endpoint_count,
+            ], dtype=torch.bool)
+            previous_joint = torch.zeros(B, morphology.joint_dof_count)
+            current_joint = previous_joint.clone()
+            current_joint[1] = torch.tensor([0.20, -0.10, 0.05])
+            brain.prev_measured_joint_position = previous_joint
+            brain.prev_measured_joint_state_valid = torch.tensor([
+                [False] * morphology.joint_dof_count,
+                [True] * morphology.joint_dof_count,
+            ], dtype=torch.bool)
+            brain.prev_target_endpoint_pose = previous.clone()
             brain.prev_target_endpoint_pose[:, :, 1] = 100.0
 
-            delta0, feedback0 = BrainCore.BuildExecutedActionFeedback(brain, current)
+            current_valid = torch.ones(
+                B, morphology.endpoint_count, dtype=torch.bool)
+            current_joint_valid = torch.ones(
+                B, morphology.joint_dof_count, dtype=torch.bool)
+            delta0, joint_delta0, joint_mask0, feedback0 = (
+                BrainCore.BuildExecutedActionFeedback(
+                    brain,
+                    current,
+                    current_joint,
+                    current_joint_valid,
+                    current_valid))
             brain.prev_target_endpoint_pose[:, :, 2] = -100.0
-            delta1, feedback1 = BrainCore.BuildExecutedActionFeedback(brain, current)
+            delta1, joint_delta1, joint_mask1, feedback1 = (
+                BrainCore.BuildExecutedActionFeedback(
+                    brain,
+                    current,
+                    current_joint,
+                    current_joint_valid,
+                    current_valid))
             raw_measured_delta = RelativePoseError(previous, current)
             expected_delta = (
                 raw_measured_delta
-                * DecisionActionMask().view(
+                * DecisionActionMask(
+                    robotMorphology=morphology).view(
                     1,
-                    ModuleDim.DecisionEndpointCount,
+                    morphology.endpoint_count,
                     ModuleDim.DecisionActionDim))
             expected_delta[0] = 0.0
-            camera_index = ModuleDim.DecisionCameraEndpointIndex
+            expected_joint_mask = brain.prev_measured_joint_state_valid
+            expected_joint_delta = (
+                brain.decision_decoupler.NormalizeMeasuredJointDelta(
+                    previous_joint,
+                    current_joint,
+                    expected_joint_mask))
+            expected_feedback = brain.decision_decoupler.EncodeMeasuredAction(
+                expected_delta,
+                expected_joint_delta,
+                expected_joint_mask)
+            expected_feedback[0] = 0.0
+            camera_joint_index = int(
+                morphology.observer_control_joint_indices[0].item())
+            sensor_endpoint_index = morphology.endpoint_names.index(
+                "sensor_mount")
             ok = (
                 tuple(delta0.shape) == (
                     B,
-                    ModuleDim.DecisionEndpointCount,
+                    morphology.endpoint_count,
                     ModuleDim.DecisionActionDim)
                 and tuple(feedback0.shape) == (
                     B,
-                    ModuleDim.DecisionActiveDofCount)
+                    ModuleDim.EndpointActionEmbedDim)
                 and torch.count_nonzero(delta0[0]).item() == 0
                 and torch.count_nonzero(feedback0[0]).item() == 0
                 and torch.allclose(
@@ -5647,23 +7821,23 @@ class TestAGICoreMTool:
                     rtol=1e-6)
                 and torch.allclose(
                     feedback0,
-                    FlattenActiveDecisionTensor(expected_delta),
+                    expected_feedback,
                     atol=1e-6,
                     rtol=1e-6)
+                and torch.count_nonzero(
+                    delta0[1, sensor_endpoint_index]).item() == 0
+                and torch.count_nonzero(
+                    delta0[1, 1:, 5]).item() == 2
+                and torch.equal(joint_mask0, expected_joint_mask)
                 and torch.allclose(
-                    delta0[
-                        1,
-                        :ModuleDim.DecisionBodyEndpointCount],
-                    raw_measured_delta[
-                        1,
-                        :ModuleDim.DecisionBodyEndpointCount],
+                    joint_delta0,
+                    expected_joint_delta,
                     atol=1e-6,
                     rtol=1e-6)
-                and torch.count_nonzero(
-                    delta0[1, camera_index, [0, 1, 2]]).item() == 0
-                and torch.count_nonzero(
-                    delta0[1, camera_index, [3, 4, 5]]).item() == 3
+                and float(joint_delta0[1, camera_joint_index].abs().item()) > 0.0
                 and torch.equal(delta0, delta1)
+                and torch.equal(joint_delta0, joint_delta1)
+                and torch.equal(joint_mask0, joint_mask1)
                 and torch.equal(feedback0, feedback1))
             print(f"AGICore measured executed feedback {'passed' if ok else 'failed'}.")
             return bool(ok)
@@ -5675,6 +7849,8 @@ class TestAGICoreMTool:
         try:
             brain = object.__new__(BrainCore)
             nn.Module.__init__(brain)
+            morphology = self.MakeRobotMorphology()
+            self.ConfigureBrainMorphology(brain, morphology)
             B = 2
 
             def feature(width: int):
@@ -5705,36 +7881,70 @@ class TestAGICoreMTool:
             brain.temporal_action_epoch = torch.tensor([1, 2])
             brain.temporal_active_kind = torch.tensor([1, 2])
             brain.temporal_invoke_drift = torch.tensor([1.0, 2.0])
-            pose = torch.zeros(B, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim)
+            pose = torch.zeros(
+                B,
+                morphology.endpoint_count,
+                ModuleDim.DecisionEndpointPoseDim)
             pose[..., 0] = torch.tensor([1.0, 2.0]).view(B, 1)
             pose[..., 6] = 1.0
             brain.prev_target_endpoint_pose = pose.clone()
             brain.prev_target_endpoint_valid = torch.tensor([True, True])
+            brain.prev_target_endpoint_controllable = (
+                morphology.endpoint_task_mask.any(dim=-1).view(
+                    1, -1).expand(B, -1).clone())
             measured_pose = torch.zeros(
                 B,
-                ModuleDim.RobotStateEndpointCount,
+                morphology.endpoint_count,
                 ModuleDim.DecisionEndpointPoseDim)
             measured_pose[..., 0] = torch.tensor([1.0, 2.0]).view(B, 1)
             measured_pose[..., 6] = 1.0
             brain.prev_measured_endpoint_pose = measured_pose
             brain.prev_measured_endpoint_valid = torch.tensor([True, True])
+            brain.prev_measured_endpoint_state_valid = torch.ones(
+                B, morphology.endpoint_count, dtype=torch.bool)
+            brain.prev_target_joint_variable_command = feature(
+                morphology.joint_dof_count)
+            brain.prev_target_joint_variable_command_mask = (
+                morphology.joint_variable_commandable.view(
+                    1, -1).expand(B, -1).clone())
+            brain.prev_measured_joint_position = feature(
+                morphology.joint_dof_count)
+            brain.prev_measured_joint_state_valid = torch.ones(
+                B, morphology.joint_dof_count, dtype=torch.bool)
+            brain.prev_observer_pose_world = torch.zeros(
+                B, ModuleDim.DecisionEndpointPoseDim)
+            brain.prev_observer_pose_world[..., 6] = 1.0
+            brain.prev_observer_pose_valid = torch.tensor([True, True])
             action = torch.stack([
-                torch.ones(ModuleDim.DecisionEndpointCount, ModuleDim.DecisionActionDim),
-                torch.full((ModuleDim.DecisionEndpointCount, ModuleDim.DecisionActionDim), 2.0)])
+                torch.ones(
+                    morphology.endpoint_count,
+                    ModuleDim.DecisionActionDim),
+                torch.full((
+                    morphology.endpoint_count,
+                    ModuleDim.DecisionActionDim), 2.0)])
             brain.active_motion_command = MotionCommand(
                 decision_tensor=action,
                 target_endpoint_pose=pose.clone(),
-                endpoint_names=ModuleDim.DecisionEndpointNames,
-                decision_dof_mask=DecisionActionMask().view(
+                endpoint_names=morphology.endpoint_names,
+                decision_dof_mask=DecisionActionMask(
+                    robotMorphology=morphology).view(
                     1,
-                    ModuleDim.DecisionEndpointCount,
+                    morphology.endpoint_count,
                     ModuleDim.DecisionActionDim).expand(B, -1, -1).bool(),
-                gripper_cmd=feature(ModuleDim.ArmCount).unsqueeze(-1),
-                gripper_valid=torch.tensor([True, True]),
+                gripper_cmd=feature(
+                    morphology.gripper_count).unsqueeze(-1),
+                gripper_valid=torch.ones(
+                    B, morphology.gripper_count, dtype=torch.bool),
                 mode_logits=feature(ModuleDim.ActTypeDim),
                 mode_valid=torch.tensor([True, True]),
                 safety_scores=feature(5),
-                safety_names=SAFETY_MARGIN_NAMES)
+                safety_names=SAFETY_MARGIN_NAMES,
+                joint_variable_command=feature(
+                    morphology.joint_dof_count),
+                joint_variable_command_mask=(
+                    morphology.joint_variable_commandable.view(
+                        1, -1).expand(B, -1).clone()),
+                joint_variable_names=morphology.joint_variable_names)
 
             BrainCore.ResetDecisionRuntimeRows(brain, torch.tensor([True, False]))
             row_fields = [
@@ -5766,8 +7976,14 @@ class TestAGICoreMTool:
             ok &= brain.prev_measured_endpoint_valid.tolist() == [False, True]
             ok &= torch.count_nonzero(brain.prev_target_endpoint_pose[0, :, :6]).item() == 0
             ok &= torch.all(brain.prev_target_endpoint_pose[0, :, 6] == 1.0).item()
+            ok &= torch.count_nonzero(
+                brain.prev_target_joint_variable_command[0]).item() == 0
+            ok &= torch.count_nonzero(
+                brain.prev_measured_joint_position[0]).item() == 0
             ok &= torch.count_nonzero(brain.active_motion_command.decision_tensor[0]).item() == 0
             ok &= torch.count_nonzero(brain.active_motion_command.decision_tensor[1]).item() > 0
+            ok &= torch.count_nonzero(
+                brain.active_motion_command.joint_variable_command[0]).item() == 0
             print(f"AGICore decision partial-done reset {'passed' if ok else 'failed'}.")
             return bool(ok)
         except Exception as e:
@@ -5777,28 +7993,43 @@ class TestAGICoreMTool:
     def TestDecisionJsonWireContract(self) -> bool:
         try:
             B = 1
+            morphology = self.MakeRobotMorphology()
+            brain = object.__new__(BrainCore)
+            nn.Module.__init__(brain)
+            self.ConfigureBrainMorphology(brain, morphology)
+            agent = object.__new__(Agent)
+            agent.brain = brain
             pose = torch.zeros(
                 B,
-                ModuleDim.DecisionEndpointCount,
+                morphology.endpoint_count,
                 ModuleDim.DecisionEndpointPoseDim)
             pose[..., 6] = 1.0
             command = MotionCommand(
                 decision_tensor=torch.zeros(
                     B,
-                    ModuleDim.DecisionEndpointCount,
+                    morphology.endpoint_count,
                     ModuleDim.DecisionActionDim),
                 target_endpoint_pose=pose,
-                endpoint_names=ModuleDim.DecisionEndpointNames,
-                decision_dof_mask=DecisionActionMask().view(
+                endpoint_names=morphology.endpoint_names,
+                decision_dof_mask=DecisionActionMask(
+                    robotMorphology=morphology).view(
                     1,
-                    ModuleDim.DecisionEndpointCount,
+                    morphology.endpoint_count,
                     ModuleDim.DecisionActionDim).expand(B, -1, -1).bool(),
-                gripper_cmd=torch.full((B, ModuleDim.ArmCount, 1), 0.5),
-                gripper_valid=torch.zeros(B, dtype=torch.bool),
+                gripper_cmd=torch.full(
+                    (B, morphology.gripper_count, 1), 0.5),
+                gripper_valid=torch.ones(
+                    B, morphology.gripper_count, dtype=torch.bool),
                 mode_logits=torch.zeros(B, ModuleDim.ActTypeDim),
                 mode_valid=torch.zeros(B, dtype=torch.bool),
                 safety_scores=torch.ones(B, len(SAFETY_MARGIN_NAMES)),
-                safety_names=SAFETY_MARGIN_NAMES)
+                safety_names=SAFETY_MARGIN_NAMES,
+                joint_variable_command=torch.zeros(
+                    B, morphology.joint_dof_count),
+                joint_variable_command_mask=(
+                    morphology.joint_variable_commandable.view(
+                        1, -1).expand(B, -1)),
+                joint_variable_names=morphology.joint_variable_names)
             execution_scores = torch.zeros(B, ModuleDim.TemporalPrimitiveCount)
             execution_scores[:, CONTINUE] = -torch.inf
             envelope = TemporalDecisionEnvelope(
@@ -5836,7 +8067,7 @@ class TestAGICoreMTool:
                 "temporal_context": SimpleNamespace(
                     action_age_steps=torch.tensor([2])),}
             packed = Agent.UnpackActPacked(
-                object.__new__(Agent),
+                agent,
                 AgentActOutput(
                     motion_command=command,
                     temporal_envelope=envelope,
@@ -5850,6 +8081,9 @@ class TestAGICoreMTool:
                     "frame_id": "frame-0007",
                     "calibration_id": "test-calibration",
                     "world_frame_id": "test-world",
+                    "description_id": morphology.description_id,
+                    "model_contract_id": morphology.model_contract_id,
+                    "adapter_id": morphology.adapter_id,
                 })
             parsed = json.loads(packed)
             temporal = parsed["temporal_envelope"]
@@ -5869,13 +8103,12 @@ class TestAGICoreMTool:
                 and contract["hardware_validation"] == "not_performed"
                 and contract["external_validation_required"] is True
                 and contract["continue_renews_timeout"] is False
-                and all(
-                    all(endpoint_mask)
-                    for endpoint_mask in decision_dof_mask[
-                        :ModuleDim.DecisionBodyEndpointCount])
-                and decision_dof_mask[
-                    ModuleDim.DecisionCameraEndpointIndex] == [
-                        False, False, False, True, True, True]
+                and decision_dof_mask == morphology.endpoint_task_mask[
+                    :morphology.endpoint_count].tolist()
+                and parsed["motion_command"]["endpoint_names"]
+                == list(morphology.endpoint_names)
+                and parsed["motion_command"]["gripper_names"]
+                == list(morphology.gripper_names)
                 and temporal["execution_kind_scores"][CONTINUE] is None
                 and temporal["execution_kind_legal"][CONTINUE] is False
                 and temporal["action_age_steps"] == 2
@@ -5988,19 +8221,137 @@ class TestAGICoreMTool:
             actual = target.world.adapter(sample).detach()
             ok = (
                 all(".base." not in name for name in canonical)
-                and any(name.startswith("world.adapter.A_list.") for name in canonical)
-                and torch.allclose(actual, expected, atol=1e-7, rtol=1e-6))
+                and any(
+                    name.startswith("world.adapter.A_list.")
+                    for name in canonical)
+                and torch.allclose(
+                    actual,
+                    expected,
+                    atol=1e-7,
+                    rtol=1e-6))
             print(f"AGICore canonical deployment state {'passed' if ok else 'failed'}.")
             return bool(ok)
         except Exception as e:
             print(f"AGICore canonical deployment state error: {e}")
             return False
 
+    def TestAgentWorldTextArtifactRoundTrip(self) -> bool:
+        try:
+            morphology = self.MakeRobotMorphology()
+
+            class ArtifactWorld(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self._use_memory = False
+                    self._mem_path = None
+                    self.entity_id = torch.tensor([[41, 73]], dtype=torch.long)
+                    self.text_semantic = torch.zeros(1, 2, 8)
+                    self.text_semantic[0, 0, 3] = 1.0
+                    self.text_confidence = torch.tensor([[0.91, 0.0]])
+                    self.text_revision = torch.tensor([[5, 0]], dtype=torch.long)
+
+                def ExportMemoryPayload(self):
+                    return {
+                        "batch_size": 1,
+                        "entity_id": self.entity_id.detach().cpu().clone(),
+                        "text_semantic": self.text_semantic.detach().cpu().clone(),
+                        "text_confidence": self.text_confidence.detach().cpu().clone(),
+                        "text_revision": self.text_revision.detach().cpu().clone(),}
+
+                def ImportMemoryPayload(self, state, *, batchSize):
+                    if (
+                        type(state) is not dict
+                        or set(state) != {
+                            "batch_size",
+                            "entity_id",
+                            "text_semantic",
+                            "text_confidence",
+                            "text_revision",}
+                        or state["batch_size"] != batchSize
+                        or state["entity_id"].dtype != torch.long
+                        or state["text_revision"].dtype != torch.long
+                        or tuple(state["entity_id"].shape) != (batchSize, 2)
+                        or tuple(state["text_semantic"].shape) != (batchSize, 2, 8)
+                        or tuple(state["text_confidence"].shape) != (batchSize, 2)
+                        or tuple(state["text_revision"].shape) != (batchSize, 2)
+                    ):
+                        raise ValueError("invalid test World memory")
+                    self.entity_id = state["entity_id"].clone()
+                    self.text_semantic = state["text_semantic"].clone()
+                    self.text_confidence = state["text_confidence"].clone()
+                    self.text_revision = state["text_revision"].clone()
+
+            class ArtifactBrain(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.is_online_learning = False
+                    self.calibration_id = "test-calibration"
+                    self.robot_description_id = morphology.description_id
+                    self.robot_model_contract_id = morphology.model_contract_id
+                    self.robot_adapter_id = morphology.adapter_id
+                    self.world = ArtifactWorld()
+
+                def ResetHebbianMemory(self):
+                    return None
+
+            source_brain = ArtifactBrain()
+            target_brain = ArtifactBrain()
+            target_brain.world.entity_id.fill_(-1)
+            target_brain.world.text_semantic.zero_()
+            target_brain.world.text_confidence.zero_()
+            target_brain.world.text_revision.zero_()
+            source_agent = Agent(source_brain, isTrain=False, device="cpu")
+            target_agent = Agent(target_brain, isTrain=False, device="cpu")
+            source_agent.world_frame_id = "test-world"
+            source_agent.world_memory_batch_size = 1
+            target_agent.world_frame_id = "test-world"
+            target_agent.world_memory_batch_size = 1
+
+            with tempfile.TemporaryDirectory() as directory:
+                artifact_path = os.path.join(directory, "world.pt")
+                malformed_path = os.path.join(directory, "world-bad.pt")
+                source_agent.SaveWorldMemory(artifact_path)
+                target_agent.LoadWorldMemory(artifact_path)
+                restored = (
+                    torch.equal(
+                        target_brain.world.entity_id,
+                        source_brain.world.entity_id)
+                    and torch.equal(
+                        target_brain.world.text_semantic,
+                        source_brain.world.text_semantic)
+                    and torch.equal(
+                        target_brain.world.text_confidence,
+                        source_brain.world.text_confidence)
+                    and torch.equal(
+                        target_brain.world.text_revision,
+                        source_brain.world.text_revision))
+                malformed = torch.load(
+                    artifact_path,
+                    map_location="cpu",
+                    weights_only=False)
+                malformed["adapter_id"] = "wrong-adapter"
+                torch.save(malformed, malformed_path)
+                before = target_brain.world.text_semantic.clone()
+                rejected = False
+                try:
+                    target_agent.LoadWorldMemory(malformed_path)
+                except ValueError:
+                    rejected = True
+                atomic = (
+                    rejected
+                    and torch.equal(
+                        target_brain.world.text_semantic,
+                        before))
+            ok = restored and atomic
+            print(f"AGICore World entity-text artifact {'passed' if ok else 'failed'}.")
+            return bool(ok)
+        except Exception as e:
+            print(f"AGICore World entity-text artifact error: {e}")
+            return False
     def TestWorldMemoryBindingIsDeferredUntilWorldFrame(self) -> bool:
         try:
-            import tempfile
-
             events = []
+            morphology = self.MakeRobotMorphology()
 
             class MemoryWorld(nn.Module):
                 def __init__(self):
@@ -6013,20 +8364,22 @@ class TestAGICoreMTool:
                 def BindMemoryContext(self, calibrationId, worldFrameId):
                     events.append(("bind", calibrationId, worldFrameId))
 
-                def SaveMemory(self, path):
-                    events.append(("save", path))
-
-                def LoadMemory(self, path, *, batchSize, mapLocation=None):
-                    events.append(("load", path, batchSize, mapLocation))
-
                 def EnsureB(self, batchSize):
                     events.append(("ensure", batchSize))
+
+                def ExportMemoryPayload(self):
+                    events.append(("world_export",))
+                    return {"batch_size": 1}
 
             class MinimalBrain(nn.Module):
                 def __init__(self):
                     super().__init__()
                     self.calibration_id = "test-calibration"
+                    self.robot_description_id = morphology.description_id
+                    self.robot_model_contract_id = morphology.model_contract_id
+                    self.robot_adapter_id = morphology.adapter_id
                     self.is_online_learning = False
+                    self.buf_B = 1
                     self.world = MemoryWorld()
 
                 def ResetHebbianMemory(self):
@@ -6052,20 +8405,144 @@ class TestAGICoreMTool:
                     agent.BindWorldMemoryContext("other-world", batchSize=1)
                 except RuntimeError:
                     different_world_rejected = True
-
             ok = (
                 deferred
                 and events == [
                     ("bind", "test-calibration", "test-world"),
                     ("ensure", 1),
-                    ("save", path),
-                ]
+                    ("world_export",),]
                 and different_batch_rejected
                 and different_world_rejected)
             print(f"AGICore deferred world-memory binding {'passed' if ok else 'failed'}.")
             return bool(ok)
         except Exception as e:
             print(f"AGICore deferred world-memory binding error: {e}")
+            return False
+    def TestWorldAutosaveAcknowledgesOnlyAfterCommit(self) -> bool:
+        try:
+            class AutosaveWorld:
+                def __init__(self):
+                    self.pending = True
+
+                def HasMemoryAutosaveRequest(self):
+                    return self.pending
+
+                def AcknowledgeMemoryAutosaveRequest(self):
+                    self.pending = False
+
+            world = AutosaveWorld()
+            agent = Agent.__new__(Agent)
+            agent.wm_mem_path = "world.pt"
+            agent.GetRuntimeWorld = lambda: world
+            attempts = []
+
+            def fail_save(path):
+                attempts.append(("failure", path))
+                raise OSError("injected save failure")
+
+            agent.SaveWorldMemory = fail_save
+            failed = False
+            try:
+                agent.CommitPendingWorldAutosave()
+            except OSError:
+                failed = True
+            retained = world.pending
+
+            def successful_save(path):
+                attempts.append(("success", path))
+
+            agent.SaveWorldMemory = successful_save
+            agent.CommitPendingWorldAutosave()
+            cleared = not world.pending
+            agent.CommitPendingWorldAutosave()
+            ok = (
+                failed
+                and retained
+                and cleared
+                and attempts == [
+                    ("failure", "world.pt"),
+                    ("success", "world.pt"),])
+            print(
+                "AGICore transactional world autosave "
+                f"{'passed' if ok else 'failed'}.")
+            return bool(ok)
+        except Exception as e:
+            print(f"AGICore transactional world-text autosave error: {e}")
+            return False
+
+    def TestOcrTextUpdatesMatchedWorldEntity(self) -> bool:
+        try:
+            class FakeIntention:
+                def EncodeStringsWithSlots(self, texts, device):
+                    semantic = torch.zeros(len(texts), 512, device=device)
+                    semantic[:, 7] = 1.0
+                    return semantic, None, None
+
+            brain = object.__new__(BrainCore)
+            nn.Module.__init__(brain)
+            brain.intention = FakeIntention()
+            observed_pst = {
+                "BBox2D": torch.tensor([[[
+                    0.10, 0.10, 0.60, 0.60], [
+                    0.70, 0.70, 0.95, 0.95]]]),
+                "PerceptualPresence": torch.ones(1, 2),}
+            persistent_pst = {
+                "EntityTextSemantic": torch.zeros(1, 3, 512),
+                "EntityTextConfidence": torch.zeros(1, 3),
+                "EntityTextRevision": torch.zeros(1, 3, dtype=torch.long),}
+            associations = {
+                "ObservedToWorldSlot": torch.tensor([[1, -1]]),
+                "WorldEntityId": torch.tensor([[101, 202, 303]]),
+                "WorldSlotGeneration": torch.tensor([[4, 5, 6]]),}
+            observed, world = BrainCore.BindOcrToWorldEntities(
+                brain,
+                [[
+                    {
+                        "text": "matched",
+                        "box": [20.0, 20.0, 30.0, 30.0],
+                        "score": 0.9,},
+                    {
+                        "text": "unmatched",
+                        "box": [80.0, 80.0, 90.0, 90.0],
+                        "score": 1.0,},]],
+                observed_pst,
+                persistent_pst,
+                associations,
+                imageHeight=100,
+                imageWidth=100,
+                fresh=True)
+            ok = bool(
+                torch.count_nonzero(
+                    world["EntityTextSemantic"][0, 1]).item() == 1
+                and float(
+                    world["EntityTextSemantic"][0, 1, 7].item()) == 1.0
+                and float(
+                    world["EntityTextConfidence"][0, 1].item()) > 0.0
+                and int(world["EntityTextRevision"][0, 1].item()) == 1
+                and bool(world["EntityTextChanged"][0, 1].item())
+                and torch.count_nonzero(
+                    world["EntityTextSemantic"][0, [0, 2]]).item() == 0
+                and torch.count_nonzero(
+                    world["EntityTextConfidence"][0, [0, 2]]).item() == 0
+                and torch.count_nonzero(
+                    world["EntityTextRevision"][0, [0, 2]]).item() == 0
+                and int(observed["EntityId"][0, 0].item()) == 202
+                and torch.equal(
+                    observed["EntityTextSemantic"][0, 0],
+                    world["EntityTextSemantic"][0, 1])
+                and int(observed["EntityId"][0, 1].item()) == -1
+                and torch.count_nonzero(
+                    observed["EntityTextSemantic"][0, 1]).item() == 0
+                and not any(
+                    "entity" in name and "state" in name
+                    for name in BRAIN_RUNTIME_BUFFER_FIELDS)
+                and not any("binder" in name for name in vars(brain)))
+            print(
+                f"AGICore OCR-to-World entity text update "
+                f"{'passed' if ok else 'failed'}.")
+            return ok
+        except Exception as e:
+            print(f"AGICore OCR-to-World entity text update error: {e}")
             return False
 
     def TestTemporalKindSupervisionMatchesExecutionSemantics(self) -> bool:
@@ -6123,11 +8600,13 @@ class TestAGICoreMTool:
         results = {
             "DataclassContracts": self.TestDataclassContracts(),
             "WorldRobotPhysicalEncodingExcludesControlFeedback": self.TestWorldRobotPhysicalEncodingExcludesControlFeedback(),
-            "CameraPhysicalReferenceGaugeInvariance": self.TestCameraPhysicalReferenceGaugeInvariance(),
-            "BodyEndpointReferenceMapping": self.TestBodyEndpointReferenceMapping(),
-            "CameraMotionConvention": self.TestCameraMotionConvention(),
+            "ObserverPhysicalReferenceGaugeInvariance": self.TestObserverPhysicalReferenceGaugeInvariance(),
+            "EndpointReferenceMapping": self.TestEndpointReferenceMapping(),
+            "ObserverMotionConvention": self.TestObserverMotionConvention(),
+            "ObserverMorphologyContract": self.TestObserverMorphologyContract(),
             "MotionCommandWorldBoundary": self.TestMotionCommandWorldBoundary(),
-            "EndpointIdentitySurvivesPooling": self.TestEndpointIdentitySurvivesPooling(),
+            "FinalOperatorPermissionFiltersActiveCommand": self.TestFinalOperatorPermissionFiltersActiveCommand(),
+            "EndpointPermutationEquivariance": self.TestEndpointPermutationEquivariance(),
             "EquivalentQuaternionEncoding": self.TestEquivalentQuaternionEncoding(),
             "WorldRobotPhysicalEncoderOptimizerOwnership": self.TestWorldRobotPhysicalEncoderOptimizerOwnership(),
             "DecisionStructureOptimizerOwnership": self.TestDecisionStructureOptimizerOwnership(),
@@ -6151,6 +8630,9 @@ class TestAGICoreMTool:
             "DecisionJsonWireContract": self.TestDecisionJsonWireContract(),
             "ModelStateExcludesWorldRuntime": self.TestModelStateExcludesWorldRuntime(),
             "DeploymentStateCanonicalizesOnlineWrapper": self.TestDeploymentStateCanonicalizesOnlineWrapper(),
+            "AgentWorldEntityTextArtifactRoundTrip": self.TestAgentWorldTextArtifactRoundTrip(),
+            "OcrTextUpdatesMatchedWorldEntity": self.TestOcrTextUpdatesMatchedWorldEntity(),
+            "WorldAutosaveAcknowledgesOnlyAfterCommit": self.TestWorldAutosaveAcknowledgesOnlyAfterCommit(),
             "TemporalKindSupervisionMatchesExecutionSemantics": self.TestTemporalKindSupervisionMatchesExecutionSemantics(),
             "WorldMemoryBindingIsDeferredUntilWorldFrame": self.TestWorldMemoryBindingIsDeferredUntilWorldFrame(),}
         passed = sum(1 for v in results.values() if v)

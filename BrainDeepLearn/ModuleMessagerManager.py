@@ -11,10 +11,31 @@ import threading
 import time
 import numpy as np
 import torch
+from RobotMorphologyModule import (
+    AGENCY_NAMES,
+    BODY_CAPABILITY_NAMES,
+    BODY_ROLE_NAMES,
+    BODY_SIDE_NAMES,
+    DEFAULT_VIRTUAL_SLOT_COUNT,
+    JOINT_TYPE_NAMES,
+    MOTION_LAYER_NAMES,
+    ONTOLOGY_RELATION_NAMES,
+    REALM_NAMES,
+)
 
 
 
 class ModuleDim:
+    RobotControlAxisDim: int = 6
+    RobotBodyRoleNames: Tuple[str, ...] = BODY_ROLE_NAMES
+    RobotBodyRoleClasses: int = len(RobotBodyRoleNames)
+    RobotBodySideNames: Tuple[str, ...] = BODY_SIDE_NAMES
+    RobotBodySideClasses: int = len(RobotBodySideNames)
+    RobotBodyCapabilityNames: Tuple[str, ...] = BODY_CAPABILITY_NAMES
+    RobotBodyCapabilityDim: int = len(RobotBodyCapabilityNames)
+    RobotJointTypeNames: Tuple[str, ...] = JOINT_TYPE_NAMES
+    RobotJointTypeClasses: int = len(RobotJointTypeNames)
+
     PerceptionEmbed: int = 512
     PerceptionFeat: int = 2 * PerceptionEmbed
 
@@ -45,6 +66,7 @@ class ModuleDim:
     # Embodied-AGI v2 extensions ------------------------------------------------
     # Physical State Tensor (slot-structured object-centric scene state)
     PstObservedSlots: int = 128 # K_o: current-frame observed object/part candidates
+    PstVirtualSlots: int = DEFAULT_VIRTUAL_SLOT_COUNT
     PstSlots: int = 256         # K_w: persistent world physical memory slots
     PstSlotDim: int = 128       # D_s: per-node physical latent
     PstPoseDim: int = 7         #      camera/world SE(3): xyz plus quaternion
@@ -64,6 +86,16 @@ class ModuleDim:
     PstIdDim: int = 515         # tracked identity (128) + supervised semantic descriptor (387)
     PstRelDim: int = 36         # relative xyz/distance (4) + relation probabilities (32)
     PstUsageDim: int = 64       # D_u: per-slot usage-bank readout
+    PstRealmNames: Tuple[str, ...] = REALM_NAMES
+    PstRealmClasses: int = len(PstRealmNames)
+    PstAgencyNames: Tuple[str, ...] = AGENCY_NAMES
+    PstAgencyClasses: int = len(PstAgencyNames)
+    PstMotionLayerNames: Tuple[str, ...] = MOTION_LAYER_NAMES
+    PstMotionLayerClasses: int = len(PstMotionLayerNames)
+    PstLayerAgencyDim: int = PstMotionLayerClasses * PstAgencyClasses
+    PstOntologyRelationNames: Tuple[str, ...] = ONTOLOGY_RELATION_NAMES
+    PstOntologyRelationClasses: int = len(PstOntologyRelationNames)
+    PstSelfPartSemanticDim: int = 128
 
     # Four-level hierarchical goal stack (mission -> long -> mid -> short)
     GoalUltimateDim: int = 256
@@ -81,14 +113,10 @@ class ModuleDim:
     DecisionGateDim: int = 2           # {gather, act}
     GatherTypeDim: int = 8
     ActTypeDim: int = 8
-    ArmCount: int = 2                  # per-arm wrist SE(3) targets
     DecisionEndpointPoseDim: int = 7
-    DecisionActionDim: int = 6
+    DecisionActionDim: int = RobotControlAxisDim
     DecisionEndpointPoseFeatDim: int = 128
-    # q_camera_base is an XYZW carrier for exactly three camera-rotation DOFs.
-    # Gravity is an environmental direction, not a robot/control DOF. Fixed
-    # camera/base translation is deliberately absent from every learned input.
-    RobotPhysicalReferenceDim: int = 7  # q_camera_base (4) + gravity_camera (3)
+    RobotPhysicalReferenceDim: int = 8
     EndpointActionEmbedDim: int = 256
     TemporalPrimitiveCount: int = 6
     TemporalContextDim: int = 20
@@ -100,54 +128,7 @@ class ModuleDim:
         "CANCEL",
         "FAILSAFE_STOP",
         "REDISPATCH",)
-    RobotStateEndpointNames: Tuple[str, ...] = (
-        "left_thumb_tip",
-        "left_index_tip",
-        "left_middle_tip",
-        "left_ring_tip",
-        "left_little_tip",
-        "right_thumb_tip",
-        "right_index_tip",
-        "right_middle_tip",
-        "right_ring_tip",
-        "right_little_tip",
-        "left_wrist",
-        "right_wrist",
-        "camera_optical",)
-    RobotStateEndpointCount: int = len(RobotStateEndpointNames)
-    RobotStateCameraEndpointIndex: int = RobotStateEndpointNames.index(
-        "camera_optical")
-    RobotStateBodyEndpointSlice: slice = slice(
-        0, RobotStateCameraEndpointIndex)
-    RobotStateControlledEndpointSlice: slice = slice(
-        0, RobotStateEndpointCount)
-
-    # Body proprioception and action ownership are deliberately separate.
-    # Strict control boundary: 12 body SE(3) endpoints plus all three camera
-    # rotations. The camera has no translational action coordinates.
-    DecisionBodyEndpointNames: Tuple[str, ...] = RobotStateEndpointNames[
-        RobotStateBodyEndpointSlice]
-    DecisionBodyEndpointCount: int = len(DecisionBodyEndpointNames)
-    DecisionEndpointNames: Tuple[str, ...] = RobotStateEndpointNames
-    DecisionEndpointCount: int = len(DecisionEndpointNames)
-    DecisionBodyDofCount: int = (
-        DecisionBodyEndpointCount * DecisionActionDim)
-    DecisionCameraDofCount: int = 3
-    CameraMotionDim: int = 4  # XYZW unit quaternion, three rotational DOFs
-    DecisionActiveDofCount: int = (
-        DecisionBodyDofCount + DecisionCameraDofCount)
-    DecisionLeftWristEndpointIndex: int = DecisionEndpointNames.index(
-        "left_wrist")
-    DecisionRightWristEndpointIndex: int = DecisionEndpointNames.index(
-        "right_wrist")
-    DecisionCameraEndpointIndex: int = DecisionEndpointNames.index(
-        "camera_optical")
-    DecisionRotationOnlyEndpoints: Tuple[int, ...] = (
-        DecisionCameraEndpointIndex,)
-    DecisionEndpointReferenceRobotStateIndices: Tuple[int, ...] = (
-        (DecisionLeftWristEndpointIndex,) * 5
-        + (DecisionRightWristEndpointIndex,) * 5
-        + (RobotStateCameraEndpointIndex,) * 2)
+    ObserverMotionDim: int = 7
     GatherParamDim: int = 32
 
     # Object usage knowledge bank

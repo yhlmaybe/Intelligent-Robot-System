@@ -27,6 +27,11 @@ class BasicParameters:
 
     DATA_ROOT_PATH = "BrainDeepLearn/Data"
     CAMERA_CALIBRATION_PATH = str(PROJECT_ROOT / "Configure/Camera_Calibration.json")
+    ROBOT_URDF_PATH = str(PROJECT_ROOT / "Configure/Arm_R_SLDASM.urdf")
+    ROBOT_SRDF_PATH = str(PROJECT_ROOT / "Configure/Arm_R_SLDASM.srdf")
+    ROBOT_SEMANTIC_PATH = None
+    ROBOT_OBSERVER_FRAME_NAME = "camera_optical"
+    ROBOT_OBSERVER_CALIBRATION_ID = "camera_v1_rectified_512x512_v1"
     DATA_SENSOR_MANIFEST_PATH = "BrainDeepLearn/Data/sensor_manifest.json"
     OCR_DATA_ROOT_PATH = "BrainDeepLearn/Data/OCR"
 

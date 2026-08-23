@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -87,21 +88,43 @@ class TemporalDecisionEnvelope:
 class TemporalExecutionGateExtractor(AGICoreModule):
     def __init__(
         self,
+        *,
+        robotMorphology: Any,
         primitiveCount: int = ModuleDim.TemporalPrimitiveCount,
         contextDim: int = ModuleDim.TemporalContextDim,
         reasonDim: int = ModuleDim.TemporalReasonDim,
-        endpointCount: int = ModuleDim.DecisionEndpointCount,
-        actionDim: int = ModuleDim.DecisionActionDim,
+        actionDim: int = ModuleDim.RobotControlAxisDim,
         poseDim: int = ModuleDim.DecisionEndpointPoseDim,
         ageNormSteps: float = 128.0,):
         super().__init__()
         self.primitive_count = int(primitiveCount)
         self.context_dim = int(contextDim)
         self.reason_dim = int(reasonDim)
-        self.endpoint_count = int(endpointCount)
+        self.endpoint_count = int(robotMorphology.endpoint_count)
+        self.gripper_count = int(robotMorphology.gripper_count)
+        self.joint_dof_count = int(robotMorphology.joint_dof_count)
         self.action_dim = int(actionDim)
         self.pose_dim = int(poseDim)
         self.age_norm_steps = float(ageNormSteps)
+        decision_action_mask = DecisionActionMask(
+            endpointCount=self.endpoint_count,
+            actionDim=self.action_dim,
+            robotMorphology=robotMorphology).bool()
+        self.endpoint_names = tuple(robotMorphology.endpoint_names)
+        self.joint_variable_names = tuple(
+            robotMorphology.joint_variable_names)
+        joint_variable_commandable = torch.as_tensor(
+            robotMorphology.joint_variable_commandable,
+            dtype=torch.bool).reshape(self.joint_dof_count)
+        self.register_buffer(
+            "decision_action_mask",
+            decision_action_mask.view(
+                1, self.endpoint_count, self.action_dim),
+            persistent=False)
+        self.register_buffer(
+            "joint_variable_commandable",
+            joint_variable_commandable.view(1, self.joint_dof_count),
+            persistent=False)
  
         self.register_buffer(
             "rule_gain",
@@ -214,14 +237,27 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         return MotionCommand(
             decision_tensor=decision_tensor,
             target_endpoint_pose=endpointPose,
-            endpoint_names=template.endpoint_names,
-            decision_dof_mask=template.decision_dof_mask,
+            endpoint_names=self.endpoint_names,
+            decision_dof_mask=self.decision_action_mask.expand(B, -1, -1),
             gripper_cmd=template.gripper_cmd,
-            gripper_valid=torch.zeros(B, device=endpointPose.device, dtype=torch.bool),
+            gripper_valid=torch.zeros(
+                B,
+                self.gripper_count,
+                device=endpointPose.device,
+                dtype=torch.bool),
             mode_logits=template.mode_logits,
             mode_valid=torch.zeros(B, device=endpointPose.device, dtype=torch.bool),
             safety_scores=safety_scores,
-            safety_names=template.safety_names,)
+            safety_names=template.safety_names,
+            joint_variable_command=endpointPose.new_zeros(
+                B,
+                self.joint_dof_count),
+            joint_variable_command_mask=torch.zeros(
+                B,
+                self.joint_dof_count,
+                device=endpointPose.device,
+                dtype=torch.bool),
+            joint_variable_names=self.joint_variable_names,)
 
     def SelectCommand(
         self,
@@ -239,7 +275,10 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         decision_tensor = (
             candidate.decision_tensor * use_candidate
             + active.decision_tensor * use_active
-            + hold.decision_tensor * use_hold)
+            + hold.decision_tensor * use_hold
+        ) * self.decision_action_mask.to(
+            device=candidate.decision_tensor.device,
+            dtype=candidate.decision_tensor.dtype)
         
         target_pose = (
             candidate.target_endpoint_pose * use_candidate
@@ -252,24 +291,56 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         select_candidate = w_candidate.detach() > 0.5
         select_active = w_active.detach() > 0.5
         select_hold = w_hold.detach() > 0.5
+        commands = (candidate, active, hold)
+        for command in commands:
+            if tuple(command.joint_variable_command.shape) != (
+                candidate.decision_tensor.size(0),
+                self.joint_dof_count,
+            ):
+                raise ValueError("motion command joint variables have invalid shape")
+            if tuple(command.joint_variable_command_mask.shape) != (
+                candidate.decision_tensor.size(0),
+                self.joint_dof_count,
+            ):
+                raise ValueError("motion command joint variable mask has invalid shape")
+            if tuple(command.joint_variable_names) != self.joint_variable_names:
+                raise ValueError("motion command joint variable names do not match morphology")
+        joint_variable_command = (
+            candidate.joint_variable_command * flat_candidate
+            + active.joint_variable_command * flat_active
+            + hold.joint_variable_command * flat_hold)
+        joint_variable_command_mask = (
+            (
+                (candidate.joint_variable_command_mask
+                 & select_candidate.view(-1, 1))
+                | (active.joint_variable_command_mask
+                   & select_active.view(-1, 1))
+                | (hold.joint_variable_command_mask
+                   & select_hold.view(-1, 1))
+            ) & self.joint_variable_commandable.to(
+                device=candidate.decision_tensor.device))
         
         return MotionCommand(
             decision_tensor=decision_tensor,
             target_endpoint_pose=target_pose,
-            endpoint_names=candidate.endpoint_names,
-            decision_dof_mask=candidate.decision_dof_mask,
+            endpoint_names=self.endpoint_names,
+            decision_dof_mask=self.decision_action_mask.expand(
+                candidate.decision_tensor.size(0), -1, -1),
             gripper_cmd=candidate.gripper_cmd * use_candidate + active.gripper_cmd * use_active + hold.gripper_cmd * use_hold,
             gripper_valid=(
-                (candidate.gripper_valid & select_candidate)
-                | (active.gripper_valid & select_active)
-                | (hold.gripper_valid & select_hold)),
+                (candidate.gripper_valid & select_candidate.view(-1, 1))
+                | (active.gripper_valid & select_active.view(-1, 1))
+                | (hold.gripper_valid & select_hold.view(-1, 1))),
             mode_logits=candidate.mode_logits * flat_candidate + active.mode_logits * flat_active + hold.mode_logits * flat_hold,
             mode_valid=(
                 (candidate.mode_valid & select_candidate)
                 | (active.mode_valid & select_active)
                 | (hold.mode_valid & select_hold)),
             safety_scores=candidate.safety_scores * flat_candidate + active.safety_scores * flat_active + hold.safety_scores * flat_hold,
-            safety_names=candidate.safety_names,)
+            safety_names=candidate.safety_names,
+            joint_variable_command=joint_variable_command,
+            joint_variable_command_mask=joint_variable_command_mask,
+            joint_variable_names=self.joint_variable_names,)
 
     def forward(
         self,
@@ -430,14 +501,42 @@ class TestTemporalExecutionGateExtractorMTool:
     def __init__(self, device: torch.device = None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         torch.manual_seed(42)
+        endpoint_count = 5
+        gripper_count = 3
+        joint_dof_count = 7
+        observer_index = 2
+        endpoint_task_mask = torch.zeros(
+            endpoint_count,
+            ModuleDim.RobotControlAxisDim,
+            dtype=torch.bool)
+        endpoint_task_mask[:] = True
+        endpoint_task_mask[observer_index, :3] = False
+        joint_variable_commandable = torch.tensor(
+            [True, True, False, True, True, False, True],
+            dtype=torch.bool)
+        self.robot_morphology = SimpleNamespace(
+            endpoint_task_mask=endpoint_task_mask,
+            observer_valid=True,
+            observer_endpoint_index=observer_index,
+            endpoint_names=tuple(
+                f"endpoint_{index}" for index in range(endpoint_count)),
+            endpoint_count=endpoint_count,
+            gripper_names=tuple(
+                f"gripper_{index}" for index in range(gripper_count)),
+            gripper_count=gripper_count,
+            joint_dof_count=joint_dof_count,
+            joint_variable_names=tuple(
+                f"joint_{index}" for index in range(joint_dof_count)),
+            joint_variable_commandable=joint_variable_commandable)
 
     def MakeGate(self) -> TemporalExecutionGateExtractor:
-        return TemporalExecutionGateExtractor().to(self.device)
+        return TemporalExecutionGateExtractor(
+            robotMorphology=self.robot_morphology).to(self.device)
 
     def MakeEndpointPose(self, B: int) -> torch.Tensor:
         endpoint_pose = torch.zeros(
             B,
-            ModuleDim.DecisionEndpointCount,
+            self.robot_morphology.endpoint_count,
             ModuleDim.DecisionEndpointPoseDim,
             device=self.device)
         endpoint_pose[..., 6] = 1.0
@@ -445,24 +544,43 @@ class TestTemporalExecutionGateExtractorMTool:
 
     def MakeMotionCommand(self, B: int, value: float) -> MotionCommand:
         endpoint_pose = self.MakeEndpointPose(B)
-        return MotionCommand(
-            decision_tensor=torch.full(
-                (B, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionActionDim),
-                float(value),
-                device=self.device),
-            target_endpoint_pose=endpoint_pose + float(value) * 0.01,
-            endpoint_names=ModuleDim.DecisionEndpointNames,
-            decision_dof_mask=DecisionActionMask().to(
+        decision_dof_mask = DecisionActionMask(
+            robotMorphology=self.robot_morphology).to(
                 self.device).view(
                     1,
-                    ModuleDim.DecisionEndpointCount,
-                    ModuleDim.DecisionActionDim).expand(B, -1, -1).bool(),
-            gripper_cmd=torch.full((B, ModuleDim.ArmCount, 1), float(value), device=self.device),
-            gripper_valid=torch.ones(B, device=self.device, dtype=torch.bool),
+                    self.robot_morphology.endpoint_count,
+                    ModuleDim.RobotControlAxisDim).expand(B, -1, -1).bool()
+        joint_mask = self.robot_morphology.joint_variable_commandable.to(
+            self.device).view(1, -1).expand(B, -1)
+        return MotionCommand(
+            decision_tensor=torch.full(
+                (
+                    B,
+                    self.robot_morphology.endpoint_count,
+                    ModuleDim.RobotControlAxisDim),
+                float(value),
+                device=self.device) * decision_dof_mask,
+            target_endpoint_pose=endpoint_pose + float(value) * 0.01,
+            endpoint_names=self.robot_morphology.endpoint_names,
+            decision_dof_mask=decision_dof_mask,
+            gripper_cmd=torch.full((
+                B, self.robot_morphology.gripper_count, 1),
+                float(value), device=self.device),
+            gripper_valid=torch.ones(
+                B,
+                self.robot_morphology.gripper_count,
+                device=self.device,
+                dtype=torch.bool),
             mode_logits=torch.full((B, ModuleDim.ActTypeDim), float(value), device=self.device),
             mode_valid=torch.ones(B, device=self.device, dtype=torch.bool),
             safety_scores=torch.full((B, 5), float(value), device=self.device),
-            safety_names=SAFETY_MARGIN_NAMES,)
+            safety_names=SAFETY_MARGIN_NAMES,
+            joint_variable_command=torch.full(
+                (B, self.robot_morphology.joint_dof_count),
+                float(value),
+                device=self.device) * joint_mask,
+            joint_variable_command_mask=joint_mask,
+            joint_variable_names=self.robot_morphology.joint_variable_names,)
 
     def MakeContext(
         self,
@@ -524,6 +642,14 @@ class TestTemporalExecutionGateExtractorMTool:
             assert tuple(ctx.feat.shape) == (B, ModuleDim.TemporalContextDim)
             assert tuple(ctx.active_mask.shape) == (B,)
             assert tuple(ctx.planner_tracking_error.shape) == (B,)
+            assert tuple(gate.decision_action_mask.shape) == (
+                1,
+                self.robot_morphology.endpoint_count,
+                ModuleDim.RobotControlAxisDim)
+            assert int(gate.decision_action_mask.sum().item()) == int(
+                self.robot_morphology.endpoint_task_mask.sum().item())
+            assert "decision_action_mask" not in gate.state_dict()
+            assert "joint_variable_commandable" not in gate.state_dict()
             assert torch.isfinite(ctx.feat).all()
             print("TemporalExecutionGateExtractor BuildContext shape test passed.")
             return True
@@ -538,10 +664,26 @@ class TestTemporalExecutionGateExtractorMTool:
             endpoint_pose = self.MakeEndpointPose(B)
             template = self.MakeMotionCommand(B, 1.0)
             hold = gate.HoldCommand(endpoint_pose, template)
-            assert tuple(hold.decision_tensor.shape) == (B, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionActionDim)
-            assert tuple(hold.target_endpoint_pose.shape) == (B, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionEndpointPoseDim)
+            assert tuple(hold.decision_tensor.shape) == (
+                B,
+                self.robot_morphology.endpoint_count,
+                ModuleDim.RobotControlAxisDim)
+            assert tuple(hold.target_endpoint_pose.shape) == (
+                B,
+                self.robot_morphology.endpoint_count,
+                ModuleDim.DecisionEndpointPoseDim)
+            assert tuple(hold.gripper_valid.shape) == (
+                B, self.robot_morphology.gripper_count)
+            assert tuple(hold.joint_variable_command.shape) == (
+                B, self.robot_morphology.joint_dof_count)
+            assert tuple(hold.joint_variable_command_mask.shape) == (
+                B, self.robot_morphology.joint_dof_count)
+            assert hold.joint_variable_names == (
+                self.robot_morphology.joint_variable_names)
             assert torch.allclose(hold.decision_tensor, torch.zeros_like(hold.decision_tensor))
             assert torch.allclose(hold.target_endpoint_pose, endpoint_pose)
+            assert torch.count_nonzero(hold.joint_variable_command) == 0
+            assert torch.count_nonzero(hold.joint_variable_command_mask) == 0
             assert torch.all(hold.safety_scores[:, :2] == 1.0)
             assert torch.equal(hold.safety_scores[:, 2:], template.safety_scores[:, 2:])
             print("TemporalExecutionGateExtractor HoldCommand shape test passed.")
@@ -570,6 +712,13 @@ class TestTemporalExecutionGateExtractorMTool:
                 out = gate.SelectCommand(candidate, active, hold, kind_weight)
                 assert torch.allclose(out.decision_tensor, expected.decision_tensor)
                 assert torch.allclose(out.target_endpoint_pose, expected.target_endpoint_pose)
+                assert torch.allclose(
+                    out.joint_variable_command,
+                    expected.joint_variable_command)
+                assert torch.equal(
+                    out.joint_variable_command_mask,
+                    expected.joint_variable_command_mask)
+                assert out.joint_variable_names == expected.joint_variable_names
             print("TemporalExecutionGateExtractor SelectCommand route test passed.")
             return True
         except Exception as e:
@@ -600,7 +749,12 @@ class TestTemporalExecutionGateExtractorMTool:
             assert out.action_id.dtype == torch.long
             assert tuple(out.reason_scores.shape) == (B, ModuleDim.TemporalReasonDim)
             assert len(out.reason_names) == ModuleDim.TemporalReasonDim
-            assert tuple(out.motion_command.decision_tensor.shape) == (B, ModuleDim.DecisionEndpointCount, ModuleDim.DecisionActionDim)
+            assert tuple(out.motion_command.decision_tensor.shape) == (
+                B,
+                self.robot_morphology.endpoint_count,
+                ModuleDim.RobotControlAxisDim)
+            assert tuple(out.motion_command.joint_variable_command.shape) == (
+                B, self.robot_morphology.joint_dof_count)
             flag_sum = (
                 out.publish_motion_command
                 + out.reuse_active_motion_command

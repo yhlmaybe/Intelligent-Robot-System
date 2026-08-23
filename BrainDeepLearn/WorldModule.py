@@ -9,7 +9,13 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from FunctionTools import SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear, GetParametersScale, HungarianAssignment
 from ModuleMessagerManager import ModuleDim
-from PhysicalStateModule import PSTWorldBinder
+from PhysicalStateModule import PSTWorldBinder, PhysicalStateExtractor
+from RobotMorphologyModule import (
+    BODY_CAPABILITY_NAMES,
+    BODY_ROLE_NAMES,
+    BODY_SIDE_NAMES,
+    JOINT_TYPE_NAMES,
+    EntityRealm,)
 
 
 PERSISTENT_PHYSICAL_STATE_FIELDS = (
@@ -18,6 +24,17 @@ PERSISTENT_PHYSICAL_STATE_FIELDS = (
     "ARaw",
     "SlotPresence",
     "MphysRaw",
+    "PerceptualPresence",
+    "GeometryValidMask",
+    "PhysicalEntityProb",
+    "PhysicalInteractionProb",
+    "RealmProb",
+    "MotionLayerProb",
+    "LayerAgencyProb",
+    "AgencyProb",
+    "BodyMembershipProb",
+    "SelfPartProb",
+    "SelfPartSemantic",
     "IdentityKey",
     "PairwiseRelationWorld",
     "PairRelationLastSeen",
@@ -27,11 +44,21 @@ PERSISTENT_PHYSICAL_STATE_FIELDS = (
     "StateRaw",
     "AffordanceRaw",
     "MotionWorldRaw",
+    "CarrierMotionWorldRaw",
+    "ArticulationMotionWorldRaw",
+    "ContentMotionUV",
+    "ContentChangeProb",
     "MovingProbRaw",
     "ContactProbRaw",
     "ContactForceRaw",
     "ContactPointWorldRaw",
     "ParentProb",
+    "DisplaySurfaceProb",
+    "SurfaceParentProb",
+    "SurfaceUV",
+    "SurfaceUVConfidence",
+    "VerificationConfidence",
+    "OntologyRelationProb",
     "Visibility",
     "Occlusion",
     "HasTextProb",
@@ -44,6 +71,8 @@ PERSISTENT_PHYSICAL_STATE_FIELDS = (
 MODEL_PHYSICAL_GEOMETRY_FIELDS = (
     "PoseCamera",
     "MotionCameraRaw",
+    "CarrierMotionCameraRaw",
+    "ArticulationMotionCameraRaw",
     "ContactPointCameraRaw",
     "PairwiseRelationCamera",
 )
@@ -55,6 +84,8 @@ MODEL_SEMANTIC_VIEW_FIELDS = (
 PERSISTENT_WORLD_GEOMETRY_FIELDS = (
     "PoseWorld",
     "MotionWorldRaw",
+    "CarrierMotionWorldRaw",
+    "ArticulationMotionWorldRaw",
     "ContactPointWorldRaw",
     "PairwiseRelationWorld",
 )
@@ -69,6 +100,17 @@ OBSERVED_PHYSICAL_STATE_FIELDS = (
     "ARaw",
     "ObservedSlotMask",
     "MphysRaw",
+    "PerceptualPresence",
+    "GeometryValidMask",
+    "PhysicalEntityProb",
+    "PhysicalInteractionProb",
+    "RealmProb",
+    "MotionLayerProb",
+    "LayerAgencyProb",
+    "AgencyProb",
+    "BodyMembershipProb",
+    "SelfPartProb",
+    "SelfPartSemantic",
     "IdentityKey",
     "Semantic",
     "ExternalRelationProbRaw",
@@ -76,6 +118,10 @@ OBSERVED_PHYSICAL_STATE_FIELDS = (
     "StateRaw",
     "AffordanceRaw",
     "MotionCameraRaw",
+    "CarrierMotionCameraRaw",
+    "ArticulationMotionCameraRaw",
+    "ContentMotionUV",
+    "ContentChangeProb",
     "MovingProbRaw",
     "ContactProbRaw",
     "ContactForceRaw",
@@ -87,9 +133,15 @@ OBSERVED_PHYSICAL_STATE_FIELDS = (
     "SymbolProb",
     "PairwiseRelationCamera",
     "ParentProb",
+    "DisplaySurfaceProb",
+    "SurfaceParentProb",
+    "SurfaceUV",
+    "SurfaceUVConfidence",
+    "VerificationConfidence",
+    "OntologyRelationProb",
 )
 
-WORLD_MEMORY_SCHEMA_VERSION = 3
+WORLD_MEMORY_SCHEMA_VERSION = 7
 WORLD_MEMORY_TENSOR_FIELDS = (
     "mem_keys",
     "mem_vals",
@@ -102,6 +154,20 @@ WORLD_MEMORY_TENSOR_FIELDS = (
     "pst_attribute",
     "pst_slot_presence",
     "pst_entity_prob",
+    "pst_entity_id",
+    "pst_slot_generation",
+    "pst_next_entity_id",
+    "last_observed_to_world_slot",
+    "pst_perceptual_presence",
+    "pst_geometry_valid",
+    "pst_physical_interaction",
+    "pst_realm",
+    "pst_motion_layer",
+    "pst_layer_agency",
+    "pst_agency",
+    "pst_body_membership",
+    "pst_self_part",
+    "pst_self_part_semantic",
     "pst_identity_key",
     "pst_pairwise_relation",
     "pst_pair_last_seen",
@@ -111,15 +177,29 @@ WORLD_MEMORY_TENSOR_FIELDS = (
     "pst_state",
     "pst_affordance",
     "pst_motion",
+    "pst_carrier_motion",
+    "pst_articulation_motion",
+    "pst_content_motion",
+    "pst_content_change",
     "pst_moving",
     "pst_contact",
     "pst_contact_force",
     "pst_contact_point",
     "pst_parent",
+    "pst_display_surface",
+    "pst_surface_parent",
+    "pst_surface_uv",
+    "pst_surface_uv_confidence",
+    "pst_verification",
+    "pst_ontology_relation",
     "pst_visibility",
     "pst_occlusion",
     "pst_has_text",
     "pst_text",
+    "pst_entity_text_semantic",
+    "pst_entity_text_confidence",
+    "pst_entity_text_revision",
+    "pst_entity_text_changed",
     "pst_symbol",
     "pst_observed",
     "pst_last_seen",
@@ -245,6 +325,33 @@ class VisualReconstructor(nn.Module):
         self.slot_presence_head = nn.Sequential(
             nn.LayerNorm(self.recon_dim),
             nn.Linear(self.recon_dim, 1),)
+
+        self.factor_realm_head = nn.Sequential(
+            nn.LayerNorm(self.recon_dim),
+            nn.Linear(self.recon_dim, ModuleDim.PstRealmClasses))
+        self.factor_motion_layer_head = nn.Sequential(
+            nn.LayerNorm(self.recon_dim),
+            nn.Linear(self.recon_dim, ModuleDim.PstMotionLayerClasses))
+        self.factor_layer_agency_head = nn.Sequential(
+            nn.LayerNorm(self.recon_dim),
+            nn.Linear(
+                self.recon_dim,
+                ModuleDim.PstMotionLayerClasses * ModuleDim.PstAgencyClasses))
+        self.factor_surface_head = nn.Sequential(
+            nn.LayerNorm(self.recon_dim),
+            nn.Linear(self.recon_dim, 1))
+        self.factor_surface_uv_head = nn.Sequential(
+            nn.LayerNorm(self.recon_dim),
+            nn.Linear(self.recon_dim, 2))
+        self.factor_content_motion_head = nn.Sequential(
+            nn.LayerNorm(self.recon_dim),
+            nn.Linear(self.recon_dim, 2))
+        self.factor_content_change_head = nn.Sequential(
+            nn.LayerNorm(self.recon_dim),
+            nn.Linear(self.recon_dim, 1))
+        self.factor_confidence_head = nn.Sequential(
+            nn.LayerNorm(self.recon_dim),
+            nn.Linear(self.recon_dim, 1))
 
         self.slot_norm = nn.LayerNorm(self.recon_dim)
 
@@ -414,6 +521,31 @@ class VisualReconstructor(nn.Module):
         slot_confidence = 1.0 - slot_entropy / slot_entropy.new_tensor(float(self.num_object_tokens)).log()
         scene_agreement = (F.cosine_similarity(scene_summary, object_summary, dim=-1) + 1.0) * 0.5
         prior_confidence = (0.5 + 0.5 * slot_confidence) * scene_agreement
+        realm_prob = F.softmax(self.factor_realm_head(slot_state), dim=-1)
+        motion_layer_prob = torch.sigmoid(
+            self.factor_motion_layer_head(slot_state))
+        layer_agency_prob = F.softmax(
+            self.factor_layer_agency_head(slot_state).view(
+                slot_state.size(0),
+                slot_state.size(1),
+                ModuleDim.PstMotionLayerClasses,
+                ModuleDim.PstAgencyClasses),
+            dim=-1)
+        agency_mass = (
+            motion_layer_prob.unsqueeze(-1) * layer_agency_prob
+        ).sum(dim=-2)
+        layer_mass = motion_layer_prob.sum(dim=-1, keepdim=True)
+        agency_prob = agency_mass / (layer_mass + 1e-6)
+        unknown_agency = torch.zeros_like(agency_prob)
+        unknown_agency[..., -1] = 1.0
+        agency_prob = torch.where(
+            layer_mass > 1e-6,
+            agency_prob,
+            unknown_agency)
+        factor_prior_confidence = (
+            torch.sigmoid(self.factor_confidence_head(slot_state).squeeze(-1))
+            * torch.sigmoid(slot_presence_logits)
+            * prior_confidence.unsqueeze(-1))
 
         return {
             "IntegratedFeat": integrated_feat, # [B,1024]
@@ -425,6 +557,19 @@ class VisualReconstructor(nn.Module):
             "SceneSummary": scene_summary, # [B,512]
             "ObjectSummary": object_summary, # [B,512]
             "PriorConfidence": prior_confidence, # [B]
+            "RealmProb": realm_prob,
+            "MotionLayerProb": motion_layer_prob,
+            "LayerAgencyProb": layer_agency_prob,
+            "ObjectAgencyProb": agency_prob,
+            "DisplaySurfaceProb": torch.sigmoid(
+                self.factor_surface_head(slot_state).squeeze(-1)),
+            "SurfaceUV": torch.sigmoid(
+                self.factor_surface_uv_head(slot_state)),
+            "ContentMotionUV": torch.tanh(
+                self.factor_content_motion_head(slot_state)),
+            "ContentChangeProb": torch.sigmoid(
+                self.factor_content_change_head(slot_state).squeeze(-1)),
+            "FactorPriorConfidence": factor_prior_confidence,
             "PredErrorBasis": self.pred_error_basis(torch.cat([
                 global_feat,
                 integrated_feat,
@@ -1480,32 +1625,652 @@ class KeyEmbed(AGICoreModule):
 
 
 class WorldRobotPhysicalEncoder(nn.Module):
-    """World-specific latent derived from proprioception and physical reference."""
-
     def __init__(
         self,
-        bodyPoseDim: int = (
-            ModuleDim.DecisionBodyEndpointCount
-            * ModuleDim.DecisionEndpointPoseDim),
         physicalReferenceDim: int = ModuleDim.RobotPhysicalReferenceDim,
-        outDim: int = ModuleDim.PstSlotDim):
+        outDim: int = ModuleDim.PstSlotDim,
+        robotMorphology: Optional[Any] = None,):
         super().__init__()
+        if robotMorphology is None:
+            raise ValueError("robot morphology is required")
+        self.endpoint_count = int(robotMorphology.endpoint_count)
+        self.node_count = int(robotMorphology.node_count)
+        self.joint_count = int(robotMorphology.joint_dof_count)
+        self.gripper_count = int(robotMorphology.gripper_count)
+        self.group_count = int(robotMorphology.group_count)
+        self.sensor_count = int(robotMorphology.sensor_count)
+        self.pose_dim = int(ModuleDim.DecisionEndpointPoseDim)
+        node_semantic = robotMorphology.NodeSemanticDescriptor()
+        joint_semantic = robotMorphology.JointSemanticDescriptor()
+        parent_index = torch.as_tensor(
+            node_semantic["parent_node_index"],
+            dtype=torch.long).detach().cpu()
+        endpoint_to_node = torch.as_tensor(
+            robotMorphology.endpoint_to_node,
+            dtype=torch.long).detach().cpu()
+        endpoint_role = torch.as_tensor(
+            robotMorphology.endpoint_role,
+            dtype=torch.long).detach().cpu()
+        endpoint_side = torch.as_tensor(
+            robotMorphology.endpoint_side,
+            dtype=torch.long).detach().cpu()
+        endpoint_capability = torch.as_tensor(
+            robotMorphology.endpoint_capability,
+            dtype=torch.float32).detach().cpu()
+        joint_lower = torch.as_tensor(
+            robotMorphology.joint_lower,
+            dtype=torch.float32).detach().cpu()
+        joint_upper = torch.as_tensor(
+            robotMorphology.joint_upper,
+            dtype=torch.float32).detach().cpu()
+        joint_effort_limit = torch.as_tensor(
+            robotMorphology.joint_effort_limit,
+            dtype=torch.float32).detach().cpu()
+        joint_velocity_limit = torch.as_tensor(
+            robotMorphology.joint_velocity_limit,
+            dtype=torch.float32).detach().cpu()
+        observer_valid = bool(robotMorphology.observer_valid)
+        observer_attachment_kind = robotMorphology.observer_attachment_kind
+        observer_endpoint_index = int(
+            robotMorphology.observer_endpoint_index)
+        observer_endpoint_valid = bool(
+            observer_valid
+            and observer_attachment_kind == "endpoint"
+            and observer_endpoint_index >= 0)
+        expected_shapes = (
+            (parent_index, (self.node_count,)),
+            (endpoint_to_node, (self.endpoint_count,)),
+            (endpoint_role, (self.endpoint_count,)),
+            (endpoint_side, (self.endpoint_count,)),
+            (endpoint_capability, (
+                self.endpoint_count, len(BODY_CAPABILITY_NAMES))),
+            (joint_lower, (self.joint_count,)),
+            (joint_upper, (self.joint_count,)),
+            (joint_effort_limit, (self.joint_count,)),
+            (joint_velocity_limit, (self.joint_count,)),)
+        if any(tuple(value.shape) != shape for value, shape in expected_shapes):
+            raise ValueError("morphology graph tensor shape does not match counts")
+        if observer_endpoint_valid:
+            if not 0 <= observer_endpoint_index < self.endpoint_count:
+                raise ValueError("morphology observer endpoint is outside morphology")
+        elif (
+            observer_endpoint_index != -1
+            and observer_attachment_kind != "endpoint"
+        ):
+            raise ValueError(
+                "non-endpoint observer cannot use an endpoint index")
         hidden = int(outDim) * 2
-        in_dim = int(bodyPoseDim) + int(physicalReferenceDim)
-        self.net = nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, hidden),
+        endpoint_descriptor = torch.cat([
+            F.one_hot(
+                endpoint_role.clamp(0, len(BODY_ROLE_NAMES) - 1),
+                num_classes=len(BODY_ROLE_NAMES)).to(torch.float32),
+            F.one_hot(
+                endpoint_side.clamp(0, len(BODY_SIDE_NAMES) - 1),
+                num_classes=len(BODY_SIDE_NAMES)).to(torch.float32),
+            endpoint_capability,], dim=-1)
+        joint_type = torch.as_tensor(
+            joint_semantic["joint_type"],
+            dtype=torch.long).detach().cpu().reshape(self.joint_count)
+        joint_axis = torch.as_tensor(
+            joint_semantic["joint_axis"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 3)
+        local_index = torch.as_tensor(
+            joint_semantic["local_index"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 1)
+        topology_depth = torch.as_tensor(
+            joint_semantic["topology_depth"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 1)
+        child_role = torch.as_tensor(
+            joint_semantic["child_role"],
+            dtype=torch.long).detach().cpu().reshape(self.joint_count)
+        child_side = torch.as_tensor(
+            joint_semantic["child_side"],
+            dtype=torch.long).detach().cpu().reshape(self.joint_count)
+        child_capability = torch.as_tensor(
+            joint_semantic["child_capability"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, len(BODY_CAPABILITY_NAMES))
+        joint_parent_node = torch.as_tensor(
+            joint_semantic["parent_node_index"],
+            dtype=torch.long).detach().cpu().reshape(self.joint_count)
+        parent_role = torch.as_tensor(
+            joint_semantic["parent_role"],
+            dtype=torch.long).detach().cpu().reshape(self.joint_count)
+        parent_side = torch.as_tensor(
+            joint_semantic["parent_side"],
+            dtype=torch.long).detach().cpu().reshape(self.joint_count)
+        parent_capability = torch.as_tensor(
+            joint_semantic["parent_capability"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, len(BODY_CAPABILITY_NAMES))
+        group_role = torch.as_tensor(
+            joint_semantic["group_role_membership"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, len(BODY_ROLE_NAMES))
+        group_side = torch.as_tensor(
+            joint_semantic["group_side_membership"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, len(BODY_SIDE_NAMES))
+        group_capability = torch.as_tensor(
+            joint_semantic["group_capability"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, len(BODY_CAPABILITY_NAMES))
+        lower_normalized = torch.as_tensor(
+            joint_semantic["lower_limit_normalized"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 1)
+        upper_normalized = torch.as_tensor(
+            joint_semantic["upper_limit_normalized"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 1)
+        effort_normalized = torch.as_tensor(
+            joint_semantic["effort_limit_normalized"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 1)
+        velocity_normalized = torch.as_tensor(
+            joint_semantic["velocity_limit_normalized"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 1)
+        lower_valid = torch.as_tensor(
+            joint_semantic["position_lower_limit_valid"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 1)
+        upper_valid = torch.as_tensor(
+            joint_semantic["position_upper_limit_valid"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 1)
+        effort_valid = torch.as_tensor(
+            joint_semantic["effort_limit_valid"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 1)
+        velocity_valid = torch.as_tensor(
+            joint_semantic["velocity_limit_valid"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 1)
+        command_scale = torch.as_tensor(
+            joint_semantic["command_delta_scale"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 1)
+        commandable = torch.as_tensor(
+            joint_semantic["commandable"],
+            dtype=torch.float32).detach().cpu().reshape(
+                self.joint_count, 1)
+        parent_present = joint_parent_node.ge(0).to(
+            torch.float32).unsqueeze(-1)
+        parent_role_feature = F.one_hot(
+            parent_role.clamp(0, len(BODY_ROLE_NAMES) - 1),
+            num_classes=len(BODY_ROLE_NAMES)).to(torch.float32)
+        parent_side_feature = F.one_hot(
+            parent_side.clamp(0, len(BODY_SIDE_NAMES) - 1),
+            num_classes=len(BODY_SIDE_NAMES)).to(torch.float32)
+        parent_role_feature *= parent_present
+        parent_side_feature *= parent_present
+        parent_capability *= parent_present
+        joint_descriptor = torch.cat([
+            F.one_hot(
+                joint_type.clamp(0, len(JOINT_TYPE_NAMES) - 1),
+                num_classes=len(JOINT_TYPE_NAMES)).to(torch.float32),
+            joint_axis,
+            local_index / (1.0 + local_index),
+            topology_depth / (1.0 + topology_depth),
+            F.one_hot(
+                child_role.clamp(0, len(BODY_ROLE_NAMES) - 1),
+                num_classes=len(BODY_ROLE_NAMES)).to(torch.float32),
+            F.one_hot(
+                child_side.clamp(0, len(BODY_SIDE_NAMES) - 1),
+                num_classes=len(BODY_SIDE_NAMES)).to(torch.float32),
+            child_capability,
+            parent_role_feature,
+            parent_side_feature,
+            parent_capability,
+            group_role,
+            group_side,
+            group_capability,
+            lower_normalized,
+            upper_normalized,
+            effort_normalized,
+            velocity_normalized,
+            lower_valid,
+            upper_valid,
+            effort_valid,
+            velocity_valid,
+            command_scale / (1.0 + command_scale.abs()),
+            commandable,], dim=-1)
+        node_descriptor = PhysicalStateExtractor.BuildSelfPartNodeDescriptors(
+            robotMorphology)
+        self.physical_reference_dim = int(physicalReferenceDim)
+        self.node_pose_proj = nn.Sequential(
+            nn.Linear(self.pose_dim, int(outDim)),
+            nn.SiLU(),
+            nn.Linear(int(outDim), int(outDim)))
+        self.node_descriptor_proj = nn.Sequential(
+            nn.LayerNorm(int(endpoint_descriptor.size(1))),
+            nn.Linear(int(endpoint_descriptor.size(1)), hidden),
             nn.SiLU(),
             nn.Linear(hidden, int(outDim)),
-            nn.LayerNorm(int(outDim)),)
+            nn.LayerNorm(int(outDim)))
+        self.endpoint_runtime_proj = nn.Sequential(
+            nn.LayerNorm(2),
+            nn.Linear(2, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, int(outDim)),
+            nn.LayerNorm(int(outDim)))
+        self.observer_reference_proj = nn.Sequential(
+            nn.Linear(int(physicalReferenceDim), int(outDim)),
+            nn.SiLU(),
+            nn.Linear(int(outDim), int(outDim)))
+        self.joint_state_proj = nn.Sequential(
+            nn.LayerNorm(6),
+            nn.Linear(6, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, int(outDim)),
+            nn.LayerNorm(int(outDim)))
+        self.joint_descriptor_proj = nn.Sequential(
+            nn.LayerNorm(int(joint_descriptor.size(1))),
+            nn.Linear(int(joint_descriptor.size(1)), hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, int(outDim)),
+            nn.LayerNorm(int(outDim)))
+        self.joint_summary_proj = nn.Sequential(
+            nn.LayerNorm(int(outDim) * 2),
+            nn.Linear(int(outDim) * 2, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, int(outDim)),
+            nn.LayerNorm(int(outDim)))
+        self.joint_residual_gain = nn.Parameter(torch.tensor(-2.944439))
+        self.body_node_state_proj = nn.Sequential(
+            nn.LayerNorm(15),
+            nn.Linear(15, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, int(outDim)),
+            nn.LayerNorm(int(outDim)))
+        self.body_node_descriptor_proj = nn.Sequential(
+            nn.LayerNorm(int(node_descriptor.size(1))),
+            nn.Linear(int(node_descriptor.size(1)), hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, int(outDim)),
+            nn.LayerNorm(int(outDim)))
+        self.body_node_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(int(outDim) * 2),
+                nn.Linear(int(outDim) * 2, hidden),
+                nn.SiLU(),
+                nn.Linear(hidden, int(outDim)))
+            for _ in range(3)])
+        self.body_node_pool = nn.Sequential(
+            nn.LayerNorm(int(outDim)),
+            nn.Linear(int(outDim), 1))
+        self.body_node_summary_proj = nn.Sequential(
+            nn.LayerNorm(int(outDim) * 2),
+            nn.Linear(int(outDim) * 2, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, int(outDim)),
+            nn.LayerNorm(int(outDim)))
+        self.body_node_residual_gain = nn.Parameter(torch.tensor(-2.944439))
+        self.graph_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(int(outDim) * 2),
+                nn.Linear(int(outDim) * 2, int(outDim) * 2),
+                nn.SiLU(),
+                nn.Linear(int(outDim) * 2, int(outDim)))
+            for _ in range(3)])
+        self.graph_pool = nn.Sequential(
+            nn.LayerNorm(int(outDim)),
+            nn.Linear(int(outDim), 1))
+        self.graph_out = nn.Sequential(
+            nn.LayerNorm(int(outDim) * 2 + int(physicalReferenceDim)),
+            nn.Linear(
+                int(outDim) * 2 + int(physicalReferenceDim),
+                hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, int(outDim)),
+            nn.LayerNorm(int(outDim)))
+        adjacency = torch.zeros(
+            self.endpoint_count, self.endpoint_count)
+        active_endpoints = list(range(self.endpoint_count))
+        endpoint_paths: Dict[int, Dict[int, int]] = {}
+        for endpoint_index in active_endpoints:
+            node_index = int(endpoint_to_node[endpoint_index].item())
+            if not (
+                0 <= node_index < self.node_count
+            ):
+                raise ValueError("morphology endpoint maps to an invalid node")
+            visited = set()
+            path: Dict[int, int] = {}
+            distance = 0
+            while 0 <= node_index < parent_index.numel():
+                if node_index in visited:
+                    raise ValueError("morphology parent graph contains a cycle")
+                visited.add(node_index)
+                path[node_index] = distance
+                node_index = int(parent_index[node_index].item())
+                distance += 1
+            endpoint_paths[endpoint_index] = path
+        for left in active_endpoints:
+            for right in active_endpoints:
+                common = set(endpoint_paths[left]).intersection(
+                    endpoint_paths[right])
+                if common:
+                    distance = min(
+                        endpoint_paths[left][node]
+                        + endpoint_paths[right][node]
+                        for node in common)
+                    adjacency[left, right] = 1.0 / float(1 + distance)
+        adjacency = adjacency / adjacency.sum(
+            dim=-1, keepdim=True).clamp_min(1.0)
+        body_node_adjacency = torch.eye(self.node_count)
+        for node_index in range(self.node_count):
+            parent = int(parent_index[node_index].item())
+            if parent >= 0:
+                body_node_adjacency[node_index, parent] = 1.0
+                body_node_adjacency[parent, node_index] = 1.0
+        body_node_adjacency = body_node_adjacency / body_node_adjacency.sum(
+            dim=-1, keepdim=True).clamp_min(1.0)
+        observer_mask = torch.zeros(
+            self.endpoint_count, dtype=torch.bool)
+        if observer_endpoint_valid:
+            observer_mask[observer_endpoint_index] = True
+        self.observer_valid = observer_valid
+        self.observer_endpoint_valid = observer_endpoint_valid
+        self.observer_endpoint_index = observer_endpoint_index
+        self.register_buffer(
+            "observer_mask", observer_mask.view(1, -1), persistent=False)
+        self.register_buffer(
+            "endpoint_descriptor",
+            endpoint_descriptor.view(1, self.endpoint_count, -1),
+            persistent=False)
+        self.register_buffer(
+            "endpoint_graph_adjacency", adjacency, persistent=False)
+        self.register_buffer(
+            "joint_descriptor",
+            joint_descriptor.unsqueeze(0),
+            persistent=False)
+        self.register_buffer(
+            "joint_lower", joint_lower.view(1, -1), persistent=False)
+        self.register_buffer(
+            "joint_upper", joint_upper.view(1, -1), persistent=False)
+        self.register_buffer(
+            "joint_velocity_limit",
+            joint_velocity_limit.view(1, -1),
+            persistent=False)
+        self.register_buffer(
+            "joint_effort_limit",
+            joint_effort_limit.view(1, -1),
+            persistent=False)
+        self.register_buffer(
+            "body_node_descriptor",
+            node_descriptor.view(1, self.node_count, -1),
+            persistent=False)
+        self.register_buffer(
+            "body_node_adjacency",
+            body_node_adjacency,
+            persistent=False)
 
     def forward(
         self,
-        bodyProprioception: torch.Tensor,
-        robotPhysicalReference: torch.Tensor,) -> torch.Tensor:
-        return self.net(torch.cat([
-            bodyProprioception.flatten(1),
-            robotPhysicalReference], dim=-1))
+        endpointProprioception: torch.Tensor,
+        robotPhysicalReference: torch.Tensor,
+        *,
+        endpointStateValid: torch.Tensor,
+        endpointControllable: torch.Tensor,
+        jointPosition: torch.Tensor,
+        jointVelocity: torch.Tensor,
+        jointEffort: torch.Tensor,
+        jointObserved: torch.Tensor,
+        jointHealthy: torch.Tensor,
+        jointControllable: torch.Tensor,
+        nodePoseWorld: torch.Tensor,
+        nodeTwistWorld: torch.Tensor,
+        nodeObserved: torch.Tensor,
+        nodeHealthy: torch.Tensor,) -> torch.Tensor:
+        if tuple(endpointProprioception.shape[1:]) != (
+            self.endpoint_count, self.pose_dim
+        ):
+            raise ValueError("robot endpoint pose tensor does not match morphology")
+        if robotPhysicalReference.size(-1) != self.physical_reference_dim:
+            raise ValueError("robot physical reference dimension does not match")
+        if not torch.is_tensor(endpointStateValid):
+            raise TypeError("runtime endpoint validity must be a tensor")
+        if tuple(endpointStateValid.shape) != (
+            endpointProprioception.size(0), self.endpoint_count
+        ):
+            raise ValueError("runtime endpoint validity does not match morphology")
+        if endpointStateValid.device != endpointProprioception.device:
+            raise ValueError("runtime endpoint validity device does not match state")
+        if endpointStateValid.dtype != torch.bool:
+            raise TypeError("runtime endpoint validity must be boolean")
+        if not torch.is_tensor(endpointControllable):
+            raise TypeError("runtime endpoint controllability must be a tensor")
+        if tuple(endpointControllable.shape) != tuple(endpointStateValid.shape):
+            raise ValueError(
+                "runtime endpoint controllability does not match morphology")
+        if endpointControllable.device != endpointProprioception.device:
+            raise ValueError(
+                "runtime endpoint controllability device does not match state")
+        if endpointControllable.dtype != torch.bool:
+            raise TypeError("runtime endpoint controllability must be boolean")
+        runtime_endpoint_valid = endpointStateValid
+        runtime_endpoint_controllable = (
+            endpointControllable & runtime_endpoint_valid)
+        valid = runtime_endpoint_valid.to(
+            dtype=endpointProprioception.dtype).unsqueeze(-1)
+        masked_proprioception = endpointProprioception * valid
+        reference_valid = robotPhysicalReference[:, -1:].clamp(0.0, 1.0)
+        effective_reference = torch.cat([
+            robotPhysicalReference[:, :-1] * reference_valid,
+            reference_valid], dim=-1)
+        B = int(endpointProprioception.size(0))
+        nodes = masked_proprioception
+        hidden = (
+            self.node_pose_proj(nodes)
+            + self.node_descriptor_proj(
+                self.endpoint_descriptor.to(
+                    device=nodes.device,
+                    dtype=nodes.dtype))
+            + self.endpoint_runtime_proj(torch.stack([
+                runtime_endpoint_valid.to(dtype=nodes.dtype),
+                runtime_endpoint_controllable.to(dtype=nodes.dtype),
+            ], dim=-1))) * valid
+        observer_mask = self.observer_mask.to(
+            device=hidden.device,
+            dtype=hidden.dtype).unsqueeze(-1)
+        hidden = hidden + (
+            observer_mask
+            * self.observer_reference_proj(
+                effective_reference).unsqueeze(1)
+            * reference_valid.unsqueeze(-1))
+        adjacency = self.endpoint_graph_adjacency.to(
+            device=hidden.device, dtype=hidden.dtype)
+        for block in self.graph_blocks:
+            message = torch.einsum("ij,bjd->bid", adjacency, hidden)
+            hidden = (
+                hidden
+                + block(torch.cat([hidden, message], dim=-1))) * valid
+        score = self.graph_pool(hidden).squeeze(-1)
+        valid_bool = runtime_endpoint_valid.to(device=score.device)
+        score = score.masked_fill(~valid_bool, torch.finfo(score.dtype).min)
+        weights = F.softmax(score, dim=-1)
+        weights = torch.where(
+            valid_bool.any(dim=-1, keepdim=True),
+            weights,
+            torch.zeros_like(weights))
+        mean = torch.einsum("bi,bid->bd", weights, hidden)
+        variance = torch.einsum(
+            "bi,bid->bd",
+            weights,
+            (hidden - mean.unsqueeze(1)).square())
+        graph_summary = self.graph_out(torch.cat([
+            mean,
+            variance,
+            effective_reference,], dim=-1))
+        body_node_tensors = (
+            nodePoseWorld,
+            nodeTwistWorld,
+            nodeObserved,
+            nodeHealthy)
+        if any(value is None for value in body_node_tensors):
+            raise ValueError("runtime node state must be supplied as one contract")
+        else:
+            if tuple(nodePoseWorld.shape) != (
+                B, self.node_count, self.pose_dim
+            ):
+                raise ValueError("runtime node pose does not match morphology")
+            if tuple(nodeTwistWorld.shape) != (B, self.node_count, 6):
+                raise ValueError("runtime node twist does not match morphology")
+            if (
+                tuple(nodeObserved.shape) != (B, self.node_count)
+                or tuple(nodeHealthy.shape) != (B, self.node_count)
+            ):
+                raise ValueError("runtime node masks do not match morphology")
+            body_node_valid = (
+                nodeObserved.to(device=graph_summary.device, dtype=torch.bool)
+                & nodeHealthy.to(
+                    device=graph_summary.device, dtype=torch.bool))
+            node_state = torch.cat([
+                torch.tanh(nodePoseWorld[..., :3]),
+                F.normalize(nodePoseWorld[..., 3:7], dim=-1, eps=1e-6),
+                torch.tanh(nodeTwistWorld),
+                nodeObserved.to(dtype=graph_summary.dtype).unsqueeze(-1),
+                nodeHealthy.to(dtype=graph_summary.dtype).unsqueeze(-1),
+            ], dim=-1)
+            body_node_mask = body_node_valid.to(
+                dtype=graph_summary.dtype).unsqueeze(-1)
+            body_node_token = (
+                self.body_node_state_proj(node_state)
+                + self.body_node_descriptor_proj(
+                    self.body_node_descriptor.to(
+                        device=graph_summary.device,
+                        dtype=graph_summary.dtype))) * body_node_mask
+            body_node_adjacency = self.body_node_adjacency.to(
+                device=graph_summary.device,
+                dtype=graph_summary.dtype)
+            for block in self.body_node_blocks:
+                body_node_message = torch.einsum(
+                    "ij,bjd->bid",
+                    body_node_adjacency,
+                    body_node_token)
+                body_node_token = (
+                    body_node_token
+                    + block(torch.cat([
+                        body_node_token,
+                        body_node_message], dim=-1))) * body_node_mask
+            body_node_score = self.body_node_pool(
+                body_node_token).squeeze(-1)
+            body_node_score = body_node_score.masked_fill(
+                ~body_node_valid,
+                torch.finfo(body_node_score.dtype).min)
+            body_node_weight = F.softmax(body_node_score, dim=-1)
+            body_node_weight = torch.where(
+                body_node_valid.any(dim=-1, keepdim=True),
+                body_node_weight,
+                torch.zeros_like(body_node_weight))
+            body_node_mean = torch.einsum(
+                "bi,bid->bd",
+                body_node_weight,
+                body_node_token)
+            body_node_variance = torch.einsum(
+                "bi,bid->bd",
+                body_node_weight,
+                (body_node_token - body_node_mean.unsqueeze(1)).square())
+            body_node_summary = self.body_node_summary_proj(torch.cat([
+                body_node_mean,
+                body_node_variance], dim=-1))
+            body_node_evidence = body_node_valid.any(
+                dim=-1, keepdim=True)
+            body_node_summary *= body_node_evidence.to(
+                dtype=body_node_summary.dtype)
+        joint_tensors = (
+            jointPosition,
+            jointVelocity,
+            jointEffort,
+            jointObserved,
+            jointHealthy,
+            jointControllable,)
+        if any(value is None for value in joint_tensors):
+            raise ValueError("runtime joint state must be supplied as one contract")
+        else:
+            expected_joint_shape = (
+                B, self.joint_count)
+            if any(tuple(value.shape) != expected_joint_shape for value in joint_tensors):
+                raise ValueError("runtime joint state does not match morphology")
+            runtime_joint_valid = (
+                jointObserved.to(device=graph_summary.device, dtype=torch.bool)
+                & jointHealthy.to(device=graph_summary.device, dtype=torch.bool))
+            lower = self.joint_lower.to(
+                device=graph_summary.device, dtype=graph_summary.dtype)
+            upper = self.joint_upper.to(
+                device=graph_summary.device, dtype=graph_summary.dtype)
+            finite_bounds = (
+                torch.isfinite(lower)
+                & torch.isfinite(upper)
+                & (upper > lower))
+            finite_lower = torch.where(
+                finite_bounds, lower, torch.zeros_like(lower))
+            finite_upper = torch.where(
+                finite_bounds, upper, torch.zeros_like(upper))
+            center = 0.5 * (finite_lower + finite_upper)
+            half_range = 0.5 * (finite_upper - finite_lower).abs()
+            position_scale = half_range.clamp_min(1e-6)
+            raw_velocity_scale = self.joint_velocity_limit.to(
+                device=graph_summary.device,
+                dtype=graph_summary.dtype).abs()
+            velocity_scale = torch.where(
+                torch.isfinite(raw_velocity_scale)
+                & (raw_velocity_scale > 1e-6),
+                raw_velocity_scale,
+                torch.ones_like(raw_velocity_scale))
+            raw_effort_scale = self.joint_effort_limit.to(
+                device=graph_summary.device,
+                dtype=graph_summary.dtype).abs()
+            effort_scale = torch.where(
+                torch.isfinite(raw_effort_scale)
+                & (raw_effort_scale > 1e-6),
+                raw_effort_scale,
+                torch.ones_like(raw_effort_scale))
+            normalized_position = torch.where(
+                finite_bounds,
+                (jointPosition - center) / position_scale,
+                jointPosition)
+            state = torch.stack([
+                torch.tanh(normalized_position),
+                torch.tanh(jointVelocity / velocity_scale),
+                torch.tanh(jointEffort / effort_scale),
+                jointObserved.to(dtype=graph_summary.dtype),
+                jointHealthy.to(dtype=graph_summary.dtype),
+                jointControllable.to(dtype=graph_summary.dtype),], dim=-1)
+            joint_mask = runtime_joint_valid.to(
+                dtype=graph_summary.dtype).unsqueeze(-1)
+            joint_token = (
+                self.joint_state_proj(state)
+                + self.joint_descriptor_proj(
+                    self.joint_descriptor.to(
+                        device=graph_summary.device,
+                        dtype=graph_summary.dtype))) * joint_mask
+            joint_count = joint_mask.sum(dim=1).clamp_min(1.0)
+            joint_mean = joint_token.sum(dim=1) / joint_count
+            joint_variance = (
+                (joint_token - joint_mean.unsqueeze(1)).square()
+                * joint_mask).sum(dim=1) / joint_count
+            joint_summary = self.joint_summary_proj(torch.cat([
+                joint_mean,
+                joint_variance,], dim=-1))
+            joint_evidence = runtime_joint_valid.any(
+                dim=-1, keepdim=True)
+            joint_summary = joint_summary * joint_evidence.to(
+                dtype=joint_summary.dtype)
+        evidence_valid = (
+            valid_bool.any(dim=-1, keepdim=True)
+            | reference_valid.gt(0.5)
+            | body_node_evidence
+            | joint_evidence)
+        output = graph_summary + (
+            torch.sigmoid(self.joint_residual_gain) * joint_summary
+            + torch.sigmoid(self.body_node_residual_gain)
+            * body_node_summary)
+        return output * evidence_valid.to(dtype=output.dtype)
 
 
 class RobotWorldRelationEncoder(AGICoreModule):
@@ -1556,10 +2321,10 @@ class RobotWorldRelationEncoder(AGICoreModule):
             + int(affordanceDim)
             + int(poseDim)
             + int(relationClasses)
-            + 14)
+            + 15)
 
         robot_action_input_dim = (
-            int(robotDim) + int(actionDim) + ModuleDim.CameraMotionDim)
+            int(robotDim) + int(actionDim) + ModuleDim.ObserverMotionDim + 1)
         self.robot_action_proj = nn.Sequential(
             nn.LayerNorm(robot_action_input_dim),
             GrowableLoRALinear(nn.Linear(robot_action_input_dim, hidden, bias=True)),
@@ -1740,6 +2505,7 @@ class RobotWorldRelationEncoder(AGICoreModule):
             **{key: (B, K, dim) for key, dim in self._slot_field_dims.items()},
             "SlotPresence": (B, K),
             "MphysRaw": (B, K),
+            "GeometryValidMask": (B, K),
             "ContactProbRaw": (B, K),
             "MovingProbRaw": (B, K),
             "Visibility": (B, K),
@@ -1763,23 +2529,30 @@ class RobotWorldRelationEncoder(AGICoreModule):
 
     def forward(
         self,
-        robotPhysicalState: torch.Tensor, # [B, 128]
-        physicalState: Dict[str, torch.Tensor], # Dict[str, Tensor]
-        actionEnc: torch.Tensor, # [B, 256]
-        cameraMotion: torch.Tensor, # [B, 4], relative XYZW rotation quaternion
+        robotPhysicalState: torch.Tensor,
+        physicalState: Dict[str, torch.Tensor],
+        actionEnc: torch.Tensor,
+        cameraMotion: torch.Tensor,
+        observerValid: torch.Tensor,
         ) -> torch.Tensor:
-        """Encode the supplied relation without shifting the caller's time indices.
-
-        Filtering callers intentionally supply the current measured robot/PST state together
-        with the previously executed action feedback. Prospective callers instead supply the
-        current state with a candidate action. The same encoder therefore supports both
-        current-state estimation and forward rollout.
-        """
         B, K = self._validate_inputs(robotPhysicalState, physicalState, actionEnc)
+        if tuple(cameraMotion.shape) != (B, ModuleDim.ObserverMotionDim):
+            raise ValueError("observer motion shape does not match dimension")
+        if not torch.is_tensor(observerValid):
+            raise TypeError("observer validity must be a tensor")
+        if tuple(observerValid.shape) != (B,):
+            raise ValueError("observer validity must be [B]")
+        if observerValid.device != cameraMotion.device:
+            raise ValueError("observer validity device does not match motion")
+        if observerValid.dtype != torch.bool:
+            raise TypeError("observer validity must be boolean")
+        observer_valid = observerValid.to(
+            dtype=cameraMotion.dtype).unsqueeze(-1)
         robot_action = self.robot_action_proj(torch.cat([
             robotPhysicalState,
             actionEnc,
-            cameraMotion], dim=-1))
+            cameraMotion,
+            observer_valid], dim=-1))
 
         confidence_dtype = physicalState["SlotState"].dtype
         slot_presence = physicalState["SlotPresence"]
@@ -1815,6 +2588,7 @@ class RobotWorldRelationEncoder(AGICoreModule):
             safe_slot("ContactPointCameraRaw"),
             safe_slot("Visibility").unsqueeze(-1),
             safe_slot("Occlusion").unsqueeze(-1),
+            safe_slot("GeometryValidMask").unsqueeze(-1),
             safe_slot("Observed").to(dtype=confidence_dtype).unsqueeze(-1),
             recency.unsqueeze(-1),], dim=-1)
         slot_token = self.slot_proj(slot_input) # [B, K, 128]
@@ -1945,7 +2719,8 @@ class RSSMWorldModel(AGICoreModule):
         physicalSymbolDim: int = 16,
         physicalObservationThreshold: float = 0.5,
         physicalIdentityThreshold: float = 0.75,
-        physicalConfidenceDecay: float = 0.995,):
+        physicalConfidenceDecay: float = 0.995,
+        robotMorphology: Optional[Any] = None,):
         super().__init__()
 
         self.vision_dim = visionDim
@@ -1976,14 +2751,46 @@ class RSSMWorldModel(AGICoreModule):
         self.physical_state_dim = int(physicalStateDim)
         self.physical_affordance_dim = int(physicalAffordanceDim)
         self.physical_text_dim = int(physicalTextDim)
+        self.entity_text_semantic_dim = 512
         self.physical_symbol_dim = int(physicalSymbolDim)
         self.physical_observation_threshold = float(physicalObservationThreshold)
         self.physical_identity_threshold = float(physicalIdentityThreshold)
         self.physical_confidence_decay = float(physicalConfidenceDecay)
+        if robotMorphology is None:
+            raise ValueError("robot morphology is required")
+        self.self_part_count = int(robotMorphology.node_count)
+        self.self_part_semantic_dim = int(
+            ModuleDim.PstSelfPartSemanticDim)
         self.robot_physical_dim = ModuleDim.PstSlotDim
         self.robot_world_dim = ModuleDim.PstSlotDim
+        self.observer_valid = bool(
+            robotMorphology is not None
+            and robotMorphology.observer_valid)
         self.robot_physical_encoder = WorldRobotPhysicalEncoder(
-            outDim=self.robot_physical_dim)
+            outDim=self.robot_physical_dim,
+            robotMorphology=robotMorphology)
+        entity_bank_input_dim = (
+            self.physical_slot_dim
+            + ModuleDim.PstRealmClasses
+            + ModuleDim.PstMotionLayerClasses
+            + ModuleDim.PstAgencyClasses
+            + 1
+            + self.self_part_semantic_dim
+            + 2
+            + 2
+            + 1
+            + 1
+            + 2
+            + 1
+            + 1
+            + self.entity_text_semantic_dim
+            + 3)
+        self.entity_conscious_encoder = nn.Sequential(
+            nn.LayerNorm(entity_bank_input_dim),
+            nn.Linear(entity_bank_input_dim, self.state_dim * 2),
+            nn.SiLU(),
+            nn.Linear(self.state_dim * 2, self.state_dim),
+            nn.LayerNorm(self.state_dim),)
 
         self._A_prev = None
 
@@ -2033,6 +2840,7 @@ class RSSMWorldModel(AGICoreModule):
         self._mem_path = memoryPath
         self._mem_autosave_every = int(memoryAutosaveEvery)
         self._mem_add_count = 0
+        self._mem_autosave_pending = False
         self._memory_calibration_id: Optional[str] = None
         self._memory_world_frame_id: Optional[str] = None
 
@@ -2048,6 +2856,35 @@ class RSSMWorldModel(AGICoreModule):
         self.register_buffer("_pst_attribute", torch.zeros(1, self.physical_slots, self.physical_attr_dim))
         self.register_buffer("_pst_slot_presence", torch.zeros(1, self.physical_slots))
         self.register_buffer("_pst_entity_prob", torch.zeros(1, self.physical_slots))
+        self.register_buffer(
+            "_pst_entity_id",
+            torch.full((1, self.physical_slots), -1, dtype=torch.long))
+        self.register_buffer(
+            "_pst_slot_generation",
+            torch.zeros(1, self.physical_slots, dtype=torch.long))
+        self.register_buffer(
+            "_pst_next_entity_id",
+            torch.zeros(1, dtype=torch.long))
+        self.register_buffer(
+            "_last_observed_to_world_slot",
+            torch.full((1, 0), -1, dtype=torch.long))
+        self.register_buffer("_pst_perceptual_presence", torch.zeros(1, self.physical_slots))
+        self.register_buffer("_pst_geometry_valid", torch.zeros(1, self.physical_slots))
+        self.register_buffer("_pst_physical_interaction", torch.zeros(1, self.physical_slots))
+        self.register_buffer("_pst_realm", torch.zeros(1, self.physical_slots, ModuleDim.PstRealmClasses))
+        self.register_buffer("_pst_motion_layer", torch.zeros(1, self.physical_slots, ModuleDim.PstMotionLayerClasses))
+        self.register_buffer("_pst_layer_agency", torch.zeros(1, self.physical_slots, ModuleDim.PstMotionLayerClasses, ModuleDim.PstAgencyClasses))
+        self.register_buffer("_pst_agency", torch.zeros(1, self.physical_slots, ModuleDim.PstAgencyClasses))
+        self.register_buffer("_pst_body_membership", torch.zeros(1, self.physical_slots))
+        self.register_buffer(
+            "_pst_self_part",
+            torch.zeros(1, self.physical_slots, self.self_part_count))
+        self.register_buffer(
+            "_pst_self_part_semantic",
+            torch.zeros(
+                1,
+                self.physical_slots,
+                self.self_part_semantic_dim))
         self.register_buffer("_pst_identity_key", torch.zeros(1, self.physical_slots, self.physical_id_dim))
         self.register_buffer("_pst_pairwise_relation", torch.zeros(1, self.physical_slots, self.physical_slots, self.physical_rel_dim))
         self.register_buffer(
@@ -2059,15 +2896,37 @@ class RSSMWorldModel(AGICoreModule):
         self.register_buffer("_pst_state", torch.zeros(1, self.physical_slots, self.physical_state_dim))
         self.register_buffer("_pst_affordance", torch.zeros(1, self.physical_slots, self.physical_affordance_dim))
         self.register_buffer("_pst_motion", torch.zeros(1, self.physical_slots, self.physical_pose_dim))
+        self.register_buffer("_pst_carrier_motion", torch.zeros(1, self.physical_slots, self.physical_pose_dim))
+        self.register_buffer("_pst_articulation_motion", torch.zeros(1, self.physical_slots, self.physical_pose_dim))
+        self.register_buffer("_pst_content_motion", torch.zeros(1, self.physical_slots, 2))
+        self.register_buffer("_pst_content_change", torch.zeros(1, self.physical_slots))
         self.register_buffer("_pst_moving", torch.zeros(1, self.physical_slots))
         self.register_buffer("_pst_contact", torch.zeros(1, self.physical_slots))
         self.register_buffer("_pst_contact_force", torch.zeros(1, self.physical_slots, 2))
         self.register_buffer("_pst_contact_point", torch.zeros(1, self.physical_slots, 3))
         self.register_buffer("_pst_parent", torch.zeros(1, self.physical_slots, self.physical_slots))
+        self.register_buffer("_pst_display_surface", torch.zeros(1, self.physical_slots))
+        self.register_buffer("_pst_surface_parent", torch.zeros(1, self.physical_slots, self.physical_slots + 1))
+        self.register_buffer("_pst_surface_uv", torch.zeros(1, self.physical_slots, 2))
+        self.register_buffer("_pst_surface_uv_confidence", torch.zeros(1, self.physical_slots))
+        self.register_buffer("_pst_verification", torch.zeros(1, self.physical_slots))
+        self.register_buffer("_pst_ontology_relation", torch.zeros(1, self.physical_slots, self.physical_slots, ModuleDim.PstOntologyRelationClasses))
         self.register_buffer("_pst_visibility", torch.zeros(1, self.physical_slots))
         self.register_buffer("_pst_occlusion", torch.zeros(1, self.physical_slots))
         self.register_buffer("_pst_has_text", torch.zeros(1, self.physical_slots))
         self.register_buffer("_pst_text", torch.zeros(1, self.physical_slots, self.physical_text_dim))
+        self.register_buffer(
+            "_pst_entity_text_semantic",
+            torch.zeros(1, self.physical_slots, self.entity_text_semantic_dim))
+        self.register_buffer(
+            "_pst_entity_text_confidence",
+            torch.zeros(1, self.physical_slots))
+        self.register_buffer(
+            "_pst_entity_text_revision",
+            torch.zeros(1, self.physical_slots, dtype=torch.long))
+        self.register_buffer(
+            "_pst_entity_text_changed",
+            torch.zeros(1, self.physical_slots, dtype=torch.bool))
         self.register_buffer("_pst_symbol", torch.zeros(1, self.physical_slots, self.physical_symbol_dim))
         self.register_buffer("_pst_observed", torch.zeros(1, self.physical_slots, dtype=torch.bool))
         self.register_buffer("_pst_last_seen", torch.zeros(1, self.physical_slots, dtype=torch.long))
@@ -2184,6 +3043,23 @@ class RSSMWorldModel(AGICoreModule):
         self._pst_attribute = self._pst_attribute.new_zeros(B, K, self.physical_attr_dim)
         self._pst_slot_presence = self._pst_slot_presence.new_zeros(B, K)
         self._pst_entity_prob = self._pst_entity_prob.new_zeros(B, K)
+        self._pst_entity_id = self._pst_entity_id.new_full((B, K), -1)
+        self._pst_slot_generation = self._pst_slot_generation.new_zeros(B, K)
+        self._pst_next_entity_id = self._pst_next_entity_id.new_zeros(B)
+        self._last_observed_to_world_slot = (
+            self._last_observed_to_world_slot.new_full((B, 0), -1))
+        self._pst_perceptual_presence = self._pst_perceptual_presence.new_zeros(B, K)
+        self._pst_geometry_valid = self._pst_geometry_valid.new_zeros(B, K)
+        self._pst_physical_interaction = self._pst_physical_interaction.new_zeros(B, K)
+        self._pst_realm = self._pst_realm.new_zeros(B, K, ModuleDim.PstRealmClasses)
+        self._pst_motion_layer = self._pst_motion_layer.new_zeros(B, K, ModuleDim.PstMotionLayerClasses)
+        self._pst_layer_agency = self._pst_layer_agency.new_zeros(B, K, ModuleDim.PstMotionLayerClasses, ModuleDim.PstAgencyClasses)
+        self._pst_agency = self._pst_agency.new_zeros(B, K, ModuleDim.PstAgencyClasses)
+        self._pst_body_membership = self._pst_body_membership.new_zeros(B, K)
+        self._pst_self_part = self._pst_self_part.new_zeros(
+            B, K, self.self_part_count)
+        self._pst_self_part_semantic = self._pst_self_part_semantic.new_zeros(
+            B, K, self.self_part_semantic_dim)
         self._pst_identity_key = self._pst_identity_key.new_zeros(B, K, self.physical_id_dim)
         self._pst_pairwise_relation = self._pst_pairwise_relation.new_zeros(B, K, K, self.physical_rel_dim)
         self._pst_pair_last_seen = self._pst_pair_last_seen.new_zeros(B, K, K)
@@ -2193,15 +3069,34 @@ class RSSMWorldModel(AGICoreModule):
         self._pst_state = self._pst_state.new_zeros(B, K, self.physical_state_dim)
         self._pst_affordance = self._pst_affordance.new_zeros(B, K, self.physical_affordance_dim)
         self._pst_motion = self._pst_motion.new_zeros(B, K, self.physical_pose_dim)
+        self._pst_carrier_motion = self._pst_carrier_motion.new_zeros(B, K, self.physical_pose_dim)
+        self._pst_articulation_motion = self._pst_articulation_motion.new_zeros(B, K, self.physical_pose_dim)
+        self._pst_content_motion = self._pst_content_motion.new_zeros(B, K, 2)
+        self._pst_content_change = self._pst_content_change.new_zeros(B, K)
         self._pst_moving = self._pst_moving.new_zeros(B, K)
         self._pst_contact = self._pst_contact.new_zeros(B, K)
         self._pst_contact_force = self._pst_contact_force.new_zeros(B, K, 2)
         self._pst_contact_point = self._pst_contact_point.new_zeros(B, K, 3)
         self._pst_parent = self._pst_parent.new_zeros(B, K, K)
+        self._pst_display_surface = self._pst_display_surface.new_zeros(B, K)
+        self._pst_surface_parent = self._pst_surface_parent.new_zeros(B, K, K + 1)
+        self._pst_surface_uv = self._pst_surface_uv.new_zeros(B, K, 2)
+        self._pst_surface_uv_confidence = self._pst_surface_uv_confidence.new_zeros(B, K)
+        self._pst_verification = self._pst_verification.new_zeros(B, K)
+        self._pst_ontology_relation = self._pst_ontology_relation.new_zeros(B, K, K, ModuleDim.PstOntologyRelationClasses)
         self._pst_visibility = self._pst_visibility.new_zeros(B, K)
         self._pst_occlusion = self._pst_occlusion.new_zeros(B, K)
         self._pst_has_text = self._pst_has_text.new_zeros(B, K)
         self._pst_text = self._pst_text.new_zeros(B, K, self.physical_text_dim)
+        self._pst_entity_text_semantic = (
+            self._pst_entity_text_semantic.new_zeros(
+                B, K, self.entity_text_semantic_dim))
+        self._pst_entity_text_confidence = (
+            self._pst_entity_text_confidence.new_zeros(B, K))
+        self._pst_entity_text_revision = (
+            self._pst_entity_text_revision.new_zeros(B, K))
+        self._pst_entity_text_changed = (
+            self._pst_entity_text_changed.new_zeros(B, K))
         self._pst_symbol = self._pst_symbol.new_zeros(B, K, self.physical_symbol_dim)
         self._pst_observed = self._pst_observed.new_zeros(B, K)
         self._pst_last_seen = self._pst_last_seen.new_zeros(B, K)
@@ -2286,6 +3181,12 @@ class RSSMWorldModel(AGICoreModule):
         if type(payload["batch_size"]) is not int or payload["batch_size"] != B:
             raise ValueError(
                 "world memory batch_size must match the stored tensor batch")
+        observed_mapping = payload["last_observed_to_world_slot"]
+        if observed_mapping.ndim != 2 or int(observed_mapping.size(0)) != B:
+            raise ValueError(
+                "world memory last_observed_to_world_slot must have shape "
+                f"[B, Kobs], got {tuple(observed_mapping.shape)}")
+        Kobs = int(observed_mapping.size(1))
         K = self.physical_slots
         expected_shapes = {
             "mem_keys": (B, C, self.stoch_dim),
@@ -2299,6 +3200,21 @@ class RSSMWorldModel(AGICoreModule):
             "pst_attribute": (B, K, self.physical_attr_dim),
             "pst_slot_presence": (B, K),
             "pst_entity_prob": (B, K),
+            "pst_entity_id": (B, K),
+            "pst_slot_generation": (B, K),
+            "pst_next_entity_id": (B,),
+            "last_observed_to_world_slot": (B, Kobs),
+            "pst_perceptual_presence": (B, K),
+            "pst_geometry_valid": (B, K),
+            "pst_physical_interaction": (B, K),
+            "pst_realm": (B, K, ModuleDim.PstRealmClasses),
+            "pst_motion_layer": (B, K, ModuleDim.PstMotionLayerClasses),
+            "pst_layer_agency": (B, K, ModuleDim.PstMotionLayerClasses, ModuleDim.PstAgencyClasses),
+            "pst_agency": (B, K, ModuleDim.PstAgencyClasses),
+            "pst_body_membership": (B, K),
+            "pst_self_part": (B, K, self.self_part_count),
+            "pst_self_part_semantic": (
+                B, K, self.self_part_semantic_dim),
             "pst_identity_key": (B, K, self.physical_id_dim),
             "pst_pairwise_relation": (B, K, K, self.physical_rel_dim),
             "pst_pair_last_seen": (B, K, K),
@@ -2308,15 +3224,30 @@ class RSSMWorldModel(AGICoreModule):
             "pst_state": (B, K, self.physical_state_dim),
             "pst_affordance": (B, K, self.physical_affordance_dim),
             "pst_motion": (B, K, self.physical_pose_dim),
+            "pst_carrier_motion": (B, K, self.physical_pose_dim),
+            "pst_articulation_motion": (B, K, self.physical_pose_dim),
+            "pst_content_motion": (B, K, 2),
+            "pst_content_change": (B, K),
             "pst_moving": (B, K),
             "pst_contact": (B, K),
             "pst_contact_force": (B, K, 2),
             "pst_contact_point": (B, K, 3),
             "pst_parent": (B, K, K),
+            "pst_display_surface": (B, K),
+            "pst_surface_parent": (B, K, K + 1),
+            "pst_surface_uv": (B, K, 2),
+            "pst_surface_uv_confidence": (B, K),
+            "pst_verification": (B, K),
+            "pst_ontology_relation": (B, K, K, ModuleDim.PstOntologyRelationClasses),
             "pst_visibility": (B, K),
             "pst_occlusion": (B, K),
             "pst_has_text": (B, K),
             "pst_text": (B, K, self.physical_text_dim),
+            "pst_entity_text_semantic": (
+                B, K, self.entity_text_semantic_dim),
+            "pst_entity_text_confidence": (B, K),
+            "pst_entity_text_revision": (B, K),
+            "pst_entity_text_changed": (B, K),
             "pst_symbol": (B, K, self.physical_symbol_dim),
             "pst_observed": (B, K),
             "pst_last_seen": (B, K),
@@ -2329,13 +3260,18 @@ class RSSMWorldModel(AGICoreModule):
 
         integer_fields = (
             "mem_steps", "mem_size", "mem_global_step",
-            "pst_pair_last_seen", "pst_last_seen", "pst_step")
+            "pst_entity_id", "pst_slot_generation", "pst_next_entity_id",
+            "last_observed_to_world_slot", "pst_pair_last_seen",
+            "pst_entity_text_revision", "pst_last_seen", "pst_step")
         for field in integer_fields:
             if payload[field].dtype != torch.long:
                 raise TypeError(f"world memory field {field!r} must have dtype torch.long")
-        if payload["pst_observed"].dtype != torch.bool:
-            raise TypeError("world memory field 'pst_observed' must have dtype torch.bool")
-        float_fields = set(WORLD_MEMORY_TENSOR_FIELDS) - set(integer_fields) - {"pst_observed"}
+        bool_fields = {"pst_entity_text_changed", "pst_observed"}
+        for field in bool_fields:
+            if payload[field].dtype != torch.bool:
+                raise TypeError(
+                    f"world memory field {field!r} must have dtype torch.bool")
+        float_fields = set(WORLD_MEMORY_TENSOR_FIELDS) - set(integer_fields) - bool_fields
         for field in float_fields:
             if not payload[field].is_floating_point():
                 raise TypeError(f"world memory field {field!r} must be floating point")
@@ -2346,6 +3282,42 @@ class RSSMWorldModel(AGICoreModule):
             raise ValueError("world memory mem_size must be within the stored memory capacity")
         if bool((payload["mem_global_step"] < 0).any().item()):
             raise ValueError("world memory mem_global_step must be non-negative")
+        entity_id = payload["pst_entity_id"]
+        slot_generation = payload["pst_slot_generation"]
+        next_entity_id = payload["pst_next_entity_id"]
+        if bool((entity_id < -1).any().item()):
+            raise ValueError("world memory pst_entity_id must be at least -1")
+        if bool((slot_generation < 0).any().item()):
+            raise ValueError("world memory pst_slot_generation must be non-negative")
+        if bool((next_entity_id < 0).any().item()):
+            raise ValueError("world memory pst_next_entity_id must be non-negative")
+        if bool((payload["pst_entity_text_revision"] < 0).any().item()):
+            raise ValueError(
+                "world memory pst_entity_text_revision must be non-negative")
+        text_confidence = payload["pst_entity_text_confidence"]
+        if bool(((text_confidence < 0.0) | (text_confidence > 1.0)).any().item()):
+            raise ValueError(
+                "world memory pst_entity_text_confidence must be a probability")
+        valid_entity = entity_id >= 0
+        if bool((valid_entity & (entity_id >= next_entity_id.unsqueeze(1))).any().item()):
+            raise ValueError(
+                "world memory pst_entity_id must be smaller than pst_next_entity_id")
+        if bool((valid_entity & (slot_generation <= 0)).any().item()):
+            raise ValueError(
+                "world memory live entity ids must have positive slot generation")
+        for b in range(B):
+            lane_ids = entity_id[b, valid_entity[b]]
+            if lane_ids.numel() != torch.unique(lane_ids).numel():
+                raise ValueError("world memory pst_entity_id must be unique within each batch lane")
+        if bool(((observed_mapping < -1) | (observed_mapping >= K)).any().item()):
+            raise ValueError(
+                "world memory last_observed_to_world_slot must contain -1 or a valid slot index")
+        if Kobs > 0:
+            safe_mapping = observed_mapping.clamp_min(0)
+            mapped_entity = entity_id.gather(1, safe_mapping)
+            if bool(((observed_mapping >= 0) & (mapped_entity < 0)).any().item()):
+                raise ValueError(
+                    "world memory observed associations must reference assigned entity ids")
         return B, C
 
     @torch.no_grad()
@@ -2375,6 +3347,21 @@ class RSSMWorldModel(AGICoreModule):
             "pst_attribute": self._pst_attribute.detach().cpu(),
             "pst_slot_presence": self._pst_slot_presence.detach().cpu(),
             "pst_entity_prob": self._pst_entity_prob.detach().cpu(),
+            "pst_entity_id": self._pst_entity_id.detach().cpu(),
+            "pst_slot_generation": self._pst_slot_generation.detach().cpu(),
+            "pst_next_entity_id": self._pst_next_entity_id.detach().cpu(),
+            "last_observed_to_world_slot": (
+                self._last_observed_to_world_slot.detach().cpu()),
+            "pst_perceptual_presence": self._pst_perceptual_presence.detach().cpu(),
+            "pst_geometry_valid": self._pst_geometry_valid.detach().cpu(),
+            "pst_physical_interaction": self._pst_physical_interaction.detach().cpu(),
+            "pst_realm": self._pst_realm.detach().cpu(),
+            "pst_motion_layer": self._pst_motion_layer.detach().cpu(),
+            "pst_layer_agency": self._pst_layer_agency.detach().cpu(),
+            "pst_agency": self._pst_agency.detach().cpu(),
+            "pst_body_membership": self._pst_body_membership.detach().cpu(),
+            "pst_self_part": self._pst_self_part.detach().cpu(),
+            "pst_self_part_semantic": self._pst_self_part_semantic.detach().cpu(),
             "pst_identity_key": self._pst_identity_key.detach().cpu(),
             "pst_pairwise_relation": self._pst_pairwise_relation.detach().cpu(),
             "pst_pair_last_seen": self._pst_pair_last_seen.detach().cpu(),
@@ -2384,15 +3371,33 @@ class RSSMWorldModel(AGICoreModule):
             "pst_state": self._pst_state.detach().cpu(),
             "pst_affordance": self._pst_affordance.detach().cpu(),
             "pst_motion": self._pst_motion.detach().cpu(),
+            "pst_carrier_motion": self._pst_carrier_motion.detach().cpu(),
+            "pst_articulation_motion": self._pst_articulation_motion.detach().cpu(),
+            "pst_content_motion": self._pst_content_motion.detach().cpu(),
+            "pst_content_change": self._pst_content_change.detach().cpu(),
             "pst_moving": self._pst_moving.detach().cpu(),
             "pst_contact": self._pst_contact.detach().cpu(),
             "pst_contact_force": self._pst_contact_force.detach().cpu(),
             "pst_contact_point": self._pst_contact_point.detach().cpu(),
             "pst_parent": self._pst_parent.detach().cpu(),
+            "pst_display_surface": self._pst_display_surface.detach().cpu(),
+            "pst_surface_parent": self._pst_surface_parent.detach().cpu(),
+            "pst_surface_uv": self._pst_surface_uv.detach().cpu(),
+            "pst_surface_uv_confidence": self._pst_surface_uv_confidence.detach().cpu(),
+            "pst_verification": self._pst_verification.detach().cpu(),
+            "pst_ontology_relation": self._pst_ontology_relation.detach().cpu(),
             "pst_visibility": self._pst_visibility.detach().cpu(),
             "pst_occlusion": self._pst_occlusion.detach().cpu(),
             "pst_has_text": self._pst_has_text.detach().cpu(),
             "pst_text": self._pst_text.detach().cpu(),
+            "pst_entity_text_semantic": (
+                self._pst_entity_text_semantic.detach().cpu()),
+            "pst_entity_text_confidence": (
+                self._pst_entity_text_confidence.detach().cpu()),
+            "pst_entity_text_revision": (
+                self._pst_entity_text_revision.detach().cpu()),
+            "pst_entity_text_changed": (
+                self._pst_entity_text_changed.detach().cpu()),
             "pst_symbol": self._pst_symbol.detach().cpu(),
             "pst_observed": self._pst_observed.detach().cpu(),
             "pst_last_seen": self._pst_last_seen.detach().cpu(),
@@ -2476,6 +3481,15 @@ class RSSMWorldModel(AGICoreModule):
             "_pst_attribute": "pst_attribute",
             "_pst_slot_presence": "pst_slot_presence",
             "_pst_entity_prob": "pst_entity_prob",
+            "_pst_perceptual_presence": "pst_perceptual_presence",
+            "_pst_physical_interaction": "pst_physical_interaction",
+            "_pst_realm": "pst_realm",
+            "_pst_motion_layer": "pst_motion_layer",
+            "_pst_layer_agency": "pst_layer_agency",
+            "_pst_agency": "pst_agency",
+            "_pst_body_membership": "pst_body_membership",
+            "_pst_self_part": "pst_self_part",
+            "_pst_self_part_semantic": "pst_self_part_semantic",
             "_pst_identity_key": "pst_identity_key",
             "_pst_pairwise_relation": "pst_pairwise_relation",
             "_pst_external_relation": "pst_external_relation",
@@ -2484,20 +3498,46 @@ class RSSMWorldModel(AGICoreModule):
             "_pst_state": "pst_state",
             "_pst_affordance": "pst_affordance",
             "_pst_motion": "pst_motion",
+            "_pst_carrier_motion": "pst_carrier_motion",
+            "_pst_articulation_motion": "pst_articulation_motion",
+            "_pst_content_motion": "pst_content_motion",
+            "_pst_content_change": "pst_content_change",
             "_pst_moving": "pst_moving",
             "_pst_contact": "pst_contact",
             "_pst_contact_force": "pst_contact_force",
             "_pst_contact_point": "pst_contact_point",
             "_pst_parent": "pst_parent",
+            "_pst_display_surface": "pst_display_surface",
+            "_pst_surface_parent": "pst_surface_parent",
+            "_pst_surface_uv": "pst_surface_uv",
+            "_pst_surface_uv_confidence": "pst_surface_uv_confidence",
+            "_pst_verification": "pst_verification",
+            "_pst_ontology_relation": "pst_ontology_relation",
             "_pst_visibility": "pst_visibility",
             "_pst_occlusion": "pst_occlusion",
             "_pst_has_text": "pst_has_text",
             "_pst_text": "pst_text",
+            "_pst_entity_text_semantic": "pst_entity_text_semantic",
+            "_pst_entity_text_confidence": "pst_entity_text_confidence",
             "_pst_symbol": "pst_symbol",}
         for buffer_name, field in float_buffers.items():
             getattr(self, buffer_name).copy_(payload[field].to(device=dev, dtype=dtyp))
         self._pst_pair_last_seen.copy_(payload["pst_pair_last_seen"].to(device=dev, dtype=torch.long))
+        self._pst_geometry_valid.copy_(payload["pst_geometry_valid"].to(device=dev, dtype=dtyp))
+        self._pst_entity_id.copy_(payload["pst_entity_id"].to(device=dev, dtype=torch.long))
+        self._pst_slot_generation.copy_(
+            payload["pst_slot_generation"].to(device=dev, dtype=torch.long))
+        self._pst_next_entity_id.copy_(
+            payload["pst_next_entity_id"].to(device=dev, dtype=torch.long))
+        self._last_observed_to_world_slot = payload[
+            "last_observed_to_world_slot"].to(device=dev, dtype=torch.long).clone()
         self._pst_observed.copy_(payload["pst_observed"].to(device=dev, dtype=torch.bool))
+        self._pst_entity_text_revision.copy_(
+            payload["pst_entity_text_revision"].to(
+                device=dev, dtype=torch.long))
+        self._pst_entity_text_changed.copy_(
+            payload["pst_entity_text_changed"].to(
+                device=dev, dtype=torch.bool))
         self._pst_last_seen.copy_(payload["pst_last_seen"].to(device=dev, dtype=torch.long))
         self._pst_step.copy_(payload["pst_step"].to(device=dev, dtype=torch.long))
 
@@ -2509,6 +3549,18 @@ class RSSMWorldModel(AGICoreModule):
             self._pst_attribute,
             self._pst_slot_presence,
             self._pst_entity_prob,
+            self._pst_slot_generation,
+            self._pst_next_entity_id,
+            self._pst_perceptual_presence,
+            self._pst_geometry_valid,
+            self._pst_physical_interaction,
+            self._pst_realm,
+            self._pst_motion_layer,
+            self._pst_layer_agency,
+            self._pst_agency,
+            self._pst_body_membership,
+            self._pst_self_part,
+            self._pst_self_part_semantic,
             self._pst_identity_key,
             self._pst_pairwise_relation,
             self._pst_pair_last_seen,
@@ -2518,15 +3570,29 @@ class RSSMWorldModel(AGICoreModule):
             self._pst_state,
             self._pst_affordance,
             self._pst_motion,
+            self._pst_carrier_motion,
+            self._pst_articulation_motion,
+            self._pst_content_motion,
+            self._pst_content_change,
             self._pst_moving,
             self._pst_contact,
             self._pst_contact_force,
             self._pst_contact_point,
             self._pst_parent,
+            self._pst_display_surface,
+            self._pst_surface_parent,
+            self._pst_surface_uv,
+            self._pst_surface_uv_confidence,
+            self._pst_verification,
+            self._pst_ontology_relation,
             self._pst_visibility,
             self._pst_occlusion,
             self._pst_has_text,
             self._pst_text,
+            self._pst_entity_text_semantic,
+            self._pst_entity_text_confidence,
+            self._pst_entity_text_revision,
+            self._pst_entity_text_changed,
             self._pst_symbol,
             self._pst_observed,
             self._pst_last_seen,
@@ -2535,6 +3601,8 @@ class RSSMWorldModel(AGICoreModule):
         if doneMask is None:
             for buffer in buffers:
                 buffer.zero_()
+            self._pst_entity_id.fill_(-1)
+            self._last_observed_to_world_slot.fill_(-1)
             return
 
         mask = doneMask.to(device=self._pst_slot_state.device, dtype=torch.bool).view(-1)
@@ -2545,6 +3613,8 @@ class RSSMWorldModel(AGICoreModule):
             return
         for buffer in buffers:
             buffer[mask] = 0
+        self._pst_entity_id[mask] = -1
+        self._last_observed_to_world_slot[mask] = -1
 
     @torch.no_grad()
     def ResetEpisodeState(self, doneMask: torch.Tensor) -> None:
@@ -2568,7 +3638,15 @@ class RSSMWorldModel(AGICoreModule):
             self._mem_steps.zero_()
             self._mem_size.zero_()
             self._mem_global_step.zero_()
+            self._mem_add_count = 0
+            self._mem_autosave_pending = False
         self.ResetPhysicalState()
+
+    def HasMemoryAutosaveRequest(self) -> bool:
+        return bool(self._mem_autosave_pending)
+
+    def AcknowledgeMemoryAutosaveRequest(self) -> None:
+        self._mem_autosave_pending = False
 
     @torch.no_grad()
     def ReorderMemorySteps(self):
@@ -2635,10 +3713,13 @@ class RSSMWorldModel(AGICoreModule):
         self._mem_imp[bidx, idx] = imp # [B]
         self._mem_steps[bidx, idx] = self._mem_global_step
 
-        if self._mem_path and self._mem_autosave_every > 0:
+        if self._mem_autosave_every > 0:
             self._mem_add_count += 1
             if self._mem_add_count % self._mem_autosave_every == 0:
-                self.SaveMemory(self._mem_path)
+                if self._mem_path:
+                    self.SaveMemory(self._mem_path)
+                else:
+                    self._mem_autosave_pending = True
 
     def MemRetrieve(
         self,
@@ -2721,6 +3802,15 @@ class RSSMWorldModel(AGICoreModule):
             normalized,
             identity)
 
+    def EffectiveObserverPose(
+        self,
+        observerPoseWorld: torch.Tensor,) -> torch.Tensor:
+        if self.observer_valid:
+            return observerPoseWorld
+        identity = torch.zeros_like(observerPoseWorld)
+        identity[..., 6] = 1.0
+        return identity
+
     @torch.no_grad()
     def ComposePose(self, parent: torch.Tensor, child: torch.Tensor) -> torch.Tensor:
         while parent.dim() < child.dim():
@@ -2740,7 +3830,8 @@ class RSSMWorldModel(AGICoreModule):
         self,
         pose: torch.Tensor,
         cameraPoseWorld: torch.Tensor,) -> torch.Tensor:
-        return self.ComposePose(cameraPoseWorld, pose)
+        return self.ComposePose(
+            self.EffectiveObserverPose(cameraPoseWorld), pose)
 
     @torch.no_grad()
     def MotionToWorld(
@@ -2753,7 +3844,7 @@ class RSSMWorldModel(AGICoreModule):
         current camera-optical axes; this rotates the translation and conjugates
         the rotation into world axes without applying camera translation.
         """
-        camera = cameraPoseWorld
+        camera = self.EffectiveObserverPose(cameraPoseWorld)
         while camera.dim() < motionCamera.dim():
             camera = camera.unsqueeze(1)
         camera_q = self.NormalizeQuaternion(camera[..., 3:7])
@@ -2774,7 +3865,7 @@ class RSSMWorldModel(AGICoreModule):
         self,
         poseWorld: torch.Tensor,
         cameraPoseWorld: torch.Tensor,) -> torch.Tensor:
-        camera = cameraPoseWorld
+        camera = self.EffectiveObserverPose(cameraPoseWorld)
         while camera.dim() < poseWorld.dim():
             camera = camera.unsqueeze(1)
         camera_q = self.NormalizeQuaternion(camera[..., 3:7])
@@ -2796,7 +3887,7 @@ class RSSMWorldModel(AGICoreModule):
         self,
         motionWorld: torch.Tensor,
         cameraPoseWorld: torch.Tensor,) -> torch.Tensor:
-        camera = cameraPoseWorld
+        camera = self.EffectiveObserverPose(cameraPoseWorld)
         while camera.dim() < motionWorld.dim():
             camera = camera.unsqueeze(1)
         camera_q = self.NormalizeQuaternion(camera[..., 3:7])
@@ -2820,7 +3911,7 @@ class RSSMWorldModel(AGICoreModule):
         weightedPointWorld: torch.Tensor,
         pointWeight: torch.Tensor,
         cameraPoseWorld: torch.Tensor,) -> torch.Tensor:
-        camera = cameraPoseWorld
+        camera = self.EffectiveObserverPose(cameraPoseWorld)
         while camera.dim() < weightedPointWorld.dim():
             camera = camera.unsqueeze(1)
         camera_q = self.NormalizeQuaternion(camera[..., 3:7])
@@ -2835,7 +3926,8 @@ class RSSMWorldModel(AGICoreModule):
         self,
         pairwiseRelationWorld: torch.Tensor,
         cameraPoseWorld: torch.Tensor,) -> torch.Tensor:
-        camera_q = self.NormalizeQuaternion(cameraPoseWorld[..., 3:7])
+        camera_pose = self.EffectiveObserverPose(cameraPoseWorld)
+        camera_q = self.NormalizeQuaternion(camera_pose[..., 3:7])
         camera_q_inverse = torch.cat(
             [-camera_q[..., :3], camera_q[..., 3:4]], dim=-1)
         camera_q_inverse = camera_q_inverse[:, None, None, :].expand(
@@ -2859,11 +3951,22 @@ class RSSMWorldModel(AGICoreModule):
             name: persistentState[name]
             for name in PERSISTENT_PHYSICAL_STATE_FIELDS
             if name not in PERSISTENT_WORLD_GEOMETRY_FIELDS}
+        pose_camera = self.PoseToCamera(
+            persistentState["PoseWorld"], cameraPoseWorld)
+        identity_pose = torch.zeros_like(pose_camera)
+        identity_pose[..., 6] = 1.0
+        pose_camera = torch.where(
+            persistentState["GeometryValidMask"].unsqueeze(-1) > 0.5,
+            pose_camera,
+            identity_pose)
         model_state.update({
-            "PoseCamera": self.PoseToCamera(
-                persistentState["PoseWorld"], cameraPoseWorld),
+            "PoseCamera": pose_camera,
             "MotionCameraRaw": self.MotionToCamera(
                 persistentState["MotionWorldRaw"], cameraPoseWorld),
+            "CarrierMotionCameraRaw": self.MotionToCamera(
+                persistentState["CarrierMotionWorldRaw"], cameraPoseWorld),
+            "ArticulationMotionCameraRaw": self.MotionToCamera(
+                persistentState["ArticulationMotionWorldRaw"], cameraPoseWorld),
             "ContactPointCameraRaw": self.WeightedPointToCamera(
                 persistentState["ContactPointWorldRaw"],
                 persistentState["ContactProbRaw"],
@@ -2883,7 +3986,7 @@ class RSSMWorldModel(AGICoreModule):
         weightedPointCamera: torch.Tensor,
         pointWeight: torch.Tensor,
         cameraPoseWorld: torch.Tensor,) -> torch.Tensor:
-        camera = cameraPoseWorld
+        camera = self.EffectiveObserverPose(cameraPoseWorld)
         while camera.dim() < weightedPointCamera.dim():
             camera = camera.unsqueeze(1)
         camera_q = self.NormalizeQuaternion(camera[..., 3:7])
@@ -2899,6 +4002,17 @@ class RSSMWorldModel(AGICoreModule):
             "ARaw": self._pst_attribute.detach().clone(),
             "SlotPresence": self._pst_slot_presence.detach().clone(),
             "MphysRaw": self._pst_entity_prob.detach().clone(),
+            "PerceptualPresence": self._pst_perceptual_presence.detach().clone(),
+            "GeometryValidMask": self._pst_geometry_valid.detach().clone(),
+            "PhysicalEntityProb": self._pst_entity_prob.detach().clone(),
+            "PhysicalInteractionProb": self._pst_physical_interaction.detach().clone(),
+            "RealmProb": self._pst_realm.detach().clone(),
+            "MotionLayerProb": self._pst_motion_layer.detach().clone(),
+            "LayerAgencyProb": self._pst_layer_agency.detach().clone(),
+            "AgencyProb": self._pst_agency.detach().clone(),
+            "BodyMembershipProb": self._pst_body_membership.detach().clone(),
+            "SelfPartProb": self._pst_self_part.detach().clone(),
+            "SelfPartSemantic": self._pst_self_part_semantic.detach().clone(),
             "IdentityKey": self._pst_identity_key.detach().clone(),
             "PairwiseRelationWorld": self._pst_pairwise_relation.detach().clone(),
             "PairRelationLastSeen": self._pst_pair_last_seen.detach().clone(),
@@ -2908,19 +4022,124 @@ class RSSMWorldModel(AGICoreModule):
             "StateRaw": self._pst_state.detach().clone(),
             "AffordanceRaw": self._pst_affordance.detach().clone(),
             "MotionWorldRaw": self._pst_motion.detach().clone(),
+            "CarrierMotionWorldRaw": self._pst_carrier_motion.detach().clone(),
+            "ArticulationMotionWorldRaw": self._pst_articulation_motion.detach().clone(),
+            "ContentMotionUV": self._pst_content_motion.detach().clone(),
+            "ContentChangeProb": self._pst_content_change.detach().clone(),
             "MovingProbRaw": self._pst_moving.detach().clone(),
             "ContactProbRaw": self._pst_contact.detach().clone(),
             "ContactForceRaw": self._pst_contact_force.detach().clone(),
             "ContactPointWorldRaw": self._pst_contact_point.detach().clone(),
             "ParentProb": self._pst_parent.detach().clone(),
+            "DisplaySurfaceProb": self._pst_display_surface.detach().clone(),
+            "SurfaceParentProb": self._pst_surface_parent.detach().clone(),
+            "SurfaceUV": self._pst_surface_uv.detach().clone(),
+            "SurfaceUVConfidence": self._pst_surface_uv_confidence.detach().clone(),
+            "VerificationConfidence": self._pst_verification.detach().clone(),
+            "OntologyRelationProb": self._pst_ontology_relation.detach().clone(),
             "Visibility": self._pst_visibility.detach().clone(),
             "Occlusion": self._pst_occlusion.detach().clone(),
             "HasTextProb": self._pst_has_text.detach().clone(),
             "TextEmbed": self._pst_text.detach().clone(),
+            "EntityTextSemantic": (
+                self._pst_entity_text_semantic.detach().clone()),
+            "EntityTextConfidence": (
+                self._pst_entity_text_confidence.detach().clone()),
+            "EntityTextRevision": (
+                self._pst_entity_text_revision.detach().clone()),
+            "EntityTextChanged": (
+                self._pst_entity_text_changed.detach().clone()),
             "SymbolProb": self._pst_symbol.detach().clone(),
             "Observed": self._pst_observed.detach().clone(),
             "LastSeen": self._pst_last_seen.detach().clone(),
             "Step": self._pst_step.detach().clone(),}
+
+    @torch.no_grad()
+    def ExportPhysicalAssociations(self) -> Dict[str, torch.Tensor]:
+        return {
+            "ObservedToWorldSlot": (
+                self._last_observed_to_world_slot.detach().clone()),
+            "WorldEntityId": self._pst_entity_id.detach().clone(),
+            "WorldSlotGeneration": (
+                self._pst_slot_generation.detach().clone()),}
+
+    @torch.no_grad()
+    def UpdateEntityTextState(
+        self,
+        textState: Dict[str, torch.Tensor],
+    ) -> None:
+        required = {
+            "EntityTextSemantic",
+            "EntityTextConfidence",
+            "EntityTextRevision",
+            "EntityTextChanged",
+            "EntityId",
+            "SlotGeneration",}
+        if set(textState) != required:
+            raise ValueError("entity text state fields mismatch")
+        B, K = self._pst_entity_id.shape
+        expected = {
+            "EntityTextSemantic": (B, K, self.entity_text_semantic_dim),
+            "EntityTextConfidence": (B, K),
+            "EntityTextRevision": (B, K),
+            "EntityTextChanged": (B, K),
+            "EntityId": (B, K),
+            "SlotGeneration": (B, K),}
+        for name, shape in expected.items():
+            value = textState[name]
+            if not torch.is_tensor(value) or tuple(value.shape) != shape:
+                raise ValueError(
+                    f"entity text field {name!r} must have shape {shape}")
+            if value.device != self._pst_entity_id.device:
+                raise ValueError(
+                    f"entity text field {name!r} must use the world device")
+        integer_fields = {
+            "EntityTextRevision", "EntityId", "SlotGeneration"}
+        for name in integer_fields:
+            if textState[name].dtype != torch.long:
+                raise TypeError(
+                    f"entity text field {name!r} must use torch.long")
+        if textState["EntityTextChanged"].dtype != torch.bool:
+            raise TypeError(
+                "entity text field 'EntityTextChanged' must use torch.bool")
+        for name in ("EntityTextSemantic", "EntityTextConfidence"):
+            if not textState[name].is_floating_point():
+                raise TypeError(
+                    f"entity text field {name!r} must be floating point")
+            if not bool(torch.isfinite(textState[name]).all().item()):
+                raise ValueError(
+                    f"entity text field {name!r} must be finite")
+        confidence = textState["EntityTextConfidence"]
+        if bool(((confidence < 0.0) | (confidence > 1.0)).any().item()):
+            raise ValueError("entity text confidence must be a probability")
+        if bool((textState["EntityTextRevision"] < 0).any().item()):
+            raise ValueError("entity text revision must be non-negative")
+        live = self._pst_entity_id >= 0
+        if bool((live & (
+            textState["EntityId"] != self._pst_entity_id)).any().item()):
+            raise ValueError("entity text identity does not match world identity")
+        if bool((live & (
+            textState["SlotGeneration"]
+            != self._pst_slot_generation)).any().item()):
+            raise ValueError(
+                "entity text generation does not match world generation")
+        self._pst_entity_text_semantic.copy_(torch.where(
+            live.unsqueeze(-1),
+            textState["EntityTextSemantic"].to(self._pst_entity_text_semantic.dtype),
+            torch.zeros_like(self._pst_entity_text_semantic)))
+        self._pst_entity_text_confidence.copy_(torch.where(
+            live,
+            confidence.to(self._pst_entity_text_confidence.dtype),
+            torch.zeros_like(self._pst_entity_text_confidence)))
+        self._pst_entity_text_revision.copy_(torch.where(
+            live,
+            textState["EntityTextRevision"],
+            torch.zeros_like(self._pst_entity_text_revision)))
+        self._pst_entity_text_changed.copy_(
+            textState["EntityTextChanged"] & live)
+        self._pst_has_text.copy_(torch.maximum(
+            self._pst_has_text,
+            self._pst_entity_text_confidence))
 
     @torch.no_grad()
     def ExportRobotPhysicalState(self) -> Dict[str, torch.Tensor]:
@@ -2944,6 +4163,22 @@ class RSSMWorldModel(AGICoreModule):
         self._pst_attribute.zero_()
         self._pst_slot_presence.zero_()
         self._pst_entity_prob.zero_()
+        self._pst_entity_id.fill_(-1)
+        self._pst_slot_generation.zero_()
+        self._pst_next_entity_id.zero_()
+        self._last_observed_to_world_slot = (
+            self._last_observed_to_world_slot.new_full(
+                (int(reference.size(0)), 0), -1))
+        self._pst_perceptual_presence.zero_()
+        self._pst_geometry_valid.zero_()
+        self._pst_physical_interaction.zero_()
+        self._pst_realm.zero_()
+        self._pst_motion_layer.zero_()
+        self._pst_layer_agency.zero_()
+        self._pst_agency.zero_()
+        self._pst_body_membership.zero_()
+        self._pst_self_part.zero_()
+        self._pst_self_part_semantic.zero_()
         self._pst_identity_key.zero_()
         self._pst_pairwise_relation.zero_()
         self._pst_pair_last_seen.zero_()
@@ -2953,15 +4188,29 @@ class RSSMWorldModel(AGICoreModule):
         self._pst_state.zero_()
         self._pst_affordance.zero_()
         self._pst_motion.zero_()
+        self._pst_carrier_motion.zero_()
+        self._pst_articulation_motion.zero_()
+        self._pst_content_motion.zero_()
+        self._pst_content_change.zero_()
         self._pst_moving.zero_()
         self._pst_contact.zero_()
         self._pst_contact_force.zero_()
         self._pst_contact_point.zero_()
         self._pst_parent.zero_()
+        self._pst_display_surface.zero_()
+        self._pst_surface_parent.zero_()
+        self._pst_surface_uv.zero_()
+        self._pst_surface_uv_confidence.zero_()
+        self._pst_verification.zero_()
+        self._pst_ontology_relation.zero_()
         self._pst_visibility.zero_()
         self._pst_occlusion.zero_()
         self._pst_has_text.zero_()
         self._pst_text.zero_()
+        self._pst_entity_text_semantic.zero_()
+        self._pst_entity_text_confidence.zero_()
+        self._pst_entity_text_revision.zero_()
+        self._pst_entity_text_changed.zero_()
         self._pst_symbol.zero_()
         self._pst_observed.zero_()
         self._pst_last_seen.zero_()
@@ -2970,6 +4219,16 @@ class RSSMWorldModel(AGICoreModule):
         copy_from(self._pst_attribute, "ARaw")
         copy_from(self._pst_slot_presence, "SlotPresence")
         copy_from(self._pst_entity_prob, "MphysRaw")
+        copy_from(self._pst_perceptual_presence, "PerceptualPresence")
+        copy_from(self._pst_geometry_valid, "GeometryValidMask")
+        copy_from(self._pst_physical_interaction, "PhysicalInteractionProb")
+        copy_from(self._pst_realm, "RealmProb")
+        copy_from(self._pst_motion_layer, "MotionLayerProb")
+        copy_from(self._pst_layer_agency, "LayerAgencyProb")
+        copy_from(self._pst_agency, "AgencyProb")
+        copy_from(self._pst_body_membership, "BodyMembershipProb")
+        copy_from(self._pst_self_part, "SelfPartProb")
+        copy_from(self._pst_self_part_semantic, "SelfPartSemantic")
         copy_from(self._pst_identity_key, "IdentityKey")
         copy_from(self._pst_pairwise_relation, "PairwiseRelationWorld")
         copy_from(self._pst_pair_last_seen, "PairRelationLastSeen")
@@ -2979,19 +4238,46 @@ class RSSMWorldModel(AGICoreModule):
         copy_from(self._pst_state, "StateRaw")
         copy_from(self._pst_affordance, "AffordanceRaw")
         copy_from(self._pst_motion, "MotionWorldRaw")
+        copy_from(self._pst_carrier_motion, "CarrierMotionWorldRaw")
+        copy_from(self._pst_articulation_motion, "ArticulationMotionWorldRaw")
+        copy_from(self._pst_content_motion, "ContentMotionUV")
+        copy_from(self._pst_content_change, "ContentChangeProb")
         copy_from(self._pst_moving, "MovingProbRaw")
         copy_from(self._pst_contact, "ContactProbRaw")
         copy_from(self._pst_contact_force, "ContactForceRaw")
         copy_from(self._pst_contact_point, "ContactPointWorldRaw")
         copy_from(self._pst_parent, "ParentProb")
+        copy_from(self._pst_display_surface, "DisplaySurfaceProb")
+        copy_from(self._pst_surface_parent, "SurfaceParentProb")
+        copy_from(self._pst_surface_uv, "SurfaceUV")
+        copy_from(self._pst_surface_uv_confidence, "SurfaceUVConfidence")
+        copy_from(self._pst_verification, "VerificationConfidence")
+        copy_from(self._pst_ontology_relation, "OntologyRelationProb")
         copy_from(self._pst_visibility, "Visibility")
         copy_from(self._pst_occlusion, "Occlusion")
         copy_from(self._pst_has_text, "HasTextProb")
         copy_from(self._pst_text, "TextEmbed")
+        copy_from(self._pst_entity_text_semantic, "EntityTextSemantic")
+        copy_from(self._pst_entity_text_confidence, "EntityTextConfidence")
+        copy_from(self._pst_entity_text_revision, "EntityTextRevision")
+        copy_from(self._pst_entity_text_changed, "EntityTextChanged")
         copy_from(self._pst_symbol, "SymbolProb")
         copy_from(self._pst_observed, "Observed")
         copy_from(self._pst_last_seen, "LastSeen")
         copy_from(self._pst_step, "Step")
+        for b in range(int(reference.size(0))):
+            active = torch.nonzero(
+                self._pst_slot_presence[b] > 1e-6,
+                as_tuple=False).flatten()
+            if active.numel() == 0:
+                continue
+            entity_ids = torch.arange(
+                active.numel(),
+                device=self._pst_entity_id.device,
+                dtype=torch.long)
+            self._pst_entity_id[b, active] = entity_ids
+            self._pst_slot_generation[b, active] = 1
+            self._pst_next_entity_id[b] = active.numel()
 
     @staticmethod
     def MatchLegalPhysicalSlots(
@@ -3044,6 +4330,18 @@ class RSSMWorldModel(AGICoreModule):
             "ARaw": (B, K, self.physical_attr_dim),
             "ObservedSlotMask": (B, K),
             "MphysRaw": (B, K),
+            "PerceptualPresence": (B, K),
+            "GeometryValidMask": (B, K),
+            "PhysicalEntityProb": (B, K),
+            "PhysicalInteractionProb": (B, K),
+            "RealmProb": (B, K, ModuleDim.PstRealmClasses),
+            "MotionLayerProb": (B, K, ModuleDim.PstMotionLayerClasses),
+            "LayerAgencyProb": (B, K, ModuleDim.PstMotionLayerClasses, ModuleDim.PstAgencyClasses),
+            "AgencyProb": (B, K, ModuleDim.PstAgencyClasses),
+            "BodyMembershipProb": (B, K),
+            "SelfPartProb": (B, K, self.self_part_count),
+            "SelfPartSemantic": (
+                B, K, self.self_part_semantic_dim),
             "IdentityKey": (B, K, self.physical_id_dim),
             "Semantic": (B, K, self.physical_semantic_dim),
             "ExternalRelationProbRaw": (B, K, self.physical_relation_classes),
@@ -3051,6 +4349,10 @@ class RSSMWorldModel(AGICoreModule):
             "StateRaw": (B, K, self.physical_state_dim),
             "AffordanceRaw": (B, K, self.physical_affordance_dim),
             "MotionCameraRaw": (B, K, self.physical_pose_dim),
+            "CarrierMotionCameraRaw": (B, K, self.physical_pose_dim),
+            "ArticulationMotionCameraRaw": (B, K, self.physical_pose_dim),
+            "ContentMotionUV": (B, K, 2),
+            "ContentChangeProb": (B, K),
             "MovingProbRaw": (B, K),
             "ContactProbRaw": (B, K),
             "ContactForceRaw": (B, K, 2),
@@ -3062,6 +4364,14 @@ class RSSMWorldModel(AGICoreModule):
             "SymbolProb": (B, K, self.physical_symbol_dim),
             "PairwiseRelationCamera": (B, K, K, self.physical_rel_dim),
             "ParentProb": (B, K, K),}
+        expected_shapes.update({
+            "DisplaySurfaceProb": (B, K),
+            "SurfaceParentProb": (B, K, K + 1),
+            "SurfaceUV": (B, K, 2),
+            "SurfaceUVConfidence": (B, K),
+            "VerificationConfidence": (B, K),
+            "OntologyRelationProb": (
+                B, K, K, ModuleDim.PstOntologyRelationClasses),})
         external_shapes = {
             "cameraPoseWorld": (cameraPoseWorld, (B, self.physical_pose_dim)),
             "robotPhysicalState": (robotPhysicalState, (B, self.robot_physical_dim)),}
@@ -3084,6 +4394,28 @@ class RSSMWorldModel(AGICoreModule):
                 raise ValueError(f"{name} must have dtype {model_dtype}, got {value.dtype}")
             if not bool(torch.isfinite(value).all().item()):
                 raise ValueError(f"{name} must contain only finite values")
+        if not torch.equal(
+            observedPst["MphysRaw"],
+            observedPst["PhysicalEntityProb"]):
+            raise ValueError(
+                "MphysRaw must be exactly PhysicalEntityProb")
+        if bool((
+            observedPst["PhysicalInteractionProb"]
+            > observedPst["MphysRaw"] + 1e-6).any().item()):
+            raise ValueError(
+                "PhysicalInteractionProb must not exceed PhysicalEntityProb")
+        realm_class = observedPst["RealmProb"].argmax(dim=-1)
+        virtual_or_effect = (
+            realm_class.eq(int(EntityRealm.VIRTUAL_CONTENT))
+            | realm_class.eq(int(EntityRealm.VISUAL_EFFECT)))
+        invalid_independent_geometry = virtual_or_effect & (
+            observedPst["GeometryValidMask"].gt(0.0)
+            | observedPst["MphysRaw"].gt(0.0)
+            | observedPst["PhysicalInteractionProb"].gt(0.0))
+        if bool(invalid_independent_geometry.any().item()):
+            raise ValueError(
+                "virtual/effect slots cannot own independent 3D geometry or "
+                "physical interaction state")
         return B, K
 
     @torch.no_grad()
@@ -3091,51 +4423,119 @@ class RSSMWorldModel(AGICoreModule):
         self,
         observedPst: Dict[str, torch.Tensor],
         cameraPoseWorld: torch.Tensor,
-        robotPhysicalState: torch.Tensor,) -> Dict[str, torch.Tensor]:
+        robotPhysicalState: torch.Tensor,
+        observerValid: torch.Tensor,) -> Dict[str, torch.Tensor]:
         B, _ = self.ValidatePhysicalUpdateInputs(
             observedPst,
             cameraPoseWorld,
             robotPhysicalState)
+        if not torch.is_tensor(observerValid):
+            raise TypeError("observer validity must be a tensor")
+        if tuple(observerValid.shape) != (B,):
+            raise ValueError("observer validity does not match batch")
+        if observerValid.device != cameraPoseWorld.device:
+            raise ValueError("observer validity device does not match pose")
+        if observerValid.dtype != torch.bool:
+            raise TypeError("observer validity must be boolean")
+        runtime_observer_valid = observerValid & bool(self.observer_valid)
         self.EnsurePhysicalMemory(B)
-
         self._robot_physical_state.copy_(robotPhysicalState.detach())
 
         observed_p_world = self.PoseToWorld(observedPst["PoseCamera"].detach(), cameraPoseWorld)
+        geometry_valid = (
+            observedPst["GeometryValidMask"].detach()
+            * runtime_observer_valid.to(
+                observedPst["GeometryValidMask"].dtype).unsqueeze(-1))
+        identity_pose = torch.zeros_like(observed_p_world)
+        identity_pose[..., 6] = 1.0
+        observed_p_world = torch.where(
+            geometry_valid.unsqueeze(-1) > 0.5,
+            observed_p_world,
+            identity_pose)
         observed_motion_world = self.MotionToWorld(
             observedPst["MotionCameraRaw"].detach(),
             cameraPoseWorld)
+        observed_carrier_world = self.MotionToWorld(
+            observedPst["CarrierMotionCameraRaw"].detach(),
+            cameraPoseWorld)
+        observed_articulation_world = self.MotionToWorld(
+            observedPst["ArticulationMotionCameraRaw"].detach(),
+            cameraPoseWorld)
+        observed_motion_world = torch.where(
+            geometry_valid.unsqueeze(-1) > 0.5,
+            observed_motion_world,
+            identity_pose)
+        observed_carrier_world = torch.where(
+            geometry_valid.unsqueeze(-1) > 0.5,
+            observed_carrier_world,
+            identity_pose)
+        observed_articulation_world = torch.where(
+            geometry_valid.unsqueeze(-1) > 0.5,
+            observed_articulation_world,
+            identity_pose)
         observed_contact_world = self.WeightedPointToWorld(
             observedPst["ContactPointCameraRaw"].detach(),
             observedPst["ContactProbRaw"].detach(),
             cameraPoseWorld)
+        observed_contact_world = (
+            observed_contact_world
+            * geometry_valid.unsqueeze(-1))
         observed_m = observedPst["ObservedSlotMask"].detach()
         observed_m_phys = observedPst["MphysRaw"].detach() # [B, K]
+        observed_presence = observedPst["PerceptualPresence"].detach()
         observed_c = observedPst["IdentityKey"].detach()
 
         self._pst_step.add_(1)
         self._pst_slot_presence.mul_(self.physical_confidence_decay)
+        effect_probability = self._pst_realm[..., int(EntityRealm.VISUAL_EFFECT)]
+        self._pst_slot_presence.mul_(1.0 - 0.20 * effect_probability)
         self._pst_observed.zero_()
 
-        incoming_to_memory = torch.full(
-            observed_m.shape,
-            -1,
-            device=observed_m.device,
-            dtype=torch.long)
+        self._last_observed_to_world_slot = (
+            self._last_observed_to_world_slot.new_full(
+                observed_m.shape, -1))
+        incoming_to_memory = self._last_observed_to_world_slot
 
         def write_slot(b: int, source_idx: int, target_idx: int, reset_pairwise_relations: bool) -> None:
-            incoming_to_memory[b, source_idx] = target_idx
             if reset_pairwise_relations:
+                self._pst_has_text[b, target_idx].zero_()
+                self._pst_text[b, target_idx].zero_()
+                self._pst_entity_text_semantic[b, target_idx].zero_()
+                self._pst_entity_text_confidence[b, target_idx].zero_()
+                self._pst_entity_text_revision[b, target_idx].zero_()
+                self._pst_entity_text_changed[b, target_idx].zero_()
+                self._pst_symbol[b, target_idx].zero_()
                 self._pst_pairwise_relation[b, target_idx].zero_()
                 self._pst_pairwise_relation[b, :, target_idx].zero_()
                 self._pst_pair_last_seen[b, target_idx].zero_()
                 self._pst_pair_last_seen[b, :, target_idx].zero_()
                 self._pst_parent[b, target_idx].zero_()
                 self._pst_parent[b, :, target_idx].zero_()
+                self._pst_surface_parent[b, target_idx].zero_()
+                self._pst_surface_parent[b, :, target_idx].zero_()
+                self._pst_ontology_relation[b, target_idx].zero_()
+                self._pst_ontology_relation[b, :, target_idx].zero_()
+            if reset_pairwise_relations or self._pst_entity_id[b, target_idx] < 0:
+                self._pst_entity_id[b, target_idx] = self._pst_next_entity_id[b]
+                self._pst_next_entity_id[b].add_(1)
+                self._pst_slot_generation[b, target_idx].add_(1)
+            incoming_to_memory[b, source_idx] = target_idx
             self._pst_slot_state[b, target_idx] = observedPst["SlotState"][b, source_idx].detach()
             self._pst_pose_world[b, target_idx] = observed_p_world[b, source_idx]
             self._pst_attribute[b, target_idx] = observedPst["ARaw"][b, source_idx].detach()
-            self._pst_slot_presence[b, target_idx] = observed_m[b, source_idx]
+            self._pst_slot_presence[b, target_idx] = observed_presence[b, source_idx]
             self._pst_entity_prob[b, target_idx] = observed_m_phys[b, source_idx]
+            self._pst_perceptual_presence[b, target_idx] = observed_presence[b, source_idx]
+            self._pst_geometry_valid[b, target_idx] = geometry_valid[b, source_idx]
+            self._pst_physical_interaction[b, target_idx] = observedPst["PhysicalInteractionProb"][b, source_idx].detach()
+            self._pst_realm[b, target_idx] = observedPst["RealmProb"][b, source_idx].detach()
+            self._pst_motion_layer[b, target_idx] = observedPst["MotionLayerProb"][b, source_idx].detach()
+            self._pst_layer_agency[b, target_idx] = observedPst["LayerAgencyProb"][b, source_idx].detach()
+            self._pst_agency[b, target_idx] = observedPst["AgencyProb"][b, source_idx].detach()
+            self._pst_self_part_semantic[b, target_idx] = observedPst[
+                "SelfPartSemantic"][b, source_idx].detach()
+            self._pst_body_membership[b, target_idx] = observedPst["BodyMembershipProb"][b, source_idx].detach()
+            self._pst_self_part[b, target_idx] = observedPst["SelfPartProb"][b, source_idx].detach()
             self._pst_identity_key[b, target_idx] = observed_c[b, source_idx]
             self._pst_semantic[b, target_idx] = observedPst["Semantic"][b, source_idx].detach()
             self._pst_external_relation[b, target_idx] = observedPst["ExternalRelationProbRaw"][b, source_idx].detach()
@@ -3143,6 +4543,10 @@ class RSSMWorldModel(AGICoreModule):
             self._pst_state[b, target_idx] = observedPst["StateRaw"][b, source_idx].detach()
             self._pst_affordance[b, target_idx] = observedPst["AffordanceRaw"][b, source_idx].detach()
             self._pst_motion[b, target_idx] = observed_motion_world[b, source_idx]
+            self._pst_carrier_motion[b, target_idx] = observed_carrier_world[b, source_idx]
+            self._pst_articulation_motion[b, target_idx] = observed_articulation_world[b, source_idx]
+            self._pst_content_motion[b, target_idx] = observedPst["ContentMotionUV"][b, source_idx].detach()
+            self._pst_content_change[b, target_idx] = observedPst["ContentChangeProb"][b, source_idx].detach()
             self._pst_moving[b, target_idx] = observedPst["MovingProbRaw"][b, source_idx].detach()
             self._pst_contact[b, target_idx] = observedPst["ContactProbRaw"][b, source_idx].detach()
             self._pst_contact_force[b, target_idx] = observedPst["ContactForceRaw"][b, source_idx].detach()
@@ -3152,6 +4556,10 @@ class RSSMWorldModel(AGICoreModule):
             self._pst_has_text[b, target_idx] = observedPst["HasTextProb"][b, source_idx].detach()
             self._pst_text[b, target_idx] = observedPst["TextEmbed"][b, source_idx].detach()
             self._pst_symbol[b, target_idx] = observedPst["SymbolProb"][b, source_idx].detach()
+            self._pst_display_surface[b, target_idx] = observedPst["DisplaySurfaceProb"][b, source_idx].detach()
+            self._pst_surface_uv[b, target_idx] = observedPst["SurfaceUV"][b, source_idx].detach()
+            self._pst_surface_uv_confidence[b, target_idx] = observedPst["SurfaceUVConfidence"][b, source_idx].detach()
+            self._pst_verification[b, target_idx] = observedPst["VerificationConfidence"][b, source_idx].detach()
             self._pst_observed[b, target_idx] = True
             self._pst_last_seen[b, target_idx] = self._pst_step[b]
 
@@ -3168,10 +4576,36 @@ class RSSMWorldModel(AGICoreModule):
 
             if active_idx.numel() > 0:
                 similarity = torch.matmul(self._pst_identity_key[b, active_idx], observed_c[b, incoming].t())
+                active_realm = self._pst_realm[
+                    b, active_idx].argmax(dim=-1)
+                incoming_realm = observedPst["RealmProb"][
+                    b, incoming].argmax(dim=-1)
+                realm_compatible = (
+                    active_realm.unsqueeze(1)
+                    == incoming_realm.unsqueeze(0))
+                active_self = active_realm.eq(int(EntityRealm.SELF_BODY))
+                incoming_self = incoming_realm.eq(int(EntityRealm.SELF_BODY))
+                active_self_part = self._pst_self_part[
+                    b, active_idx].argmax(dim=-1)
+                incoming_self_part = observedPst["SelfPartProb"][
+                    b, incoming].argmax(dim=-1)
+                self_part_compatible = (
+                    active_self_part.unsqueeze(1)
+                    == incoming_self_part.unsqueeze(0))
+                self_identity_compatible = (
+                    ~(active_self.unsqueeze(1) | incoming_self.unsqueeze(0))
+                    | (
+                        active_self.unsqueeze(1)
+                        & incoming_self.unsqueeze(0)
+                        & self_part_compatible))
                 pose_delta = (
                     self._pst_pose_world[b, active_idx, :3].unsqueeze(1)
                     - observed_p_world[b, incoming, :3].unsqueeze(0))
-                pose_cost = torch.tanh(pose_delta.norm(dim=-1))
+                pose_comparable = (
+                    self._pst_geometry_valid[b, active_idx].unsqueeze(1)
+                    * geometry_valid[b, incoming].unsqueeze(0))
+                pose_cost = (
+                    torch.tanh(pose_delta.norm(dim=-1)) * pose_comparable)
                 last_seen_age = (self._pst_step[b].float() - self._pst_last_seen[b, active_idx].float()).clamp_min(0.0)
                 age_cost = last_seen_age / (last_seen_age + 1.0)
                 cost = (
@@ -3182,7 +4616,9 @@ class RSSMWorldModel(AGICoreModule):
                     - 0.05 * observed_m[b, incoming].unsqueeze(0)) # [N_active, N_incoming]
                 active_local, incoming_local = self.MatchLegalPhysicalSlots(
                     cost,
-                    similarity >= self.physical_identity_threshold)
+                    (
+                        similarity >= self.physical_identity_threshold
+                    ) & realm_compatible & self_identity_compatible)
 
                 for active_pos_t, incoming_pos_t in zip(active_local, incoming_local):
                     active_pos = int(active_pos_t.item())
@@ -3216,6 +4652,12 @@ class RSSMWorldModel(AGICoreModule):
                         + 0.20 * semantic_importance
                         + 0.10 * relation_importance)
                     replacement_score = slot_age * (1.0 - slot_importance)
+                    replaceable = self._pst_body_membership[b] <= 0.5
+                    if not bool(replaceable.any().item()):
+                        continue
+                    replacement_score = replacement_score.masked_fill(
+                        ~replaceable,
+                        torch.finfo(replacement_score.dtype).min)
                     target_idx = int(torch.argmax(replacement_score).item())
                 write_slot(b, int(source_idx), target_idx, True)
 
@@ -3227,19 +4669,48 @@ class RSSMWorldModel(AGICoreModule):
                 self._pst_pairwise_relation[b, mem_grid, mem_grid.t()] = observedPst["PairwiseRelationCamera"][b, src_grid, src_grid.t()].detach()
                 self._pst_pair_last_seen[b, mem_grid, mem_grid.t()] = self._pst_step[b]
                 self._pst_parent[b, mem_grid, mem_grid.t()] = observedPst["ParentProb"][b, src_grid, src_grid.t()].detach()
+                self._pst_ontology_relation[b, mem_grid, mem_grid.t()] = observedPst["OntologyRelationProb"][b, src_grid, src_grid.t()].detach()
+                observed_surface_parent = observedPst["SurfaceParentProb"][b]
+                for source_idx in mapped_sources.tolist():
+                    target_idx = int(incoming_to_memory[b, source_idx].item())
+                    self._pst_surface_parent[b, target_idx].zero_()
+                    parent_sources = torch.nonzero(
+                        incoming_to_memory[b] >= 0,
+                        as_tuple=False).flatten()
+                    parent_targets = incoming_to_memory[b, parent_sources]
+                    self._pst_surface_parent[b, target_idx, parent_targets] = (
+                        observed_surface_parent[source_idx, parent_sources])
+                    unmapped_parent = incoming_to_memory[b] < 0
+                    self._pst_surface_parent[b, target_idx, -1] = (
+                        observed_surface_parent[source_idx, -1]
+                        + observed_surface_parent[
+                            source_idx, :observed_m.size(1)][unmapped_parent].sum())
 
         relative = self._pst_pose_world[..., :3].unsqueeze(1) - self._pst_pose_world[..., :3].unsqueeze(2)
         distance = relative.norm(dim=-1, keepdim=True)
         off_diagonal = ~torch.eye(self.physical_slots, device=self._pst_slot_presence.device, dtype=torch.bool)
-        pair_valid = (
+        semantic_pair_valid = (
             (self._pst_slot_presence > 1e-6).unsqueeze(2)
             & (self._pst_slot_presence > 1e-6).unsqueeze(1)
             & off_diagonal.unsqueeze(0)).unsqueeze(-1)
-        self._pst_pairwise_relation.masked_fill_(~pair_valid, 0.0)
-        self._pst_pair_last_seen.masked_fill_(~pair_valid.squeeze(-1), 0)
-        self._pst_pairwise_relation[..., :3] = relative * pair_valid.to(relative.dtype)
-        self._pst_pairwise_relation[..., 3:4] = distance * pair_valid.to(distance.dtype)
-        self._pst_parent.masked_fill_(~pair_valid.squeeze(-1), 0.0)
+        geometry_pair_valid = (
+            semantic_pair_valid
+            & (self._pst_geometry_valid > 0.5).unsqueeze(2).unsqueeze(-1)
+            & (self._pst_geometry_valid > 0.5).unsqueeze(1).unsqueeze(-1))
+        self._pst_pairwise_relation[..., :4].masked_fill_(
+            ~geometry_pair_valid, 0.0)
+        self._pst_pairwise_relation[..., 4:].masked_fill_(
+            ~semantic_pair_valid, 0.0)
+        self._pst_pair_last_seen.masked_fill_(
+            ~semantic_pair_valid.squeeze(-1), 0)
+        self._pst_pairwise_relation[..., :3] = (
+            relative * geometry_pair_valid.to(relative.dtype))
+        self._pst_pairwise_relation[..., 3:4] = (
+            distance * geometry_pair_valid.to(distance.dtype))
+        self._pst_parent.masked_fill_(
+            ~semantic_pair_valid.squeeze(-1), 0.0)
+        self._pst_ontology_relation.masked_fill_(
+            ~semantic_pair_valid, 0.0)
 
         return self.BuildModelPhysicalState(self.ExportPhysicalState(), cameraPoseWorld)
 
@@ -3249,27 +4720,60 @@ class RSSMWorldModel(AGICoreModule):
 
     def EncodeRobotPhysicalState(
         self,
-        bodyProprioception: torch.Tensor,
-        robotPhysicalReference: torch.Tensor,) -> torch.Tensor:
+        endpointProprioception: torch.Tensor,
+        robotPhysicalReference: torch.Tensor,
+        *,
+        endpointStateValid: torch.Tensor,
+        endpointControllable: torch.Tensor,
+        jointPosition: torch.Tensor,
+        jointVelocity: torch.Tensor,
+        jointEffort: torch.Tensor,
+        jointObserved: torch.Tensor,
+        jointHealthy: torch.Tensor,
+        jointControllable: torch.Tensor,
+        nodePoseWorld: torch.Tensor,
+        nodeTwistWorld: torch.Tensor,
+        nodeObserved: torch.Tensor,
+        nodeHealthy: torch.Tensor,) -> torch.Tensor:
         return self.robot_physical_encoder(
-            bodyProprioception,
-            robotPhysicalReference)
+            endpointProprioception,
+            robotPhysicalReference,
+            endpointStateValid=endpointStateValid,
+            endpointControllable=endpointControllable,
+            jointPosition=jointPosition,
+            jointVelocity=jointVelocity,
+            jointEffort=jointEffort,
+            jointObserved=jointObserved,
+            jointHealthy=jointHealthy,
+            jointControllable=jointControllable,
+            nodePoseWorld=nodePoseWorld,
+            nodeTwistWorld=nodeTwistWorld,
+            nodeObserved=nodeObserved,
+            nodeHealthy=nodeHealthy)
 
     def BuildEmbodiedAction(
         self,
         physicalState: Dict[str, torch.Tensor],
         actionEnc: torch.Tensor,
         robotPhysicalState: torch.Tensor,
-        cameraMotion: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build a relation-conditioned action from one explicitly selected time context.
-
-        Filtering/training callers build the transition action from ``PST_{t-1}`` and
-        ``robot_{t-1}``, then build a separate observation context from ``PST_t`` and
-        ``robot_t`` for posterior binding. Prospective callers use the current context and a
-        candidate action to predict the next state.
-        """
+        cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not torch.is_tensor(observerMotionValid):
+            raise TypeError("observer motion validity must be a tensor")
+        if tuple(observerMotionValid.shape) != (cameraMotion.size(0),):
+            raise ValueError("observer motion validity must be [B]")
+        if observerMotionValid.device != cameraMotion.device:
+            raise ValueError("observer motion validity device does not match motion")
+        if observerMotionValid.dtype != torch.bool:
+            raise TypeError("observer motion validity must be boolean")
+        observer_valid = observerMotionValid & bool(self.observer_valid)
         robot_world_context = self.robot_world_relation(
-            robotPhysicalState, physicalState, actionEnc, cameraMotion)
+            robotPhysicalState,
+            physicalState,
+            actionEnc,
+            cameraMotion,
+            observer_valid)
         embodied_action = self.embodied_action_proj(torch.cat([
             actionEnc,
             robotPhysicalState,
@@ -3370,7 +4874,85 @@ class RSSMWorldModel(AGICoreModule):
             + 0.5 * (reconstructedVisualState["IntegratedFeat"] - target["IntegratedFeat"]).pow(2).mean(dim=-1))
         basis_err = (reconstructedVisualState["PredErrorBasis"] - target["GlobalFeat"]).pow(2).mean(dim=-1)
 
-        per_sample = global_err + object_err + 0.5 * integrated_err + 0.25 * motion_err + 0.5 * recon_err + 0.1 * basis_err
+        target_auxiliary = targetVisualState.Auxiliary
+        alignment = F.softmax(
+            torch.matmul(
+                reconstructedVisualState["ObjectTokens"],
+                target["ObjectTokens"].transpose(1, 2))
+            / (float(target["ObjectTokens"].size(-1)) ** 0.5),
+            dim=-1)
+
+        def align_slot(value: torch.Tensor) -> torch.Tensor:
+            return torch.einsum("bij,bj...->bi...", alignment, value.detach())
+
+        factor_presence = align_slot(
+            target_auxiliary["PerceptualPresence"])
+        factor_denominator = factor_presence.sum(dim=-1) + 1e-6
+        realm_target = align_slot(target_auxiliary["RealmProb"])
+        realm_err = (
+            -realm_target
+            * torch.log(reconstructedVisualState["RealmProb"] + 1e-8)
+        ).sum(dim=-1)
+        layer_target = align_slot(target_auxiliary["MotionLayerProb"])
+        layer_err = F.binary_cross_entropy(
+            reconstructedVisualState["MotionLayerProb"],
+            layer_target,
+            reduction="none").mean(dim=-1)
+        layer_agency_target = align_slot(
+            target_auxiliary["LayerAgencyProb"])
+        layer_agency_err = (
+            -layer_agency_target
+            * torch.log(
+                reconstructedVisualState["LayerAgencyProb"] + 1e-8)
+        ).sum(dim=-1).mean(dim=-1)
+        display_target = align_slot(
+            target_auxiliary["DisplaySurfaceProb"])
+        display_err = F.binary_cross_entropy(
+            reconstructedVisualState["DisplaySurfaceProb"],
+            display_target,
+            reduction="none")
+        surface_uv_target = align_slot(target_auxiliary["SurfaceUV"])
+        surface_uv_err = (
+            reconstructedVisualState["SurfaceUV"] - surface_uv_target
+        ).square().mean(dim=-1) * display_target
+        content_motion_target = align_slot(
+            target_auxiliary["ContentMotionUV"])
+        content_motion_err = (
+            reconstructedVisualState["ContentMotionUV"]
+            - content_motion_target
+        ).square().mean(dim=-1) * layer_target[..., 3]
+        content_change_target = align_slot(
+            target_auxiliary["ContentChangeProb"])
+        content_change_err = F.binary_cross_entropy(
+            reconstructedVisualState["ContentChangeProb"],
+            content_change_target,
+            reduction="none")
+        factor_confidence_target = align_slot(
+            target_auxiliary["VerificationConfidence"])
+        factor_confidence_err = (
+            reconstructedVisualState["FactorPriorConfidence"]
+            - factor_confidence_target).square()
+        factor_err = (
+            (
+                realm_err
+                + layer_err
+                + layer_agency_err
+                + display_err
+                + surface_uv_err
+                + content_motion_err
+                + content_change_err
+                + factor_confidence_err)
+            * factor_presence
+        ).sum(dim=-1) / factor_denominator
+
+        per_sample = (
+            global_err
+            + object_err
+            + 0.5 * integrated_err
+            + 0.25 * motion_err
+            + 0.5 * recon_err
+            + 0.1 * basis_err
+            + 0.25 * factor_err)
         batch_size = int(per_sample.size(0))
         if sampleMask.dtype != torch.bool:
             raise TypeError(f"sampleMask must be bool, got {sampleMask.dtype}")
@@ -3407,6 +4989,7 @@ class RSSMWorldModel(AGICoreModule):
             "loss_pred_motion": masked_mean(motion_err),
             "loss_pred_recon": masked_mean(recon_err),
             "loss_pred_basis": masked_mean(basis_err),
+            "loss_pred_entity_motion_factors": masked_mean(factor_err),
             "loss_pred_precision": precision_loss,
             "loss_pred_total": total_loss,}
         losses.update(inverse_losses)
@@ -3421,11 +5004,16 @@ class RSSMWorldModel(AGICoreModule):
         actionEnc: torch.Tensor,
         robotPhysicalState: torch.Tensor,
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         sample: bool = False,) -> Dict[str, torch.Tensor]:
         s_prev_base = self.state_proj(torch.cat([hPrev, zPrev], dim=-1))
 
         embodied_action, robot_world_context = self.BuildEmbodiedAction(
-            physicalState, actionEnc, robotPhysicalState, cameraMotion)
+            physicalState,
+            actionEnc,
+            robotPhysicalState,
+            cameraMotion,
+            observerMotionValid)
         a_t = self.act_proj(embodied_action)
 
         h_next, x_next = self.s4.StepWithX(zPrev, a_t, s4xPrev)
@@ -3489,6 +5077,7 @@ class RSSMWorldModel(AGICoreModule):
         actionEnc: torch.Tensor,
         robotPhysicalState: torch.Tensor,
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         sample: bool = False,) -> Dict[str, Any]:
         rollout = self.PriorRolloutFromStateAction(
             hPrev=h,
@@ -3498,6 +5087,7 @@ class RSSMWorldModel(AGICoreModule):
             actionEnc=actionEnc,
             robotPhysicalState=robotPhysicalState,
             cameraMotion=cameraMotion,
+            observerMotionValid=observerMotionValid,
             sample=sample,)
         pred = self.BuildPredictedVisual(rollout["s_next"])
         pred["prior_rollout"] = rollout
@@ -3520,6 +5110,10 @@ class RSSMWorldModel(AGICoreModule):
             actionEnc=actionEnc,
             robotPhysicalState=robotPhysicalState,
             cameraMotion=self.StationaryCameraMotion(actionEnc),
+            observerMotionValid=torch.zeros(
+                actionEnc.size(0),
+                device=actionEnc.device,
+                dtype=torch.bool),
             sample=sample,)
 
     def BuildWorldAbstract(
@@ -3684,13 +5278,17 @@ class RSSMWorldModel(AGICoreModule):
             physicalState=physicalState,
             robotPhysicalState=robotPhysicalState,
             cameraMotion=self.StationaryCameraMotion(actionEnc),
+            observerMotionValid=torch.zeros(
+                actionEnc.size(0),
+                device=actionEnc.device,
+                dtype=torch.bool),
             sample=sample,)
 
     @staticmethod
     def StationaryCameraMotion(reference: torch.Tensor) -> torch.Tensor:
         camera_motion = reference.new_zeros(
-            reference.size(0), ModuleDim.CameraMotionDim)
-        camera_motion[:, 3] = 1.0
+            reference.size(0), ModuleDim.ObserverMotionDim)
+        camera_motion[:, 6] = 1.0
         return camera_motion
 
     @torch.no_grad()
@@ -3703,6 +5301,7 @@ class RSSMWorldModel(AGICoreModule):
         physicalState: Dict[str, torch.Tensor],
         robotPhysicalState: torch.Tensor,
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         sample: bool = False,) -> Dict[str, torch.Tensor]:
 
         B = actionEnc.size(0)
@@ -3714,7 +5313,11 @@ class RSSMWorldModel(AGICoreModule):
             s4xPrev = torch.zeros(B, self.ssm_dim, device=device, dtype=dtype)
 
         embodied_action, robot_world_context = self.BuildEmbodiedAction(
-            physicalState, actionEnc, robotPhysicalState, cameraMotion)
+            physicalState,
+            actionEnc,
+            robotPhysicalState,
+            cameraMotion,
+            observerMotionValid)
         a_t = self.act_proj(embodied_action)
         h_next, s4x_next = self.s4.StepWithX(zPrev, a_t, s4xPrev) # h_next: [B, deterDim], s4x_next: [B, ssmDim]
 
@@ -3795,6 +5398,7 @@ class RSSMWorldModel(AGICoreModule):
         transitionPhysicalState: Dict[str, torch.Tensor],
         transitionRobotPhysicalState: torch.Tensor,
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         sample: bool = False,  # False: Deterministic Forward, True: Reparameterized sampling with noise(More exploratory)
         ) -> Dict[str, torch.Tensor]:
         """Infer state ``t`` from an explicit transition context and current observation.
@@ -3810,9 +5414,17 @@ class RSSMWorldModel(AGICoreModule):
 
         raw_e = self.obs_enc(visionIn) # [B, stochDim]
         transition_embodied_action, transition_robot_world_context = self.BuildEmbodiedAction(
-            transitionPhysicalState, actionEnc, transitionRobotPhysicalState, cameraMotion)
+            transitionPhysicalState,
+            actionEnc,
+            transitionRobotPhysicalState,
+            cameraMotion,
+            observerMotionValid)
         observation_embodied_action, observation_robot_world_context = self.BuildEmbodiedAction(
-            physicalState, actionEnc, robotPhysicalState, cameraMotion)
+            physicalState,
+            actionEnc,
+            robotPhysicalState,
+            cameraMotion,
+            observerMotionValid)
         a_t = self.act_proj(transition_embodied_action) # [B, stochDim]
         key = self.key_emb(raw_e, a_t) # [B, stochDim]
 
@@ -3935,6 +5547,7 @@ class RSSMWorldModel(AGICoreModule):
         transitionPhysicalState: Dict[str, torch.Tensor], # transition context at t-1
         transitionRobotPhysicalState: torch.Tensor, # transition context at t-1
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         sample: Optional[bool] = None,
         updateMemory: Optional[bool] = None,
         alphaKl: float = 0.8,
@@ -3959,9 +5572,17 @@ class RSSMWorldModel(AGICoreModule):
 
         a_enc = actionEnc
         transition_embodied_action, transition_robot_world_context = self.BuildEmbodiedAction(
-            transitionPhysicalState, a_enc, transitionRobotPhysicalState, cameraMotion)
+            transitionPhysicalState,
+            a_enc,
+            transitionRobotPhysicalState,
+            cameraMotion,
+            observerMotionValid)
         observation_embodied_action, observation_robot_world_context = self.BuildEmbodiedAction(
-            physicalState, a_enc, robotPhysicalState, cameraMotion)
+            physicalState,
+            a_enc,
+            robotPhysicalState,
+            cameraMotion,
+            observerMotionValid)
         a_t = self.act_proj(transition_embodied_action) # [B, stochDim]
 
         h_pred = self.s4.Step(z0, a_t) # [B,D]
@@ -4188,52 +5809,89 @@ class RSSMWorldModel(AGICoreModule):
         return out
 
 
-    def ExportWorldMemoryBank(self, topk: int = 1024) -> Optional[Dict[str, torch.Tensor]]:
-        if (not getattr(self, "_use_memory", False)):
-            return None
+    def ExportConsciousBank(
+        self,
+        topk: int = 1024,
+    ) -> Dict[str, torch.Tensor]:
+        B = int(self._pst_slot_state.size(0))
+        budget = max(0, int(topk))
+        if budget == 0:
+            return {
+                "tokens": torch.zeros(
+                    B, 0, self.state_dim,
+                    device=self.device, dtype=self.dtype),
+                "valid": torch.zeros(
+                    B, 0,
+                    device=self.device, dtype=torch.bool),}
+        entity_features = torch.cat([
+            self._pst_slot_state,
+            self._pst_realm,
+            self._pst_motion_layer,
+            self._pst_agency,
+            self._pst_body_membership.unsqueeze(-1),
+            self._pst_self_part_semantic,
+            self._pst_entity_prob.unsqueeze(-1),
+            self._pst_physical_interaction.unsqueeze(-1),
+            self._pst_content_motion,
+            self._pst_content_change.unsqueeze(-1),
+            self._pst_display_surface.unsqueeze(-1),
+            self._pst_surface_uv,
+            self._pst_surface_uv_confidence.unsqueeze(-1),
+            self._pst_verification.unsqueeze(-1),
+            self._pst_entity_text_semantic,
+            self._pst_entity_text_confidence.unsqueeze(-1),
+            torch.tanh(
+                self._pst_entity_text_revision.to(self.dtype).unsqueeze(-1)
+                / 16.0),
+            self._pst_entity_text_changed.to(self.dtype).unsqueeze(-1),], dim=-1)
+        entity_valid = (
+            (self._pst_entity_id >= 0)
+            & (self._pst_slot_presence > 0.0))
+        entity_tokens = self.entity_conscious_encoder(entity_features)
+        entity_tokens = entity_tokens * entity_valid.unsqueeze(-1).to(
+            entity_tokens.dtype)
+        entity_scores = (
+            self._pst_slot_presence
+            * (1.0
+               + self._pst_verification
+               + self._pst_entity_text_confidence))
+        entity_scores = entity_scores.masked_fill(~entity_valid, -torch.inf)
 
-        K = int(topk)
-        if K <= 0:
-            return None
-
-        B = int(self._mem_vals.size(0))
-        cap = int(self._mem_vals.size(1))
-
-        filled = self._mem_size # [B] 
-        if (filled <= 0).all():
-            return None
-
-        K = min(K, cap)
-        K = min(K, int(filled.min().item()))
-        if K <= 0:
-            return None
-
-        ar = torch.arange(cap, device=self._mem_vals.device).view(1, cap) # [1,cap]
-        valid = ar < filled.view(B, 1) # [B,cap]
-        scores = self._mem_imp.masked_fill(~valid, -1e9) # [B,cap]
-
-        _, idx = torch.topk(scores, k=K, dim=-1) # [B,K]
-        sel_steps = torch.gather(self._mem_steps, 1, idx) # [B,K]
-        time_order = torch.argsort(sel_steps, dim=-1, descending=True)
-        idx = torch.gather(idx, 1, time_order)
-
-        out: Dict[str, torch.Tensor] = {} 
-
-        Dv = int(self._mem_vals.size(-1))
-        out["vals"] = torch.gather(self._mem_vals, 1, idx.unsqueeze(-1).expand(B, K, Dv)).contiguous()
-        out["vals_valid"] = torch.ones(B, K, device=self._mem_vals.device, dtype=torch.bool)
-
-        out["size"] = filled.detach().clone() # [B]
-        out["idx"]  = idx.contiguous() # [B,K]
-        out["steps"] = torch.gather(self._mem_steps, 1, idx).contiguous() # [B,K]
-
-        Dk = int(self._mem_keys.size(-1))
-        out["keys"] = torch.gather(self._mem_keys, 1, idx.unsqueeze(-1).expand(B, K, Dk)).contiguous()
-
-        out["imp"]  = torch.gather(self._mem_imp, 1, idx).contiguous() # [B,K]
-        return out
-    
-
+        if self._use_memory:
+            cap = int(self._mem_vals.size(1))
+            ar = torch.arange(
+                cap,
+                device=self._mem_vals.device).view(1, cap)
+            history_valid = ar < self._mem_size.view(B, 1)
+            history_tokens = self._mem_vals
+            history_scores = self._mem_imp.masked_fill(
+                ~history_valid, -torch.inf)
+        else:
+            history_tokens = torch.zeros(
+                B, 0, self.state_dim,
+                device=self.device, dtype=self.dtype)
+            history_valid = torch.zeros(
+                B, 0,
+                device=self.device, dtype=torch.bool)
+            history_scores = torch.zeros(
+                B, 0,
+                device=self.device, dtype=self.dtype)
+        all_tokens = torch.cat([entity_tokens, history_tokens], dim=1)
+        all_valid = torch.cat([entity_valid, history_valid], dim=1)
+        all_scores = torch.cat([entity_scores, history_scores], dim=1)
+        count = min(budget, int(all_tokens.size(1)))
+        if count == 0:
+            return {
+                "tokens": all_tokens[:, :0],
+                "valid": all_valid[:, :0],}
+        _, indices = torch.topk(all_scores, k=count, dim=1)
+        tokens = torch.gather(
+            all_tokens,
+            1,
+            indices.unsqueeze(-1).expand(B, count, self.state_dim))
+        valid = torch.gather(all_valid, 1, indices)
+        tokens = tokens * valid.unsqueeze(-1).to(tokens.dtype)
+        return {"tokens": tokens, "valid": valid}
 
 class WorldOnlineWrapper(BaseOnlineWrapper):
     def __init__(
@@ -4840,6 +6498,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         transitionPhysicalState = kwargs["transitionPhysicalState"]
         transitionRobotPhysicalState = kwargs["transitionRobotPhysicalState"]
         cameraMotion = kwargs["cameraMotion"]
+        observerMotionValid = kwargs["observerMotionValid"]
 
         sample_arg = kwargs.get("sample")
         sample = bool(self.training) if sample_arg is None else bool(sample_arg)
@@ -4867,9 +6526,17 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
 
         a_enc = actionEnc
         transition_embodied_action, transition_robot_world_context = self.base.BuildEmbodiedAction(
-            transitionPhysicalState, a_enc, transitionRobotPhysicalState, cameraMotion)
+            transitionPhysicalState,
+            a_enc,
+            transitionRobotPhysicalState,
+            cameraMotion,
+            observerMotionValid)
         observation_embodied_action, observation_robot_world_context = self.base.BuildEmbodiedAction(
-            physicalState, a_enc, robotPhysicalState, cameraMotion)
+            physicalState,
+            a_enc,
+            robotPhysicalState,
+            cameraMotion,
+            observerMotionValid)
         a_t = self.ActProj(transition_embodied_action, d) # [B, stochDim]
 
         h_pred = self.S4_Step(z0, a_t, updateState=True, d=d) # [B, deterDim]
@@ -5112,6 +6779,10 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
             physicalState=physicalState,
             robotPhysicalState=robotPhysicalState,
             cameraMotion=self.base.StationaryCameraMotion(actionEnc),
+            observerMotionValid=torch.zeros(
+                actionEnc.size(0),
+                device=actionEnc.device,
+                dtype=torch.bool),
             sample=sample,)
 
     @torch.no_grad()
@@ -5124,6 +6795,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         physicalState: Dict[str, torch.Tensor],
         robotPhysicalState: torch.Tensor,
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         sample: bool = False,
         ) -> Dict[str, torch.Tensor]:
         deltas = [self.ComposeLayerDelta(layerIdx) for layerIdx in range(self.layerCount)]
@@ -5136,7 +6808,8 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
             deltasPerLayer=deltas,
             physicalState=physicalState,
             robotPhysicalState=robotPhysicalState,
-            cameraMotion=cameraMotion)
+            cameraMotion=cameraMotion,
+            observerMotionValid=observerMotionValid)
 
     @torch.no_grad()
     def StepPriorWithDeltas(
@@ -5151,6 +6824,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         physicalState = kwargs["physicalState"]
         robotPhysicalState = kwargs["robotPhysicalState"]
         cameraMotion = kwargs["cameraMotion"]
+        observerMotionValid = kwargs["observerMotionValid"]
         B = int(actionEnc.size(0))
         device, dtype = self.base.device, self.base.dtype
 
@@ -5162,7 +6836,11 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
             s4xPrev = torch.zeros(B, self.base.ssm_dim, device=device, dtype=dtype)
 
         embodied_action, robot_world_context = self.base.BuildEmbodiedAction(
-            physicalState, actionEnc, robotPhysicalState, cameraMotion)
+            physicalState,
+            actionEnc,
+            robotPhysicalState,
+            cameraMotion,
+            observerMotionValid)
         a_t = self.ActProj(embodied_action, d)
         h_next, s4x_next = self.S4StepWithX(zPrev, a_t, s4xPrev, d)
 
@@ -5241,6 +6919,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         actionEnc: torch.Tensor,
         robotPhysicalState: torch.Tensor,
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         sample: bool = False,) -> Dict[str, torch.Tensor]:
         d = self.ComposeLayerDelta(0)
         return self.PriorRolloutFromStateActionWithDeltas(
@@ -5251,6 +6930,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
             actionEnc=actionEnc,
             robotPhysicalState=robotPhysicalState,
             cameraMotion=cameraMotion,
+            observerMotionValid=observerMotionValid,
             sample=sample,
             d=d)
 
@@ -5263,12 +6943,17 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         actionEnc: torch.Tensor,
         robotPhysicalState: torch.Tensor,
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         sample: bool,
         d: Dict[str, Optional[torch.Tensor]],) -> Dict[str, torch.Tensor]:
         s_prev_base = self.StateProj(torch.cat([hPrev, zPrev], dim=-1), d)
 
         embodied_action, robot_world_context = self.base.BuildEmbodiedAction(
-            physicalState, actionEnc, robotPhysicalState, cameraMotion)
+            physicalState,
+            actionEnc,
+            robotPhysicalState,
+            cameraMotion,
+            observerMotionValid)
         a_t = self.ActProj(embodied_action, d)
         h_next, x_next = self.S4StepWithX(zPrev, a_t, s4xPrev, d)
         mu_p, logstd_p = self.Prior(h_next, d).chunk(2, dim=-1)
@@ -5330,6 +7015,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         actionEnc: torch.Tensor,
         robotPhysicalState: torch.Tensor,
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         sample: bool = False,) -> Dict[str, Any]:
         d = self.ComposeLayerDelta(0)
         return self.PredictNextVisualFromPosteriorWithDeltas(
@@ -5340,6 +7026,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
             actionEnc=actionEnc,
             robotPhysicalState=robotPhysicalState,
             cameraMotion=cameraMotion,
+            observerMotionValid=observerMotionValid,
             sample=sample,
             d=d)
 
@@ -5360,6 +7047,10 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
             actionEnc=actionEnc,
             robotPhysicalState=robotPhysicalState,
             cameraMotion=self.base.StationaryCameraMotion(actionEnc),
+            observerMotionValid=torch.zeros(
+                actionEnc.size(0),
+                device=actionEnc.device,
+                dtype=torch.bool),
             sample=sample,)
 
     def PredictNextVisualFromPosteriorWithDeltas(
@@ -5371,6 +7062,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         actionEnc: torch.Tensor,
         robotPhysicalState: torch.Tensor,
         cameraMotion: torch.Tensor,
+        observerMotionValid: torch.Tensor,
         sample: bool,
         d: Dict[str, Optional[torch.Tensor]],) -> Dict[str, Any]:
         rollout = self.PriorRolloutFromStateActionWithDeltas(
@@ -5381,6 +7073,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
             actionEnc=actionEnc,
             robotPhysicalState=robotPhysicalState,
             cameraMotion=cameraMotion,
+            observerMotionValid=observerMotionValid,
             sample=sample,
             d=d)
         pred = self.base.BuildPredictedVisual(rollout["s_next"])
@@ -5543,6 +7236,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
 class TestWorldMTool:
     def __init__(self, device: Optional[torch.device] = None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.robot_morphology = self.MakeRobotMorphology()
         self.wm = RSSMWorldModel(
             visionDim=64,
             actionDim=ModuleDim.EndpointActionEmbedDim,
@@ -5569,7 +7263,167 @@ class TestWorldMTool:
             physicalStateDim=8,
             physicalAffordanceDim=4,
             physicalTextDim=4,
-            physicalSymbolDim=8,).to(self.device)
+            physicalSymbolDim=8,
+            robotMorphology=self.robot_morphology,).to(self.device)
+
+    @staticmethod
+    def MakeRobotMorphology(rich: bool = False):
+        from RobotMorphologyModule import (
+            ROBOT_MORPHOLOGY_SCHEMA_VERSION,
+            RobotMorphologyModule,)
+        compiler = RobotMorphologyModule()
+        if rich:
+            link_names = ["root"] + [
+                f"link_{index}" for index in range(4)]
+            joint_names = [f"joint_{index}" for index in range(4)]
+            joints = [{
+                "name": name,
+                "type": "revolute",
+                "parent": link_names[index],
+                "child": link_names[index + 1],
+                "origin_xyz": [0.0, 0.0, 0.1],
+                "origin_rpy": [0.0, 0.0, 0.0],
+                "axis": [0.0, 0.0, 1.0],
+                "limit": {
+                    "lower": -1.0,
+                    "upper": 1.0,
+                    "effort": 2.0,
+                    "velocity": 3.0,},
+                "mimic": None,}
+                for index, name in enumerate(joint_names)]
+            return compiler.Compile({
+                "schema_version": ROBOT_MORPHOLOGY_SCHEMA_VERSION,
+                "urdf": {
+                    "name": "synthetic_world_rich_robot",
+                    "links": [
+                        {"name": name} for name in link_names],
+                    "joints": joints,},
+                "srdf": {
+                    "name": "synthetic_world_rich_robot",
+                    "groups": [
+                        {
+                            "name": "arm",
+                            "joints": [
+                                joint_names[index] for index in (0, 2, 3)],
+                            "links": [],
+                            "subgroups": [],
+                            "chains": [],},
+                        {
+                            "name": "camera",
+                            "joints": [joint_names[1]],
+                            "links": [],
+                            "subgroups": [],
+                            "chains": [],},],
+                    "passive_joints": [],
+                    "end_effectors": [],
+                    "virtual_joints": [],
+                    "group_states": [],
+                    "disabled_collisions": [],},
+                "control": {
+                    "endpoints": [
+                        {
+                            "name": "tool_endpoint",
+                            "link": link_names[-1],
+                            "task_mask": [
+                                True, True, True, True, True, True],},
+                        {
+                            "name": "support_endpoint",
+                            "link": link_names[-2],
+                            "task_mask": [
+                                True, True, True, False, False, False],},],
+                    "grippers": [
+                        {
+                            "name": "tool_gripper",
+                            "endpoint": "tool_endpoint",},
+                        {
+                            "name": "support_gripper",
+                            "endpoint": "support_endpoint",},],
+                    "sensors": [
+                        {
+                            "name": "camera",
+                            "type": "rgbd",
+                            "link": link_names[2],},
+                        {
+                            "name": "force",
+                            "type": "force",
+                            "link": link_names[-1],},],
+                    "observer": {
+                        "sensor": "camera",
+                        "control_group": "camera",},
+                    "observer_frame_name": "synthetic_camera_optical",
+                    "observer_calibration_id": "synthetic_rich_calibration",},})
+        joints = [
+            {
+                "name": "root_to_sensor",
+                "type": "fixed",
+                "parent": "root",
+                "child": "sensor",
+                "origin_xyz": [0.0, 0.0, 0.0],
+                "origin_rpy": [0.0, 0.0, 0.0],
+                "axis": [0.0, 0.0, 1.0],
+                "mimic": None,
+                "limit": None,
+            },
+            {
+                "name": "root_to_branch",
+                "type": "fixed",
+                "parent": "root",
+                "child": "branch",
+                "origin_xyz": [0.0, 0.0, 0.0],
+                "origin_rpy": [0.0, 0.0, 0.0],
+                "axis": [0.0, 0.0, 1.0],
+                "mimic": None,
+                "limit": None,
+            },
+            {
+                "name": "branch_to_tool",
+                "type": "fixed",
+                "parent": "branch",
+                "child": "tool",
+                "origin_xyz": [0.0, 0.0, 0.0],
+                "origin_rpy": [0.0, 0.0, 0.0],
+                "axis": [0.0, 0.0, 1.0],
+                "mimic": None,
+                "limit": None,
+            },]
+        return compiler.Compile({
+            "schema_version": ROBOT_MORPHOLOGY_SCHEMA_VERSION,
+            "urdf": {
+                "name": "synthetic_world_test_robot",
+                "links": [
+                    {"name": "root"},
+                    {"name": "sensor"},
+                    {"name": "branch"},
+                    {"name": "tool"},],
+                "joints": joints,},
+            "srdf": {
+                "name": "synthetic_world_test_robot",
+                "groups": [],
+                "passive_joints": [],
+                "end_effectors": [],},
+            "control": {
+                "endpoints": [
+                    {
+                        "name": "tool_endpoint",
+                        "link": "tool",
+                        "task_mask": [True, True, True, True, True, True],
+                    },
+                    {
+                        "name": "observer_endpoint",
+                        "link": "sensor",
+                        "task_mask": [False, False, False, False, False, False],
+                    },
+                    {
+                        "name": "support_endpoint",
+                        "link": "branch",
+                        "task_mask": [True, True, True, False, False, False],
+                    },],
+                "observer_endpoint": "observer_endpoint",
+                "observer_frame_name": "synthetic_observer",
+                "observer_calibration_id": "synthetic_calibration",
+                "grippers": [{
+                    "name": "tool_gripper",
+                    "endpoint": "tool_endpoint",}],},})
 
     def MakeMemoryPersistenceWorld(self) -> RSSMWorldModel:
         return RSSMWorldModel(
@@ -5594,7 +7448,8 @@ class TestWorldMTool:
             physicalStateDim=4,
             physicalAffordanceDim=3,
             physicalTextDim=2,
-            physicalSymbolDim=4,).to(self.device).eval()
+            physicalSymbolDim=4,
+            robotMorphology=self.robot_morphology,).to(self.device).eval()
 
     def MakePhysicalState(self, wm: RSSMWorldModel, B: int, activeSlots: int = 4) -> Dict[str, torch.Tensor]:
         K = wm.physical_slots
@@ -5611,16 +7466,44 @@ class TestWorldMTool:
         pose[..., 6] = 1.0
         motion = torch.zeros(B, K, wm.physical_pose_dim, device=device)
         motion[..., 6] = 1.0
+        realm = torch.zeros(
+            B, K, ModuleDim.PstRealmClasses, device=device)
+        realm[..., int(EntityRealm.EXTERNAL_PHYSICAL)] = M
+        realm[..., int(EntityRealm.UNKNOWN)] = 1.0 - M
+        motion_layer = torch.zeros(
+            B, K, ModuleDim.PstMotionLayerClasses, device=device)
+        layer_agency = torch.zeros(
+            B, K, ModuleDim.PstMotionLayerClasses,
+            ModuleDim.PstAgencyClasses, device=device)
+        layer_agency[..., -1] = 1.0
+        agency = torch.zeros(
+            B, K, ModuleDim.PstAgencyClasses, device=device)
+        agency[..., -1] = 1.0
+        surface_parent = torch.zeros(B, K, K + 1, device=device)
+        surface_parent[..., -1] = 1.0
         semantic = torch.randn(
             B, K, wm.physical_semantic_dim, device=device) * M.unsqueeze(-1)
         pairwise_relation = torch.zeros(B, K, K, wm.physical_rel_dim, device=device)
         contact_point = torch.zeros(B, K, 3, device=device)
         return {
-            "SlotPresence": M,
-            "MphysRaw": M,
+            "SlotPresence": M.clone(),
+            "MphysRaw": M.clone(),
+            "PerceptualPresence": M.clone(),
+            "GeometryValidMask": M.clone(),
+            "PhysicalEntityProb": M.clone(),
+            "PhysicalInteractionProb": M.clone(),
+            "RealmProb": realm,
+            "MotionLayerProb": motion_layer,
+            "LayerAgencyProb": layer_agency,
+            "AgencyProb": agency,
+            "BodyMembershipProb": torch.zeros(B, K, device=device),
+            "SelfPartProb": torch.zeros(
+                B, K, wm.self_part_count, device=device),
+            "SelfPartSemantic": torch.zeros(
+                B, K, wm.self_part_semantic_dim, device=device),
             "IdentityKey": F.normalize(torch.randn(B, K, wm.physical_id_dim, device=device), dim=-1, eps=1e-6),
             "SlotState": torch.randn(B, K, D, device=device) * M.unsqueeze(-1),
-            "ObservedSlotMask": M,
+            "ObservedSlotMask": M.clone(),
             "PoseCamera": pose.clone(),
             "PoseWorld": pose.clone(),
             "ARaw": torch.randn(B, K, wm.physical_attr_dim, device=device) * M.unsqueeze(-1),
@@ -5629,6 +7512,12 @@ class TestWorldMTool:
             "AffordanceRaw": torch.randn(B, K, wm.physical_affordance_dim, device=device) * M.unsqueeze(-1),
             "MotionCameraRaw": motion.clone(),
             "MotionWorldRaw": motion.clone(),
+            "CarrierMotionCameraRaw": motion.clone(),
+            "CarrierMotionWorldRaw": motion.clone(),
+            "ArticulationMotionCameraRaw": motion.clone(),
+            "ArticulationMotionWorldRaw": motion.clone(),
+            "ContentMotionUV": torch.zeros(B, K, 2, device=device),
+            "ContentChangeProb": torch.zeros(B, K, device=device),
             "MovingProbRaw": torch.zeros(B, K, device=device),
             "ContactProbRaw": torch.zeros(B, K, device=device),
             "ContactForceRaw": torch.zeros(B, K, 2, device=device),
@@ -5638,6 +7527,13 @@ class TestWorldMTool:
             "Occlusion": torch.zeros(B, K, device=device),
             "HasTextProb": torch.zeros(B, K, device=device),
             "TextEmbed": torch.zeros(B, K, wm.physical_text_dim, device=device),
+            "EntityTextSemantic": torch.zeros(
+                B, K, wm.entity_text_semantic_dim, device=device),
+            "EntityTextConfidence": torch.zeros(B, K, device=device),
+            "EntityTextRevision": torch.zeros(
+                B, K, device=device, dtype=torch.long),
+            "EntityTextChanged": torch.zeros(
+                B, K, device=device, dtype=torch.bool),
             "SymbolProb": torch.zeros(B, K, wm.physical_symbol_dim, device=device),
             "Semantic": semantic,
             "LevelProb": semantic[..., :3],
@@ -5648,6 +7544,14 @@ class TestWorldMTool:
             "PairwiseRelationWorld": pairwise_relation.clone(),
             "PairRelationLastSeen": torch.zeros(B, K, K, device=device, dtype=torch.long),
             "ParentProb": torch.zeros(B, K, K, device=device),
+            "DisplaySurfaceProb": torch.zeros(B, K, device=device),
+            "SurfaceParentProb": surface_parent,
+            "SurfaceUV": torch.zeros(B, K, 2, device=device),
+            "SurfaceUVConfidence": torch.zeros(B, K, device=device),
+            "VerificationConfidence": M.clone(),
+            "OntologyRelationProb": torch.zeros(
+                B, K, K, ModuleDim.PstOntologyRelationClasses,
+                device=device),
             "Observed": observed,
             "LastSeen": last_seen,
             "Step": step,}
@@ -5657,9 +7561,42 @@ class TestWorldMTool:
 
     def MakeCameraMotion(self, B: int) -> torch.Tensor:
         camera_motion = torch.zeros(
-            B, ModuleDim.CameraMotionDim, device=self.device)
-        camera_motion[:, 3] = 1.0
+            B, ModuleDim.ObserverMotionDim, device=self.device)
+        camera_motion[:, 6] = 1.0
         return camera_motion
+
+    def MakeObserverValid(self, B: int) -> torch.Tensor:
+        return torch.ones(B, device=self.device, dtype=torch.bool)
+
+    def MakeOntologyTargetAuxiliary(
+        self,
+        wm: RSSMWorldModel,
+        presence: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        B, K = presence.shape
+        realm = torch.zeros(
+            B, K, ModuleDim.PstRealmClasses, device=self.device)
+        realm[..., int(EntityRealm.EXTERNAL_PHYSICAL)] = presence
+        realm[..., int(EntityRealm.UNKNOWN)] = 1.0 - presence
+        layer_agency = torch.zeros(
+            B, K,
+            ModuleDim.PstMotionLayerClasses,
+            ModuleDim.PstAgencyClasses,
+            device=self.device)
+        layer_agency[..., -1] = 1.0
+        return {
+            "PerceptualPresence": presence,
+            "RealmProb": realm,
+            "MotionLayerProb": torch.zeros(
+                B, K, ModuleDim.PstMotionLayerClasses,
+                device=self.device),
+            "LayerAgencyProb": layer_agency,
+            "DisplaySurfaceProb": torch.zeros(B, K, device=self.device),
+            "SurfaceUV": torch.zeros(B, K, 2, device=self.device),
+            "SurfaceUVConfidence": torch.zeros(B, K, device=self.device),
+            "ContentMotionUV": torch.zeros(B, K, 2, device=self.device),
+            "ContentChangeProb": torch.zeros(B, K, device=self.device),
+            "VerificationConfidence": presence.clone(),}
 
     def TestPSTWorldBinderShapes(self) -> bool:
         B = 2
@@ -6036,6 +7973,7 @@ class TestWorldMTool:
             transitionPhysicalState=physical,
             transitionRobotPhysicalState=robot,
             cameraMotion=self.MakeCameraMotion(B),
+            observerMotionValid=self.MakeObserverValid(B),
             sample=False,)
         ok = (
             out["h_next"].shape == (B, wm.deter_dim)
@@ -6057,6 +7995,7 @@ class TestWorldMTool:
             self.MakePhysicalState(wm, B),
             self.MakeRobotPhysicalState(wm, B),
             self.MakeCameraMotion(B),
+            self.MakeObserverValid(B),
             sample=False,)
         ok = (
             out["h_next"].shape == (B, wm.deter_dim)
@@ -6092,6 +8031,8 @@ class TestWorldMTool:
             physicalState=physical,
             robotPhysicalState=robot,
             cameraMotion=self.MakeCameraMotion(B),
+            observerMotionValid=torch.zeros(
+                B, device=self.device, dtype=torch.bool),
             sample=False,)
         ok = all(
             torch.equal(stationary[name], explicit[name])
@@ -6122,8 +8063,11 @@ class TestWorldMTool:
         action = torch.randn(B, wm.action_dim, device=self.device)
         robot = self.MakeRobotPhysicalState(wm, B)
         camera_motion = self.MakeCameraMotion(B)
-        first = wm.StepPriorOnly(h, z, x, action, physical, robot, camera_motion)
-        second = wm.StepPriorOnly(h, z, x, action, physical, robot, camera_motion)
+        observer_valid = self.MakeObserverValid(B)
+        first = wm.StepPriorOnly(
+            h, z, x, action, physical, robot, camera_motion, observer_valid)
+        second = wm.StepPriorOnly(
+            h, z, x, action, physical, robot, camera_motion, observer_valid)
 
         live_after = dict(wm.named_buffers())
         state_unchanged = all(
@@ -6155,7 +8099,8 @@ class TestWorldMTool:
             kwargs = {
                 "physicalState": self.MakePhysicalState(wm, B, activeSlots=2),
                 "robotPhysicalState": self.MakeRobotPhysicalState(wm, B),
-                "cameraMotion": self.MakeCameraMotion(B)}
+                "cameraMotion": self.MakeCameraMotion(B),
+                "observerMotionValid": self.MakeObserverValid(B)}
             first = wm.StepPriorOnly(*inputs, **kwargs)
             second = wm.StepPriorOnly(*inputs, **kwargs)
             deterministic = all(
@@ -6336,7 +8281,8 @@ class TestWorldMTool:
         kwargs = {
             "physicalState": physical,
             "robotPhysicalState": self.MakeRobotPhysicalState(wm, B),
-            "cameraMotion": self.MakeCameraMotion(B)}
+            "cameraMotion": self.MakeCameraMotion(B),
+            "observerMotionValid": self.MakeObserverValid(B)}
         automatic = wrapper.StepPriorOnly(*inputs, **kwargs)
         explicit = wrapper.StepPriorWithDeltas(
             *inputs,
@@ -6374,6 +8320,127 @@ class TestWorldMTool:
         wm.train(original_training)
         return bool(ok)
 
+    def TestRobotPhysicalEncoderActualTopologies(self) -> bool:
+        try:
+            topologies = (
+                (
+                    self.MakeRobotMorphology(False),
+                    (4, 3, 0, 1, 0, 0)),
+                (
+                    self.MakeRobotMorphology(True),
+                    (5, 2, 4, 2, 2, 2)),)
+            valid = []
+            for morphology, counts in topologies:
+                world = RSSMWorldModel(
+                    visionDim=16,
+                    actionDim=ModuleDim.EndpointActionEmbedDim,
+                    deterDim=16,
+                    stochDim=4,
+                    stateDim=16,
+                    ssmDim=8,
+                    useDecoder=False,
+                    useMemory=False,
+                    nsEnabled=False,
+                    globalFeatDim=16,
+                    objectTokenDim=8,
+                    numObjectTokens=4,
+                    motionPredDim=8,
+                    integratedFeatDim=16,
+                    physicalSlots=4,
+                    physicalSlotDim=8,
+                    physicalPoseDim=7,
+                    physicalAttrDim=4,
+                    physicalIdDim=8,
+                    physicalRelDim=9,
+                    physicalRelationClasses=5,
+                    physicalSemanticDim=8,
+                    physicalStateDim=4,
+                    physicalAffordanceDim=3,
+                    physicalTextDim=2,
+                    physicalSymbolDim=4,
+                    robotMorphology=morphology).to(self.device).eval()
+                encoder = world.robot_physical_encoder
+                B = 2
+                L = morphology.node_count
+                E = morphology.endpoint_count
+                Q = morphology.joint_dof_count
+                endpoint_pose = torch.zeros(
+                    B,
+                    E,
+                    ModuleDim.DecisionEndpointPoseDim,
+                    device=self.device)
+                endpoint_pose[..., 6] = 1.0
+                physical_reference = torch.zeros(
+                    B,
+                    ModuleDim.RobotPhysicalReferenceDim,
+                    device=self.device)
+                physical_reference[:, 6] = 1.0
+                physical_reference[:, -1] = 1.0
+                joint_position = torch.zeros(B, Q, device=self.device)
+                joint_velocity = torch.zeros_like(joint_position)
+                joint_effort = torch.zeros_like(joint_position)
+                joint_observed = torch.ones(
+                    B, Q, device=self.device, dtype=torch.bool)
+                joint_healthy = joint_observed.clone()
+                joint_controllable = (
+                    morphology.joint_variable_commandable.to(
+                        device=self.device).view(1, Q).expand(B, -1))
+                node_pose = torch.zeros(
+                    B,
+                    L,
+                    ModuleDim.DecisionEndpointPoseDim,
+                    device=self.device)
+                node_pose[..., 6] = 1.0
+                node_twist = torch.zeros(B, L, 6, device=self.device)
+                node_observed = torch.ones(
+                    B, L, device=self.device, dtype=torch.bool)
+                node_healthy = node_observed.clone()
+                endpoint_valid = torch.ones(
+                    B, E, device=self.device, dtype=torch.bool)
+                endpoint_controllable = (
+                    morphology.endpoint_task_mask.any(dim=-1).to(
+                        device=self.device).view(1, E).expand(B, -1))
+                output = encoder(
+                    endpoint_pose,
+                    physical_reference,
+                    endpointStateValid=endpoint_valid,
+                    endpointControllable=endpoint_controllable,
+                    jointPosition=joint_position,
+                    jointVelocity=joint_velocity,
+                    jointEffort=joint_effort,
+                    jointObserved=joint_observed,
+                    jointHealthy=joint_healthy,
+                    jointControllable=joint_controllable,
+                    nodePoseWorld=node_pose,
+                    nodeTwistWorld=node_twist,
+                    nodeObserved=node_observed,
+                    nodeHealthy=node_healthy)
+                actual_counts = (
+                    encoder.node_count,
+                    encoder.endpoint_count,
+                    encoder.joint_count,
+                    encoder.gripper_count,
+                    encoder.group_count,
+                    encoder.sensor_count)
+                valid.append(bool(
+                    actual_counts == counts
+                    and world.self_part_count == L
+                    and world._pst_self_part.size(-1) == L
+                    and world._pst_self_part_semantic.size(-1)
+                        == ModuleDim.PstSelfPartSemanticDim
+                    and world._pst_entity_text_semantic.size(-1)
+                        == world.entity_text_semantic_dim
+                    and tuple(output.shape) == (B, world.robot_physical_dim)
+                    and torch.isfinite(output).all().item()))
+            ok = all(valid)
+            print(
+                f"Robot physical actual topologies "
+                f"{'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as error:
+            print(f"Robot physical actual topologies error: {error}")
+            return False
+
     def TestRobotPhysicalStateAffectsWorldDynamics(self) -> bool:
         B = 2
         wm = self.wm.eval()
@@ -6393,6 +8460,7 @@ class TestWorldMTool:
             physical,
             robot_a,
             self.MakeCameraMotion(B),
+            self.MakeObserverValid(B),
             sample=False,)
         prior_b = wm.StepPriorOnly(
             h,
@@ -6402,6 +8470,7 @@ class TestWorldMTool:
             physical,
             robot_b,
             self.MakeCameraMotion(B),
+            self.MakeObserverValid(B),
             sample=False,)
 
         vision = torch.randn(B, wm.vision_dim, device=self.device)
@@ -6414,6 +8483,7 @@ class TestWorldMTool:
             transitionPhysicalState=physical,
             transitionRobotPhysicalState=robot_a,
             cameraMotion=self.MakeCameraMotion(B),
+            observerMotionValid=self.MakeObserverValid(B),
             sample=False,)
         wm.ResetState(batchSize=B)
         post_b = wm.StepPosterior(
@@ -6424,6 +8494,7 @@ class TestWorldMTool:
             transitionPhysicalState=physical,
             transitionRobotPhysicalState=robot_b,
             cameraMotion=self.MakeCameraMotion(B),
+            observerMotionValid=self.MakeObserverValid(B),
             sample=False,)
 
         prior_diff = float((prior_a["s_next"] - prior_b["s_next"]).abs().mean())
@@ -6472,6 +8543,7 @@ class TestWorldMTool:
                     transitionPhysicalState=transition_physical,
                     transitionRobotPhysicalState=transition_robot,
                     cameraMotion=camera_motion,
+                    observerMotionValid=self.MakeObserverValid(B),
                     sample=False)
 
             posterior_a = run_posterior(observation_physical_a, observation_robot_a)
@@ -6510,6 +8582,7 @@ class TestWorldMTool:
                     transitionPhysicalState=transition_physical_state,
                     transitionRobotPhysicalState=transition_robot_state,
                     cameraMotion=camera_motion,
+                    observerMotionValid=self.MakeObserverValid(B),
                     reward=None,
                     done=None,
                     sample=False,
@@ -6589,8 +8662,10 @@ class TestWorldMTool:
         robot = self.MakeRobotPhysicalState(wm, B)
         action = torch.randn(B, wm.action_dim, device=self.device)
         camera_motion = self.MakeCameraMotion(B)
-        context_a = wm.robot_world_relation(robot, physical_a, action, camera_motion)
-        context_b = wm.robot_world_relation(robot, physical_b, action, camera_motion)
+        context_a = wm.robot_world_relation(
+            robot, physical_a, action, camera_motion, self.MakeObserverValid(B))
+        context_b = wm.robot_world_relation(
+            robot, physical_b, action, camera_motion, self.MakeObserverValid(B))
         diff = float((context_a - context_b).abs().mean())
         ok = context_a.shape == (B, wm.robot_world_dim) and diff > 1e-8
         print(f"Robot-world relation uses pairwise relations {'passed' if ok else 'failed'} | diff={diff:.3e}")
@@ -6620,8 +8695,10 @@ class TestWorldMTool:
         robot = self.MakeRobotPhysicalState(wm, B)
         action = torch.randn(B, wm.action_dim, device=self.device)
         camera_motion = self.MakeCameraMotion(B)
-        context_a = wm.robot_world_relation(robot, physical_a, action, camera_motion)
-        context_b = wm.robot_world_relation(robot, physical_b, action, camera_motion)
+        context_a = wm.robot_world_relation(
+            robot, physical_a, action, camera_motion, self.MakeObserverValid(B))
+        context_b = wm.robot_world_relation(
+            robot, physical_b, action, camera_motion, self.MakeObserverValid(B))
         diff = float((context_a - context_b).abs().max())
         ok = context_a.shape == (B, wm.robot_world_dim) and diff < 1e-6
         print(f"Robot-world relation ignores invalid slots {'passed' if ok else 'failed'} | max_diff={diff:.3e}")
@@ -6645,8 +8722,10 @@ class TestWorldMTool:
         robot = self.MakeRobotPhysicalState(wm, B)
         action = torch.randn(B, wm.action_dim, device=self.device)
         camera_motion = self.MakeCameraMotion(B)
-        context_a = wm.robot_world_relation(robot, physical_a, action, camera_motion)
-        context_b = wm.robot_world_relation(robot, physical_b, action, camera_motion)
+        context_a = wm.robot_world_relation(
+            robot, physical_a, action, camera_motion, self.MakeObserverValid(B))
+        context_b = wm.robot_world_relation(
+            robot, physical_b, action, camera_motion, self.MakeObserverValid(B))
         diff = float((context_a - context_b).abs().max())
         ok = torch.allclose(context_a, context_b, atol=2e-6, rtol=1e-5)
         print(f"Robot-world relation quaternion double cover {'passed' if ok else 'failed'} | max_diff={diff:.3e}")
@@ -6672,8 +8751,10 @@ class TestWorldMTool:
         robot = self.MakeRobotPhysicalState(wm, B)
         action = torch.randn(B, wm.action_dim, device=self.device)
         camera_motion = self.MakeCameraMotion(B)
-        context_near = wm.robot_world_relation(robot, physical_near, action, camera_motion)
-        context_far = wm.robot_world_relation(robot, physical_far, action, camera_motion)
+        context_near = wm.robot_world_relation(
+            robot, physical_near, action, camera_motion, self.MakeObserverValid(B))
+        context_far = wm.robot_world_relation(
+            robot, physical_far, action, camera_motion, self.MakeObserverValid(B))
         diff = float((context_near - context_far).abs().mean())
         ok = diff > 1e-5
         print(f"Robot-world relation preserves metric scale {'passed' if ok else 'failed'} | diff={diff:.3e}")
@@ -6703,10 +8784,16 @@ class TestWorldMTool:
         robot = self.MakeRobotPhysicalState(wm, B)
         action = torch.randn(B, wm.action_dim, device=self.device)
         camera_motion = self.MakeCameraMotion(B)
-        context_fresh = wm.robot_world_relation(robot, physical_fresh, action, camera_motion)
-        context_stale = wm.robot_world_relation(robot, physical_stale, action, camera_motion)
+        context_fresh = wm.robot_world_relation(
+            robot, physical_fresh, action, camera_motion, self.MakeObserverValid(B))
+        context_stale = wm.robot_world_relation(
+            robot, physical_stale, action, camera_motion, self.MakeObserverValid(B))
         context_without_semantics = wm.robot_world_relation(
-            robot, physical_without_semantics, action, camera_motion)
+            robot,
+            physical_without_semantics,
+            action,
+            camera_motion,
+            self.MakeObserverValid(B))
         diff = float((context_fresh - context_stale).abs().mean())
         unseen_diff = float((context_stale - context_without_semantics).abs().max())
         ok = diff > 1e-5 and unseen_diff < 1e-6
@@ -6727,8 +8814,10 @@ class TestWorldMTool:
         robot = self.MakeRobotPhysicalState(wm, B)
         action = torch.randn(B, wm.action_dim, device=self.device)
         camera_motion = self.MakeCameraMotion(B)
-        context_high = wm.robot_world_relation(robot, physical_high, action, camera_motion)
-        context_low = wm.robot_world_relation(robot, physical_low, action, camera_motion)
+        context_high = wm.robot_world_relation(
+            robot, physical_high, action, camera_motion, self.MakeObserverValid(B))
+        context_low = wm.robot_world_relation(
+            robot, physical_low, action, camera_motion, self.MakeObserverValid(B))
         diff = float((context_high - context_low).abs().mean())
         high_norm = float(context_high.norm(dim=-1).mean())
         low_norm = float(context_low.norm(dim=-1).mean())
@@ -6762,7 +8851,8 @@ class TestWorldMTool:
             self.MakeRobotPhysicalState(wm, B),
             physical,
             torch.randn(B, wm.action_dim, device=self.device),
-            self.MakeCameraMotion(B))
+            self.MakeCameraMotion(B),
+            self.MakeObserverValid(B))
         max_value = float(context.abs().max())
         ok = context.shape == (B, wm.robot_world_dim) and bool(torch.isfinite(context).all().item()) and max_value == 0.0
         print(f"Robot-world relation empty scene is zero {'passed' if ok else 'failed'} | max={max_value:.3e}")
@@ -6787,7 +8877,7 @@ class TestWorldMTool:
             "SlotPresence", "MphysRaw", "SlotState", "PoseCamera", "ARaw", "Size",
             "StateRaw", "AffordanceRaw", "MotionCameraRaw", "ExternalRelationProbRaw",
             "ContactProbRaw", "MovingProbRaw", "ContactForceRaw", "ContactPointCameraRaw",
-            "Visibility", "Occlusion", "Observed", "LastSeen"]
+            "Visibility", "Occlusion", "GeometryValidMask", "Observed", "LastSeen"]
         for key in slot_fields:
             physical_b[key] = physical_a[key].index_select(1, permutation)
         physical_b["PairwiseRelationCamera"] = physical_a["PairwiseRelationCamera"].index_select(
@@ -6799,8 +8889,10 @@ class TestWorldMTool:
         robot = self.MakeRobotPhysicalState(wm, B)
         action = torch.randn(B, wm.action_dim, device=self.device)
         camera_motion = self.MakeCameraMotion(B)
-        context_a = wm.robot_world_relation(robot, physical_a, action, camera_motion)
-        context_b = wm.robot_world_relation(robot, physical_b, action, camera_motion)
+        context_a = wm.robot_world_relation(
+            robot, physical_a, action, camera_motion, self.MakeObserverValid(B))
+        context_b = wm.robot_world_relation(
+            robot, physical_b, action, camera_motion, self.MakeObserverValid(B))
         diff = float((context_a - context_b).abs().max())
         ok = diff < 1e-5
         print(f"Robot-world relation slot permutation invariant {'passed' if ok else 'failed'} | max_diff={diff:.3e}")
@@ -6816,7 +8908,8 @@ class TestWorldMTool:
                 self.MakeRobotPhysicalState(wm, B),
                 physical,
                 torch.randn(B, wm.action_dim, device=self.device),
-                self.MakeCameraMotion(B))
+                self.MakeCameraMotion(B),
+                self.MakeObserverValid(B))
         except ValueError as error:
             ok = "PairwiseRelationCamera" in str(error)
             print(f"Robot-world relation input contract {'passed' if ok else 'failed'}")
@@ -6834,7 +8927,8 @@ class TestWorldMTool:
         wm.UpdatePhysicalState(
             self.MakePhysicalState(wm, B),
             cameraPoseWorld=camera_pose,
-            robotPhysicalState=robot_physical,)
+            robotPhysicalState=robot_physical,
+            observerValid=self.MakeObserverValid(B),)
         physical_export = wm.ExportPhysicalState()
         robot_export = wm.ExportRobotPhysicalState()
         wm._robot_physical_state.zero_()
@@ -6880,6 +8974,7 @@ class TestWorldMTool:
                 transitionPhysicalState=self.MakePhysicalState(wm, B),
                 transitionRobotPhysicalState=self.MakeRobotPhysicalState(wm, B),
                 cameraMotion=self.MakeCameraMotion(B),
+                observerMotionValid=self.MakeObserverValid(B),
                 reward=None,
                 done=None,
                 sample=False,)
@@ -6910,6 +9005,7 @@ class TestWorldMTool:
             transitionPhysicalState=self.MakePhysicalState(wm, B),
             transitionRobotPhysicalState=self.MakeRobotPhysicalState(wm, B),
             cameraMotion=self.MakeCameraMotion(B),
+            observerMotionValid=self.MakeObserverValid(B),
             reward=torch.zeros(B, device=self.device),
             done=torch.zeros(B, device=self.device),
             sample=False,)
@@ -6951,6 +9047,7 @@ class TestWorldMTool:
                 transitionPhysicalState=physical,
                 transitionRobotPhysicalState=robot,
                 cameraMotion=self.MakeCameraMotion(B),
+                observerMotionValid=self.MakeObserverValid(B),
                 reward=None,
                 done=None,
                 updateMemory=False)
@@ -6964,6 +9061,7 @@ class TestWorldMTool:
                 transitionPhysicalState=physical,
                 transitionRobotPhysicalState=robot,
                 cameraMotion=self.MakeCameraMotion(B),
+                observerMotionValid=self.MakeObserverValid(B),
                 reward=None,
                 done=None,
                 updateMemory=False)
@@ -7016,6 +9114,7 @@ class TestWorldMTool:
                 transitionPhysicalState=self.MakePhysicalState(wm, B, activeSlots=2),
                 transitionRobotPhysicalState=self.MakeRobotPhysicalState(wm, B),
                 cameraMotion=self.MakeCameraMotion(B),
+                observerMotionValid=self.MakeObserverValid(B),
                 reward=torch.zeros(B, device=self.device),
                 done=torch.zeros(B, device=self.device),
                 sample=False,
@@ -7065,6 +9164,7 @@ class TestWorldMTool:
                     transitionPhysicalState=physical,
                     transitionRobotPhysicalState=robot,
                     cameraMotion=self.MakeCameraMotion(B),
+                    observerMotionValid=self.MakeObserverValid(B),
                     sample=False)
 
             first = run(torch.zeros(B, wm.state_dim, device=self.device))
@@ -7111,6 +9211,7 @@ class TestWorldMTool:
                 transitionPhysicalState=self.MakePhysicalState(wm, B, activeSlots=2),
                 transitionRobotPhysicalState=self.MakeRobotPhysicalState(wm, B),
                 cameraMotion=self.MakeCameraMotion(B),
+                observerMotionValid=self.MakeObserverValid(B),
                 reward=None,
                 done=None,
                 sample=False,
@@ -7144,6 +9245,7 @@ class TestWorldMTool:
             transitionPhysicalState=self.MakePhysicalState(wm, B),
             transitionRobotPhysicalState=self.MakeRobotPhysicalState(wm, B),
             cameraMotion=self.MakeCameraMotion(B),
+            observerMotionValid=self.MakeObserverValid(B),
             reward=torch.zeros(B, device=self.device),
             done=torch.zeros(B, device=self.device),
             sample=False,)
@@ -7175,7 +9277,11 @@ class TestWorldMTool:
         target.MotionToken = torch.randn(B, wm.motion_pred_dim, device=self.device)
         target.Auxiliary = {
             "ObjectGeometryValid": torch.zeros(
-                B, wm.num_object_tokens, 1, device=self.device)}
+                B, wm.num_object_tokens, 1, device=self.device),
+            **self.MakeOntologyTargetAuxiliary(
+                wm,
+                torch.zeros(
+                    B, wm.num_object_tokens, device=self.device))}
         target.SemanticNodes = {
             "node_logits": torch.randn(
                 B, wm.num_object_tokens, 2, device=self.device)}
@@ -7217,7 +9323,11 @@ class TestWorldMTool:
         target.MotionToken = torch.randn(B, wm.motion_pred_dim, device=self.device)
         target.Auxiliary = {
             "ObjectGeometryValid": torch.ones(
-                B, wm.num_object_tokens, 1, device=self.device)}
+                B, wm.num_object_tokens, 1, device=self.device),
+            **self.MakeOntologyTargetAuxiliary(
+                wm,
+                torch.ones(
+                    B, wm.num_object_tokens, device=self.device))}
         target.SemanticNodes = {
             "node_logits": torch.randn(
                 B, wm.num_object_tokens, 2, device=self.device)}
@@ -7268,6 +9378,7 @@ class TestWorldMTool:
             transitionPhysicalState=self.MakePhysicalState(wm, B),
             transitionRobotPhysicalState=self.MakeRobotPhysicalState(wm, B),
             cameraMotion=self.MakeCameraMotion(B),
+            observerMotionValid=self.MakeObserverValid(B),
             reward=torch.zeros(B, device=self.device),
             done=torch.zeros(B, device=self.device),
             sample=False,)
@@ -7342,7 +9453,8 @@ class TestWorldMTool:
             physicalStateDim=8,
             physicalAffordanceDim=4,
             physicalTextDim=4,
-            physicalSymbolDim=8,).to(self.device).train()
+            physicalSymbolDim=8,
+            robotMorphology=self.robot_morphology,).to(self.device).train()
         opt = torch.optim.Adam(wm.parameters(), lr=1e-3)
         vision = torch.randn(B, wm.vision_dim, device=self.device)
         action = torch.randn(B, wm.action_dim, device=self.device)
@@ -7359,6 +9471,7 @@ class TestWorldMTool:
                 transitionPhysicalState=self.MakePhysicalState(wm, B),
                 transitionRobotPhysicalState=self.MakeRobotPhysicalState(wm, B),
                 cameraMotion=self.MakeCameraMotion(B),
+                observerMotionValid=self.MakeObserverValid(B),
                 reward=reward,
                 done=done,
                 sample=False,)
@@ -7383,6 +9496,7 @@ class TestWorldMTool:
             transitionPhysicalState=self.MakePhysicalState(wm, B),
             transitionRobotPhysicalState=self.MakeRobotPhysicalState(wm, B),
             cameraMotion=self.MakeCameraMotion(B),
+            observerMotionValid=self.MakeObserverValid(B),
             reward=torch.zeros(B, device=self.device),
             done=torch.zeros(B, device=self.device),
             sample=False,)
@@ -7563,7 +9677,7 @@ class TestWorldMTool:
             print(f"World memory schema/fields rejection error: {error}")
             return False
 
-    def TestExportWorldMemoryBank(self) -> bool:
+    def TestExportConsciousBank(self) -> bool:
         wm = RSSMWorldModel(
             visionDim=32,
             actionDim=ModuleDim.EndpointActionEmbedDim,
@@ -7574,12 +9688,13 @@ class TestWorldMTool:
             useDecoder=False,
             useMemory=True,
             memoryCapacity=8,
-            nsEnabled=False,).to(self.device).eval()
-        B = 1
+            nsEnabled=False,
+            robotMorphology=self.robot_morphology,).to(self.device).eval()
+        B = 2
         wm.ResetState(batchSize=B)
         wm.ResetMemory()
         with torch.no_grad():
-            wm._mem_size.fill_(3)
+            wm._mem_size[:] = torch.tensor([3, 0], device=self.device)
             wm._mem_imp.zero_()
             wm._mem_steps.zero_()
             wm._mem_vals.zero_()
@@ -7588,20 +9703,23 @@ class TestWorldMTool:
             wm._mem_steps[0, :3] = torch.tensor([1, 2, 3], device=self.device)
             wm._mem_vals[0, :3, 0] = torch.tensor([1.0, 2.0, 3.0], device=self.device)
             wm._mem_keys[0, :3, 0] = torch.tensor([4.0, 5.0, 6.0], device=self.device)
-        out = wm.ExportWorldMemoryBank(topk=2)
+            wm._pst_entity_id[1, 0] = 0
+            wm._pst_slot_generation[1, 0] = 1
+            wm._pst_next_entity_id[1] = 1
+            wm._pst_slot_presence[1, 0] = 1.0
+        out = wm.ExportConsciousBank(topk=2)
         ok = (
-            out is not None
-            and out["vals"].shape == (B, 2, wm.state_dim)
-            and out["vals_valid"].shape == (B, 2)
-            and out["vals_valid"].dtype == torch.bool
-            and bool(out["vals_valid"].all().item())
-            and out["keys"].shape == (B, 2, wm.stoch_dim)
-            and out["idx"].shape == (B, 2)
-            and out["steps"].shape == (B, 2))
-        print(f"ExportWorldMemoryBank {'passed' if ok else 'failed'}")
+            set(out) == {"tokens", "valid"}
+            and out["tokens"].shape == (B, 2, wm.state_dim)
+            and out["valid"].shape == (B, 2)
+            and out["valid"].dtype == torch.bool
+            and int(out["valid"][0].sum().item()) == 2
+            and int(out["valid"][1].sum().item()) == 1
+            and bool(torch.isfinite(out["tokens"]).all().item()))
+        print(f"ExportConsciousBank {'passed' if ok else 'failed'}")
         return bool(ok)
 
-    def TestExportWorldMemoryBankLatestFirst(self) -> bool:
+    def TestExportConsciousBankEntityText(self) -> bool:
         wm = RSSMWorldModel(
             visionDim=32,
             actionDim=ModuleDim.EndpointActionEmbedDim,
@@ -7612,17 +9730,38 @@ class TestWorldMTool:
             useDecoder=False,
             useMemory=True,
             memoryCapacity=8,
-            nsEnabled=False,).to(self.device).eval()
+            nsEnabled=False,
+            robotMorphology=self.robot_morphology,).to(self.device).eval()
         wm.ResetState(batchSize=1)
         wm.ResetMemory()
         with torch.no_grad():
-            wm._mem_size.fill_(3)
-            wm._mem_imp[0, :3] = torch.tensor([0.9, 0.8, 0.7], device=self.device)
-            wm._mem_steps[0, :3] = torch.tensor([30, 10, 20], device=self.device)
-            wm._mem_vals[0, :3, 0] = torch.tensor([30.0, 10.0, 20.0], device=self.device)
-        out = wm.ExportWorldMemoryBank(topk=3)
-        ok = out is not None and torch.equal(out["steps"][0], torch.tensor([30, 20, 10], device=self.device))
-        print(f"ExportWorldMemoryBank latest-first {'passed' if ok else 'failed'}")
+            wm._pst_entity_id[0, 0] = 0
+            wm._pst_slot_generation[0, 0] = 1
+            wm._pst_next_entity_id[0] = 1
+            wm._pst_slot_presence[0, 0] = 1.0
+        before = wm.ExportConsciousBank(topk=1)["tokens"].detach().clone()
+        text_state = {
+            "EntityTextSemantic": torch.zeros(
+                1, wm.physical_slots, 512, device=self.device),
+            "EntityTextConfidence": torch.zeros(
+                1, wm.physical_slots, device=self.device),
+            "EntityTextRevision": torch.zeros(
+                1, wm.physical_slots, device=self.device, dtype=torch.long),
+            "EntityTextChanged": torch.zeros(
+                1, wm.physical_slots, device=self.device, dtype=torch.bool),
+            "EntityId": wm._pst_entity_id.detach().clone(),
+            "SlotGeneration": wm._pst_slot_generation.detach().clone(),}
+        text_state["EntityTextSemantic"][0, 0, 0] = 1.0
+        text_state["EntityTextConfidence"][0, 0] = 0.9
+        text_state["EntityTextRevision"][0, 0] = 1
+        text_state["EntityTextChanged"][0, 0] = True
+        wm.UpdateEntityTextState(text_state)
+        after = wm.ExportConsciousBank(topk=1)["tokens"]
+        ok = (
+            after.shape == before.shape
+            and not torch.equal(before, after)
+            and bool(torch.isfinite(after).all().item()))
+        print(f"ExportConsciousBank entity text {'passed' if ok else 'failed'}")
         return bool(ok)
 
     def TestReorderMemorySteps(self) -> bool:
@@ -7636,7 +9775,8 @@ class TestWorldMTool:
             useDecoder=False,
             useMemory=True,
             memoryCapacity=8,
-            nsEnabled=False,).to(self.device).eval()
+            nsEnabled=False,
+            robotMorphology=self.robot_morphology,).to(self.device).eval()
         wm.ResetState(batchSize=1)
         wm.ResetMemory()
         with torch.no_grad():
@@ -7647,6 +9787,27 @@ class TestWorldMTool:
         ok = torch.equal(wm._mem_steps[0, :3], torch.tensor([3, 1, 2], device=self.device))
         print(f"ReorderMemorySteps {'passed' if ok else 'failed'}")
         return bool(ok)
+
+    def TestMemoryAutosaveDefersWithoutWorldPath(self) -> bool:
+        try:
+            wm = self.MakeMemoryPersistenceWorld().to(self.device)
+            wm.ResetMemory()
+            wm._mem_path = None
+            wm._mem_autosave_every = 1
+            wm.MemAdd(
+                torch.randn(1, wm.stoch_dim, device=self.device),
+                torch.randn(1, wm.state_dim, device=self.device),
+                torch.ones(1, device=self.device))
+            first = wm.HasMemoryAutosaveRequest()
+            second = wm.HasMemoryAutosaveRequest()
+            wm.AcknowledgeMemoryAutosaveRequest()
+            third = wm.HasMemoryAutosaveRequest()
+            ok = first and second and not third
+            print(f"Deferred World autosave {'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Deferred World autosave error: {e}")
+            return False
 
     def TestWrapperAPIBasics(self) -> bool:
         B = 3
@@ -7661,6 +9822,7 @@ class TestWorldMTool:
             transitionPhysicalState=self.MakePhysicalState(wm, B),
             transitionRobotPhysicalState=self.MakeRobotPhysicalState(wm, B),
             cameraMotion=self.MakeCameraMotion(B),
+            observerMotionValid=self.MakeObserverValid(B),
             reward=torch.zeros(B, device=self.device),
             done=torch.zeros(B, device=self.device),
             sample=False,)
@@ -7689,13 +9851,17 @@ class TestWorldMTool:
             vision, None, None, None, [{}],
             actionEnc=action, physicalState=physical, robotPhysicalState=robot_physical,
             transitionPhysicalState=physical, transitionRobotPhysicalState=robot_physical,
-            cameraMotion=self.MakeCameraMotion(B), reward=reward, done=done, sample=False,)
+            cameraMotion=self.MakeCameraMotion(B),
+            observerMotionValid=self.MakeObserverValid(B),
+            reward=reward, done=done, sample=False,)
         wm.ResetState(batchSize=B)
         out1 = wrapper.ForwardWithDeltas(
             vision, None, None, None, [{site: deltaW}],
             actionEnc=action, physicalState=physical, robotPhysicalState=robot_physical,
             transitionPhysicalState=physical, transitionRobotPhysicalState=robot_physical,
-            cameraMotion=self.MakeCameraMotion(B), reward=reward, done=done, sample=False,)
+            cameraMotion=self.MakeCameraMotion(B),
+            observerMotionValid=self.MakeObserverValid(B),
+            reward=reward, done=done, sample=False,)
         diff = float((out0["s_next"] - out1["s_next"]).abs().mean())
         ok = diff > 1e-8
         print(f"ForwardWithDeltas injection {'passed' if ok else 'failed'} | |delta|={diff:.3e}")
@@ -7725,6 +9891,7 @@ class TestWorldMTool:
                 transitionPhysicalState=physical,
                 transitionRobotPhysicalState=robot_physical,
                 cameraMotion=self.MakeCameraMotion(B),
+                observerMotionValid=self.MakeObserverValid(B),
                 reward=torch.zeros(B, device=self.device),
                 done=torch.zeros(B, device=self.device), sample=False)
             lo.alpha[-1].copy_(last_s)
@@ -7735,6 +9902,7 @@ class TestWorldMTool:
                 transitionPhysicalState=physical,
                 transitionRobotPhysicalState=robot_physical,
                 cameraMotion=self.MakeCameraMotion(B),
+                observerMotionValid=self.MakeObserverValid(B),
                 reward=torch.zeros(B, device=self.device),
                 done=torch.zeros(B, device=self.device), sample=False)
         diff = float((out0["s_next"] - out1["s_next"]).abs().mean())
@@ -7755,6 +9923,7 @@ class TestWorldMTool:
             transitionPhysicalState=self.MakePhysicalState(wm, B),
             transitionRobotPhysicalState=self.MakeRobotPhysicalState(wm, B),
             cameraMotion=self.MakeCameraMotion(B),
+            observerMotionValid=self.MakeObserverValid(B),
             reward=torch.zeros(B, device=self.device),
             done=torch.zeros(B, device=self.device),
             sample=False,)
@@ -7797,6 +9966,15 @@ class TestWorldMTool:
                 state["SlotPresence"][:, :2] = 1.0
                 state["ObservedSlotMask"][:, :2] = 1.0
                 state["MphysRaw"][:, :2] = 1.0
+                state["PerceptualPresence"][:, :2] = 1.0
+                state["GeometryValidMask"][:, :2] = 1.0
+                state["PhysicalEntityProb"][:, :2] = 1.0
+                state["PhysicalInteractionProb"][:, :2] = 1.0
+                state["RealmProb"][:, :2, int(EntityRealm.EXTERNAL_PHYSICAL)] = 1.0
+                state["VerificationConfidence"][:, :2] = 1.0
+                state["LayerAgencyProb"][:, :2, :, -1] = 1.0
+                state["AgencyProb"][:, :2, -1] = 1.0
+                state["SurfaceParentProb"][:, :2, -1] = 1.0
                 state["Observed"][:, :2] = True
                 state["IdentityKey"][0, 0] = first
                 state["IdentityKey"][0, 1] = second
@@ -7808,11 +9986,13 @@ class TestWorldMTool:
             wm.UpdatePhysicalState(
                 observed_state(id_a, id_b),
                 cameraPoseWorld=camera_pose,
-                robotPhysicalState=robot_physical)
+                robotPhysicalState=robot_physical,
+                observerValid=self.MakeObserverValid(B))
             wm.UpdatePhysicalState(
                 observed_state(id_b, id_a),
                 cameraPoseWorld=camera_pose,
-                robotPhysicalState=robot_physical)
+                robotPhysicalState=robot_physical,
+                observerValid=self.MakeObserverValid(B))
             merged = wm.ExportPhysicalState()
             slot0_a = float(torch.dot(merged["IdentityKey"][0, 0], id_a).item())
             slot1_b = float(torch.dot(merged["IdentityKey"][0, 1], id_b).item())
@@ -7821,6 +10001,211 @@ class TestWorldMTool:
             return bool(ok)
         except Exception as e:
             print(f"PST Hungarian identity swap error: {e}")
+            return False
+
+    def TestStableEntityIdentityAcrossObservedPermutation(self) -> bool:
+        try:
+            wm = self.wm.eval()
+            B = 1
+            wm.ResetState(batchSize=B)
+            wm.ResetPhysicalState()
+            camera_pose = torch.zeros(
+                B, wm.physical_pose_dim, device=self.device)
+            camera_pose[:, 6] = 1.0
+            robot_physical = self.MakeRobotPhysicalState(wm, B)
+            id_a = torch.zeros(wm.physical_id_dim, device=self.device)
+            id_b = torch.zeros(wm.physical_id_dim, device=self.device)
+            id_a[0] = 1.0
+            id_b[1] = 1.0
+
+            first = self.MakePhysicalState(wm, B, activeSlots=2)
+            first["IdentityKey"].zero_()
+            first["IdentityKey"][0, 0] = id_a
+            first["IdentityKey"][0, 1] = id_b
+            wm.UpdatePhysicalState(
+                first,
+                camera_pose,
+                robot_physical,
+                self.MakeObserverValid(B))
+            before = wm.ExportPhysicalAssociations()
+
+            permuted = self.MakePhysicalState(wm, B, activeSlots=2)
+            permuted["IdentityKey"].zero_()
+            permuted["IdentityKey"][0, 0] = id_b
+            permuted["IdentityKey"][0, 1] = id_a
+            returned = wm.UpdatePhysicalState(
+                permuted,
+                camera_pose,
+                robot_physical,
+                self.MakeObserverValid(B))
+            after = wm.ExportPhysicalAssociations()
+            expected_mapping = torch.tensor(
+                [1, 0], device=self.device, dtype=torch.long)
+            ok = (
+                frozenset(returned) == frozenset(MODEL_PHYSICAL_STATE_FIELDS)
+                and frozenset(after) == frozenset((
+                    "ObservedToWorldSlot",
+                    "WorldEntityId",
+                    "WorldSlotGeneration"))
+                and torch.equal(
+                    after["ObservedToWorldSlot"][0, :2],
+                    expected_mapping)
+                and torch.equal(
+                    after["WorldEntityId"],
+                    before["WorldEntityId"])
+                and torch.equal(
+                    after["WorldSlotGeneration"],
+                    before["WorldSlotGeneration"])
+                and torch.equal(
+                    after["WorldEntityId"][0, :2],
+                    torch.tensor([0, 1], device=self.device)))
+            print(
+                f"Stable entity identity across observed permutation "
+                f"{'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Stable entity identity permutation error: {e}")
+            return False
+
+    def TestReplacementAllocatesNewEntityIdentity(self) -> bool:
+        try:
+            wm = self.wm.eval()
+            B = 1
+            wm.ResetState(batchSize=B)
+            wm.ResetPhysicalState()
+            camera_pose = torch.zeros(
+                B, wm.physical_pose_dim, device=self.device)
+            camera_pose[:, 6] = 1.0
+            robot_physical = self.MakeRobotPhysicalState(wm, B)
+
+            physical = self.MakePhysicalState(
+                wm, B, activeSlots=wm.physical_slots)
+            physical["Step"].fill_(8)
+            physical["LastSeen"].fill_(8)
+            physical["LastSeen"][0, 0] = 0
+            physical["IdentityKey"].zero_()
+            physical["IdentityKey"][0, :, 0] = 1.0
+            physical["HasTextProb"][0, 0] = 1.0
+            physical["TextEmbed"][0, 0].fill_(3.0)
+            physical["SymbolProb"][0, 0].fill_(1.0)
+            wm.ImportPhysicalState(physical)
+            before = wm.ExportPhysicalAssociations()
+            old_id = int(before["WorldEntityId"][0, 0].item())
+            old_generation = int(
+                before["WorldSlotGeneration"][0, 0].item())
+
+            observed = self.MakePhysicalState(wm, B, activeSlots=1)
+            observed["IdentityKey"].zero_()
+            observed["IdentityKey"][0, 0, 1] = 1.0
+            observed["HasTextProb"].zero_()
+            observed["TextEmbed"].zero_()
+            observed["SymbolProb"].zero_()
+            wm.UpdatePhysicalState(
+                observed,
+                camera_pose,
+                robot_physical,
+                self.MakeObserverValid(B))
+            after = wm.ExportPhysicalAssociations()
+            new_id = int(after["WorldEntityId"][0, 0].item())
+            new_generation = int(
+                after["WorldSlotGeneration"][0, 0].item())
+            physical_after = wm.ExportPhysicalState()
+            ok = (
+                int(after["ObservedToWorldSlot"][0, 0].item()) == 0
+                and new_id == wm.physical_slots
+                and new_id != old_id
+                and new_generation == old_generation + 1
+                and int(wm._pst_next_entity_id[0].item()) == (
+                    wm.physical_slots + 1)
+                and torch.equal(
+                    after["WorldEntityId"][0, 1:],
+                    before["WorldEntityId"][0, 1:])
+                and float(physical_after["HasTextProb"][0, 0].item()) == 0.0
+                and float(physical_after["TextEmbed"][0, 0].abs().sum().item()) == 0.0
+                and float(physical_after["SymbolProb"][0, 0].abs().sum().item()) == 0.0)
+            print(
+                f"Replacement entity identity generation "
+                f"{'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Replacement entity identity generation error: {e}")
+            return False
+
+    def TestEntityIdentityPersistenceAndPartialReset(self) -> bool:
+        try:
+            source = self.MakeMemoryPersistenceWorld()
+            target = self.MakeMemoryPersistenceWorld()
+            B = 2
+            calibration_id = "calibration-entity-id"
+            world_frame_id = "world-entity-id"
+            source.BindMemoryContext(calibration_id, world_frame_id)
+            target.BindMemoryContext(calibration_id, world_frame_id)
+            source.ResetState(batchSize=B)
+            source.ResetPhysicalState()
+            camera_pose = torch.zeros(
+                B, source.physical_pose_dim, device=self.device)
+            camera_pose[:, 6] = 1.0
+            source.UpdatePhysicalState(
+                self.MakePhysicalState(source, B, activeSlots=2),
+                camera_pose,
+                self.MakeRobotPhysicalState(source, B),
+                self.MakeObserverValid(B))
+            source_associations = source.ExportPhysicalAssociations()
+
+            with tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "world_entity_id.pt")
+                source.SaveMemory(path)
+                payload = torch.load(path, weights_only=False)
+                target.LoadMemory(path, batchSize=B)
+
+            loaded_associations = target.ExportPhysicalAssociations()
+            persisted = (
+                payload["world_memory_schema_version"]
+                == WORLD_MEMORY_SCHEMA_VERSION
+                and torch.equal(
+                    loaded_associations["ObservedToWorldSlot"],
+                    source_associations["ObservedToWorldSlot"])
+                and torch.equal(
+                    loaded_associations["WorldEntityId"],
+                    source_associations["WorldEntityId"])
+                and torch.equal(
+                    loaded_associations["WorldSlotGeneration"],
+                    source_associations["WorldSlotGeneration"])
+                and torch.equal(
+                    target._pst_next_entity_id,
+                    source._pst_next_entity_id))
+            live_before = {
+                "entity": target._pst_entity_id[1].clone(),
+                "generation": target._pst_slot_generation[1].clone(),
+                "next": target._pst_next_entity_id[1].clone(),
+                "association": (
+                    target._last_observed_to_world_slot[1].clone()),}
+            target.ResetEpisodeState(torch.tensor(
+                [True, False], device=self.device))
+            done_cleared = (
+                bool((target._pst_entity_id[0] == -1).all().item())
+                and int(target._pst_slot_generation[0].sum().item()) == 0
+                and int(target._pst_next_entity_id[0].item()) == 0
+                and bool((
+                    target._last_observed_to_world_slot[0] == -1
+                ).all().item()))
+            live_preserved = (
+                torch.equal(target._pst_entity_id[1], live_before["entity"])
+                and torch.equal(
+                    target._pst_slot_generation[1],
+                    live_before["generation"])
+                and torch.equal(
+                    target._pst_next_entity_id[1], live_before["next"])
+                and torch.equal(
+                    target._last_observed_to_world_slot[1],
+                    live_before["association"]))
+            ok = persisted and done_cleared and live_preserved
+            print(
+                f"Entity identity persistence and partial reset "
+                f"{'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print(f"Entity identity persistence/partial reset error: {e}")
             return False
 
     def TestPhysicalUpdateRejectsNonFiniteBeforeMutation(self) -> bool:
@@ -7839,7 +10224,8 @@ class TestWorldMTool:
             wm.UpdatePhysicalState(
                 observed,
                 camera,
-                self.MakeRobotPhysicalState(wm, B))
+                self.MakeRobotPhysicalState(wm, B),
+                self.MakeObserverValid(B))
         except ValueError as error:
             rejected = "finite" in str(error)
         after_physical = wm.ExportPhysicalState()
@@ -7869,7 +10255,8 @@ class TestWorldMTool:
             wm.UpdatePhysicalState(
                 observed,
                 camera,
-                self.MakeRobotPhysicalState(wm, B))
+                self.MakeRobotPhysicalState(wm, B),
+                self.MakeObserverValid(B))
         except ValueError as error:
             rejected = "shape" in str(error)
         after_physical = wm.ExportPhysicalState()
@@ -7911,7 +10298,8 @@ class TestWorldMTool:
         merged = wm.UpdatePhysicalState(
             observed,
             camera,
-            self.MakeRobotPhysicalState(wm, B))
+            self.MakeRobotPhysicalState(wm, B),
+            self.MakeObserverValid(B))
         legal_match_kept = torch.allclose(
             merged["SlotState"][0, 0],
             observed["SlotState"][0, 0])
@@ -7971,7 +10359,8 @@ class TestWorldMTool:
             wm.UpdatePhysicalState(
                 observed,
                 cameraPoseWorld=camera_pose,
-                robotPhysicalState=robot_physical)
+                robotPhysicalState=robot_physical,
+                observerValid=self.MakeObserverValid(B))
             merged = wm.ExportPhysicalState()
             stale_pair_relation = (
                 merged["PairwiseRelationWorld"][0, 0, 1, 4:].abs().sum()
@@ -8013,7 +10402,8 @@ class TestWorldMTool:
             wm.UpdatePhysicalState(
                 observed,
                 cameraPoseWorld=camera_pose,
-                robotPhysicalState=robot_physical)
+                robotPhysicalState=robot_physical,
+                observerValid=self.MakeObserverValid(B))
             merged = wm.ExportPhysicalState()
             stale_pair_relation = (
                 merged["PairwiseRelationWorld"][0, 0, 0].abs().sum()
@@ -8078,12 +10468,14 @@ class TestWorldMTool:
                 robot_physical,
                 model_view,
                 endpoint_action,
-                camera_motion)
+                camera_motion,
+                self.MakeObserverValid(B))
             transformed_context = wm.robot_world_relation(
                 robot_physical,
                 transformed_view,
                 endpoint_action,
-                camera_motion)
+                camera_motion,
+                self.MakeObserverValid(B))
 
             ok = (
                 torch.allclose(
@@ -8124,7 +10516,8 @@ class TestWorldMTool:
             wm.UpdatePhysicalState(
                 observed,
                 cameraPoseWorld=camera_pose,
-                robotPhysicalState=self.MakeRobotPhysicalState(wm, B))
+                robotPhysicalState=self.MakeRobotPhysicalState(wm, B),
+                observerValid=self.MakeObserverValid(B))
             merged = wm.ExportPhysicalState()
             expected = torch.tensor([5.0, 10.5, 15.0], device=self.device)
             transformed = merged["ContactPointWorldRaw"][0, 0]
@@ -8137,7 +10530,8 @@ class TestWorldMTool:
                 self.MakeRobotPhysicalState(wm, B),
                 explicit_model_state,
                 torch.zeros(B, wm.action_dim, device=self.device),
-                self.MakeCameraMotion(B))
+                self.MakeCameraMotion(B),
+                self.MakeObserverValid(B))
             explicit_binding = wm.pst_binder(
                 torch.zeros(B, wm.deter_dim, device=self.device),
                 torch.zeros(B, wm.stoch_dim, device=self.device),
@@ -8170,7 +10564,11 @@ class TestWorldMTool:
             observed["PairwiseRelationCamera"].zero_()
             observed["PairwiseRelationCamera"][0, 0, 1, 4] = 1.0
             observed["PairwiseRelationCamera"][0, 1, 0, 5] = 1.0
-            wm.UpdatePhysicalState(observed, camera_pose, robot_physical)
+            wm.UpdatePhysicalState(
+                observed,
+                camera_pose,
+                robot_physical,
+                self.MakeObserverValid(B))
             first = wm.ExportPhysicalState()
             first_step = int(first["Step"][0].item())
             first_seen = first["PairRelationLastSeen"][0, :2, :2].clone()
@@ -8180,8 +10578,14 @@ class TestWorldMTool:
                 for key, value in observed.items()}
             only_first["ObservedSlotMask"][:, 1:] = 0.0
             only_first["MphysRaw"][:, 1:] = 0.0
+            only_first["PhysicalEntityProb"][:, 1:] = 0.0
+            only_first["PhysicalInteractionProb"][:, 1:] = 0.0
             only_first["PairwiseRelationCamera"].zero_()
-            wm.UpdatePhysicalState(only_first, camera_pose, robot_physical)
+            wm.UpdatePhysicalState(
+                only_first,
+                camera_pose,
+                robot_physical,
+                self.MakeObserverValid(B))
             second = wm.ExportPhysicalState()
             second_seen = second["PairRelationLastSeen"][0, :2, :2]
             ok = (
@@ -8296,25 +10700,56 @@ class TestWorldMTool:
 
             wrapper.zero_grad(set_to_none=True)
             physical = self.MakePhysicalState(wm, 1, activeSlots=3)
-            body_proprioception = torch.zeros(
+            endpoint_proprioception = torch.zeros(
                 1,
-                ModuleDim.DecisionBodyEndpointCount,
+                self.robot_morphology.endpoint_count,
                 ModuleDim.DecisionEndpointPoseDim,
                 device=self.device)
-            body_proprioception[..., 6] = 1.0
+            endpoint_proprioception[..., 6] = 1.0
             robot_physical_reference = torch.zeros(
                 1,
                 ModuleDim.RobotPhysicalReferenceDim,
                 device=self.device)
             robot_physical_reference[:, 3] = 1.0
             robot_physical_reference[:, 6] = -1.0
+            robot_physical_reference[:, -1] = 1.0
+            Q = self.robot_morphology.joint_dof_count
+            L = self.robot_morphology.node_count
+            node_pose = torch.zeros(
+                1, L, 7, device=self.device)
+            node_pose[..., 6] = 1.0
             context = wm.robot_world_relation(
                 wm.EncodeRobotPhysicalState(
-                    body_proprioception,
-                    robot_physical_reference),
+                    endpoint_proprioception,
+                    robot_physical_reference,
+                    endpointStateValid=torch.ones(
+                        1,
+                        self.robot_morphology.endpoint_count,
+                        device=self.device,
+                        dtype=torch.bool),
+                    endpointControllable=(
+                        self.robot_morphology.endpoint_task_mask.any(dim=-1)
+                        .to(self.device).unsqueeze(0)),
+                    jointPosition=torch.zeros(1, Q, device=self.device),
+                    jointVelocity=torch.zeros(1, Q, device=self.device),
+                    jointEffort=torch.zeros(1, Q, device=self.device),
+                    jointObserved=torch.zeros(
+                        1, Q, device=self.device, dtype=torch.bool),
+                    jointHealthy=torch.zeros(
+                        1, Q, device=self.device, dtype=torch.bool),
+                    jointControllable=torch.zeros(
+                        1, Q, device=self.device, dtype=torch.bool),
+                    nodePoseWorld=node_pose,
+                    nodeTwistWorld=torch.zeros(
+                        1, L, 6, device=self.device),
+                    nodeObserved=torch.zeros(
+                        1, L, device=self.device, dtype=torch.bool),
+                    nodeHealthy=torch.zeros(
+                        1, L, device=self.device, dtype=torch.bool)),
                 physical,
                 torch.randn(1, wm.action_dim, device=self.device),
-                self.MakeCameraMotion(1))
+                self.MakeCameraMotion(1),
+                self.MakeObserverValid(1))
             probe = torch.linspace(0.5, 1.5, context.size(-1), device=self.device)
             (context * probe).sum().backward()
             relation_grad = wm.robot_world_relation.relation_proj[3].target.weight.grad
@@ -8322,7 +10757,8 @@ class TestWorldMTool:
                 relation_grad is not None
                 and bool(torch.isfinite(relation_grad).all().item())
                 and float(relation_grad.abs().sum().item()) > 0.0)
-            encoder_grad = wm.robot_physical_encoder.net[1].weight.grad
+            encoder_grad = (
+                wm.robot_physical_encoder.node_pose_proj[0].weight.grad)
             encoder_receives_grad = (
                 encoder_grad is not None
                 and bool(torch.isfinite(encoder_grad).all().item())
@@ -8370,6 +10806,132 @@ class TestWorldMTool:
             print(f"Online commit trainability contract error: {e}")
             return False
 
+    def TestVirtualEntityDoesNotAcquireWorldGeometry(self) -> bool:
+        wm = self.wm.eval()
+        wm.ResetState(batchSize=1)
+        observed = self.MakePhysicalState(wm, 1, activeSlots=1)
+        observed["RealmProb"][0, 0].zero_()
+        observed["RealmProb"][
+            0, 0, int(EntityRealm.VIRTUAL_CONTENT)] = 1.0
+        camera_pose = torch.tensor(
+            [[10.0, 20.0, 30.0, 0.0, 0.0, 0.0, 1.0]],
+            device=self.device)
+        malformed_rejected = False
+        try:
+            wm.UpdatePhysicalState(
+                observed,
+                camera_pose,
+                self.MakeRobotPhysicalState(wm, 1),
+                self.MakeObserverValid(1))
+        except ValueError:
+            malformed_rejected = True
+        observed["GeometryValidMask"][0, 0] = 0.0
+        observed["MphysRaw"][0, 0] = 0.0
+        observed["PhysicalEntityProb"][0, 0] = 0.0
+        observed["PhysicalInteractionProb"][0, 0] = 0.0
+        observed["PoseCamera"][0, 0, :3] = torch.tensor(
+            [2.0, 3.0, 4.0], device=self.device)
+        model_state = wm.UpdatePhysicalState(
+            observed,
+            camera_pose,
+            self.MakeRobotPhysicalState(wm, 1),
+            self.MakeObserverValid(1))
+        persistent = wm.ExportPhysicalState()
+        expected_identity = torch.tensor(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            device=self.device)
+        ok = bool(
+            malformed_rejected
+            and persistent["PerceptualPresence"][0, 0] > 0.0
+            and persistent["MphysRaw"][0, 0] == 0.0
+            and torch.equal(persistent["PoseWorld"][0, 0], expected_identity)
+            and torch.equal(model_state["PoseCamera"][0, 0], expected_identity)
+            and model_state["GeometryValidMask"][0, 0] == 0.0
+            and model_state["RealmProb"][
+                0, 0, int(EntityRealm.VIRTUAL_CONTENT)] == 1.0)
+        print(
+            f"Virtual entity has no fabricated world geometry "
+            f"{'passed' if ok else 'failed'}")
+        return ok
+
+    def TestSelfBodySlotsCannotBeEvicted(self) -> bool:
+        wm = self.wm.eval()
+        B = 1
+        wm.ResetPhysicalState()
+        camera_pose = torch.zeros(B, wm.physical_pose_dim, device=self.device)
+        camera_pose[:, 6] = 1.0
+        robot_physical = self.MakeRobotPhysicalState(wm, B)
+        self_observed = self.MakePhysicalState(
+            wm, B, activeSlots=wm.physical_slots)
+        self_observed["IdentityKey"].zero_()
+        self_observed["IdentityKey"][..., 0] = 1.0
+        self_observed["RealmProb"].zero_()
+        self_observed["RealmProb"][
+            ..., int(EntityRealm.SELF_BODY)] = 1.0
+        self_observed["BodyMembershipProb"].fill_(1.0)
+        self_observed["SelfPartProb"].zero_()
+        self_observed["SelfPartProb"][..., 0] = 1.0
+        wm.UpdatePhysicalState(
+            self_observed,
+            camera_pose,
+            robot_physical,
+            self.MakeObserverValid(B))
+        before = wm.ExportPhysicalState()
+
+        external = self.MakePhysicalState(wm, B, activeSlots=1)
+        external["IdentityKey"].zero_()
+        external["IdentityKey"][..., 0] = 1.0
+        external["RealmProb"].zero_()
+        external["RealmProb"][
+            ..., int(EntityRealm.EXTERNAL_PHYSICAL)] = 1.0
+        external["BodyMembershipProb"].zero_()
+        external["SelfPartProb"].zero_()
+        wm.UpdatePhysicalState(
+            external,
+            camera_pose,
+            robot_physical,
+            self.MakeObserverValid(B))
+        after = wm.ExportPhysicalState()
+        ok = bool(
+            torch.equal(after["IdentityKey"], before["IdentityKey"])
+            and torch.equal(
+                after["BodyMembershipProb"],
+                before["BodyMembershipProb"])
+            and bool((after["BodyMembershipProb"] > 0.5).all().item()))
+        print(
+            f"Protected self-body slots "
+            f"{'passed' if ok else 'failed'}")
+        return ok
+
+    def TestPredictedEntityMotionFactorShapes(self) -> bool:
+        wm = self.wm.eval()
+        B = 2
+        output = wm.BuildPredictedVisual(torch.randn(
+            B, wm.state_dim, device=self.device))[
+                "reconstructed_visual_state"]
+        K = wm.num_object_tokens
+        expected = {
+            "RealmProb": (B, K, ModuleDim.PstRealmClasses),
+            "MotionLayerProb": (B, K, ModuleDim.PstMotionLayerClasses),
+            "LayerAgencyProb": (
+                B, K,
+                ModuleDim.PstMotionLayerClasses,
+                ModuleDim.PstAgencyClasses),
+            "ObjectAgencyProb": (B, K, ModuleDim.PstAgencyClasses),
+            "DisplaySurfaceProb": (B, K),
+            "SurfaceUV": (B, K, 2),
+            "ContentMotionUV": (B, K, 2),
+            "ContentChangeProb": (B, K),
+            "FactorPriorConfidence": (B, K),}
+        ok = all(
+            tuple(output[name].shape) == shape
+            and bool(torch.isfinite(output[name]).all().item())
+            for name, shape in expected.items())
+        print(
+            f"Predicted entity-motion factors "
+            f"{'passed' if ok else 'failed'}")
+        return ok
+
     def RunAll(self) -> bool:
         results = {
             "PSTWorldBinderShapes": self.TestPSTWorldBinderShapes(),
@@ -8385,6 +10947,7 @@ class TestWorldMTool:
             "BoundedImportanceAndGateParity": self.TestBoundedImportanceAndGateParity(),
             "PhysicsRefinerSupportsInferenceModeAndDamping": self.TestPhysicsRefinerSupportsInferenceModeAndDamping(),
             "OnlinePriorRolloutUsesCandidatesWithoutMutatingState": self.TestOnlinePriorRolloutUsesCandidatesWithoutMutatingState(),
+            "RobotPhysicalEncoderActualTopologies": self.TestRobotPhysicalEncoderActualTopologies(),
             "RobotPhysicalStateAffectsWorldDynamics": self.TestRobotPhysicalStateAffectsWorldDynamics(),
             "FilteringSeparatesTransitionAndObservationContexts": self.TestFilteringSeparatesTransitionAndObservationContexts(),
             "RobotWorldRelationUsesPairwiseRelations": self.TestRobotWorldRelationUsesPairwiseRelations(),
@@ -8416,15 +10979,19 @@ class TestWorldMTool:
             "MemoryContextRoundTrip": self.TestMemoryContextRoundTrip(),
             "MemoryContextMismatchRejected": self.TestMemoryContextMismatchRejected(),
             "MemorySchemaAndFieldsMismatchRejected": self.TestMemorySchemaAndFieldsMismatchRejected(),
-            "ExportWorldMemoryBank": self.TestExportWorldMemoryBank(),
-            "ExportWorldMemoryBankLatestFirst": self.TestExportWorldMemoryBankLatestFirst(),
+            "ExportConsciousBank": self.TestExportConsciousBank(),
+            "ExportConsciousBankEntityText": self.TestExportConsciousBankEntityText(),
             "ReorderMemorySteps": self.TestReorderMemorySteps(),
+            "MemoryAutosaveDefersWithoutWorldPath": self.TestMemoryAutosaveDefersWithoutWorldPath(),
             "WrapperAPIBasics": self.TestWrapperAPIBasics(),
             "ForwardWithDeltasInjection": self.TestForwardWithDeltasInjection(),
             "CommitOneGrowAndValueChange": self.TestCommitOneGrowAndValueChange(),
             "GradFlowCandidates": self.TestGradFlowCandidates(),
             "WrapperUpdateInjectLoRA": self.TestWrapperUpdateInjectLoRA(),
             "PSTHungarianAssignmentIdentitySwap": self.TestPSTHungarianAssignmentIdentitySwap(),
+            "StableEntityIdentityAcrossObservedPermutation": self.TestStableEntityIdentityAcrossObservedPermutation(),
+            "ReplacementAllocatesNewEntityIdentity": self.TestReplacementAllocatesNewEntityIdentity(),
+            "EntityIdentityPersistenceAndPartialReset": self.TestEntityIdentityPersistenceAndPartialReset(),
             "PhysicalUpdateRejectsNonFiniteBeforeMutation": self.TestPhysicalUpdateRejectsNonFiniteBeforeMutation(),
             "PhysicalUpdateRejectsInvalidShapeBeforeMutation": self.TestPhysicalUpdateRejectsInvalidShapeBeforeMutation(),
             "PSTAssignmentKeepsLegalMatchWithUnmatchedDummies": self.TestPSTAssignmentKeepsLegalMatchWithUnmatchedDummies(),
@@ -8437,7 +11004,10 @@ class TestWorldMTool:
             "PhysicalStateTimestampRoundTrip": self.TestPhysicalStateTimestampRoundTrip(),
             "PartialEpisodeResetClearsOnlyDoneRows": self.TestPartialEpisodeResetClearsOnlyDoneRows(),
             "OnlineRelationHeadsRemainTrainable": self.TestOnlineRelationHeadsRemainTrainable(),
-            "OnlineCommitKeepsOnlyDirectHeadsTrainable": self.TestOnlineCommitKeepsOnlyDirectHeadsTrainable(),}
+            "OnlineCommitKeepsOnlyDirectHeadsTrainable": self.TestOnlineCommitKeepsOnlyDirectHeadsTrainable(),
+            "VirtualEntityDoesNotAcquireWorldGeometry": self.TestVirtualEntityDoesNotAcquireWorldGeometry(),
+            "SelfBodySlotsCannotBeEvicted": self.TestSelfBodySlotsCannotBeEvicted(),
+            "PredictedEntityMotionFactorShapes": self.TestPredictedEntityMotionFactorShapes(),}
         passed = sum(1 for v in results.values() if v)
         print(f"\n[WorldModule Tests] {passed}/{len(results)} passed.")
         return passed == len(results)

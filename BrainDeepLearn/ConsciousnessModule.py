@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-BankInput = Optional[Dict[str, torch.Tensor]] # world, memory
+BankInput = Dict[str, torch.Tensor]
 
 class FiLMBlock(AGICoreModule):
     def __init__(self, inDim: int, outDim: int):
@@ -258,9 +258,6 @@ class ConsciousnessOutput(NamedTuple):
     extras: Dict[str, torch.Tensor]
 
 class ConsciousnessExtractor(AGICoreModule):
-    def TypeModuleName(self, typeKey: str) -> str:
-        return f"type_{typeKey}"
-
     def __init__(
         self,
         memItemDim: int = 1024,  
@@ -292,27 +289,6 @@ class ConsciousnessExtractor(AGICoreModule):
         self.top_k_world = topKWorld
         self.rand_k_world = randKWorld
 
-        self.mem_type_keys: Tuple[str, ...] = ("gws", "kv", "ltm_sem", "ltm_epi", "sym")
-        self.world_type_keys: Tuple[str, ...] = ("vals",)
-        self.world_typed_min_tokens: int = 2
-
-        def make_score_net(item_dim: int) -> nn.Sequential:
-            return nn.Sequential(
-                nn.Linear(item_dim, hiddenDim),
-                nn.LayerNorm(hiddenDim),
-                nn.GELU(),
-                nn.Linear(hiddenDim, 1),)
-
-        def make_agg_proj(item_dim: int) -> nn.Sequential:
-            hidden = 2 * item_dim
-            return nn.Sequential(
-                nn.Linear(3 * item_dim, hidden),
-                nn.LayerNorm(hidden),
-                nn.GELU(),
-                nn.Linear(hidden, item_dim),
-                nn.LayerNorm(item_dim),
-                nn.GELU(),)
-
         self.mem_score_net = nn.Sequential(
             nn.Linear(self.mem_item_dim, hiddenDim),
             nn.LayerNorm(hiddenDim),
@@ -325,12 +301,6 @@ class ConsciousnessExtractor(AGICoreModule):
             nn.GELU(),
             nn.Linear(hiddenDim, 1),)
 
-        self.mem_type_score_nets = nn.ModuleDict({
-            self.TypeModuleName(k): make_score_net(self.mem_item_dim) for k in self.mem_type_keys})
-        
-        self.world_type_score_nets = nn.ModuleDict({
-            self.TypeModuleName(k): make_score_net(self.world_item_dim) for k in self.world_type_keys})
-
         self.mem_agg_proj = nn.Sequential(
             nn.Linear(3 * self.mem_item_dim, self.mem_item_dim),
             nn.LayerNorm(self.mem_item_dim),
@@ -340,67 +310,6 @@ class ConsciousnessExtractor(AGICoreModule):
             nn.Linear(3 * self.world_item_dim, self.world_item_dim),
             nn.LayerNorm(self.world_item_dim),
             nn.GELU(),)
-
-        self.mem_type_agg_proj = nn.ModuleDict({
-            self.TypeModuleName(k): make_agg_proj(self.mem_item_dim) for k in self.mem_type_keys})
-        
-        self.world_type_agg_proj = nn.ModuleDict({
-            self.TypeModuleName(k): make_agg_proj(self.world_item_dim) for k in self.world_type_keys})
-
-        self.mem_type_fuse_proj = nn.Sequential(
-            nn.Linear(len(self.mem_type_keys) * self.mem_item_dim, self.mem_item_dim),
-            nn.LayerNorm(self.mem_item_dim),
-            nn.GELU(),)
-        
-        self.world_type_fuse_proj = nn.Sequential(
-            nn.Linear(len(self.world_type_keys) * self.world_item_dim, self.world_item_dim),
-            nn.LayerNorm(self.world_item_dim),
-            nn.GELU(),)
-
-        self.mem_type_gate = nn.Linear(len(self.mem_type_keys) * self.mem_item_dim, len(self.mem_type_keys))
-
-        self.world_type_gate = nn.Linear(len(self.world_type_keys) * self.world_item_dim, len(self.world_type_keys))
-
-        self.mem_type_film = nn.Linear(len(self.mem_type_keys) * self.mem_item_dim, 2 * self.mem_item_dim)
-        self.world_type_film = nn.Linear(len(self.world_type_keys) * self.world_item_dim, 2 * self.world_item_dim)
-        self.mem_type_alpha_net = nn.Linear(len(self.mem_type_keys) * self.mem_item_dim, 1)
-        self.world_type_alpha_net = nn.Linear(len(self.world_type_keys) * self.world_item_dim, 1)
-        self.mem_type_mix_norm = nn.LayerNorm(self.mem_item_dim)
-        self.mem_type_film_norm = nn.LayerNorm(self.mem_item_dim)
-        self.world_type_mix_norm = nn.LayerNorm(self.world_item_dim)
-        self.world_type_film_norm = nn.LayerNorm(self.world_item_dim)
-
-        self.mem_ctx_blend = nn.Sequential(
-            nn.LayerNorm(2 * self.mem_item_dim),
-            nn.Linear(2 * self.mem_item_dim, self.mem_item_dim),
-            nn.GELU(),
-            nn.Linear(self.mem_item_dim, 1),
-            nn.Sigmoid(),)
-        
-        self.world_ctx_blend = nn.Sequential(
-            nn.LayerNorm(2 * self.world_item_dim),
-            nn.Linear(2 * self.world_item_dim, self.world_item_dim),
-            nn.GELU(),
-            nn.Linear(self.world_item_dim, 1),
-            nn.Sigmoid(),)
-
-        def make_dim_mapper(outDim: int, inDim: int) -> nn.Sequential:
-            first = nn.Linear(inDim, outDim)
-            return nn.Sequential(
-                first,
-                nn.LayerNorm(outDim),
-                nn.GELU(),
-                nn.Linear(outDim, outDim),)
-
-        self.mem_type_dim_mapper = nn.ModuleDict({
-            self.TypeModuleName("gws"): make_dim_mapper(self.mem_item_dim, self.mem_item_dim),
-            self.TypeModuleName("kv"): make_dim_mapper(self.mem_item_dim, self.mem_item_dim),
-            self.TypeModuleName("ltm_sem"): make_dim_mapper(self.mem_item_dim, self.mem_item_dim),
-            self.TypeModuleName("ltm_epi"): make_dim_mapper(self.mem_item_dim, self.mem_item_dim),
-            self.TypeModuleName("sym"): make_dim_mapper(self.mem_item_dim, self.sym_item_dim),})
-
-        self.world_type_dim_mapper = nn.ModuleDict({
-            self.TypeModuleName("vals"): make_dim_mapper(self.world_item_dim, self.world_item_dim),})
 
         ctx_in_dim = self.mem_item_dim + self.world_item_dim + self.dev_dim
 
@@ -820,227 +729,50 @@ class ConsciousnessExtractor(AGICoreModule):
 
         return summary, stats # summary: [B, 3D]
 
-    def FirstTensorFromBank(self, bank: BankInput) -> Optional[torch.Tensor]:
-        if isinstance(bank, dict):
-            for v in bank.values():
-                if isinstance(v, torch.Tensor) and v.dim() >= 2:
-                    return v
-        return None
-
-    def ResolveDimMapper(self, bankRole: str, typeKey: str) -> nn.Module:
-        if bankRole == "mem":
-            mapper_dict = self.mem_type_dim_mapper
-        elif bankRole == "world":
-            mapper_dict = self.world_type_dim_mapper
-        else:
-            raise ValueError(f"Unknown bankRole: {bankRole}")
-
-        mk = self.TypeModuleName(typeKey)
-        if mk in mapper_dict:
-            return mapper_dict[mk]
-        raise KeyError(f"Unknown typeKey for {bankRole} bank: {typeKey}")
-
-    def MapBankItemDimWithNet(
-        self,
-        x: torch.Tensor,
-        targetDim: int,
-        bankRole: str,
-        typeKey: str,) -> torch.Tensor:
-
-        B, N, D = x.shape
-        if N == 0:
-            return torch.zeros(B, 0, int(targetDim), device=x.device, dtype=x.dtype)
-
-        mapper = self.ResolveDimMapper(bankRole=bankRole, typeKey=typeKey)
-
-        z = x.reshape(B * N, D)
-        z = mapper(z)
-
-        z = z.reshape(B, N, int(targetDim))
-        return z # [B, N, D]
-
-
-    def NormalizeBankDictInput(
+    def NormalizeBankInput(
         self,
         bank: BankInput,
         *,
-        expectedB: int,
-        targetDim: int,
+        expectedB: Optional[int],
+        expectedDim: int,
         bankRole: str,
-        preferredKeys: Tuple[str, ...],
         device: torch.device,
-        dtype: torch.dtype,) -> Dict[str, torch.Tensor]:
-        out: Dict[str, torch.Tensor] = {}
+        dtype: torch.dtype,) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not isinstance(bank, dict):
+            raise TypeError(f"{bankRole} bank must be a dict")
+        if set(bank.keys()) != {"tokens", "valid"}:
+            raise ValueError(
+                f"{bankRole} bank must contain exactly 'tokens' and 'valid'")
 
-        if (bank is not None) and (not isinstance(bank, dict)):
-            raise TypeError("Bank input must be Dict[str, Tensor] or None")
-
-        for k in preferredKeys:
-            if (bank is None) or (k not in bank):
-                out[k] = torch.zeros(expectedB, 0, targetDim, device=device, dtype=dtype)
-                continue
-
-            v = bank[k]
-            if not isinstance(v, torch.Tensor):
-                raise TypeError(f"{bankRole}.{k} must be a tensor")
-            if v.dim() != 3:
-                raise ValueError(f"{bankRole}.{k} must have shape [B, N, D]")
-            if int(v.size(0)) != expectedB:
-                raise ValueError(
-                    f"{bankRole}.{k} batch size must be {expectedB}, got {int(v.size(0))}")
-            if v.device != device:
-                raise ValueError(f"{bankRole}.{k} must be on the model device")
-            if v.dtype != dtype:
-                raise TypeError(f"{bankRole}.{k} must use the model dtype")
-            mapper = self.ResolveDimMapper(bankRole=bankRole, typeKey=k)
-            expected_dim = int(mapper[0].in_features)
-            if int(v.size(2)) != expected_dim:
-                raise ValueError(
-                    f"{bankRole}.{k} feature size must be {expected_dim}, "
-                    f"got {int(v.size(2))}")
-            out[k] = self.MapBankItemDimWithNet(
-                v,
-                targetDim=targetDim,
-                bankRole=bankRole,
-                typeKey=k)
-
-        return out # [B, N, D]
-
-    def NormalizeBankValidityInput(
-        self,
-        bank: BankInput,
-        bankByType: Dict[str, torch.Tensor],
-        *,
-        preferredKeys: Tuple[str, ...],) -> Dict[str, torch.Tensor]:
-        validity: Dict[str, torch.Tensor] = {}
-
-        for key in preferredKeys:
-            items = bankByType[key]
-            B, N, _ = items.shape
-            if (bank is None) or (key not in bank):
-                validity[key] = torch.zeros(B, N, device=items.device, dtype=torch.bool)
-                continue
-
-            valid_key = f"{key}_valid"
-            if valid_key not in bank:
-                raise ValueError(f"present bank tensor {key!r} requires {valid_key!r}")
-            valid = bank[valid_key]
-            if not isinstance(valid, torch.Tensor):
-                raise TypeError(f"{valid_key} must be a tensor")
-            if valid.dtype != torch.bool:
-                raise TypeError(f"{valid_key} must use torch.bool")
-            if valid.device != items.device:
-                raise ValueError(f"{valid_key} must be on the same device as {key}")
-            if valid.shape != (B, N):
-                raise ValueError(
-                    f"{valid_key} must have shape {(B, N)}, got {tuple(valid.shape)}")
-            validity[key] = valid
-
-        return validity
-
-    def AggregateTypedBank(
-        self,
-        bankByType: Dict[str, torch.Tensor],
-        validByType: Dict[str, torch.Tensor],
-        *,
-        bankRole: str,
-        topK: int,
-        randK: int,
-        expectedB: int,
-        targetDim: int,
-        device: torch.device,
-        dtype: torch.dtype,) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        if bankRole == "mem":
-            typeKeys = self.mem_type_keys
-            scoreNets = self.mem_type_score_nets
-            aggProjs = self.mem_type_agg_proj
-            fuseProj = self.mem_type_fuse_proj
-            gateNet = self.mem_type_gate
-            filmNet = self.mem_type_film
-            alphaNet = self.mem_type_alpha_net
-            mixNorm = self.mem_type_mix_norm
-            filmNorm = self.mem_type_film_norm
-        elif bankRole == "world":
-            typeKeys = self.world_type_keys
-            scoreNets = self.world_type_score_nets
-            aggProjs = self.world_type_agg_proj
-            fuseProj = self.world_type_fuse_proj
-            gateNet = self.world_type_gate
-            filmNet = self.world_type_film
-            alphaNet = self.world_type_alpha_net
-            mixNorm = self.world_type_mix_norm
-            filmNorm = self.world_type_film_norm
-        else:
-            raise ValueError(f"Unknown bankRole: {bankRole}")
-
-        zero_bank = torch.zeros(expectedB, 0, targetDim, device=device, dtype=dtype)
-        zero_valid = torch.zeros(expectedB, 0, device=device, dtype=torch.bool)
-
-        per_type_ctx = []
-        per_type_score = []
-        per_type_n = []
-        per_type_available = []
-        per_type_stats: Dict[str, torch.Tensor] = {}
-
-        for k in typeKeys:
-            cur = bankByType.get(k, zero_bank)
-            cur_valid = validByType.get(k, zero_valid)
-            mk = self.TypeModuleName(k)
-            summary, st = self.AggregateBank(
-                cur,
-                scoreNets[mk],
-                topK=topK,
-                randK=randK,
-                validMask=cur_valid)
-            available = st["n_items"].gt(0.0)
-            ctx_k = aggProjs[mk](summary) + summary[:, :targetDim]
-            ctx_k = ctx_k * available.to(dtype)
-
-            per_type_ctx.append(ctx_k)
-            per_type_score.append(st["score_mean"])
-            per_type_n.append(st["n_items"])
-            per_type_available.append(available)
-            per_type_stats[f"{k}_score_mean"] = st["score_mean"]
-            per_type_stats[f"{k}_n_items"] = st["n_items"]
-
-        if len(per_type_ctx) == 0:
-            ctx = torch.zeros(expectedB, targetDim, device=device, dtype=dtype)
-            stats = {
-                "score_mean": torch.zeros(expectedB, 1, device=device, dtype=dtype),
-                "n_items": torch.zeros(expectedB, 1, device=device, dtype=dtype),
-                "type_gate": torch.zeros(expectedB, 0, device=device, dtype=dtype),}
-            return ctx, stats, per_type_stats
-
-        ctx_cat = torch.cat(per_type_ctx, dim=-1)
-        gate_logits = gateNet(ctx_cat)
-        type_available = torch.cat(per_type_available, dim=1)
-        gate = F.softmax(
-            gate_logits.masked_fill(~type_available, torch.finfo(gate_logits.dtype).min),
-            dim=-1)
-        gate = gate * type_available.to(dtype)
-        gate = gate / gate.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-
-        ctx_stack = torch.stack(per_type_ctx, dim=1)
-        ctx_mix = torch.einsum("bt,btd->bd", gate, ctx_stack)
-        ctx_proj = fuseProj(ctx_cat)
-        gamma_beta = filmNet(ctx_cat)
-        gamma, beta = gamma_beta.chunk(2, dim=-1)
-        ctx_film = ctx_proj * (1.0 + torch.tanh(gamma)) + beta
-        alpha = torch.sigmoid(alphaNet(ctx_cat))
-        ctx = mixNorm(ctx_mix) + alpha * filmNorm(ctx_film)
-        any_type_available = type_available.any(dim=1, keepdim=True)
-        ctx = ctx * any_type_available.to(dtype)
-
-        type_count = type_available.to(dtype).sum(dim=1, keepdim=True).clamp_min(1.0)
-        score_mean = (
-            torch.cat(per_type_score, dim=1) * type_available.to(dtype)
-        ).sum(dim=1, keepdim=True) / type_count
-        n_items = torch.stack(per_type_n, dim=1).sum(dim=1)
-        stats = {
-            "score_mean": score_mean,
-            "n_items": n_items,
-            "type_gate": gate,}
-        return ctx, stats, per_type_stats
+        tokens = bank["tokens"]
+        valid = bank["valid"]
+        if not isinstance(tokens, torch.Tensor):
+            raise TypeError(f"{bankRole}.tokens must be a tensor")
+        if tokens.dim() != 3:
+            raise ValueError(f"{bankRole}.tokens must have shape [B, N, D]")
+        if expectedB is not None and int(tokens.size(0)) != expectedB:
+            raise ValueError(
+                f"{bankRole}.tokens batch size must be {expectedB}, "
+                f"got {int(tokens.size(0))}")
+        if int(tokens.size(2)) != expectedDim:
+            raise ValueError(
+                f"{bankRole}.tokens feature size must be {expectedDim}, "
+                f"got {int(tokens.size(2))}")
+        if tokens.device != device:
+            raise ValueError(f"{bankRole}.tokens must be on the model device")
+        if tokens.dtype != dtype:
+            raise TypeError(f"{bankRole}.tokens must use the model dtype")
+        if not isinstance(valid, torch.Tensor):
+            raise TypeError(f"{bankRole}.valid must be a tensor")
+        if valid.dtype != torch.bool:
+            raise TypeError(f"{bankRole}.valid must use torch.bool")
+        if valid.device != device:
+            raise ValueError(f"{bankRole}.valid must be on the model device")
+        if valid.shape != tokens.shape[:2]:
+            raise ValueError(
+                f"{bankRole}.valid must have shape {tuple(tokens.shape[:2])}, "
+                f"got {tuple(valid.shape)}")
+        return tokens.contiguous(), valid.contiguous()
 
     def forward(
         self,
@@ -1054,58 +786,28 @@ class ConsciousnessExtractor(AGICoreModule):
         # Ds = self.self_dim
         # Di = self.intent_dim
         # H = hyperHiddenDim
-        # Tmem = len(self.mem_type_keys)
-        # Tworld = len(self.world_type_keys)
         # Nm = memory_bank.size(1) memory token
         # Nw = world_bank.size(1) world token 
-
-        ref_mem = self.FirstTensorFromBank(memoryBank)
-        ref_world = self.FirstTensorFromBank(worldBank)
-        ref = ref_mem if ref_mem is not None else ref_world
 
         device = self.device
         dtype = self.dtype
 
-        if ref is None:
-            B = int(self._dev_trace.size(0))
-        else:
-            B = int(ref.size(0))
-
-        self.EnsureB(B)
-
-        mem_by_type = self.NormalizeBankDictInput(
+        memory_bank, memory_valid = self.NormalizeBankInput(
             memoryBank,
-            expectedB=B,
-            targetDim=self.mem_item_dim,
+            expectedB=None,
+            expectedDim=self.mem_item_dim,
             bankRole="mem",
-            preferredKeys=self.mem_type_keys,
             device=device,
-            dtype=dtype,)
-        mem_valid_by_type = self.NormalizeBankValidityInput(
-            memoryBank,
-            mem_by_type,
-            preferredKeys=self.mem_type_keys,)
-        memory_bank = torch.cat([mem_by_type[k] for k in self.mem_type_keys], dim=1).contiguous() # [B, N_k, Dm]
-        memory_valid = torch.cat(
-            [mem_valid_by_type[k] for k in self.mem_type_keys],
-            dim=1).contiguous()
-
-        world_by_type = self.NormalizeBankDictInput(
+            dtype=dtype)
+        B = int(memory_bank.size(0))
+        world_bank, world_valid = self.NormalizeBankInput(
             worldBank,
             expectedB=B,
-            targetDim=self.world_item_dim,
+            expectedDim=self.world_item_dim,
             bankRole="world",
-            preferredKeys=self.world_type_keys,
             device=device,
-            dtype=dtype,)
-        world_valid_by_type = self.NormalizeBankValidityInput(
-            worldBank,
-            world_by_type,
-            preferredKeys=self.world_type_keys,)
-        world_bank = torch.cat([world_by_type[k] for k in self.world_type_keys], dim=1).contiguous() # [B, N_k, Dw]
-        world_valid = torch.cat(
-            [world_valid_by_type[k] for k in self.world_type_keys],
-            dim=1).contiguous()
+            dtype=dtype)
+        self.EnsureB(B)
 
         mem_available = memory_valid.any(dim=1, keepdim=True)
         world_available = world_valid.any(dim=1, keepdim=True)
@@ -1126,16 +828,8 @@ class ConsciousnessExtractor(AGICoreModule):
                 "mem_available": zeros_1,
                 "world_available": zeros_1,
                 "dev_available": dev_available.to(dtype),
-                "mem_type_gate": torch.zeros(B, len(self.mem_type_keys), device=device, dtype=dtype),
-                "world_type_gate": torch.zeros(B, len(self.world_type_keys), device=device, dtype=dtype),
                 "cold_start": (~self._state_valid).view(B, 1).to(dtype),
                 "no_observation": torch.ones(B, 1, device=device, dtype=dtype),}
-            for k in self.mem_type_keys:
-                extras[f"mem_type_{k}_score_mean"] = zeros_1
-                extras[f"mem_type_{k}_n_items"] = zeros_1
-            for k in self.world_type_keys:
-                extras[f"world_type_{k}_score_mean"] = zeros_1
-                extras[f"world_type_{k}_n_items"] = zeros_1
             return ConsciousnessOutput(
                 self_sem=self._last_sem,
                 intent_sem=self._last_self_intent,
@@ -1157,78 +851,22 @@ class ConsciousnessExtractor(AGICoreModule):
             dev_candidate,
             torch.zeros_like(dev_candidate)) # [B, Dd]
 
-        mem_summary_raw, mem_stats_global = self.AggregateBank(
+        mem_summary_raw, mem_stats = self.AggregateBank(
             memory_bank,
             self.mem_score_net,
             topK=self.top_k_mem,
             randK=self.rand_k_mem,
             validMask=memory_valid,)
-        mem_ctx_global = self.mem_agg_proj(mem_summary_raw) # [B, Dm]
-
-        mem_ctx_typed, mem_stats_typed, mem_type_stats = self.AggregateTypedBank(
-            mem_by_type,
-            mem_valid_by_type,
-            bankRole="mem",
-            topK=self.top_k_mem,
-            randK=self.rand_k_mem,
-            expectedB=B,
-            targetDim=self.mem_item_dim,
-            device=device,
-            dtype=dtype,) # mem_ctx_typed: [B, Dm]
-        
-        mem_alpha = self.mem_ctx_blend(torch.cat([mem_ctx_global, mem_ctx_typed], dim=-1))
-        mem_alpha = mem_alpha * mem_available.to(dtype)
-
-        mem_ctx = mem_ctx_global + mem_alpha * (mem_ctx_typed - mem_ctx_global) # [B, Dm]
+        mem_ctx = self.mem_agg_proj(mem_summary_raw)
         mem_ctx = mem_ctx * mem_available.to(dtype)
-        
-        mem_stats = {
-            "score_mean": mem_stats_global["score_mean"] + mem_alpha * (mem_stats_typed["score_mean"] - mem_stats_global["score_mean"]),
-            "n_items": mem_stats_global["n_items"],
-            "type_gate": mem_stats_typed["type_gate"],}
 
-        world_summary_raw, world_stats_global = self.AggregateBank(
+        world_summary_raw, world_stats = self.AggregateBank(
             world_bank,
             self.world_score_net,
             topK=self.top_k_world,
             randK=self.rand_k_world,
             validMask=world_valid,) # world_summary_raw" [B, 3*Dw]
-        
-        world_ctx_global = self.world_agg_proj(world_summary_raw) #: [B, Dw]
-        world_use_typed = (world_bank.size(1) >= int(self.world_typed_min_tokens))
-        if world_use_typed:
-            world_ctx_typed, world_stats_typed, world_type_stats = self.AggregateTypedBank(
-                world_by_type,
-                world_valid_by_type,
-                bankRole="world",
-                topK=self.top_k_world,
-                randK=self.rand_k_world,
-                expectedB=B,
-                targetDim=self.world_item_dim,
-                device=device,
-                dtype=dtype,) # world_ctx_typed: [B, Dw]
-            
-            world_alpha = self.world_ctx_blend(torch.cat([world_ctx_global, world_ctx_typed], dim=-1))
-            world_alpha = world_alpha * world_available.to(dtype)
-
-            world_ctx = world_ctx_global + world_alpha * (world_ctx_typed - world_ctx_global) #: [B,Dw]
-
-            world_stats = {
-                "score_mean": world_stats_global["score_mean"] + world_alpha * (world_stats_typed["score_mean"] - world_stats_global["score_mean"]),
-                "n_items": world_stats_global["n_items"],
-                "type_gate": world_stats_typed["type_gate"],}
-        else:
-            world_alpha = torch.zeros(B, 1, device=device, dtype=dtype)
-            world_ctx = world_ctx_global
-            world_type_stats = {}
-            for k in self.world_type_keys:
-                world_type_stats[f"{k}_score_mean"] = world_stats_global["score_mean"]
-                world_type_stats[f"{k}_n_items"] = world_stats_global["n_items"]
-            world_stats = {
-                "score_mean": world_stats_global["score_mean"],
-                "n_items": world_stats_global["n_items"],
-                "type_gate": world_available.to(dtype),}
-
+        world_ctx = self.world_agg_proj(world_summary_raw)
         world_ctx = world_ctx * world_available.to(dtype)
 
         ctx_raw = torch.cat([world_ctx, mem_ctx, dev_ctx], dim=-1)
@@ -1282,7 +920,7 @@ class ConsciousnessExtractor(AGICoreModule):
                 world_tokens,
                 keyPaddingMask=~safe_world_valid,
                 needWeights=True)
-            world_attn_vec = world_attn_out.squeeze(1) * world_available.to(dtype) # [B,H]
+            world_attn_vec = world_attn_out.squeeze(1) * world_available.to(dtype)
             world_attn_prob = world_attn_prob.squeeze(1) # [B,Nw]
             world_attn_prob = world_attn_prob * world_valid.to(dtype)
             world_attn_entropy = -(world_attn_prob * world_attn_prob.clamp_min(1e-8).log()).sum(dim=-1, keepdim=True)
@@ -1598,8 +1236,6 @@ class ConsciousnessExtractor(AGICoreModule):
             "dev_trace_norm": dev_state.norm(dim=-1, keepdim=True).detach(),
             "mem_score_mean": mem_stats["score_mean"].detach(),
             "world_score_mean": world_stats["score_mean"].detach(),
-            "mem_ctx_blend_alpha": mem_alpha.detach(),
-            "world_ctx_blend_alpha": world_alpha.detach(),
             "modal_precision_world": w_world.detach(),
             "modal_precision_mem": w_mem.detach(),
             "modal_precision_dev": w_dev.detach(),
@@ -1629,15 +1265,6 @@ class ConsciousnessExtractor(AGICoreModule):
             extras["loss_align"] = active_mean(align_loss).detach()
             extras["loss_prior_smooth"] = active_mean(prior_smooth).detach()
             extras["loss_ctx_inject"] = active_mean(loss_ctx_inject).detach()
-
-        if "type_gate" in mem_stats:
-            extras["mem_type_gate"] = mem_stats["type_gate"].detach()
-        if "type_gate" in world_stats:
-            extras["world_type_gate"] = world_stats["type_gate"].detach()
-        for k, v in mem_type_stats.items():
-            extras[f"mem_type_{k}"] = v.detach()
-        for k, v in world_type_stats.items():
-            extras[f"world_type_{k}"] = v.detach()
 
         return ConsciousnessOutput(
             self_sem=self_sem_out,
@@ -1696,21 +1323,11 @@ class TestConsciousMTool:
     def DummyBankDicts(self, B: int = 8, Nm: int = 10, Nw: int = 7) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         mem, world = self.DummyBanks(B=B, Nm=Nm, Nw=Nw)
         mem_dict = {
-            "gws": mem[:, :max(1, Nm // 4), :].contiguous(),
-            "kv": mem.contiguous(),
-            "ltm_sem": mem[:, :max(1, Nm // 2), :].contiguous(),
-            "ltm_epi": mem[:, :max(1, Nm // 3), :].contiguous(),
-            "sym": torch.randn(B, max(1, Nm // 3), self.sym_dim, device=self.device),}
-        for key in ("gws", "kv", "ltm_sem", "ltm_epi", "sym"):
-            mem_dict[f"{key}_valid"] = torch.ones(
-                mem_dict[key].shape[:2],
-                dtype=torch.bool,
-                device=self.device)
+            "tokens": mem.contiguous(),
+            "valid": torch.ones(B, Nm, dtype=torch.bool, device=self.device),}
         world_dict = {
-            "vals": world.contiguous(),
-            "vals_valid": torch.ones(B, Nw, dtype=torch.bool, device=self.device),
-            "idx": torch.randint(0, max(1, Nw), (B, Nw), device=self.device),
-            "size": torch.full((B,), Nw, device=self.device, dtype=torch.long),}
+            "tokens": world.contiguous(),
+            "valid": torch.ones(B, Nw, dtype=torch.bool, device=self.device),}
         return mem_dict, world_dict
 
     def TestDictBankInterface(self) -> bool:
@@ -1725,14 +1342,51 @@ class TestConsciousMTool:
             assert "mem_n_items" in out.extras and "world_n_items" in out.extras
             assert (out.extras["mem_n_items"] > 0).all()
             assert (out.extras["world_n_items"] > 0).all()
-            assert "mem_type_gate" in out.extras and "world_type_gate" in out.extras
+            assert set(mem_dict.keys()) == {"tokens", "valid"}
+            assert set(world_dict.keys()) == {"tokens", "valid"}
 
-            missing_mask_rejected = False
+            invalid_banks = [
+                {"tokens": mem_dict["tokens"]},
+                {
+                    "tokens": mem_dict["tokens"],
+                    "valid": mem_dict["valid"],
+                    "payload": mem_dict["tokens"],},
+                {"items": mem_dict["tokens"], "mask": mem_dict["valid"]},]
+            for invalid in invalid_banks:
+                rejected = False
+                try:
+                    model(invalid, world_dict)
+                except ValueError:
+                    rejected = True
+                assert rejected
+
+            invalid_valid = {
+                "tokens": mem_dict["tokens"],
+                "valid": mem_dict["valid"].to(dtype=mem_dict["tokens"].dtype),}
+            rejected = False
             try:
-                model({"kv": mem_dict["kv"]}, None)
-            except ValueError:
-                missing_mask_rejected = True
-            assert missing_mask_rejected, "present bank tensor without kv_valid was accepted"
+                model(invalid_valid, world_dict)
+            except TypeError:
+                rejected = True
+            assert rejected
+
+            rejected = False
+            try:
+                model(None, world_dict)
+            except TypeError:
+                rejected = True
+            assert rejected
+
+            model.eval()
+            empty_mem, first_world = self.DummyBankDicts(B=2, Nm=0, Nw=3)
+            second_world = {
+                "tokens": torch.randn_like(first_world["tokens"]),
+                "valid": first_world["valid"].clone(),}
+            model.ResetState()
+            first = model(empty_mem, first_world)
+            model.ResetState()
+            second = model(empty_mem, second_world)
+            assert not torch.allclose(first.self_sem, second.self_sem)
 
             print("TestDictBankInterface passed.")
             return True
@@ -1894,11 +1548,12 @@ class TestConsciousMTool:
             model.ResetState()
             model.train()
 
-            out = model(None, None)
-            out_repeat = model(None, None)
+            empty_mem, empty_world = self.DummyBankDicts(B=2, Nm=0, Nw=0)
+            out = model(empty_mem, empty_world)
+            out_repeat = model(empty_mem, empty_world)
 
-            assert out.self_sem.shape == (1, self.self_dim), f"cold-start self_sem shape wrong: {out.self_sem.shape}"
-            assert out.intent_sem.shape == (1, self.intent_dim), f"cold-start intent_sem shape wrong: {out.intent_sem.shape}"
+            assert out.self_sem.shape == (2, self.self_dim), f"cold-start self_sem shape wrong: {out.self_sem.shape}"
+            assert out.intent_sem.shape == (2, self.intent_dim), f"cold-start intent_sem shape wrong: {out.intent_sem.shape}"
             assert "cold_start" in out.extras, "cold-start extras missing key: cold_start"
             assert torch.all(out.extras["cold_start"] == 1.0), "cold_start flag should be all ones"
             assert out.extras["loss"] is not None, "training cold-start should provide zero loss tensor"
@@ -1914,10 +1569,10 @@ class TestConsciousMTool:
             assert step == 0, f"empty observations must not advance state, got step={step}"
             assert dev_trace is None and last_intent is None and last_sem is None
 
-            _, world = self.DummyBankDicts(B=1, Nm=0, Nw=1)
-            observed = model(None, world)
+            empty_mem, world = self.DummyBankDicts(B=2, Nm=0, Nw=1)
+            observed = model(empty_mem, world)
             observed_step = model.GetState()[-1]
-            empty_after_state = model(None, None)
+            empty_after_state = model(empty_mem, empty_world)
             assert observed_step == 1
             assert model.GetState()[-1] == observed_step
             assert torch.allclose(empty_after_state.self_sem, observed.self_sem.detach())
@@ -1942,28 +1597,17 @@ class TestConsciousMTool:
 
             B = 3
             mem_dict: Dict[str, torch.Tensor] = {
-                "gws": torch.zeros(B, 0, self.mem_dim, device=self.device),
-                "gws_valid": torch.zeros(B, 0, dtype=torch.bool, device=self.device),
-                "kv": torch.zeros(B, 0, self.mem_dim, device=self.device),
-                "kv_valid": torch.zeros(B, 0, dtype=torch.bool, device=self.device),
-                "ltm_sem": torch.zeros(B, 0, self.mem_dim, device=self.device),
-                "ltm_sem_valid": torch.zeros(B, 0, dtype=torch.bool, device=self.device),
-                "ltm_epi": torch.zeros(B, 0, self.mem_dim, device=self.device),
-                "ltm_epi_valid": torch.zeros(B, 0, dtype=torch.bool, device=self.device),
-                "sym": torch.zeros(B, 0, self.sym_dim, device=self.device),
-                "sym_valid": torch.zeros(B, 0, dtype=torch.bool, device=self.device),}
+                "tokens": torch.zeros(B, 0, self.mem_dim, device=self.device),
+                "valid": torch.zeros(B, 0, dtype=torch.bool, device=self.device),}
             world_dict: Dict[str, torch.Tensor] = {
-                "vals": torch.randn(B, 1, self.world_dim, device=self.device),
-                "vals_valid": torch.ones(B, 1, dtype=torch.bool, device=self.device),}
+                "tokens": torch.randn(B, 1, self.world_dim, device=self.device),
+                "valid": torch.ones(B, 1, dtype=torch.bool, device=self.device),}
 
             out = model(mem_dict, world_dict)
 
             zeros = torch.zeros(B, 1, device=self.device)
-            ones_gate = torch.ones(B, len(model.world_type_keys), device=self.device)
-            assert torch.allclose(out.extras["world_ctx_blend_alpha"], zeros), "world_alpha should be zero when world tokens < world_typed_min_tokens"
             assert torch.allclose(out.extras["mem_attn_entropy"], zeros), "mem_attn_entropy should be zero when memory_bank is empty"
             assert torch.allclose(out.extras["world_attn_entropy"], zeros), "world_attn_entropy should be zero when world tokens <= 1"
-            assert torch.allclose(out.extras["world_type_gate"], ones_gate), "world_type_gate should be all ones in world typed fallback branch"
             assert torch.all(out.extras["mem_n_items"] == 0.0), "mem_n_items should be zero for empty memory bank"
             assert torch.all(out.extras["world_n_items"] == 1.0), "world_n_items should equal 1 for single-token world bank"
             assert torch.all(out.extras["mem_available"] == 0.0)
@@ -1990,8 +1634,8 @@ class TestConsciousMTool:
             with torch.no_grad():
                 model.z_world_head.bias[hidden:].fill_(-20.0)
 
-            _, world = self.DummyBankDicts(B=1, Nm=0, Nw=1)
-            out = model(None, world)
+            memory, world = self.DummyBankDicts(B=1, Nm=0, Nw=1)
+            out = model(memory, world)
             assert torch.isfinite(out.extras["loss"])
             assert float(out.extras["loss_nce"].item()) == 0.0
             assert float(out.extras["loss_precision"].item()) >= 0.0
@@ -2038,7 +1682,7 @@ class TestConsciousMTool:
             model.ResetState()
             model.train()
             memory, world = self.DummyBankDicts(B=2, Nm=2, Nw=1)
-            world["vals_valid"][1, 0] = False
+            world["valid"][1, 0] = False
             out = model(memory, world)
             assert torch.isfinite(out.extras["loss_nce"])
             assert float(out.extras["nce_active_modalities"].item()) == 1.0
@@ -2056,8 +1700,8 @@ class TestConsciousMTool:
             model.ResetState()
             model.train()
 
-            _, initial_world = self.DummyBankDicts(B=B, Nm=0, Nw=1)
-            _ = model(None, initial_world)
+            initial_memory, initial_world = self.DummyBankDicts(B=B, Nm=0, Nw=1)
+            _ = model(initial_memory, initial_world)
             prev_dev, prev_intent, prev_self, _ = model.GetState()
             assert prev_dev is not None and prev_intent is not None and prev_self is not None
             hebb_before = {
@@ -2069,11 +1713,14 @@ class TestConsciousMTool:
             with torch.no_grad():
                 values[1].fill_(1e4)
             memory = {
-                "kv": values,
-                "kv_valid": torch.tensor(
+                "tokens": values,
+                "valid": torch.tensor(
                     [[True, True], [False, False]],
                     device=self.device)}
-            out = model(memory, None)
+            empty_world = {
+                "tokens": torch.zeros(B, 0, self.world_dim, device=self.device),
+                "valid": torch.zeros(B, 0, dtype=torch.bool, device=self.device),}
+            out = model(memory, empty_world)
 
             assert torch.isfinite(out.self_sem).all()
             assert torch.isfinite(out.intent_sem).all()

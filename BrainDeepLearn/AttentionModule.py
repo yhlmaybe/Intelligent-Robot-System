@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Any, Optional, Tuple, List, Dict
 from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear, RotaryEmbedding
+from ModuleMessagerManager import ModuleDim
 
 
 
@@ -925,6 +926,72 @@ class AttentionExtractor(AGICoreModule):
         self.quality_log_gain = nn.Parameter(torch.tensor(0.0))
         self.presence_gain = nn.Parameter(torch.tensor(1.85))
 
+        self.ontology_object_feature_dim = (
+            46 + ModuleDim.PstSelfPartSemanticDim)
+        self.ontology_object_encoder = nn.Sequential(
+            nn.LayerNorm(self.ontology_object_feature_dim),
+            nn.Linear(
+                self.ontology_object_feature_dim,
+                self.structured_dim * 2),
+            nn.SiLU(),
+            nn.Linear(
+                self.structured_dim * 2,
+                self.structured_dim),
+            nn.LayerNorm(self.structured_dim),)
+        self.ontology_object_residual = nn.Sequential(
+            nn.LayerNorm(self.structured_dim * 2),
+            nn.Linear(
+                self.structured_dim * 2,
+                self.structured_dim * 2),
+            nn.SiLU(),
+            nn.Linear(
+                self.structured_dim * 2,
+                self.structured_dim),)
+        self.ontology_object_gate = nn.Sequential(
+            nn.LayerNorm(self.structured_dim * 2),
+            nn.Linear(
+                self.structured_dim * 2,
+                self.structured_dim),
+            nn.Sigmoid(),)
+        self.ontology_object_residual_gain = nn.Parameter(
+            torch.tensor(-2.944439))
+        self.entity_text_feature_dim = 515
+        self.entity_text_encoder = nn.Sequential(
+            nn.LayerNorm(self.entity_text_feature_dim),
+            nn.Linear(
+                self.entity_text_feature_dim,
+                self.structured_dim * 2),
+            nn.SiLU(),
+            nn.Linear(
+                self.structured_dim * 2,
+                self.structured_dim),
+            nn.LayerNorm(self.structured_dim),)
+        self.entity_text_residual = nn.Sequential(
+            nn.LayerNorm(self.structured_dim * 2),
+            nn.Linear(
+                self.structured_dim * 2,
+                self.structured_dim * 2),
+            nn.SiLU(),
+            nn.Linear(
+                self.structured_dim * 2,
+                self.structured_dim),)
+        self.entity_text_gate = nn.Sequential(
+            nn.LayerNorm(self.structured_dim * 2),
+            nn.Linear(
+                self.structured_dim * 2,
+                self.structured_dim),
+            nn.Sigmoid(),)
+        self.entity_text_gain = nn.Parameter(torch.tensor(-2.944439))
+        nn.init.zeros_(self.entity_text_residual[-1].weight)
+        nn.init.zeros_(self.entity_text_residual[-1].bias)
+        self.object_salience_allocation_head = nn.Sequential(
+            nn.LayerNorm(self.structured_dim),
+            nn.Linear(self.structured_dim, self.structured_dim),
+            nn.SiLU(),
+            nn.Linear(self.structured_dim, 1),)
+        nn.init.zeros_(self.object_salience_allocation_head[-1].weight)
+        nn.init.zeros_(self.object_salience_allocation_head[-1].bias)
+
         self.object_seq_proj = nn.Sequential(
             nn.LayerNorm(self.structured_dim),
             nn.Linear(self.structured_dim, embedDim),
@@ -1026,6 +1093,52 @@ class AttentionExtractor(AGICoreModule):
             ord=2,
             dim=-1) / math.sqrt(float(objectSeq.size(-1)))
 
+    def EncodeOntologyObjectSequence(
+        self,
+        objectSeq: torch.Tensor,
+        ontologyAuxSeq: Dict[str, torch.Tensor],) -> torch.Tensor:
+        presence = ontologyAuxSeq["PerceptualPresence"].unsqueeze(-1)
+        ontology = torch.cat([
+            ontologyAuxSeq["EntityRealmProb"],
+            ontologyAuxSeq["ObjectAgencyProb"],
+            ontologyAuxSeq["ObjectMotionLayerProb"],
+            ontologyAuxSeq["LayerAgencyProb"].flatten(-2),
+            ontologyAuxSeq["BodyMembershipProb"].unsqueeze(-1),
+            ontologyAuxSeq["SelfPartSemantic"],
+            ontologyAuxSeq["PhysicalInteractionProb"].unsqueeze(-1),
+            ontologyAuxSeq["ContentMotionUV"],
+            ontologyAuxSeq["ContentChangeProb"].unsqueeze(-1),
+            presence,
+        ], dim=-1)
+        ontology_code = self.ontology_object_encoder(ontology)
+        joint = torch.cat([objectSeq, ontology_code], dim=-1)
+        residual = self.ontology_object_residual(joint)
+        gate = self.ontology_object_gate(joint)
+        gain = 0.25 * torch.sigmoid(
+            self.ontology_object_residual_gain)
+        return objectSeq + presence * gain * gate * residual
+
+    def EncodeTextEntityObjectSequence(
+        self,
+        objectSeq: torch.Tensor,
+        textAuxSeq: Dict[str, torch.Tensor],) -> torch.Tensor:
+        confidence = textAuxSeq["EntityTextConfidence"].unsqueeze(-1)
+        revision = torch.tanh(
+            textAuxSeq["EntityTextRevision"].to(objectSeq.dtype).unsqueeze(-1)
+            / 16.0)
+        changed = textAuxSeq["EntityTextChanged"].unsqueeze(-1)
+        features = torch.cat([
+            textAuxSeq["EntityTextSemantic"],
+            confidence,
+            revision,
+            changed,], dim=-1)
+        code = self.entity_text_encoder(features)
+        joint = torch.cat([objectSeq, code], dim=-1)
+        residual = self.entity_text_residual(joint)
+        gate = self.entity_text_gate(joint)
+        return objectSeq + 0.25 * confidence * torch.sigmoid(
+            self.entity_text_gain) * gate * residual
+
     def BuildObjectTimeCompetition(
         self,
         objectSeq: torch.Tensor,
@@ -1097,9 +1210,20 @@ class AttentionExtractor(AGICoreModule):
                 real_object_logits.size(0),
                 real_object_logits.size(1),
                 1)], dim=-1)
+        real_salience_allocation_logits = (
+            self.object_salience_allocation_head(objectSeq).squeeze(-1))
+        salience_allocation_logits = torch.cat([
+            real_salience_allocation_logits,
+            real_salience_allocation_logits.new_zeros(
+                real_salience_allocation_logits.size(0),
+                real_salience_allocation_logits.size(1),
+                1)], dim=-1)
+        salience_allocation = torch.softmax(
+            salience_allocation_logits,
+            dim=-1) * float(K + 1)
         joint_logits = (
             object_logits
-            + salience.unsqueeze(-1)
+            + salience.unsqueeze(-1) * salience_allocation
             + F.softplus(self.quality_log_gain)
             * log_reliability.unsqueeze(-1))
 
@@ -2177,6 +2301,150 @@ class TestAttentionMTool:
             print(f"ObjectTimeCompetition test error: {e}")
             return False
 
+    def TestOntologyObjectConditioning(self):
+        try:
+            model = AttentionExtractor(
+                embedDim=64,
+                sequenceLength=3,
+                numHeads=4,
+                temporalLayers=1,
+                capsDim=16,
+                routingIterations=2,
+                objectTokenCount=4).to(self.device)
+            B, S, K, D = 1, 3, 4, 32
+            objects = torch.randn(
+                B, S, K, D,
+                device=self.device,
+                requires_grad=True)
+            auxiliary = {
+                "EntityRealmProb": torch.softmax(torch.randn(B, S, K, 5, device=self.device), dim=-1),
+                "ObjectAgencyProb": torch.softmax(torch.randn(B, S, K, 5, device=self.device), dim=-1),
+                "ObjectMotionLayerProb": torch.sigmoid(torch.randn(B, S, K, 5, device=self.device)),
+                "LayerAgencyProb": torch.softmax(torch.randn(B, S, K, 5, 5, device=self.device), dim=-1),
+                "BodyMembershipProb": torch.sigmoid(torch.randn(B, S, K, device=self.device)),
+                "SelfPartSemantic": torch.randn(
+                    B, S, K, ModuleDim.PstSelfPartSemanticDim,
+                    device=self.device),
+                "PhysicalInteractionProb": torch.sigmoid(torch.randn(B, S, K, device=self.device)),
+                "ContentMotionUV": torch.randn(B, S, K, 2, device=self.device),
+                "ContentChangeProb": torch.sigmoid(torch.randn(B, S, K, device=self.device)),
+                "PerceptualPresence": torch.sigmoid(torch.randn(B, S, K, device=self.device)),}
+            enriched = model.EncodeOntologyObjectSequence(objects, auxiliary)
+            assert enriched.shape == objects.shape
+
+            changed = {name: value.clone() for name, value in auxiliary.items()}
+            changed["EntityRealmProb"][:, :, 2] = torch.roll(
+                changed["EntityRealmProb"][:, :, 2], shifts=1, dims=-1)
+            enriched_changed = model.EncodeOntologyObjectSequence(
+                objects,
+                changed)
+            unchanged_slots = torch.tensor([0, 1, 3], device=self.device)
+            assert torch.equal(
+                enriched.index_select(2, unchanged_slots),
+                enriched_changed.index_select(2, unchanged_slots))
+            assert not torch.equal(
+                enriched[:, :, 2],
+                enriched_changed[:, :, 2])
+
+            enriched.square().mean().backward()
+            assert objects.grad is not None
+            assert model.ontology_object_encoder[1].weight.grad is not None
+
+            empty_objects = torch.zeros(
+                B, S, K, D,
+                device=self.device,
+                requires_grad=True)
+            sparse_auxiliary = {
+                name: value.detach().clone()
+                for name, value in auxiliary.items()}
+            sparse_auxiliary["PerceptualPresence"].zero_()
+            sparse_auxiliary["PerceptualPresence"][:, :, 1] = 1.0
+            sparse_enriched = model.EncodeOntologyObjectSequence(
+                empty_objects,
+                sparse_auxiliary)
+            absent = torch.tensor([0, 2, 3], device=self.device)
+            assert torch.count_nonzero(
+                sparse_enriched.index_select(2, absent)).item() == 0
+            assert torch.count_nonzero(
+                sparse_enriched[:, :, 1]).item() > 0
+            sparse_enriched[:, :, 1].square().mean().backward()
+            assert empty_objects.grad is not None
+            assert torch.isfinite(empty_objects.grad).all()
+
+            with torch.no_grad():
+                allocation_hidden = model.object_salience_allocation_head[1]
+                allocation_hidden.weight.copy_(torch.eye(D, device=self.device))
+                allocation_hidden.bias.zero_()
+                allocation_out = model.object_salience_allocation_head[-1]
+                allocation_out.weight.zero_()
+                allocation_out.weight[0, 0] = 1.0
+                allocation_out.bias.zero_()
+                probe = torch.zeros(B, S, K, D, device=self.device)
+                probe[:, :, 0, 0] = 2.0
+                probe[:, :, 0, 1] = -2.0
+                probe[:, :, 1, 0] = -2.0
+                probe[:, :, 1, 1] = 2.0
+                allocation_logits = (
+                    model.object_salience_allocation_head(probe).squeeze(-1))
+            assert torch.all(
+                allocation_logits[:, :, 0]
+                > allocation_logits[:, :, 1])
+            print("OntologyObjectConditioning passed.")
+            return True
+        except AssertionError as e:
+            print(f"OntologyObjectConditioning failed: {e}")
+            return False
+        except Exception as e:
+            print(f"OntologyObjectConditioning error: {e}")
+            return False
+
+    def TestEntityTextConditioning(self):
+        try:
+            model = AttentionExtractor(
+                embedDim=64,
+                sequenceLength=3,
+                numHeads=4,
+                temporalLayers=1,
+                capsDim=16,
+                routingIterations=2,
+                objectTokenCount=4).to(self.device).train()
+            B, S, K, D = 1, 3, 4, 32
+            objects = torch.randn(B, S, K, D, device=self.device)
+            confidence = torch.ones(B, S, K, device=self.device)
+            confidence[:, :, 0] = 0.0
+            auxiliary = {
+                "EntityTextSemantic": torch.randn(
+                    B, S, K, 512, device=self.device),
+                "EntityTextConfidence": confidence,
+                "EntityTextRevision": torch.ones(
+                    B, S, K, device=self.device, dtype=torch.long),
+                "EntityTextChanged": torch.ones(
+                    B, S, K, device=self.device),}
+            optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+            neutral = model.EncodeTextEntityObjectSequence(objects, auxiliary)
+            assert torch.equal(neutral, objects)
+            optimizer.zero_grad(set_to_none=True)
+            neutral.square().mean().backward()
+            optimizer.step()
+
+            model.zero_grad(set_to_none=True)
+            enriched = model.EncodeTextEntityObjectSequence(objects, auxiliary)
+            assert torch.equal(enriched[:, :, 0], objects[:, :, 0])
+            assert not torch.equal(enriched[:, :, 1:], objects[:, :, 1:])
+            enriched[:, :, 1:].square().mean().backward()
+            assert model.entity_text_encoder[1].weight.grad is not None
+            assert model.entity_text_residual[1].weight.grad is not None
+            assert model.entity_text_gate[1].weight.grad is not None
+            assert model.entity_text_gain.grad is not None
+            print("EntityTextConditioning passed.")
+            return True
+        except AssertionError as e:
+            print(f"EntityTextConditioning failed: {e}")
+            return False
+        except Exception as e:
+            print(f"EntityTextConditioning error: {e}")
+            return False
+
     def TestGoalConditionedSelection(self):
         try:
             torch.manual_seed(446)
@@ -3156,6 +3424,8 @@ class TestAttentionMTool:
             "TemporalAttention": self.TestTemporalAttention(),
             "AttentionWorkspace": self.TestAttentionWorkspace(),
             "ObjectTimeCompetition": self.TestObjectTimeCompetition(),
+            "OntologyObjectConditioning": self.TestOntologyObjectConditioning(),
+            "EntityTextConditioning": self.TestEntityTextConditioning(),
             "GoalConditionedSelection": self.TestGoalConditionedSelection(),
             "BottomUpSalienceAndReliability": self.TestBottomUpSalienceAndReliability(),
             "ObjectPresenceRejectsEmptySlots": self.TestObjectPresenceRejectsEmptySlots(),

@@ -3018,6 +3018,17 @@ class TestIntentionMTool:
                 extTexts,
                 targetSym,)
 
+            warm_optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+            model.zero_grad(set_to_none=True)
+            losses["loss_total"].backward()
+            warm_optimizer.step()
+            losses, symProbs, _ = self.ComputeBaseLossBundle(
+                model,
+                selfState,
+                intentState,
+                ocrTexts,
+                extTexts,
+                targetSym,)
             model.zero_grad(set_to_none=True)
             losses["loss_total"].backward()
 
@@ -3083,6 +3094,19 @@ class TestIntentionMTool:
                     prioritizeExt=bool(spec["prioritizeExt"]),
                     textTrust=spec["textTrust"],)
 
+                warm_optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+                model.zero_grad(set_to_none=True)
+                losses["loss_total"].backward()
+                warm_optimizer.step()
+                losses, _, _ = self.ComputeBaseLossBundle(
+                    model,
+                    selfState,
+                    intentState,
+                    ocrTexts,
+                    extTexts,
+                    targetSym,
+                    prioritizeExt=bool(spec["prioritizeExt"]),
+                    textTrust=spec["textTrust"],)
                 model.zero_grad(set_to_none=True)
                 losses["loss_total"].backward()
 

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import statistics as stats
 from torch.func import functional_call as torch_functional_call
 from FunctionTools import SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear, GetParametersScale
+from RobotMorphologyModule import Agency, MotionLayer, Realm
 
 
 class HebbianLinearFW(AGICoreModule):
@@ -1615,6 +1616,17 @@ class ValueEstimationExtractor(AGICoreModule):
         self.wBranchStructure = 0.01
         self.wManifoldLatent = 0.05
         self.wPhysicalTDParamReg = 1.0
+        self.entity_ontology_risk_loss_weight = 0.02
+
+        self.entity_ontology_physical_risk_head = nn.Sequential(
+            nn.LayerNorm(20),
+            nn.Linear(20, 256),
+            nn.SiLU(),
+            nn.Linear(256, 128),
+            nn.SiLU(),
+            nn.Linear(128, 1),)
+        nn.init.zeros_(self.entity_ontology_physical_risk_head[-1].weight)
+        nn.init.zeros_(self.entity_ontology_physical_risk_head[-1].bias)
 
         self.reward_predictor = KalmanFilteredEnsembleNext()
         self.done_predictor = KalmanFilteredEnsembleNext()
@@ -1727,6 +1739,8 @@ class ValueEstimationExtractor(AGICoreModule):
         nn.init.zeros_(self.td_context_head[-1].bias)
         nn.init.normal_(self.td_heat_basis, mean=0.0, std=1.0 / math.sqrt(float(self.value_tensor_dim)))
         nn.init.normal_(self.td_ot_cost_embed, mean=0.0, std=1.0 / math.sqrt(float(self.td_ot_cost_dim)))
+        nn.init.zeros_(self.entity_ontology_physical_risk_head[-1].weight)
+        nn.init.zeros_(self.entity_ontology_physical_risk_head[-1].bias)
         self.emotion_core.ResetParams()
 
     def EnsureB(self, B: int):
@@ -2428,6 +2442,111 @@ class ValueEstimationExtractor(AGICoreModule):
             "risk_termination": termination01,
             "unc_prior01": unc_prior_evidence,
             "unc_epistemic01": unc_epistemic01,}
+
+    def RefineEntityOntologyRisk(
+        self,
+        output: GeoTropicalOut,
+        physicalState: Dict[str, torch.Tensor],) -> GeoTropicalOut:
+        realm = physicalState["RealmProb"]
+        motion_layer = physicalState["MotionLayerProb"]
+        layer_agency = physicalState["LayerAgencyProb"]
+        presence = physicalState["PerceptualPresence"]
+        physical_entity = physicalState["PhysicalEntityProb"]
+        physical_interaction = physicalState["PhysicalInteractionProb"]
+        body_membership = physicalState["BodyMembershipProb"]
+        verification = physicalState["VerificationConfidence"]
+        contact = physicalState["ContactProbRaw"]
+
+        physical_realm = torch.stack([
+            realm[..., int(Realm.SELF_BODY)],
+            realm[..., int(Realm.EXTERNAL_PHYSICAL)],], dim=-1)
+        physical_layers = torch.stack([
+            motion_layer[..., int(MotionLayer.CARRIER_MOTION)],
+            motion_layer[..., int(MotionLayer.ARTICULATION_MOTION)],], dim=-1)
+        physical_layer_agency = torch.stack([
+            layer_agency[..., int(MotionLayer.CARRIER_MOTION), :],
+            layer_agency[..., int(MotionLayer.ARTICULATION_MOTION), :],], dim=-2)
+        physical_token = torch.cat([
+            physical_realm,
+            physical_layers,
+            physical_layer_agency.flatten(start_dim=-2),
+            body_membership.unsqueeze(-1),
+            physical_entity.unsqueeze(-1),
+            physical_interaction.unsqueeze(-1),
+            presence.unsqueeze(-1),
+            verification.unsqueeze(-1),
+            contact.unsqueeze(-1),], dim=-1)
+
+        physical_support = (
+            presence
+            * physical_entity
+            * physical_realm.sum(dim=-1))
+        pooled_physical = (
+            physical_token * physical_support.unsqueeze(-1)
+        ).sum(dim=1) / physical_support.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        physical_risk_raw = self.entity_ontology_physical_risk_head(
+            pooled_physical).squeeze(-1)
+
+        non_self_agency = (
+            physical_layer_agency[..., int(Agency.EXTERNAL_CAUSED)]
+            + physical_layer_agency[..., int(Agency.AUTONOMOUS)]
+            + physical_layer_agency[..., int(Agency.MIXED)])
+        non_self_motion = 1.0 - torch.prod(
+            1.0 - physical_layers * non_self_agency,
+            dim=-1)
+        interaction_event = 1.0 - (
+            (1.0 - non_self_motion) * (1.0 - contact))
+        physical_hazard_target = (
+            physical_support
+            * (0.5 + 0.5 * physical_interaction)
+            * interaction_event).amax(dim=1)
+
+        positive_risk_raw = torch.where(
+            physical_risk_raw >= 0.0,
+            physical_risk_raw,
+            torch.zeros_like(physical_risk_raw))
+        physical_risk_residual = (
+            1.0 - torch.exp(-positive_risk_raw)
+        ) * physical_support.amax(dim=1)
+
+        virtual_support = (
+            presence * realm[..., int(Realm.VIRTUAL_CONTENT)])
+        virtual_animation = (
+            virtual_support
+            * (1.0 - (
+                1.0 - motion_layer[..., int(MotionLayer.SURFACE_CONTENT_MOTION)])
+                * (1.0 - physicalState["ContentChangeProb"])))
+        virtual_animation_salience = virtual_animation.amax(dim=1)
+        visual_effect_salience = (
+            presence
+            * realm[..., int(Realm.VISUAL_EFFECT)]
+            * motion_layer[..., int(MotionLayer.PHOTOMETRIC_CHANGE)]
+        ).amax(dim=1)
+
+        risk_base = output.rComps["risk"]
+        risk_with_physical_residual = 1.0 - (
+            (1.0 - risk_base) * (1.0 - physical_risk_residual))
+        refined_risk = torch.where(
+            physical_risk_residual > 0.0,
+            risk_with_physical_residual,
+            risk_base)
+        risk_loss = F.binary_cross_entropy_with_logits(
+            physical_risk_raw,
+            physical_hazard_target.detach())
+        loss = output.loss
+        if loss is not None:
+            loss = loss + self.entity_ontology_risk_loss_weight * risk_loss
+
+        r_comps = dict(output.rComps)
+        r_comps.update({
+            "risk": refined_risk.detach(),
+            "riskBase": risk_base.detach(),
+            "physicalEntityHazard": physical_hazard_target.detach(),
+            "physicalRiskResidual": physical_risk_residual.detach(),
+            "virtualAnimationSalience": virtual_animation_salience.detach(),
+            "visualEffectSalience": visual_effect_salience.detach(),
+            "lossEntityOntologyRisk": risk_loss.detach(),})
+        return output._replace(loss=loss, rComps=r_comps)
 
     def ConsumePendingTransitions(
         self,
@@ -3344,6 +3463,84 @@ class TestValueEstimationMTool:
         d_tr = torch.randn(B, self.state_dim, device=self.device) * 0.2
         d_ph = torch.randn(B, self.state_dim, device=self.device) * 0.2
         return reward, entropy, done, d_tr, d_ph
+
+    def OntologyPhysicalState(self, B: int, K: int = 4) -> Dict[str, torch.Tensor]:
+        realm = torch.zeros(B, K, len(Realm), device=self.device)
+        realm[..., int(Realm.EXTERNAL_PHYSICAL)] = 1.0
+        motion = torch.zeros(B, K, len(MotionLayer), device=self.device)
+        motion[..., int(MotionLayer.CARRIER_MOTION)] = 1.0
+        agency = torch.zeros(
+            B,
+            K,
+            len(MotionLayer),
+            len(Agency),
+            device=self.device)
+        agency[..., int(Agency.UNKNOWN)] = 1.0
+        agency[..., int(MotionLayer.CARRIER_MOTION), :] = 0.0
+        agency[..., int(MotionLayer.CARRIER_MOTION), int(Agency.EXTERNAL_CAUSED)] = 1.0
+        ones = torch.ones(B, K, device=self.device)
+        zeros = torch.zeros(B, K, device=self.device)
+        return {
+            "RealmProb": realm,
+            "MotionLayerProb": motion,
+            "LayerAgencyProb": agency,
+            "PerceptualPresence": ones.clone(),
+            "PhysicalEntityProb": ones.clone(),
+            "PhysicalInteractionProb": ones.clone(),
+            "BodyMembershipProb": zeros.clone(),
+            "VerificationConfidence": ones.clone(),
+            "ContactProbRaw": zeros.clone(),
+            "ContentChangeProb": zeros.clone(),}
+
+    def TestEntityOntologyRiskSeparation(self) -> bool:
+        try:
+            torch.manual_seed(113)
+            B, K = 2, 4
+            est = self.NewEstimator().eval()
+            mem, attn, state = self.RandBatch(B)
+            reward, entropy, done, d_tr, d_ph = self.RandSignals(
+                B, doneProb=0.0)
+            out = self.ForwardOnce(
+                est,
+                mem,
+                attn,
+                state,
+                reward,
+                entropy,
+                done,
+                d_tr,
+                d_ph)
+            physical_state = self.OntologyPhysicalState(B, K)
+            physical_state["RealmProb"].zero_()
+            physical_state["RealmProb"][
+                ..., int(Realm.VIRTUAL_CONTENT)] = 1.0
+            physical_state["MotionLayerProb"].zero_()
+            physical_state["MotionLayerProb"][
+                ..., int(MotionLayer.SURFACE_CONTENT_MOTION)] = 1.0
+            physical_state["LayerAgencyProb"].zero_()
+            physical_state["LayerAgencyProb"][
+                ..., int(Agency.UNKNOWN)] = 1.0
+            physical_state["PhysicalEntityProb"].zero_()
+            physical_state["PhysicalInteractionProb"].zero_()
+            physical_state["ContentChangeProb"].fill_(1.0)
+
+            refined = est.RefineEntityOntologyRisk(out, physical_state)
+            ok = bool(
+                torch.equal(
+                    refined.rComps["risk"],
+                    out.rComps["risk"].detach())
+                and int(torch.count_nonzero(
+                    refined.rComps["physicalRiskResidual"]).item()) == 0
+                and bool((
+                    refined.rComps["virtualAnimationSalience"] > 0.0
+                ).all().item()))
+            print(
+                "EntityOntologyRiskSeparation "
+                f"{'pass' if ok else 'fail'}")
+            return ok
+        except Exception as e:
+            print(f"EntityOntologyRiskSeparation error: {e}")
+            return False
 
     def ParamIds(self, module: nn.Module):
         return {id(p) for p in module.parameters() if p.requires_grad}
@@ -4575,6 +4772,9 @@ class TestValueEstimationMTool:
                 reward, entropy, done, d_tr, d_ph = self.RandSignals(B)
 
                 out = self.ForwardOnce(est, mem, attn, state, reward, entropy, done, d_tr, d_ph)
+                out = est.RefineEntityOntologyRisk(
+                    out,
+                    self.OntologyPhysicalState(B))
                 loss = (
                     out.loss
                     + out.extras["loss_transport_delayed_graph"]
@@ -5375,6 +5575,7 @@ class TestValueEstimationMTool:
             ("StateMachineAndMicroGraph", self.TestStateMachineAndMicroGraph),
             ("BatchResizeAndPredictorShapes", self.TestBatchResizeAndPredictorShapes),
             ("ResetFunctions", self.TestResetFunctions),
+            ("EntityOntologyRiskSeparation", self.TestEntityOntologyRiskSeparation),
             ("AllTrainableParamsHaveGradAndStep", self.TestAllTrainableParamsHaveGradAndStep),
             ("WrapperAlignmentNoDelta", self.TestWrapperAlignmentNoDelta),
             ("WrapperCandidateParamsTrainable", self.TestWrapperCandidateParamsTrainable),
