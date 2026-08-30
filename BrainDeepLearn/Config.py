@@ -3,9 +3,6 @@ from __future__ import annotations
 from typing import Any, Dict
 import ast
 import math
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class BasicParameters:
@@ -26,12 +23,6 @@ class BasicParameters:
     SAVE_EVERY_SAMPLE_COUNT = 500
 
     DATA_ROOT_PATH = "BrainDeepLearn/Data"
-    CAMERA_CALIBRATION_PATH = str(PROJECT_ROOT / "Configure/Camera_Calibration.json")
-    ROBOT_URDF_PATH = str(PROJECT_ROOT / "Configure/Arm_R_SLDASM.urdf")
-    ROBOT_SRDF_PATH = str(PROJECT_ROOT / "Configure/Arm_R_SLDASM.srdf")
-    ROBOT_SEMANTIC_PATH = None
-    ROBOT_OBSERVER_FRAME_NAME = "camera_optical"
-    ROBOT_OBSERVER_CALIBRATION_ID = "camera_v1_rectified_512x512_v1"
     DATA_SENSOR_MANIFEST_PATH = "BrainDeepLearn/Data/sensor_manifest.json"
     OCR_DATA_ROOT_PATH = "BrainDeepLearn/Data/OCR"
 
@@ -40,7 +31,7 @@ class BasicParameters:
     DATA_DONE_PATH = "BrainDeepLearn/Data/done"
     DATA_DEPTH_PATH = "BrainDeepLearn/Data/depth"
     DATA_DEPTH_VALID_PATH = "BrainDeepLearn/Data/depth_valid"
-    DATA_ROBOT_STATE_PATH = "BrainDeepLearn/Data/robot_state"
+    DATA_FEEDBACK_PATH = "BrainDeepLearn/Data/feedback"
     DATA_NORMAL_PATH = "BrainDeepLearn/Data/normal"
     DATA_SEMANTIC_SEGMENTATION_PATH = "BrainDeepLearn/Data/semantic_segmentation"
     DATA_INSTANCE_SEGMENTATION_PATH = "BrainDeepLearn/Data/instance_segmentation"
@@ -76,7 +67,7 @@ class BasicParameters:
     DATA_SENSOR_MANIFEST_PATH_TEST = "BrainDeepLearn/TestData/sensor_manifest.json"
     DATA_DEPTH_PATH_TEST = "BrainDeepLearn/TestData/depth"
     DATA_DEPTH_VALID_PATH_TEST = "BrainDeepLearn/TestData/depth_valid"
-    DATA_ROBOT_STATE_PATH_TEST = "BrainDeepLearn/TestData/robot_state"
+    DATA_FEEDBACK_PATH_TEST = "BrainDeepLearn/TestData/feedback"
     DATA_NORMAL_PATH_TEST = "BrainDeepLearn/TestData/normal"
     DATA_SEMANTIC_SEGMENTATION_PATH_TEST = "BrainDeepLearn/TestData/semantic_segmentation"
     DATA_INSTANCE_SEGMENTATION_PATH_TEST = "BrainDeepLearn/TestData/instance_segmentation"

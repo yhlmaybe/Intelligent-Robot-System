@@ -92,7 +92,6 @@ def SynchronizeDynamicAdapterTopology(
     shapeValidator: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], bool],
     *,
     authoritative: bool,) -> int:
-    """Restore committed dynamic-Adapter parameters before tensor loading."""
     names = ("A_list", "B_list", "alpha")
     topology_key = f"{prefix}topology_count"
 
@@ -299,7 +298,6 @@ def SynchronizeDynamicAdapterTopologiesForFullLoad(
     root: nn.Module,
     stateDict: Dict[str, Any],
     ) -> int:
-    """Make a full model artifact authoritative over all committed adapters."""
     cleared = 0
     for module_name, module in root.named_modules():
         if not isinstance(module, DynamicAdapterTopologyMixin):
@@ -502,7 +500,7 @@ class RoPEMultiheadAttention(AGICoreModule):
         return out, weights
 
 
-def _RestoreOnlineWrapperTrainabilityAfterLoad(
+def RestoreOnlineWrapperTrainabilityAfterLoad(
     module: nn.Module,
     incompatibleKeys: Any,) -> None:
     del incompatibleKeys
@@ -538,16 +536,10 @@ class BaseOnlineWrapper(nn.Module):
         self.InitCandidates(initRankEach)
 
         self.freezeOldPar = True
-        # Dynamic committed LoRA parameters are materialized while state_dict is loading.
-        # They therefore do not inherit the base's pre-load requires_grad flags. Re-apply the
-        # wrapper contract after all descendants have loaded, including when this wrapper is a
-        # child of a larger BrainCore load rather than the direct load_state_dict target.
         self.register_load_state_dict_post_hook(
-            _RestoreOnlineWrapperTrainabilityAfterLoad)
+            RestoreOnlineWrapperTrainabilityAfterLoad)
 
     def _apply(self, fn, recurse: bool = True):
-        # Candidates are deliberately unregistered/ephemeral, so nn.Module._apply cannot move
-        # them. Keep their identity (and therefore optimizer references) while moving data.
         super()._apply(fn, recurse=recurse)
         for parameter in self.CandParameters():
             with torch.no_grad():
@@ -795,8 +787,137 @@ class BaseOnlineWrapper(nn.Module):
             "layers": layers,
             "grad_ema": grad_ema,}
 
+    def ValidateCandidateState(self, state: Dict[str, Any]) -> None:
+        if type(state) is not dict or set(state) != {
+            "site_names",
+            "layers",
+            "grad_ema",
+        }:
+            raise TypeError(
+                "online candidate state fields do not match the current schema")
+        site_names = state["site_names"]
+        if type(site_names) is not tuple or site_names != tuple(self.sites):
+            raise ValueError(
+                "online candidate sites do not match the current wrapper")
+        layers = state["layers"]
+        if type(layers) is not dict or tuple(layers) != tuple(self.sites):
+            raise ValueError(
+                "online candidate layer sites do not match the current wrapper")
+        for name, spec in self.sites.items():
+            site_layers = layers[name]
+            if type(site_layers) is not list or len(
+                site_layers) != self.layerCount:
+                raise ValueError(
+                    "online candidate layer count does not match the current wrapper")
+            for layerIdx, saved_slot in enumerate(site_layers):
+                if type(saved_slot) is not dict or set(saved_slot) != {
+                    "A",
+                    "B",
+                    "s",
+                }:
+                    raise TypeError(
+                        "online candidate slot fields do not match the current schema")
+                a_values = saved_slot["A"]
+                b_values = saved_slot["B"]
+                s_values = saved_slot["s"]
+                if not (
+                    type(a_values) is list
+                    and type(b_values) is list
+                    and type(s_values) is list
+                    and len(a_values) == len(b_values) == len(s_values)
+                ):
+                    raise ValueError(
+                        "online candidate slot lists must have equal lengths")
+                if layerIdx >= spec.nLayers and a_values:
+                    raise ValueError(
+                        "online candidate state contains an inactive layer")
+                if not all(
+                    torch.is_tensor(value)
+                    for values in (a_values, b_values, s_values)
+                    for value in values
+                ):
+                    raise TypeError(
+                        "online candidate entries must be tensors")
+                for a_value, b_value, s_value in zip(
+                    a_values,
+                    b_values,
+                    s_values,
+                ):
+                    if (
+                        not all(torch.is_tensor(value) for value in (
+                            a_value,
+                            b_value,
+                            s_value))
+                        or any(value.layout != torch.strided for value in (
+                            a_value,
+                            b_value,
+                            s_value))
+                        or a_value.dim() != 2
+                        or b_value.dim() != 2
+                        or int(a_value.size(1)) != spec.inDim
+                        or int(b_value.size(0)) != spec.outDim
+                        or int(a_value.size(0)) != int(b_value.size(1))
+                        or a_value.size(0) < 1
+                        or s_value.numel() != 1
+                    ):
+                        raise ValueError(
+                            "online candidate tensor shapes do not match the site")
+                    if any(
+                        not value.dtype.is_floating_point
+                        or not bool(torch.isfinite(value).all().item())
+                        for value in (a_value, b_value, s_value)
+                    ):
+                        raise ValueError(
+                            "online candidate tensors must be finite floating point")
+                if sum(int(value.size(0)) for value in a_values) > spec.maxRank:
+                    raise ValueError(
+                        "online candidate state exceeds the site rank limit")
+        grad_ema = state["grad_ema"]
+        if grad_ema is None:
+            return
+        if type(grad_ema) is not dict or tuple(
+            grad_ema) != tuple(self.sites):
+            raise ValueError(
+                "online candidate gradient EMA sites do not match the wrapper")
+        for name in self.sites:
+            saved_layers = grad_ema[name]
+            if type(saved_layers) is not list or len(
+                saved_layers) != self.layerCount:
+                raise ValueError(
+                    "online candidate gradient EMA layer count is invalid")
+            for layerIdx, saved_slot in enumerate(saved_layers):
+                if type(saved_slot) is not dict or set(saved_slot) != {"A", "B"}:
+                    raise TypeError(
+                        "online candidate gradient EMA fields are invalid")
+                candidate_slot = layers[name][layerIdx]
+                for key in ("A", "B"):
+                    saved_values = saved_slot[key]
+                    expected_values = candidate_slot[key]
+                    if type(saved_values) is not list or len(
+                        saved_values) != len(expected_values):
+                        raise ValueError(
+                            "online candidate gradient EMA length is invalid")
+                    for saved_value, expected_value in zip(
+                        saved_values,
+                        expected_values,
+                    ):
+                        if saved_value is None:
+                            continue
+                        if (
+                            not torch.is_tensor(saved_value)
+                            or saved_value.layout != torch.strided
+                            or tuple(saved_value.shape)
+                            != tuple(expected_value.shape)
+                            or not saved_value.dtype.is_floating_point
+                            or not bool(torch.isfinite(
+                                saved_value).all().item())
+                        ):
+                            raise ValueError(
+                                "online candidate gradient EMA is invalid")
+
     @torch.no_grad()
     def ImportCandidateState(self, state: Dict[str, Any]) -> None:
+        self.ValidateCandidateState(state)
         if type(state) is not dict or set(state) != {"site_names", "layers", "grad_ema"}:
             raise TypeError("online candidate state fields do not match the current schema")
         if tuple(state["site_names"]) != tuple(self.sites):
@@ -893,7 +1014,7 @@ class BaseOnlineWrapper(nn.Module):
         if self.gradEmaBuf is None:
             self.gradEmaBuf = {name: [{"A": [], "B": []} for _ in range(self.layerCount)] for name in self.sites}
 
-        def ema_update(dstList, srcList):
+        def EmaUpdate(dstList, srcList):
             if len(dstList) < len(srcList):
                 dstList.clear()
             out = []
@@ -911,8 +1032,8 @@ class BaseOnlineWrapper(nn.Module):
             for layerIdx in range(self.layerCount):
                 gA = [p.grad.clone() if (p.grad is not None) else None for p in self.cand[name][layerIdx]["A"]]
                 gB = [p.grad.clone() if (p.grad is not None) else None for p in self.cand[name][layerIdx]["B"]]
-                self.gradEmaBuf[name][layerIdx]["A"] = ema_update(self.gradEmaBuf[name][layerIdx]["A"], gA)
-                self.gradEmaBuf[name][layerIdx]["B"] = ema_update(self.gradEmaBuf[name][layerIdx]["B"], gB)
+                self.gradEmaBuf[name][layerIdx]["A"] = EmaUpdate(self.gradEmaBuf[name][layerIdx]["A"], gA)
+                self.gradEmaBuf[name][layerIdx]["B"] = EmaUpdate(self.gradEmaBuf[name][layerIdx]["B"], gB)
 
     @torch.no_grad()
     def GrowCandidates(self, growFactor: float = 2.0, addEach: int = 0):
@@ -946,7 +1067,7 @@ class BaseOnlineWrapper(nn.Module):
                         self.cand[name][layerIdx]["s"].append(s)
             return
 
-        def sugges_rank(gradAList, gradBList, aList, bList, sList, inDim, outDim, maxRank):
+        def SuggestRank(gradAList, gradBList, aList, bList, sList, inDim, outDim, maxRank):
             gAcc = None
             cnt = 0
             for gA, gB, aParam, bParam, sParam in zip(gradAList, gradBList, aList, bList, sList):
@@ -981,7 +1102,7 @@ class BaseOnlineWrapper(nn.Module):
         for name, spec in self.sites.items():
             for layerIdx in range(spec.nLayers):
                 cur = sum(p.size(0) for p in self.cand[name][layerIdx]["A"])
-                rTarget = sugges_rank(
+                rTarget = SuggestRank(
                     self.gradEmaBuf[name][layerIdx]["A"],
                     self.gradEmaBuf[name][layerIdx]["B"],
                     self.cand[name][layerIdx]["A"],

@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Any, List, Tuple, Dict, Optional
 from Config import BasicParameters
-from CoreTypes import TEXT_TRUST_OPERATOR_COMMAND, TEXT_TRUST_UNSAFE_EXTERNAL
+from CoreTypes import TEXT_TRUST_OCR_OBSERVED, TEXT_TRUST_OPERATOR_COMMAND, TEXT_TRUST_UNSAFE_EXTERNAL
 from FunctionTools import GetParametersScale, SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear, RoPEMultiheadAttention
 
 import copy
@@ -459,7 +459,7 @@ class SymControlNet(nn.Module):
         self.dimSem = int(dimSem)
         self.n_token_sources = int(nTokenSources)
 
-        inK = self.nSymbols * 5  # symProbs + sym_probs0 + imp + cooc + contr
+        inK = self.nSymbols * 5 # symProbs + sym_probs0 + imp + cooc + contr
 
         self.k2h = nn.Sequential(
             GrowableLoRALinear(nn.Linear(inK, dimSem)),
@@ -483,7 +483,7 @@ class SymControlNet(nn.Module):
 
     def forward(
         self,
-        symProbs: torch.Tensor,  # [B, K]
+        symProbs: torch.Tensor, # [B, K]
         support: Dict[str, torch.Tensor],
         conceptEmb: torch.Tensor, # [K, D]
         token_mask: torch.Tensor,) -> Dict[str, torch.Tensor]:
@@ -616,13 +616,13 @@ class IntentionExtractor(AGICoreModule):
             nn.Linear(dimSem, self.n_text_slots),
             nn.Sigmoid(),)
 
-        def pick_heads(embed_dim: int) -> int:
+        def PickHeads(embed_dim: int) -> int:
             for h in (8, 4, 2, 1):
                 if (embed_dim % h) == 0:
                     return h
             return 1
 
-        attn_heads = pick_heads(dimSem)
+        attn_heads = PickHeads(dimSem)
 
         self.slotCrossAttn = RoPEMultiheadAttention(
             embedDim=dimSem,
@@ -810,7 +810,7 @@ class IntentionExtractor(AGICoreModule):
             return ids
 
         pieces = s.lower().split()
-        span = max(1, self.eos_idx - 1) # map words into [1, eos_idx-1], excluding PAD/EOS
+        span = max(1, self.eos_idx - 1)
         for tok in pieces:
             h = int.from_bytes(hashlib.md5(tok.encode("utf-8")).digest()[:8], "little", signed=False)
             idx = 1 + (h % span)
@@ -962,7 +962,7 @@ class IntentionExtractor(AGICoreModule):
 
         pooled = self.chunkFuseOut(torch.cat([slot_fwd, slot_bwd], dim=-1)) # [B, D]
         pooled = pooled * chunkValid.any(dim=1).unsqueeze(-1).float() # [B, D]
-        return pooled, slots, slot_mask # pooled: [B, D] 
+        return pooled, slots, slot_mask # pooled: [B, D]
 
 
     def EncodeStringsWithSlots(
@@ -1357,7 +1357,7 @@ class IntentionExtractor(AGICoreModule):
 
         use_dict = len(self.id2ch) > 0
 
-        def decode_one_row(row: List[int]) -> Tuple[str, bool]:
+        def DecodeOneRow(row: List[int]) -> Tuple[str, bool]:
             pieces: List[str] = []
             hit_eos = False
             for tid_raw in row:
@@ -1380,7 +1380,7 @@ class IntentionExtractor(AGICoreModule):
         rows = tokenIds.detach().to("cpu").tolist()
         texts: List[str] = []
         for row in rows:
-            txt, _ = decode_one_row(row)
+            txt, _ = DecodeOneRow(row)
             texts.append(txt)
         return texts
 
@@ -1543,10 +1543,19 @@ class IntentionExtractor(AGICoreModule):
         batchSize: int,
         textTrust: Optional[List[str]],
         device: torch.device,) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+        if textTrust is not None and len(textTrust) != batchSize:
+            raise ValueError(
+                f"textTrust must have length {batchSize}, got {len(textTrust)}")
         trust = (
             [TEXT_TRUST_UNSAFE_EXTERNAL for _ in range(batchSize)]
             if textTrust is None
             else [str(item) for item in textTrust])
+        valid_trust = {
+            TEXT_TRUST_OCR_OBSERVED,
+            TEXT_TRUST_OPERATOR_COMMAND,
+            TEXT_TRUST_UNSAFE_EXTERNAL,}
+        if any(item not in valid_trust for item in trust):
+            raise ValueError("textTrust contains an unsupported source class")
         ext_control = torch.tensor(
             [1.0 if item == TEXT_TRUST_OPERATOR_COMMAND else 0.0 for item in trust],
             device=device,
@@ -1558,6 +1567,680 @@ class IntentionExtractor(AGICoreModule):
             dtype=torch.float32)
         return trust, ext_control, ocr_control
 
+    def ResolveSourceReliability(
+        self,
+        batchSize: int,
+        textTrust: List[str],
+        sourceReliability: Optional[torch.Tensor],
+        device: torch.device,
+        dtype: torch.dtype,
+        hasInternalContext: bool,
+        hasOcrMask: Optional[torch.Tensor] = None,
+        hasExtMask: Optional[torch.Tensor] = None,) -> Tuple[torch.Tensor, torch.Tensor]:
+        internal_available = torch.full(
+            (batchSize,),
+            bool(hasInternalContext),
+            device=device,
+            dtype=torch.bool)
+        ocr_available = (
+            torch.zeros(batchSize, device=device, dtype=torch.bool)
+            if hasOcrMask is None
+            else torch.as_tensor(
+                hasOcrMask,
+                device=device,
+                dtype=torch.bool))
+        ext_available = (
+            torch.zeros(batchSize, device=device, dtype=torch.bool)
+            if hasExtMask is None
+            else torch.as_tensor(
+                hasExtMask,
+                device=device,
+                dtype=torch.bool))
+        if ocr_available.shape != (batchSize,):
+            raise ValueError(
+                f"hasOcrMask must have shape [{batchSize}]")
+        if ext_available.shape != (batchSize,):
+            raise ValueError(
+                f"hasExtMask must have shape [{batchSize}]")
+        availability = torch.stack([
+            internal_available,
+            ocr_available,
+            ext_available,], dim=-1)
+        if sourceReliability is not None:
+            reliability = torch.as_tensor(
+                sourceReliability,
+                device=device,
+                dtype=dtype)
+            if reliability.dim() == 2 and reliability.size(-1) == 1:
+                reliability = reliability.squeeze(-1)
+            if reliability.shape == (batchSize, 3):
+                if not bool(torch.isfinite(reliability).all().item()):
+                    raise ValueError("sourceReliability must be finite")
+                components = reliability.clamp(0.0, 1.0)
+                components = components * availability.to(dtype=dtype)
+                fused = components.amax(dim=-1)
+                return fused, components
+            if reliability.shape != (batchSize,):
+                raise ValueError(
+                    f"sourceReliability must have shape [{batchSize}] or [{batchSize}, 3], got {tuple(reliability.shape)}")
+            if not bool(torch.isfinite(reliability).all().item()):
+                raise ValueError("sourceReliability must be finite")
+            fused = reliability.clamp(0.0, 1.0)
+            components = torch.zeros(
+                batchSize, 3, device=device, dtype=dtype)
+            components[:, 0] = torch.where(
+                internal_available,
+                fused,
+                torch.zeros_like(fused))
+            unresolved = ~internal_available
+            components[:, 1] = torch.where(
+                unresolved & ocr_available,
+                fused,
+                torch.zeros_like(fused))
+            components[:, 2] = torch.where(
+                unresolved & ~ocr_available,
+                fused,
+                torch.zeros_like(fused))
+            return fused, components
+
+        internal_reliability = torch.where(
+            internal_available,
+            torch.full((batchSize,), 0.65, device=device, dtype=dtype),
+            torch.zeros(batchSize, device=device, dtype=dtype))
+        ocr_reliability = torch.where(
+            ocr_available,
+            torch.full((batchSize,), 0.55, device=device, dtype=dtype),
+            torch.zeros(batchSize, device=device, dtype=dtype))
+        external_values = torch.tensor([
+            1.0 if item == TEXT_TRUST_OPERATOR_COMMAND
+            else 0.55 if item == TEXT_TRUST_OCR_OBSERVED
+            else 0.1
+            for item in textTrust], device=device, dtype=dtype)
+        external_reliability = torch.where(
+            ext_available,
+            external_values,
+            torch.zeros_like(external_values))
+        components = torch.stack([
+            internal_reliability,
+            ocr_reliability,
+            external_reliability,], dim=-1)
+        reliability = components.amax(dim=-1)
+        return reliability, components
+
+    def BuildSourceAttribution(
+        self,
+        candidateIntent: torch.Tensor,
+        initialIntent: Optional[torch.Tensor],
+        hasInternalContext: bool,
+        hasOcrMask: Optional[torch.Tensor],
+        hasExtMask: Optional[torch.Tensor],
+        ) -> torch.Tensor:
+        if candidateIntent.dim() != 2:
+            raise ValueError("candidateIntent must be rank two")
+        batch_size = int(candidateIntent.size(0))
+        device = candidateIntent.device
+        dtype = candidateIntent.dtype
+        ocr_available = (
+            torch.zeros(batch_size, device=device, dtype=torch.bool)
+            if hasOcrMask is None
+            else torch.as_tensor(
+                hasOcrMask,
+                device=device,
+                dtype=torch.bool))
+        ext_available = (
+            torch.zeros(batch_size, device=device, dtype=torch.bool)
+            if hasExtMask is None
+            else torch.as_tensor(
+                hasExtMask,
+                device=device,
+                dtype=torch.bool))
+        if (
+            tuple(ocr_available.shape) != (batch_size,)
+            or tuple(ext_available.shape) != (batch_size,)
+        ):
+            raise ValueError("source availability must match candidate batch")
+        internal_available = torch.full(
+            (batch_size,),
+            bool(hasInternalContext),
+            device=device,
+            dtype=torch.bool)
+        noninternal_count = torch.stack([
+            ocr_available,
+            ext_available,
+        ], dim=-1).sum(dim=-1).to(dtype=dtype)
+        noninternal_available = noninternal_count.gt(0.0)
+        if initialIntent is None:
+            external_weight = noninternal_available.to(dtype=dtype)
+            internal_weight = (
+                internal_available & ~noninternal_available).to(dtype=dtype)
+        else:
+            if (
+                initialIntent.shape != candidateIntent.shape
+                or initialIntent.device != device
+                or initialIntent.dtype != dtype
+                or not bool(torch.isfinite(initialIntent).all().item())
+            ):
+                raise ValueError("initialIntent must match candidateIntent")
+            difference = (
+                candidateIntent - initialIntent).norm(dim=-1)
+            cosine_change = (
+                1.0 - F.cosine_similarity(
+                    candidateIntent,
+                    initialIntent,
+                    dim=-1,
+                    eps=1e-6)).clamp(0.0, 1.0)
+            source_change = torch.where(
+                difference.le(1e-6),
+                torch.zeros_like(cosine_change),
+                cosine_change)
+            external_weight = torch.where(
+                noninternal_available,
+                torch.where(
+                    internal_available,
+                    source_change,
+                    torch.ones_like(source_change)),
+                torch.zeros_like(source_change))
+            internal_weight = torch.where(
+                internal_available,
+                torch.where(
+                    noninternal_available,
+                    1.0 - external_weight,
+                    torch.ones_like(external_weight)),
+                torch.zeros_like(external_weight))
+        denominator = noninternal_count.clamp_min(1.0)
+        attribution = torch.stack([
+            internal_weight,
+            external_weight * ocr_available.to(dtype=dtype) / denominator,
+            external_weight * ext_available.to(dtype=dtype) / denominator,
+        ], dim=-1)
+        return attribution
+
+    def ResolveCommitment(
+        self,
+        candidateIntent: torch.Tensor,
+        previousIntent: Optional[torch.Tensor],
+        sourceReliability: torch.Tensor,
+        currentVersion: Optional[torch.Tensor] = None,
+        previousVersion: Optional[torch.Tensor] = None,
+        previousStrength: Optional[torch.Tensor] = None,
+        previousValid: Optional[torch.Tensor] = None,
+        reliabilityEnter: float = 0.75,
+        reliabilityExit: float = 0.45,
+        changeEnter: float = 0.35,
+        changeExit: float = 0.15,
+        previousPendingIntent: Optional[torch.Tensor] = None,
+        previousPendingEvidence: Optional[torch.Tensor] = None,
+        previousPendingDwell: Optional[torch.Tensor] = None,
+        previousPendingValid: Optional[torch.Tensor] = None,
+        previousExitDwell: Optional[torch.Tensor] = None,
+        previousWeakDwell: Optional[torch.Tensor] = None,
+        hardCommand: Optional[torch.Tensor] = None,
+        initialIntent: Optional[torch.Tensor] = None,
+        enterDwell: int = 3,
+        exitDwell: int = 2,
+        evidenceDecay: float = 0.8,) -> Dict[str, torch.Tensor]:
+        if candidateIntent.dim() != 2:
+            raise ValueError("candidateIntent must be rank two")
+        if not bool(torch.isfinite(candidateIntent).all().item()):
+            raise ValueError("candidateIntent must be finite")
+        if not (
+            0.0 <= float(reliabilityExit) < float(reliabilityEnter) <= 1.0
+        ):
+            raise ValueError("reliability thresholds are invalid")
+        if not (0.0 <= float(changeExit) < float(changeEnter) <= 1.0):
+            raise ValueError("change thresholds are invalid")
+        if int(enterDwell) < 1 or int(exitDwell) < 1:
+            raise ValueError("commitment dwell values must be positive")
+        if not (0.0 <= float(evidenceDecay) <= 1.0):
+            raise ValueError("evidenceDecay must be in [0, 1]")
+        B, D = candidateIntent.shape
+        device = candidateIntent.device
+        dtype = candidateIntent.dtype
+
+        reliability = torch.as_tensor(
+            sourceReliability,
+            device=device,
+            dtype=dtype)
+        if reliability.dim() == 2 and reliability.size(-1) == 1:
+            reliability = reliability.squeeze(-1)
+        if reliability.shape != (B,):
+            raise ValueError(
+                f"sourceReliability must have shape [{B}], got {tuple(reliability.shape)}")
+        if not bool(torch.isfinite(reliability).all().item()):
+            raise ValueError("sourceReliability must be finite")
+        reliability = reliability.clamp(0.0, 1.0)
+
+        if previousIntent is None:
+            previous = torch.zeros_like(candidateIntent)
+            valid = torch.zeros(B, dtype=torch.bool, device=device)
+        else:
+            previous = previousIntent.to(device=device, dtype=dtype)
+            if previous.shape != (B, D):
+                raise ValueError(
+                    f"previousIntent must have shape [{B}, {D}], got {tuple(previous.shape)}")
+            if not bool(torch.isfinite(previous).all().item()):
+                raise ValueError("previousIntent must be finite")
+            valid = torch.ones(B, dtype=torch.bool, device=device)
+
+        if previousValid is not None:
+            supplied_valid = torch.as_tensor(
+                previousValid,
+                device=device,
+                dtype=torch.bool)
+            if supplied_valid.shape != (B,):
+                raise ValueError(
+                    f"previousValid must have shape [{B}], got {tuple(supplied_valid.shape)}")
+            valid = valid & supplied_valid
+
+        current_version = (
+            torch.zeros(B, dtype=torch.long, device=device)
+            if currentVersion is None
+            else torch.as_tensor(currentVersion, device=device, dtype=torch.long))
+        previous_version = (
+            torch.zeros(B, dtype=torch.long, device=device)
+            if previousVersion is None
+            else torch.as_tensor(previousVersion, device=device, dtype=torch.long))
+        if current_version.shape != (B,) or previous_version.shape != (B,):
+            raise ValueError("command versions must have shape [B]")
+        if bool((current_version < 0).any().item()) or bool(
+            (previous_version < 0).any().item()
+        ):
+            raise ValueError("command versions must be nonnegative")
+
+        previous_strength = (
+            torch.zeros(B, device=device, dtype=dtype)
+            if previousStrength is None
+            else torch.as_tensor(previousStrength, device=device, dtype=dtype))
+        if previous_strength.shape != (B,):
+            raise ValueError("previousStrength must have shape [B]")
+        if not bool(torch.isfinite(previous_strength).all().item()):
+            raise ValueError("previousStrength must be finite")
+        previous_strength = previous_strength.clamp(0.0, 1.0)
+
+        fallback = (
+            torch.zeros_like(candidateIntent)
+            if initialIntent is None
+            else torch.as_tensor(
+                initialIntent,
+                device=device,
+                dtype=dtype))
+        if fallback.shape != (B, D):
+            raise ValueError(
+                f"initialIntent must have shape [{B}, {D}]")
+        if not bool(torch.isfinite(fallback).all().item()):
+            raise ValueError("initialIntent must be finite")
+
+        pending_intent = (
+            torch.zeros_like(candidateIntent)
+            if previousPendingIntent is None
+            else torch.as_tensor(
+                previousPendingIntent,
+                device=device,
+                dtype=dtype))
+        if pending_intent.shape != (B, D):
+            raise ValueError(
+                f"previousPendingIntent must have shape [{B}, {D}]")
+        if not bool(torch.isfinite(pending_intent).all().item()):
+            raise ValueError("previousPendingIntent must be finite")
+
+        pending_evidence = (
+            torch.zeros(B, device=device, dtype=dtype)
+            if previousPendingEvidence is None
+            else torch.as_tensor(
+                previousPendingEvidence,
+                device=device,
+                dtype=dtype))
+        pending_dwell = (
+            torch.zeros(B, device=device, dtype=torch.long)
+            if previousPendingDwell is None
+            else torch.as_tensor(
+                previousPendingDwell,
+                device=device,
+                dtype=torch.long))
+        pending_valid = (
+            torch.zeros(B, device=device, dtype=torch.bool)
+            if previousPendingValid is None
+            else torch.as_tensor(
+                previousPendingValid,
+                device=device,
+                dtype=torch.bool))
+        pending_exit_dwell = (
+            torch.zeros(B, device=device, dtype=torch.long)
+            if previousExitDwell is None
+            else torch.as_tensor(
+                previousExitDwell,
+                device=device,
+                dtype=torch.long))
+        weak_dwell = (
+            torch.zeros(B, device=device, dtype=torch.long)
+            if previousWeakDwell is None
+            else torch.as_tensor(
+                previousWeakDwell,
+                device=device,
+                dtype=torch.long))
+        for name, value in (
+            ("previousPendingEvidence", pending_evidence),
+            ("previousPendingDwell", pending_dwell),
+            ("previousPendingValid", pending_valid),
+            ("previousExitDwell", pending_exit_dwell),
+            ("previousWeakDwell", weak_dwell),
+        ):
+            if value.shape != (B,):
+                raise ValueError(f"{name} must have shape [B]")
+        if not bool(torch.isfinite(pending_evidence).all().item()):
+            raise ValueError("previousPendingEvidence must be finite")
+        if (
+            bool((pending_dwell < 0).any().item())
+            or bool((pending_exit_dwell < 0).any().item())
+            or bool((weak_dwell < 0).any().item())
+        ):
+            raise ValueError("commitment dwell state must be nonnegative")
+        pending_evidence = pending_evidence.clamp(0.0, 1.0)
+
+        hard_command = (
+            reliability.ge(0.95)
+            if hardCommand is None
+            else torch.as_tensor(
+                hardCommand,
+                device=device,
+                dtype=torch.bool))
+        if hard_command.shape != (B,):
+            raise ValueError("hardCommand must have shape [B]")
+
+        similarity = F.cosine_similarity(
+            candidateIntent,
+            previous,
+            dim=-1,
+            eps=1e-6)
+        change_score = (1.0 - similarity).mul(0.5).clamp(0.0, 1.0)
+        version_advanced = current_version > previous_version
+        version_regressed = current_version < previous_version
+        conflict = valid & change_score.ge(float(changeEnter))
+        initial = ~valid
+        hard_accept = (
+            hard_command
+            & reliability.ge(float(reliabilityEnter))
+            & version_advanced
+            & ~version_regressed)
+
+        pending_similarity = F.cosine_similarity(
+            candidateIntent,
+            pending_intent,
+            dim=-1,
+            eps=1e-6)
+        pending_change = (
+            (1.0 - pending_similarity).mul(0.5).clamp(0.0, 1.0))
+        proposal = initial | conflict
+        qualified = (
+            proposal
+            & ~hard_command
+            & ~version_regressed
+            & reliability.ge(float(reliabilityExit)))
+        pending_stable = pending_valid & pending_change.le(float(changeExit))
+        pending_incompatible = (
+            pending_valid & pending_change.ge(float(changeEnter)))
+        seed_pending = qualified & (~pending_valid | pending_incompatible)
+        continue_pending = qualified & pending_stable & ~seed_pending
+        retain_pending = (
+            qualified
+            & pending_valid
+            & ~seed_pending
+            & ~continue_pending)
+
+        blended_pending = (
+            float(evidenceDecay) * pending_intent
+            + (1.0 - float(evidenceDecay)) * candidateIntent)
+        pending_intent_next = torch.where(
+            seed_pending.unsqueeze(-1),
+            candidateIntent,
+            torch.where(
+                continue_pending.unsqueeze(-1),
+                blended_pending,
+                pending_intent))
+        accumulated_evidence = (
+            float(evidenceDecay) * pending_evidence + reliability).clamp(0.0, 1.0)
+        pending_evidence_next = torch.where(
+            seed_pending,
+            reliability,
+            torch.where(
+                continue_pending,
+                accumulated_evidence,
+                torch.where(
+                    retain_pending,
+                    pending_evidence * float(evidenceDecay),
+                    pending_evidence)))
+        pending_dwell_next = torch.where(
+            seed_pending,
+            torch.ones_like(pending_dwell),
+            torch.where(
+                continue_pending,
+                pending_dwell + 1,
+                torch.where(
+                    retain_pending,
+                    pending_dwell,
+                    torch.zeros_like(pending_dwell))))
+        close_previous = valid & change_score.le(float(changeExit))
+        pending_exit_dwell_next = torch.where(
+            close_previous & pending_valid,
+            pending_exit_dwell + 1,
+            torch.zeros_like(pending_exit_dwell))
+        cancel_pending = pending_exit_dwell_next.ge(int(exitDwell))
+        pending_valid_next = pending_valid | seed_pending
+        pending_valid_next = pending_valid_next & ~cancel_pending
+        pending_intent_next = torch.where(
+            cancel_pending.unsqueeze(-1),
+            torch.zeros_like(pending_intent_next),
+            pending_intent_next)
+        pending_evidence_next = torch.where(
+            cancel_pending,
+            torch.zeros_like(pending_evidence_next),
+            pending_evidence_next)
+        pending_dwell_next = torch.where(
+            cancel_pending,
+            torch.zeros_like(pending_dwell_next),
+            pending_dwell_next)
+        pending_exit_dwell_next = torch.where(
+            cancel_pending,
+            torch.zeros_like(pending_exit_dwell_next),
+            pending_exit_dwell_next)
+
+        soft_accept = (
+            qualified
+            & pending_valid_next
+            & pending_dwell_next.ge(int(enterDwell))
+            & pending_evidence_next.ge(float(reliabilityEnter)))
+        accept = hard_accept | soft_accept
+        held = torch.where(valid.unsqueeze(-1), previous, fallback)
+        selected = torch.where(accept.unsqueeze(-1), candidateIntent, held)
+        committed = (
+            candidateIntent + (selected - candidateIntent).detach()
+            if self.training
+            else selected)
+        changed = accept & (
+            initial
+            | version_advanced
+            | change_score.ge(float(changeEnter)))
+        confirmed_conflict = changed & conflict
+        version = torch.where(
+            accept,
+            current_version,
+            previous_version)
+        weak_dwell_next = torch.where(
+            reliability.lt(float(reliabilityExit)),
+            weak_dwell + 1,
+            torch.zeros_like(weak_dwell))
+        held_strength = torch.where(
+            weak_dwell_next.ge(int(exitDwell)),
+            previous_strength.mul(0.98),
+            previous_strength)
+        maintained_strength = torch.maximum(
+            held_strength,
+            reliability.mul(0.9))
+        held_strength = torch.where(
+            valid
+            & change_score.le(float(changeExit))
+            & reliability.ge(float(reliabilityExit)),
+            maintained_strength,
+            held_strength)
+        accepted_strength = torch.where(
+            hard_accept,
+            reliability,
+            torch.maximum(reliability, pending_evidence_next))
+        strength = torch.where(
+            accept,
+            accepted_strength,
+            held_strength).clamp(0.0, 1.0)
+        valid_out = valid | accept
+        clear_pending = accept
+        pending_intent_next = torch.where(
+            clear_pending.unsqueeze(-1),
+            torch.zeros_like(pending_intent_next),
+            pending_intent_next)
+        pending_evidence_next = torch.where(
+            clear_pending,
+            torch.zeros_like(pending_evidence_next),
+            pending_evidence_next)
+        pending_dwell_next = torch.where(
+            clear_pending,
+            torch.zeros_like(pending_dwell_next),
+            pending_dwell_next)
+        pending_valid_next = pending_valid_next & ~clear_pending
+        pending_exit_dwell_next = torch.where(
+            clear_pending,
+            torch.zeros_like(pending_exit_dwell_next),
+            pending_exit_dwell_next)
+        return {
+            "committed_intent": committed,
+            "commitment_strength": strength,
+            "command_version": version,
+            "intent_changed": changed,
+            "intent_conflict": conflict,
+            "intent_conflict_confirmed": confirmed_conflict,
+            "change_score": change_score,
+            "source_reliability": reliability,
+            "commitment_valid": valid_out,
+            "pending_intent": pending_intent_next,
+            "pending_evidence": pending_evidence_next,
+            "pending_dwell": pending_dwell_next,
+            "pending_valid": pending_valid_next,
+            "pending_exit_dwell": pending_exit_dwell_next,
+            "weak_dwell": weak_dwell_next,
+            "hard_command": hard_command,
+            "hard_accepted": hard_accept,
+            "version_advanced": version_advanced,
+            "version_regressed": version_regressed,}
+
+    def ApplyCommitment(
+        self,
+        candidateIntent: torch.Tensor,
+        textTrust: List[str],
+        sourceReliability: Optional[torch.Tensor],
+        commandVersion: Optional[torch.Tensor],
+        commitmentState: Optional[Dict[str, torch.Tensor]],
+        hasInternalContext: bool,
+        hasOcrMask: Optional[torch.Tensor] = None,
+        hasExtMask: Optional[torch.Tensor] = None,
+        initialIntent: Optional[torch.Tensor] = None,) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        B = int(candidateIntent.size(0))
+        state = {} if commitmentState is None else commitmentState
+        reliability, reliability_components = self.ResolveSourceReliability(
+            batchSize=B,
+            textTrust=textTrust,
+            sourceReliability=sourceReliability,
+            device=candidateIntent.device,
+            dtype=candidateIntent.dtype,
+            hasInternalContext=hasInternalContext,
+            hasOcrMask=hasOcrMask,
+            hasExtMask=hasExtMask)
+        source_attribution = self.BuildSourceAttribution(
+            candidateIntent,
+            initialIntent,
+            hasInternalContext,
+            hasOcrMask,
+            hasExtMask)
+        explicit_reliability = (
+            None
+            if sourceReliability is None
+            else torch.as_tensor(
+                sourceReliability,
+                device=candidateIntent.device,
+                dtype=candidateIntent.dtype))
+        if explicit_reliability is None or explicit_reliability.shape == (B, 3):
+            attribution_mass = source_attribution.sum(
+                dim=-1).clamp_min(1e-6)
+            reliability = (
+                reliability_components * source_attribution
+            ).sum(dim=-1) / attribution_mass
+        previous_intent = state.get("committed_intent")
+        current_version = commandVersion
+        if current_version is None:
+            current_version = state.get("command_version")
+        ext_available = (
+            torch.zeros(B, device=candidateIntent.device, dtype=torch.bool)
+            if hasExtMask is None
+            else torch.as_tensor(
+                hasExtMask,
+                device=candidateIntent.device,
+                dtype=torch.bool))
+        hard_command = torch.tensor(
+            [item == TEXT_TRUST_OPERATOR_COMMAND for item in textTrust],
+            device=candidateIntent.device,
+            dtype=torch.bool) & ext_available
+        reliability = torch.where(
+            hard_command,
+            reliability_components[:, 2],
+            reliability)
+        result = self.ResolveCommitment(
+            candidateIntent=candidateIntent,
+            previousIntent=previous_intent,
+            sourceReliability=reliability,
+            currentVersion=current_version,
+            previousVersion=state.get("command_version"),
+            previousStrength=state.get("commitment_strength"),
+            previousValid=state.get("commitment_valid"),
+            previousPendingIntent=state.get("pending_intent"),
+            previousPendingEvidence=state.get("pending_evidence"),
+            previousPendingDwell=state.get("pending_dwell"),
+            previousPendingValid=state.get("pending_valid"),
+            previousExitDwell=state.get("pending_exit_dwell"),
+            previousWeakDwell=state.get("weak_dwell"),
+            hardCommand=hard_command,
+            initialIntent=initialIntent)
+        state_names = (
+            "committed_intent",
+            "commitment_strength",
+            "command_version",
+            "commitment_valid",
+            "pending_intent",
+            "pending_evidence",
+            "pending_dwell",
+            "pending_valid",
+            "pending_exit_dwell",
+            "weak_dwell",)
+        detached = {
+            name: result[name].detach()
+            for name in state_names}
+        extras: Dict[str, Any] = {
+            "commitment_state": detached,
+            "commitment_strength": result["commitment_strength"].detach(),
+            "command_version": result["command_version"].detach(),
+            "intent_changed": result["intent_changed"].detach(),
+            "intent_conflict": result["intent_conflict"].detach(),
+            "intent_conflict_confirmed": result[
+                "intent_conflict_confirmed"].detach(),
+            "intent_change_score": result["change_score"].detach(),
+            "source_reliability": result["source_reliability"].detach(),
+            "source_reliability_components": reliability_components.detach(),
+            "source_attribution": source_attribution.detach(),
+            "pending_evidence": result["pending_evidence"].detach(),
+            "pending_dwell": result["pending_dwell"].detach(),
+            "pending_valid": result["pending_valid"].detach(),
+            "hard_command": result["hard_command"].detach(),
+            "hard_accepted": result["hard_accepted"].detach(),
+            "version_advanced": result["version_advanced"].detach(),
+            "version_regressed": result["version_regressed"].detach(),}
+        return result["committed_intent"], extras
+
     def forward(
         self,
         selfState: Optional[torch.Tensor],
@@ -1566,7 +2249,10 @@ class IntentionExtractor(AGICoreModule):
         extTexts: Optional[List[Optional[str]]] = None,
         *,
         prioritizeExt: bool = False,
-        textTrust: Optional[List[str]] = None,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, Any]]:
+        textTrust: Optional[List[str]] = None,
+        sourceReliability: Optional[torch.Tensor] = None,
+        commandVersion: Optional[torch.Tensor] = None,
+        commitmentState: Optional[Dict[str, torch.Tensor]] = None,) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, Any]]:
 
         device = self.device
         batch_size = self.InferBatchSize(selfState, intentState, ocrTexts, extTexts)
@@ -1716,15 +2402,15 @@ class IntentionExtractor(AGICoreModule):
             ocr_slot_mask,
             ext_slot_mask_control,], dim=1)
 
-        def safe_token_mask(token_mask_: torch.Tensor) -> torch.Tensor:
+        def SafeTokenMask(token_mask_: torch.Tensor) -> torch.Tensor:
             safe = token_mask_.clone()
             all_pad = ~safe.any(dim=1)
             safe[:, 0] |= all_pad
             return safe
 
         trans_tokens: Optional[torch.Tensor] = None
-        token_mask_safe = safe_token_mask(token_mask)
-        src_key_padding_mask = ~token_mask_safe  # [B, S]
+        token_mask_safe = SafeTokenMask(token_mask)
+        src_key_padding_mask = ~token_mask_safe # [B, S]
 
         if token_mask.any():
             trans_tokens = self.intentTransformer(tokens, src_key_padding_mask=src_key_padding_mask)
@@ -1803,6 +2489,24 @@ class IntentionExtractor(AGICoreModule):
             extras["sym_ctrl_gains"] = torch.cat([ctrl["g_ocr"], ctrl["g_ext"], ctrl["g_trans"]], dim=-1).detach()
             extras["sym_tok_w"] = ctrl["tok_w"].detach()
             extras["sym_reason_alpha"] = support["alpha_eff"].detach()
+
+        if (
+            sourceReliability is not None
+            or commandVersion is not None
+            or commitmentState is not None
+        ):
+            intentSem, commitment_extras = self.ApplyCommitment(
+                candidateIntent=intentSem,
+                textTrust=text_trust,
+                sourceReliability=sourceReliability,
+                commandVersion=commandVersion,
+                commitmentState=commitmentState,
+                hasInternalContext=(
+                    selfState is not None or intentState is not None),
+                hasOcrMask=has_ocr_mask,
+                hasExtMask=has_ext_mask,
+                initialIntent=cons_sem)
+            extras.update(commitment_extras)
 
         final_logits = F.linear(intentSem, self.conceptEmb, self.conceptBias)
 
@@ -1953,7 +2657,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         sym_film: "GrowableLoRALinear" = base.symCtrl.film_head[0]
         sym_ctx: "GrowableLoRALinear" = base.symCtrl.ctx_proj[0]
 
-        def make_alloc(inDim: int, outDim: int, maxRank: int):
+        def MakeAlloc(inDim: int, outDim: int, maxRank: int):
             def alloc(addRank: int, device: torch.device, dtype: torch.dtype):
                 A = nn.Parameter(torch.randn(addRank, inDim, device=device, dtype=dtype) * 1e-4)
                 B = nn.Parameter(torch.zeros(outDim, addRank, device=device, dtype=dtype) * 1e-4)
@@ -1971,7 +2675,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 inDim=int(sem_lora.in_f),
                 outDim=int(sem_lora.out_f),
                 maxRank=self.maxRankSem,
-                allocFn=make_alloc(int(sem_lora.in_f), int(sem_lora.out_f), self.maxRankSem),
+                allocFn=MakeAlloc(int(sem_lora.in_f), int(sem_lora.out_f), self.maxRankSem),
                 composeFn=compose,),
 
             "cons_self": SiteSpec(
@@ -1980,7 +2684,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 inDim=int(cons_self_lora.in_f),
                 outDim=int(cons_self_lora.out_f),
                 maxRank=self.maxRankCons,
-                allocFn=make_alloc(int(cons_self_lora.in_f), int(cons_self_lora.out_f), self.maxRankCons),
+                allocFn=MakeAlloc(int(cons_self_lora.in_f), int(cons_self_lora.out_f), self.maxRankCons),
                 composeFn=compose,),
 
             "cons_intent": SiteSpec(
@@ -1989,7 +2693,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 inDim=int(cons_intent_lora.in_f),
                 outDim=int(cons_intent_lora.out_f),
                 maxRank=self.maxRankCons,
-                allocFn=make_alloc(int(cons_intent_lora.in_f), int(cons_intent_lora.out_f), self.maxRankCons),
+                allocFn=MakeAlloc(int(cons_intent_lora.in_f), int(cons_intent_lora.out_f), self.maxRankCons),
                 composeFn=compose,),
 
             "cons_pair": SiteSpec(
@@ -1998,7 +2702,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 inDim=int(cons_pair_lora.in_f),
                 outDim=int(cons_pair_lora.out_f),
                 maxRank=self.maxRankCons,
-                allocFn=make_alloc(int(cons_pair_lora.in_f), int(cons_pair_lora.out_f), self.maxRankCons),
+                allocFn=MakeAlloc(int(cons_pair_lora.in_f), int(cons_pair_lora.out_f), self.maxRankCons),
                 composeFn=compose,),
 
             "cons_token_gate": SiteSpec(
@@ -2007,7 +2711,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 inDim=int(cons_gate_lora.in_f),
                 outDim=int(cons_gate_lora.out_f),
                 maxRank=self.maxRankCons,
-                allocFn=make_alloc(int(cons_gate_lora.in_f), int(cons_gate_lora.out_f), self.maxRankCons),
+                allocFn=MakeAlloc(int(cons_gate_lora.in_f), int(cons_gate_lora.out_f), self.maxRankCons),
                 composeFn=compose,),
 
             "ocr_gate": SiteSpec(
@@ -2016,7 +2720,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 inDim=int(ocr_lora.in_f),
                 outDim=int(ocr_lora.out_f),
                 maxRank=self.maxRankOcr,
-                allocFn=make_alloc(int(ocr_lora.in_f), int(ocr_lora.out_f), self.maxRankOcr),
+                allocFn=MakeAlloc(int(ocr_lora.in_f), int(ocr_lora.out_f), self.maxRankOcr),
                 composeFn=compose,),
 
             "ext_gate": SiteSpec(
@@ -2025,7 +2729,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 inDim=int(ext_lora.in_f),
                 outDim=int(ext_lora.out_f),
                 maxRank=self.maxRankExt,
-                allocFn=make_alloc(int(ext_lora.in_f), int(ext_lora.out_f), self.maxRankExt),
+                allocFn=MakeAlloc(int(ext_lora.in_f), int(ext_lora.out_f), self.maxRankExt),
                 composeFn=compose,),
 
             "sym_k2h": SiteSpec(
@@ -2034,7 +2738,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 inDim=int(sym_k2h.in_f),
                 outDim=int(sym_k2h.out_f),
                 maxRank=self.maxRankSym,
-                allocFn=make_alloc(int(sym_k2h.in_f), int(sym_k2h.out_f), self.maxRankSym),
+                allocFn=MakeAlloc(int(sym_k2h.in_f), int(sym_k2h.out_f), self.maxRankSym),
                 composeFn=compose,),
 
             "sym_gain": SiteSpec(
@@ -2043,7 +2747,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 inDim=int(sym_gain.in_f),
                 outDim=int(sym_gain.out_f),
                 maxRank=self.maxRankSym,
-                allocFn=make_alloc(int(sym_gain.in_f), int(sym_gain.out_f), self.maxRankSym),
+                allocFn=MakeAlloc(int(sym_gain.in_f), int(sym_gain.out_f), self.maxRankSym),
                 composeFn=compose,),
 
             "sym_tok": SiteSpec(
@@ -2052,7 +2756,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 inDim=int(sym_tok.in_f),
                 outDim=int(sym_tok.out_f),
                 maxRank=self.maxRankSym,
-                allocFn=make_alloc(int(sym_tok.in_f), int(sym_tok.out_f), self.maxRankSym),
+                allocFn=MakeAlloc(int(sym_tok.in_f), int(sym_tok.out_f), self.maxRankSym),
                 composeFn=compose,),
 
             "sym_film": SiteSpec(
@@ -2061,7 +2765,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 inDim=int(sym_film.in_f),
                 outDim=int(sym_film.out_f),
                 maxRank=self.maxRankSym,
-                allocFn=make_alloc(int(sym_film.in_f), int(sym_film.out_f), self.maxRankSym),
+                allocFn=MakeAlloc(int(sym_film.in_f), int(sym_film.out_f), self.maxRankSym),
                 composeFn=compose,),
 
             "sym_ctx": SiteSpec(
@@ -2070,7 +2774,7 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
                 inDim=int(sym_ctx.in_f),
                 outDim=int(sym_ctx.out_f),
                 maxRank=self.maxRankSym,
-                allocFn=make_alloc(int(sym_ctx.in_f), int(sym_ctx.out_f), self.maxRankSym),
+                allocFn=MakeAlloc(int(sym_ctx.in_f), int(sym_ctx.out_f), self.maxRankSym),
                 composeFn=compose,),}
         
         return specs
@@ -2266,6 +2970,12 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
         extTexts: Optional[List[Optional[str]]] = kwargs.get("extTexts", None)
         prioritizeExt: bool = bool(kwargs.get("prioritizeExt", False))
         textTrust: Optional[List[str]] = kwargs.get("textTrust", None)
+        sourceReliability: Optional[torch.Tensor] = kwargs.get(
+            "sourceReliability", None)
+        commandVersion: Optional[torch.Tensor] = kwargs.get(
+            "commandVersion", None)
+        commitmentState: Optional[Dict[str, torch.Tensor]] = kwargs.get(
+            "commitmentState", None)
 
         row = deltasPerLayer[0] if (deltasPerLayer is not None and len(deltasPerLayer) > 0) else {}
 
@@ -2433,13 +3143,13 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
             ocr_slot_mask,
             ext_slot_mask_control,], dim=1)
 
-        def safe_token_mask(token_mask: torch.Tensor) -> torch.Tensor:
+        def SafeTokenMask(token_mask: torch.Tensor) -> torch.Tensor:
             safe = token_mask.clone()
             all_pad = ~safe.any(dim=1) 
             safe[:, 0] |= all_pad
             return safe
 
-        token_mask_safe = safe_token_mask(token_mask)
+        token_mask_safe = SafeTokenMask(token_mask)
         src_key_padding_mask = ~token_mask_safe 
 
         trans_out: Optional[torch.Tensor] = None
@@ -2524,6 +3234,24 @@ class IntentionOnlineWrapper(BaseOnlineWrapper):
             extras["sym_ctrl_gains"] = torch.cat([ctrl["g_ocr"], ctrl["g_ext"], ctrl["g_trans"]], dim=-1).detach()
             extras["sym_tok_w"] = ctrl["tok_w"].detach()
             extras["sym_reason_alpha"] = support["alpha_eff"].detach()
+
+        if (
+            sourceReliability is not None
+            or commandVersion is not None
+            or commitmentState is not None
+        ):
+            intentSem, commitment_extras = base.ApplyCommitment(
+                candidateIntent=intentSem,
+                textTrust=text_trust,
+                sourceReliability=sourceReliability,
+                commandVersion=commandVersion,
+                commitmentState=commitmentState,
+                hasInternalContext=(
+                    self_state is not None or intent_state is not None),
+                hasOcrMask=has_ocr_mask,
+                hasExtMask=has_ext_mask,
+                initialIntent=cons_sem)
+            extras.update(commitment_extras)
 
         final_logits = F.linear(intentSem, base.conceptEmb, base.conceptBias)
         symProbs, final_support = base.reasoner(
@@ -2771,22 +3499,22 @@ class TestIntentionMTool:
                 with_cons=True,
                 compact_text=True,)
 
-            def print_shape(name: str, tensor: torch.Tensor):
+            def PrintShape(name: str, tensor: torch.Tensor):
                 print(f"{name}: {tuple(tensor.shape)}")
 
-            def print_nested(prefix: str, obj):
+            def PrintNested(prefix: str, obj):
                 if isinstance(obj, torch.Tensor):
-                    print_shape(prefix, obj)
+                    PrintShape(prefix, obj)
                 elif isinstance(obj, dict):
                     for key, value in obj.items():
                         next_prefix = f"{prefix}.{key}" if prefix else key
-                        print_nested(next_prefix, value)
+                        PrintNested(next_prefix, value)
 
             with torch.no_grad():
                 if selfState is not None:
-                    print_shape("input.selfState", selfState)
+                    PrintShape("input.selfState", selfState)
                 if intentState is not None:
-                    print_shape("input.intentState", intentState)
+                    PrintShape("input.intentState", intentState)
 
                 intentSem, symProbs, extras = model(
                     selfState,
@@ -2796,10 +3524,10 @@ class TestIntentionMTool:
                     prioritizeExt=False,)
 
                 if intentSem is not None:
-                    print_shape("output.intentSem", intentSem)
+                    PrintShape("output.intentSem", intentSem)
                 if symProbs is not None:
-                    print_shape("output.symProbs", symProbs)
-                print_nested("output.extras", extras)
+                    PrintShape("output.symProbs", symProbs)
+                PrintNested("output.extras", extras)
 
             assert intentSem is not None and intentSem.shape == (B, model.dimSem)
             assert symProbs is not None and symProbs.shape == (B, int(model.conceptEmb.size(0)))
@@ -3480,7 +4208,7 @@ class TestIntentionMTool:
 
             atol, rtol = 1e-6, 1e-4
 
-            def site_to_mod(site: str) -> "GrowableLoRALinear":
+            def SiteToMod(site: str) -> "GrowableLoRALinear":
                 if site == "sem":
                     return base.semProj[0]
                 if site == "cons_self":
@@ -3509,7 +4237,7 @@ class TestIntentionMTool:
 
             for site in sites:
                 exp = expected[site]
-                mod = site_to_mod(site)
+                mod = SiteToMod(site)
 
                 got = mod.DeltaWeight()
                 if got is None:
@@ -3697,7 +4425,7 @@ class TestIntentionMTool:
                 model.dimSem,)
             assert torch.allclose(model._last_recall_cons_sem, expected_condition)
 
-            def text_encoder_grad_norm(trust: str) -> float:
+            def TextEncoderGradNorm(trust: str) -> float:
                 probe = self.MakeTestModel()
                 probe.train()
                 probe.zero_grad(set_to_none=True)
@@ -3713,8 +4441,8 @@ class TestIntentionMTool:
                 grad = probe.encoder.embedding.weight.grad
                 return 0.0 if grad is None else float(grad.norm().item())
 
-            unsafe_grad = text_encoder_grad_norm(TEXT_TRUST_UNSAFE_EXTERNAL)
-            trusted_grad = text_encoder_grad_norm(TEXT_TRUST_OPERATOR_COMMAND)
+            unsafe_grad = TextEncoderGradNorm(TEXT_TRUST_UNSAFE_EXTERNAL)
+            trusted_grad = TextEncoderGradNorm(TEXT_TRUST_OPERATOR_COMMAND)
             assert unsafe_grad > 1e-10, "observed unsafe text did not train recall encoder"
             assert trusted_grad > 1e-10, "trusted operator recall did not reach text encoder"
 
@@ -3799,6 +4527,71 @@ class TestIntentionMTool:
             print("RecallLossMasksBeforeComputation error:", e)
             return False
 
+    def CommitmentHysteresisAndVersioning(self) -> bool:
+        try:
+            model = self.MakeTestModel().eval()
+            B = 2
+            previous = F.normalize(
+                torch.randn(B, model.dimSem, device=self.device),
+                dim=-1)
+            candidate = (-previous).detach().clone().requires_grad_(True)
+            previous_version = torch.full(
+                (B,), 4, dtype=torch.long, device=self.device)
+            current_version = torch.full(
+                (B,), 5, dtype=torch.long, device=self.device)
+            previous_strength = torch.full(
+                (B,), 0.9, device=self.device)
+            previous_valid = torch.ones(
+                B, dtype=torch.bool, device=self.device)
+
+            low = model.ResolveCommitment(
+                candidateIntent=candidate,
+                previousIntent=previous,
+                sourceReliability=torch.full((B,), 0.2, device=self.device),
+                currentVersion=current_version,
+                previousVersion=previous_version,
+                previousStrength=previous_strength,
+                previousValid=previous_valid)
+            assert torch.allclose(low["committed_intent"], previous)
+            assert not bool(low["intent_changed"].any().item())
+            assert bool(low["intent_conflict"].all().item())
+            assert torch.equal(low["command_version"], previous_version)
+
+            high = model.ResolveCommitment(
+                candidateIntent=candidate,
+                previousIntent=previous,
+                sourceReliability=torch.full((B,), 0.95, device=self.device),
+                currentVersion=current_version,
+                previousVersion=previous_version,
+                previousStrength=previous_strength,
+                previousValid=previous_valid)
+            assert torch.allclose(high["committed_intent"], candidate)
+            assert bool(high["intent_changed"].all().item())
+            assert bool(high["intent_conflict"].all().item())
+            assert torch.equal(high["command_version"], current_version)
+            high["committed_intent"].sum().backward()
+            assert candidate.grad is not None
+            assert float(candidate.grad.abs().sum().item()) > 0.0
+
+            stable = model.ResolveCommitment(
+                candidateIntent=previous,
+                previousIntent=previous,
+                sourceReliability=torch.full((B,), 0.95, device=self.device),
+                currentVersion=previous_version,
+                previousVersion=previous_version,
+                previousStrength=previous_strength,
+                previousValid=previous_valid)
+            assert not bool(stable["intent_changed"].any().item())
+            assert not bool(stable["intent_conflict"].any().item())
+            print("CommitmentHysteresisAndVersioning passed.")
+            return True
+        except AssertionError as e:
+            print("CommitmentHysteresisAndVersioning failed:", e)
+            return False
+        except Exception as e:
+            print("CommitmentHysteresisAndVersioning error:", e)
+            return False
+
 
     def RunAll(self) -> Dict[str, bool]:
         results = {
@@ -3816,6 +4609,7 @@ class TestIntentionMTool:
             "WrapperCandidateConvergence": self.WrapperCandidateConvergence(),
             "WrapperManualGrowTrainAndCommit": self.WrapperManualGrowTrainAndCommit(),
             "TextTrustPolicy": self.TextTrustPolicy(),
+            "CommitmentHysteresisAndVersioning": self.CommitmentHysteresisAndVersioning(),
             "RecallConditionAndTrust": self.RecallConditionAndTrust(),
             "RecallLossMasksBeforeComputation": self.RecallLossMasksBeforeComputation(),}
         

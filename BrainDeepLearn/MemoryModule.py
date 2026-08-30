@@ -1,10 +1,9 @@
 from __future__ import annotations
-from typing import Any, Optional, Tuple, Dict, List, Union
+from typing import Any, Optional, Tuple, Dict, List
 from pathlib import Path
 from types import SimpleNamespace, MethodType
 from FunctionTools import AGICoreModule
 from ModuleMessagerManager import ModuleDim
-from RobotMorphologyModule import Realm, Agency
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,6 +12,18 @@ import math
 import os
 import inspect
 import tempfile
+import hashlib
+
+
+ONTOLOGY_REALM_SELF = 0
+ONTOLOGY_REALM_EXTERNAL = 1
+ONTOLOGY_REALM_VIRTUAL = 2
+ONTOLOGY_REALM_EFFECT = 3
+ONTOLOGY_REALM_UNKNOWN = 4
+ONTOLOGY_AGENCY_SELF = 0
+ONTOLOGY_AGENCY_EXTERNAL = 1
+ONTOLOGY_AGENCY_AUTONOMOUS = 2
+ONTOLOGY_AGENCY_UNKNOWN = 4
 
 
 
@@ -40,8 +51,8 @@ def StableTopk(scores: torch.Tensor, k: int, epsMax: float = 1e-6, preferLowInde
     return values, indices
 
 class MemoryType:
-    SRC_REAL: int = 0 
-    SRC_IMAGINE: int = 1 
+    SRC_REAL: int = 0
+    SRC_IMAGINE: int = 1
     SRC_MIXED: int = 2
 
 
@@ -52,7 +63,7 @@ def UnknownEpisodicTypeMetadata(
     B = int(realm.size(0))
     return {
         "agency_id": torch.full(
-            (B,), int(Agency.UNKNOWN), device=realm.device, dtype=torch.int8),
+            (B,), ONTOLOGY_AGENCY_UNKNOWN, device=realm.device, dtype=torch.int8),
         "motion_layer_prob": torch.zeros(
             B, 5, device=realm.device, dtype=dtype),
         "observed_surface_parent_index": torch.full(
@@ -282,7 +293,7 @@ class SoftSymbolicRules(AGICoreModule):
         W_or = torch.sigmoid(self.or_logits) #[G_or, K]
 
         A_imp = torch.sigmoid(self.imp_logits) #[K, K]
-        A_imp = A_imp.masked_fill(~self.no_self_mask, 0.0) 
+        A_imp = A_imp.masked_fill(~self.no_self_mask, 0.0)
 
         return W_excl, W_or, A_imp
 
@@ -293,18 +304,18 @@ class SoftSymbolicRules(AGICoreModule):
         total_penalty = p_f.new_zeros(B)
         aux_reg = p_f.new_zeros(())
 
-        W_excl, W_or, A_imp = self.Weights()#[G_excl, K] , [G_or, K] , [K, K]
+        W_excl, W_or, A_imp = self.Weights() #[G_excl, K] , [G_or, K] , [K, K]
 
         if W_excl.numel() > 0:
             s = torch.matmul(p_f, W_excl.t()) #[B, G_excl]
             s2 = torch.matmul(p_f.pow(2), W_excl.pow(2).t())
-            excl_pen = 0.5 * (s.pow(2) - s2) 
+            excl_pen = 0.5 * (s.pow(2) - s2)
             total_penalty = total_penalty + excl_pen.mean(dim=1) #[B]
 
         if W_or.numel() > 0:
             eps = p_f.new_tensor(1e-6)
             z = (p_f.unsqueeze(1) * W_or.unsqueeze(0)).clamp(0.0, 1.0 - eps) #[B, G_or, K]
-            prob_not_sat = torch.exp(torch.log1p(-z).sum(dim=-1)) 
+            prob_not_sat = torch.exp(torch.log1p(-z).sum(dim=-1))
             total_penalty = total_penalty + prob_not_sat.mean(dim=1)
 
         if self.imp_scale > 0.0:
@@ -312,7 +323,7 @@ class SoftSymbolicRules(AGICoreModule):
             weighted = violation * A_imp.unsqueeze(0) # [B, K, K]
 
             denom = max(1, K * (K - 1))
-            imp_pen = weighted.sum(dim=(1, 2)) / float(denom)  #[B]
+            imp_pen = weighted.sum(dim=(1, 2)) / float(denom) #[B]
             total_penalty = total_penalty + self.imp_scale * imp_pen
 
         if pPrev is not None :
@@ -339,7 +350,7 @@ class SoftSymbolicRules(AGICoreModule):
                 if W_or is not None:
                     aux_reg = aux_reg + self.mass_weight * (W_or.sum(dim=1) - self.mass_or).pow(2).mean()
 
-                row_sum = A_imp.sum(dim=1) 
+                row_sum = A_imp.sum(dim=1)
                 aux_reg = aux_reg + self.mass_weight * (row_sum - self.mass_imp_row).pow(2).mean()
 
             if self.l1_imp > 0:
@@ -364,28 +375,28 @@ class SymbolicCoder(AGICoreModule):
                 nn.Linear(hidden, hidden), nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden, k)) for _ in range(experts)])
-        
+
         self.proto = nn.Parameter(torch.randn(k, inDim) * 0.02)
 
-        self.proto_scale_log = nn.Parameter(torch.tensor(2.3)) 
+        self.proto_scale_log = nn.Parameter(torch.tensor(2.3))
 
         self.proto_mix_log = nn.Parameter(torch.tensor(0.0))
 
-    def forward(self, x: torch.Tensor):  # x: [B, inDim]
+    def forward(self, x: torch.Tensor): # x: [B, inDim]
         gate_logits = self.gate(x) #[B, experts]
         weights = F.softmax(gate_logits, dim=-1) #[B, experts]
 
         expert_outputs = [e(x) for e in self.experts] #list experts * [B, K]
-        
+
         stacked_experts = torch.stack(expert_outputs, dim=1) #[B, experts, k]
-        
+
         moe_logits = (weights.unsqueeze(-1) * stacked_experts).sum(dim=1) #[B, k]
 
         x_norm = F.normalize(x, dim=-1) #[B, inDim]
         proto_norm = F.normalize(self.proto, dim=-1) #[k, inDim]
-        
+
         cosine_sim = x_norm @ proto_norm.t() #[B, k]
-        
+
         scale = torch.exp(self.proto_scale_log)
         proto_logits = cosine_sim * scale
 
@@ -531,7 +542,7 @@ class SymbolicMemory(AGICoreModule):
             self.P_vals,
             1,
             idx.unsqueeze(-1).expand(B, k, self.K))
-        out = torch.einsum("bk,bkd->bd", w, selected_vals)  
+        out = torch.einsum("bk,bkd->bd", w, selected_vals)
 
         with torch.no_grad():
             b_idx = torch.arange(B, device=qSym.device).unsqueeze(1).expand_as(idx)
@@ -587,7 +598,7 @@ class SymbolicEmbed(AGICoreModule):
             nn.Linear(hidden, self.outDim),)
 
     def forward(
-        self, 
+        self,
         pCur: torch.Tensor, #[B, K]
         symRecall: torch.Tensor):
         eps = pCur.new_tensor(1e-6)
@@ -704,8 +715,8 @@ class GlobalWorkspace(AGICoreModule):
     @torch.no_grad()
     def Write(
         self,
-        key: torch.Tensor,  # [B, Dim]
-        val: torch.Tensor,  # [B, Dim]
+        key: torch.Tensor, # [B, Dim]
+        val: torch.Tensor, # [B, Dim]
         *,
         priority: Optional[torch.Tensor] = None, # [B]
         ttl: Optional[torch.Tensor] = None, # [B]
@@ -812,7 +823,7 @@ class GlobalWorkspace(AGICoreModule):
             sim = sim.clone()
             sim[~any_alive] = 0.0
 
-        top_sim, top_idx = StableTopk(sim, kk)  #[B, kk]
+        top_sim, top_idx = StableTopk(sim, kk) #[B, kk]
         candidate_alive = torch.gather(alive, 1, top_idx)
         w, accepted, evidence = NullGatedTopKWeights(
             top_sim,
@@ -878,7 +889,7 @@ class SemanticLTM(AGICoreModule):
             "realm",
             torch.full(
                 (B0, capacity),
-                int(Realm.UNKNOWN),
+                ONTOLOGY_REALM_UNKNOWN,
                 dtype=torch.int8))
         self.register_buffer("filled", torch.zeros(B0, dtype=torch.long))
         self.register_buffer("global_step", torch.zeros(B0, dtype=torch.long))
@@ -903,7 +914,7 @@ class SemanticLTM(AGICoreModule):
         self.source_confidence = self.source_confidence.new_zeros(B, self.capacity)
         self.realm = self.realm.new_full(
             (B, self.capacity),
-            int(Realm.UNKNOWN))
+            ONTOLOGY_REALM_UNKNOWN)
         self.filled = self.filled.new_zeros(B)
         self.global_step = self.global_step.new_zeros(B)
 
@@ -915,8 +926,8 @@ class SemanticLTM(AGICoreModule):
     @torch.no_grad()
     def Store(
         self,
-        key: torch.Tensor,  # [B, D] 
-        value: torch.Tensor,  # [B, D] 
+        key: torch.Tensor, # [B, D]
+        value: torch.Tensor, # [B, D]
         score: torch.Tensor, # [B,]
         source: Optional[torch.Tensor] = None,
         writeMask: Optional[torch.Tensor] = None,
@@ -1005,7 +1016,7 @@ class SemanticLTM(AGICoreModule):
             self.realm[b, idx] = realm[b]
 
     def Retrieve(
-        self, 
+        self,
         query: torch.Tensor, #[B, D]
         topk: int = 8,
         returnEvidence: bool = False,):
@@ -1015,9 +1026,9 @@ class SemanticLTM(AGICoreModule):
         filled = self.filled
         gstep = self.global_step
 
-        slots = torch.arange(self.capacity, device=self.device).unsqueeze(0) #[1, capacity] 
+        slots = torch.arange(self.capacity, device=self.device).unsqueeze(0) #[1, capacity]
         valid_mask = slots < filled.unsqueeze(1) #[B, capacity]
-        any_valid = valid_mask.any(dim=1)  
+        any_valid = valid_mask.any(dim=1)
         if not bool(any_valid.any().item()):
             out = torch.zeros(B, self.dim, device=self.device, dtype=query.dtype)
             evidence = torch.zeros(B, 1, device=self.device, dtype=query.dtype)
@@ -1046,7 +1057,7 @@ class SemanticLTM(AGICoreModule):
             self.null_logit,
             candidate_valid)
 
-        idx_expanded = top_idx.unsqueeze(-1).expand(B, K, self.dim) 
+        idx_expanded = top_idx.unsqueeze(-1).expand(B, K, self.dim)
         vecs = torch.gather(self.vals, 1, idx_expanded) #[B, K, D]
         out = torch.einsum("bk,bkd->bd", w, vecs)
 
@@ -1087,13 +1098,13 @@ class EpisodicLTM(AGICoreModule):
             "realm",
             torch.full(
                 (B0, capacity),
-                int(Realm.UNKNOWN),
+                ONTOLOGY_REALM_UNKNOWN,
                 dtype=torch.int8))
         self.register_buffer(
             "agency_id",
             torch.full(
                 (B0, capacity),
-                int(Agency.UNKNOWN),
+                ONTOLOGY_AGENCY_UNKNOWN,
                 dtype=torch.int8))
         self.register_buffer(
             "motion_layer_prob",
@@ -1150,10 +1161,10 @@ class EpisodicLTM(AGICoreModule):
         self.source_confidence = self.source_confidence.new_zeros(B, self.capacity)
         self.realm = self.realm.new_full(
             (B, self.capacity),
-            int(Realm.UNKNOWN))
+            ONTOLOGY_REALM_UNKNOWN)
         self.agency_id = self.agency_id.new_full(
             (B, self.capacity),
-            int(Agency.UNKNOWN))
+            ONTOLOGY_AGENCY_UNKNOWN)
         self.motion_layer_prob = self.motion_layer_prob.new_zeros(
             B, self.capacity, 5)
         self.observed_surface_parent_index = (
@@ -1293,8 +1304,8 @@ class EpisodicLTM(AGICoreModule):
         filled = self.filled
         gstep = self.global_step
 
-        slots = torch.arange(self.capacity, device=self.device).unsqueeze(0) 
-        valid_mask = slots < filled.unsqueeze(1) 
+        slots = torch.arange(self.capacity, device=self.device).unsqueeze(0)
+        valid_mask = slots < filled.unsqueeze(1)
         any_valid = valid_mask.any(dim=1)
         if not bool(any_valid.any().item()):
             out = torch.zeros(B, self.dim, device=self.device, dtype=query.dtype)
@@ -1377,7 +1388,7 @@ class EpisodicLTM(AGICoreModule):
 
     @torch.no_grad()
     def RebuildSequenceLinks(self) -> None:
-        """Rebuild generation-checked event links after state merge or slot reuse."""
+
         self.prev_index.fill_(-1)
         self.next_index.fill_(-1)
         self.prev_generation.fill_(-1)
@@ -1517,9 +1528,9 @@ class LTMFuser(AGICoreModule):
             nn.Linear(hidden, self.dim),)
 
     def forward(
-        self, 
-        semOut: torch.Tensor, #[B, dim] 
-        epiOut: torch.Tensor #[B, dim] 
+        self,
+        semOut: torch.Tensor, #[B, dim]
+        epiOut: torch.Tensor #[B, dim]
         ) -> torch.Tensor:
         sem = self.norm_sem(semOut)
         epi = self.norm_epi(epiOut)
@@ -1527,7 +1538,7 @@ class LTMFuser(AGICoreModule):
         diff = torch.abs(sem - epi)
         prod = sem * epi
 
-        cos = F.cosine_similarity(sem, epi, dim=-1, eps=1e-8).clamp(-1.0, 1.0) #[B] 
+        cos = F.cosine_similarity(sem, epi, dim=-1, eps=1e-8).clamp(-1.0, 1.0) #[B]
         n_sem = torch.linalg.vector_norm(sem, ord=2, dim=-1) #[B]
         n_epi = torch.linalg.vector_norm(epi, ord=2, dim=-1) #[B]
         n_diff = torch.linalg.vector_norm((sem - epi), ord=2, dim=-1) #[B]
@@ -1602,7 +1613,7 @@ class LongTermMemory(AGICoreModule):
         self.semantic.prototype_variance.zero_()
         self.semantic.source.zero_()
         self.semantic.source_confidence.zero_()
-        self.semantic.realm.fill_(int(Realm.UNKNOWN))
+        self.semantic.realm.fill_(ONTOLOGY_REALM_UNKNOWN)
         self.semantic.filled.zero_()
         self.semantic.global_step.zero_()
 
@@ -1619,8 +1630,8 @@ class LongTermMemory(AGICoreModule):
         self.episodic.touch.zero_()
         self.episodic.source.zero_()
         self.episodic.source_confidence.zero_()
-        self.episodic.realm.fill_(int(Realm.UNKNOWN))
-        self.episodic.agency_id.fill_(int(Agency.UNKNOWN))
+        self.episodic.realm.fill_(ONTOLOGY_REALM_UNKNOWN)
+        self.episodic.agency_id.fill_(ONTOLOGY_AGENCY_UNKNOWN)
         self.episodic.motion_layer_prob.zero_()
         self.episodic.observed_surface_parent_index.fill_(-1)
         self.episodic.surface_uv.zero_()
@@ -1683,8 +1694,8 @@ class FusionMoE(AGICoreModule):
         numExperts: int = 4,
         hidden: int = 1024,
         noisyGating: bool = True,
-        noiseStd: Optional[float] = 0.1,  
-        temperature: float = 0.9, 
+        noiseStd: Optional[float] = 0.1,
+        temperature: float = 0.9,
         expertDropout: float = 0.1,):
         super().__init__()
         self.numExperts = int(numExperts)
@@ -1706,8 +1717,9 @@ class FusionMoE(AGICoreModule):
         return self.aux_loss
 
     def forward(
-        self, 
-        x: torch.Tensor #[B, inDim]
+        self,
+        x: torch.Tensor, #[B, inDim]
+        sampleMask: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
 
         logits = self.gate(x) # [B, numExperts]
@@ -1716,7 +1728,7 @@ class FusionMoE(AGICoreModule):
             logits = logits + torch.randn_like(logits) * self.noise_std
 
         if self.training and (self.expert_dropout > 0.0):
-            keep = (torch.rand_like(logits) > self.expert_dropout) 
+            keep = (torch.rand_like(logits) > self.expert_dropout)
 
             all_drop = (~keep).all(dim=-1)
             if all_drop.any():
@@ -1725,32 +1737,50 @@ class FusionMoE(AGICoreModule):
                 keep[all_drop] = False
                 keep[all_drop, rand_idx] = True
 
-            logits = logits.masked_fill(~keep, -1e9)
+            logits = logits.masked_fill(
+                ~keep,
+                torch.finfo(logits.dtype).min)
 
         t = max(self.temperature, 1e-6)
         a = F.softmax((logits / t).float(), dim=-1) # [B, numExperts]
 
         if self.training:
-            importance = a.mean(dim=0)
-            self.aux_loss  = float(self.numExperts) * (importance.pow(2).sum())
+            if sampleMask is None:
+                sample_mask = torch.ones(
+                    x.size(0), device=x.device, dtype=torch.bool)
+            else:
+                if (
+                    not torch.is_tensor(sampleMask)
+                    or tuple(sampleMask.shape) != (x.size(0),)
+                    or sampleMask.dtype != torch.bool
+                    or sampleMask.device != x.device
+                ):
+                    raise ValueError("fusion sample mask must be a boolean batch vector")
+                sample_mask = sampleMask
+            if bool(sample_mask.any().item()):
+                importance = a[sample_mask].mean(dim=0)
+                self.aux_loss = float(self.numExperts) * (
+                    importance.pow(2).sum())
+            else:
+                self.aux_loss = x.new_zeros(())
         else:
             self.aux_loss = x.new_zeros(())
 
-        ys = [expert(x) for expert in self.experts] 
+        ys = [expert(x) for expert in self.experts]
         y = torch.stack(ys, dim=-1) # [B, outDim, numExperts]
-        out = (y * a.unsqueeze(1)).sum(dim=-1) 
+        out = (y * a.unsqueeze(1)).sum(dim=-1)
         return out # [B, outDim]
-    
+
 
 class ObjectUsageBank(AGICoreModule):
-    """Per-instance tensorized affordance table (Part 6, Option C + Gaussian residual).
 
-    Indexed by integer object/skill ids. Stores applicability, default parameters,
-    expected slot-tensor deltas, Beta-distributed success priors, and a per-(skill,
-    instance) Gaussian over the continuous parameter vector for online refinement.
-    Novel objects are bootstrapped by Robo-ABC cosine retrieval over identity
-    descriptors. No knowledge graph, no language tokens.
-    """
+
+
+
+
+
+
+
 
     def __init__(
         self,
@@ -1781,8 +1811,8 @@ class ObjectUsageBank(AGICoreModule):
         self.register_buffer("param_logvar", torch.zeros(self.num_objects, self.num_skills, self.param_dim))
         self.register_buffer("parameter_observations", torch.zeros(self.num_objects, self.num_skills))
         self.register_buffer("instance_descriptors", F.normalize(torch.randn(self.num_objects, int(idDim)), dim=-1))
-        # Per-(object, skill) attribute centroid: lets attribute deltas refine the readout
-        # so we don't reduce to identity-only lookup.
+
+
         self.register_buffer("attribute_centroid", torch.zeros(self.num_objects, self.num_skills, self.attr_dim))
 
         self.readout_proj = nn.Linear(
@@ -1799,7 +1829,7 @@ class ObjectUsageBank(AGICoreModule):
         return self.applicable * total / (total + 10.0)
 
     def NearestObject(self, descriptor: torch.Tensor) -> torch.Tensor:
-        """Robo-ABC retrieval: cosine NN over identity descriptors. descriptor [..., D_c]."""
+
         similarity, index = self.NearestObjectMatch(descriptor)
         threshold = torch.sigmoid(self.unknown_similarity_logit)
         return torch.where(similarity >= threshold, index, torch.full_like(index, -1))
@@ -1818,22 +1848,22 @@ class ObjectUsageBank(AGICoreModule):
         identity: torch.Tensor,
         attribute: Optional[torch.Tensor],
         slotAttention: torch.Tensor,) -> torch.Tensor:
-        """Per-slot top-1 skill summary cached into PST.U. identity [B,K,D_c] -> [B,K,D_u].
-        Attribute residuals against the bank's centroid let attribute deltas refine the readout."""
+
+
         B, K, _ = identity.shape
         match_similarity, obj_idx = self.NearestObjectMatch(identity) # [B,K]
         known_probability = torch.sigmoid(
             12.0 * (match_similarity - torch.sigmoid(self.unknown_similarity_logit)))
-        applicable_rows = self.applicable[obj_idx]                   # [B,K,N_skills]
-        best_skill = applicable_rows.argmax(dim=-1)                  # [B,K]
+        applicable_rows = self.applicable[obj_idx] # [B,K,N_skills]
+        best_skill = applicable_rows.argmax(dim=-1) # [B,K]
         gather = lambda t: t[obj_idx.reshape(-1), best_skill.reshape(-1)].view(B, K, -1)
-        default_params = gather(self.default_params)                 # [B,K,P]
+        default_params = gather(self.default_params) # [B,K,P]
         posterior_params = gather(self.param_mu)
         observation_count = self.parameter_observations[obj_idx, best_skill].unsqueeze(-1)
         posterior_weight = observation_count / (observation_count + 10.0)
         params = (1.0 - posterior_weight) * default_params + posterior_weight * posterior_params
-        expected_delta = gather(self.expected_dx)                     # [B,K,D_slot]
-        attribute_centroid = gather(self.attribute_centroid)        # [B,K,A]
+        expected_delta = gather(self.expected_dx) # [B,K,D_slot]
+        attribute_centroid = gather(self.attribute_centroid) # [B,K,A]
         attribute_residual = (
             torch.zeros_like(attribute_centroid)
             if attribute is None
@@ -1878,8 +1908,8 @@ class ObjectUsageBank(AGICoreModule):
         observedParams: torch.Tensor,
         observedAttributes: Optional[torch.Tensor] = None,
         momentum: float = 0.9,) -> None:
-        """Online update: Beta posterior on success and Bayesian moment matching on params.
-        Also tracks attribute centroid per (object, skill) when attributes are supplied."""
+
+
         obj = objId.reshape(-1).long()
         skill = skillId.reshape(-1).long()
         succ = success.reshape(-1).to(self.success_alpha.dtype)
@@ -1901,6 +1931,15 @@ class ObjectUsageBank(AGICoreModule):
 class MemoryExtractor(AGICoreModule):
     DURABLE_MEMORY_ARTIFACT_TYPE = "MemoryExtractorDurableMemory"
     DURABLE_MEMORY_SCHEMA_VERSION = 6
+    COUNTERFACTUAL_PREDICTED_REWARD = 0
+    COUNTERFACTUAL_CORRECTED_REWARD = 1
+    COUNTERFACTUAL_PREDICTED_DONE = 2
+    COUNTERFACTUAL_CORRECTED_DONE = 3
+    COUNTERFACTUAL_REWARD_VARIANCE = 4
+    COUNTERFACTUAL_DONE_VARIANCE = 5
+    COUNTERFACTUAL_INFORMATION = 6
+    COUNTERFACTUAL_SOURCE = 7
+    COUNTERFACTUAL_OUTCOME_DIM = 8
     DURABLE_MEMORY_STATE_FIELDS = (
         "time_step",
         "memory_filled",
@@ -2015,6 +2054,57 @@ class MemoryExtractor(AGICoreModule):
         "gws_source",
         "gws_source_confidence",)
     FULL_MEMORY_STATE_FIELDS = DURABLE_MEMORY_STATE_FIELDS + TRANSIENT_MEMORY_STATE_FIELDS
+    UNBATCHED_MEMORY_STATE_FIELDS = (
+        "memory_version",
+        "merged_delta_signature",
+        "pattern_usage",
+        "usage_applicable",
+        "usage_default_params",
+        "usage_expected_dx",
+        "usage_success_alpha",
+        "usage_success_beta",
+        "usage_param_mu",
+        "usage_param_logvar",
+        "usage_parameter_observations",
+        "usage_instance_descriptors",
+        "usage_attribute_centroid",)
+    FORWARD_MUTABLE_ROW_STATE_FIELDS = (
+        "time_step",
+        "memory_last_access_steps",
+        "memory_touch",
+        "episode_id",
+        "event_id",
+        "ltm_sem_global_step",
+        "ltm_sem_touch",
+        "ltm_sem_last_access_step",
+        "ltm_epi_global_step",
+        "ltm_epi_last_access_step",
+        "ltm_epi_touch",
+        "sym_mem_global_step",
+        "sym_mem_last_access_step",
+        "sym_mem_touch",
+        "h_state",
+        "fast_weights",
+        "ns_prev_P_post",
+        "ns_penalty_vec",
+        "previous_attention",
+        "previous_intent",
+        "previous_object_summary",
+        "previous_motion_token",
+        "previous_ontology_context",
+        "event_age",
+        "has_previous_event",
+        "gws_global_step",
+        "gws_keys",
+        "gws_vals",
+        "gws_priority",
+        "gws_ttl",
+        "gws_created_step",
+        "gws_last_step",
+        "gws_last_rehearsal_step",
+        "gws_touch",
+        "gws_source",
+        "gws_source_confidence",)
 
     def __init__(
         self,
@@ -2030,7 +2120,8 @@ class MemoryExtractor(AGICoreModule):
         gwsSlots: int = 24,
         gwsTtl: int = 64,
         compressEvery: int = 8192,
-        emotionDim: int = 512,) -> None:
+        emotionDim: int = 512,
+        replayCapacity: int = 1024,) -> None:
         super().__init__()
 
         self.ssm_state_dim = ssmStateDim
@@ -2042,7 +2133,7 @@ class MemoryExtractor(AGICoreModule):
 
         self.ltm_topk_sem = 6
         self.ltm_topk_epi = 4
-        self.ltm_align_lambda = 0.0 
+        self.ltm_align_lambda = 0.0
         self.ltm_online_imp_thresh = 0.75
         self.ltm_online_td_thresh  = 0.60
 
@@ -2094,7 +2185,7 @@ class MemoryExtractor(AGICoreModule):
             "memory_realm",
             torch.full(
                 (B0, memorySize),
-                int(Realm.UNKNOWN),
+                ONTOLOGY_REALM_UNKNOWN,
                 dtype=torch.int8))
         self.register_buffer("memory_reward_abs", torch.zeros(B0, memorySize))
         self.register_buffer("memory_version", torch.zeros((), dtype=torch.long))
@@ -2126,7 +2217,7 @@ class MemoryExtractor(AGICoreModule):
             nn.SiLU(),
             nn.Linear(64, 1),
             nn.Sigmoid(),)
-        
+
         self.emo_val_mod = nn.Sequential(
             nn.Linear(self.memory_dim, self.memory_dim),
             nn.SiLU(),
@@ -2148,8 +2239,8 @@ class MemoryExtractor(AGICoreModule):
             nn.SiLU(),
             nn.Linear(self.memory_dim, 2 * self.memory_dim),)
 
-        self.register_buffer("time_step", torch.zeros(B0, dtype=torch.long)) 
-        self.register_buffer("memory_filled", torch.zeros(B0, dtype=torch.long)) 
+        self.register_buffer("time_step", torch.zeros(B0, dtype=torch.long))
+        self.register_buffer("memory_filled", torch.zeros(B0, dtype=torch.long))
         self.register_buffer("last_compress_step", torch.zeros(B0, dtype=torch.long))
 
         self.ctrl_norm = nn.LayerNorm(ssmStateDim)
@@ -2160,7 +2251,7 @@ class MemoryExtractor(AGICoreModule):
             nn.Linear(ctrl_hidden, ctrl_hidden // 4), nn.SiLU(),
             nn.Linear(ctrl_hidden // 4, ctrl_hidden // 8), nn.SiLU(),
             nn.Linear(ctrl_hidden // 8, 4))
-        
+
         nn.init.zeros_(self.ctrl_head[-1].weight)
         nn.init.zeros_(self.ctrl_head[-1].bias)
 
@@ -2176,7 +2267,7 @@ class MemoryExtractor(AGICoreModule):
         self.kv_head_proj = nn.Parameter(torch.randn(self.kv_heads, memoryDim // 2, self.kv_head_dim * 2) * 0.02)
         self.k_bias = nn.Parameter(torch.zeros(self.kv_heads, self.kv_head_dim))
         self.v_bias = nn.Parameter(torch.zeros(self.kv_heads, self.kv_head_dim))
-        
+
         self.importance_net = nn.Sequential(
             nn.Linear(ssmStateDim, 512), nn.SiLU(),
             nn.Linear(512, 256), nn.SiLU(),
@@ -2190,7 +2281,7 @@ class MemoryExtractor(AGICoreModule):
         self.fusion_gate_net = nn.Sequential(
             nn.Linear(memoryDim * 3 + 4, 512), nn.SiLU(),
             nn.Linear(512, 1), nn.Sigmoid(),)
-        
+
         self.output_refine = nn.Sequential(
             nn.Linear(memoryDim * 2, memoryDim),
             nn.LayerNorm(memoryDim),
@@ -2233,27 +2324,27 @@ class MemoryExtractor(AGICoreModule):
         self.ns_retrieve_boost = 0.3
 
         self.ns_K: int = nsK
-        self.sym_capacity: int = symSize 
-        self.ns_gExcl: int = 5  
-        self.ns_gOr: int = 5 
+        self.sym_capacity: int = symSize
+        self.ns_gExcl: int = 5
+        self.ns_gOr: int = 5
 
         self.ns_coder_post = SymbolicCoder(self.memory_dim, self.ns_K, hidden=1024, experts=4)
 
         self.sym_rules = SoftSymbolicRules(
             k=nsK,
-            gExcl=40,  
-            gOr=40,    
-            impScale=0.2, 
-            binarize=1e-4, 
-            l1Imp=1e-5,    
+            gExcl=40,
+            gOr=40,
+            impScale=0.2,
+            binarize=1e-4,
+            l1Imp=1e-5,
             massExcl=3.0,
             massOr=3.0,
             massImpRow=1.5,
-            massWeight=1e-2, 
-            initStd=0.5, 
+            massWeight=1e-2,
+            initStd=0.5,
             seedDisjoint=True,)
 
-        self.sym_query = QueryToSymbol(inDim=self.memory_dim, k=self.ns_K, hidden=512) 
+        self.sym_query = QueryToSymbol(inDim=self.memory_dim, k=self.ns_K, hidden=512)
         self.sym_query_fusion = nn.Sequential(
             nn.LayerNorm(self.ns_K * 2),
             nn.Linear(self.ns_K * 2, self.ns_K),
@@ -2264,10 +2355,10 @@ class MemoryExtractor(AGICoreModule):
 
         self.sym_embed = SymbolicEmbed(self.ns_K, outDim=self.memory_dim)
 
-        self.register_buffer("ns_prev_P_post", torch.zeros(B0, self.ns_K)) 
+        self.register_buffer("ns_prev_P_post", torch.zeros(B0, self.ns_K))
         self.register_buffer("ns_penalty_vec", torch.zeros(B0, 1))
 
-        def make_film(D: int) -> nn.Module:
+        def MakeFilm(D: int) -> nn.Module:
             m = nn.Sequential(
                 nn.LayerNorm(D),
                 nn.Linear(D, 2 * D),
@@ -2282,10 +2373,10 @@ class MemoryExtractor(AGICoreModule):
         self.sem_film_norm = nn.LayerNorm(self.memory_dim)
         self.epi_film_norm = nn.LayerNorm(self.memory_dim)
 
-        self.film_mem = make_film(self.memory_dim)
-        self.film_gws = make_film(self.memory_dim)
-        self.film_sem = make_film(self.memory_dim)
-        self.film_epi = make_film(self.memory_dim)
+        self.film_mem = MakeFilm(self.memory_dim)
+        self.film_gws = MakeFilm(self.memory_dim)
+        self.film_sem = MakeFilm(self.memory_dim)
+        self.film_epi = MakeFilm(self.memory_dim)
 
         self.film_clip = 0.5
         self.film_context_proj = nn.Sequential(
@@ -2405,7 +2496,6 @@ class MemoryExtractor(AGICoreModule):
             nn.SiLU(),
             nn.Linear(memoryDim, 3),)
 
-        # Current camera-relative object context and durable object-usage knowledge.
         self.usage_bank = ObjectUsageBank()
         object_input_dim = (
             512 + 7 + 4 + 1
@@ -2459,6 +2549,1100 @@ class MemoryExtractor(AGICoreModule):
             nn.SiLU(),
             nn.Linear(memoryDim, 1),
             nn.Sigmoid(),)
+        self.replay_capacity = max(1, int(replayCapacity))
+        self._plan_cache: Dict[str, Dict[str, Any]] = {}
+        self._skill_cache: Dict[str, Dict[str, Any]] = {}
+        self._offline_replay: List[Dict[str, Any]] = []
+        self._replay_signature: Optional[str] = None
+        self._replay_sequence = 0
+        self._replay_transaction_version = 0
+        self._replay_timeline_version = 0
+        self.counterfactual_replay_predictor = nn.Sequential(
+            nn.LayerNorm(memoryDim),
+            nn.Linear(memoryDim, memoryDim * 2),
+            nn.SiLU(),
+            nn.Linear(memoryDim * 2, memoryDim),)
+        nn.init.zeros_(self.counterfactual_replay_predictor[-1].weight)
+        nn.init.zeros_(self.counterfactual_replay_predictor[-1].bias)
+        self._row_merge_contract_id: Optional[str] = None
+        self._row_merge_model_signature: Optional[str] = None
+        self._row_merge_transactions: Dict[str, str] = {}
+        self._row_merge_versions: Dict[int, Tuple[int, int]] = {}
+
+    def ValidateModelSignature(self, modelSignature: str) -> str:
+        if type(modelSignature) is not str or not modelSignature.strip():
+            raise ValueError("modelSignature must be a non-empty string")
+        return modelSignature
+
+    def ValidateWriteMask(
+        self,
+        writeMask: Optional[torch.Tensor],
+        batchSize: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if writeMask is None:
+            return torch.ones(batchSize, device=device, dtype=torch.bool)
+        if not torch.is_tensor(writeMask) or writeMask.dtype != torch.bool:
+            raise TypeError("writeMask must be a bool tensor")
+        if writeMask.device != device:
+            raise ValueError("writeMask must be on the memory input device")
+        if tuple(writeMask.shape) != (batchSize,):
+            raise ValueError("writeMask must have shape [B]")
+        return writeMask
+
+    def ValidateLossSampleMask(
+        self,
+        lossSampleMask: Optional[torch.Tensor],
+        batchSize: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if lossSampleMask is None:
+            return torch.ones(
+                batchSize, device=device, dtype=torch.bool)
+        if (
+            not torch.is_tensor(lossSampleMask)
+            or tuple(lossSampleMask.shape) != (batchSize,)
+            or lossSampleMask.dtype != torch.bool
+            or lossSampleMask.device != device
+        ):
+            raise ValueError("lossSampleMask must be a boolean batch vector")
+        return lossSampleMask
+
+    def MutableMemoryStateTensors(self) -> Dict[str, torch.Tensor]:
+        state = dict(self.DurableStateTensors())
+        state.update({
+            "last_compress_step": self.last_compress_step,
+            "h_state": self.h_state,
+            "fast_weights": self.fast_weights,
+            "ns_prev_P_post": self.ns_prev_P_post,
+            "ns_penalty_vec": self.ns_penalty_vec,
+            "pattern_usage": self.pattern_usage,
+            "previous_attention": self.previous_attention,
+            "previous_intent": self.previous_intent,
+            "previous_object_summary": self.previous_object_summary,
+            "previous_motion_token": self.previous_motion_token,
+            "previous_ontology_context": self.previous_ontology_context,
+            "event_age": self.event_age,
+            "has_previous_event": self.has_previous_event,
+            "gws_global_step": self.gws.global_step,
+            "gws_keys": self.gws.keys,
+            "gws_vals": self.gws.vals,
+            "gws_priority": self.gws.priority,
+            "gws_ttl": self.gws.ttl,
+            "gws_created_step": self.gws.created_step,
+            "gws_last_step": self.gws.last_step,
+            "gws_last_rehearsal_step": self.gws.last_rehearsal_step,
+            "gws_touch": self.gws.touch,
+            "gws_source": self.gws.source,
+            "gws_source_confidence": self.gws.source_confidence,})
+        return state
+
+    @torch.no_grad()
+    def CaptureFrozenRows(
+        self,
+        writeMask: torch.Tensor,
+        fieldNames: Optional[Tuple[str, ...]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        frozen = ~writeMask
+        if not bool(frozen.any().item()):
+            return {}
+        state = self.MutableMemoryStateTensors()
+        names = (
+            tuple(state)
+            if fieldNames is None
+            else tuple(fieldNames))
+        return {
+            name: tensor[frozen].detach().clone()
+            for name in names
+            for tensor in (state[name],)
+            if name not in self.UNBATCHED_MEMORY_STATE_FIELDS}
+
+    @torch.no_grad()
+    def RestoreFrozenRows(
+        self,
+        frozenState: Dict[str, torch.Tensor],
+        writeMask: torch.Tensor,
+    ) -> None:
+        if not frozenState:
+            return
+        frozen = ~writeMask
+        targets = self.MutableMemoryStateTensors()
+        for name, value in frozenState.items():
+            target = targets[name]
+            restored = target.clone()
+            restored[frozen] = value
+            self.ReplaceMutableStateTensor(target, restored)
+
+    def ReplaceMutableStateTensor(
+        self,
+        target: torch.Tensor,
+        replacement: torch.Tensor,
+    ) -> None:
+        for module in self.modules():
+            for name, value in module._buffers.items():
+                if value is target:
+                    setattr(module, name, replacement)
+                    return
+        raise RuntimeError("mutable memory state tensor is not a registered buffer")
+
+    def ValidateCacheKey(self, key: str) -> str:
+        if type(key) is not str or not key.strip():
+            raise ValueError("cache key must be a non-empty string")
+        return key
+
+    def CloneCognitiveRecord(self, value: Any) -> Any:
+        if torch.is_tensor(value):
+            return value.detach().clone()
+        if isinstance(value, dict):
+            return {
+                key: self.CloneCognitiveRecord(item)
+                for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.CloneCognitiveRecord(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.CloneCognitiveRecord(item) for item in value)
+        return value
+
+    def CachePlan(
+        self,
+        planId: str,
+        planFeature: torch.Tensor,
+        modelSignature: str,
+        validMask: Optional[torch.Tensor] = None,
+    ) -> None:
+        plan_id = self.ValidateCacheKey(planId)
+        signature = self.ValidateModelSignature(modelSignature)
+        if not torch.is_tensor(planFeature) or planFeature.dim() < 2:
+            raise ValueError("planFeature must be a batched tensor")
+        batch_size = int(planFeature.size(0))
+        if validMask is None:
+            valid = torch.ones(
+                batch_size,
+                dtype=torch.bool,
+                device=planFeature.device)
+        else:
+            if (
+                not torch.is_tensor(validMask)
+                or tuple(validMask.shape) != (batch_size,)
+                or validMask.dtype != torch.bool
+                or validMask.device != planFeature.device
+            ):
+                raise ValueError(
+                    "validMask must match the plan feature batch")
+            valid = validMask
+        previous = self._plan_cache.get(plan_id)
+        if previous is not None and previous["modelSignature"] != signature:
+            raise ValueError("plan cache model signature mismatch")
+        if previous is not None and tuple(previous["feature"].shape) != tuple(
+            planFeature.shape
+        ):
+            raise ValueError("plan cache feature shape mismatch")
+        version = 1 if previous is None else int(previous["version"]) + 1
+        if previous is None:
+            feature = torch.zeros_like(planFeature)
+            previous_valid = torch.zeros_like(valid)
+            age = torch.zeros(
+                batch_size,
+                device=planFeature.device,
+                dtype=torch.long)
+        else:
+            feature = previous["feature"].to(
+                device=planFeature.device,
+                dtype=planFeature.dtype).clone()
+            previous_valid = previous["valid"].to(
+                device=valid.device).clone()
+            previous_age = previous["age"]
+            if type(previous_age) is int:
+                age = torch.full(
+                    (batch_size,),
+                    previous_age,
+                    device=planFeature.device,
+                    dtype=torch.long)
+            else:
+                age = previous_age.to(
+                    device=planFeature.device,
+                    dtype=torch.long).clone()
+            if tuple(age.shape) != (batch_size,) or bool(
+                (age < 0).any().item()
+            ):
+                raise ValueError("plan cache age is invalid")
+        selection = valid.reshape(
+            (batch_size,) + (1,) * (planFeature.dim() - 1))
+        feature = torch.where(
+            selection,
+            planFeature.detach(),
+            feature)
+        age = torch.where(valid, torch.zeros_like(age), age)
+        self._plan_cache[plan_id] = {
+            "modelSignature": signature,
+            "feature": feature,
+            "valid": previous_valid | valid.detach(),
+            "age": age,
+            "version": version,}
+
+    def RecallPlan(
+        self,
+        planId: str,
+        modelSignature: str,) -> Optional[Dict[str, Any]]:
+        plan_id = self.ValidateCacheKey(planId)
+        signature = self.ValidateModelSignature(modelSignature)
+        cached = self._plan_cache.get(plan_id)
+        if cached is None:
+            return None
+        if cached["modelSignature"] != signature:
+            raise ValueError("plan cache model signature mismatch")
+        if not bool(cached["valid"].any().item()):
+            return None
+        return self.CloneCognitiveRecord(cached)
+
+    def AgePlanCache(
+        self,
+        increment: int = 1,
+        ageMask: Optional[torch.Tensor] = None,
+        ) -> None:
+        step = int(increment)
+        if step < 0:
+            raise ValueError("plan cache age increment must be non-negative")
+        for cached in self._plan_cache.values():
+            age = cached["age"]
+            valid = cached["valid"]
+            if type(age) is int:
+                age = torch.full_like(valid, age, dtype=torch.long)
+            if (
+                not torch.is_tensor(age)
+                or tuple(age.shape) != tuple(valid.shape)
+                or age.dtype != torch.long
+                or age.device != valid.device
+                or bool((age < 0).any().item())
+            ):
+                raise ValueError("plan cache age is invalid")
+            if ageMask is None:
+                age_mask = torch.ones_like(valid)
+            elif (
+                not torch.is_tensor(ageMask)
+                or tuple(ageMask.shape) != tuple(valid.shape)
+                or ageMask.dtype != torch.bool
+                or ageMask.device != valid.device
+            ):
+                raise ValueError("ageMask must match the plan cache batch")
+            else:
+                age_mask = ageMask
+            bounded_step = min(step, torch.iinfo(age.dtype).max)
+            incremented = age.clamp_max(
+                torch.iinfo(age.dtype).max - bounded_step) + bounded_step
+            cached["age"] = torch.where(
+                valid & age_mask,
+                incremented,
+                age)
+
+    def InvalidatePlan(
+        self,
+        planId: str,
+        modelSignature: str,) -> None:
+        plan_id = self.ValidateCacheKey(planId)
+        signature = self.ValidateModelSignature(modelSignature)
+        cached = self._plan_cache.get(plan_id)
+        if cached is None:
+            return
+        if cached["modelSignature"] != signature:
+            raise ValueError("plan cache model signature mismatch")
+        self._plan_cache.pop(plan_id)
+
+    def CacheSkill(
+        self,
+        skillId: str,
+        skillFeature: torch.Tensor,
+        modelSignature: str,) -> None:
+        skill_id = self.ValidateCacheKey(skillId)
+        signature = self.ValidateModelSignature(modelSignature)
+        if not torch.is_tensor(skillFeature) or skillFeature.dim() < 1:
+            raise ValueError("skillFeature must be a tensor")
+        previous = self._skill_cache.get(skill_id)
+        if previous is not None and previous["modelSignature"] != signature:
+            raise ValueError("skill cache model signature mismatch")
+        self._skill_cache[skill_id] = {
+            "modelSignature": signature,
+            "feature": skillFeature.detach().clone(),}
+
+    def RecallSkill(
+        self,
+        skillId: str,
+        modelSignature: str,) -> Optional[torch.Tensor]:
+        skill_id = self.ValidateCacheKey(skillId)
+        signature = self.ValidateModelSignature(modelSignature)
+        cached = self._skill_cache.get(skill_id)
+        if cached is None:
+            return None
+        if cached["modelSignature"] != signature:
+            raise ValueError("skill cache model signature mismatch")
+        return cached["feature"].detach().clone()
+
+    def ValidateReplaySignature(self, modelSignature: str) -> str:
+        signature = self.ValidateModelSignature(modelSignature)
+        if self._replay_signature is None:
+            self._replay_signature = signature
+        elif self._replay_signature != signature:
+            raise ValueError("offline replay model signature mismatch")
+        return signature
+
+    def ValidateReplayVersion(
+        self,
+        transactionVersion: int,
+        timelineVersion: int,
+    ) -> Tuple[int, int]:
+        if (
+            type(transactionVersion) is not int
+            or transactionVersion < 0
+            or type(timelineVersion) is not int
+            or timelineVersion < 0
+        ):
+            raise ValueError("replay versions must be non-negative integers")
+        return transactionVersion, timelineVersion
+
+    def AdvanceReplayBoundary(
+        self,
+        transactionVersion: int,
+        timelineVersion: int,
+    ) -> None:
+        transaction, timeline = self.ValidateReplayVersion(
+            transactionVersion,
+            timelineVersion)
+        if timeline < self._replay_timeline_version:
+            raise ValueError("offline replay timeline is stale")
+        if (
+            timeline == self._replay_timeline_version
+            and transaction < self._replay_transaction_version
+        ):
+            raise ValueError("offline replay transaction is stale")
+        if timeline > self._replay_timeline_version:
+            self._replay_timeline_version = timeline
+            self._replay_transaction_version = transaction
+        else:
+            self._replay_transaction_version = max(
+                self._replay_transaction_version,
+                transaction)
+
+    def ValidateReplayConfidence(
+        self,
+        confidence: Optional[torch.Tensor],
+        batchSize: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if confidence is None:
+            return torch.ones(batchSize, device=device, dtype=dtype)
+        if not torch.is_tensor(confidence):
+            raise TypeError("replay confidence must be a tensor")
+        value = confidence.reshape(-1)
+        if (
+            tuple(value.shape) != (batchSize,)
+            or value.device != device
+            or not value.dtype.is_floating_point
+            or not bool(torch.isfinite(value).all().item())
+            or bool(((value < 0.0) | (value > 1.0)).any().item())
+        ):
+            raise ValueError("replay confidence must be finite within [0, 1]")
+        return value.to(dtype=dtype)
+
+    def RecordReplayEpisode(
+        self,
+        kind: str,
+        context: torch.Tensor,
+        outcome: torch.Tensor,
+        modelSignature: str,
+        *,
+        confidence: Optional[torch.Tensor] = None,
+        transactionVersion: int = 0,
+        timelineVersion: int = 0,) -> None:
+        episode_kind = self.ValidateCacheKey(kind)
+        signature = self.ValidateModelSignature(modelSignature)
+        if self._replay_signature not in (None, signature):
+            raise ValueError("offline replay model signature mismatch")
+        if not torch.is_tensor(context) or context.dim() < 2:
+            raise ValueError("episode context must be a batched tensor")
+        if not torch.is_tensor(outcome) or outcome.dim() < 2:
+            raise ValueError("episode outcome must be a batched tensor")
+        if context.size(0) != outcome.size(0):
+            raise ValueError("episode context and outcome batch sizes must match")
+        if (
+            not context.dtype.is_floating_point
+            or not outcome.dtype.is_floating_point
+            or not bool(torch.isfinite(context).all().item())
+            or not bool(torch.isfinite(outcome).all().item())
+        ):
+            raise ValueError("episode tensors must be finite floating point values")
+        if context.device != outcome.device:
+            raise ValueError("episode tensors must share a device")
+        transaction, timeline = self.ValidateReplayVersion(
+            transactionVersion,
+            timelineVersion)
+        replay_confidence = self.ValidateReplayConfidence(
+            confidence,
+            int(context.size(0)),
+            context.device,
+            context.dtype)
+        self.AdvanceReplayBoundary(transaction, timeline)
+        if self._replay_signature is None:
+            self._replay_signature = signature
+        self._offline_replay.append({
+            "kind": episode_kind,
+            "context": context.detach().clone(),
+            "outcome": outcome.detach().clone(),
+            "confidence": replay_confidence.detach().clone(),
+            "modelSignature": signature,
+            "sequence": self._replay_sequence,
+            "transactionVersion": transaction,
+            "timelineVersion": timeline,})
+        self._replay_sequence += 1
+        overflow = len(self._offline_replay) - self.replay_capacity
+        if overflow > 0:
+            del self._offline_replay[:overflow]
+
+    def RecordHierarchyTransition(
+        self,
+        context: torch.Tensor,
+        coarseProgress: torch.Tensor,
+        detailProgress: torch.Tensor,
+        modelSignature: str,
+        *,
+        confidence: Optional[torch.Tensor] = None,
+        transactionVersion: int = 0,
+        timelineVersion: int = 0,) -> None:
+        coarse = coarseProgress.reshape(context.size(0), -1)
+        detail = detailProgress.reshape(context.size(0), -1)
+        self.RecordReplayEpisode(
+            "hierarchyTransition",
+            context,
+            torch.cat([coarse, detail], dim=-1),
+            modelSignature,
+            confidence=confidence,
+            transactionVersion=transactionVersion,
+            timelineVersion=timelineVersion)
+
+    def RecordFailureEpisode(
+        self,
+        context: torch.Tensor,
+        outcome: torch.Tensor,
+        modelSignature: str,
+        *,
+        confidence: Optional[torch.Tensor] = None,
+        transactionVersion: int = 0,
+        timelineVersion: int = 0,) -> None:
+        self.RecordReplayEpisode(
+            "failure",
+            context,
+            outcome,
+            modelSignature,
+            confidence=confidence,
+            transactionVersion=transactionVersion,
+            timelineVersion=timelineVersion)
+
+    def RecordCounterfactualEpisode(
+        self,
+        context: torch.Tensor,
+        outcome: torch.Tensor,
+        modelSignature: str,
+        *,
+        confidence: Optional[torch.Tensor] = None,
+        transactionVersion: int = 0,
+        timelineVersion: int = 0,) -> None:
+        replay_confidence = confidence
+        if not torch.is_tensor(outcome) or outcome.dim() < 2:
+            raise ValueError("episode outcome must be a batched tensor")
+        flat_outcome = outcome.reshape(outcome.size(0), -1)
+        if (
+            replay_confidence is None
+            and flat_outcome.size(1) == self.COUNTERFACTUAL_OUTCOME_DIM
+        ):
+            replay_confidence = flat_outcome[
+                :,
+                self.COUNTERFACTUAL_INFORMATION].clamp(0.0, 1.0)
+        self.RecordReplayEpisode(
+            "counterfactual",
+            context,
+            outcome,
+            modelSignature,
+            confidence=replay_confidence,
+            transactionVersion=transactionVersion,
+            timelineVersion=timelineVersion)
+
+    def SampleOfflineReplay(
+        self,
+        batchSize: int,
+        modelSignature: str,
+        *,
+        kind: Optional[str] = None,
+        transactionVersion: Optional[int] = None,
+        timelineVersion: Optional[int] = None,
+        seed: Optional[int] = None,) -> List[Dict[str, Any]]:
+        self.ValidateReplaySignature(modelSignature)
+        count = int(batchSize)
+        if count <= 0:
+            raise ValueError("batchSize must be positive")
+        if seed is not None and (type(seed) is not int or seed < 0):
+            raise ValueError("replay seed must be a non-negative integer")
+        transaction = (
+            self._replay_transaction_version
+            if transactionVersion is None
+            else transactionVersion)
+        timeline = (
+            self._replay_timeline_version
+            if timelineVersion is None
+            else timelineVersion)
+        transaction, timeline = self.ValidateReplayVersion(
+            transaction,
+            timeline)
+        if (
+            transaction != self._replay_transaction_version
+            or timeline != self._replay_timeline_version
+        ):
+            raise ValueError("offline replay boundary is stale")
+        selected_kind = None if kind is None else self.ValidateCacheKey(kind)
+        candidates = [
+            record
+            for record in self._offline_replay
+            if (
+                record["timelineVersion"] < timeline
+                or (
+                    record["timelineVersion"] == timeline
+                    and record["transactionVersion"] <= transaction))
+            and (selected_kind is None or record["kind"] == selected_kind)]
+        if seed is None or len(candidates) <= count:
+            return self.CloneCognitiveRecord(candidates[-count:])
+        weights = torch.tensor([
+            float(record["confidence"].mean().item())
+            for record in candidates], dtype=torch.float64)
+        valid = weights > 0.0
+        if not bool(valid.any().item()):
+            return []
+        valid_indices = torch.nonzero(valid, as_tuple=False).reshape(-1)
+        sample_count = min(count, int(valid_indices.numel()))
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        sampled = torch.multinomial(
+            weights.index_select(0, valid_indices),
+            sample_count,
+            replacement=False,
+            generator=generator)
+        indices = valid_indices.index_select(0, sampled).sort().values.tolist()
+        return self.CloneCognitiveRecord([candidates[index] for index in indices])
+
+    def BuildCounterfactualRevision(
+        self,
+        context: torch.Tensor,
+        outcome: torch.Tensor,
+        confidence: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if (
+            not torch.is_tensor(context)
+            or context.dim() != 2
+            or int(context.size(1)) != self.memory_dim
+            or not context.dtype.is_floating_point
+            or not bool(torch.isfinite(context).all().item())
+        ):
+            raise ValueError("counterfactual context has invalid shape or values")
+        if (
+            not torch.is_tensor(outcome)
+            or outcome.dim() != 2
+            or tuple(outcome.shape) != (
+                int(context.size(0)),
+                self.COUNTERFACTUAL_OUTCOME_DIM)
+            or outcome.device != context.device
+            or not outcome.dtype.is_floating_point
+            or not bool(torch.isfinite(outcome).all().item())
+        ):
+            raise ValueError("counterfactual outcome has invalid shape or values")
+        replay_confidence = self.ValidateReplayConfidence(
+            confidence,
+            int(context.size(0)),
+            context.device,
+            context.dtype)
+        predicted_reward = outcome[:, self.COUNTERFACTUAL_PREDICTED_REWARD]
+        corrected_reward = outcome[:, self.COUNTERFACTUAL_CORRECTED_REWARD]
+        predicted_done = outcome[:, self.COUNTERFACTUAL_PREDICTED_DONE]
+        corrected_done = outcome[:, self.COUNTERFACTUAL_CORRECTED_DONE]
+        reward_variance = outcome[:, self.COUNTERFACTUAL_REWARD_VARIANCE]
+        done_variance = outcome[:, self.COUNTERFACTUAL_DONE_VARIANCE]
+        information = outcome[:, self.COUNTERFACTUAL_INFORMATION]
+        if (
+            bool(((predicted_done < 0.0) | (predicted_done > 1.0)).any().item())
+            or bool(((corrected_done < 0.0) | (corrected_done > 1.0)).any().item())
+            or bool((reward_variance < 0.0).any().item())
+            or bool((done_variance < 0.0).any().item())
+            or bool(((information < 0.0) | (information > 1.0)).any().item())
+        ):
+            raise ValueError("counterfactual outcome violates its probability schema")
+        epsilon = torch.finfo(context.dtype).eps
+        reward_scale = torch.sqrt(reward_variance + epsilon)
+        done_scale = torch.sqrt(
+            done_variance
+            + corrected_done * (1.0 - corrected_done)
+            + epsilon)
+        reward_innovation = torch.tanh(
+            (corrected_reward - predicted_reward) / reward_scale)
+        done_innovation = torch.tanh(
+            (corrected_done - predicted_done) / done_scale)
+        predicted_done_centered = predicted_done * 2.0 - 1.0
+        corrected_done_centered = corrected_done * 2.0 - 1.0
+        information_centered = information * 2.0 - 1.0
+        descriptor = torch.stack([
+            reward_innovation,
+            done_innovation,
+            predicted_done_centered,
+            corrected_done_centered,
+            information_centered,
+            reward_innovation * done_innovation,
+            reward_innovation * information_centered,
+            done_innovation * information_centered,
+        ], dim=-1)
+        if self.memory_dim != descriptor.size(1):
+            descriptor = F.interpolate(
+                descriptor.unsqueeze(1),
+                size=self.memory_dim,
+                mode="linear",
+                align_corners=False).squeeze(1)
+        descriptor = F.normalize(descriptor, dim=-1)
+        context_scale = context.square().mean(dim=-1).sqrt().clamp_min(1.0)
+        revision_scale = (
+            0.25 * (0.25 + information) * context_scale
+        ).unsqueeze(-1)
+        residual = (
+            replay_confidence.unsqueeze(-1)
+            * revision_scale
+            * descriptor)
+        return {
+            "query": F.normalize(context, dim=-1),
+            "revisedValue": context + residual,
+            "residual": residual,
+            "descriptor": descriptor,}
+
+    def ConsumeCounterfactualReplay(
+        self,
+        batchSize: int,
+        modelSignature: str,
+        *,
+        transactionVersion: Optional[int] = None,
+        timelineVersion: Optional[int] = None,
+        seed: int = 0,
+        addInternalLoss: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        count = int(batchSize)
+        if count <= 0:
+            raise ValueError("batchSize must be positive")
+        if type(seed) is not int or seed < 0:
+            raise ValueError("replay seed must be a non-negative integer")
+        records = self.SampleOfflineReplay(
+            self.replay_capacity,
+            modelSignature,
+            kind="counterfactual",
+            transactionVersion=transactionVersion,
+            timelineVersion=timelineVersion)
+        contexts = []
+        outcomes = []
+        confidences = []
+        sequences = []
+        row_indices = []
+        for record in records:
+            flat_context = record["context"].reshape(
+                record["context"].size(0), -1)
+            flat_outcome = record["outcome"].reshape(
+                record["outcome"].size(0), -1)
+            if int(flat_context.size(1)) != self.memory_dim:
+                raise ValueError(
+                    "counterfactual replay context does not match memory dimension")
+            if int(flat_outcome.size(1)) != self.COUNTERFACTUAL_OUTCOME_DIM:
+                raise ValueError("counterfactual replay outcome schema does not match")
+            contexts.append(flat_context)
+            outcomes.append(flat_outcome)
+            confidences.append(record["confidence"])
+            sequences.append(torch.full(
+                (flat_context.size(0),),
+                int(record["sequence"]),
+                device=flat_context.device,
+                dtype=torch.long))
+            row_indices.append(torch.arange(
+                flat_context.size(0),
+                device=flat_context.device,
+                dtype=torch.long))
+        if not contexts:
+            zero = sum((
+                parameter.sum() * 0.0
+                for parameter in self.counterfactual_replay_predictor.parameters()),
+                self.h_state.sum() * 0.0)
+            empty_feature = self.h_state.new_zeros(0, self.memory_dim)
+            empty_scalar = self.h_state.new_zeros(0)
+            empty_index = torch.zeros(0, device=self.device, dtype=torch.long)
+            return {
+                "loss": zero,
+                "query": empty_feature,
+                "revisedValue": empty_feature.clone(),
+                "confidence": empty_scalar,
+                "sequence": empty_index,
+                "rowIndex": empty_index.clone(),
+                "available": torch.zeros(
+                    (), device=self.device, dtype=torch.bool),
+                "sampleCount": torch.zeros(
+                    (), device=self.device, dtype=torch.long),}
+        context = torch.cat(contexts, dim=0).to(
+            device=self.device,
+            dtype=self.dtype)
+        outcome = torch.cat(outcomes, dim=0).to(
+            device=self.device,
+            dtype=self.dtype)
+        confidence = torch.cat(confidences, dim=0).to(
+            device=self.device,
+            dtype=self.dtype)
+        sequence = torch.cat(sequences, dim=0).to(device=self.device)
+        row_index = torch.cat(row_indices, dim=0).to(device=self.device)
+        valid = confidence > 0.0
+        if not bool(valid.any().item()):
+            zero = self.counterfactual_replay_predictor[1].weight.sum() * 0.0
+            empty_feature = context.new_zeros(0, self.memory_dim)
+            empty_scalar = context.new_zeros(0)
+            empty_index = torch.zeros(0, device=self.device, dtype=torch.long)
+            return {
+                "loss": zero,
+                "query": empty_feature,
+                "revisedValue": empty_feature.clone(),
+                "confidence": empty_scalar,
+                "sequence": empty_index,
+                "rowIndex": empty_index.clone(),
+                "available": torch.zeros(
+                    (), device=self.device, dtype=torch.bool),
+                "sampleCount": torch.zeros(
+                    (), device=self.device, dtype=torch.long),}
+        candidate_index = torch.nonzero(valid, as_tuple=False).reshape(-1)
+        weights = confidence.index_select(0, candidate_index).double().cpu()
+        sample_count = min(count, int(candidate_index.numel()))
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        sampled_local = torch.multinomial(
+            weights,
+            sample_count,
+            replacement=False,
+            generator=generator)
+        sampled = candidate_index.index_select(
+            0,
+            sampled_local.to(device=candidate_index.device))
+        context = context.index_select(0, sampled)
+        outcome = outcome.index_select(0, sampled)
+        confidence = confidence.index_select(0, sampled)
+        sequence = sequence.index_select(0, sampled)
+        row_index = row_index.index_select(0, sampled)
+        revision = self.BuildCounterfactualRevision(
+            context,
+            outcome,
+            confidence)
+        prediction_scale = context.square().mean(
+            dim=-1).sqrt().clamp_min(1.0).unsqueeze(-1)
+        prediction = (
+            context
+            + 0.5
+            * prediction_scale
+            * torch.tanh(self.counterfactual_replay_predictor(context)))
+        target = revision["revisedValue"].detach()
+        regression = F.smooth_l1_loss(
+            prediction,
+            target,
+            reduction="none").mean(dim=-1)
+        angular = 1.0 - F.cosine_similarity(
+            prediction,
+            target,
+            dim=-1).clamp(-1.0, 1.0)
+        per_sample = regression + 0.1 * angular
+        loss = (
+            per_sample * confidence
+        ).sum() / confidence.sum().clamp_min(torch.finfo(confidence.dtype).eps)
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError("counterfactual replay loss is non-finite")
+        if self.training and addInternalLoss:
+            self.AddInternalLoss(0.05 * loss)
+        return {
+            "loss": loss,
+            "query": revision["query"],
+            "revisedValue": revision["revisedValue"],
+            "confidence": confidence,
+            "sequence": sequence,
+            "rowIndex": row_index,
+            "available": torch.ones(
+                (), device=self.device, dtype=torch.bool),
+            "sampleCount": torch.tensor(
+                sample_count,
+                device=self.device,
+                dtype=torch.long),}
+
+    def ExportCognitiveCacheState(self) -> Dict[str, Any]:
+        return self.CloneCognitiveRecord({
+            "planCache": self._plan_cache,
+            "skillCache": self._skill_cache,
+            "offlineReplay": self._offline_replay,
+            "replaySignature": self._replay_signature,
+            "replaySequence": self._replay_sequence,
+            "replayTransactionVersion": self._replay_transaction_version,
+            "replayTimelineVersion": self._replay_timeline_version,
+        })
+
+    def ImportCognitiveCacheState(
+        self,
+        state: Dict[str, Any],
+        *,
+        modelSignature: str,
+        batchSize: int,
+    ) -> None:
+        signature = self.ValidateModelSignature(modelSignature)
+        if type(batchSize) is not int or batchSize < 1:
+            raise ValueError("batchSize must be positive")
+        legacy_fields = {
+            "planCache",
+            "skillCache",
+            "offlineReplay",
+            "replaySignature",
+            "replaySequence",
+        }
+        current_fields = legacy_fields | {
+            "replayTransactionVersion",
+            "replayTimelineVersion",
+        }
+        state_fields = set(state) if type(state) is dict else set()
+        if (
+            type(state) is not dict
+            or (
+                state_fields != legacy_fields
+                and state_fields != current_fields)
+        ):
+            raise ValueError("cognitive cache state fields do not match")
+        plan_cache = state["planCache"]
+        skill_cache = state["skillCache"]
+        offline_replay = state["offlineReplay"]
+        replay_signature = state["replaySignature"]
+        replay_sequence = state["replaySequence"]
+        replay_transaction = state.get("replayTransactionVersion", 0)
+        replay_timeline = state.get("replayTimelineVersion", 0)
+        self.ValidateReplayVersion(replay_transaction, replay_timeline)
+        if (
+            type(plan_cache) is not dict
+            or type(skill_cache) is not dict
+            or type(offline_replay) is not list
+            or replay_signature not in (None, signature)
+            or self._replay_signature not in (None, signature)
+            or type(replay_sequence) is not int
+            or replay_sequence < 0
+        ):
+            raise ValueError("cognitive cache state is invalid")
+        batch_size = int(self.h_state.size(0))
+        if batchSize != batch_size:
+            raise ValueError("cognitive cache batch does not match memory")
+        for plan_id, cached in plan_cache.items():
+            self.ValidateCacheKey(plan_id)
+            if type(cached) is not dict or set(cached) != {
+                "modelSignature",
+                "feature",
+                "valid",
+                "age",
+                "version",
+            }:
+                raise ValueError("plan cache record fields do not match")
+            if cached["modelSignature"] != signature:
+                raise ValueError("plan cache model signature mismatch")
+            if (
+                not torch.is_tensor(cached["feature"])
+                or cached["feature"].dim() < 2
+                or int(cached["feature"].size(0)) != batch_size
+                or not torch.is_tensor(cached["valid"])
+                or tuple(cached["valid"].shape) != (batch_size,)
+                or cached["valid"].dtype != torch.bool
+                or cached["valid"].device != cached["feature"].device
+                or (
+                    type(cached["age"]) is not int
+                    and (
+                        not torch.is_tensor(cached["age"])
+                        or tuple(cached["age"].shape) != (batch_size,)
+                        or cached["age"].dtype != torch.long
+                        or cached["age"].device != cached["feature"].device
+                        or bool((cached["age"] < 0).any().item())))
+                or (
+                    type(cached["age"]) is int
+                    and cached["age"] < 0)
+                or type(cached["version"]) is not int
+                or cached["version"] < 1
+            ):
+                raise ValueError("plan cache record is invalid")
+        for skill_id, cached in skill_cache.items():
+            self.ValidateCacheKey(skill_id)
+            if type(cached) is not dict or set(cached) != {
+                "modelSignature",
+                "feature",
+            }:
+                raise ValueError("skill cache record fields do not match")
+            if (
+                cached["modelSignature"] != signature
+                or not torch.is_tensor(cached["feature"])
+            ):
+                raise ValueError("skill cache record is invalid")
+        previous_sequence = -1
+        for record in offline_replay:
+            legacy_record_fields = {
+                "kind",
+                "context",
+                "outcome",
+                "modelSignature",
+                "sequence",
+            }
+            current_record_fields = legacy_record_fields | {
+                "confidence",
+                "transactionVersion",
+                "timelineVersion",
+            }
+            fields = set(record) if type(record) is dict else set()
+            if (
+                type(record) is not dict
+                or (
+                    fields != legacy_record_fields
+                    and fields != current_record_fields)
+                or record["modelSignature"] != signature
+                or not torch.is_tensor(record["context"])
+                or not torch.is_tensor(record["outcome"])
+                or record["context"].dim() < 2
+                or record["outcome"].dim() < 2
+                or not record["context"].dtype.is_floating_point
+                or not record["outcome"].dtype.is_floating_point
+                or not bool(torch.isfinite(record["context"]).all().item())
+                or not bool(torch.isfinite(record["outcome"]).all().item())
+                or int(record["context"].size(0))
+                != int(record["outcome"].size(0))
+                or type(record["sequence"]) is not int
+                or record["sequence"] <= previous_sequence
+                or record["sequence"] >= replay_sequence
+            ):
+                raise ValueError("offline replay record is invalid")
+            if fields == current_record_fields:
+                self.ValidateReplayConfidence(
+                    record["confidence"],
+                    int(record["context"].size(0)),
+                    record["context"].device,
+                    record["context"].dtype)
+                transaction, timeline = self.ValidateReplayVersion(
+                    record["transactionVersion"],
+                    record["timelineVersion"])
+            else:
+                transaction, timeline = 0, 0
+            if (
+                timeline > replay_timeline
+                or (
+                    timeline == replay_timeline
+                    and transaction > replay_transaction)
+            ):
+                raise ValueError("offline replay record exceeds its boundary")
+            previous_sequence = record["sequence"]
+        migrated_plan = self.CloneCognitiveRecord(plan_cache)
+        for cached in migrated_plan.values():
+            cached["feature"] = cached["feature"].to(
+                device=self.device,
+                dtype=self.dtype)
+            cached["valid"] = cached["valid"].to(
+                device=self.device,
+                dtype=torch.bool)
+            if type(cached["age"]) is int:
+                cached["age"] = torch.full(
+                    (batch_size,),
+                    cached["age"],
+                    device=self.device,
+                    dtype=torch.long)
+            else:
+                cached["age"] = cached["age"].to(
+                    device=self.device,
+                    dtype=torch.long)
+        migrated_skill = self.CloneCognitiveRecord(skill_cache)
+        for cached in migrated_skill.values():
+            cached["feature"] = cached["feature"].to(
+                device=self.device)
+        migrated_replay = self.CloneCognitiveRecord(offline_replay)
+        for record in migrated_replay:
+            record["context"] = record["context"].to(
+                device=self.device,
+                dtype=self.dtype)
+            record["outcome"] = record["outcome"].to(
+                device=self.device,
+                dtype=self.dtype)
+            if "confidence" not in record:
+                record["confidence"] = torch.ones(
+                    record["context"].size(0),
+                    device=self.device,
+                    dtype=self.dtype)
+                record["transactionVersion"] = 0
+                record["timelineVersion"] = 0
+            else:
+                record["confidence"] = record["confidence"].to(
+                    device=self.device,
+                    dtype=self.dtype)
+        self._plan_cache = migrated_plan
+        self._skill_cache = migrated_skill
+        self._offline_replay = migrated_replay
+        self._replay_signature = replay_signature
+        self._replay_sequence = replay_sequence
+        self._replay_transaction_version = replay_transaction
+        self._replay_timeline_version = replay_timeline
+
+    @torch.no_grad()
+    def ReconsolidateSemantic(
+        self,
+        query: torch.Tensor,
+        revisedValue: torch.Tensor,
+        confidence: torch.Tensor,
+        similarityThreshold: float = -1.0,) -> torch.Tensor:
+        if query.shape != revisedValue.shape:
+            raise ValueError("query and revisedValue shapes must match")
+        if query.dim() != 2 or query.size(1) != self.memory_dim:
+            raise ValueError("semantic reconsolidation tensors have invalid shape")
+        if confidence.reshape(-1).size(0) != query.size(0):
+            raise ValueError("semantic reconsolidation confidence has invalid shape")
+        if (
+            isinstance(similarityThreshold, bool)
+            or not isinstance(similarityThreshold, (int, float))
+            or not math.isfinite(float(similarityThreshold))
+            or float(similarityThreshold) < -1.0
+            or float(similarityThreshold) > 1.0
+        ):
+            raise ValueError("similarityThreshold must be finite and within [-1, 1]")
+        self.EnsureB(int(query.size(0)))
+        semantic = self.ltm.semantic
+        valid = torch.arange(
+            semantic.capacity,
+            device=query.device).view(1, -1) < semantic.filled.view(-1, 1)
+        similarity = torch.einsum(
+            "bd,bmd->bm",
+            F.normalize(query, dim=-1),
+            F.normalize(semantic.keys, dim=-1))
+        similarity = similarity.masked_fill(~valid, -torch.inf)
+        best_similarity, index = similarity.max(dim=-1)
+        accepted = (
+            valid.any(dim=-1)
+            & (confidence.reshape(-1) > 0.0)
+            & (best_similarity >= float(similarityThreshold)))
+        rows = torch.arange(query.size(0), device=query.device)
+        alpha = confidence.reshape(-1).clamp(0.0, 1.0)
+        current = semantic.vals[rows, index]
+        residual = revisedValue - current
+        updated = current + alpha.unsqueeze(-1) * residual
+        semantic.vals[rows[accepted], index[accepted]] = updated[accepted]
+        current_variance = semantic.prototype_variance[rows, index]
+        updated_variance = (
+            (1.0 - alpha).unsqueeze(-1) * current_variance
+            + (alpha * (1.0 - alpha)).unsqueeze(-1)
+            * residual.square()).clamp_min(0.0)
+        semantic.prototype_variance[rows[accepted], index[accepted]] = (
+            updated_variance[accepted])
+        semantic.prototype_count[rows[accepted], index[accepted]] += alpha[accepted]
+        semantic.consolidation_count[rows[accepted], index[accepted]] += 1
+        semantic.last_rehearsal_step[rows[accepted], index[accepted]] = (
+            semantic.global_step[rows[accepted]])
+        if bool(accepted.any().item()):
+            self.memory_version.add_(1)
+        return accepted
+
+    @torch.no_grad()
+    def SemanticConsolidation(self, topk: int = 8) -> None:
+        self.ConsolidateMemory(topk=topk)
 
     @torch.no_grad()
     def EnsureB(self, B: int) -> None:
@@ -2487,7 +3671,7 @@ class MemoryExtractor(AGICoreModule):
         self.memory_source_confidence = self.memory_source_confidence.new_zeros(B, self.memory_size)
         self.memory_realm = self.memory_realm.new_full(
             (B, self.memory_size),
-            int(Realm.UNKNOWN))
+            ONTOLOGY_REALM_UNKNOWN)
         self.memory_reward_abs = self.memory_reward_abs.new_zeros(
             B, self.memory_size)
 
@@ -2534,7 +3718,7 @@ class MemoryExtractor(AGICoreModule):
         return torch.stack([l for l in self.extra_losses]).sum()
 
     def EncodeKV(
-        self, 
+        self,
         h: torch.Tensor, #[B, ssm_state_dim]
         ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.kv_mlp(h) #[B, memory_dim // 2]
@@ -2545,16 +3729,16 @@ class MemoryExtractor(AGICoreModule):
         k_heads = k_raw + self.k_bias.unsqueeze(0) # [B, 4, kv_head_dim]
         v_heads = v_raw + self.v_bias.unsqueeze(0) # [B, 4, kv_head_dim]
 
-        key = k_heads.reshape(h.size(0), -1) 
+        key = k_heads.reshape(h.size(0), -1)
         val = v_heads.reshape(h.size(0), -1)
 
         key = F.normalize(key, dim=-1)
-        
+
         return key, val # [B, memory_dim]
 
     @torch.no_grad()
     def KvStats(
-        self, 
+        self,
         key: torch.Tensor, # [B, memory_dim]
         topK: int = 8) -> torch.Tensor:
         B, M = int(key.size(0)), int(self.memory_size)
@@ -2604,13 +3788,24 @@ class MemoryExtractor(AGICoreModule):
         out[:, 2] = age_w
         return out # [B, 3]
 
-    def NsRules(self, P: torch.Tensor, P_prev: Optional[torch.Tensor]) -> torch.Tensor: # P: [B, nsK]
+    def NsRules(
+        self,
+        P: torch.Tensor, # P: [B, nsK]
+        P_prev: Optional[torch.Tensor],
+        lossSampleMask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
 
         total_penalty, aux_reg = self.sym_rules(P, P_prev) # total_penalty: [B]
 
         if self.training:
-            self.AddInternalLoss(
-                self.ns_lambda * (total_penalty.mean() + aux_reg))
+            loss_mask = self.ValidateLossSampleMask(
+                lossSampleMask,
+                int(P.size(0)),
+                P.device)
+            if bool(loss_mask.any().item()):
+                masked_penalty = total_penalty[loss_mask].mean()
+                self.AddInternalLoss(
+                    self.ns_lambda * (masked_penalty + aux_reg))
 
         return total_penalty
 
@@ -2633,16 +3828,20 @@ class MemoryExtractor(AGICoreModule):
             writeMask=writeMask)
 
     def NsPostRead(
-        self, 
-        memRecall: torch.Tensor #[B, memory_dim]
+        self,
+        memRecall: torch.Tensor, #[B, memory_dim]
+        lossSampleMask: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
-        P_post = self.ns_coder_post(memRecall)  # [B, nsK]
-        per_sample_post = self.NsRules(P_post, self.ns_prev_P_post) # [B]
-        self.ns_prev_P_post = P_post.detach()
+        P_post = self.ns_coder_post(memRecall) # [B, nsK]
+        per_sample_post = self.NsRules(
+            P_post,
+            self.ns_prev_P_post,
+            lossSampleMask=lossSampleMask) # [B]
+        self.ns_prev_P_post = P_post.detach().clone()
 
         damp = torch.clamp(per_sample_post, 0, 1).view(-1, 1) # [B, 1]
 
-        self.ns_penalty_vec = damp
+        self.ns_penalty_vec = damp.detach().clone()
         return P_post # [B, nsK], [B, memory_dim]
 
     def FilmParams(self, film: nn.Module, src: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2736,7 +3935,11 @@ class MemoryExtractor(AGICoreModule):
         scale = 0.25 * torch.sigmoid(self.context_fuse_scale)
         return x + scale * modulation * F.layer_norm(x, (self.input_dim,))
 
-    def PatternSeparate(self, x: torch.Tensor) -> torch.Tensor:
+    def PatternSeparate(
+        self,
+        x: torch.Tensor,
+        writeMask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         x = x + self.pattern_separation_proj(x)
         k = max(1, int(self.memory_dim) // 8)
         homeostatic_score = x.abs() / (1.0 + self.pattern_usage.unsqueeze(0))
@@ -2744,8 +3947,13 @@ class MemoryExtractor(AGICoreModule):
         sparse = torch.zeros_like(x)
         sparse.scatter_(1, idx, torch.gather(x, 1, idx))
         with torch.no_grad():
-            activity = torch.zeros_like(x).scatter_(1, idx, 1.0).mean(dim=0)
-            self.pattern_usage.mul_(0.995).add_(activity, alpha=0.005)
+            activityRows = torch.zeros_like(x).scatter_(1, idx, 1.0)
+            if writeMask is None:
+                activity = activityRows.mean(dim=0)
+                self.pattern_usage.mul_(0.995).add_(activity, alpha=0.005)
+            elif bool(writeMask.any().item()):
+                activity = activityRows[writeMask].mean(dim=0)
+                self.pattern_usage.mul_(0.995).add_(activity, alpha=0.005)
         return F.normalize(sparse, dim=-1)
 
     def BuildOntologyObjectContext(
@@ -2822,7 +4030,7 @@ class MemoryExtractor(AGICoreModule):
         unknown = F.one_hot(
             torch.full(
                 (attended.size(0),),
-                int(Realm.UNKNOWN),
+                ONTOLOGY_REALM_UNKNOWN,
                 device=attended.device),
             num_classes=5).to(realm_posterior.dtype)
         realm_posterior = torch.where(
@@ -2832,8 +4040,8 @@ class MemoryExtractor(AGICoreModule):
         focused_realm = realm_posterior.argmax(dim=-1).to(torch.int8)
 
         physical_realm = (
-            realm[..., int(Realm.SELF_BODY)]
-            + realm[..., int(Realm.EXTERNAL_PHYSICAL)])
+            realm[..., ONTOLOGY_REALM_SELF]
+            + realm[..., ONTOLOGY_REALM_EXTERNAL])
         physical_layer = motion_layer[..., 1] + motion_layer[..., 2]
         physical_motion = torch.einsum(
             "bk,bk->b",
@@ -2848,8 +4056,8 @@ class MemoryExtractor(AGICoreModule):
             weights,
             verification.squeeze(-1))
         virtual_effect = (
-            realm_posterior[:, int(Realm.VIRTUAL_CONTENT)]
-            + realm_posterior[:, int(Realm.VISUAL_EFFECT)])
+            realm_posterior[:, ONTOLOGY_REALM_VIRTUAL]
+            + realm_posterior[:, ONTOLOGY_REALM_EFFECT])
         realm_entropy = -(
             realm_posterior.clamp_min(1e-8)
             * realm_posterior.clamp_min(1e-8).log()).sum(dim=-1)
@@ -2884,7 +4092,7 @@ class MemoryExtractor(AGICoreModule):
         selected_agency = torch.where(
             any_valid,
             selected_agency,
-            torch.full_like(selected_agency, int(Agency.UNKNOWN)))
+            torch.full_like(selected_agency, ONTOLOGY_AGENCY_UNKNOWN))
         selected_motion_layer = torch.where(
             any_valid.unsqueeze(-1),
             selected_motion_layer,
@@ -2934,7 +4142,9 @@ class MemoryExtractor(AGICoreModule):
         risk: torch.Tensor,
         uncertainty: torch.Tensor,
         confidence: torch.Tensor,
-        ontology: Dict[str, torch.Tensor],) -> Tuple[torch.Tensor, torch.Tensor]:
+        ontology: Dict[str, torch.Tensor],
+        lossSampleMask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         presence = visualState.Auxiliary["PerceptualPresence"]
         valid_object = presence > 0.05
         object_weight = presence * valid_object.to(presence.dtype)
@@ -2985,8 +4195,8 @@ class MemoryExtractor(AGICoreModule):
             (1.0 - learned_probability)
             * (1.0 - ontology_probability))
         physical_realm = (
-            ontology["realm_posterior"][:, int(Realm.SELF_BODY)]
-            + ontology["realm_posterior"][:, int(Realm.EXTERNAL_PHYSICAL)])
+            ontology["realm_posterior"][:, ONTOLOGY_REALM_SELF]
+            + ontology["realm_posterior"][:, ONTOLOGY_REALM_EXTERNAL])
         screen_dominant = ontology["virtual_effect"] > physical_realm
         text_change = ontology.get(
             "text_change",
@@ -3026,8 +4236,17 @@ class MemoryExtractor(AGICoreModule):
             | (risk > 0.70))
         boundary = heuristic | (probability > 0.50)
         if self.training:
-            self.AddInternalLoss(
-                0.01 * F.binary_cross_entropy(probability, heuristic.float()))
+            loss_mask = self.ValidateLossSampleMask(
+                lossSampleMask,
+                int(probability.size(0)),
+                probability.device)
+            if bool(loss_mask.any().item()):
+                boundary_loss = F.binary_cross_entropy(
+                    probability,
+                    heuristic.float(),
+                    reduction="none")
+                self.AddInternalLoss(
+                    0.01 * boundary_loss[loss_mask].mean())
         with torch.no_grad():
             self.previous_attention.copy_(attended)
             self.previous_intent.copy_(intentHint)
@@ -3052,6 +4271,7 @@ class MemoryExtractor(AGICoreModule):
         confidence: torch.Tensor,
         ontologyContext: torch.Tensor,
         entityTextContext: Optional[torch.Tensor] = None,
+        writeMask: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, torch.Tensor]:
         vis = torch.cat([
             visualState.IntegratedFeat,
@@ -3081,7 +4301,7 @@ class MemoryExtractor(AGICoreModule):
                 text_code,], dim=-1))
             raw = raw + 0.25 * torch.sigmoid(
                 self.entity_text_event_gain) * text_residual
-        return raw, self.PatternSeparate(raw)
+        return raw, self.PatternSeparate(raw, writeMask=writeMask)
 
     def BuildEntityTextContext(
         self,
@@ -3132,7 +4352,7 @@ class MemoryExtractor(AGICoreModule):
         ) -> torch.Tensor:
         objects = visualState.ObjectTokens
         presence = visualState.Auxiliary["PerceptualPresence"]
-        pose = visualState.SemanticNodes["pose_camera"]
+        pose = visualState.SemanticNodes["SpatialState"]
         bbox = visualState.SemanticNodes["bbox_2d"]
         semantic_identity = torch.cat([
             F.softmax(visualState.SemanticNodes["level_logits"], dim=-1),
@@ -3199,7 +4419,7 @@ class MemoryExtractor(AGICoreModule):
         x: torch.Tensor, # [B, inputDim]
         tdError: torch.Tensor, # [B] [-1, 1]
         emotion: torch.Tensor, # [B, emotionDim]
-        reward: torch.Tensor, # [B] 
+        reward: torch.Tensor, # [B]
         visualState: Any,
         ocrSemantic: torch.Tensor,
         intentHint: torch.Tensor,
@@ -3209,7 +4429,10 @@ class MemoryExtractor(AGICoreModule):
         *,
         reset: bool = False,
         softReset: bool = False,
-        sourceLabel: Optional[torch.Tensor] = None) -> torch.Tensor:
+        sourceLabel: Optional[torch.Tensor] = None,
+        writeMask: Optional[torch.Tensor] = None,
+        lossSampleMask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
 
         if self.training:
             self.ResetInternalLoss()
@@ -3217,6 +4440,9 @@ class MemoryExtractor(AGICoreModule):
         B = x.size(0)
 
         self.EnsureB(B)
+        write_mask = self.ValidateWriteMask(writeMask, B, x.device)
+        loss_sample_mask = self.ValidateLossSampleMask(
+            lossSampleMask, B, x.device)
 
         src_all = sourceLabel
         if sourceLabel is None:
@@ -3245,6 +4471,9 @@ class MemoryExtractor(AGICoreModule):
         attended_x = x
 
         self.FlushPendingWrites()
+        frozen_state = self.CaptureFrozenRows(
+            write_mask,
+            self.FORWARD_MUTABLE_ROW_STATE_FIELDS)
         next_pending = []
 
         ontology = self.BuildOntologyObjectContext(
@@ -3287,7 +4516,8 @@ class MemoryExtractor(AGICoreModule):
             risk=risk_eff,
             confidence=confidence_eff,
             ontologyContext=ontology["context"],
-            entityTextContext=entity_text["context"])
+            entityTextContext=entity_text["context"],
+            writeMask=write_mask)
         _, event_boundary = self.DetectEventBoundary(
             attended_x,
             visualState,
@@ -3296,7 +4526,8 @@ class MemoryExtractor(AGICoreModule):
             risk_eff,
             uncertainty_eff,
             confidence_eff,
-            ontology)
+            ontology,
+            lossSampleMask=loss_sample_mask)
 
         emo_emb = self.emo_write_proj(emotion_eff) # [B, memoryDim]
 
@@ -3365,16 +4596,24 @@ class MemoryExtractor(AGICoreModule):
             emotion=emotion_eff,
             tdError=td_memory,
             returnEvidence=True,) # [B, memoryDim], [B, 1]
-        self.HebbianUpdate(key, val, gate_local, td_memory.abs(), a, b)
-        
+        self.HebbianUpdate(
+            key,
+            val,
+            gate_local,
+            td_memory.abs(),
+            a,
+            b,
+            writeMask=write_mask)
+
         mem_film_ctx = self.BuildFilmContext(val, mem_recall, emo_emb, td_memory, risk_eff, uncertainty_eff, confidence_eff)
         g2, b2 = self.FilmParams(self.film_mem, mem_film_ctx)
         s2 = 1.0 + g2
 
         mem_state = self.mem_film_norm(mem_recall * s2 + b2) * mem_evidence
 
+        durable_write_mask = event_boundary & write_mask
         next_pending.append(("kv",
-                             (key.detach(),val.detach(),importance_eff.detach(),emotion_eff.detach(),reward_abs_eff.detach(),src_all.detach(),source_reliability.detach(),focused_realm.detach(),event_boundary.detach())))
+                             (key.detach(),val.detach(),importance_eff.detach(),emotion_eff.detach(),reward_abs_eff.detach(),src_all.detach(),source_reliability.detach(),focused_realm.detach(),durable_write_mask.detach(),write_mask.detach())))
 
         gws_val, gws_mod_signal = self.BuildGwsValue(h_new, y_ssm, val, td_memory, risk_eff, confidence_eff) # [B, memoryDim]
 
@@ -3398,8 +4637,8 @@ class MemoryExtractor(AGICoreModule):
         ttl = torch.where(src_all == MemoryType.SRC_IMAGINE, torch.full_like(ttl, 4), ttl)
 
         next_pending.append(("gws",
-                             (key.detach(),gws_val.detach(),prio.detach(),ttl.detach(),src_all.detach(),source_reliability.detach(),event_boundary.detach())))
-        
+                             (key.detach(),gws_val.detach(),prio.detach(),ttl.detach(),src_all.detach(),source_reliability.detach(),durable_write_mask.detach(),write_mask.detach())))
+
 
         (
             sem_recall,
@@ -3457,18 +4696,21 @@ class MemoryExtractor(AGICoreModule):
                                sem_in.detach(),epi_in.detach(),
                                importance_eff.detach(),td_memory.detach(),reward_eff.detach(),src_all.detach(),
                                uncertainty_eff.detach(),risk_eff.detach(),confidence_eff.detach(),
-                               source_reliability.detach(),focused_realm.detach(),event_boundary.detach(),self.episode_id.detach().clone(),self.event_id.detach().clone(),
+                               source_reliability.detach(),focused_realm.detach(),durable_write_mask.detach(),self.episode_id.detach().clone(),self.event_id.detach().clone(),
                                {
                                    name: value.detach()
                                    for name, value in ontology[
-                                       "episodic_metadata"].items()})))
+                                       "episodic_metadata"].items()},
+                               write_mask.detach())))
 
         ltm_fused = self.ltm.fuser(sem_state, epi_state)
         ltm_evidence = 1.0 - (
             (1.0 - sem_evidence) * (1.0 - epi_evidence))
         ltm_fused = ltm_fused * ltm_evidence
 
-        P_post = self.NsPostRead(val)
+        P_post = self.NsPostRead(
+            val,
+            lossSampleMask=loss_sample_mask)
 
         Qsym_key = self.sym_query(key) # [B, nsK]
         qsym_mix = self.sym_query_fusion(torch.cat([Qsym_key, P_post], dim=-1)) # [B, nsK]
@@ -3478,9 +4720,9 @@ class MemoryExtractor(AGICoreModule):
         symbolic_verified = (
             SourceProbabilityReal(src_all, source_reliability) >= 0.55)
         next_pending.append(("ns",
-                             (Qsym.detach(), P_post.detach(), importance_eff.detach(), src_all.detach(),source_reliability.detach(),(event_boundary & symbolic_verified).detach())))
+                             (Qsym.detach(), P_post.detach(), importance_eff.detach(), src_all.detach(),source_reliability.detach(),(durable_write_mask & symbolic_verified).detach(),write_mask.detach())))
 
-        sym_recall = self.sym_mem.Retrieve(Qsym, topK=8) 
+        sym_recall = self.sym_mem.Retrieve(Qsym, topK=8)
 
         sym_vec = self.sym_embed(P_post, sym_recall) # [B, memoryDim]
         embodied_memory = self.BuildEmbodiedMemory(
@@ -3489,7 +4731,9 @@ class MemoryExtractor(AGICoreModule):
             ontology["object_features"],
             entity_text["object_code"])
 
-        fused_state = self.fusion(torch.cat([mem_state, gws_state, ltm_fused, sym_vec], dim=-1)) # [B, outputDim]
+        fused_state = self.fusion(
+            torch.cat([mem_state, gws_state, ltm_fused, sym_vec], dim=-1),
+            sampleMask=loss_sample_mask) # [B, outputDim]
         embodied_output = self.embodied_output_proj(embodied_memory)
         embodied_gate = self.embodied_memory_gate(
             torch.cat([fused_state, embodied_output], dim=-1))
@@ -3502,16 +4746,18 @@ class MemoryExtractor(AGICoreModule):
 
         step0 = int(self.time_step[0].item())
 
-        if (step0 % self.compress_every) == 0:
-            next_pending.append(("compress", None))
-        if (step0 % max(1, self.compress_every // 4)) == 0:
-            next_pending.append(("consolidate", None))
+        if bool(write_mask.any().item()):
+            if (step0 % self.compress_every) == 0:
+                next_pending.append(("compress", write_mask.detach()))
+            if (step0 % max(1, self.compress_every // 4)) == 0:
+                next_pending.append(("consolidate", write_mask.detach()))
 
         self.pending = next_pending
+        self.RestoreFrozenRows(frozen_state, write_mask)
 
         return fused_state
 
-    
+
     def ApplyOutputGate(self, memRecall: torch.Tensor, tdError: torch.Tensor, gateBias: torch.Tensor) -> torch.Tensor:
         gate_delta = torch.tanh(tdError + gateBias).view(-1, 1)
         return memRecall + 0.3 * gate_delta * memRecall
@@ -3525,7 +4771,8 @@ class MemoryExtractor(AGICoreModule):
         gateLocal: torch.Tensor, # [B]
         surprise: torch.Tensor, # [B]
         a: torch.Tensor, # [B]
-        b: torch.Tensor # [B]
+        b: torch.Tensor, # [B]
+        writeMask: Optional[torch.Tensor] = None,
         ) -> None:
 
         B = int(key.size(0))
@@ -3549,14 +4796,21 @@ class MemoryExtractor(AGICoreModule):
 
         max_fro = math.sqrt(float(self.memory_dim))
         flat = new_weights.reshape(B, -1)
-        fro = torch.linalg.vector_norm(flat, ord=2, dim=1) 
-        scale = (max_fro / (fro + 1e-12)).clamp(max=1.0) 
+        fro = torch.linalg.vector_norm(flat, ord=2, dim=1)
+        scale = (max_fro / (fro + 1e-12)).clamp(max=1.0)
 
-        self.fast_weights = new_weights * scale.view(B, 1, 1)
+        updated_weights = new_weights * scale.view(B, 1, 1)
+        if writeMask is None:
+            self.fast_weights = updated_weights
+        else:
+            self.fast_weights = torch.where(
+                writeMask.view(B, 1, 1),
+                updated_weights,
+                self.fast_weights)
 
     @torch.no_grad()
     def KvWrite(
-        self, 
+        self,
         key: torch.Tensor, # [B, memory_dim]
         val: torch.Tensor, # [B, memory_dim]
         importance: torch.Tensor, # [B]
@@ -3650,7 +4904,7 @@ class MemoryExtractor(AGICoreModule):
 
     @torch.no_grad()
     def LtmOnlineStore(
-        self, 
+        self,
         keySem: torch.Tensor, # [B, memory_dim]
         keyEpi: torch.Tensor, # [B, memory_dim]
         keyEpiState: torch.Tensor, # [B, memory_dim]
@@ -3699,7 +4953,7 @@ class MemoryExtractor(AGICoreModule):
         semantic_mask = (
             mask
             & (probability_real >= 0.55)
-            & (realm != int(Realm.VISUAL_EFFECT)))
+            & (realm != ONTOLOGY_REALM_EFFECT))
         sem.Store(
             key=keySem,
             value=valSem,
@@ -3724,11 +4978,11 @@ class MemoryExtractor(AGICoreModule):
         self.memory_version.add_(1)
 
     def Retrieve(
-        self, 
-        query: torch.Tensor, # [B, memory_dim] 
+        self,
+        query: torch.Tensor, # [B, memory_dim]
         fusionGate: torch.Tensor, # [B]
-        importance: torch.Tensor, # [B] 
-        localGate: torch.Tensor, # [B] 
+        importance: torch.Tensor, # [B]
+        localGate: torch.Tensor, # [B]
         emotion: torch.Tensor, # [B, emotion_dim]
         tdError: torch.Tensor, # [B]
         returnEvidence: bool = False,
@@ -3742,7 +4996,7 @@ class MemoryExtractor(AGICoreModule):
         qf = query
         fast_part = torch.bmm(qf.unsqueeze(1), fw).squeeze(1) # [B, memory_dim]
 
-        filled = self.memory_filled 
+        filled = self.memory_filled
         any_valid = filled > 0
 
         feat_imp = importance.view(B, 1)
@@ -3758,7 +5012,7 @@ class MemoryExtractor(AGICoreModule):
             keys = self.memory_keys # [B, M, D]
             values = self.memory_values # [B, M, D]
             imp_kv = self.memory_importance # [B, M]
-            steps = self.memory_steps # [B, M] 
+            steps = self.memory_steps # [B, M]
             src = self.memory_source # [B, M]
 
             age = (self.time_step.view(B, 1) - steps).clamp(min=0).float() # [B, M]
@@ -3948,7 +5202,7 @@ class MemoryExtractor(AGICoreModule):
             torch.isfinite(score)
             & (score > 0)
             & (probability_real >= 0.55)
-            & (realm != int(Realm.VISUAL_EFFECT)))
+            & (realm != ONTOLOGY_REALM_EFFECT))
         if not bool(keep.any().item()):
             return
 
@@ -3987,7 +5241,11 @@ class MemoryExtractor(AGICoreModule):
         while self.pending:
             kind, payload = self.pending[0]
             if kind == "gws":
-                key, ws_val, prio, ttl, src, src_conf, write_mask = payload
+                if len(payload) == 8:
+                    key, ws_val, prio, ttl, src, src_conf, write_mask, hard_mask = payload
+                    write_mask = write_mask & hard_mask
+                else:
+                    key, ws_val, prio, ttl, src, src_conf, write_mask = payload
                 self.gws.Write(
                     key,
                     ws_val,
@@ -3998,7 +5256,11 @@ class MemoryExtractor(AGICoreModule):
                     writeMask=write_mask)
 
             elif kind == "kv":
-                key, val, imp, emo, rew_abs, src, src_conf, realm, write_mask = payload
+                if len(payload) == 10:
+                    key, val, imp, emo, rew_abs, src, src_conf, realm, write_mask, hard_mask = payload
+                    write_mask = write_mask & hard_mask
+                else:
+                    key, val, imp, emo, rew_abs, src, src_conf, realm, write_mask = payload
                 self.KvWrite(
                     key=key,
                     val=val,
@@ -4011,7 +5273,11 @@ class MemoryExtractor(AGICoreModule):
                     writeMask=write_mask)
 
             elif kind == "ltm":
-                key_sem, key_epi, key_epi_state, sem, epi, imp, td, rwd, src, unc, risk, conf, src_conf, realm, event_mask, episode_id, event_id, episodic_metadata = payload
+                if len(payload) == 19:
+                    key_sem, key_epi, key_epi_state, sem, epi, imp, td, rwd, src, unc, risk, conf, src_conf, realm, event_mask, episode_id, event_id, episodic_metadata, hard_mask = payload
+                    event_mask = event_mask & hard_mask
+                else:
+                    key_sem, key_epi, key_epi_state, sem, epi, imp, td, rwd, src, unc, risk, conf, src_conf, realm, event_mask, episode_id, event_id, episodic_metadata = payload
                 self.LtmOnlineStore(
                     keySem=key_sem,
                     keyEpi=key_epi,
@@ -4031,16 +5297,24 @@ class MemoryExtractor(AGICoreModule):
                     eventMask=event_mask,
                     episodeId=episode_id,
                     eventId=event_id)
-                
+
             elif kind == "ns":
-                key, P_post, importance, src, src_conf, write_mask = payload
+                if len(payload) == 7:
+                    key, P_post, importance, src, src_conf, write_mask, hard_mask = payload
+                    write_mask = write_mask & hard_mask
+                else:
+                    key, P_post, importance, src, src_conf, write_mask = payload
                 self.NsStore(key, P_post, importance, src, src_conf, write_mask)
 
             elif kind == "compress":
+                frozen_state = self.CaptureFrozenRows(payload)
                 self.AutoCompress()
+                self.RestoreFrozenRows(frozen_state, payload)
 
             elif kind == "consolidate":
+                frozen_state = self.CaptureFrozenRows(payload)
                 self.ConsolidateMemory()
+                self.RestoreFrozenRows(frozen_state, payload)
 
             self.pending.pop(0)
 
@@ -4050,28 +5324,43 @@ class MemoryExtractor(AGICoreModule):
         for kind, payload in self.pending:
             if kind == "kv":
                 fields = list(payload)
+                hard_mask = (
+                    fields[9]
+                    if len(fields) == 10
+                    else torch.ones_like(done))
+                terminal = done & hard_mask
                 fields[2] = torch.where(
-                    done,
+                    terminal,
                     torch.maximum(fields[2], torch.ones_like(fields[2])),
                     fields[2])
-                fields[8] = fields[8] | done
+                fields[8] = (fields[8] | terminal) & hard_mask
                 payload = tuple(fields)
             elif kind == "gws":
                 fields = list(payload)
+                hard_mask = (
+                    fields[7]
+                    if len(fields) == 8
+                    else torch.ones_like(done))
+                terminal = done & hard_mask
                 fields[2] = torch.where(
-                    done,
+                    terminal,
                     torch.maximum(fields[2], torch.ones_like(fields[2])),
                     fields[2])
-                fields[6] = fields[6] | done
+                fields[6] = (fields[6] | terminal) & hard_mask
                 payload = tuple(fields)
             elif kind == "ltm":
                 fields = list(payload)
+                hard_mask = (
+                    fields[18]
+                    if len(fields) == 19
+                    else torch.ones_like(done))
+                terminal = done & hard_mask
                 fields[5] = torch.where(
-                    done,
+                    terminal,
                     torch.maximum(fields[5], torch.full_like(fields[5], 1.5)),
                     fields[5])
                 already_an_event = fields[14]
-                allocate_terminal_event = done & ~already_an_event
+                allocate_terminal_event = terminal & ~already_an_event
                 next_event_id = torch.maximum(
                     fields[16],
                     self.event_id) + 1
@@ -4079,21 +5368,31 @@ class MemoryExtractor(AGICoreModule):
                     allocate_terminal_event,
                     next_event_id,
                     fields[16])
-                self.event_id.copy_(torch.where(
+                updated_event_id = torch.where(
                     allocate_terminal_event,
                     next_event_id,
-                    torch.maximum(self.event_id, fields[16])))
-                fields[14] = fields[14] | done
+                    torch.maximum(self.event_id, fields[16]))
+                self.event_id.copy_(torch.where(
+                    hard_mask,
+                    updated_event_id,
+                    self.event_id))
+                fields[14] = (fields[14] | terminal) & hard_mask
                 payload = tuple(fields)
             elif kind == "ns":
                 fields = list(payload)
+                hard_mask = (
+                    fields[6]
+                    if len(fields) == 7
+                    else torch.ones_like(done))
+                terminal = done & hard_mask
                 fields[2] = torch.where(
-                    done,
+                    terminal,
                     torch.maximum(fields[2], torch.ones_like(fields[2])),
                     fields[2])
                 fields[5] = fields[5] | (
-                    done
+                    terminal
                     & (SourceProbabilityReal(fields[3], fields[4]) >= 0.55))
+                fields[5] = fields[5] & hard_mask
                 payload = tuple(fields)
             sealed.append((kind, payload))
         self.pending = sealed
@@ -4108,8 +5407,8 @@ class MemoryExtractor(AGICoreModule):
         self.fast_weights.zero_()
 
         self.memory_filled.zero_()
-        # Soft reset clears activity/recent-KV state but remains on the same
-        # durable memory timeline as semantic, episodic and symbolic memory.
+
+
         self.last_compress_step.copy_(self.time_step)
         self.memory_version.add_(1)
 
@@ -4129,6 +5428,7 @@ class MemoryExtractor(AGICoreModule):
         self.has_previous_event.zero_()
         self.ResetInternalLoss()
         self.pending.clear()
+        self._plan_cache.clear()
 
     @torch.no_grad()
     def ResetEpisodeState(self, doneMask: Optional[torch.Tensor] = None):
@@ -4162,6 +5462,38 @@ class MemoryExtractor(AGICoreModule):
         self.gws.ResetRows(done)
         next_episode = self.ltm.episodic.StartNewEpisode(done)
         self.episode_id[done] = next_episode[done]
+        if bool(done.any().item()):
+            invalidated = []
+            for plan_id, cached in self._plan_cache.items():
+                valid = cached.get("valid")
+                feature = cached.get("feature")
+                age = cached.get("age")
+                if (
+                    not torch.is_tensor(valid)
+                    or not torch.is_tensor(feature)
+                    or not torch.is_tensor(age)
+                    or tuple(valid.shape) != tuple(done.shape)
+                    or tuple(age.shape) != tuple(done.shape)
+                    or valid.device != done.device
+                    or age.device != done.device
+                    or age.dtype != torch.long
+                    or int(feature.size(0)) != int(done.numel())
+                ):
+                    invalidated.append(plan_id)
+                    continue
+                valid = valid.clone()
+                feature = feature.clone()
+                age = age.clone()
+                valid[done] = False
+                feature[done] = 0
+                age[done] = 0
+                cached["valid"] = valid
+                cached["feature"] = feature
+                cached["age"] = age
+                if not bool(valid.any().item()):
+                    invalidated.append(plan_id)
+            for plan_id in invalidated:
+                self._plan_cache.pop(plan_id, None)
 
 
     def ResetAll(self):
@@ -4179,7 +5511,7 @@ class MemoryExtractor(AGICoreModule):
         self.memory_emotion.zero_()
         self.memory_source.zero_()
         self.memory_source_confidence.zero_()
-        self.memory_realm.fill_(int(Realm.UNKNOWN))
+        self.memory_realm.fill_(ONTOLOGY_REALM_UNKNOWN)
         self.memory_reward_abs.zero_()
         self.merged_delta_signature.fill_(-1)
 
@@ -4205,6 +5537,17 @@ class MemoryExtractor(AGICoreModule):
         self.has_previous_event.zero_()
         self.ResetInternalLoss()
         self.pending.clear()
+        self._plan_cache.clear()
+        self._skill_cache.clear()
+        self._offline_replay.clear()
+        self._replay_signature = None
+        self._replay_sequence = 0
+        self._replay_transaction_version = 0
+        self._replay_timeline_version = 0
+        self._row_merge_contract_id = None
+        self._row_merge_model_signature = None
+        self._row_merge_transactions.clear()
+        self._row_merge_versions.clear()
         self.memory_version.add_(1)
 
     def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None):
@@ -4515,8 +5858,8 @@ class MemoryExtractor(AGICoreModule):
                 device=values.device).view(1, -1)
             valid = slots < state[filled_field].view(-1, 1)
             invalid_realm = (
-                (values < int(Realm.SELF_BODY))
-                | (values > int(Realm.UNKNOWN)))
+                (values < ONTOLOGY_REALM_SELF)
+                | (values > ONTOLOGY_REALM_UNKNOWN))
             if bool((invalid_realm & valid).any().item()):
                 raise ValueError(
                     f"durable-memory field {realm_field} contains an "
@@ -4528,8 +5871,8 @@ class MemoryExtractor(AGICoreModule):
         epi_valid = epi_slots < state["ltm_epi_filled"].view(-1, 1)
         agency_id = state["ltm_epi_agency_id"]
         if bool((epi_valid & (
-            (agency_id < int(Agency.SELF_CAUSED))
-            | (agency_id > int(Agency.UNKNOWN))
+            (agency_id < ONTOLOGY_AGENCY_SELF)
+            | (agency_id > ONTOLOGY_AGENCY_UNKNOWN)
         )).any().item()):
             raise ValueError("durable episodic agency_id is invalid")
         observed_parent = state[
@@ -4586,6 +5929,8 @@ class MemoryExtractor(AGICoreModule):
         self.gws.Reset()
         self.ResetInternalLoss()
         self.pending.clear()
+        self._row_merge_transactions.clear()
+        self._row_merge_versions.clear()
 
     @torch.no_grad()
     def ExportMemoryBank(
@@ -4640,7 +5985,7 @@ class MemoryExtractor(AGICoreModule):
             return torch.gather(values, 1, time_indices).contiguous()
 
         S_gws = int(self.gws.slots)
-        gws_valid = (self.gws.ttl > 0) & (self.gws.priority > 0)  # [B, S_gws]
+        gws_valid = (self.gws.ttl > 0) & (self.gws.priority > 0) # [B, S_gws]
         K_gws = min(perTypeBudget["gws"], S_gws, int(gws_valid.sum(dim=1).max().item()))
         if K_gws > 0:
             gws_age = (self.gws.global_step.view(B, 1) - self.gws.created_step).clamp(min=0).float()
@@ -4651,7 +5996,7 @@ class MemoryExtractor(AGICoreModule):
             gws_scores = self.gws.priority * torch.exp(-gws_beta * gws_age)
             gws_scores = gws_scores * self.gws.source_confidence
             gws_scores = gws_scores.masked_fill(~gws_valid, -1e9)
-            _, gws_idx = StableTopk(gws_scores, K_gws)  # [B, K_gws]
+            _, gws_idx = StableTopk(gws_scores, K_gws) # [B, K_gws]
             out["gws"] = GatherTopkLatestFirst(self.gws.vals, gws_idx, self.gws.created_step)
             out["gws_valid"] = GatherMeta(
                 gws_valid,
@@ -4667,13 +6012,21 @@ class MemoryExtractor(AGICoreModule):
                 "step": GatherMeta(self.gws.created_step.float(), gws_idx, self.gws.created_step),}
 
         M_kv = int(self.memory_size)
-        filled_kv = self.memory_filled  # [B]
+        filled_kv = self.memory_filled # [B]
         K_kv = min(perTypeBudget["kv"], M_kv, int(filled_kv.max().item()))
         if K_kv > 0:
             ar = torch.arange(M_kv, device=device).view(1, M_kv) # [1, M_kv]
             valid = ar < filled_kv.view(B, 1) # [B, M_kv]
             age = (self.time_step.view(B, 1) - self.memory_steps).clamp(min=0).float()
-            scores = (self.memory_importance * (1.0 + 0.5 * torch.tanh(self.memory_reward_abs))).masked_fill(~valid, -1e9) # [B, M_kv]
+            if self.memory_importance.dtype == torch.float16:
+                scores = (
+                    self.memory_importance
+                    * (1.0 + 0.5 * torch.tanh(self.memory_reward_abs))
+                ).masked_fill(
+                    ~valid,
+                    torch.finfo(self.memory_importance.dtype).min)
+            else:
+                scores = (self.memory_importance * (1.0 + 0.5 * torch.tanh(self.memory_reward_abs))).masked_fill(~valid, -1e9) # [B, M_kv]
             _, idx = StableTopk(scores, K_kv) # [B, K_kv]
             out["kv"] = GatherTopkLatestFirst(self.memory_values, idx, self.memory_steps) # [B, K_kv, D]
             out["kv_valid"] = GatherMeta(valid, idx, self.memory_steps)
@@ -4696,7 +6049,15 @@ class MemoryExtractor(AGICoreModule):
             ar = torch.arange(M_sem, device=sem.prio.device).view(1, M_sem) # [1, M_sem]
             valid = ar < filled_sem.view(B, 1) # [B, M_sem]
             age = (sem.global_step.view(B, 1) - sem.step).clamp(min=0).float()
-            scores = (sem.prio * SourceConfidence(sem.source, dtype=sem.prio.dtype)).masked_fill(~valid, -1e9) # [B, M_sem]
+            if sem.prio.dtype == torch.float16:
+                scores = (
+                    sem.prio
+                    * SourceConfidence(sem.source, dtype=sem.prio.dtype)
+                ).masked_fill(
+                    ~valid,
+                    torch.finfo(sem.prio.dtype).min)
+            else:
+                scores = (sem.prio * SourceConfidence(sem.source, dtype=sem.prio.dtype)).masked_fill(~valid, -1e9) # [B, M_sem]
             _, idx = StableTopk(scores, K_sem) # [B, K_sem]
             out["ltm_sem"] = GatherTopkLatestFirst(sem.vals, idx, sem.step) # [B, K_sem, D]
             out["ltm_sem_valid"] = GatherMeta(valid, idx, sem.step)
@@ -4713,13 +6074,22 @@ class MemoryExtractor(AGICoreModule):
 
         epi = self.ltm.episodic
         M_epi = int(epi.capacity)
-        filled_epi = epi.filled  # [B]
+        filled_epi = epi.filled # [B]
         K_epi = min(perTypeBudget["ltm_epi"], M_epi, int(filled_epi.max().item()))
         if K_epi > 0:
             ar = torch.arange(M_epi, device=epi.prio.device).view(1, M_epi) # [1, M_epi]
             valid = ar < filled_epi.view(B, 1) # [B, M_epi]
             age = (epi.global_step.view(B, 1) - epi.step).clamp(min=0).float()
-            scores = (epi.prio * (1.0 + 0.5 * torch.tanh(epi.rew_abs)) * SourceConfidence(epi.source, dtype=epi.prio.dtype)).masked_fill(~valid, -1e9) # [B, M_epi]
+            if epi.prio.dtype == torch.float16:
+                scores = (
+                    epi.prio
+                    * (1.0 + 0.5 * torch.tanh(epi.rew_abs))
+                    * SourceConfidence(epi.source, dtype=epi.prio.dtype)
+                ).masked_fill(
+                    ~valid,
+                    torch.finfo(epi.prio.dtype).min)
+            else:
+                scores = (epi.prio * (1.0 + 0.5 * torch.tanh(epi.rew_abs)) * SourceConfidence(epi.source, dtype=epi.prio.dtype)).masked_fill(~valid, -1e9) # [B, M_epi]
             _, idx = StableTopk(scores, K_epi) # [B, K_epi]
             out["ltm_epi"] = GatherTopkLatestFirst(epi.vals, idx, epi.step) # [B, K_epi, D]
             out["ltm_epi_valid"] = GatherMeta(valid, idx, epi.step)
@@ -4751,7 +6121,6 @@ class MemoryExtractor(AGICoreModule):
 
 
         sym = self.sym_mem
-        nsK = int(sym.K)
         K_sym = min(perTypeBudget["sym"], int(sym.filled.max().item()))
         if K_sym > 0:
             sym_slots = torch.arange(sym.capacity, device=device).view(1, sym.capacity)
@@ -4806,6 +6175,10 @@ class MemoryExtractor(AGICoreModule):
         tokens: List[torch.Tensor] = []
         valid: List[torch.Tensor] = []
         scores: List[torch.Tensor] = []
+        sources: List[torch.Tensor] = []
+        ages: List[torch.Tensor] = []
+        confidences: List[torch.Tensor] = []
+        staleness: List[torch.Tensor] = []
         for name in ("gws", "kv", "ltm_sem", "ltm_epi", "sym"):
             if name not in bank:
                 continue
@@ -4822,6 +6195,15 @@ class MemoryExtractor(AGICoreModule):
             scores.append(
                 bank["meta"][name]["score"].masked_fill(
                     ~item_valid, -torch.inf))
+            metadata = bank["meta"][name]
+            source = metadata["source"].to(dtype=torch.long).clamp_min(0)
+            age = metadata["age"].to(dtype=value.dtype).clamp_min(0.0)
+            confidence = metadata["confidence"].to(
+                dtype=value.dtype).clamp(0.0, 1.0)
+            sources.append(source)
+            ages.append(age)
+            confidences.append(confidence)
+            staleness.append(age / (1.0 + age))
         if not tokens:
             return {
                 "tokens": torch.zeros(
@@ -4833,6 +6215,10 @@ class MemoryExtractor(AGICoreModule):
         merged_tokens = torch.cat(tokens, dim=1)
         merged_valid = torch.cat(valid, dim=1)
         merged_scores = torch.cat(scores, dim=1)
+        merged_sources = torch.cat(sources, dim=1)
+        merged_ages = torch.cat(ages, dim=1)
+        merged_confidences = torch.cat(confidences, dim=1)
+        merged_staleness = torch.cat(staleness, dim=1)
         count = min(budget, int(merged_tokens.size(1)))
         _, indices = torch.topk(merged_scores, k=count, dim=1)
         merged_tokens = torch.gather(
@@ -4840,12 +6226,21 @@ class MemoryExtractor(AGICoreModule):
             1,
             indices.unsqueeze(-1).expand(B, count, self.memory_dim))
         merged_valid = torch.gather(merged_valid, 1, indices)
+        merged_sources = torch.gather(merged_sources, 1, indices)
+        merged_ages = torch.gather(merged_ages, 1, indices)
+        merged_confidences = torch.gather(
+            merged_confidences, 1, indices)
+        merged_staleness = torch.gather(merged_staleness, 1, indices)
         merged_tokens = merged_tokens * merged_valid.unsqueeze(-1).to(
             merged_tokens.dtype)
         return {
             "tokens": merged_tokens,
-            "valid": merged_valid,}
-    
+            "valid": merged_valid,
+            "source": merged_sources,
+            "age": merged_ages,
+            "confidence": merged_confidences,
+            "staleness": merged_staleness,}
+
 
     @torch.no_grad()
     def ExportTransientState(self) -> Dict[str, torch.Tensor]:
@@ -4881,7 +6276,7 @@ class MemoryExtractor(AGICoreModule):
 
     @torch.no_grad()
     def ImportTransientState(self, state: Dict[str, torch.Tensor]) -> None:
-        self._ImportCurrentState(state, includeDurable=False)
+        self.ImportCurrentState(state, includeDurable=False)
 
     @torch.no_grad()
     def ExportState(self, step: Optional[int] = None) -> Dict[str, torch.Tensor]:
@@ -4917,7 +6312,7 @@ class MemoryExtractor(AGICoreModule):
         metric = torch.where(
             keep0,
             modified_step.float(),
-            torch.full_like(modified_step.float(), -1e9))  # [B,M]
+            torch.full_like(modified_step.float(), -1e9)) # [B,M]
         _, idx = torch.sort(metric, dim=1, descending=True) # [B,M]
 
         new_valid = ar < keep_cnt.view(B, 1) # [B,M]
@@ -4942,7 +6337,7 @@ class MemoryExtractor(AGICoreModule):
             torch.gather(state["memory_realm"], 1, idx),
             torch.full_like(
                 state["memory_realm"],
-                int(Realm.UNKNOWN)))
+                ONTOLOGY_REALM_UNKNOWN))
         state["memory_reward_abs"] = torch.gather(state["memory_reward_abs"], 1, idx) * new_valid.float()
 
         state["memory_filled"] = keep_cnt # [B]
@@ -4985,7 +6380,7 @@ class MemoryExtractor(AGICoreModule):
             torch.gather(state["ltm_sem_realm"], 1, idxS),
             torch.full_like(
                 state["ltm_sem_realm"],
-                int(Realm.UNKNOWN)))
+                ONTOLOGY_REALM_UNKNOWN))
         state["ltm_sem_filled"] = keepS
 
         CapE = int(epi.capacity)
@@ -5037,13 +6432,13 @@ class MemoryExtractor(AGICoreModule):
             torch.gather(state["ltm_epi_realm"], 1, idxEpi),
             torch.full_like(
                 state["ltm_epi_realm"],
-                int(Realm.UNKNOWN)))
+                ONTOLOGY_REALM_UNKNOWN))
         state["ltm_epi_agency_id"] = torch.where(
             new_validE,
             torch.gather(state["ltm_epi_agency_id"], 1, idxEpi),
             torch.full_like(
                 state["ltm_epi_agency_id"],
-                int(Agency.UNKNOWN)))
+                ONTOLOGY_AGENCY_UNKNOWN))
         state["ltm_epi_observed_surface_parent_index"] = torch.where(
             new_validE,
             torch.gather(
@@ -5135,7 +6530,7 @@ class MemoryExtractor(AGICoreModule):
             relative_age = int(sourceNewStep) - int(value)
             return max(0, int(destinationNow) - relative_age)
 
-        def require_shape(condition: bool, message: str) -> None:
+        def RequireShape(condition: bool, message: str) -> None:
             if not condition:
                 raise ValueError(f"invalid merged memory-state shape: {message}")
 
@@ -5152,17 +6547,17 @@ class MemoryExtractor(AGICoreModule):
             ("usage_instance_descriptors", usage.instance_descriptors),
             ("usage_attribute_centroid", usage.attribute_centroid),)
         for field, destination in usage_fields:
-            require_shape(
+            RequireShape(
                 state[field].shape == destination.shape,
                 f"{field} differs from the destination")
 
         memory_keys = state["memory_keys"]
         memory_values = state["memory_values"]
-        require_shape(memory_keys.dim() == 3, "memory_keys must be [B,M,D]")
-        require_shape(memory_values.shape == memory_keys.shape, "memory_values must match memory_keys")
+        RequireShape(memory_keys.dim() == 3, "memory_keys must be [B,M,D]")
+        RequireShape(memory_values.shape == memory_keys.shape, "memory_values must match memory_keys")
         B_src, M_src, D_src = memory_keys.shape
-        require_shape(D_src == self.memory_dim, "memory feature dimension differs from the destination")
-        require_shape(state["memory_filled"].shape == (B_src,), "memory_filled must be [B]")
+        RequireShape(D_src == self.memory_dim, "memory feature dimension differs from the destination")
+        RequireShape(state["memory_filled"].shape == (B_src,), "memory_filled must be [B]")
         for field in (
             "memory_importance",
             "memory_steps",
@@ -5174,19 +6569,19 @@ class MemoryExtractor(AGICoreModule):
             "memory_source_confidence",
             "memory_realm",
             "memory_reward_abs",):
-            require_shape(state[field].shape == (B_src, M_src), f"{field} must be [B,M]")
-        require_shape(
+            RequireShape(state[field].shape == (B_src, M_src), f"{field} must be [B,M]")
+        RequireShape(
             state["memory_emotion"].shape == (B_src, M_src, self.emotion_dim),
             "memory_emotion must be [B,M,E]")
-        require_shape(state["time_step"].shape == (B_src,), "time_step must be [B]")
+        RequireShape(state["time_step"].shape == (B_src,), "time_step must be [B]")
 
         sem_keys = state["ltm_sem_keys"]
         sem_vals = state["ltm_sem_vals"]
-        require_shape(sem_keys.dim() == 3, "ltm_sem_keys must be [B,C,D]")
-        require_shape(sem_vals.shape == sem_keys.shape, "ltm_sem_vals must match ltm_sem_keys")
+        RequireShape(sem_keys.dim() == 3, "ltm_sem_keys must be [B,C,D]")
+        RequireShape(sem_vals.shape == sem_keys.shape, "ltm_sem_vals must match ltm_sem_keys")
         B_sem, C_sem, D_sem = sem_keys.shape
-        require_shape(B_sem == B_src and D_sem == self.memory_dim, "semantic-memory batch/feature dimensions differ")
-        require_shape(state["ltm_sem_filled"].shape == (B_src,), "ltm_sem_filled must be [B]")
+        RequireShape(B_sem == B_src and D_sem == self.memory_dim, "semantic-memory batch/feature dimensions differ")
+        RequireShape(state["ltm_sem_filled"].shape == (B_src,), "ltm_sem_filled must be [B]")
         for field in (
             "ltm_sem_prio",
             "ltm_sem_touch",
@@ -5198,23 +6593,23 @@ class MemoryExtractor(AGICoreModule):
             "ltm_sem_source",
             "ltm_sem_source_confidence",
             "ltm_sem_realm",):
-            require_shape(state[field].shape == (B_src, C_sem), f"{field} must be [B,C]")
-        require_shape(
+            RequireShape(state[field].shape == (B_src, C_sem), f"{field} must be [B,C]")
+        RequireShape(
             state["ltm_sem_prototype_variance"].shape == sem_keys.shape,
             "ltm_sem_prototype_variance must be [B,C,D]")
-        require_shape(
+        RequireShape(
             state["ltm_sem_global_step"].shape == (B_src,),
             "ltm_sem_global_step must be [B]")
 
         epi_keys = state["ltm_epi_keys"]
         epi_state_keys = state["ltm_epi_state_keys"]
         epi_vals = state["ltm_epi_vals"]
-        require_shape(epi_keys.dim() == 3, "ltm_epi_keys must be [B,C,D]")
-        require_shape(epi_state_keys.shape == epi_keys.shape, "ltm_epi_state_keys must match ltm_epi_keys")
-        require_shape(epi_vals.shape == epi_keys.shape, "ltm_epi_vals must match ltm_epi_keys")
+        RequireShape(epi_keys.dim() == 3, "ltm_epi_keys must be [B,C,D]")
+        RequireShape(epi_state_keys.shape == epi_keys.shape, "ltm_epi_state_keys must match ltm_epi_keys")
+        RequireShape(epi_vals.shape == epi_keys.shape, "ltm_epi_vals must match ltm_epi_keys")
         B_epi, C_epi, D_epi = epi_keys.shape
-        require_shape(B_epi == B_src and D_epi == self.memory_dim, "episodic-memory batch/feature dimensions differ")
-        require_shape(state["ltm_epi_filled"].shape == (B_src,), "ltm_epi_filled must be [B]")
+        RequireShape(B_epi == B_src and D_epi == self.memory_dim, "episodic-memory batch/feature dimensions differ")
+        RequireShape(state["ltm_epi_filled"].shape == (B_src,), "ltm_epi_filled must be [B]")
         for field in (
             "ltm_epi_prio", "ltm_epi_rew", "ltm_epi_rew_abs",
             "ltm_epi_step", "ltm_epi_last_access_step",
@@ -5228,32 +6623,32 @@ class MemoryExtractor(AGICoreModule):
             "ltm_epi_episode_id", "ltm_epi_event_id", "ltm_epi_prev_index",
             "ltm_epi_next_index", "ltm_epi_slot_generation",
             "ltm_epi_prev_generation", "ltm_epi_next_generation",):
-            require_shape(state[field].shape == (B_src, C_epi), f"{field} must be [B,C]")
-        require_shape(
+            RequireShape(state[field].shape == (B_src, C_epi), f"{field} must be [B,C]")
+        RequireShape(
             state["ltm_epi_motion_layer_prob"].shape == (B_src, C_epi, 5),
             "ltm_epi_motion_layer_prob must be [B,C,5]")
-        require_shape(
+        RequireShape(
             state["ltm_epi_surface_uv"].shape == (B_src, C_epi, 2),
             "ltm_epi_surface_uv must be [B,C,2]")
         for field in ("ltm_epi_last_event_index", "ltm_epi_current_episode_id"):
-            require_shape(state[field].shape == (B_src,), f"{field} must be [B]")
-        require_shape(
+            RequireShape(state[field].shape == (B_src,), f"{field} must be [B]")
+        RequireShape(
             state["ltm_epi_global_step"].shape == (B_src,),
             "ltm_epi_global_step must be [B]")
 
         sym_keys = state["sym_mem_P_keys"]
         sym_vals = state["sym_mem_P_vals"]
-        require_shape(sym_keys.dim() == 3, "sym_mem_P_keys must be [B,C,K]")
-        require_shape(sym_vals.shape == sym_keys.shape, "sym_mem_P_vals must match sym_mem_P_keys")
+        RequireShape(sym_keys.dim() == 3, "sym_mem_P_keys must be [B,C,K]")
+        RequireShape(sym_vals.shape == sym_keys.shape, "sym_mem_P_vals must match sym_mem_P_keys")
         B_sym, C_sym, K_sym = sym_keys.shape
-        require_shape(B_sym == B_src and K_sym == self.sym_mem.K, "symbolic-memory batch/feature dimension differs")
+        RequireShape(B_sym == B_src and K_sym == self.sym_mem.K, "symbolic-memory batch/feature dimension differs")
         for field in (
             "sym_mem_prio", "sym_mem_step", "sym_mem_last_access_step",
             "sym_mem_last_rehearsal_step", "sym_mem_touch", "sym_mem_source",
             "sym_mem_source_confidence",):
-            require_shape(state[field].shape == (B_src, C_sym), f"{field} must be [B,C]")
-        require_shape(state["sym_mem_filled"].shape == (B_src,), "sym_mem_filled must be [B]")
-        require_shape(
+            RequireShape(state[field].shape == (B_src, C_sym), f"{field} must be [B,C]")
+        RequireShape(state["sym_mem_filled"].shape == (B_src,), "sym_mem_filled must be [B]")
+        RequireShape(
             state["sym_mem_global_step"].shape == (B_src,),
             "sym_mem_global_step must be [B]")
 
@@ -5278,8 +6673,8 @@ class MemoryExtractor(AGICoreModule):
                 device=values.device).view(1, -1)
             valid = slots < state[filled_field].view(-1, 1)
             invalid = (
-                (values < int(Realm.SELF_BODY))
-                | (values > int(Realm.UNKNOWN)))
+                (values < ONTOLOGY_REALM_SELF)
+                | (values > ONTOLOGY_REALM_UNKNOWN))
             if bool((invalid & valid).any().item()):
                 raise ValueError(
                     f"{realm_field} contains an invalid entity realm")
@@ -5290,8 +6685,8 @@ class MemoryExtractor(AGICoreModule):
         epi_valid = epi_slots < state["ltm_epi_filled"].view(-1, 1)
         agency_id = state["ltm_epi_agency_id"]
         if bool((epi_valid & (
-            (agency_id < int(Agency.SELF_CAUSED))
-            | (agency_id > int(Agency.UNKNOWN))
+            (agency_id < ONTOLOGY_AGENCY_SELF)
+            | (agency_id > ONTOLOGY_AGENCY_UNKNOWN)
         )).any().item()):
             raise ValueError("ltm_epi_agency_id contains an invalid agency")
         observed_parent = state[
@@ -5321,16 +6716,16 @@ class MemoryExtractor(AGICoreModule):
         if mergeGws:
             gws_keys = state["gws_keys"]
             gws_vals = state["gws_vals"]
-            require_shape(gws_keys.dim() == 3, "gws_keys must be [B,S,D]")
-            require_shape(gws_vals.shape == gws_keys.shape, "gws_vals must match gws_keys")
+            RequireShape(gws_keys.dim() == 3, "gws_keys must be [B,S,D]")
+            RequireShape(gws_vals.shape == gws_keys.shape, "gws_vals must match gws_keys")
             B_gws, S_gws, D_gws = gws_keys.shape
-            require_shape(B_gws == B_src and D_gws == self.memory_dim, "workspace batch/feature dimensions differ")
+            RequireShape(B_gws == B_src and D_gws == self.memory_dim, "workspace batch/feature dimensions differ")
             for field in (
                 "gws_priority", "gws_ttl", "gws_created_step", "gws_last_step",
                 "gws_last_rehearsal_step", "gws_touch", "gws_source",
                 "gws_source_confidence",):
-                require_shape(state[field].shape == (B_src, S_gws), f"{field} must be [B,S]")
-            require_shape(state["gws_global_step"].shape == (B_src,), "gws_global_step must be [B]")
+                RequireShape(state[field].shape == (B_src, S_gws), f"{field} must be [B,S]")
+            RequireShape(state["gws_global_step"].shape == (B_src,), "gws_global_step must be [B]")
 
         self.FlushPendingWrites()
 
@@ -5576,7 +6971,7 @@ class MemoryExtractor(AGICoreModule):
             device=self.memory_realm.device,
             dtype=torch.int8)
         rew_abs_src = state["memory_reward_abs"].to(device=device, dtype=dtype)
-        step_src = state["memory_steps"].to(device=device, dtype=torch.long)  # [B, M]
+        step_src = state["memory_steps"].to(device=device, dtype=torch.long) # [B, M]
         access_src = state["memory_last_access_steps"].to(device=device, dtype=torch.long)
         rehearsal_src = state["memory_last_rehearsal_steps"].to(device=device, dtype=torch.long)
         touch_src = state["memory_touch"].to(device=device, dtype=torch.long)
@@ -6014,8 +7409,8 @@ class MemoryExtractor(AGICoreModule):
                 epi.event_id[b, target] = event_epi_src[b, t]
                 epi.slot_generation[b, target].clamp_min_(1)
 
-        # A merge imports historical episodes; it must not switch the
-        # destination lane's currently active episode namespace.
+
+
         epi.RebuildSequenceLinks()
 
 
@@ -6133,9 +7528,9 @@ class MemoryExtractor(AGICoreModule):
                     torch.maximum(sym.touch[b, target], sym_touch_src[b, i])
                     if target_existed else sym_touch_src[b, i])
 
-        # Smooth replay never updates procedural statistics, so a delta must not
-        # count the cloned baseline twice.  A generic full-state merge combines
-        # independent Beta and Gaussian sufficient statistics once.
+
+
+
         if sourceBaseStep is None:
             src_usage = {
                 field: state[field].to(
@@ -6240,8 +7635,177 @@ class MemoryExtractor(AGICoreModule):
             sourceNewStep=int(delta["new_step"].item()))
         self.merged_delta_signature.copy_(signature)
 
+    def MemoryDeltaRowsFingerprint(
+        self,
+        delta: Dict[str, Any],
+        destinationRows: torch.Tensor,
+        contractId: str,
+        modelSignature: str,
+        transactionId: str,
+        timelineVersion: int,
+        episodeVersion: int,
+    ) -> str:
+        digest = hashlib.sha256()
+        identity = (
+            contractId,
+            modelSignature,
+            transactionId,
+            int(timelineVersion),
+            int(episodeVersion),
+            tuple(int(row) for row in destinationRows.tolist()),
+            int(delta["base_step"].item()),
+            int(delta["new_step"].item()),
+            int(delta["kind"].item()),)
+        digest.update(repr(identity).encode("utf-8"))
+        for name in self.FULL_MEMORY_STATE_FIELDS:
+            tensor = delta["state"][name].detach().to(
+                device=torch.device("cpu")).contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(tensor.dtype).encode("utf-8"))
+            digest.update(repr(tuple(tensor.shape)).encode("utf-8"))
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
+
     @torch.no_grad()
-    def _ImportCurrentState(
+    def MergeMemoryDeltaRows(
+        self,
+        delta: Dict[str, Any],
+        destinationRows: torch.Tensor,
+        contractId: str,
+        modelSignature: str,
+        transactionId: str,
+        timelineVersion: int,
+        episodeVersion: int,
+    ) -> None:
+        expected = ("state", "base_step", "new_step", "kind")
+        if type(delta) is not dict or tuple(delta) != expected:
+            raise TypeError("memory delta does not match its transaction envelope")
+        if not all(torch.is_tensor(delta[name]) for name in expected[1:]):
+            raise TypeError("memory delta transaction metadata must be tensors")
+        if any(delta[name].numel() != 1 for name in expected[1:]):
+            raise ValueError("memory delta transaction metadata must be scalar")
+        base_step = int(delta["base_step"].item())
+        new_step = int(delta["new_step"].item())
+        kind = int(delta["kind"].item())
+        if new_step < base_step:
+            raise ValueError("delta new step precedes its base step")
+        if kind not in (1, 2):
+            raise ValueError("memory delta transaction kind is invalid")
+        state = delta["state"]
+        if type(state) is not dict or tuple(state) != self.FULL_MEMORY_STATE_FIELDS:
+            raise TypeError("memory delta state fields do not match the current schema")
+        if not all(torch.is_tensor(value) for value in state.values()):
+            raise TypeError("every memory delta state field must be a tensor")
+        if type(contractId) is not str or not contractId.strip():
+            raise ValueError("contractId must be a non-empty string")
+        signature = self.ValidateModelSignature(modelSignature)
+        if type(transactionId) is not str or not transactionId.strip():
+            raise ValueError("transactionId must be a non-empty string")
+        if type(timelineVersion) is not int or timelineVersion < 0:
+            raise ValueError("timelineVersion must be a non-negative integer")
+        if type(episodeVersion) is not int or episodeVersion < 0:
+            raise ValueError("episodeVersion must be a non-negative integer")
+        if not torch.is_tensor(destinationRows):
+            raise TypeError("destinationRows must be a tensor")
+        if destinationRows.dtype != torch.long:
+            raise TypeError("destinationRows must use torch.long")
+        if destinationRows.device != self.device:
+            raise ValueError("destinationRows must be on the memory device")
+        if destinationRows.dim() != 1 or destinationRows.numel() < 1:
+            raise ValueError("destinationRows must be a non-empty vector")
+        if state["h_state"].dim() < 1:
+            raise ValueError("memory delta state must have a batch dimension")
+        source_batch = int(state["h_state"].size(0))
+        destination_batch = int(self.h_state.size(0))
+        if source_batch != int(destinationRows.numel()):
+            raise ValueError("source batch must match destinationRows")
+        if (
+            bool((destinationRows < 0).any().item())
+            or bool((destinationRows >= destination_batch).any().item())
+        ):
+            raise ValueError("destinationRows contains an out-of-range row")
+        if int(torch.unique(destinationRows).numel()) != source_batch:
+            raise ValueError("destinationRows must be unique")
+        if (
+            self._row_merge_contract_id is not None
+            and self._row_merge_contract_id != contractId
+        ):
+            raise ValueError("row merge contract identity mismatch")
+        if (
+            self._row_merge_model_signature is not None
+            and self._row_merge_model_signature != signature
+        ):
+            raise ValueError("row merge model signature mismatch")
+        for row in destinationRows.tolist():
+            previous = self._row_merge_versions.get(int(row))
+            if previous is not None and (
+                timelineVersion < previous[0]
+                or (
+                    timelineVersion == previous[0]
+                    and episodeVersion < previous[1])
+            ):
+                raise ValueError("row merge version is stale")
+        fingerprint = self.MemoryDeltaRowsFingerprint(
+            delta,
+            destinationRows,
+            contractId,
+            signature,
+            transactionId,
+            timelineVersion,
+            episodeVersion)
+        previous_fingerprint = self._row_merge_transactions.get(transactionId)
+        if previous_fingerprint is not None:
+            if previous_fingerprint != fingerprint:
+                raise ValueError("row merge transaction identity mismatch")
+            return
+        current = self.ExportState()
+        remapped = {}
+        for name in self.FULL_MEMORY_STATE_FIELDS:
+            destination = current[name]
+            source = state[name]
+            if name in self.UNBATCHED_MEMORY_STATE_FIELDS:
+                if tuple(source.shape) != tuple(destination.shape):
+                    raise ValueError(f"memory delta field {name} has an invalid shape")
+                remapped[name] = destination.clone()
+                continue
+            expected_shape = (source_batch, *tuple(destination.shape[1:]))
+            if tuple(source.shape) != expected_shape:
+                raise ValueError(f"memory delta field {name} has an invalid shape")
+            mapped = destination.clone()
+            mapped.index_copy_(
+                0,
+                destinationRows,
+                source.to(device=mapped.device, dtype=mapped.dtype))
+            remapped[name] = mapped
+        selected = torch.zeros(
+            destination_batch,
+            device=self.device,
+            dtype=torch.bool)
+        selected[destinationRows] = True
+        frozen = self.CaptureFrozenRows(selected)
+        try:
+            self.MergeMemoryState(
+                remapped,
+                sourceBaseStep=base_step,
+                sourceNewStep=new_step)
+        except Exception:
+            transactions = dict(self._row_merge_transactions)
+            versions = dict(self._row_merge_versions)
+            self.ImportState(current)
+            self._row_merge_transactions = transactions
+            self._row_merge_versions = versions
+            raise
+        self.RestoreFrozenRows(frozen, selected)
+        self._row_merge_contract_id = contractId
+        self._row_merge_model_signature = signature
+        self._row_merge_transactions[transactionId] = fingerprint
+        for row in destinationRows.tolist():
+            self._row_merge_versions[int(row)] = (
+                timelineVersion,
+                episodeVersion)
+
+    @torch.no_grad()
+    def ImportCurrentState(
         self,
         state: Dict[str, torch.Tensor],
         *,
@@ -6334,21 +7898,26 @@ class MemoryExtractor(AGICoreModule):
 
         self.ResetInternalLoss()
         self.pending.clear()
+        if includeDurable:
+            self._row_merge_transactions.clear()
+            self._row_merge_versions.clear()
 
     @torch.no_grad()
     def ImportState(self, state: Dict[str, torch.Tensor]) -> None:
-        self._ImportCurrentState(state, includeDurable=True)
+        self.ImportCurrentState(state, includeDurable=True)
 
 
     @torch.no_grad()
     def ResetSteps(self, resetGlobal: bool = True) -> None:
         self.merged_delta_signature.fill_(-1)
+        self._row_merge_transactions.clear()
+        self._row_merge_versions.clear()
         if hasattr(self, "time_step") and isinstance(self.time_step, torch.Tensor):
-            self.time_step.zero_() 
+            self.time_step.zero_()
         if hasattr(self, "last_compress_step") and isinstance(self.last_compress_step, torch.Tensor):
-            self.last_compress_step.zero_()  
+            self.last_compress_step.zero_()
         if hasattr(self, "memory_steps") and isinstance(self.memory_steps, torch.Tensor) and self.memory_steps.numel() > 0:
-            self.memory_steps.zero_() 
+            self.memory_steps.zero_()
             self.memory_last_access_steps.zero_()
             self.memory_last_rehearsal_steps.zero_()
 
@@ -6356,10 +7925,10 @@ class MemoryExtractor(AGICoreModule):
         if gws is not None:
             if hasattr(gws, "last_step") and isinstance(gws.last_step, torch.Tensor) and gws.last_step.numel() > 0:
                 gws.created_step.zero_()
-                gws.last_step.zero_() 
+                gws.last_step.zero_()
                 gws.last_rehearsal_step.zero_()
             if resetGlobal and hasattr(gws, "global_step") and isinstance(gws.global_step, torch.Tensor):
-                gws.global_step.zero_() 
+                gws.global_step.zero_()
 
         ltm = getattr(self, "ltm", None)
         if ltm is not None:
@@ -6367,14 +7936,14 @@ class MemoryExtractor(AGICoreModule):
             epi = ltm.episodic
 
             if hasattr(sem, "step") and isinstance(sem.step, torch.Tensor) and sem.step.numel() > 0:
-                sem.step.zero_() 
+                sem.step.zero_()
                 sem.last_access_step.zero_()
                 sem.last_rehearsal_step.zero_()
             if resetGlobal and hasattr(sem, "global_step") and isinstance(sem.global_step, torch.Tensor):
-                sem.global_step.zero_() 
+                sem.global_step.zero_()
 
             if hasattr(epi, "step") and isinstance(epi.step, torch.Tensor) and epi.step.numel() > 0:
-                epi.step.zero_() 
+                epi.step.zero_()
                 epi.last_access_step.zero_()
                 epi.last_rehearsal_step.zero_()
             if resetGlobal and hasattr(epi, "global_step") and isinstance(epi.global_step, torch.Tensor):
@@ -6383,7 +7952,7 @@ class MemoryExtractor(AGICoreModule):
         sym = getattr(self, "sym_mem", None)
         if sym is not None:
             if hasattr(sym, "step") and isinstance(sym.step, torch.Tensor) and sym.step.numel() > 0:
-                sym.step.zero_() 
+                sym.step.zero_()
                 sym.last_access_step.zero_()
                 sym.last_rehearsal_step.zero_()
             if resetGlobal and hasattr(sym, "global_step") and isinstance(sym.global_step, torch.Tensor):
@@ -6392,6 +7961,8 @@ class MemoryExtractor(AGICoreModule):
     @torch.no_grad()
     def ReorderMemorySteps(self) -> None:
         self.merged_delta_signature.fill_(-1)
+        self._row_merge_transactions.clear()
+        self._row_merge_versions.clear()
 
         B, M = self.memory_steps.shape
         slots = torch.arange(M, device=self.memory_steps.device).view(1, M)
@@ -6497,7 +8068,7 @@ class TestMemoryMTool:
     def MakeVisualState(self, B: int, device: torch.device, dtype: torch.dtype = torch.float32):
         K = 8
         realm = torch.zeros(B, K, 5, device=device, dtype=dtype)
-        realm[..., int(Realm.EXTERNAL_PHYSICAL)] = 1.0
+        realm[..., ONTOLOGY_REALM_EXTERNAL] = 1.0
         agency = torch.zeros(B, K, 5, device=device, dtype=dtype)
         agency[..., 1] = 1.0
         layer_agency = torch.zeros(B, K, 5, 5, device=device, dtype=dtype)
@@ -6548,7 +8119,7 @@ class TestMemoryMTool:
                     B, K, ModuleDim.PstPartClasses, device=device, dtype=dtype),
                 "identity_embed": F.normalize(torch.randn(
                     B, K, ModuleDim.PstIdentityDim, device=device, dtype=dtype), dim=-1),
-                "pose_camera": torch.randn(B, K, 7, device=device, dtype=dtype),
+                "SpatialState": torch.randn(B, K, 7, device=device, dtype=dtype),
                 "bbox_2d": torch.randn(B, K, 4, device=device, dtype=dtype),},
             Auxiliary=auxiliary,)
 
@@ -6756,7 +8327,7 @@ class TestMemoryMTool:
             val2[0, 4] = 3.0
             realm = torch.full(
                 (B,),
-                int(Realm.EXTERNAL_PHYSICAL),
+                ONTOLOGY_REALM_EXTERNAL,
                 device=self.device,
                 dtype=torch.int8)
 
@@ -6809,12 +8380,12 @@ class TestMemoryMTool:
             epi.EnsureB(1)
             epi.StepTick()
 
-            def store_with(i, prio, rew):
+            def StoreWith(i, prio, rew):
                 k = torch.zeros(1, dim, device=self.device); k[0, i] = 1.0
                 v = torch.randn(1, dim, device=self.device)
                 realm = torch.full(
                     (1,),
-                    int(Realm.EXTERNAL_PHYSICAL),
+                    ONTOLOGY_REALM_EXTERNAL,
                     device=self.device,
                     dtype=torch.int8)
                 epi.Store(
@@ -6827,9 +8398,9 @@ class TestMemoryMTool:
                     typedMetadata=UnknownEpisodicTypeMetadata(
                         realm, dtype=k.dtype),)
 
-            store_with(0, prio=1.0, rew=0.0)
-            store_with(1, prio=1.0, rew=0.0)
-            store_with(2, prio=100.0, rew=0.0) 
+            StoreWith(0, prio=1.0, rew=0.0)
+            StoreWith(1, prio=1.0, rew=0.0)
+            StoreWith(2, prio=100.0, rew=0.0)
 
             with torch.no_grad():
                 epi.touch[0, 0] = 1
@@ -6839,7 +8410,7 @@ class TestMemoryMTool:
 
             keys_before = epi.keys.clone()
 
-            store_with(3, prio=0.5, rew=0.0)
+            StoreWith(3, prio=0.5, rew=0.0)
             keys_after = epi.keys.clone()
 
             changed = (keys_after - keys_before).abs().sum(dim=-1).squeeze(0).argmax().item()
@@ -6862,12 +8433,12 @@ class TestMemoryMTool:
             epi.EnsureB(1)
             epi.StepTick()
 
-            def store_with(i, prio, rew):
+            def StoreWith(i, prio, rew):
                 k = torch.zeros(1, dim, device=self.device); k[0, i] = 1.0
                 v = torch.randn(1, dim, device=self.device)
                 realm = torch.full(
                     (1,),
-                    int(Realm.EXTERNAL_PHYSICAL),
+                    ONTOLOGY_REALM_EXTERNAL,
                     device=self.device,
                     dtype=torch.int8)
                 epi.Store(
@@ -6880,16 +8451,16 @@ class TestMemoryMTool:
                     typedMetadata=UnknownEpisodicTypeMetadata(
                         realm, dtype=k.dtype),)
 
-            store_with(0, prio=1.0, rew=-10.0)
-            store_with(1, prio=1.0, rew=0.0)
-            store_with(2, prio=100.0, rew=0.0)
+            StoreWith(0, prio=1.0, rew=-10.0)
+            StoreWith(1, prio=1.0, rew=0.0)
+            StoreWith(2, prio=100.0, rew=0.0)
 
             with torch.no_grad():
                 epi.touch[0, :3] = 1
                 epi.step[0, :3] = epi.global_step[0]
 
             keys_before = epi.keys.clone()
-            store_with(3, prio=0.5, rew=0.0) 
+            StoreWith(3, prio=0.5, rew=0.0)
             keys_after = epi.keys.clone()
 
             changed = (keys_after - keys_before).abs().sum(dim=-1).squeeze(0).argmax().item()
@@ -7523,7 +9094,7 @@ class TestMemoryMTool:
             _ = self.CallMemForward(mem, x, tdError=td, reward=reward, emotion=emotion)
             mem.FlushPendingWrites()
 
-            def assert_unit(name: str, keys: torch.Tensor, mask: torch.Tensor):
+            def AssertUnit(name: str, keys: torch.Tensor, mask: torch.Tensor):
                 if not bool(mask.any().item()):
                     raise AssertionError(f"{name} has no valid keys to check")
                 norms = torch.linalg.vector_norm(keys[mask], ord=2, dim=-1)
@@ -7531,19 +9102,19 @@ class TestMemoryMTool:
                     raise AssertionError(f"{name} key norms not unit: {norms.detach().cpu().tolist()}")
 
             kv_mask = torch.arange(int(mem.memory_size), device=self.device).view(1, -1) < mem.memory_filled.view(-1, 1)
-            assert_unit("kv", mem.memory_keys, kv_mask)
+            AssertUnit("kv", mem.memory_keys, kv_mask)
 
             gws_mask = (mem.gws.ttl > 0) & (mem.gws.priority > 0)
-            assert_unit("gws", mem.gws.keys, gws_mask)
+            AssertUnit("gws", mem.gws.keys, gws_mask)
 
             sem = mem.ltm.semantic
             sem_mask = torch.arange(int(sem.capacity), device=self.device).view(1, -1) < sem.filled.view(-1, 1)
-            assert_unit("ltm_sem", sem.keys, sem_mask)
+            AssertUnit("ltm_sem", sem.keys, sem_mask)
 
             epi = mem.ltm.episodic
             epi_mask = torch.arange(int(epi.capacity), device=self.device).view(1, -1) < epi.filled.view(-1, 1)
-            assert_unit("ltm_epi", epi.keys, epi_mask)
-            assert_unit("ltm_epi_state", epi.state_keys, epi_mask)
+            AssertUnit("ltm_epi", epi.keys, epi_mask)
+            AssertUnit("ltm_epi_state", epi.state_keys, epi_mask)
 
             sym_n = int(mem.sym_mem.filled.max().item())
             if sym_n <= 0:
@@ -7765,7 +9336,7 @@ class TestMemoryMTool:
                 gwsTtl=6,
                 compressEvery=50,
                 emotionDim=32,)
-            
+
             cfg = self.FilterKwargs(MemoryExtractor, cfg)
 
             mem = MemoryExtractor(**cfg).to(self.device)
@@ -7873,15 +9444,15 @@ class TestMemoryMTool:
             emotion = torch.randn(B, cfg["emotionDim"], device=self.device)
             source_label = torch.zeros(B, dtype=torch.int8, device=self.device)
 
-            def print_shape(name: str, tensor: torch.Tensor):
+            def PrintShape(name: str, tensor: torch.Tensor):
                 print(f"{name}: {tuple(tensor.shape)}")
 
             with torch.no_grad():
-                print_shape("input.x", x)
-                print_shape("input.tdError", td)
-                print_shape("input.emotion", emotion)
-                print_shape("input.reward", reward)
-                print_shape("input.sourceLabel", source_label)
+                PrintShape("input.x", x)
+                PrintShape("input.tdError", td)
+                PrintShape("input.emotion", emotion)
+                PrintShape("input.reward", reward)
+                PrintShape("input.sourceLabel", source_label)
 
                 y = self.CallMemForward(
                     mem,
@@ -7890,7 +9461,7 @@ class TestMemoryMTool:
                     emotion=emotion,
                     reward=reward,
                     sourceLabel=source_label,)
-                print_shape("output.y", y)
+                PrintShape("output.y", y)
 
             assert y.shape == (B, cfg["outputDim"]), f"Output shape mismatch: {y.shape}"
             print("MemoryExtractor IO shapes test passed.")
@@ -7917,7 +9488,7 @@ class TestMemoryMTool:
                 gwsTtl=6,
                 compressEvery=10_000,
                 emotionDim=16,)
-            
+
             cfg = self.FilterKwargs(MemoryExtractor, cfg)
 
             mem = MemoryExtractor(**cfg).to(self.device)
@@ -7972,7 +9543,7 @@ class TestMemoryMTool:
                 gwsTtl=4,
                 compressEvery=10_000,
                 emotionDim=16,)
-            
+
             cfg = self.FilterKwargs(MemoryExtractor, cfg)
             mem1 = MemoryExtractor(**cfg).to(self.device).eval()
 
@@ -8215,16 +9786,13 @@ class TestMemoryMTool:
             key = torch.zeros(1, 8, device=self.device); key[0, 0] = 1.0
             value = torch.zeros(1, 8, device=self.device); value[0, 1] = 1.0
             source = torch.zeros(1, device=self.device, dtype=torch.int8)
-            realm = torch.full_like(
-                source,
-                int(Realm.EXTERNAL_PHYSICAL))
             emotion = torch.zeros(1, 4, device=self.device)
             mem.time_step.fill_(7)
             mem.KvWrite(
                 key, value, one, emotion, one, source, one, mask,
                 realm=torch.full_like(
                     source,
-                    int(Realm.EXTERNAL_PHYSICAL)))
+                    ONTOLOGY_REALM_EXTERNAL))
             snapshot = mem.ExportState()
 
             malformed = dict(snapshot)
@@ -8423,7 +9991,7 @@ class TestMemoryMTool:
                 inputDim=16,
                 ssmStateDim=16,
                 memoryDim=24,
-                memorySize=10, 
+                memorySize=10,
                 symSize=20,
                 ltmSize=20,
                 nsK=12,
@@ -8432,7 +10000,7 @@ class TestMemoryMTool:
                 gwsTtl=4,
                 compressEvery=5,
                 emotionDim=8,)
-            
+
             cfg = self.FilterKwargs(MemoryExtractor, cfg)
             mem = MemoryExtractor(**cfg).to(self.device).eval()
 
@@ -8466,7 +10034,7 @@ class TestMemoryMTool:
                 inputDim=32, ssmStateDim=32, memoryDim=48, memorySize=16,
                 symSize=32, ltmSize=32, nsK=16,
                 outputDim=48, gwsSlots=6, gwsTtl=6, compressEvery=10_000, emotionDim=16)
-            
+
             cfg = self.FilterKwargs(MemoryExtractor, cfg)
 
             mem = MemoryExtractor(**cfg).to(self.device).train()
@@ -8579,14 +10147,19 @@ class TestMemoryMTool:
                     torch.ones(2, device=self.device, dtype=mem.dtype),
                     torch.full(
                         (2,),
-                        int(Realm.EXTERNAL_PHYSICAL),
+                        ONTOLOGY_REALM_EXTERNAL,
                         device=self.device,
                         dtype=torch.int8),
                     torch.ones(2, device=self.device, dtype=torch.bool),))
             mem.pending = [pending_write]
+            plan = torch.tensor(
+                [[1.0, 2.0], [3.0, 4.0]],
+                device=self.device)
+            mem.CachePlan("active", plan, "shape-a")
 
             mem.ResetEpisodeState(torch.tensor(
                 [True, False], device=self.device))
+            cached_plan = mem.RecallPlan("active", "shape-a")
             partial_ok = (
                 torch.count_nonzero(mem.h_state[0]).item() == 0
                 and torch.count_nonzero(mem.h_state[1]).item() > 0
@@ -8596,6 +10169,13 @@ class TestMemoryMTool:
                 and float(mem.gws.keys[1, 0, 0].item()) == 7.0
                 and float(mem.gws.priority[1, 0].item()) == 1.0
                 and mem.memory_filled.tolist() == [1, 1]
+                and cached_plan is not None
+                and cached_plan["valid"].tolist() == [False, True]
+                and torch.equal(
+                    cached_plan["feature"],
+                    torch.tensor(
+                        [[0.0, 0.0], [3.0, 4.0]],
+                        device=self.device))
                 and not mem.pending)
 
             mem.pending = [pending_write]
@@ -8605,6 +10185,7 @@ class TestMemoryMTool:
                 torch.count_nonzero(mem.gws.keys).item() == 0
                 and torch.count_nonzero(mem.gws.priority).item() == 0
                 and mem.memory_filled.tolist() == [1, 1]
+                and mem.RecallPlan("active", "shape-a") is None
                 and not mem.pending)
             dtype_rejected = False
             try:
@@ -8634,7 +10215,7 @@ class TestMemoryMTool:
                 inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=32,
                 symSize=64, ltmSize=64, nsK=32,
                 outputDim=96, gwsSlots=8, gwsTtl=6, compressEvery=10_000, emotionDim=32)
-            
+
             cfg = self.FilterKwargs(MemoryExtractor, cfg)
 
             mem = MemoryExtractor(**cfg).to(self.device).train()
@@ -8706,7 +10287,7 @@ class TestMemoryMTool:
             gwsTtl=int(mem.gws.default_ttl),
             compressEvery=int(getattr(mem, "compress_every", 10_000)),
             emotionDim=int(mem.emotion_dim),)
-        
+
         cfg = self.FilterKwargs(MemoryExtractor, cfg)
 
         mem2 = MemoryExtractor(**cfg).to(device).eval()
@@ -8752,7 +10333,7 @@ class TestMemoryMTool:
                 inputDim=64, ssmStateDim=64, memoryDim=96, memorySize=48,
                 symSize=64, ltmSize=64, nsK=32,
                 outputDim=96, gwsSlots=8, gwsTtl=6, compressEvery=1000, emotionDim=32)
-            
+
             cfg = self.FilterKwargs(MemoryExtractor, cfg)
 
             mem = MemoryExtractor(**cfg).to(self.device)
@@ -8769,7 +10350,7 @@ class TestMemoryMTool:
         except Exception as e:
             print(f"MemoryExtractor numerical stability test error: {e}")
             return False
-        
+
     def TestAllTrainableParamsHaveGrad(self):
         try:
             cfg = dict(
@@ -8847,7 +10428,7 @@ class TestMemoryMTool:
         except Exception as e:
             print(f"All-trainable-params grad test error: {e}")
             return False
-        
+
     def TestSymbolicViolationBackprop(self):
         try:
             cfg = self.FilterKwargs(MemoryExtractor, dict(
@@ -9056,7 +10637,7 @@ class TestMemoryMTool:
             sem = SemanticLTM(D, 4).to(self.device)
             realm = torch.full_like(
                 source,
-                int(Realm.EXTERNAL_PHYSICAL))
+                ONTOLOGY_REALM_EXTERNAL)
             sem.Store(
                 key,
                 value,
@@ -9171,7 +10752,7 @@ class TestMemoryMTool:
             mask = torch.ones(1, device=self.device, dtype=torch.bool)
             realm = torch.full(
                 (1,),
-                int(Realm.EXTERNAL_PHYSICAL),
+                ONTOLOGY_REALM_EXTERNAL,
                 device=self.device,
                 dtype=torch.int8)
             mem.time_step.fill_(1)
@@ -9258,7 +10839,7 @@ class TestMemoryMTool:
             confidence = torch.ones(1, device=self.device)
             realm = torch.full_like(
                 source,
-                int(Realm.EXTERNAL_PHYSICAL))
+                ONTOLOGY_REALM_EXTERNAL)
             for event in range(3):
                 key = torch.zeros(1, 8, device=self.device); key[0, event] = 1.0
                 value = torch.zeros(1, 8, device=self.device); value[0, event] = float(event + 1)
@@ -9304,7 +10885,7 @@ class TestMemoryMTool:
                 dtype=torch.int8)
             realm = torch.full_like(
                 imagined,
-                int(Realm.EXTERNAL_PHYSICAL))
+                ONTOLOGY_REALM_EXTERNAL)
             for event in range(3):
                 key = torch.zeros(1, 8, device=self.device)
                 key[0, event] = 1.0
@@ -9351,7 +10932,7 @@ class TestMemoryMTool:
             confidence = torch.ones(1, device=self.device)
             realm = torch.full_like(
                 source,
-                int(Realm.EXTERNAL_PHYSICAL))
+                ONTOLOGY_REALM_EXTERNAL)
             sem.Store(
                 key_a, value_a, score, source,
                 sourceConfidence=confidence,
@@ -9394,12 +10975,12 @@ class TestMemoryMTool:
                 dtype=torch.int8)
             physical = torch.full(
                 (1,),
-                int(Realm.EXTERNAL_PHYSICAL),
+                ONTOLOGY_REALM_EXTERNAL,
                 device=self.device,
                 dtype=torch.int8)
             virtual = torch.full(
                 (1,),
-                int(Realm.VIRTUAL_CONTENT),
+                ONTOLOGY_REALM_VIRTUAL,
                 device=self.device,
                 dtype=torch.int8)
 
@@ -9411,8 +10992,8 @@ class TestMemoryMTool:
                 realm=virtual)
             assert int(mem.memory_filled[0].item()) == 2
             assert mem.memory_realm[0, :2].tolist() == [
-                int(Realm.EXTERNAL_PHYSICAL),
-                int(Realm.VIRTUAL_CONTENT)]
+                ONTOLOGY_REALM_EXTERNAL,
+                ONTOLOGY_REALM_VIRTUAL]
             assert mem.memory_source[0, :2].tolist() == [
                 MemoryType.SRC_REAL,
                 MemoryType.SRC_IMAGINE]
@@ -9429,19 +11010,19 @@ class TestMemoryMTool:
             assert int(semantic.filled[0].item()) == 2
             assert semantic.prototype_count[0, :2].tolist() == [1.0, 1.0]
             assert semantic.realm[0, :2].tolist() == [
-                int(Realm.EXTERNAL_PHYSICAL),
-                int(Realm.VIRTUAL_CONTENT)]
+                ONTOLOGY_REALM_EXTERNAL,
+                ONTOLOGY_REALM_VIRTUAL]
 
             policy_memory = self.MakeTinyMemory()
             visual_effect = torch.full(
                 (1,),
-                int(Realm.VISUAL_EFFECT),
+                ONTOLOGY_REALM_EFFECT,
                 device=self.device,
                 dtype=torch.int8)
             effect_metadata = UnknownEpisodicTypeMetadata(
                 visual_effect,
                 dtype=key.dtype)
-            effect_metadata["agency_id"].fill_(int(Agency.AUTONOMOUS))
+            effect_metadata["agency_id"].fill_(ONTOLOGY_AGENCY_AUTONOMOUS)
             effect_metadata["motion_layer_prob"][0, 4] = 1.0
             effect_metadata["surface_uv"][0] = torch.tensor(
                 [0.25, 0.75], device=self.device)
@@ -9473,9 +11054,9 @@ class TestMemoryMTool:
             assert int(policy_memory.ltm.semantic.filled[0].item()) == 0
             assert int(policy_memory.ltm.episodic.filled[0].item()) == 1
             assert int(policy_memory.ltm.episodic.realm[0, 0].item()) == int(
-                Realm.VISUAL_EFFECT)
+                ONTOLOGY_REALM_EFFECT)
             assert int(policy_memory.ltm.episodic.agency_id[0, 0].item()) == int(
-                Agency.AUTONOMOUS)
+                ONTOLOGY_AGENCY_AUTONOMOUS)
             assert torch.equal(
                 policy_memory.ltm.episodic.motion_layer_prob[0, 0],
                 effect_metadata["motion_layer_prob"][0])
@@ -9519,7 +11100,7 @@ class TestMemoryMTool:
             visual.SemanticNodes["node_logits"][..., 1] = 10.0
             realm = visual.Auxiliary["RealmProb"]
             realm.zero_()
-            realm[..., int(Realm.VIRTUAL_CONTENT)] = 1.0
+            realm[..., ONTOLOGY_REALM_VIRTUAL] = 1.0
             visual.Auxiliary["PhysicalInteractionProb"].zero_()
             visual.Auxiliary["ContentChangeProb"].zero_()
             attended = torch.zeros(1, 16, device=self.device)
@@ -9529,7 +11110,7 @@ class TestMemoryMTool:
 
             ontology = mem.BuildOntologyObjectContext(attended, visual)
             assert int(ontology["realm_id"][0].item()) == int(
-                Realm.VIRTUAL_CONTENT)
+                ONTOLOGY_REALM_VIRTUAL)
             _, first = mem.DetectEventBoundary(
                 attended, visual, intent, zero, zero, zero, one, ontology)
             assert bool(first.item())
@@ -9564,10 +11145,10 @@ class TestMemoryMTool:
             auxiliary["PerceptualPresence"][0, 0] = 1.0
             auxiliary["RealmProb"].zero_()
             auxiliary["RealmProb"][
-                0, 0, int(Realm.VIRTUAL_CONTENT)] = 1.0
+                0, 0, ONTOLOGY_REALM_VIRTUAL] = 1.0
             auxiliary["AgencyProb"].zero_()
             auxiliary["AgencyProb"][
-                0, 0, int(Agency.AUTONOMOUS)] = 1.0
+                0, 0, ONTOLOGY_AGENCY_AUTONOMOUS] = 1.0
             auxiliary["MotionLayerProb"].zero_()
             auxiliary["MotionLayerProb"][0, 0, 3] = 1.0
             auxiliary["BodyMembershipProb"].zero_()
@@ -9609,10 +11190,10 @@ class TestMemoryMTool:
             episodic = mem.ltm.episodic
             assert int(episodic.filled[0].item()) == 1
             assert int(episodic.realm[0, 0].item()) == int(
-                Realm.VIRTUAL_CONTENT)
+                ONTOLOGY_REALM_VIRTUAL)
             assert int(episodic.source[0, 0].item()) == MemoryType.SRC_REAL
             assert int(episodic.agency_id[0, 0].item()) == int(
-                Agency.AUTONOMOUS)
+                ONTOLOGY_AGENCY_AUTONOMOUS)
             assert int(episodic.observed_surface_parent_index[0, 0].item()) == 1
             assert torch.allclose(
                 episodic.surface_uv[0, 0],
@@ -9687,7 +11268,7 @@ class TestMemoryMTool:
                 visual.SemanticNodes["object_class_logits"],
                 visual.SemanticNodes["part_class_logits"],
                 visual.SemanticNodes["identity_embed"],
-                visual.SemanticNodes["pose_camera"],
+                visual.SemanticNodes["SpatialState"],
                 visual.SemanticNodes["bbox_2d"],]
             for value in differentiable_inputs:
                 value.requires_grad_(True)
@@ -9772,7 +11353,7 @@ class TestMemoryMTool:
             value = torch.zeros(1, 8, device=self.device); value[0, 1] = 1.0
             realm = torch.full(
                 (1,),
-                int(Realm.EXTERNAL_PHYSICAL),
+                ONTOLOGY_REALM_EXTERNAL,
                 device=self.device,
                 dtype=torch.int8)
             common = dict(
@@ -9864,7 +11445,7 @@ class TestMemoryMTool:
             source = torch.zeros(1, device=self.device, dtype=torch.int8)
             realm = torch.full_like(
                 source,
-                int(Realm.EXTERNAL_PHYSICAL))
+                ONTOLOGY_REALM_EXTERNAL)
             emotion = torch.zeros(1, 4, device=self.device)
 
             destination.time_step.fill_(10)
@@ -9962,10 +11543,10 @@ class TestMemoryMTool:
             source = torch.zeros(1, device=self.device, dtype=torch.int8)
             realm = torch.full_like(
                 source,
-                int(Realm.EXTERNAL_PHYSICAL))
+                ONTOLOGY_REALM_EXTERNAL)
             realm = torch.full_like(
                 source,
-                int(Realm.EXTERNAL_PHYSICAL))
+                ONTOLOGY_REALM_EXTERNAL)
             base.ltm.semantic.global_step.fill_(10)
             base.ltm.semantic.Store(
                 key_a, value_a, one, source, sourceConfidence=one,
@@ -10039,7 +11620,7 @@ class TestMemoryMTool:
             emotion = torch.zeros(1, 4, device=self.device)
             realm = torch.full(
                 (1,),
-                int(Realm.EXTERNAL_PHYSICAL),
+                ONTOLOGY_REALM_EXTERNAL,
                 device=self.device,
                 dtype=torch.int8)
 
@@ -10111,14 +11692,14 @@ class TestMemoryMTool:
                     device=self.device)
                 realm = torch.full(
                     (1,),
-                    int(Realm.EXTERNAL_PHYSICAL),
+                    ONTOLOGY_REALM_EXTERNAL,
                     device=self.device,
                     dtype=torch.int8)
                 typed_metadata = UnknownEpisodicTypeMetadata(
                     realm,
                     dtype=key.dtype)
                 typed_metadata["agency_id"].fill_(
-                    int(Agency.EXTERNAL_CAUSED))
+                    ONTOLOGY_AGENCY_EXTERNAL)
                 typed_metadata["motion_layer_prob"][0, event % 5] = 1.0
                 typed_metadata["observed_surface_parent_index"].fill_(event)
                 typed_metadata["surface_uv"][0] = torch.tensor(
@@ -10235,7 +11816,7 @@ class TestMemoryMTool:
             source = torch.zeros(B, device=self.device, dtype=torch.int8)
             realm = torch.full_like(
                 source,
-                int(Realm.EXTERNAL_PHYSICAL))
+                ONTOLOGY_REALM_EXTERNAL)
             confidence = torch.ones(B, device=self.device)
             write_mask = torch.tensor([False, True], device=self.device)
             ttl = torch.full((B,), 4, device=self.device, dtype=torch.long)
@@ -10313,7 +11894,7 @@ class TestMemoryMTool:
             source = torch.zeros(1, device=self.device, dtype=torch.int8)
             realm = torch.full_like(
                 source,
-                int(Realm.EXTERNAL_PHYSICAL))
+                ONTOLOGY_REALM_EXTERNAL)
 
             semantic = SemanticLTM(8, 4).to(self.device)
             semantic.Store(
@@ -10464,26 +12045,26 @@ class TestMemoryMTool:
                     film[-1].bias.zero_()
                     film[-1].bias[D:] = 1.0
 
-            def zero_recall(module, query, *args, returnEvidence=False, **kwargs):
+            def ZeroRecall(module, query, *args, returnEvidence=False, **kwargs):
                 out = query.new_zeros(query.size(0), D)
                 evidence = query.new_zeros(query.size(0), 1)
                 return (out, evidence) if returnEvidence else out
 
-            def zero_ltm(module, query, *args, returnEvidence=False, **kwargs):
+            def ZeroLtm(module, query, *args, returnEvidence=False, **kwargs):
                 out = query.new_zeros(query.size(0), D)
                 evidence = query.new_zeros(query.size(0), 1)
                 if returnEvidence:
                     return out, out.clone(), evidence, evidence.clone()
                 return out, out.clone()
 
-            memory.Retrieve = MethodType(zero_recall, memory)
-            memory.gws.Attend = MethodType(zero_recall, memory.gws)
-            memory.ltm.Retrieve = MethodType(zero_ltm, memory.ltm)
+            memory.Retrieve = MethodType(ZeroRecall, memory)
+            memory.gws.Attend = MethodType(ZeroRecall, memory.gws)
+            memory.ltm.Retrieve = MethodType(ZeroLtm, memory.ltm)
             memory.ltm.episodic.Retrieve = MethodType(
-                zero_recall,
+                ZeroRecall,
                 memory.ltm.episodic)
             memory.ltm.RetrieveEpisodeSequence = MethodType(
-                zero_recall,
+                ZeroRecall,
                 memory.ltm)
 
             captured = {}
@@ -10508,7 +12089,7 @@ class TestMemoryMTool:
                 symSize=64, ltmSize=64, nsK=32,
                 outputDim=96, gwsSlots=8, gwsTtl=6,
                 compressEvery=10_000, emotionDim=32)
-            
+
             cfg = self.FilterKwargs(MemoryExtractor, cfg)
 
             mem = MemoryExtractor(**cfg).to(self.device).train()
@@ -10569,7 +12150,7 @@ class TestMemoryMTool:
                 f"LossDecrease test passed. "
                 f"base head={base_head:.6f} -> tail={base_tail:.6f}; "
                 f"total head={total_head:.6f} -> tail={total_tail:.6f}")
-            
+
             return True
 
         except AssertionError as e:
@@ -10577,6 +12158,136 @@ class TestMemoryMTool:
             return False
         except Exception as e:
             print(f"LossDecrease test error: {e}")
+            return False
+
+    def TestSignatureBoundPlanAndSkillCache(self):
+        try:
+            memory = self.MakeTinyMemory()
+            plan = torch.randn(2, 7, device=self.device)
+            skill = torch.randn(2, 5, device=self.device)
+            memory.CachePlan("active", plan, "shape-a")
+            memory.CacheSkill("refine", skill, "shape-a")
+            recalled_plan = memory.RecallPlan("active", "shape-a")
+            recalled_skill = memory.RecallSkill("refine", "shape-a")
+            recalled_plan["feature"].zero_()
+            recalled_skill.zero_()
+            if not torch.equal(
+                memory.RecallPlan("active", "shape-a")["feature"],
+                plan):
+                return False
+            if not torch.equal(memory.RecallSkill("refine", "shape-a"), skill):
+                return False
+            memory.AgePlanCache()
+            if not torch.equal(
+                memory.RecallPlan("active", "shape-a")["age"],
+                torch.ones(2, device=self.device, dtype=torch.long)
+            ):
+                return False
+            memory.RecordFailureEpisode(
+                torch.randn(2, 8, device=self.device),
+                torch.randn(2, 3, device=self.device),
+                "shape-a")
+            cache_state = memory.ExportCognitiveCacheState()
+            restored = self.MakeTinyMemory(batch=2)
+            restored.ImportCognitiveCacheState(
+                cache_state,
+                modelSignature="shape-a",
+                batchSize=2)
+            restored_plan = restored.RecallPlan("active", "shape-a")
+            if (
+                restored_plan is None
+                or not torch.equal(
+                    restored_plan["age"],
+                    torch.ones(2, device=self.device, dtype=torch.long))
+                or not torch.equal(restored_plan["feature"], plan)
+                or len(restored.SampleOfflineReplay(1, "shape-a")) != 1
+            ):
+                return False
+            rejected = 0
+            for recall in (
+                lambda: memory.RecallPlan("active", "shape-b"),
+                lambda: memory.RecallSkill("refine", "shape-b"),
+                lambda: memory.CachePlan("active", plan, "shape-b"),
+                lambda: memory.CacheSkill("refine", skill, "shape-b")):
+                try:
+                    recall()
+                except ValueError:
+                    rejected += 1
+            return rejected == 4
+        except Exception as error:
+            print(f"SignatureBoundPlanAndSkillCache error: {error}")
+            return False
+
+    def TestReplayAndTransitionEpisodes(self):
+        try:
+            memory = self.MakeTinyMemory()
+            context = torch.randn(2, 8, device=self.device)
+            outcome = torch.randn(2, 4, device=self.device)
+            memory.RecordHierarchyTransition(
+                context,
+                torch.tensor([0.2, 0.8], device=self.device),
+                torch.tensor([0.0, 1.0], device=self.device),
+                "shape-a")
+            memory.RecordFailureEpisode(
+                context,
+                outcome,
+                "shape-a")
+            memory.RecordCounterfactualEpisode(
+                context,
+                -outcome,
+                "shape-a")
+            replay = memory.SampleOfflineReplay(8, "shape-a")
+            if len(replay) != 3:
+                return False
+            kinds = {item["kind"] for item in replay}
+            if kinds != {"hierarchyTransition", "failure", "counterfactual"}:
+                return False
+            replay[0]["context"].zero_()
+            replay_again = memory.SampleOfflineReplay(8, "shape-a")
+            if not bool(any(item["context"].abs().sum().item() > 0 for item in replay_again)):
+                return False
+            try:
+                memory.SampleOfflineReplay(1, "shape-b")
+                return False
+            except ValueError:
+                return True
+        except Exception as error:
+            print(f"ReplayAndTransitionEpisodes error: {error}")
+            return False
+
+    def TestSemanticReconsolidation(self):
+        try:
+            memory = self.MakeTinyMemory()
+            memory.EnsureB(1)
+            query = F.normalize(
+                torch.randn(1, memory.memory_dim, device=self.device),
+                dim=-1)
+            original = torch.randn(1, memory.memory_dim, device=self.device)
+            revised = torch.randn(1, memory.memory_dim, device=self.device)
+            memory.ltm.semantic.Store(
+                query,
+                original,
+                torch.ones(1, device=self.device),
+                realm=torch.full(
+                    (1,),
+                    ONTOLOGY_REALM_EXTERNAL,
+                    device=self.device,
+                    dtype=torch.int8),
+                writeMask=torch.ones(1, device=self.device, dtype=torch.bool))
+            before = memory.ltm.semantic.vals[0, 0].clone()
+            updated = memory.ReconsolidateSemantic(
+                query,
+                revised,
+                torch.ones(1, device=self.device))
+            after = memory.ltm.semantic.vals[0, 0]
+            if not bool(updated.all().item()):
+                return False
+            if torch.equal(before, after):
+                return False
+            memory.SemanticConsolidation(topk=1)
+            return bool(torch.isfinite(after).all().item())
+        except Exception as error:
+            print(f"SemanticReconsolidation error: {error}")
             return False
 
     def RunAll(self):
@@ -10643,6 +12354,9 @@ class TestMemoryMTool:
             "AutoCompress": self.TestAutoCompress(),
             "ResetAndSoftReset": self.TestResetAndSoftReset(),
             "PartialEpisodeResetPreservesSharedState": self.TestPartialEpisodeResetPreservesSharedState(),
+            "SignatureBoundPlanAndSkillCache": self.TestSignatureBoundPlanAndSkillCache(),
+            "ReplayAndTransitionEpisodes": self.TestReplayAndTransitionEpisodes(),
+            "SemanticReconsolidation": self.TestSemanticReconsolidation(),
             "TrainStepSmoke": self.TrainStepSmoke(),
             "NumericalStability": self.TestNumericalStability(),
             "AllTrainableParamsHaveGrad": self.TestAllTrainableParamsHaveGrad(),

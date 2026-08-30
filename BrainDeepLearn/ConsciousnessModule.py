@@ -1,4 +1,4 @@
-from __future__ import annotations 
+from __future__ import annotations
 from typing import Optional, Dict, Tuple, NamedTuple
 from FunctionTools import AGICoreModule, RoPEMultiheadAttention
 
@@ -64,7 +64,7 @@ class ConsciousnessHyperNet(AGICoreModule):
     def forward(self, ctxTensor: torch.Tensor) -> Dict[str, torch.Tensor]:
         ctx = ctxTensor # [B, ctxDim]
         B, D = ctx.shape
-        h = self.mlp(ctx) # [B, out_dim] 
+        h = self.mlp(ctx) # [B, out_dim]
 
         cur = 0
         hs = self.total_self_params
@@ -169,12 +169,12 @@ class NeuroGeoControlFusion(AGICoreModule):
             nn.LayerNorm(self.dev_dim),
             nn.Linear(self.dev_dim, self.dev_dim),
             nn.GELU(),)
-        
+
         self.self_path = nn.Sequential(
             nn.LayerNorm(self.self_dim),
             nn.Linear(self.self_dim, self.dev_dim),
             nn.GELU(),)
-        
+
         self.intent_path = nn.Sequential(
             nn.LayerNorm(self.intent_dim),
             nn.Linear(self.intent_dim, self.dev_dim),
@@ -184,12 +184,12 @@ class NeuroGeoControlFusion(AGICoreModule):
             nn.Linear(2 * self.dev_dim, self.dev_dim),
             nn.LayerNorm(self.dev_dim),
             nn.GELU(),)
-        
+
         self.cross_di = nn.Sequential(
             nn.Linear(2 * self.dev_dim, self.dev_dim),
             nn.LayerNorm(self.dev_dim),
             nn.GELU(),)
-        
+
         self.cross_si = nn.Sequential(
             nn.Linear(2 * self.dev_dim, self.dev_dim),
             nn.LayerNorm(self.dev_dim),
@@ -253,20 +253,20 @@ class NeuroGeoControlFusion(AGICoreModule):
 
 
 class ConsciousnessOutput(NamedTuple):
-    self_sem: torch.Tensor 
-    intent_sem: torch.Tensor  
+    self_sem: torch.Tensor
+    intent_sem: torch.Tensor
     extras: Dict[str, torch.Tensor]
 
 class ConsciousnessExtractor(AGICoreModule):
     def __init__(
         self,
-        memItemDim: int = 1024,  
-        worldItemDim: int = 512, 
+        memItemDim: int = 1024,
+        worldItemDim: int = 512,
         symItemDim: int = 256,
         hiddenDim: int = 512,
-        devDim: int = 512, 
-        selfDim: int = 1024, 
-        intentDim: int = 1024, 
+        devDim: int = 512,
+        selfDim: int = 1024,
+        intentDim: int = 1024,
         nSelfBlocks: int = 4,
         nIntentBlocks: int = 4,
         hyperHiddenDim: int = 1024,
@@ -294,7 +294,7 @@ class ConsciousnessExtractor(AGICoreModule):
             nn.LayerNorm(hiddenDim),
             nn.GELU(),
             nn.Linear(hiddenDim, 1),)
-        
+
         self.world_score_net = nn.Sequential(
             nn.Linear(self.world_item_dim, hiddenDim),
             nn.LayerNorm(hiddenDim),
@@ -305,7 +305,7 @@ class ConsciousnessExtractor(AGICoreModule):
             nn.Linear(3 * self.mem_item_dim, self.mem_item_dim),
             nn.LayerNorm(self.mem_item_dim),
             nn.GELU(),)
-        
+
         self.world_agg_proj = nn.Sequential(
             nn.Linear(3 * self.world_item_dim, self.world_item_dim),
             nn.LayerNorm(self.world_item_dim),
@@ -326,12 +326,12 @@ class ConsciousnessExtractor(AGICoreModule):
             nn.LayerNorm(self.world_item_dim),
             nn.Linear(self.world_item_dim, hyperHiddenDim),
             nn.GELU(),)
-        
+
         self.ctx_mem_proj = nn.Sequential(
             nn.LayerNorm(self.mem_item_dim),
             nn.Linear(self.mem_item_dim, hyperHiddenDim),
             nn.GELU(),)
-        
+
         self.ctx_dev_proj = nn.Sequential(
             nn.LayerNorm(self.dev_dim),
             nn.Linear(self.dev_dim, hyperHiddenDim),
@@ -340,11 +340,11 @@ class ConsciousnessExtractor(AGICoreModule):
         self.ctx_world_logvar = nn.Sequential(
             nn.LayerNorm(self.world_item_dim),
             nn.Linear(self.world_item_dim, 1),)
-        
+
         self.ctx_mem_logvar = nn.Sequential(
             nn.LayerNorm(self.mem_item_dim),
             nn.Linear(self.mem_item_dim, 1),)
-        
+
         self.ctx_dev_logvar = nn.Sequential(
             nn.LayerNorm(self.dev_dim),
             nn.Linear(self.dev_dim, 1),)
@@ -353,53 +353,71 @@ class ConsciousnessExtractor(AGICoreModule):
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, hyperHiddenDim),
             nn.GELU(),)
-        
+
         self.ctx_prior = nn.Sequential(
             nn.Linear(self.self_dim + self.intent_dim + self.dev_dim, hyperHiddenDim),
             nn.LayerNorm(hyperHiddenDim),
             nn.GELU(),
             nn.Linear(hyperHiddenDim, hyperHiddenDim),)
-        
+
         self.ctx_kalman_gain = nn.Sequential(
             nn.LayerNorm(2 * hyperHiddenDim),
             nn.Linear(2 * hyperHiddenDim, hyperHiddenDim),
             nn.Sigmoid(),)
-        
+
         self.ctx_post_norm = nn.LayerNorm(hyperHiddenDim)
 
         self.ctx_query_proj = nn.Sequential(
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, hyperHiddenDim),)
 
-        def pick_heads(embed_dim: int) -> int:
+        def PickHeads(embed_dim: int) -> int:
             for h in (8, 4, 2, 1):
                 if (embed_dim % h) == 0:
                     return h
             return 1
 
-        self.ctx_attn_heads = pick_heads(hyperHiddenDim)
+        self.ctx_attn_heads = PickHeads(hyperHiddenDim)
 
         self.mem_token_proj = nn.Sequential(
             nn.LayerNorm(self.mem_item_dim),
             nn.Linear(self.mem_item_dim, hyperHiddenDim),)
-        
+
         self.world_token_proj = nn.Sequential(
             nn.LayerNorm(self.world_item_dim),
             nn.Linear(self.world_item_dim, hyperHiddenDim),)
-        
+
         self.mem_cross_attn = RoPEMultiheadAttention(
             embedDim=hyperHiddenDim,
             numHeads=self.ctx_attn_heads,)
-        
+
         self.world_cross_attn = RoPEMultiheadAttention(
             embedDim=hyperHiddenDim,
             numHeads=self.ctx_attn_heads,)
-        
+
+        self.source_count = 32
+        self.source_embedding = nn.Embedding(
+            self.source_count,
+            hyperHiddenDim)
+        self.source_priority = nn.Embedding(self.source_count, 1)
+        self.metadata_gain = nn.Parameter(torch.zeros(3))
+        self.ignition_context_gain = nn.Parameter(torch.zeros(2))
+        self.mem_ignition_norm = nn.LayerNorm(hyperHiddenDim)
+        self.world_ignition_norm = nn.LayerNorm(hyperHiddenDim)
+        self.mem_ignition_count = max(1, min(topKMem, max(1, topKMem // 2)))
+        self.world_ignition_count = max(1, min(topKWorld, max(1, topKWorld // 2)))
+        self.content_competition_head = nn.Sequential(
+            nn.LayerNorm(hyperHiddenDim),
+            nn.Linear(hyperHiddenDim, 3))
+        nn.init.zeros_(self.content_competition_head[-1].weight)
+        nn.init.zeros_(self.content_competition_head[-1].bias)
+        self.content_competition_gain = nn.Parameter(torch.tensor(0.0))
+
         self.mem_obs_fuse = nn.Sequential(
             nn.LayerNorm(2 * hyperHiddenDim),
             nn.Linear(2 * hyperHiddenDim, hyperHiddenDim),
             nn.GELU(),)
-        
+
         self.world_obs_fuse = nn.Sequential(
             nn.LayerNorm(2 * hyperHiddenDim),
             nn.Linear(2 * hyperHiddenDim, hyperHiddenDim),
@@ -414,7 +432,7 @@ class ConsciousnessExtractor(AGICoreModule):
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, hyperHiddenDim),
             nn.GELU(),)
-        
+
         self.z_next_pred = nn.Sequential(
             nn.Linear(self.self_dim + self.intent_dim + self.dev_dim, hyperHiddenDim),
             nn.LayerNorm(hyperHiddenDim),
@@ -425,12 +443,12 @@ class ConsciousnessExtractor(AGICoreModule):
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, hyperHiddenDim),
             nn.GELU(),)
-        
+
         self.z_to_mem = nn.Sequential(
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, hyperHiddenDim),
             nn.GELU(),)
-        
+
         self.z_to_dev = nn.Sequential(
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, hyperHiddenDim),
@@ -442,15 +460,15 @@ class ConsciousnessExtractor(AGICoreModule):
         self.nce_proj_z = nn.Sequential(
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, self.nce_dim),)
-        
+
         self.nce_proj_world = nn.Sequential(
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, self.nce_dim),)
-        
+
         self.nce_proj_mem = nn.Sequential(
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, self.nce_dim),)
-        
+
         self.nce_proj_dev = nn.Sequential(
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, self.nce_dim),)
@@ -468,7 +486,7 @@ class ConsciousnessExtractor(AGICoreModule):
             ConsciousHebbianLinear(in_self, self.self_dim),
             nn.LayerNorm(self.self_dim),
             nn.GELU(),)
-        
+
         self.self_blocks = nn.ModuleList([FiLMBlock(self.self_dim, self.self_dim) for _ in range(self.n_self_blocks)])
 
         in_intent = self.self_dim + self.mem_item_dim + self.dev_dim
@@ -476,22 +494,22 @@ class ConsciousnessExtractor(AGICoreModule):
             ConsciousHebbianLinear(in_intent, self.intent_dim),
             nn.LayerNorm(self.intent_dim),
             nn.GELU(),)
-        
+
         self.intent_blocks = nn.ModuleList([FiLMBlock(self.intent_dim, self.intent_dim) for _ in range(self.n_intent_blocks)])
 
         self.ctx_to_self = nn.Sequential(
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, self.self_dim),)
-        
+
         self.ctx_to_self_gate = nn.Sequential(
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, 1),
             nn.Sigmoid(),)
-        
+
         self.ctx_to_intent = nn.Sequential(
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, self.intent_dim),)
-        
+
         self.ctx_to_intent_gate = nn.Sequential(
             nn.LayerNorm(hyperHiddenDim),
             nn.Linear(hyperHiddenDim, 1),
@@ -505,7 +523,7 @@ class ConsciousnessExtractor(AGICoreModule):
             hiddenMul=2,
             dampMin=0.05,
             dampMax=0.35,)
-        
+
         self.mem_query_net = nn.Sequential(
             nn.LayerNorm(self.self_dim),
             nn.Linear(self.self_dim, self.mem_item_dim),)
@@ -521,7 +539,7 @@ class ConsciousnessExtractor(AGICoreModule):
         self.world_focus_to_self = nn.Sequential(
             nn.LayerNorm(self.world_item_dim),
             nn.Linear(self.world_item_dim, self.self_dim),)
-        
+
         self.arousal_net = nn.Sequential(
             nn.LayerNorm(self.dev_dim),
             nn.Linear(self.dev_dim, 1),
@@ -532,12 +550,12 @@ class ConsciousnessExtractor(AGICoreModule):
             nn.LayerNorm(self.self_dim),
             nn.Linear(self.self_dim, 1),
             nn.Sigmoid(),)
-        
+
         self.world_gain_net = nn.Sequential(
             nn.LayerNorm(self.self_dim),
             nn.Linear(self.self_dim, 1),
             nn.Sigmoid(),)
-        
+
         self.gain_min = 0.05
         self.gain_max = 0.35
 
@@ -550,6 +568,38 @@ class ConsciousnessExtractor(AGICoreModule):
         self.register_buffer("_last_sem", torch.zeros(1, self.self_dim), persistent=True)
         self.register_buffer("_state_valid", torch.zeros(1, dtype=torch.bool), persistent=True)
         self.register_buffer("_step", torch.zeros(1, dtype=torch.long), persistent=True)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,):
+        compatibility_prefixes = (
+            "source_embedding.",
+            "source_priority.",
+            "metadata_gain",
+            "ignition_context_gain",
+            "mem_ignition_norm.",
+            "world_ignition_norm.",
+            "content_competition_head.",
+            "content_competition_gain")
+        for name, value in self.state_dict().items():
+            if name.startswith(compatibility_prefixes):
+                key = prefix + name
+                if key not in state_dict:
+                    state_dict[key] = value.detach().clone()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs)
 
     @torch.no_grad()
     def EnsureB(self, B: int):
@@ -607,9 +657,9 @@ class ConsciousnessExtractor(AGICoreModule):
             top_w = torch.zeros(B, 0, device=device)
             return focus, top_idx, top_w
 
-        q = F.normalize(query, dim=-1).unsqueeze(1) 
+        q = F.normalize(query, dim=-1).unsqueeze(1)
         x = F.normalize(bank, dim=-1)
-        sim = (q * x).sum(-1) 
+        sim = (q * x).sum(-1)
         valid = (
             torch.ones(B, N, device=device, dtype=torch.bool)
             if validMask is None
@@ -637,7 +687,7 @@ class ConsciousnessExtractor(AGICoreModule):
 
         top_items = torch.gather(bank, 1,top_idx.unsqueeze(-1).expand(-1, -1, D) )
 
-        focus = torch.einsum('bk,bkd->bd', top_w, top_items) 
+        focus = torch.einsum('bk,bkd->bd', top_w, top_items)
 
         return focus, top_idx, top_w # focus: [B, D], top_w: [B, k_top], top_idx: [B, k_top]
 
@@ -648,7 +698,8 @@ class ConsciousnessExtractor(AGICoreModule):
         scoreNet: nn.Module,
         topK: int,
         randK: int,
-        validMask: Optional[torch.Tensor] = None,) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        validMask: Optional[torch.Tensor] = None,
+        metadata: Optional[Dict[str, torch.Tensor]] = None,) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
         bank = bankTensor
         score_net = scoreNet
@@ -663,7 +714,7 @@ class ConsciousnessExtractor(AGICoreModule):
             stats = {
                 "score_mean": torch.zeros(B, 1, device=device, dtype=bank.dtype),
                 "n_items": torch.zeros(B, 1, device=device, dtype=bank.dtype),}
-            
+
             return summary, stats
 
         valid = (
@@ -690,7 +741,7 @@ class ConsciousnessExtractor(AGICoreModule):
             masked_scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
             top_scores, top_idx = torch.topk(masked_scores, k=k_top, dim=1) # [B, k_top]
 
-            idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, D) 
+            idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, D)
             top_items = torch.gather(bank, 1, idx_exp) # [B, k_top, D]
             top_valid = torch.gather(valid, 1, top_idx)
             top_w = F.softmax(top_scores, dim=-1) * top_valid.to(scores.dtype)
@@ -706,8 +757,30 @@ class ConsciousnessExtractor(AGICoreModule):
             if k_top > 0:
                 avail_mask.scatter_(1, top_idx, False)
 
-            rand_noise = torch.rand(B, N, device=device)
-            rand_scores = rand_noise.masked_fill(~avail_mask, -1.0) # [B, N]
+            if self.training:
+                coverage_scores = torch.rand(
+                    B,
+                    N,
+                    device=device,
+                    dtype=bank.dtype)
+            else:
+                anchor = F.normalize(top_mean, dim=-1).unsqueeze(1)
+                normalized_bank = F.normalize(bank, dim=-1)
+                diversity = 1.0 - (normalized_bank * anchor).sum(dim=-1)
+                magnitude = torch.tanh(bank.square().mean(dim=-1).sqrt())
+                coverage_scores = diversity + 0.125 * magnitude
+                if metadata is not None:
+                    confidence = metadata["confidence"]
+                    age = metadata["age"]
+                    staleness = metadata["staleness"]
+                    coverage_scores = (
+                        coverage_scores
+                        + 0.25 * torch.log(confidence.clamp_min(1e-6))
+                        - 0.125 * torch.log1p(age)
+                        - 0.125 * staleness)
+            rand_scores = coverage_scores.masked_fill(
+                ~avail_mask,
+                torch.finfo(coverage_scores.dtype).min) # [B, N]
 
             _, rand_idx = torch.topk(rand_scores, k=k_rand, dim=1) # [B, k_rand]
             idx_exp2 = rand_idx.unsqueeze(-1).expand(-1, -1, D)
@@ -740,9 +813,17 @@ class ConsciousnessExtractor(AGICoreModule):
         dtype: torch.dtype,) -> Tuple[torch.Tensor, torch.Tensor]:
         if not isinstance(bank, dict):
             raise TypeError(f"{bankRole} bank must be a dict")
-        if set(bank.keys()) != {"tokens", "valid"}:
+        allowed = {
+            "tokens",
+            "valid",
+            "source",
+            "age",
+            "confidence",
+            "staleness"}
+        if not {"tokens", "valid"}.issubset(bank.keys()) or not set(
+                bank.keys()).issubset(allowed):
             raise ValueError(
-                f"{bankRole} bank must contain exactly 'tokens' and 'valid'")
+                f"{bankRole} bank contains unsupported fields")
 
         tokens = bank["tokens"]
         valid = bank["valid"]
@@ -773,6 +854,323 @@ class ConsciousnessExtractor(AGICoreModule):
                 f"{bankRole}.valid must have shape {tuple(tokens.shape[:2])}, "
                 f"got {tuple(valid.shape)}")
         return tokens.contiguous(), valid.contiguous()
+
+    def NormalizeBankMetadata(
+        self,
+        bank: BankInput,
+        tokens: torch.Tensor,
+        valid: torch.Tensor,
+        defaultSource: int,) -> Dict[str, torch.Tensor]:
+        B, N = tokens.shape[:2]
+        shape = (B, N)
+        source = bank.get("source")
+        if source is None:
+            source = torch.full(
+                shape,
+                defaultSource,
+                device=tokens.device,
+                dtype=torch.long)
+        if not isinstance(source, torch.Tensor):
+            raise TypeError("bank source must be a tensor")
+        if source.dtype != torch.long:
+            raise TypeError("bank source must use torch.long")
+        if source.device != tokens.device:
+            raise ValueError("bank source must be on the token device")
+        if source.shape != shape:
+            raise ValueError(f"bank source must have shape {shape}")
+        if source.numel() > 0 and (
+                int(source.min().item()) < 0
+                or int(source.max().item()) >= self.source_count):
+            raise ValueError("bank source is outside the supported range")
+
+        values: Dict[str, torch.Tensor] = {"source": source.contiguous()}
+        defaults = {
+            "age": 0.0,
+            "confidence": 1.0,
+            "staleness": 0.0}
+        for name, default in defaults.items():
+            value = bank.get(name)
+            if value is None:
+                value = torch.full(
+                    shape,
+                    default,
+                    device=tokens.device,
+                    dtype=tokens.dtype)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"bank {name} must be a tensor")
+            if value.device != tokens.device:
+                raise ValueError(f"bank {name} must be on the token device")
+            if value.dtype != tokens.dtype:
+                raise TypeError(f"bank {name} must use the token dtype")
+            if value.shape != shape:
+                raise ValueError(f"bank {name} must have shape {shape}")
+            if not bool(torch.isfinite(value).all().item()):
+                raise ValueError(f"bank {name} must be finite")
+            if name in {"age", "staleness"} and bool((value < 0).any().item()):
+                raise ValueError(f"bank {name} must be nonnegative")
+            if name == "confidence" and bool(
+                    ((value < 0) | (value > 1)).any().item()):
+                raise ValueError("bank confidence must be within [0, 1]")
+            values[name] = value.contiguous()
+        return values
+
+    def BuildSparseIgnition(
+        self,
+        tokens: torch.Tensor,
+        valid: torch.Tensor,
+        metadata: Dict[str, torch.Tensor],
+        scoreNet: nn.Module,
+        tokenProjection: nn.Module,
+        ignitionCount: int,) -> Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Dict[str, torch.Tensor]]:
+        B, N = tokens.shape[:2]
+        if N == 0:
+            context_dim = self.source_embedding.embedding_dim
+            context = tokens.new_zeros(B, context_dim)
+            weights = tokens.new_zeros(B, 0)
+            mask = torch.zeros(B, 0, dtype=torch.bool, device=tokens.device)
+            zero = tokens.new_zeros(B, 1)
+            return context, weights, mask, {
+                "confidence": zero,
+                "age": zero,
+                "staleness": zero,
+                "source": zero,
+                "source_mass": tokens.new_zeros(B, self.source_count)}
+
+        confidence_gain = F.softplus(self.metadata_gain[0])
+        age_gain = F.softplus(self.metadata_gain[1])
+        staleness_gain = F.softplus(self.metadata_gain[2])
+        priority = scoreNet(tokens).squeeze(-1)
+        priority = (
+            priority
+            + confidence_gain * torch.log(metadata["confidence"].clamp_min(1e-6))
+            - age_gain * torch.log1p(metadata["age"])
+            - staleness_gain * metadata["staleness"]
+            + self.source_priority(metadata["source"]).squeeze(-1))
+        priority = priority.masked_fill(~valid, torch.finfo(priority.dtype).min)
+        count = min(max(1, int(ignitionCount)), N)
+        indices = torch.topk(priority, k=count, dim=-1).indices
+        mask = torch.zeros(B, N, dtype=torch.bool, device=tokens.device)
+        mask.scatter_(1, indices, True)
+        mask = mask & valid
+        sparse_priority = priority.masked_fill(~mask, torch.finfo(priority.dtype).min)
+        weights = torch.softmax(sparse_priority, dim=-1)
+        weights = weights.masked_fill(~mask, 0.0)
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        encoded = (
+            tokenProjection(tokens)
+            + self.source_embedding(metadata["source"]))
+        context = torch.einsum("bn,bnd->bd", weights, encoded)
+        source_mass = torch.einsum(
+            "bn,bnc->bc",
+            weights,
+            F.one_hot(
+                metadata["source"],
+                num_classes=self.source_count).to(dtype=tokens.dtype))
+        source_index = source_mass.argmax(dim=-1, keepdim=True).to(
+            dtype=tokens.dtype)
+        stats = {
+            "confidence": torch.einsum(
+                "bn,bn->b",
+                weights,
+                metadata["confidence"]).unsqueeze(-1),
+            "age": torch.einsum(
+                "bn,bn->b",
+                weights,
+                metadata["age"]).unsqueeze(-1),
+            "staleness": torch.einsum(
+                "bn,bn->b",
+                weights,
+                metadata["staleness"]).unsqueeze(-1),
+            "source": source_index,
+            "source_mass": source_mass}
+        return context, weights, mask, stats
+
+    def BuildContentCompetition(
+        self,
+        ctxBase: torch.Tensor,
+        worldFeature: torch.Tensor,
+        memoryFeature: torch.Tensor,
+        developmentFeature: torch.Tensor,
+        availability: torch.Tensor,
+        metadataPriority: torch.Tensor,) -> Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor]:
+        logits = self.content_competition_head(ctxBase) + metadataPriority
+        logits = logits.masked_fill(~availability, torch.finfo(logits.dtype).min)
+        count = min(2, int(logits.size(-1)))
+        indices = torch.topk(logits, k=count, dim=-1).indices
+        mask = torch.zeros_like(availability)
+        mask.scatter_(1, indices, True)
+        mask = mask & availability
+        sparse_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+        weights = torch.softmax(sparse_logits, dim=-1)
+        weights = weights.masked_fill(~mask, 0.0)
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        features = torch.stack([
+            worldFeature,
+            memoryFeature,
+            developmentFeature], dim=1)
+        context = torch.einsum("bn,bnd->bd", weights, features)
+        return context, weights, mask
+
+    def SelectBankRows(
+        self,
+        bank: BankInput,
+        rowIndex: torch.Tensor,
+        fullBatchSize: int,
+        bankRole: str,
+    ) -> BankInput:
+        if not isinstance(bank, dict):
+            raise TypeError(f"{bankRole} bank must be a dict")
+        selected: BankInput = {}
+        for name, value in bank.items():
+            if not torch.is_tensor(value) or value.dim() < 1:
+                raise ValueError(f"{bankRole}.{name} must have a batch dimension")
+            if int(value.size(0)) != fullBatchSize:
+                raise ValueError(f"{bankRole}.{name} batch size does not match")
+            if value.device != rowIndex.device:
+                raise ValueError(f"{bankRole}.{name} must share the rowIndex device")
+            selected[name] = value.index_select(0, rowIndex)
+        return selected
+
+    def ForwardRows(
+        self,
+        memoryBank: BankInput,
+        worldBank: BankInput,
+        rowIndex: torch.Tensor,
+    ) -> ConsciousnessOutput:
+        if not isinstance(memoryBank, dict) or "tokens" not in memoryBank:
+            raise ValueError("memory bank must contain tokens")
+        memoryTokens = memoryBank["tokens"]
+        if not torch.is_tensor(memoryTokens) or memoryTokens.dim() < 1:
+            raise ValueError("memory bank tokens must have a batch dimension")
+        fullBatchSize = int(memoryTokens.size(0))
+        if (
+            not torch.is_tensor(rowIndex)
+            or rowIndex.dim() != 1
+            or rowIndex.dtype != torch.long
+            or rowIndex.device != memoryTokens.device
+        ):
+            raise ValueError("rowIndex must be a one-dimensional long tensor on the bank device")
+        if rowIndex.numel() < 1:
+            raise ValueError("rowIndex must select at least one row")
+        if bool(((rowIndex < 0) | (rowIndex >= fullBatchSize)).any().item()):
+            raise IndexError("rowIndex contains an out-of-range consciousness row")
+        if int(torch.unique(rowIndex).numel()) != int(rowIndex.numel()):
+            raise ValueError("rowIndex must not contain duplicate rows")
+        selectedMemory = self.SelectBankRows(
+            memoryBank,
+            rowIndex,
+            fullBatchSize,
+            "memory")
+        selectedWorld = self.SelectBankRows(
+            worldBank,
+            rowIndex,
+            fullBatchSize,
+            "world")
+        fullRows = torch.arange(
+            fullBatchSize,
+            dtype=torch.long,
+            device=rowIndex.device)
+        if torch.equal(rowIndex, fullRows):
+            return self(memoryBank, worldBank)
+
+        originalDevTrace = self._dev_trace.detach().clone()
+        originalLastSelfIntent = self._last_self_intent.detach().clone()
+        originalLastSem = self._last_sem.detach().clone()
+        originalStateValid = self._state_valid.detach().clone()
+        originalStep = self._step.detach().clone()
+        originalHebbianModules = [
+            module
+            for module in self.modules()
+            if isinstance(module, ConsciousHebbianLinear)]
+        originalHebbianState = [
+            module.hebb.detach().clone()
+            for module in originalHebbianModules]
+
+        def RestoreOriginalState() -> None:
+            self._dev_trace = originalDevTrace
+            self._last_self_intent = originalLastSelfIntent
+            self._last_sem = originalLastSem
+            self._state_valid = originalStateValid
+            self._step = originalStep
+            for module, state in zip(
+                originalHebbianModules,
+                originalHebbianState,
+            ):
+                module.hebb = state
+
+        try:
+            self.EnsureB(fullBatchSize)
+            devTrace = self._dev_trace.detach().clone()
+            lastSelfIntent = self._last_self_intent.detach().clone()
+            lastSem = self._last_sem.detach().clone()
+            stateValid = self._state_valid.detach().clone()
+            hebbianModules = [
+                module
+                for module in self.modules()
+                if isinstance(module, ConsciousHebbianLinear)]
+            hebbianState = [
+                module.hebb.detach().clone()
+                for module in hebbianModules]
+
+            self._dev_trace = devTrace.index_select(0, rowIndex)
+            self._last_self_intent = lastSelfIntent.index_select(0, rowIndex)
+            self._last_sem = lastSem.index_select(0, rowIndex)
+            self._state_valid = stateValid.index_select(0, rowIndex)
+            for module, state in zip(hebbianModules, hebbianState):
+                module.hebb = state.index_select(0, rowIndex)
+        except BaseException:
+            RestoreOriginalState()
+            raise
+
+        try:
+            output = self(selectedMemory, selectedWorld)
+            selectedDevTrace = self._dev_trace.detach().clone()
+            selectedLastSelfIntent = self._last_self_intent.detach().clone()
+            selectedLastSem = self._last_sem.detach().clone()
+            selectedStateValid = self._state_valid.detach().clone()
+            selectedStep = self._step.detach().clone()
+            selectedHebbianState = [
+                module.hebb.detach().clone()
+                for module in hebbianModules]
+        except BaseException:
+            RestoreOriginalState()
+            raise
+
+        try:
+            self._dev_trace = devTrace.index_copy(
+                0,
+                rowIndex,
+                selectedDevTrace)
+            self._last_self_intent = lastSelfIntent.index_copy(
+                0,
+                rowIndex,
+                selectedLastSelfIntent)
+            self._last_sem = lastSem.index_copy(
+                0,
+                rowIndex,
+                selectedLastSem)
+            self._state_valid = stateValid.index_copy(
+                0,
+                rowIndex,
+                selectedStateValid)
+            self._step = selectedStep
+            for module, state, selectedState in zip(
+                hebbianModules,
+                hebbianState,
+                selectedHebbianState,
+            ):
+                module.hebb = state.index_copy(0, rowIndex, selectedState)
+        except BaseException:
+            RestoreOriginalState()
+            raise
+        return output
 
     def forward(
         self,
@@ -807,6 +1205,40 @@ class ConsciousnessExtractor(AGICoreModule):
             bankRole="world",
             device=device,
             dtype=dtype)
+        memory_metadata = self.NormalizeBankMetadata(
+            memoryBank,
+            memory_bank,
+            memory_valid,
+            defaultSource=0)
+        world_metadata = self.NormalizeBankMetadata(
+            worldBank,
+            world_bank,
+            world_valid,
+            defaultSource=1)
+        (
+            mem_ignition_context,
+            mem_ignition_weights,
+            mem_ignition_mask,
+            mem_ignition_stats,
+        ) = self.BuildSparseIgnition(
+            memory_bank,
+            memory_valid,
+            memory_metadata,
+            self.mem_score_net,
+            self.mem_token_proj,
+            self.mem_ignition_count)
+        (
+            world_ignition_context,
+            world_ignition_weights,
+            world_ignition_mask,
+            world_ignition_stats,
+        ) = self.BuildSparseIgnition(
+            world_bank,
+            world_valid,
+            world_metadata,
+            self.world_score_net,
+            self.world_token_proj,
+            self.world_ignition_count)
         self.EnsureB(B)
 
         mem_available = memory_valid.any(dim=1, keepdim=True)
@@ -829,7 +1261,26 @@ class ConsciousnessExtractor(AGICoreModule):
                 "world_available": zeros_1,
                 "dev_available": dev_available.to(dtype),
                 "cold_start": (~self._state_valid).view(B, 1).to(dtype),
-                "no_observation": torch.ones(B, 1, device=device, dtype=dtype),}
+                "no_observation": torch.ones(B, 1, device=device, dtype=dtype),
+                "mem_ignition_weights": mem_ignition_weights,
+                "world_ignition_weights": world_ignition_weights,
+                "mem_ignition_mask": mem_ignition_mask,
+                "world_ignition_mask": world_ignition_mask,
+                "content_competition_weights": torch.zeros(
+                    B, 3, device=device, dtype=dtype),
+                "content_competition_mask": torch.zeros(
+                    B, 3, device=device, dtype=torch.bool),
+                "mem_content_confidence": mem_ignition_stats["confidence"],
+                "world_content_confidence": world_ignition_stats["confidence"],
+                "mem_content_age": mem_ignition_stats["age"],
+                "world_content_age": world_ignition_stats["age"],
+                "mem_content_staleness": mem_ignition_stats["staleness"],
+                "world_content_staleness": world_ignition_stats["staleness"],
+                "mem_content_source": mem_ignition_stats["source"],
+                "world_content_source": world_ignition_stats["source"],
+                "mem_content_source_mass": mem_ignition_stats["source_mass"],
+                "world_content_source_mass": world_ignition_stats[
+                    "source_mass"],}
             return ConsciousnessOutput(
                 self_sem=self._last_sem,
                 intent_sem=self._last_self_intent,
@@ -856,7 +1307,8 @@ class ConsciousnessExtractor(AGICoreModule):
             self.mem_score_net,
             topK=self.top_k_mem,
             randK=self.rand_k_mem,
-            validMask=memory_valid,)
+            validMask=memory_valid,
+            metadata=memory_metadata,)
         mem_ctx = self.mem_agg_proj(mem_summary_raw)
         mem_ctx = mem_ctx * mem_available.to(dtype)
 
@@ -865,7 +1317,8 @@ class ConsciousnessExtractor(AGICoreModule):
             self.world_score_net,
             topK=self.top_k_world,
             randK=self.rand_k_world,
-            validMask=world_valid,) # world_summary_raw" [B, 3*Dw]
+            validMask=world_valid,
+            metadata=world_metadata,) # world_summary_raw" [B, 3*Dw]
         world_ctx = self.world_agg_proj(world_summary_raw)
         world_ctx = world_ctx * world_available.to(dtype)
 
@@ -947,6 +1400,14 @@ class ConsciousnessExtractor(AGICoreModule):
         world_feat = world_feat * world_available.to(dtype)
         mem_feat = mem_feat * mem_available.to(dtype)
         dev_feat = dev_feat * dev_available.to(dtype)
+        mem_feat = mem_feat + (
+            torch.tanh(self.ignition_context_gain[0])
+            * self.mem_ignition_norm(mem_ignition_context)
+            * mem_available.to(dtype))
+        world_feat = world_feat + (
+            torch.tanh(self.ignition_context_gain[1])
+            * self.world_ignition_norm(world_ignition_context)
+            * world_available.to(dtype))
 
         mu_world, logvar_world_head = self.z_world_head(world_feat).chunk(2, dim=-1)
         mu_mem, logvar_mem_head = self.z_mem_head(mem_feat).chunk(2, dim=-1)
@@ -998,6 +1459,34 @@ class ConsciousnessExtractor(AGICoreModule):
         kalman_gain = self.ctx_kalman_gain(torch.cat([z_ctx, prior_feat], dim=-1)) # [B,H]
         ctx_vec = self.ctx_post_norm(prior_feat + kalman_gain * (z_ctx - prior_feat) + 0.3 * ctx_obs) # [B,H]
 
+        content_availability = torch.cat([
+            world_available,
+            mem_available,
+            dev_available], dim=-1)
+        content_priority = torch.cat([
+            world_ignition_stats["confidence"]
+            - torch.log1p(world_ignition_stats["age"])
+            - world_ignition_stats["staleness"],
+            mem_ignition_stats["confidence"]
+            - torch.log1p(mem_ignition_stats["age"])
+            - mem_ignition_stats["staleness"],
+            arousal], dim=-1)
+        (
+            competition_context,
+            content_competition_weights,
+            content_competition_mask,
+        ) = self.BuildContentCompetition(
+            ctx_base,
+            world_feat,
+            mem_feat,
+            dev_feat,
+            content_availability,
+            content_priority)
+        ctx_vec = self.ctx_post_norm(
+            ctx_vec
+            + torch.tanh(self.content_competition_gain)
+            * competition_context)
+
         modal_prec_scalar = torch.stack(
             [prec_world_eff.mean(dim=-1), prec_mem_eff.mean(dim=-1), prec_dev_eff.mean(dim=-1)],
             dim=-1) # [B,3]
@@ -1019,7 +1508,7 @@ class ConsciousnessExtractor(AGICoreModule):
         self_in_vec = torch.cat([world_ctx_eff, mem_ctx_eff, dev_ctx_eff], dim=-1)
         h_self = self.self_in(self_in_vec)
         ctx_self_gain = 0.5 + self.ctx_to_self_gate(ctx_vec)
-        ctx_self_delta = self.ctx_to_self(ctx_vec)  # [B,Ds]
+        ctx_self_delta = self.ctx_to_self(ctx_vec) # [B,Ds]
         h_self = h_self + ctx_self_gain * ctx_self_delta # [B,Ds]
 
         for i, block in enumerate(self.self_blocks):
@@ -1048,7 +1537,7 @@ class ConsciousnessExtractor(AGICoreModule):
         mem_delta = mem_delta * mem_available.to(dtype)
         world_delta = world_delta * world_available.to(dtype)
 
-        g_m = self.mem_gain_net(self_sem) 
+        g_m = self.mem_gain_net(self_sem)
         g_w = self.world_gain_net(self_sem)
 
         g_m = self.gain_min + (self.gain_max - self.gain_min) * g_m
@@ -1063,14 +1552,14 @@ class ConsciousnessExtractor(AGICoreModule):
         ctx_intent_gain = 0.5 + self.ctx_to_intent_gate(ctx_vec)
         ctx_intent_delta = self.ctx_to_intent(ctx_vec)
         h_intent = h_intent + ctx_intent_gain * ctx_intent_delta # [B,Di]
-        
+
         for i, block in enumerate(self.intent_blocks):
             g = gamma_intent[:, i, :]
             b = beta_intent[:, i, :]
             h_intent = block(h_intent, gamma=g, beta=b)
 
         if self.training:
-            def symmetric_info_nce(
+            def SymmetricInfoNce(
                 a: torch.Tensor,
                 b: torch.Tensor,
                 tau: float,
@@ -1092,10 +1581,10 @@ class ConsciousnessExtractor(AGICoreModule):
             current_mask = current_available.to(dtype)
             modality_count = (world_mask + mem_mask + dev_mask).clamp_min(1.0)
 
-            def active_mean(value: torch.Tensor) -> torch.Tensor:
+            def ActiveMean(value: torch.Tensor) -> torch.Tensor:
                 return (value * current_mask).sum() / current_mask.sum().clamp_min(1.0)
 
-            ctx_hat = self.dev_to_ctx(dev_ctx) 
+            ctx_hat = self.dev_to_ctx(dev_ctx)
             ctx_align_loss = (
                 F.mse_loss(ctx_hat, ctx_vec.detach(), reduction="none").mean(dim=1, keepdim=True)
                 * dev_mask)
@@ -1121,9 +1610,9 @@ class ConsciousnessExtractor(AGICoreModule):
             w_n = self.nce_proj_world(world_feat)
             m_n = self.nce_proj_mem(mem_feat)
             d_n = self.nce_proj_dev(dev_feat)
-            nce_world = symmetric_info_nce(z_n, w_n, self.nce_temp, world_available)
-            nce_mem = symmetric_info_nce(z_n, m_n, self.nce_temp, mem_available)
-            nce_dev = symmetric_info_nce(z_n, d_n, self.nce_temp, dev_available)
+            nce_world = SymmetricInfoNce(z_n, w_n, self.nce_temp, world_available)
+            nce_mem = SymmetricInfoNce(z_n, m_n, self.nce_temp, mem_available)
+            nce_dev = SymmetricInfoNce(z_n, d_n, self.nce_temp, dev_available)
             nce_weights = torch.stack([
                 world_available.sum() > 1,
                 mem_available.sum() > 1,
@@ -1143,7 +1632,7 @@ class ConsciousnessExtractor(AGICoreModule):
             precision_target = mu_post.detach()
             variance_floor = 5e-2
 
-            def calibrated_precision_loss(
+            def CalibratedPrecisionLoss(
                 mean: torch.Tensor,
                 logvar: torch.Tensor,
                 mask: torch.Tensor,) -> torch.Tensor:
@@ -1163,9 +1652,9 @@ class ConsciousnessExtractor(AGICoreModule):
                     keepdim=True) * mask
 
             loss_precision = (
-                calibrated_precision_loss(mu_world, logvar_world, world_mask)
-                + calibrated_precision_loss(mu_mem, logvar_mem, mem_mask)
-                + calibrated_precision_loss(mu_dev, logvar_dev, dev_mask)
+                CalibratedPrecisionLoss(mu_world, logvar_world, world_mask)
+                + CalibratedPrecisionLoss(mu_mem, logvar_mem, mem_mask)
+                + CalibratedPrecisionLoss(mu_dev, logvar_dev, dev_mask)
             ) / modality_count
             loss_var_range = (
                 (F.relu(logvar_world_raw - 4.0) + F.relu(-4.0 - logvar_world_raw)).mean(dim=-1, keepdim=True) * world_mask +
@@ -1186,24 +1675,24 @@ class ConsciousnessExtractor(AGICoreModule):
             prior_smooth = (
                 F.smooth_l1_loss(ctx_vec, prior_feat.detach(), reduction="none").mean(dim=1, keepdim=True)
                 * dev_mask)
-            
+
             loss_ctx_inject = (
                 (ctx_self_gain * ctx_self_delta).pow(2).mean(dim=-1, keepdim=True) +
                 (ctx_intent_gain * ctx_intent_delta).pow(2).mean(dim=-1, keepdim=True)
             ) * 0.5 * current_mask
 
             loss = (
-                0.05 * active_mean(ctx_align_loss) +
-                1e-3 * active_mean(slow_loss) +
-                0.02 * active_mean(loss_kl) +
-                0.04 * active_mean(loss_recon) +
+                0.05 * ActiveMean(ctx_align_loss) +
+                1e-3 * ActiveMean(slow_loss) +
+                0.02 * ActiveMean(loss_kl) +
+                0.04 * ActiveMean(loss_recon) +
                 0.02 * loss_nce +
-                0.02 * active_mean(loss_trans) +
-                0.01 * active_mean(loss_precision) +
-                0.003 * active_mean(align_loss) +
-                0.01 * active_mean(prior_smooth) +
-                0.005 * active_mean(loss_var_range) +
-                0.003 * active_mean(loss_ctx_inject))
+                0.02 * ActiveMean(loss_trans) +
+                0.01 * ActiveMean(loss_precision) +
+                0.003 * ActiveMean(align_loss) +
+                0.01 * ActiveMean(prior_smooth) +
+                0.005 * ActiveMean(loss_var_range) +
+                0.003 * ActiveMean(loss_ctx_inject))
         else:
             loss_kl = None
             loss_recon = None
@@ -1253,24 +1742,42 @@ class ConsciousnessExtractor(AGICoreModule):
             "world_n_items": world_stats["n_items"].detach(),
             "mem_focus_norm": mem_focus.norm(dim=-1, keepdim=True).detach(),
             "world_focus_norm": world_focus.norm(dim=-1, keepdim=True).detach(),}
+        extras["mem_ignition_weights"] = mem_ignition_weights.detach()
+        extras["world_ignition_weights"] = world_ignition_weights.detach()
+        extras["mem_ignition_mask"] = mem_ignition_mask
+        extras["world_ignition_mask"] = world_ignition_mask
+        extras["content_competition_weights"] = content_competition_weights.detach()
+        extras["content_competition_mask"] = content_competition_mask
+        extras["mem_content_confidence"] = mem_ignition_stats["confidence"].detach()
+        extras["world_content_confidence"] = world_ignition_stats["confidence"].detach()
+        extras["mem_content_age"] = mem_ignition_stats["age"].detach()
+        extras["world_content_age"] = world_ignition_stats["age"].detach()
+        extras["mem_content_staleness"] = mem_ignition_stats["staleness"].detach()
+        extras["world_content_staleness"] = world_ignition_stats["staleness"].detach()
+        extras["mem_content_source"] = mem_ignition_stats["source"].detach()
+        extras["world_content_source"] = world_ignition_stats["source"].detach()
+        extras["mem_content_source_mass"] = mem_ignition_stats[
+            "source_mass"].detach()
+        extras["world_content_source_mass"] = world_ignition_stats[
+            "source_mass"].detach()
 
         if self.training:
-            extras["loss_kl"] = active_mean(loss_kl).detach()
-            extras["loss_recon"] = active_mean(loss_recon).detach()
+            extras["loss_kl"] = ActiveMean(loss_kl).detach()
+            extras["loss_recon"] = ActiveMean(loss_recon).detach()
             extras["loss_nce"] = loss_nce.detach()
             extras["nce_active_modalities"] = nce_weights.sum().detach()
-            extras["loss_trans"] = active_mean(loss_trans).detach()
-            extras["loss_precision"] = active_mean(loss_precision).detach()
-            extras["loss_var_range"] = active_mean(loss_var_range).detach()
-            extras["loss_align"] = active_mean(align_loss).detach()
-            extras["loss_prior_smooth"] = active_mean(prior_smooth).detach()
-            extras["loss_ctx_inject"] = active_mean(loss_ctx_inject).detach()
+            extras["loss_trans"] = ActiveMean(loss_trans).detach()
+            extras["loss_precision"] = ActiveMean(loss_precision).detach()
+            extras["loss_var_range"] = ActiveMean(loss_var_range).detach()
+            extras["loss_align"] = ActiveMean(align_loss).detach()
+            extras["loss_prior_smooth"] = ActiveMean(prior_smooth).detach()
+            extras["loss_ctx_inject"] = ActiveMean(loss_ctx_inject).detach()
 
         return ConsciousnessOutput(
             self_sem=self_sem_out,
             intent_sem=intent_sem_out,
             extras=extras,)
-    
+
     @torch.no_grad()
     def ResetHebbianMemory(
         self,
@@ -1441,28 +1948,28 @@ class TestConsciousMTool:
             B = 2
             memory_bank, world_bank = self.DummyBankDicts(B=B, Nm=9, Nw=6)
 
-            def print_shape(name: str, tensor: torch.Tensor):
+            def PrintShape(name: str, tensor: torch.Tensor):
                 print(f"{name}: {tuple(tensor.shape)}")
 
-            def print_nested(prefix: str, obj):
+            def PrintNested(prefix: str, obj):
                 if isinstance(obj, torch.Tensor):
-                    print_shape(prefix, obj)
+                    PrintShape(prefix, obj)
                 elif isinstance(obj, dict):
                     for key, value in obj.items():
                         next_prefix = f"{prefix}.{key}" if prefix else key
-                        print_nested(next_prefix, value)
+                        PrintNested(next_prefix, value)
                 elif hasattr(obj, "_asdict"):
                     for key, value in obj._asdict().items():
                         next_prefix = f"{prefix}.{key}" if prefix else key
-                        print_nested(next_prefix, value)
+                        PrintNested(next_prefix, value)
 
             with torch.no_grad():
-                print_nested("input.memoryBank", memory_bank)
-                print_nested("input.worldBank", world_bank)
+                PrintNested("input.memoryBank", memory_bank)
+                PrintNested("input.worldBank", world_bank)
 
                 out = model(memory_bank, world_bank)
 
-                print_nested("output", out)
+                PrintNested("output", out)
 
             assert out.self_sem.shape == (B, self.self_dim)
             assert out.intent_sem.shape == (B, self.intent_dim)
@@ -1852,8 +2359,8 @@ class TestConsciousMTool:
             model.ResetState()
             model.ResetHebbianMemory()
 
-            _ = model(mem, world) 
-            out = model(mem, world) 
+            _ = model(mem, world)
+            out = model(mem, world)
 
             rep = torch.cat([out.self_sem, out.intent_sem], dim=-1)
             pred = head(rep)
@@ -2092,6 +2599,38 @@ class TestConsciousMTool:
             print("QueryTopKEdgeCases error:", e)
             return False
 
+    def TestSparseIgnitionMetadata(self) -> bool:
+        try:
+            torch.manual_seed(719)
+            model = self.BuildModel().eval()
+            memory, world = self.DummyBankDicts(B=3, Nm=7, Nw=6)
+            memory["source"] = torch.randint(0, 4, (3, 7), device=self.device)
+            world["source"] = torch.randint(8, 10, (3, 6), device=self.device)
+            memory["age"] = torch.arange(7, device=self.device).float().view(1, 7).expand(3, -1)
+            world["age"] = torch.arange(6, device=self.device).float().view(1, 6).expand(3, -1)
+            memory["confidence"] = torch.rand(3, 7, device=self.device)
+            world["confidence"] = torch.rand(3, 6, device=self.device)
+            memory["staleness"] = torch.rand(3, 7, device=self.device)
+            world["staleness"] = torch.rand(3, 6, device=self.device)
+            model.ResetState()
+            out = model(memory, world)
+            assert out.self_sem.shape == (3, self.self_dim)
+            assert out.intent_sem.shape == (3, self.intent_dim)
+            assert out.extras["mem_ignition_mask"].dtype == torch.bool
+            assert out.extras["world_ignition_mask"].dtype == torch.bool
+            assert out.extras["content_competition_mask"].shape == (3, 3)
+            assert out.extras["mem_ignition_mask"].sum(dim=-1).max().item() < 7
+            assert out.extras["world_ignition_mask"].sum(dim=-1).max().item() < 6
+            assert torch.isfinite(out.extras["content_competition_weights"]).all()
+            print("TestSparseIgnitionMetadata passed.")
+            return True
+        except AssertionError as e:
+            print("TestSparseIgnitionMetadata failed:", e)
+            return False
+        except Exception as e:
+            print("TestSparseIgnitionMetadata error:", e)
+            return False
+
     def RunAll(self) -> Dict[str, bool]:
         results = {
             "ForwardShapes": self.TestForwardShapes(),
@@ -2110,6 +2649,7 @@ class TestConsciousMTool:
             "NormalTrainingConvergence": self.NormalTrainingConvergence(),
             "GradCoverageReport": self.GradCoverageReport(),
             "ParameterUpdateAfterStep": self.TestParameterUpdateAfterStep(),
+            "SparseIgnitionMetadata": self.TestSparseIgnitionMetadata(),
             "QueryTopKEdgeCases": self.QueryTopKEdgeCases(),}
 
         passed = sum(1 for v in results.values() if v)

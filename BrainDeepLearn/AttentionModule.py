@@ -14,8 +14,8 @@ class SelectiveSSM(AGICoreModule):
     def __init__(
         self,
         embedDim: int,
-        stateDim: int = 4, 
-        convKernel: int = 4, 
+        stateDim: int = 4,
+        convKernel: int = 4,
         slowDtScale: float = 0.25,):
         super().__init__()
         E = embedDim
@@ -47,19 +47,19 @@ class SelectiveSSM(AGICoreModule):
         nn.init.zeros_(self.time_mix_gate.bias)
 
     def CausalDwconv(self, u: torch.Tensor) -> torch.Tensor:
-        x = u.transpose(1, 2) 
+        x = u.transpose(1, 2)
         k = self.dw_conv.kernel_size[0]
         x = F.pad(x, (k - 1, 0))
         y = self.dw_conv(x)
-        y = y.transpose(1, 2)  
+        y = y.transpose(1, 2)
         return y
 
     def forward(
         self,
         x: torch.Tensor, # [B,S,E]
         tdError: torch.Tensor, # [B]
-        uncertainty: torch.Tensor,# [B]
-        keyPaddingMask: Optional[torch.Tensor] = None,  # [B,S] bool，True=padding
+        uncertainty: torch.Tensor, # [B]
+        keyPaddingMask: Optional[torch.Tensor] = None, # [B,S] bool，True=padding
         ) -> torch.Tensor:
         B, S, E = x.shape
         N = self.N
@@ -75,7 +75,7 @@ class SelectiveSSM(AGICoreModule):
         u = u + 0.5 * self.CausalDwconv(u)
 
         gate_bias = (0.5 * surprise - 0.5 * uncertainty)[:, None, None]
-        g = torch.sigmoid(g + gate_bias) 
+        g = torch.sigmoid(g + gate_bias)
 
         p = self.param_proj(u)
         dt_raw = p[..., :E]
@@ -97,7 +97,7 @@ class SelectiveSSM(AGICoreModule):
 
         for t in range(S):
             if has_mask:
-                keep = (~keyPaddingMask[:, t]).view(B, 1, 1) 
+                keep = (~keyPaddingMask[:, t]).view(B, 1, 1)
             else:
                 keep = None
 
@@ -139,10 +139,10 @@ class SelectiveSSM(AGICoreModule):
 
 class MultiHeadAttention(AGICoreModule):
     def __init__(
-        self, 
-        embedDim: int, 
-        numHeads: int, 
-        attnDropout: float = 0.1, 
+        self,
+        embedDim: int,
+        numHeads: int,
+        attnDropout: float = 0.1,
         tdUncScale: float = 1.0,):
         super().__init__()
         assert embedDim % numHeads == 0, "AttentionModule embed_dim must be divisible by num_heads"
@@ -219,7 +219,7 @@ class MultiHeadAttention(AGICoreModule):
     def ComputeNeuromodulation(self, tdError: torch.Tensor) -> torch.Tensor:
         neuromod = 1.0 + 0.25 * tdError.abs()
         return neuromod[:, None, None, None]
-    
+
     def ComputeHebbMod(
         self,
         tdError: torch.Tensor,
@@ -261,9 +261,9 @@ class MultiHeadAttention(AGICoreModule):
         q = F.normalize(q, dim=-1, eps=1e-6)
 
         hebb = torch.einsum("bhse,bhsd->bhde", v, q)
-        hebb = torch.tanh(hebb) 
+        hebb = torch.tanh(hebb)
 
-        def clamp_fro(x: torch.Tensor, max_norm: float):
+        def ClampFro(x: torch.Tensor, max_norm: float):
             n = torch.linalg.vector_norm(x, ord=2, dim=(-2, -1), keepdim=True).clamp_min(1e-6)
             scale = torch.clamp(max_norm / n, max=1.0)
             return x * scale
@@ -279,8 +279,8 @@ class MultiHeadAttention(AGICoreModule):
         Ur = U_s[..., :r] * sqrtSr
         Vr = Vh.transpose(-2, -1)[..., :r] * sqrtSr
 
-        Ur = clamp_fro(Ur, 1.5)
-        Vr = clamp_fro(Vr, 1.5)
+        Ur = ClampFro(Ur, 1.5)
+        Vr = ClampFro(Vr, 1.5)
 
         row_mask = update_rows.view(-1, 1, 1, 1)
         Ur = torch.where(row_mask, Ur, self.U)
@@ -341,7 +341,7 @@ class MultiHeadAttention(AGICoreModule):
                 self.attention_prior_gain).view(1, self.num_heads, 1, 1)
             scores = scores + prior_gain * attentionBias[:, None, None, :]
         if keyPaddingMask is not None:
-            mask = keyPaddingMask[:, None, None, :]  # bool [B,1,1,L]
+            mask = keyPaddingMask[:, None, None, :] # bool [B,1,1,L]
             scores = scores.masked_fill(mask, -torch.inf)
 
         weights = F.softmax(scores, dim=-1)
@@ -357,7 +357,7 @@ class MultiHeadAttention(AGICoreModule):
             self.UpdateHebbianWeights(v, q_hebb, alpha, keep4=keep4)
         else:
             self.UpdateHebbianWeights(v, q_hebb, alpha, keep4=None)
-        
+
         return out
 
     def forward(
@@ -413,16 +413,16 @@ class TemporalAttention(AGICoreModule):
             nn.Linear(embedDim, embedDim),
             nn.SiLU(),
             nn.Linear(embedDim, 1))
-        
+
         nn.init.constant_(self.mix_gate[-1].bias, -1.0)
 
         self.ffn = nn.Sequential(
             nn.Linear(embedDim, 4 * embedDim),
             nn.GELU(),
             nn.Linear(4 * embedDim, embedDim))
-        
+
         self.gamma_ffn = nn.Parameter(1e-1 * torch.ones(embedDim), requires_grad=True)
-        
+
         self.dropout = nn.Dropout(0.1)
         self.norm = nn.LayerNorm(embedDim)
         self.norm_ffn = nn.LayerNorm(embedDim)
@@ -439,7 +439,7 @@ class TemporalAttention(AGICoreModule):
         attentionBias: Optional[torch.Tensor] = None,):
         residual = x
         x_norm = self.norm(x)
-        
+
         mhsa_out = self.mhsa(
             x_norm,
             x_norm,
@@ -469,7 +469,7 @@ class TemporalAttention(AGICoreModule):
         out = residual + self.dropout(ffn_out) * self.gamma_ffn
 
         if keyPaddingMask is not None:
-            keep = (~keyPaddingMask).unsqueeze(-1)  # [B,S,1]
+            keep = (~keyPaddingMask).unsqueeze(-1) # [B,S,1]
             out = out * keep
         return out
 
@@ -868,8 +868,8 @@ class AttentionExtractor(AGICoreModule):
             for idx in range(temporalLayers)])
 
         self.caps_in_proj = nn.Sequential(
-            nn.Linear(embedDim, self.caps_dim), 
-            nn.LayerNorm(self.caps_dim), 
+            nn.Linear(embedDim, self.caps_dim),
+            nn.LayerNorm(self.caps_dim),
             nn.SiLU())
         self.workspace_goal_proj = nn.Sequential(
             nn.LayerNorm(self.goal_dim),
@@ -1024,6 +1024,12 @@ class AttentionExtractor(AGICoreModule):
             nn.Linear(gate_hidden, numHeads + embedDim))
         nn.init.zeros_(self.mod_gate[-1].weight)
         nn.init.zeros_(self.mod_gate[-1].bias)
+        self.independent_head_scale = nn.Parameter(torch.zeros(5, numHeads))
+        self.independent_channel_scale = nn.Parameter(torch.zeros(5, embedDim))
+        self.independent_attention_scale = nn.Parameter(
+            torch.zeros(5, sequenceLength))
+        self.inhibition_return_gain = nn.Parameter(torch.tensor(-4.0))
+        self.inhibition_return_decay = nn.Parameter(torch.tensor(1.4))
 
         self.scene_query = nn.Parameter(
             torch.randn(embedDim) * 0.02)
@@ -1047,7 +1053,92 @@ class AttentionExtractor(AGICoreModule):
         self.readout_fusion = GoalConditionedHebbianFusion(
             numModes=3,
             embedDim=embedDim)
-            
+        self.local_detail_query = nn.Sequential(
+            nn.LayerNorm(embedDim),
+            nn.Linear(embedDim, embedDim, bias=False))
+        self.local_detail_value = nn.Sequential(
+            nn.LayerNorm(embedDim),
+            nn.Linear(embedDim, embedDim, bias=False))
+        self.local_detail_gain = nn.Parameter(torch.tensor(0.0))
+        self.local_detail_radius = max(1, int(round(math.sqrt(sequenceLength))))
+        self.workspace_ignition_gain = nn.Parameter(torch.tensor(0.0))
+        self.workspace_ignition_count = max(
+            1,
+            min(self.routing_out_caps, int(round(math.sqrt(self.routing_out_caps)))))
+        self.fast_student_residual = nn.Sequential(
+            nn.LayerNorm(2 * embedDim),
+            nn.Linear(2 * embedDim, embedDim),
+            nn.GELU(),
+            nn.Linear(embedDim, embedDim))
+        self.fast_student_norm = nn.LayerNorm(embedDim)
+        self.fast_student_gain = nn.Parameter(torch.tensor(0.1))
+        nn.init.zeros_(self.fast_student_residual[-1].weight)
+        nn.init.zeros_(self.fast_student_residual[-1].bias)
+        self.detail_token_student = nn.Sequential(
+            nn.LayerNorm(embedDim),
+            nn.Linear(embedDim, embedDim),
+            nn.GELU(),
+            nn.Linear(embedDim, embedDim))
+        self.detail_token_gain = nn.Parameter(torch.tensor(0.1))
+        nn.init.zeros_(self.detail_token_student[-1].weight)
+        nn.init.zeros_(self.detail_token_student[-1].bias)
+        self.detail_student_query = nn.Linear(
+            embedDim,
+            embedDim,
+            bias=False)
+        nn.init.eye_(self.detail_student_query.weight)
+        self.detail_student_residual = nn.Sequential(
+            nn.LayerNorm(2 * embedDim),
+            nn.Linear(2 * embedDim, embedDim),
+            nn.GELU(),
+            nn.Linear(embedDim, embedDim))
+        self.detail_student_norm = nn.LayerNorm(embedDim)
+        self.detail_student_gain = nn.Parameter(torch.tensor(0.1))
+        nn.init.zeros_(self.detail_student_residual[-1].weight)
+        nn.init.zeros_(self.detail_student_residual[-1].bias)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,):
+        compatibility_prefixes = (
+            "independent_head_scale",
+            "independent_channel_scale",
+            "independent_attention_scale",
+            "inhibition_return_gain",
+            "inhibition_return_decay",
+            "local_detail_query.",
+            "local_detail_value.",
+            "local_detail_gain",
+            "workspace_ignition_gain",
+            "fast_student_residual.",
+            "fast_student_norm.",
+            "fast_student_gain",
+            "detail_token_student.",
+            "detail_token_gain",
+            "detail_student_query.",
+            "detail_student_residual.",
+            "detail_student_norm.",
+            "detail_student_gain")
+        for name, value in self.state_dict().items():
+            if name.startswith(compatibility_prefixes):
+                key = prefix + name
+                if key not in state_dict:
+                    state_dict[key] = value.detach().clone()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs)
+
 
     def ClipGrads(self):
         if self.gradient_clip_val > 0:
@@ -1087,6 +1178,121 @@ class AttentionExtractor(AGICoreModule):
         channel_gate = 1.0 + 0.25 * torch.tanh(channel_logits).view(B, 1, self.output_dim)
         return head_gate, channel_gate
 
+    def NormalizeSignal(
+        self,
+        signal: Optional[torch.Tensor],
+        B: int,
+        x: torch.Tensor,
+        signalName: str,) -> torch.Tensor:
+        if signal is None:
+            return x.new_zeros(B)
+        if not isinstance(signal, torch.Tensor):
+            raise TypeError(f"{signalName} must be a tensor")
+        if signal.device != x.device:
+            raise ValueError(f"{signalName} must be on the input device")
+        if signal.dtype != x.dtype:
+            raise TypeError(f"{signalName} must use the input dtype")
+        if signal.shape == (B, 1):
+            signal = signal[:, 0]
+        if signal.shape != (B,):
+            raise ValueError(f"{signalName} must have shape {(B,)}")
+        if not bool(torch.isfinite(signal).all().item()):
+            raise ValueError(f"{signalName} must be finite")
+        return signal
+
+    def ResolveStagePadding(
+        self,
+        x: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor],
+        stageMask: Optional[torch.Tensor],) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        B, S = x.shape[:2]
+        if keyPaddingMask is not None:
+            if keyPaddingMask.dtype != torch.bool:
+                raise TypeError("keyPaddingMask must use torch.bool")
+            if keyPaddingMask.device != x.device:
+                raise ValueError("keyPaddingMask must be on the input device")
+            if keyPaddingMask.shape != (B, S):
+                raise ValueError(f"keyPaddingMask must have shape {(B, S)}")
+        if stageMask is None:
+            active = (
+                torch.ones(B, S, dtype=torch.bool, device=x.device)
+                if keyPaddingMask is None
+                else ~keyPaddingMask)
+        else:
+            if stageMask.dtype != torch.bool:
+                raise TypeError("stageMask must use torch.bool")
+            if stageMask.device != x.device:
+                raise ValueError("stageMask must be on the input device")
+            if stageMask.shape != (B, S):
+                raise ValueError(f"stageMask must have shape {(B, S)}")
+            active = stageMask if keyPaddingMask is None else stageMask & ~keyPaddingMask
+        effective = ~active
+        return effective, active
+
+    def ResolveDetailMask(
+        self,
+        x: torch.Tensor,
+        activeMask: torch.Tensor,
+        localDetailMask: Optional[torch.Tensor],) -> Optional[torch.Tensor]:
+        if localDetailMask is None:
+            return None
+        if localDetailMask.dtype != torch.bool:
+            raise TypeError("localDetailMask must use torch.bool")
+        if localDetailMask.device != x.device:
+            raise ValueError("localDetailMask must be on the input device")
+        if localDetailMask.shape != activeMask.shape:
+            raise ValueError(
+                f"localDetailMask must have shape {tuple(activeMask.shape)}")
+        return localDetailMask & activeMask
+
+    def ComputeIndependentModulation(
+        self,
+        signals: torch.Tensor,
+        sequenceLength: int,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        head_delta = torch.einsum(
+            "bn,nh->bh",
+            signals,
+            self.independent_head_scale)
+        channel_delta = torch.einsum(
+            "bn,nd->bd",
+            signals,
+            self.independent_channel_scale)
+        temporal_basis = F.interpolate(
+            self.independent_attention_scale.unsqueeze(0),
+            size=sequenceLength,
+            mode="linear",
+            align_corners=True).squeeze(0)
+        attention_delta = torch.einsum(
+            "bn,ns->bs",
+            signals,
+            temporal_basis)
+        head_gate = 1.0 + 0.25 * torch.tanh(head_delta).unsqueeze(-1).unsqueeze(-1)
+        channel_gate = 1.0 + 0.25 * torch.tanh(channel_delta).unsqueeze(1)
+        return head_gate, channel_gate, 0.25 * torch.tanh(attention_delta)
+
+    def ApplyInhibitionOfReturn(
+        self,
+        logits: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor],) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, S, C = logits.shape
+        trace = logits.new_zeros(B, C)
+        traces = []
+        adjusted = []
+        gain = F.softplus(self.inhibition_return_gain)
+        decay = torch.sigmoid(self.inhibition_return_decay)
+        for index in range(S):
+            valid = (
+                torch.ones(B, 1, dtype=torch.bool, device=logits.device)
+                if keyPaddingMask is None
+                else ~keyPaddingMask[:, index:index + 1])
+            traces.append(trace)
+            current = logits[:, index] - gain * trace
+            probability = torch.softmax(current, dim=-1)
+            probability = torch.where(valid, probability, torch.zeros_like(probability))
+            trace = torch.where(valid, decay * trace + probability, trace)
+            adjusted.append(current)
+        return torch.stack(adjusted, dim=1), torch.stack(traces, dim=1)
+
     def ObjectEvidence(self, objectSeq: torch.Tensor) -> torch.Tensor:
         return torch.linalg.vector_norm(
             objectSeq,
@@ -1111,9 +1317,9 @@ class AttentionExtractor(AGICoreModule):
             presence,
         ], dim=-1)
         ontology_code = self.ontology_object_encoder(ontology)
-        joint = torch.cat([objectSeq, ontology_code], dim=-1)
-        residual = self.ontology_object_residual(joint)
-        gate = self.ontology_object_gate(joint)
+        combined = torch.cat([objectSeq, ontology_code], dim=-1)
+        residual = self.ontology_object_residual(combined)
+        gate = self.ontology_object_gate(combined)
         gain = 0.25 * torch.sigmoid(
             self.ontology_object_residual_gain)
         return objectSeq + presence * gain * gate * residual
@@ -1133,9 +1339,9 @@ class AttentionExtractor(AGICoreModule):
             revision,
             changed,], dim=-1)
         code = self.entity_text_encoder(features)
-        joint = torch.cat([objectSeq, code], dim=-1)
-        residual = self.entity_text_residual(joint)
-        gate = self.entity_text_gate(joint)
+        combined = torch.cat([objectSeq, code], dim=-1)
+        residual = self.entity_text_residual(combined)
+        gate = self.entity_text_gate(combined)
         return objectSeq + 0.25 * confidence * torch.sigmoid(
             self.entity_text_gain) * gate * residual
 
@@ -1149,6 +1355,7 @@ class AttentionExtractor(AGICoreModule):
         precision: torch.Tensor,
         tdError: torch.Tensor,
         keyPaddingMask: Optional[torch.Tensor],
+        returnDiagnostics: bool = False,
         ) -> Tuple[
             torch.Tensor,
             torch.Tensor,
@@ -1221,27 +1428,33 @@ class AttentionExtractor(AGICoreModule):
         salience_allocation = torch.softmax(
             salience_allocation_logits,
             dim=-1) * float(K + 1)
-        joint_logits = (
+        competition_logits = (
             object_logits
             + salience.unsqueeze(-1) * salience_allocation
             + F.softplus(self.quality_log_gain)
             * log_reliability.unsqueeze(-1))
+        competition_logits, inhibition_trace = self.ApplyInhibitionOfReturn(
+            competition_logits,
+            keyPaddingMask)
 
         if keyPaddingMask is not None:
-            joint_logits = joint_logits.masked_fill(
+            competition_logits = competition_logits.masked_fill(
                 keyPaddingMask.unsqueeze(-1),
                 -torch.inf)
 
-        B, S, candidate_count = joint_logits.shape
-        joint_attention = torch.softmax(
-            joint_logits.reshape(B, S * candidate_count),
+        B, S, candidate_count = competition_logits.shape
+        competition_attention = torch.softmax(
+            competition_logits.reshape(B, S * candidate_count),
             dim=-1).reshape(B, S, candidate_count)
         if keyPaddingMask is not None:
-            joint_attention = joint_attention.masked_fill(
+            competition_attention = competition_attention.masked_fill(
                 keyPaddingMask.unsqueeze(-1),
                 0.0)
 
-        object_attention = torch.softmax(object_logits, dim=-1)
+        object_attention = torch.softmax(
+            object_logits
+            - F.softplus(self.inhibition_return_gain) * inhibition_trace,
+            dim=-1)
         if keyPaddingMask is not None:
             object_attention = object_attention * (
                 ~keyPaddingMask).unsqueeze(-1)
@@ -1252,7 +1465,7 @@ class AttentionExtractor(AGICoreModule):
         object_content_evidence = (
             real_object_attention * object_evidence).sum(dim=-1)
 
-        temporal_logits = torch.logsumexp(joint_logits, dim=-1)
+        temporal_logits = torch.logsumexp(competition_logits, dim=-1)
         temporal_log_attention = F.log_softmax(
             temporal_logits,
             dim=-1)
@@ -1290,14 +1503,17 @@ class AttentionExtractor(AGICoreModule):
         structured = (
             (content + event_content) * channel_reliability) * (
                 reliability * precision.unsqueeze(-1)).unsqueeze(-1)
-        return (
+        result = (
             structured,
             content_weights,
-            joint_attention,
+            competition_attention,
             object_attention,
             temporal_attention,
             attention_bias,
             reliability)
+        if returnDiagnostics:
+            return result + (inhibition_trace,)
+        return result
 
     def PrepareAttentionSequence(
         self,
@@ -1311,6 +1527,11 @@ class AttentionExtractor(AGICoreModule):
         keyPaddingMask: Optional[torch.Tensor],
         tdError: Optional[torch.Tensor],
         uncertainty: Optional[torch.Tensor],
+        novelty: Optional[torch.Tensor] = None,
+        risk: Optional[torch.Tensor] = None,
+        informationGain: Optional[torch.Tensor] = None,
+        localDetailMask: Optional[torch.Tensor] = None,
+        stageActiveMask: Optional[torch.Tensor] = None,
         ) -> Tuple[
             torch.Tensor,
             torch.Tensor,
@@ -1334,15 +1555,45 @@ class AttentionExtractor(AGICoreModule):
             precision,
             tdError,
             uncertainty)
+        if novelty is None:
+            novelty_signal = torch.log1p(
+                (objectSeq[:, 1:] - objectSeq[:, :-1]).square().mean(
+                    dim=(1, 2, 3))) if objectSeq.size(1) > 1 else x.new_zeros(B)
+        else:
+            novelty_signal = self.NormalizeSignal(
+                novelty,
+                B,
+                x,
+                "novelty")
+        risk_signal = self.NormalizeSignal(risk, B, x, "risk")
+        information_signal = self.NormalizeSignal(
+            informationGain,
+            B,
+            x,
+            "informationGain")
+        signals = torch.stack([
+            tdError.abs(),
+            precision,
+            novelty_signal,
+            risk_signal,
+            information_signal], dim=-1)
+        independent_head, independent_channel, independent_attention = (
+            self.ComputeIndependentModulation(signals, x.size(1)))
+        head_gate = independent_head if head_gate is None else head_gate * independent_head
+        channel_gate = (
+            independent_channel
+            if channel_gate is None
+            else channel_gate * independent_channel)
 
         (
             structured,
             content_weights,
-            joint_attention,
+            competition_attention,
             object_attention,
             temporal_attention,
             attention_bias,
             reliability,
+            inhibition_trace,
         ) = self.BuildObjectTimeCompetition(
             objectSeq,
             motionSeq,
@@ -1351,7 +1602,11 @@ class AttentionExtractor(AGICoreModule):
             goalBias,
             precision,
             tdError,
-            keyPaddingMask)
+            keyPaddingMask,
+            returnDiagnostics=True)
+        attention_bias = attention_bias + independent_attention
+        if keyPaddingMask is not None:
+            attention_bias = attention_bias.masked_fill(keyPaddingMask, 0.0)
 
         x = x + 0.0625 * structured
         goal_term = self.goal_bias_proj(goalBias)
@@ -1359,7 +1614,7 @@ class AttentionExtractor(AGICoreModule):
         if keyPaddingMask is not None:
             x = x * (~keyPaddingMask).unsqueeze(-1)
 
-        attention_mass_square = joint_attention.square().sum(
+        attention_mass_square = competition_attention.square().sum(
             dim=(1, 2))
         effective_capacity = torch.where(
             attention_mass_square > 0,
@@ -1382,7 +1637,7 @@ class AttentionExtractor(AGICoreModule):
         extras: Dict[str, Any] = {
             "structured_terms": x.new_tensor(3.0),
             "structured_weights": content_weights,
-            "object_time_attention": joint_attention,
+            "object_time_attention": competition_attention,
             "object_attention": object_attention,
             "temporal_attention_prior": temporal_attention,
             "frame_reliability": reliability,
@@ -1391,6 +1646,13 @@ class AttentionExtractor(AGICoreModule):
             "attention_transfer_rate": attention_transfer_rate,
             "goal_bias_norm": goal_term.detach().norm(dim=-1),
             "precision": precision.detach(),}
+        extras["independent_modulation"] = signals
+        extras["inhibition_trace"] = inhibition_trace
+        extras["local_detail_mask"] = localDetailMask
+        extras["stage_active_mask"] = (
+            stageActiveMask
+            if stageActiveMask is not None
+            else torch.ones(B, x.size(1), dtype=torch.bool, device=x.device))
         if head_gate is not None:
             extras["head_gate_mean"] = head_gate.detach().mean(
                 dim=(1, 2, 3))
@@ -1465,10 +1727,64 @@ class AttentionExtractor(AGICoreModule):
             query,
             self.readout_key(workspace_tokens)) / math.sqrt(self.output_dim)
         workspace_weights = torch.softmax(workspace_scores, dim=-1)
-        workspace_readout = torch.einsum(
+        dense_workspace_readout = torch.einsum(
             "bl,bld->bd",
             workspace_weights,
             self.readout_value(workspace_tokens))
+        ignition_count = min(
+            self.workspace_ignition_count,
+            int(workspace_scores.size(1)))
+        ignition_index = torch.topk(
+            workspace_scores,
+            k=ignition_count,
+            dim=-1).indices
+        ignition_mask = torch.zeros_like(workspace_scores, dtype=torch.bool)
+        ignition_mask.scatter_(1, ignition_index, True)
+        ignition_scores = workspace_scores.masked_fill(
+            ~ignition_mask,
+            -torch.inf)
+        ignition_weights = torch.softmax(ignition_scores, dim=-1)
+        ignition_readout = torch.einsum(
+            "bl,bld->bd",
+            ignition_weights,
+            self.readout_value(workspace_tokens))
+        workspace_readout = (
+            dense_workspace_readout
+            + torch.tanh(self.workspace_ignition_gain) * ignition_readout)
+
+        local_mask = extras["local_detail_mask"]
+        if local_mask is None:
+            center = extras["temporal_attention_prior"].argmax(dim=-1)
+            positions = torch.arange(x.size(1), device=x.device).view(1, -1)
+            local_mask = (
+                positions - center.unsqueeze(-1)).abs() <= self.local_detail_radius
+            if keyPaddingMask is not None:
+                local_mask = local_mask & ~keyPaddingMask
+        local_enabled = local_mask.any(dim=-1)
+        fallback_index = extras["temporal_attention_prior"].argmax(dim=-1)
+        fallback_mask = F.one_hot(
+            fallback_index,
+            num_classes=x.size(1)).to(dtype=torch.bool)
+        safe_local_mask = local_mask | (
+            fallback_mask & ~local_enabled.unsqueeze(-1))
+        local_query = query + self.local_detail_query(goalTerm)
+        local_scores = torch.einsum(
+            "bd,bsd->bs",
+            local_query,
+            self.readout_key(x)) / math.sqrt(self.output_dim)
+        local_scores = local_scores.masked_fill(~safe_local_mask, -torch.inf)
+        local_weights = torch.softmax(local_scores, dim=-1)
+        local_weights = (
+            local_weights.masked_fill(~local_mask, 0.0)
+            * local_enabled.to(dtype=local_weights.dtype).unsqueeze(-1))
+        local_readout = torch.einsum(
+            "bs,bsd->bd",
+            local_weights,
+            self.local_detail_value(x))
+        full_temporal_readout = temporal_readout
+        temporal_readout = (
+            temporal_readout
+            + torch.tanh(self.local_detail_gain) * local_readout)
 
         if keyPaddingMask is None:
             current_token = x[:, -1]
@@ -1516,9 +1832,559 @@ class AttentionExtractor(AGICoreModule):
             workspace_object_attention)
         extras["workspace_source_mass"] = workspace_source_mass
         extras["workspace_readout_attention"] = workspace_weights
+        extras["workspace_ignition_mask"] = ignition_mask
+        extras["workspace_ignition_attention"] = ignition_weights
+        extras["local_detail_attention"] = local_weights
+        extras["local_detail_readout"] = local_readout
+        extras["full_temporal_readout"] = full_temporal_readout
         extras["readout_weights"] = readout_weights
         extras["fusion_weights"] = fusion_weights
         return self.output_proj(out)
+
+    def ForwardPreparedFull(
+        self,
+        x: torch.Tensor,
+        objectSeq: torch.Tensor,
+        goalBias: torch.Tensor,
+        goalTerm: torch.Tensor,
+        precision: torch.Tensor,
+        tdError: torch.Tensor,
+        uncertainty: torch.Tensor,
+        headGate: Optional[torch.Tensor],
+        channelGate: Optional[torch.Tensor],
+        attentionBias: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor],
+        extras: Dict[str, Any],
+        ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        for block in self.temporal_blocks:
+            x = block(
+                x,
+                keyPaddingMask=keyPaddingMask,
+                tdError=tdError,
+                uncertainty=uncertainty,
+                precision=precision,
+                headGate=headGate,
+                channelGate=channelGate,
+                attentionBias=attentionBias)
+        out = self.GoalConditionedReadout(
+            x,
+            objectSeq,
+            goalBias,
+            goalTerm,
+            precision,
+            tdError,
+            attentionBias,
+            keyPaddingMask,
+            extras)
+        return out, extras
+
+    def LatestPreparedToken(
+        self,
+        x: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor],
+        ) -> torch.Tensor:
+        if keyPaddingMask is None:
+            return x[:, -1]
+        positions = torch.arange(
+            x.size(1),
+            device=x.device).unsqueeze(0)
+        current_index = positions.masked_fill(
+            keyPaddingMask,
+            0).amax(dim=-1)
+        current = x[
+            torch.arange(x.size(0), device=x.device),
+            current_index]
+        valid = (~keyPaddingMask).any(dim=-1).unsqueeze(-1)
+        return current * valid.to(dtype=x.dtype)
+
+    def ForwardFastPrepared(
+        self,
+        x: torch.Tensor,
+        goalTerm: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor],
+        ) -> torch.Tensor:
+        current = self.LatestPreparedToken(x, keyPaddingMask)
+        residual = self.fast_student_residual(
+            torch.cat([current, goalTerm], dim=-1))
+        return self.fast_student_norm(
+            current + torch.tanh(self.fast_student_gain) * residual)
+
+    def ForwardDetailPrepared(
+        self,
+        x: torch.Tensor,
+        goalTerm: torch.Tensor,
+        localDetailMask: Optional[torch.Tensor],
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = int(x.size(0))
+        if localDetailMask is None:
+            localDetailMask = torch.zeros(
+                B,
+                x.size(1),
+                device=x.device,
+                dtype=torch.bool)
+        selected_index = localDetailMask.nonzero(as_tuple=False)
+        selected_count = localDetailMask.sum(dim=-1)
+        summary = x.new_zeros(B, x.size(-1))
+        if selected_index.numel() > 0:
+            selected = x[
+                selected_index[:, 0],
+                selected_index[:, 1]]
+            selected = (
+                selected
+                + torch.tanh(self.detail_token_gain)
+                * self.detail_token_student(selected))
+            selected_query = self.detail_student_query(
+                goalTerm).index_select(0, selected_index[:, 0])
+            selected_score = (
+                selected * selected_query).sum(dim=-1) / math.sqrt(
+                    float(x.size(-1)))
+            for rowIndex in range(B):
+                row_selected = selected_index[:, 0].eq(rowIndex)
+                if not bool(row_selected.any().item()):
+                    continue
+                row_weight = torch.softmax(
+                    selected_score[row_selected],
+                    dim=0)
+                summary[rowIndex] = (
+                    row_weight.unsqueeze(-1)
+                    * selected[row_selected]).sum(dim=0)
+        residual = self.detail_student_residual(
+            torch.cat([summary, goalTerm], dim=-1))
+        output = self.detail_student_norm(
+            summary + torch.tanh(self.detail_student_gain) * residual)
+        return output, selected_count
+
+    def IndexAttentionExtras(
+        self,
+        extras: Dict[str, Any],
+        rowIndex: torch.Tensor,
+        batchSize: int,
+        ) -> Dict[str, Any]:
+        return {
+            name: (
+                value.index_select(0, rowIndex)
+                if (
+                    torch.is_tensor(value)
+                    and value.dim() > 0
+                    and int(value.size(0)) == batchSize)
+                else value)
+            for name, value in extras.items()}
+
+    def ScatterAttentionExtras(
+        self,
+        extras: Dict[str, Any],
+        update: Dict[str, Any],
+        rowIndex: torch.Tensor,
+        batchSize: int,
+        ) -> Dict[str, Any]:
+        merged = dict(extras)
+        update_rows = int(rowIndex.numel())
+        for name, value in update.items():
+            if (
+                torch.is_tensor(value)
+                and value.dim() > 0
+                and int(value.size(0)) == update_rows
+            ):
+                existing = merged.get(name)
+                if (
+                    torch.is_tensor(existing)
+                    and existing.dim() > 0
+                    and int(existing.size(0)) == batchSize
+                    and existing.shape[1:] == value.shape[1:]
+                ):
+                    destination = existing.clone()
+                else:
+                    destination = value.new_zeros(
+                        batchSize,
+                        *value.shape[1:])
+                destination.index_copy_(0, rowIndex, value)
+                merged[name] = destination
+            elif name not in merged:
+                merged[name] = value
+        return merged
+
+    @torch.no_grad()
+    def IndexAttentionState(
+        self,
+        state: Dict[str, Any],
+        rowIndex: torch.Tensor,
+        ) -> Dict[str, Any]:
+        return {
+            "fusion": state["fusion"].index_select(0, rowIndex),
+            "mhsa": [
+                {
+                    "U": item["U"].index_select(0, rowIndex),
+                    "V": item["V"].index_select(0, rowIndex),}
+                for item in state["mhsa"]]}
+
+    @torch.no_grad()
+    def ScatterAttentionState(
+        self,
+        state: Dict[str, Any],
+        rowIndex: torch.Tensor,
+        ) -> None:
+        self.readout_fusion.hebbian_memory.index_copy_(
+            0,
+            rowIndex,
+            state["fusion"])
+        for block, item in zip(self.temporal_blocks, state["mhsa"]):
+            block.mhsa.U.index_copy_(0, rowIndex, item["U"])
+            block.mhsa.V.index_copy_(0, rowIndex, item["V"])
+
+    def RunFullPreparedRows(
+        self,
+        fullRunner: Any,
+        rowIndex: torch.Tensor,
+        x: torch.Tensor,
+        objectSeq: torch.Tensor,
+        goalBias: torch.Tensor,
+        goalTerm: torch.Tensor,
+        precision: torch.Tensor,
+        tdError: torch.Tensor,
+        uncertainty: torch.Tensor,
+        headGate: Optional[torch.Tensor],
+        channelGate: Optional[torch.Tensor],
+        attentionBias: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor],
+        extras: Dict[str, Any],
+        ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        B = int(x.size(0))
+
+        def Select(value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            return (
+                None
+                if value is None
+                else value.index_select(0, rowIndex))
+
+        selected_extras = self.IndexAttentionExtras(
+            extras,
+            rowIndex,
+            B)
+        if int(rowIndex.numel()) == B:
+            return fullRunner(
+                x,
+                objectSeq,
+                goalBias,
+                goalTerm,
+                precision,
+                tdError,
+                uncertainty,
+                headGate,
+                channelGate,
+                attentionBias,
+                keyPaddingMask,
+                selected_extras)
+        full_state = self.ExportState()
+        selected_state = self.IndexAttentionState(
+            full_state,
+            rowIndex)
+        self.ImportState(selected_state)
+        updated_state = None
+        try:
+            output, selected_extras = fullRunner(
+                Select(x),
+                Select(objectSeq),
+                Select(goalBias),
+                Select(goalTerm),
+                Select(precision),
+                Select(tdError),
+                Select(uncertainty),
+                Select(headGate),
+                Select(channelGate),
+                Select(attentionBias),
+                Select(keyPaddingMask),
+                selected_extras)
+            updated_state = self.ExportState()
+        finally:
+            self.ImportState(full_state)
+        if updated_state is not None:
+            self.ScatterAttentionState(
+                updated_state,
+                rowIndex)
+        return output, selected_extras
+
+    def ConditionalComputeUnits(
+        self,
+        fullMask: torch.Tensor,
+        fastMask: torch.Tensor,
+        detailMask: torch.Tensor,
+        localDetailMask: Optional[torch.Tensor],
+        sequenceLength: int,
+        trainStudents: bool,
+        ) -> Dict[str, torch.Tensor]:
+        dtype = torch.float32
+        device = fullMask.device
+        B = int(fullMask.size(0))
+        full_unit_value = float(
+            max(
+                1,
+                len(self.temporal_blocks) * int(sequenceLength)
+                + self.workspace.iterations * self.routing_out_caps
+                + 1))
+        full_units = torch.full(
+            (B,),
+            full_unit_value,
+            device=device,
+            dtype=dtype)
+        detail_count = (
+            torch.zeros(B, device=device, dtype=dtype)
+            if localDetailMask is None
+            else localDetailMask.sum(dim=-1).to(dtype=dtype))
+        fast_units = torch.ones(B, device=device, dtype=dtype)
+        detail_units = detail_count + 1.0
+        selected_units = (
+            fullMask.to(dtype=dtype) * full_units
+            + fastMask.to(dtype=dtype) * fast_units
+            + detailMask.to(dtype=dtype) * detail_units)
+        actual_units = (
+            (fullMask | fastMask | detailMask).to(dtype=dtype) * full_units
+            + fastMask.to(dtype=dtype) * fast_units
+            + detailMask.to(dtype=dtype) * detail_units
+            if trainStudents
+            else selected_units)
+        return {
+            "selected_compute_units": selected_units,
+            "actual_compute_units": actual_units,
+            "full_compute_units": full_units,
+            "selected_normalized_compute_fraction": (
+                selected_units / full_units),
+            "actual_normalized_compute_fraction": (
+                actual_units / full_units),}
+
+    def StudentDistillationLoss(
+        self,
+        student: torch.Tensor,
+        teacher: torch.Tensor,
+        sampleMask: torch.Tensor,
+        ) -> torch.Tensor:
+        if (
+            student.dim() != 2
+            or teacher.shape != student.shape
+            or sampleMask.shape != student.shape[:1]
+            or sampleMask.dtype != torch.bool
+            or sampleMask.device != student.device
+            or teacher.device != student.device
+            or teacher.dtype != student.dtype
+        ):
+            raise ValueError(
+                "attention distillation inputs must share [B, D]")
+        per_row = F.smooth_l1_loss(
+            student,
+            teacher.detach(),
+            reduction="none").mean(dim=-1)
+        weight = sampleMask.to(dtype=student.dtype)
+        return (per_row * weight).sum() / weight.sum().clamp_min(1.0)
+
+    def ForwardConditional(
+        self,
+        x: torch.Tensor,
+        objectSeq: torch.Tensor,
+        motionSeq: torch.Tensor,
+        qualitySeq: torch.Tensor,
+        predErrorSeq: torch.Tensor,
+        goalBias: torch.Tensor,
+        precision: torch.Tensor,
+        fullMask: torch.Tensor,
+        fastMask: torch.Tensor,
+        detailMask: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor] = None,
+        tdError: Optional[torch.Tensor] = None,
+        uncertainty: Optional[torch.Tensor] = None,
+        returnExtras: bool = False,
+        novelty: Optional[torch.Tensor] = None,
+        risk: Optional[torch.Tensor] = None,
+        informationGain: Optional[torch.Tensor] = None,
+        stageMask: Optional[torch.Tensor] = None,
+        localDetailMask: Optional[torch.Tensor] = None,
+        trainStudents: bool = False,
+        fullRunner: Optional[Any] = None,
+        ) -> torch.Tensor:
+        B = int(x.size(0))
+        for name, mask in (
+            ("fullMask", fullMask),
+            ("fastMask", fastMask),
+            ("detailMask", detailMask),
+        ):
+            if (
+                not torch.is_tensor(mask)
+                or mask.shape != (B,)
+                or mask.dtype != torch.bool
+                or mask.device != x.device
+            ):
+                raise ValueError(name + " must be boolean [B]")
+        if bool((
+            fullMask.to(dtype=torch.int8)
+            + fastMask.to(dtype=torch.int8)
+            + detailMask.to(dtype=torch.int8)
+        ).gt(1).any().item()):
+            raise ValueError("attention compute paths must be disjoint")
+        keyPaddingMask, stage_active_mask = self.ResolveStagePadding(
+            x,
+            keyPaddingMask,
+            stageMask)
+        local_detail_mask = self.ResolveDetailMask(
+            x,
+            stage_active_mask,
+            localDetailMask)
+        (
+            prepared,
+            tdError,
+            uncertainty,
+            precision,
+            head_gate,
+            channel_gate,
+            goal_term,
+            attention_bias,
+            extras,
+        ) = self.PrepareAttentionSequence(
+            x,
+            objectSeq,
+            motionSeq,
+            qualitySeq,
+            predErrorSeq,
+            goalBias,
+            precision,
+            keyPaddingMask,
+            tdError,
+            uncertainty,
+            novelty,
+            risk,
+            informationGain,
+            local_detail_mask,
+            stage_active_mask)
+        runner = (
+            self.ForwardPreparedFull
+            if fullRunner is None
+            else fullRunner)
+        units = self.ConditionalComputeUnits(
+            fullMask,
+            fastMask,
+            detailMask,
+            local_detail_mask,
+            int(x.size(1)),
+            bool(trainStudents))
+        extras.update(units)
+        if bool(trainStudents):
+            active_rows = (fullMask | fastMask | detailMask).nonzero(
+                as_tuple=False).flatten()
+            output = x.new_zeros(B, self.output_dim)
+            if active_rows.numel() > 0:
+                teacher_output, teacher_extras = self.RunFullPreparedRows(
+                    runner,
+                    active_rows,
+                    prepared,
+                    objectSeq,
+                    goalBias,
+                    goal_term,
+                    precision,
+                    tdError,
+                    uncertainty,
+                    head_gate,
+                    channel_gate,
+                    attention_bias,
+                    keyPaddingMask,
+                    extras)
+                output.index_copy_(0, active_rows, teacher_output)
+                extras = self.ScatterAttentionExtras(
+                    extras,
+                    teacher_extras,
+                    active_rows,
+                    B)
+            if "local_detail_readout" not in extras:
+                extras["local_detail_readout"] = x.new_zeros(
+                    B,
+                    self.output_dim)
+            if "full_temporal_readout" not in extras:
+                extras["full_temporal_readout"] = x.new_zeros(
+                    B,
+                    self.output_dim)
+            fast_student = x.new_zeros(B, self.output_dim)
+            fast_rows = fastMask.nonzero(as_tuple=False).flatten()
+            if fast_rows.numel() > 0:
+                fast_update = self.ForwardFastPrepared(
+                    prepared.index_select(0, fast_rows),
+                    goal_term.index_select(0, fast_rows),
+                    None if keyPaddingMask is None else (
+                        keyPaddingMask.index_select(0, fast_rows)))
+                fast_student.index_copy_(0, fast_rows, fast_update)
+            detail_student = x.new_zeros(B, self.output_dim)
+            detail_count = torch.zeros(
+                B,
+                device=x.device,
+                dtype=torch.long)
+            detail_rows = detailMask.nonzero(as_tuple=False).flatten()
+            if detail_rows.numel() > 0:
+                detail_update, detail_update_count = (
+                    self.ForwardDetailPrepared(
+                        prepared.index_select(0, detail_rows),
+                        goal_term.index_select(0, detail_rows),
+                        None if local_detail_mask is None else (
+                            local_detail_mask.index_select(0, detail_rows))))
+                detail_student.index_copy_(
+                    0,
+                    detail_rows,
+                    detail_update)
+                detail_count.index_copy_(
+                    0,
+                    detail_rows,
+                    detail_update_count)
+            extras["fast_student_attention"] = fast_student
+            extras["detail_student_attention"] = detail_student
+            extras["detail_student_token_count"] = detail_count
+            extras.update(units)
+            if returnExtras:
+                return output, extras
+            return output
+        output = x.new_zeros(B, self.output_dim)
+        full_rows = fullMask.nonzero(as_tuple=False).flatten()
+        if full_rows.numel() > 0:
+            full_output, full_extras = self.RunFullPreparedRows(
+                runner,
+                full_rows,
+                prepared,
+                objectSeq,
+                goalBias,
+                goal_term,
+                precision,
+                tdError,
+                uncertainty,
+                head_gate,
+                channel_gate,
+                attention_bias,
+                keyPaddingMask,
+                extras)
+            output.index_copy_(0, full_rows, full_output)
+            extras = self.ScatterAttentionExtras(
+                extras,
+                full_extras,
+                full_rows,
+                B)
+        fast_rows = fastMask.nonzero(as_tuple=False).flatten()
+        if fast_rows.numel() > 0:
+            fast_output = self.ForwardFastPrepared(
+                prepared.index_select(0, fast_rows),
+                goal_term.index_select(0, fast_rows),
+                None if keyPaddingMask is None else keyPaddingMask.index_select(
+                    0, fast_rows))
+            output.index_copy_(0, fast_rows, fast_output)
+        detail_rows = detailMask.nonzero(as_tuple=False).flatten()
+        detail_count = torch.zeros(
+            B,
+            device=x.device,
+            dtype=torch.long)
+        if detail_rows.numel() > 0:
+            detail_output, selected_count = self.ForwardDetailPrepared(
+                prepared.index_select(0, detail_rows),
+                goal_term.index_select(0, detail_rows),
+                None if local_detail_mask is None else (
+                    local_detail_mask.index_select(0, detail_rows)))
+            output.index_copy_(0, detail_rows, detail_output)
+            detail_count.index_copy_(0, detail_rows, selected_count)
+        extras["detail_student_token_count"] = detail_count
+        extras.update(units)
+        if returnExtras:
+            return output, extras
+        return output
 
     def EnsureB(self, B: int) -> None:
         for block in self.temporal_blocks:
@@ -1537,7 +2403,20 @@ class AttentionExtractor(AGICoreModule):
         keyPaddingMask: Optional[torch.Tensor] = None,
         tdError: Optional[torch.Tensor] = None, # [-1 ,1] [B]
         uncertainty: Optional[torch.Tensor]=None, # [0 ,1] [B]
-        returnExtras: bool = False,) -> torch.Tensor: # [B] or scalar
+        returnExtras: bool = False,
+        novelty: Optional[torch.Tensor] = None,
+        risk: Optional[torch.Tensor] = None,
+        informationGain: Optional[torch.Tensor] = None,
+        stageMask: Optional[torch.Tensor] = None,
+        localDetailMask: Optional[torch.Tensor] = None,) -> torch.Tensor:
+        keyPaddingMask, stage_active_mask = self.ResolveStagePadding(
+            x,
+            keyPaddingMask,
+            stageMask)
+        local_detail_mask = self.ResolveDetailMask(
+            x,
+            stage_active_mask,
+            localDetailMask)
         (
             x,
             tdError,
@@ -1558,8 +2437,13 @@ class AttentionExtractor(AGICoreModule):
             precision,
             keyPaddingMask,
             tdError,
-            uncertainty)
-        
+            uncertainty,
+            novelty,
+            risk,
+            informationGain,
+            local_detail_mask,
+            stage_active_mask)
+
         for blk in self.temporal_blocks:
             x = blk(
                 x,
@@ -1596,13 +2480,13 @@ class AttentionExtractor(AGICoreModule):
         st = {
             "fusion": self.readout_fusion.hebbian_memory.detach().clone(),
             "mhsa": []}
-        
+
         for blk in self.temporal_blocks:
             mhsa = blk.mhsa
             st["mhsa"].append({
                 "U": mhsa.U.detach().clone(),
                 "V": mhsa.V.detach().clone(),})
-            
+
         return st
 
     @torch.no_grad()
@@ -1637,31 +2521,72 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
             autoRank=autoRank,
             evThreshold=evThreshold,
             gradEma=gradEma,)
+        self.EnableStudentTraining()
+        self.EnableAttentionEnhancementTraining()
+        self.register_load_state_dict_post_hook(
+            self.RestoreStudentTraining)
+
+    def EnableStudentTraining(self) -> None:
+        prefixes = (
+            "fast_student_",
+            "detail_token_",
+            "detail_student_")
+        for name, parameter in self.base.named_parameters():
+            if name.startswith(prefixes):
+                parameter.requires_grad_(True)
+
+    def EnableAttentionEnhancementTraining(self) -> None:
+        prefixes = (
+            "independent_head_scale",
+            "independent_channel_scale",
+            "independent_attention_scale",
+            "inhibition_return_gain",
+            "inhibition_return_decay",
+            "local_detail_query.",
+            "local_detail_value.",
+            "local_detail_gain",
+            "workspace_ignition_gain")
+        for name, parameter in self.base.named_parameters():
+            if name.startswith(prefixes):
+                parameter.requires_grad_(True)
+
+    def RestoreBaseTrainabilityAfterCommit(self) -> None:
+        super().RestoreBaseTrainabilityAfterCommit()
+        self.EnableStudentTraining()
+        self.EnableAttentionEnhancementTraining()
+
+    def RestoreStudentTraining(
+        self,
+        module: nn.Module,
+        incompatibleKeys: Any,
+        ) -> None:
+        self.EnableStudentTraining()
+        self.EnableAttentionEnhancementTraining()
 
     def BuildSiteSpecs(self) -> Dict[str, SiteSpec]:
         L = len(self.base.temporal_blocks)
         assert L > 0, "AttentionExtractor.temporal_blocks is NULL"
         E = int(self.base.temporal_blocks[0].mhsa.embed_dim)
 
-        def alloc_linear(addRank: int, device: torch.device, dtype: torch.dtype):
+        def AllocLinear(addRank: int, device: torch.device, dtype: torch.dtype):
             A = nn.Parameter(torch.randn(addRank, E, device=device, dtype=dtype) * 1e-4) # [r, inDim]
             B = nn.Parameter(torch.zeros(E, addRank, device=device, dtype=dtype) * 1e-4) # [outDim, r]
             s = nn.Parameter(torch.tensor(1e-2, device=device, dtype=dtype))
             return A, B, s
 
-        def compose_linear(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-            s_eff = torch.tanh(s) * GetParametersScale(s) 
+        def ComposeLinear(a: torch.Tensor, b: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+            s_eff = torch.tanh(s) * GetParametersScale(s)
             return s_eff * (b @ a)
 
         return {
-            "q": SiteSpec("q", L, E, E, self.maxRankQ, alloc_linear, compose_linear),
-            "k": SiteSpec("k", L, E, E, self.maxRankK, alloc_linear, compose_linear),
-            "v": SiteSpec("v", L, E, E, self.maxRankV, alloc_linear, compose_linear),
-            "o": SiteSpec("o", L, E, E, self.maxRankO, alloc_linear, compose_linear),}
+            "q": SiteSpec("q", L, E, E, self.maxRankQ, AllocLinear, ComposeLinear),
+            "k": SiteSpec("k", L, E, E, self.maxRankK, AllocLinear, ComposeLinear),
+            "v": SiteSpec("v", L, E, E, self.maxRankV, AllocLinear, ComposeLinear),
+            "o": SiteSpec("o", L, E, E, self.maxRankO, AllocLinear, ComposeLinear),}
 
     def ForwardWithDeltas(
         self,
-        x: torch.Tensor,  # [B,S,E]
+        x: torch.Tensor, # [B,S,E]
         keyPaddingMask: Optional[torch.Tensor] = None,
         tdError: Optional[torch.Tensor] = None,
         uncertainty: Optional[torch.Tensor] = None,
@@ -1675,6 +2600,19 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         precision: torch.Tensor,
         returnExtras: bool = False,
         **kwargs,) -> torch.Tensor:
+        stage_mask = kwargs.pop("stageMask", None)
+        local_detail_mask = kwargs.pop("localDetailMask", None)
+        novelty = kwargs.pop("novelty", None)
+        risk = kwargs.pop("risk", None)
+        information_gain = kwargs.pop("informationGain", None)
+        keyPaddingMask, stage_active_mask = self.base.ResolveStagePadding(
+            x,
+            keyPaddingMask,
+            stage_mask)
+        local_detail_mask = self.base.ResolveDetailMask(
+            x,
+            stage_active_mask,
+            local_detail_mask)
         (
             h,
             tdError,
@@ -1695,7 +2633,12 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
             precision,
             keyPaddingMask,
             tdError,
-            uncertainty)
+            uncertainty,
+            novelty,
+            risk,
+            information_gain,
+            local_detail_mask,
+            stage_active_mask)
 
         for layerIdx, blk in enumerate(self.base.temporal_blocks):
             h = self.ForwardBlockWithDeltas(
@@ -1723,6 +2666,84 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         if returnExtras:
             return out, extras
         return out
+
+    def ForwardPreparedFullWithDeltas(
+        self,
+        x: torch.Tensor,
+        objectSeq: torch.Tensor,
+        goalBias: torch.Tensor,
+        goalTerm: torch.Tensor,
+        precision: torch.Tensor,
+        tdError: torch.Tensor,
+        uncertainty: torch.Tensor,
+        headGate: Optional[torch.Tensor],
+        channelGate: Optional[torch.Tensor],
+        attentionBias: torch.Tensor,
+        keyPaddingMask: Optional[torch.Tensor],
+        extras: Dict[str, Any],
+        deltasPerLayer: List[Dict[str, Optional[torch.Tensor]]],
+        ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        for layerIdx, block in enumerate(self.base.temporal_blocks):
+            x = self.ForwardBlockWithDeltas(
+                blk=block,
+                x=x,
+                keyPaddingMask=keyPaddingMask,
+                tdError=tdError,
+                uncertainty=uncertainty,
+                precision=precision,
+                delta=deltasPerLayer[layerIdx],
+                headGate=headGate,
+                channelGate=channelGate,
+                attentionBias=attentionBias)
+        out = self.base.GoalConditionedReadout(
+            x,
+            objectSeq,
+            goalBias,
+            goalTerm,
+            precision,
+            tdError,
+            attentionBias,
+            keyPaddingMask,
+            extras)
+        return out, extras
+
+    def ForwardConditional(self, *args, **kwargs) -> torch.Tensor:
+        deltas = [
+            self.ComposeLayerDelta(layerIdx)
+            for layerIdx in range(self.layerCount)]
+
+        def RunFull(
+            x,
+            objectSeq,
+            goalBias,
+            goalTerm,
+            precision,
+            tdError,
+            uncertainty,
+            headGate,
+            channelGate,
+            attentionBias,
+            keyPaddingMask,
+            extras,):
+            return self.ForwardPreparedFullWithDeltas(
+                x,
+                objectSeq,
+                goalBias,
+                goalTerm,
+                precision,
+                tdError,
+                uncertainty,
+                headGate,
+                channelGate,
+                attentionBias,
+                keyPaddingMask,
+                extras,
+                deltas)
+
+        return self.base.ForwardConditional(
+            *args,
+            fullRunner=RunFull,
+            **kwargs)
 
     def ResetHebbianMemory(self, doneMask: Optional[torch.Tensor] = None) -> None:
         self.base.ResetHebbianMemory(doneMask=doneMask)
@@ -1767,7 +2788,7 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
         residual0 = x
         x_norm = blk.norm(x)
 
-        def eff_linear(weight: torch.Tensor, adapter, d2: Optional[torch.Tensor]):
+        def EffLinear(weight: torch.Tensor, adapter, d2: Optional[torch.Tensor]):
             W = weight
             d_base = adapter.DeltaWeight()
             if d_base is not None:
@@ -1776,10 +2797,10 @@ class AttentionOnlineWrapper(BaseOnlineWrapper):
                 W = W + d2
             return W
 
-        Wq = eff_linear(mhsa.q_proj.weight, mhsa.q_adapter, delta.get("q"))
-        Wk = eff_linear(mhsa.k_proj.weight, mhsa.k_adapter, delta.get("k"))
-        Wv = eff_linear(mhsa.v_proj.weight, mhsa.v_adapter, delta.get("v"))
-        Wo = eff_linear(mhsa.out_proj.weight, mhsa.o_adapter, delta.get("o"))
+        Wq = EffLinear(mhsa.q_proj.weight, mhsa.q_adapter, delta.get("q"))
+        Wk = EffLinear(mhsa.k_proj.weight, mhsa.k_adapter, delta.get("k"))
+        Wv = EffLinear(mhsa.v_proj.weight, mhsa.v_adapter, delta.get("v"))
+        Wo = EffLinear(mhsa.out_proj.weight, mhsa.o_adapter, delta.get("o"))
 
         q_lin = F.linear(x_norm, Wq, mhsa.q_proj.bias)
         k_lin = F.linear(x_norm, Wk, mhsa.k_proj.bias)
@@ -2284,14 +3305,14 @@ class TestAttentionMTool:
                 args["precision"],
                 td,
                 mask)
-            structured, weights, joint, objects, temporal, bias, reliability = result
+            structured, weights, competition, objects, temporal, bias, reliability = result
             assert structured.shape == (2, 8, 64)
             assert weights.shape == (2, 8, 2)
-            assert joint.shape == (2, 8, 17)
+            assert competition.shape == (2, 8, 17)
             assert objects.shape == (2, 8, 17)
             assert temporal.shape == bias.shape == reliability.shape == (2, 8)
-            assert torch.allclose(joint.sum(dim=(1, 2)), torch.ones(2, device=self.device))
-            assert torch.count_nonzero(joint[:, :2]) == 0
+            assert torch.allclose(competition.sum(dim=(1, 2)), torch.ones(2, device=self.device))
+            assert torch.count_nonzero(competition[:, :2]) == 0
             print("ObjectTimeCompetition test passed.")
             return True
         except AssertionError as e:
@@ -2338,10 +3359,10 @@ class TestAttentionMTool:
             enriched_changed = model.EncodeOntologyObjectSequence(
                 objects,
                 changed)
-            unchanged_slots = torch.tensor([0, 1, 3], device=self.device)
+            unchanged_candidates = torch.tensor([0, 1, 3], device=self.device)
             assert torch.equal(
-                enriched.index_select(2, unchanged_slots),
-                enriched_changed.index_select(2, unchanged_slots))
+                enriched.index_select(2, unchanged_candidates),
+                enriched_changed.index_select(2, unchanged_candidates))
             assert not torch.equal(
                 enriched[:, :, 2],
                 enriched_changed[:, :, 2])
@@ -2536,7 +3557,7 @@ class TestAttentionMTool:
             print(f"BottomUpSalienceAndReliability test failed: {e}")
             return False
 
-    def TestObjectPresenceRejectsEmptySlots(self):
+    def TestObjectPresenceRejectsEmptyCandidates(self):
         try:
             K = 128
             model = AttentionExtractor(
@@ -2580,13 +3601,13 @@ class TestAttentionMTool:
             output.square().mean().backward()
             assert objects.grad is not None
             assert torch.isfinite(objects.grad).all()
-            print("ObjectPresenceRejectsEmptySlots passed.")
+            print("ObjectPresenceRejectsEmptyCandidates passed.")
             return True
         except AssertionError as e:
-            print(f"ObjectPresenceRejectsEmptySlots failed: {e}")
+            print(f"ObjectPresenceRejectsEmptyCandidates failed: {e}")
             return False
         except Exception as e:
-            print(f"ObjectPresenceRejectsEmptySlots error: {e}")
+            print(f"ObjectPresenceRejectsEmptyCandidates error: {e}")
             return False
 
     def TestAttentionMapsSupportAuxiliaryLearning(self):
@@ -2849,16 +3870,16 @@ class TestAttentionMTool:
             td = torch.randn(batch_size, device=self.device)
             uncertainty = torch.rand(batch_size, device=self.device)
 
-            def print_shape(name: str, tensor: torch.Tensor):
+            def PrintShape(name: str, tensor: torch.Tensor):
                 print(f"{name}: {tuple(tensor.shape)}")
 
             with torch.no_grad():
-                print_shape("input.x", x)
-                print_shape("input.keyPaddingMask", kpm)
-                print_shape("input.tdError", td)
-                print_shape("input.uncertainty", uncertainty)
+                PrintShape("input.x", x)
+                PrintShape("input.keyPaddingMask", kpm)
+                PrintShape("input.tdError", td)
+                PrintShape("input.uncertainty", uncertainty)
                 y = self.AttentionForward(model, x, keyPaddingMask=kpm, tdError=td, uncertainty=uncertainty)
-                print_shape("output.y", y)
+                PrintShape("output.y", y)
 
             expected_out_shape = (batch_size, embed_dim)
             assert tuple(y.shape) == expected_out_shape, f"Output shape mismatch: {y.shape}"
@@ -3226,7 +4247,7 @@ class TestAttentionMTool:
                     for s_param in wrapper.cand[site][li]["s"]:
                         s_param.requires_grad_(False)
 
-            wrapper.train(); 
+            wrapper.train();
             head = nn.Linear(64, 10).to(self.device)
             head.train()
 
@@ -3417,6 +4438,48 @@ class TestAttentionMTool:
             print(f"SmallBatchSafety error: {e}")
             return False
 
+    def TestIndependentSignalsAndSparseSelection(self):
+        try:
+            torch.manual_seed(517)
+            model = AttentionExtractor(
+                embedDim=64,
+                sequenceLength=8,
+                numHeads=4,
+                temporalLayers=1,
+                routingIterations=2).to(self.device).eval()
+            x = torch.randn(2, 8, 64, device=self.device)
+            stage_mask = torch.ones(2, 8, dtype=torch.bool, device=self.device)
+            stage_mask[:, :2] = False
+            detail_mask = torch.zeros_like(stage_mask)
+            detail_mask[:, 4:7] = True
+            args = self.AttentionInputs(2, 8, 64, x.dtype)
+            with torch.no_grad():
+                out, extras = model(
+                    x,
+                    **args,
+                    novelty=torch.tensor([0.2, 0.7], device=self.device),
+                    risk=torch.tensor([0.8, 0.1], device=self.device),
+                    informationGain=torch.tensor([0.3, 0.9], device=self.device),
+                    stageMask=stage_mask,
+                    localDetailMask=detail_mask,
+                    returnExtras=True)
+            assert out.shape == (2, 64)
+            assert extras["independent_modulation"].shape == (2, 5)
+            assert extras["inhibition_trace"].shape[:2] == (2, 8)
+            assert extras["local_detail_attention"].shape == (2, 8)
+            assert extras["workspace_ignition_mask"].dtype == torch.bool
+            assert extras["temporal_attention_prior"][:, :2].abs().max().item() == 0.0
+            assert extras["local_detail_attention"][~detail_mask].abs().max().item() == 0.0
+            assert extras["workspace_ignition_mask"].sum(dim=-1).max().item() < model.routing_out_caps
+            print("TestIndependentSignalsAndSparseSelection passed.")
+            return True
+        except AssertionError as e:
+            print("TestIndependentSignalsAndSparseSelection failed:", e)
+            return False
+        except Exception as e:
+            print("TestIndependentSignalsAndSparseSelection error:", e)
+            return False
+
     def RunAll(self):
         results = {
             "SimpleSSM": self.TestSimpleSSM(),
@@ -3428,7 +4491,7 @@ class TestAttentionMTool:
             "EntityTextConditioning": self.TestEntityTextConditioning(),
             "GoalConditionedSelection": self.TestGoalConditionedSelection(),
             "BottomUpSalienceAndReliability": self.TestBottomUpSalienceAndReliability(),
-            "ObjectPresenceRejectsEmptySlots": self.TestObjectPresenceRejectsEmptySlots(),
+            "ObjectPresenceRejectsEmptyCandidates": self.TestObjectPresenceRejectsEmptyCandidates(),
             "AttentionMapsSupportAuxiliaryLearning": self.TestAttentionMapsSupportAuxiliaryLearning(),
             "CurrentFrameOnlyHebbianUpdate": self.TestCurrentFrameOnlyHebbianUpdate(),
             "FusionPlasticityUsesPreviousState": self.TestFusionPlasticityUsesPreviousState(),
@@ -3455,6 +4518,7 @@ class TestAttentionMTool:
             "RoutingAndDistributedGates": self.TestRoutingAndDistributedGates(),
             "CapacityNotReduced": self.TestCapacityNotReduced(),
             "DualTimeConstantSSM": self.TestDualTimeConstantSSM(),
+            "IndependentSignalsAndSparseSelection": self.TestIndependentSignalsAndSparseSelection(),
             "SmallBatchSafety": self.SmallBatchSafety(),}
         passed = sum(1 for v in results.values() if v)
         print(f"\nAttention module tests (with wrapper): {passed}/{len(results)} passed.")

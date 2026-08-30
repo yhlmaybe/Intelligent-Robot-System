@@ -159,7 +159,7 @@ namespace
             0,                           /* tp_setattro */
             0,                           /* tp_as_buffer */
             Py_TPFLAGS_DEFAULT,          /* tp_flags */
-            "C++ backed JSON queue",     /* tp_doc */
+            nullptr,                     /* tp_doc */
             0,                           /* tp_traverse */
             0,                           /* tp_clear */
             0,                           /* tp_richcompare */
@@ -201,7 +201,6 @@ namespace
         JsonQueueType.tp_name = const_cast<char*>("cpp.JsonQueue");
         JsonQueueType.tp_basicsize = sizeof(JsonQueueObj);
         JsonQueueType.tp_flags = Py_TPFLAGS_DEFAULT;
-        JsonQueueType.tp_doc = const_cast<char*>("C++ backed JSON queue");
         JsonQueueType.tp_methods = JsonQueueMethods;
         JsonQueueType.tp_dealloc = reinterpret_cast<destructor>(JsonQueueDealloc);
         JsonQueueType.tp_new = PyType_GenericNew;
@@ -602,7 +601,7 @@ bool BrainDeepLearnInterface::InitAgentHandle(bool usePlanner)
 bool BrainDeepLearnInterface::AgentHandleForward(
     StatusValue& result,
     const std::string& sensorPacketJson,
-    const std::string& robotStateJson,
+    const std::string& feedbackPayloadJson,
     std::optional<double> reward,
     std::optional<double> done)
 {
@@ -639,7 +638,7 @@ bool BrainDeepLearnInterface::AgentHandleForward(
         rewardObj,
         doneObj,
         sensorPacketJson.c_str(),
-        robotStateJson.c_str());
+        feedbackPayloadJson.c_str());
     Py_DECREF(rewardObj);
     Py_DECREF(doneObj);
 
@@ -857,26 +856,14 @@ bool BrainDeepLearnInterface::TestOCRModule()
 bool BrainDeepLearnInterface::TestModuleTrain(bool onlineLearning)
 {
     return CALL_METHOD_RET_BOOL("TestModuleTrain", "b", onlineLearning);
-    //return RunPythonAsync([this, onlineLearning]()
-    //{
-    //    (void)CALL_METHOD_RET_BOOL("TestModuleTrain", "b", onlineLearning);
-    //});
 }
 
 bool BrainDeepLearnInterface::TestOCRModuleTrain()
 {
     return CALL_METHOD_NOARG("TestOCRModuleTrain");
-    //return RunPythonAsync([this, onlineLearning]()
-    //{
-    //    (void)CALL_METHOD_RET_BOOL("TestOCRModuleTrain", "b", onlineLearning);
-    //});
 }
 
 bool BrainDeepLearnInterface::TestOCRRecognitionTrain()
 {
     return CALL_METHOD_NOARG("TestOCRRecognitionTrain");
-    // return RunPythonAsync([this, onlineLearning]()
-    //{
-    //     (void)CALL_METHOD_RET_BOOL("TestOCRRecognitionTrain", "b", onlineLearning);
-    // });
 }

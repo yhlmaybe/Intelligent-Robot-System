@@ -1,12 +1,12 @@
 from __future__ import annotations
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from FunctionTools import AGICoreModule
 from ModuleMessagerManager import ModuleDim
-from RobotMorphologyModule import Realm
+from RobotMorphologyModule import RobotEmbodimentContractView
 
 
 class CodebookGoalHead(AGICoreModule):
@@ -48,19 +48,25 @@ class CodebookGoalHead(AGICoreModule):
         return {"goal": goal, "logits": logits, "code": code, "index": logits.argmax(dim=-1), "usage": self.code_usage}
 
     def UtilizationLoss(self, logits: torch.Tensor) -> torch.Tensor:
-        prob = F.softmax(logits, dim=-1).mean(dim=0)
+        probability = F.softmax(logits.float(), dim=-1)
+        prob = probability.mean(dim=0)
+        probability_floor = max(
+            1e-8,
+            float(torch.finfo(prob.dtype).tiny))
         soft_balance = (
             math.log(self.codes)
-            + (prob * prob.clamp_min(1e-8).log()).sum(dim=-1)).mean()
+            + (prob * prob.clamp_min(
+                probability_floor).log()).sum(dim=-1)).mean()
 
-        sample_prob = F.softmax(logits, dim=-1)
+        sample_prob = probability
         hard_index = sample_prob.argmax(dim=-1, keepdim=True)
         hard = torch.zeros_like(sample_prob).scatter_(-1, hard_index, 1.0)
         hard_st = hard + sample_prob - sample_prob.detach()
         hard_usage = hard_st.mean(dim=0)
         hard_balance = (
             math.log(self.codes)
-            + (hard_usage * hard_usage.clamp_min(1e-8).log()).sum(dim=-1)
+            + (hard_usage * hard_usage.clamp_min(
+                probability_floor).log()).sum(dim=-1)
         ).mean()
         return soft_balance + 0.25 * hard_balance
 
@@ -78,10 +84,6 @@ class CodebookGoalHead(AGICoreModule):
 
 
 class GoalGrounding(AGICoreModule):
-    REALM_SELF_BODY = int(Realm.SELF_BODY)
-    REALM_EXTERNAL_PHYSICAL = int(Realm.EXTERNAL_PHYSICAL)
-    REALM_VIRTUAL_CONTENT = int(Realm.VIRTUAL_CONTENT)
-
     def __init__(
         self,
         goalDim: int = ModuleDim.GoalShortDim,
@@ -176,6 +178,12 @@ class GoalGrounding(AGICoreModule):
         self.skill_head = nn.Linear(self.slot_dim, int(numSkills))
         self.slot_head = nn.Linear(self.slot_dim, 1)
         self.param_head = nn.Linear(self.slot_dim, int(paramDim))
+
+    @staticmethod
+    def MaskFloor(value: torch.Tensor) -> float:
+        if not torch.is_tensor(value) or not value.is_floating_point():
+            raise TypeError("goal grounding mask requires a floating tensor")
+        return float(torch.finfo(value.dtype).min)
 
     def BuildSemanticReferenceWeights(
         self,
@@ -283,113 +291,11 @@ class GoalGrounding(AGICoreModule):
             revision,
             changed,], dim=-1)
         code = self.entity_text_slot_encoder(features)
-        joint = torch.cat([slotTensor, code], dim=-1)
-        residual = self.entity_text_slot_residual(joint)
-        gate = self.entity_text_slot_gate(joint)
+        combined = torch.cat([slotTensor, code], dim=-1)
+        residual = self.entity_text_slot_residual(combined)
+        gate = self.entity_text_slot_gate(combined)
         return 0.25 * confidence * torch.sigmoid(
             self.entity_text_slot_gain) * gate * residual
-
-    def ResolveActuationReference(
-        self,
-        physicalState: Dict[str, torch.Tensor],
-        semanticReference: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        K = int(semanticReference.size(1))
-        realm = physicalState["RealmProb"]
-        verification = physicalState["VerificationConfidence"]
-        interaction = physicalState["PhysicalInteractionProb"]
-        presence = physicalState["PerceptualPresence"]
-
-        external_mass = realm[..., self.REALM_EXTERNAL_PHYSICAL]
-        physical_parent_mass = (
-            realm[..., self.REALM_SELF_BODY]
-            + realm[..., self.REALM_EXTERNAL_PHYSICAL])
-        direct_reference = (
-            semanticReference
-            * external_mass
-            * presence
-            * interaction
-            * verification)
-
-        uv = physicalState["SurfaceUV"]
-        uv_confidence = physicalState["SurfaceUVConfidence"]
-        virtual_child_reference = (
-            semanticReference
-            * realm[..., self.REALM_VIRTUAL_CONTENT]
-            * presence
-            * verification
-            * uv_confidence)
-        parent_eligibility = (
-            presence
-            * physical_parent_mass
-            * interaction
-            * verification
-            * physicalState["DisplaySurfaceProb"])
-        surface_parent = physicalState["SurfaceParentProb"][..., :K]
-        verified_parent_path = (
-            surface_parent * parent_eligibility.unsqueeze(1))
-        surface_reference = torch.einsum(
-            "bk,bkj->bj",
-            virtual_child_reference,
-            verified_parent_path)
-
-        actuation_reference = direct_reference
-        actuation_confidence = actuation_reference.sum(dim=-1)
-        no_actuation_prob = 1.0 - actuation_confidence
-        actuation_distribution = torch.cat([
-            actuation_reference,
-            no_actuation_prob.unsqueeze(-1),], dim=-1)
-
-        actuation_slot_index = actuation_reference.argmax(dim=-1)
-        batch_index = torch.arange(
-            actuation_reference.size(0), device=actuation_reference.device)
-        selected_parent_pose = physicalState["PoseCamera"][
-            batch_index, actuation_slot_index]
-        actuation_pose = torch.where(
-            (actuation_confidence > 0.0).unsqueeze(-1),
-            selected_parent_pose,
-            torch.zeros_like(selected_parent_pose))
-
-        surface_parent_slot_index = surface_reference.argmax(dim=-1)
-        selected_parent_path = torch.gather(
-            verified_parent_path,
-            2,
-            surface_parent_slot_index.view(-1, 1, 1).expand(-1, K, 1),
-        ).squeeze(-1)
-        resolved_child_mass = (
-            virtual_child_reference * selected_parent_path)
-        selected_surface_confidence = resolved_child_mass.sum(dim=-1)
-        surface_uv = torch.einsum(
-            "bk,bkd->bd",
-            resolved_child_mass,
-            uv) / (selected_surface_confidence.unsqueeze(-1) + 1e-8)
-        direct_confidence = direct_reference.sum(dim=-1)
-        surface_binding_confidence = surface_reference.sum(dim=-1)
-        surface_parent_pose = physicalState["PoseCamera"][
-            batch_index, surface_parent_slot_index]
-        surface_parent_pose = torch.where(
-            (surface_binding_confidence > 0.0).unsqueeze(-1),
-            surface_parent_pose,
-            torch.zeros_like(surface_parent_pose))
-        binding_kind_prob = torch.stack([
-            direct_confidence,
-            surface_binding_confidence,
-            1.0 - direct_confidence - surface_binding_confidence,], dim=-1)
-
-        return {
-            "actuation_reference_probs": actuation_reference,
-            "actuation_reference_distribution": actuation_distribution,
-            "actuation_reference_confidence": actuation_confidence,
-            "no_actuation_prob": no_actuation_prob,
-            "actuation_slot_index": actuation_slot_index,
-            "actuation_pose_camera": actuation_pose,
-            "actuation_surface_uv": surface_uv,
-            "actuation_binding_kind_prob": binding_kind_prob,
-            "surface_binding_reference_probs": surface_reference,
-            "surface_binding_confidence": surface_binding_confidence,
-            "surface_parent_slot_index": surface_parent_slot_index,
-            "surface_parent_pose_camera": surface_parent_pose,
-            "surface_binding_uv": surface_uv,}
 
     def forward(
         self,
@@ -466,10 +372,15 @@ class GoalGrounding(AGICoreModule):
             torch.einsum("bd,bkd->bk", subgoal_query, slot_embed)
             / (float(self.slot_dim) ** 0.5)
             + reference_prior)
-        query_slot_logits = query_slot_logits.masked_fill(invalid_slot, -1e9)
-        subgoal_slot_logits = subgoal_slot_logits.masked_fill(invalid_slot, -1e9)
+        mask_floor = self.MaskFloor(query_slot_logits)
+        query_slot_logits = query_slot_logits.masked_fill(
+            invalid_slot,
+            mask_floor)
+        subgoal_slot_logits = subgoal_slot_logits.masked_fill(
+            invalid_slot,
+            mask_floor)
         slot_logits = query_slot_logits + subgoal_slot_logits - reference_prior
-        slot_logits = slot_logits.masked_fill(invalid_slot, -1e9)
+        slot_logits = slot_logits.masked_fill(invalid_slot, mask_floor)
 
         no_slot_logit = self.no_slot_head(grounded_query + subgoal_query).squeeze(-1)
         reference_distribution = F.softmax(torch.cat([slot_logits, no_slot_logit.unsqueeze(-1)], dim=-1), dim=-1)
@@ -498,27 +409,23 @@ class GoalGrounding(AGICoreModule):
             ).sum(dim=-1)
         ).mean()
         referenced = reference_distribution[:, :-1]
-        no_slot_prob = reference_distribution[:, -1]
-        referenced_slot_summary = (slot_embed * referenced.unsqueeze(-1)).sum(dim=1)
+        no_reference_prob = reference_distribution[:, -1]
+        referenced_entity_summary = (slot_embed * referenced.unsqueeze(-1)).sum(dim=1)
 
         reference_confidence = referenced.sum(dim=-1)
-
-        actuation = self.ResolveActuationReference(
-            physicalState,
-            referenced)
         output = {
             "referenced_object_probs": referenced,
             "reference_distribution": reference_distribution,
             "query_reference_distribution": query_reference_distribution,
             "subgoal_reference_distribution": subgoal_reference_distribution,
             "grounding_consistency_loss": grounding_consistency_loss,
-            "referenced_slot_summary": referenced_slot_summary,
+            "referenced_entity_summary": referenced_entity_summary,
             "reference_confidence": reference_confidence,
-            "no_slot_prob": no_slot_prob,
+            "no_reference_prob": no_reference_prob,
             "semantic_reference_probs": referenced,
             "semantic_reference_distribution": reference_distribution,
             "semantic_reference_confidence": reference_confidence,}
-        if "EntityId" in physicalState and "SlotGeneration" in physicalState:
+        if "EntityId" in physicalState and "EntityGeneration" in physicalState:
             selected_slot = referenced.argmax(dim=-1)
             batch_index = torch.arange(
                 B,
@@ -526,30 +433,22 @@ class GoalGrounding(AGICoreModule):
             selected_entity = physicalState["EntityId"][
                 batch_index,
                 selected_slot]
-            selected_generation = physicalState["SlotGeneration"][
+            selected_generation = physicalState["EntityGeneration"][
                 batch_index,
                 selected_slot]
-            has_reference = reference_confidence > no_slot_prob
+            has_reference = reference_confidence > no_reference_prob
             output["referenced_entity_id"] = torch.where(
                 has_reference,
                 selected_entity,
                 torch.full_like(selected_entity, -1))
-            output["referenced_slot_generation"] = torch.where(
+            output["referenced_entity_generation"] = torch.where(
                 has_reference,
                 selected_generation,
                 torch.full_like(selected_generation, -1))
-        output.update(actuation)
         return output
 
 
 class TemporalGoalHead(AGICoreModule):
-    """Predict nominal/soft duration and derive a policy hard-deadline grace.
-
-    Synthetic supervision supplies an explicitly-valid soft-duration label.
-    There is no independent hard-timeout label, so the hard deadline is
-    derived as a fixed grace beyond the learned soft timeout.
-    """
-
     def __init__(
         self,
         shortGoalDim: int = ModuleDim.GoalShortDim,
@@ -647,20 +546,93 @@ class HierarchicalGoalFusion(AGICoreModule):
 class FourLevelGoalManager(AGICoreModule):
     def __init__(
         self,
+        contractView: RobotEmbodimentContractView,
         worldLatentDim: int,
         pstSummaryDim: int = ModuleDim.PstSlotDim,
         intentDim: int = ModuleDim.IntentionFeat,
         ultimateDim: int = ModuleDim.GoalUltimateDim,
         longDim: int = ModuleDim.GoalLongDim,
         midDim: int = ModuleDim.GoalMidDim,
-        shortDim: int = ModuleDim.GoalShortDim,):
+        shortDim: int = ModuleDim.GoalShortDim,
+        taskRelationDim: int = 16,
+        taskObjectDim: int = 32,
+        capabilityDim: int = 32,
+        taskContextDim: int = 128,):
         super().__init__()
+        if type(contractView) is not RobotEmbodimentContractView:
+            raise TypeError("goal manager requires an embodiment contract view")
+        contractView.Validate()
+        self.contract_view = contractView
+        self.endpoint_count = int(contractView.end_effector_count)
+        static_end_effector_tokens = torch.tensor(
+            contractView.static_end_effector_tokens,
+            dtype=torch.float32)
+        if (
+            static_end_effector_tokens.dim() != 2
+            or int(static_end_effector_tokens.size(0)) != self.endpoint_count
+            or int(static_end_effector_tokens.size(1)) < 1
+        ):
+            raise ValueError("goal contract end-effector descriptors are invalid")
+        self.register_buffer(
+            "static_end_effector_tokens",
+            static_end_effector_tokens,
+            persistent=True)
+        self.register_buffer(
+            "root_mask",
+            torch.tensor(contractView.root_mask, dtype=torch.bool),
+            persistent=True)
+        self.parent_index = tuple(int(value) for value in contractView.parent_index)
+        self.topological_layers = tuple(
+            tuple(int(index) for index in layer)
+            for layer in contractView.topological_layers)
         self.ultimate_dim = int(ultimateDim)
         self.long_dim = int(longDim)
         self.mid_dim = int(midDim)
         self.short_dim = int(shortDim)
+        self.task_relation_dim = int(taskRelationDim)
+        self.task_object_dim = int(taskObjectDim)
+        self.capability_dim = int(capabilityDim)
+        self.task_context_dim = int(taskContextDim)
 
         ctx_dim = worldLatentDim + pstSummaryDim + intentDim
+        self.context_dim = int(ctx_dim)
+        self.task_relation_encoder = nn.Sequential(
+            nn.LayerNorm(self.task_relation_dim),
+            nn.Linear(self.task_relation_dim, self.task_context_dim),
+            nn.SiLU(),)
+        self.task_object_encoder = nn.Sequential(
+            nn.LayerNorm(self.task_object_dim),
+            nn.Linear(self.task_object_dim, self.task_context_dim),
+            nn.SiLU(),)
+        self.requirement_encoder = nn.Sequential(
+            nn.LayerNorm(4),
+            nn.Linear(4, self.task_context_dim),
+            nn.SiLU(),)
+        self.task_context_encoder = nn.Sequential(
+            nn.LayerNorm(self.task_context_dim * 3),
+            nn.Linear(self.task_context_dim * 3, self.task_context_dim * 2),
+            nn.SiLU(),
+            nn.Linear(self.task_context_dim * 2, self.task_context_dim),
+            nn.LayerNorm(self.task_context_dim),)
+        descriptor_dim = int(static_end_effector_tokens.size(-1))
+        self.endpoint_capability_adapter = nn.Sequential(
+            nn.LayerNorm(descriptor_dim),
+            nn.Linear(descriptor_dim, self.capability_dim),
+            nn.SiLU(),)
+        self.capability_encoder = nn.Sequential(
+            nn.LayerNorm(self.capability_dim),
+            nn.Linear(self.capability_dim, self.task_context_dim),
+            nn.SiLU(),
+            nn.Linear(self.task_context_dim, self.task_context_dim),)
+        self.capability_query = nn.Sequential(
+            nn.LayerNorm(self.task_context_dim),
+            nn.Linear(self.task_context_dim, self.task_context_dim),)
+        self.task_to_context = nn.Sequential(
+            nn.LayerNorm(self.task_context_dim * 2),
+            nn.Linear(self.task_context_dim * 2, self.context_dim),
+            nn.Tanh(),)
+        self.task_context_gain = nn.Parameter(
+            torch.zeros(self.context_dim))
         self.ultimate_head = CodebookGoalHead(
             ctx_dim,
             ModuleDim.GoalUltimateCodebookGroups,
@@ -694,13 +666,248 @@ class FourLevelGoalManager(AGICoreModule):
             shortDim=self.short_dim)
         self.temporal_goal_head = TemporalGoalHead(shortGoalDim=self.short_dim)
 
+    @property
+    def ContractView(self) -> RobotEmbodimentContractView:
+        return self.contract_view
+
+    def NormalizeRequirement(
+        self,
+        value: Optional[torch.Tensor],
+        batchSize: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        name: str,) -> torch.Tensor:
+        if value is None:
+            return torch.zeros(batchSize, device=device, dtype=dtype)
+        normalized = torch.as_tensor(value, device=device, dtype=dtype)
+        if normalized.dim() == 2 and normalized.size(-1) == 1:
+            normalized = normalized.squeeze(-1)
+        if normalized.shape != (batchSize,):
+            raise ValueError(
+                f"{name} must have shape [{batchSize}], got {tuple(normalized.shape)}")
+        if not bool(torch.isfinite(normalized).all().item()):
+            raise ValueError(f"{name} must be finite")
+        return normalized.clamp(0.0, 1.0)
+
+    def BuildTaskRequirements(
+        self,
+        batchSize: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        taskRelation: Optional[torch.Tensor],
+        taskObject: Optional[torch.Tensor],
+        precisionRequirement: Optional[torch.Tensor],
+        timeRequirement: Optional[torch.Tensor],
+        terminationRequirement: Optional[torch.Tensor],
+        activePerceptionRequirement: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        if taskRelation is None:
+            relation = torch.zeros(
+                batchSize,
+                self.task_relation_dim,
+                device=device,
+                dtype=dtype)
+        else:
+            relation = taskRelation.to(device=device, dtype=dtype)
+            if relation.shape != (batchSize, self.task_relation_dim):
+                raise ValueError(
+                    f"taskRelation must have shape [{batchSize}, {self.task_relation_dim}], got {tuple(relation.shape)}")
+        if taskObject is None:
+            task_object = torch.zeros(
+                batchSize,
+                self.task_object_dim,
+                device=device,
+                dtype=dtype)
+        else:
+            task_object = taskObject.to(device=device, dtype=dtype)
+            if task_object.shape != (batchSize, self.task_object_dim):
+                raise ValueError(
+                    f"taskObject must have shape [{batchSize}, {self.task_object_dim}], got {tuple(task_object.shape)}")
+        if not bool(torch.isfinite(relation).all().item()):
+            raise ValueError("taskRelation must be finite")
+        if not bool(torch.isfinite(task_object).all().item()):
+            raise ValueError("taskObject must be finite")
+
+        precision = self.NormalizeRequirement(
+            precisionRequirement, batchSize, device, dtype, "precisionRequirement")
+        time = self.NormalizeRequirement(
+            timeRequirement, batchSize, device, dtype, "timeRequirement")
+        termination = self.NormalizeRequirement(
+            terminationRequirement, batchSize, device, dtype, "terminationRequirement")
+        active_perception = self.NormalizeRequirement(
+            activePerceptionRequirement,
+            batchSize,
+            device,
+            dtype,
+            "activePerceptionRequirement")
+        requirements = torch.stack([
+            precision,
+            time,
+            termination,
+            active_perception,], dim=-1)
+        relation_code = self.task_relation_encoder(relation)
+        object_code = self.task_object_encoder(task_object)
+        requirement_code = self.requirement_encoder(requirements)
+        context = self.task_context_encoder(torch.cat([
+            relation_code,
+            object_code,
+            requirement_code,], dim=-1))
+        return {
+            "task_context": context,
+            "task_relation": relation,
+            "task_object": task_object,
+            "precision_requirement": precision,
+            "time_requirement": time,
+            "termination_requirement": termination,
+            "active_perception_requirement": active_perception,}
+
+    def BindCapabilities(
+        self,
+        taskContext: torch.Tensor,
+        endpointAvailable: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        B = int(taskContext.size(0))
+        descriptors = self.endpoint_capability_adapter(
+            self.static_end_effector_tokens.to(
+                device=taskContext.device,
+                dtype=taskContext.dtype)).unsqueeze(0).expand(B, -1, -1)
+        if endpointAvailable is None:
+            available = torch.ones(
+                B,
+                self.endpoint_count,
+                dtype=torch.bool,
+                device=taskContext.device)
+        else:
+            available = endpointAvailable.to(
+                device=taskContext.device,
+                dtype=torch.bool)
+            if available.shape != (B, self.endpoint_count):
+                raise ValueError(
+                    f"endpointAvailable must have shape [{B}, {self.endpoint_count}], got {tuple(available.shape)}")
+        codes = self.capability_encoder(descriptors)
+        query = self.capability_query(taskContext)
+        logits = torch.einsum("bd,bnd->bn", query, codes)
+        logits = logits / math.sqrt(float(self.task_context_dim))
+        relevance = F.softmax(
+            logits.masked_fill(
+                ~available,
+                torch.finfo(logits.dtype).min),
+            dim=-1)
+        relevance = relevance * available.to(dtype=relevance.dtype)
+        relevance = relevance / relevance.sum(
+            dim=-1,
+            keepdim=True).clamp_min(max(
+                1e-8,
+                float(torch.finfo(relevance.dtype).tiny)))
+        summary = torch.einsum("bn,bnd->bd", relevance, codes)
+        return {
+            "capability_relevance": relevance,
+            "capability_summary": summary,}
+
+    def ResolveEndpointActivity(
+        self,
+        endpointAvailable: Optional[torch.Tensor],
+        hierarchyEnabled: Optional[torch.Tensor],
+        batchSize: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        shape = (int(batchSize), self.endpoint_count)
+        if endpointAvailable is None:
+            available = torch.ones(shape, dtype=torch.bool, device=device)
+        else:
+            available = endpointAvailable.to(device=device, dtype=torch.bool)
+            if tuple(available.shape) != shape:
+                raise ValueError("endpointAvailable does not match the contract")
+        if hierarchyEnabled is None:
+            enabled = self.root_mask.to(device=device).unsqueeze(0).expand(shape)
+        else:
+            enabled = hierarchyEnabled.to(device=device, dtype=torch.bool)
+            if tuple(enabled.shape) != shape:
+                raise ValueError("hierarchyEnabled does not match the contract")
+            enabled = enabled | self.root_mask.to(
+                device=device).unsqueeze(0)
+        active = available & enabled
+        for endpointIndex, parentIndex in enumerate(self.parent_index):
+            if parentIndex >= 0 and bool(
+                (active[:, endpointIndex] & ~active[:, parentIndex]).any().item()
+            ):
+                raise ValueError("active child endpoints require an active parent")
+        return active
+
+    def BuildSubtreeState(
+        self,
+        endpointRelevance: torch.Tensor,
+        endpointActive: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            endpointRelevance.dim() != 2
+            or tuple(endpointRelevance.shape) != tuple(endpointActive.shape)
+            or int(endpointRelevance.size(-1)) != self.endpoint_count
+            or not endpointRelevance.is_floating_point()
+            or endpointActive.dtype != torch.bool
+            or endpointRelevance.device != endpointActive.device
+            or not bool(torch.isfinite(endpointRelevance).all().item())
+            or bool((endpointRelevance < 0.0).any().item())
+        ):
+            raise ValueError("endpoint subtree state is invalid")
+        subtree_relevance = endpointRelevance.clone()
+        subtree_active = endpointActive.clone()
+        for layer in reversed(self.topological_layers):
+            for endpointIndex in layer:
+                parentIndex = self.parent_index[endpointIndex]
+                if parentIndex < 0:
+                    continue
+                subtree_relevance[:, parentIndex] = (
+                    subtree_relevance[:, parentIndex]
+                    + subtree_relevance[:, endpointIndex])
+                subtree_active[:, parentIndex] = (
+                    subtree_active[:, parentIndex]
+                    | subtree_active[:, endpointIndex])
+        return subtree_relevance, subtree_active
+
     def forward(
         self,
         worldLatent: torch.Tensor, # [B, WorldFeat]
         pstSummary: torch.Tensor, # [B, PstSlotDim]
         intentEmbed: torch.Tensor, # [B, IntentionFeat]
+        *,
+        taskRelation: Optional[torch.Tensor] = None,
+        taskObject: Optional[torch.Tensor] = None,
+        precisionRequirement: Optional[torch.Tensor] = None,
+        timeRequirement: Optional[torch.Tensor] = None,
+        terminationRequirement: Optional[torch.Tensor] = None,
+        activePerceptionRequirement: Optional[torch.Tensor] = None,
+        endpointAvailable: Optional[torch.Tensor] = None,
+        hierarchyEnabled: Optional[torch.Tensor] = None,
         ) -> Dict[str, torch.Tensor]:
         ctx = torch.cat([worldLatent, pstSummary, intentEmbed], dim=-1)
+        task = self.BuildTaskRequirements(
+            batchSize=int(ctx.size(0)),
+            device=ctx.device,
+            dtype=ctx.dtype,
+            taskRelation=taskRelation,
+            taskObject=taskObject,
+            precisionRequirement=precisionRequirement,
+            timeRequirement=timeRequirement,
+            terminationRequirement=terminationRequirement,
+            activePerceptionRequirement=activePerceptionRequirement)
+        capability = self.BindCapabilities(
+            taskContext=task["task_context"],
+            endpointAvailable=endpointAvailable)
+        has_task = any(value is not None for value in (
+            taskRelation,
+            taskObject,
+            precisionRequirement,
+            timeRequirement,
+            terminationRequirement,
+            activePerceptionRequirement,
+            endpointAvailable,))
+        if has_task:
+            task_residual = self.task_to_context(torch.cat([
+                task["task_context"],
+                capability["capability_summary"],], dim=-1))
+            ctx = ctx + torch.tanh(
+                self.task_context_gain).unsqueeze(0) * task_residual
         ultimate_out = self.ultimate_head(ctx)
 
         long_out = self.long_head(torch.cat([ctx, ultimate_out["goal"]], dim=-1))
@@ -708,7 +915,7 @@ class FourLevelGoalManager(AGICoreModule):
         g_short = self.short_head(torch.cat([ultimate_out["goal"], long_out["goal"], mid_out["goal"], pstSummary], dim=-1))
         fused = self.FuseGoals(ultimate_out["goal"], long_out["goal"], mid_out["goal"], g_short)
 
-        return {
+        output = {
             "g_ultimate": ultimate_out["goal"],
             "g_long": long_out["goal"],
             "g_mid": mid_out["goal"],
@@ -719,6 +926,21 @@ class FourLevelGoalManager(AGICoreModule):
             "ultimate_logits": ultimate_out["logits"],
             "long_logits": long_out["logits"],
             "mid_logits": mid_out["logits"],}
+        output.update(task)
+        output.update(capability)
+        endpoint_active = self.ResolveEndpointActivity(
+            endpointAvailable=endpointAvailable,
+            hierarchyEnabled=hierarchyEnabled,
+            batchSize=int(ctx.size(0)),
+            device=ctx.device)
+        subtree_relevance, subtree_active = self.BuildSubtreeState(
+            capability["capability_relevance"],
+            endpoint_active)
+        output["endpoint_relevance"] = capability["capability_relevance"]
+        output["subtree_relevance"] = subtree_relevance
+        output["endpoint_active"] = endpoint_active
+        output["subtree_active"] = subtree_active
+        return output
 
     def TemporalGoal(self, goalTemporal: torch.Tensor, temporalContextFeat: torch.Tensor) -> Dict[str, torch.Tensor]:
         return self.temporal_goal_head(goalTemporal, temporalContextFeat)
@@ -745,7 +967,15 @@ class FourLevelGoalManager(AGICoreModule):
 
 
 class TestGoalMTool:
-    def __init__(self, device=None):
+    def __init__(
+        self,
+        contractView: RobotEmbodimentContractView,
+        device=None,
+    ):
+        if type(contractView) is not RobotEmbodimentContractView:
+            raise TypeError("goal tests require an embodiment contract view")
+        contractView.Validate()
+        self.contract_view = contractView
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def WorldLatentDim(self) -> int:
@@ -753,6 +983,7 @@ class TestGoalMTool:
 
     def MakeManager(self) -> FourLevelGoalManager:
         return FourLevelGoalManager(
+            contractView=self.contract_view,
             worldLatentDim=self.WorldLatentDim(),
             pstSummaryDim=ModuleDim.PstSlotDim,
             intentDim=ModuleDim.IntentionFeat).to(self.device)
@@ -765,7 +996,7 @@ class TestGoalMTool:
 
     def MakeGroundingState(self, B: int, K: int) -> Dict[str, torch.Tensor]:
         realm = torch.zeros(B, K, 5, device=self.device)
-        realm[..., GoalGrounding.REALM_EXTERNAL_PHYSICAL] = 1.0
+        realm[..., 0] = 1.0
         agency = torch.zeros(B, K, 5, device=self.device)
         agency[..., 4] = 1.0
         motion_layer = torch.zeros(B, K, 5, device=self.device)
@@ -775,8 +1006,6 @@ class TestGoalMTool:
             B, K, ModuleDim.PstSelfPartSemanticDim, device=self.device)
         surface_parent = torch.zeros(B, K, K + 1, device=self.device)
         surface_parent[..., K] = 1.0
-        pose = torch.zeros(B, K, ModuleDim.PstPoseDim, device=self.device)
-        pose[..., 6] = 1.0
         return {
             "SlotState": torch.randn(B, K, ModuleDim.PstSlotDim, device=self.device),
             "U": torch.randn(B, K, ModuleDim.PstUsageDim, device=self.device),
@@ -786,7 +1015,6 @@ class TestGoalMTool:
             "Step": torch.full((B,), 4, device=self.device, dtype=torch.long),
             "SlotPresence": torch.ones(B, K, device=self.device),
             "ObservedSlotMask": torch.ones(B, K, device=self.device),
-            "PoseCamera": pose,
             "PerceptualPresence": torch.ones(B, K, device=self.device),
             "PhysicalInteractionProb": torch.ones(B, K, device=self.device),
             "RealmProb": realm,
@@ -808,7 +1036,7 @@ class TestGoalMTool:
                 B, K, device=self.device, dtype=torch.bool),
             "EntityId": torch.arange(
                 K, device=self.device, dtype=torch.long).view(1, K).expand(B, K),
-            "SlotGeneration": torch.ones(
+            "EntityGeneration": torch.ones(
                 B, K, device=self.device, dtype=torch.long),}
 
     def AssertFinite(self, value: torch.Tensor, name: str) -> None:
@@ -938,13 +1166,9 @@ class TestGoalMTool:
                 out = grounding(goal, intent, physical_state, physical_state)
             assert tuple(out["referenced_object_probs"].shape) == (B, K)
             assert tuple(out["reference_distribution"].shape) == (B, K + 1)
-            assert tuple(out["referenced_slot_summary"].shape) == (B, ModuleDim.PstSlotDim)
+            assert tuple(out["referenced_entity_summary"].shape) == (B, ModuleDim.PstSlotDim)
             assert tuple(out["reference_confidence"].shape) == (B,)
-            assert tuple(out["no_slot_prob"].shape) == (B,)
-            assert tuple(out["actuation_reference_probs"].shape) == (B, K)
-            assert tuple(out["actuation_reference_distribution"].shape) == (B, K + 1)
-            assert tuple(out["actuation_pose_camera"].shape) == (B, ModuleDim.PstPoseDim)
-            assert tuple(out["actuation_surface_uv"].shape) == (B, 2)
+            assert tuple(out["no_reference_prob"].shape) == (B,)
             for name, value in out.items():
                 self.AssertFinite(value, f"GoalGrounding {name}")
             print("GoalGrounding shape test passed.")
@@ -980,6 +1204,78 @@ class TestGoalMTool:
             return True
         except Exception as e:
             print(f"FourLevelGoalManager backward test failed: {type(e).__name__}: {e}")
+            return False
+
+    def TestAbstractTaskRequirementsAndExternalActivity(self) -> bool:
+        try:
+            B = 2
+            manager = FourLevelGoalManager(
+                contractView=self.contract_view,
+                worldLatentDim=self.WorldLatentDim(),
+                pstSummaryDim=ModuleDim.PstSlotDim,
+                intentDim=ModuleDim.IntentionFeat,
+                taskRelationDim=6,
+                taskObjectDim=7,
+                capabilityDim=5).to(self.device)
+            N = manager.endpoint_count
+            inputs = self.MakeGoalInputs(B)
+            relation = torch.randn(
+                B, 6, device=self.device, requires_grad=True)
+            task_object = torch.randn(
+                B, 7, device=self.device, requires_grad=True)
+            available = torch.ones(
+                B, N, device=self.device, dtype=torch.bool)
+            enabled = manager.root_mask.to(
+                device=self.device).unsqueeze(0).expand(B, -1).clone()
+            for endpointIndex, parentIndex in enumerate(manager.parent_index):
+                if parentIndex >= 0:
+                    enabled[:, endpointIndex] = True
+                    break
+            out = manager(
+                **inputs,
+                taskRelation=relation,
+                taskObject=task_object,
+                precisionRequirement=torch.tensor(
+                    [[0.8], [0.4]], device=self.device),
+                timeRequirement=torch.tensor(
+                    [[0.6], [0.3]], device=self.device),
+                terminationRequirement=torch.tensor(
+                    [[0.7], [0.5]], device=self.device),
+                activePerceptionRequirement=torch.tensor(
+                    [[0.9], [0.2]], device=self.device),
+                endpointAvailable=available,
+                hierarchyEnabled=enabled)
+            expected_active = available & enabled
+            assert tuple(out["task_context"].shape) == (
+                B, manager.task_context_dim)
+            assert tuple(out["capability_relevance"].shape) == (B, N)
+            assert tuple(out["capability_summary"].shape) == (
+                B, manager.task_context_dim)
+            assert torch.equal(out["endpoint_active"], expected_active)
+            assert torch.count_nonzero(
+                out["capability_relevance"].masked_select(~available)).item() == 0
+            assert torch.allclose(
+                out["precision_requirement"],
+                torch.tensor([0.8, 0.4], device=self.device))
+            loss = (
+                out["g_short"].square().mean()
+                + out["task_context"].square().mean()
+                + out["capability_summary"].square().mean())
+            loss.backward()
+            assert relation.grad is not None
+            assert task_object.grad is not None
+            assert float(relation.grad.abs().sum().item()) > 0.0
+            assert float(task_object.grad.abs().sum().item()) > 0.0
+            capability_grad = sum(
+                float(parameter.grad.abs().sum().item())
+                for parameter in manager.endpoint_capability_adapter.parameters()
+                if parameter.grad is not None)
+            assert capability_grad > 0.0
+            print("AbstractTaskRequirementsAndExternalActivity passed.")
+            return True
+        except Exception as e:
+            print(
+                f"AbstractTaskRequirementsAndExternalActivity failed: {type(e).__name__}: {e}")
             return False
 
     def TestHardCodebookCollapsePenalty(self) -> bool:
@@ -1047,13 +1343,13 @@ class TestGoalMTool:
                 query_grad > 0.0
                 and subgoal_grad > 0.0
                 and torch.allclose(
-                    no_slot["no_slot_prob"],
-                    torch.ones_like(no_slot["no_slot_prob"]),
+                    no_slot["no_reference_prob"],
+                    torch.ones_like(no_slot["no_reference_prob"]),
                     atol=1e-6,
                     rtol=1e-6)
                 and torch.allclose(
-                    no_slot["referenced_slot_summary"],
-                    torch.zeros_like(no_slot["referenced_slot_summary"]),
+                    no_slot["referenced_entity_summary"],
+                    torch.zeros_like(no_slot["referenced_entity_summary"]),
                     atol=1e-6,
                     rtol=1e-6)
                 and torch.allclose(
@@ -1096,60 +1392,11 @@ class TestGoalMTool:
                 state,
                 state)
             assert output["referenced_entity_id"].shape == (B,)
-            assert output["referenced_slot_generation"].shape == (B,)
+            assert output["referenced_entity_generation"].shape == (B,)
             print("EntityTextGrounding passed.")
             return True
         except Exception as e:
             print(f"EntityTextGrounding failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestSemanticToActuationReference(self) -> bool:
-        try:
-            B, K = 3, 4
-            grounding = GoalGrounding().to(self.device).eval()
-            state = self.MakeGroundingState(B, K)
-            realm = state["RealmProb"]
-            realm[1, 1].zero_()
-            realm[1, 1, GoalGrounding.REALM_VIRTUAL_CONTENT] = 1.0
-            realm[2, 2].zero_()
-            realm[2, 2, int(Realm.VISUAL_EFFECT)] = 1.0
-            state["PhysicalInteractionProb"][1, 1] = 0.0
-            state["PhysicalInteractionProb"][2, 2] = 0.0
-            state["SurfaceParentProb"][1, 1].zero_()
-            state["SurfaceParentProb"][1, 1, 0] = 1.0
-            state["SurfaceUV"][1, 1] = torch.tensor(
-                [0.25, 0.75], device=self.device)
-            semantic = torch.zeros(B, K, device=self.device)
-            semantic[0, 0] = 1.0
-            semantic[1, 1] = 1.0
-            semantic[2, 2] = 1.0
-            with torch.no_grad():
-                out = grounding.ResolveActuationReference(state, semantic)
-            assert out["actuation_reference_probs"][0, 0] == 1.0
-            assert out["actuation_reference_confidence"][1] == 0.0
-            assert out["surface_binding_reference_probs"][1, 0] == 1.0
-            assert out["surface_binding_confidence"][1] == 1.0
-            assert out["actuation_reference_confidence"][2] == 0.0
-            assert out["no_actuation_prob"][2] == 1.0
-            assert torch.allclose(
-                out["actuation_surface_uv"][1],
-                torch.tensor([0.25, 0.75], device=self.device))
-            invalid_uv_state = {
-                name: value.clone() for name, value in state.items()}
-            invalid_uv_state["SurfaceUVConfidence"][1, 1] = 0.0
-            invalid_uv = grounding.ResolveActuationReference(
-                invalid_uv_state, semantic)
-            assert invalid_uv["surface_binding_confidence"][1] == 0.0
-            non_surface_state = {
-                name: value.clone() for name, value in state.items()}
-            non_surface_state["DisplaySurfaceProb"][1, 0] = 0.0
-            non_surface = grounding.ResolveActuationReference(
-                non_surface_state, semantic)
-            assert non_surface["surface_binding_confidence"][1] == 0.0
-            print("SemanticToActuationReference passed.")
-            return True
-        except Exception as e:
-            print(f"SemanticToActuationReference failed: {type(e).__name__}: {e}")
             return False
 
     def RunAll(self) -> Dict[str, bool]:
@@ -1159,10 +1406,10 @@ class TestGoalMTool:
             "TemporalGoalShapes": self.TestTemporalGoalShapes(),
             "TemporalTimeoutGradientSemantics": self.TestTemporalTimeoutGradientSemantics(),
             "GoalGroundingShapes": self.TestGoalGroundingShapes(),
-            "SemanticToActuationReference": self.TestSemanticToActuationReference(),
             "HardCodebookCollapsePenalty": self.TestHardCodebookCollapsePenalty(),
             "GroundingConsistencyGradient": self.TestGroundingConsistencyGradient(),
             "EntityTextGrounding": self.TestEntityTextGrounding(),
+            "AbstractTaskRequirementsAndExternalActivity": self.TestAbstractTaskRequirementsAndExternalActivity(),
             "GoalManagerBackward": self.TestGoalManagerBackward(),}
         passed = sum(1 for value in results.values() if value)
         print(f"\n[GoalModule Tests] {passed}/{len(results)} passed.")

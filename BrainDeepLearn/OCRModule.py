@@ -691,10 +691,10 @@ class OCREngineExtractor(nn.Module):
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            patch = gray[y1:y2, x1:x2]  # [h,w]
+            patch = gray[y1:y2, x1:x2] # [h,w]
             h, w = patch.shape
 
-            patch = patch.unsqueeze(0).unsqueeze(0)  # [1,1,h,w]
+            patch = patch.unsqueeze(0).unsqueeze(0) # [1,1,h,w]
 
             scale = targetH / float(h)
             new_w = max(1, int(round(w * scale)))
@@ -727,17 +727,47 @@ class OCREngineExtractor(nn.Module):
         self,
         imagesTensor: torch.Tensor, # [B,3,H,W]
         binThresh: float = 0.3,
-        minBoxArea: int = 10,) -> List[List[OcrItem]]:
+        minBoxArea: int = 10,
+        batchIndices: Optional[torch.Tensor] = None,
+        fullBatchSize: Optional[int] = None,) -> List[List[OcrItem]]:
 
         feat = self.backbone(imagesTensor) # [B,256,H,W]
         prob_map = self.dbHead(feat) # [B,1,H,W]
 
         bsz = imagesTensor.size(0)
+        if batchIndices is None:
+            batch_indices = torch.arange(
+                bsz,
+                device=imagesTensor.device,
+                dtype=torch.long)
+            full_batch_size = (
+                bsz if fullBatchSize is None else int(fullBatchSize))
+        else:
+            if (
+                not torch.is_tensor(batchIndices)
+                or batchIndices.dim() != 1
+                or batchIndices.dtype != torch.long
+                or batchIndices.device != imagesTensor.device
+                or int(batchIndices.numel()) != int(bsz)
+            ):
+                raise ValueError("batchIndices must identify every OCR input row")
+            batch_indices = batchIndices
+            full_batch_size = (
+                int(batchIndices.max().item()) + 1
+                if fullBatchSize is None
+                else int(fullBatchSize))
+        if (
+            full_batch_size < int(bsz)
+            or bool(((batch_indices < 0) | (
+                batch_indices >= full_batch_size)).any().item())
+            or int(torch.unique(batch_indices).numel()) != int(bsz)
+        ):
+            raise ValueError("OCR batch row mapping is invalid")
         results_batch: List[List[Tuple[np.ndarray, str, float, float]]] = []
 
         if self.temporalSteps > 0 and self._tracks_by_bi:
             for k in list(self._tracks_by_bi.keys()):
-                if k < 0 or k >= bsz:
+                if k < 0 or k >= full_batch_size:
                     del self._tracks_by_bi[k]
 
         for bi in range(bsz):
@@ -781,14 +811,25 @@ class OCREngineExtractor(nn.Module):
             results_batch.append(triplets)
 
             if self.temporalSteps > 0:
-                self.UpdateTemporalTracks(bi, frame_obs)
+                self.UpdateTemporalTracks(
+                    int(batch_indices[bi].item()),
+                    frame_obs)
 
         if self.temporalSteps > 0:
             self._temporal_step += 1
 
         ocr_items = self.OcrResultsToOcrItems(results_batch) 
-        self._last_batch_size = bsz
-        self._last_ocr_texts_batch = [[it["text"] for it in items] for items in ocr_items]
+        previous_texts = self._last_ocr_texts_batch
+        if len(previous_texts) != full_batch_size:
+            previous_texts = [[] for _ in range(full_batch_size)]
+        else:
+            previous_texts = [list(value) for value in previous_texts]
+        for local_index, global_index in enumerate(batch_indices.tolist()):
+            previous_texts[int(global_index)] = [
+                item["text"]
+                for item in ocr_items[local_index]]
+        self._last_batch_size = full_batch_size
+        self._last_ocr_texts_batch = previous_texts
         return ocr_items
 
 
@@ -829,7 +870,7 @@ class OCREngineExtractor(nn.Module):
                 if not t:
                     continue
 
-                x1, y1, x2, y2 = [int(v) for v in box.tolist()]  # xyxy
+                x1, y1, x2, y2 = [int(v) for v in box.tolist()] # xyxy
                 items.append({
                     "box": (x1, y1, x2, y2),
                     "text": t,
@@ -898,7 +939,7 @@ class OCREngineExtractor(nn.Module):
         for tr in tracks:
             tr.age += 1
 
-        def match_track(obs: OcrLineObs) -> int:
+        def MatchTrack(obs: OcrLineObs) -> int:
             best_i = -1
             best_s = -1e9
             for i, tr in enumerate(tracks):
@@ -913,7 +954,7 @@ class OCREngineExtractor(nn.Module):
             return best_i
 
         for obs in frameObs:
-            ti = match_track(obs)
+            ti = MatchTrack(obs)
             if ti < 0:
                 dq = deque([obs], maxlen=self.temporalSteps)
                 tracks.append(OcrTrack(obs=dq, age=0))

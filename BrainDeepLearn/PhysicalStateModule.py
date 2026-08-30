@@ -1,5 +1,4 @@
 from __future__ import annotations
-from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
@@ -8,10 +7,300 @@ from FunctionTools import AGICoreModule, HungarianAssignment, BuildReferenceWeig
 from ModuleMessagerManager import ModuleDim
 from PerceptionModule import PerceiveExtractor, PerceptionRecallLoss, TopDownContext, VisualState
 from RobotMorphologyModule import (
-    CompiledRobotMorphology,
-    EntityAgency,
-    EntityRealm,
-    MotionLayer)
+    BrainFeedbackPacket,
+    RobotEmbodimentContractView)
+
+
+SelfRealmIndex = 0
+VirtualRealmIndex = 2
+EffectRealmIndex = 3
+CarrierMotionIndex = 1
+ArticulationMotionIndex = 2
+SurfaceContentMotionIndex = 3
+
+
+class ContractPhysicalStateAdapter(nn.Module):
+    def __init__(
+        self,
+        contractView: RobotEmbodimentContractView,
+        bodyDim: int,
+        controlFeedbackDim: Optional[int] = None,
+        embodimentContextDim: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        if type(contractView) is not RobotEmbodimentContractView:
+            raise TypeError("physical state adapter requires a contract view")
+        contractView.Validate()
+        if type(bodyDim) is not int or bodyDim < 1:
+            raise ValueError("bodyDim must be a positive integer")
+        if controlFeedbackDim is None:
+            controlFeedbackDim = bodyDim
+        if embodimentContextDim is None:
+            embodimentContextDim = bodyDim
+        if type(controlFeedbackDim) is not int or controlFeedbackDim < 1:
+            raise ValueError(
+                "controlFeedbackDim must be a positive integer")
+        if type(embodimentContextDim) is not int or embodimentContextDim < 1:
+            raise ValueError(
+                "embodimentContextDim must be a positive integer")
+        self.ContractView = contractView
+        self.BodyDim = int(bodyDim)
+        self.ControlFeedbackDim = int(controlFeedbackDim)
+        self.EmbodimentContextDim = int(embodimentContextDim)
+        static_joint_tokens = torch.tensor(
+            contractView.static_joint_tokens,
+            dtype=torch.float32)
+        static_slot_tokens = torch.tensor(
+            contractView.static_end_effector_tokens,
+            dtype=torch.float32)
+        endpoint_joint_mask = torch.zeros(
+            contractView.end_effector_count,
+            contractView.joint_count,
+            dtype=torch.bool)
+        for endpointIndex in range(contractView.end_effector_count):
+            begin = contractView.end_effector_joint_chain_offsets[endpointIndex]
+            end = contractView.end_effector_joint_chain_offsets[
+                endpointIndex + 1]
+            endpoint_joint_mask[
+                endpointIndex,
+                list(contractView.end_effector_joint_chain_indices[begin:end])
+            ] = True
+        self.register_buffer(
+            "StaticJointTokens",
+            static_joint_tokens,
+            persistent=True)
+        self.register_buffer(
+            "StaticSlotTokens",
+            static_slot_tokens,
+            persistent=True)
+        self.register_buffer(
+            "EndpointJointMask",
+            endpoint_joint_mask,
+            persistent=True)
+        self.JointStaticAdapter = nn.Linear(
+            contractView.model_shape.joint_static_descriptor_dim,
+            self.BodyDim)
+        self.JointFeedbackAdapters = nn.ModuleList([
+            nn.Sequential(
+                (
+                    nn.Identity()
+                    if contractView.joint_feedback_layout.Width(jointIndex) == 1
+                    else nn.LayerNorm(
+                        contractView.joint_feedback_layout.Width(jointIndex))),
+                nn.Linear(
+                    contractView.joint_feedback_layout.Width(jointIndex),
+                    self.BodyDim),
+                nn.SiLU())
+            for jointIndex in range(contractView.joint_count)
+        ])
+        self.JointOutputNorm = (
+            nn.Identity()
+            if self.BodyDim == 1
+            else nn.LayerNorm(self.BodyDim))
+        self.StaticAdapter = nn.Linear(
+            contractView.model_shape.end_effector_static_descriptor_dim,
+            self.BodyDim)
+        self.EndpointQueryAdapter = nn.Linear(
+            contractView.model_shape.end_effector_static_descriptor_dim,
+            self.BodyDim)
+        self.StatusAdapter = nn.Sequential(
+            nn.Linear(8, self.BodyDim),
+            nn.SiLU(),
+            nn.Linear(self.BodyDim, self.BodyDim))
+        self.OutputNorm = (
+            nn.Identity()
+            if self.BodyDim == 1
+            else nn.LayerNorm(self.BodyDim))
+        self.ControlJointAdapter = nn.Linear(
+            self.BodyDim,
+            self.ControlFeedbackDim)
+        self.ControlStaticAdapter = nn.Linear(
+            contractView.model_shape.end_effector_static_descriptor_dim,
+            self.ControlFeedbackDim)
+        self.ControlActivityAdapter = nn.Sequential(
+            nn.Linear(8, self.ControlFeedbackDim),
+            nn.SiLU(),
+            nn.Linear(self.ControlFeedbackDim, self.ControlFeedbackDim))
+        self.ControlOutputNorm = (
+            nn.Identity()
+            if self.ControlFeedbackDim == 1
+            else nn.LayerNorm(self.ControlFeedbackDim))
+        self.ContextJointAdapter = nn.Linear(
+            self.BodyDim,
+            self.EmbodimentContextDim)
+        self.ContextEndpointAdapter = nn.Linear(
+            self.BodyDim,
+            self.EmbodimentContextDim)
+        self.InvalidContextState = nn.Parameter(
+            torch.zeros(self.EmbodimentContextDim))
+        self.ContextOutputNorm = (
+            nn.Identity()
+            if self.EmbodimentContextDim == 1
+            else nn.LayerNorm(self.EmbodimentContextDim))
+
+    def ValidatePacket(self, feedback: BrainFeedbackPacket) -> None:
+        if type(feedback) is not BrainFeedbackPacket:
+            raise TypeError("physical state adapter requires BrainFeedbackPacket")
+        feedback.Validate(self.ContractView)
+        if feedback.joint_features.device != self.StaticJointTokens.device:
+            raise ValueError(
+                "physical state packet and adapter must share one device")
+        if feedback.joint_features.dtype != self.StaticJointTokens.dtype:
+            raise ValueError(
+                "physical state packet and adapter must share one floating dtype")
+        if feedback.progress.dtype != feedback.joint_features.dtype:
+            raise ValueError("progress and joint features must share one dtype")
+
+    def EncodeJointState(
+        self,
+        feedback: BrainFeedbackPacket,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dynamic_tokens = []
+        for jointIndex, adapter in enumerate(self.JointFeedbackAdapters):
+            dynamic_tokens.append(adapter(feedback.joint_features[
+                ..., self.ContractView.joint_feedback_layout.Slice(jointIndex)]))
+        dynamic = torch.stack(dynamic_tokens, dim=1)
+        static = self.JointStaticAdapter(
+            self.StaticJointTokens.to(
+                device=dynamic.device,
+                dtype=dynamic.dtype)).unsqueeze(0)
+        joint_weight = feedback.joint_valid.to(dtype=dynamic.dtype)
+        joint_tokens = self.JointOutputNorm(dynamic + static)
+        joint_tokens = joint_tokens * joint_weight.unsqueeze(-1)
+        joint_summary = joint_tokens.sum(dim=1) / joint_weight.sum(
+            dim=1,
+            keepdim=True).clamp_min(1.0)
+        return joint_tokens, joint_weight, joint_summary
+
+    def PoolEndpointChains(
+        self,
+        jointTokens: torch.Tensor,
+        feedback: BrainFeedbackPacket,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        queries = self.EndpointQueryAdapter(
+            self.StaticSlotTokens.to(
+                device=jointTokens.device,
+                dtype=jointTokens.dtype))
+        score = torch.einsum(
+            "bjd,ed->bej",
+            jointTokens,
+            queries) / float(self.BodyDim) ** 0.5
+        chain_mask = self.EndpointJointMask.to(
+            device=jointTokens.device).unsqueeze(0)
+        valid_mask = chain_mask & feedback.joint_valid.unsqueeze(1)
+        score = score.masked_fill(
+            ~valid_mask,
+            torch.finfo(score.dtype).min)
+        weight = torch.softmax(score, dim=-1)
+        weight = weight * valid_mask.to(dtype=weight.dtype)
+        weight = weight / weight.sum(dim=-1, keepdim=True).clamp_min(
+            torch.finfo(weight.dtype).eps)
+        endpoint_tokens = torch.bmm(weight, jointTokens)
+        chain_size = chain_mask.sum(dim=-1).clamp_min(1)
+        chain_ratio = valid_mask.sum(dim=-1).to(
+            dtype=jointTokens.dtype) / chain_size.to(dtype=jointTokens.dtype)
+        return endpoint_tokens, chain_ratio
+
+    @staticmethod
+    def EncodeEndpointStatus(
+        feedback: BrainFeedbackPacket,
+        chainRatio: torch.Tensor,
+    ) -> torch.Tensor:
+        dtype = feedback.joint_features.dtype
+        target_active = feedback.target_active.to(dtype=dtype)
+        child_enabled = feedback.child_enabled.to(dtype=dtype)
+        progress = feedback.progress
+        return torch.stack((
+            progress,
+            feedback.reached.to(dtype=dtype),
+            child_enabled,
+            target_active,
+            feedback.endpoint_valid.to(dtype=dtype),
+            chainRatio,
+            progress * child_enabled,
+            target_active * (1.0 - progress),
+        ), dim=-1)
+
+    def EncodeControlFeedback(
+        self,
+        jointSummary: torch.Tensor,
+        endpointStatus: torch.Tensor,
+        slotWeight: torch.Tensor,
+    ) -> torch.Tensor:
+        static = self.ControlStaticAdapter(
+            self.StaticSlotTokens.to(
+                device=jointSummary.device,
+                dtype=jointSummary.dtype)).unsqueeze(0)
+        endpoint_tokens = (
+            static + self.ControlActivityAdapter(endpointStatus))
+        endpoint_summary = (
+            endpoint_tokens * slotWeight.unsqueeze(-1)
+        ).sum(dim=1) / slotWeight.sum(dim=1, keepdim=True).clamp_min(1.0)
+        return self.ControlOutputNorm(
+            self.ControlJointAdapter(jointSummary) + endpoint_summary)
+
+    def EncodeEmbodimentContext(
+        self,
+        jointSummary: torch.Tensor,
+        bodySummary: torch.Tensor,
+        jointWeight: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        context_valid = jointWeight.gt(0.0).any(dim=-1)
+        valid_feature = (
+            self.ContextJointAdapter(jointSummary)
+            + self.ContextEndpointAdapter(bodySummary))
+        invalid_feature = self.InvalidContextState.unsqueeze(0).expand(
+            jointSummary.size(0), -1)
+        context_feature = torch.where(
+            context_valid.unsqueeze(-1),
+            valid_feature,
+            invalid_feature)
+        return self.ContextOutputNorm(context_feature), context_valid
+
+    def forward(
+        self,
+        feedback: BrainFeedbackPacket,
+    ) -> Dict[str, torch.Tensor]:
+        self.ValidatePacket(feedback)
+        joint_tokens, joint_weight, joint_summary = self.EncodeJointState(
+            feedback)
+        endpoint_dynamic, chain_ratio = self.PoolEndpointChains(
+            joint_tokens,
+            feedback)
+        static = self.StaticAdapter(
+            self.StaticSlotTokens.to(
+                device=endpoint_dynamic.device,
+                dtype=endpoint_dynamic.dtype)).unsqueeze(0)
+        status = self.EncodeEndpointStatus(feedback, chain_ratio)
+        slot_weight = feedback.endpoint_valid.to(dtype=endpoint_dynamic.dtype)
+        slot_tokens = self.OutputNorm(
+            endpoint_dynamic + static + self.StatusAdapter(status))
+        slot_tokens = slot_tokens * slot_weight.unsqueeze(-1)
+        body_summary = slot_tokens.sum(dim=1) / slot_weight.sum(
+            dim=1,
+            keepdim=True).clamp_min(1.0)
+        control_feedback = self.EncodeControlFeedback(
+            joint_summary,
+            status,
+            slot_weight)
+        context_feature, context_valid = self.EncodeEmbodimentContext(
+            joint_summary,
+            body_summary,
+            joint_weight)
+        return {
+            "SlotBodyTokens": slot_tokens,
+            "BodySummary": body_summary,
+            "SlotWeight": slot_weight,
+            "JointStateTokens": joint_tokens,
+            "JointWeight": joint_weight,
+            "JointSummary": joint_summary,
+            "ControlFeedbackFeature": control_feedback,
+            "EmbodimentContextFeature": context_feature,
+            "EmbodimentContextValid": context_valid,
+            "StaticSlotTokens": static.expand(
+                endpoint_dynamic.size(0), -1, -1),
+        }
+
 
 class SlotCrossAttention(AGICoreModule):
     def __init__(self, queryDim: int, sourceDim: int, numHeads: int = 4):
@@ -84,82 +373,6 @@ class PhysicalStateExtractor(AGICoreModule):
             nn.Linear(inDim, outDim))
 
     @staticmethod
-    def BuildSelfPartNodeDescriptors(
-        robotMorphology: CompiledRobotMorphology,
-        ) -> torch.Tensor:
-        node_count = int(robotMorphology.node_count)
-        semantic = robotMorphology.NodeSemanticDescriptor()
-
-        def Tensor(name: str, dtype: torch.dtype) -> torch.Tensor:
-            return torch.as_tensor(
-                semantic[name],
-                dtype=dtype).detach().cpu()
-
-        role = Tensor("role", torch.long).reshape(node_count)
-        side = Tensor("side", torch.long).reshape(node_count)
-        capability = Tensor("capability", torch.float32).reshape(
-            node_count,
-            ModuleDim.RobotBodyCapabilityDim)
-        parent_index = Tensor(
-            "parent_node_index", torch.long).reshape(node_count)
-        parent_role = Tensor("parent_role", torch.long).reshape(node_count)
-        parent_side = Tensor("parent_side", torch.long).reshape(node_count)
-        parent_capability = Tensor(
-            "parent_capability", torch.float32).reshape(
-                node_count,
-                ModuleDim.RobotBodyCapabilityDim)
-        group_role = Tensor(
-            "group_role_membership", torch.float32).reshape(
-                node_count,
-                ModuleDim.RobotBodyRoleClasses)
-        group_side = Tensor(
-            "group_side_membership", torch.float32).reshape(
-                node_count,
-                ModuleDim.RobotBodySideClasses)
-        group_capability = Tensor(
-            "group_capability", torch.float32).reshape(
-                node_count,
-                ModuleDim.RobotBodyCapabilityDim)
-        topology_depth = Tensor(
-            "topology_depth", torch.float32).reshape(node_count, 1)
-        in_degree = Tensor("in_degree", torch.float32).reshape(node_count, 1)
-        out_degree = Tensor(
-            "out_degree", torch.float32).reshape(node_count, 1)
-        is_root = Tensor("is_root", torch.float32).reshape(node_count, 1)
-        is_leaf = Tensor("is_leaf", torch.float32).reshape(node_count, 1)
-        parent_present = parent_index.ge(0).to(torch.float32).unsqueeze(-1)
-        parent_role_feature = F.one_hot(
-            parent_role.clamp(0, ModuleDim.RobotBodyRoleClasses - 1),
-            num_classes=ModuleDim.RobotBodyRoleClasses).to(torch.float32)
-        parent_side_feature = F.one_hot(
-            parent_side.clamp(0, ModuleDim.RobotBodySideClasses - 1),
-            num_classes=ModuleDim.RobotBodySideClasses).to(torch.float32)
-        parent_role_feature *= parent_present
-        parent_side_feature *= parent_present
-        parent_capability *= parent_present
-        descriptor = torch.cat([
-            F.one_hot(
-                role,
-                num_classes=ModuleDim.RobotBodyRoleClasses).to(torch.float32),
-            F.one_hot(
-                side,
-                num_classes=ModuleDim.RobotBodySideClasses).to(torch.float32),
-            capability,
-            parent_role_feature,
-            parent_side_feature,
-            parent_capability,
-            group_role,
-            group_side,
-            group_capability,
-            topology_depth / (1.0 + topology_depth),
-            in_degree / (1.0 + in_degree),
-            out_degree / (1.0 + out_degree),
-            parent_present,
-            is_root,
-            is_leaf,], dim=-1)
-        return descriptor
-
-    @staticmethod
     def SemanticWorldView(nodes: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         level_prob = F.softmax(nodes["level_logits"], dim=-1)
         object_prob = F.softmax(nodes["object_class_logits"], dim=-1)
@@ -174,7 +387,7 @@ class PhysicalStateExtractor(AGICoreModule):
             eps=1e-6)
         return {
             "NodePresence": F.softmax(nodes["node_logits"], dim=-1)[..., 1],
-            "PoseCamera": nodes["pose_camera"],
+            "SpatialFrame": nodes["spatial_frame"],
             "Size": nodes["size_3d"],
             "BBox2D": nodes["bbox_2d"],
             "IdentityKey": identity_key,
@@ -191,7 +404,7 @@ class PhysicalStateExtractor(AGICoreModule):
 
     def __init__(
         self,
-        robotMorphology: CompiledRobotMorphology,
+        contractView: RobotEmbodimentContractView,
         inObjectDim: int = ModuleDim.PerceptionEmbed,
         motionDim: int = ModuleDim.PerceptionEmbed,
         slotDim: int = ModuleDim.PstSlotDim,
@@ -213,8 +426,14 @@ class PhysicalStateExtractor(AGICoreModule):
         self.relation_classes = int(relationClasses)
         self.node_mask_threshold = float(nodeMaskThreshold)
         self.geometry_mask_threshold = float(geometryMaskThreshold)
-        node_descriptor = self.BuildSelfPartNodeDescriptors(robotMorphology)
-        self.self_part_count = int(robotMorphology.node_count)
+        if type(contractView) is not RobotEmbodimentContractView:
+            raise TypeError(
+                "physical state requires an immutable contract view")
+        contractView.Validate()
+        node_descriptor = torch.tensor(
+            contractView.static_end_effector_tokens,
+            dtype=torch.float32)
+        self.self_part_count = int(contractView.end_effector_count)
         self.register_buffer(
             "self_part_node_descriptor",
             node_descriptor,
@@ -228,7 +447,7 @@ class PhysicalStateExtractor(AGICoreModule):
 
         self.slot_layers = nn.ModuleList([
             SlotRefineLayer(self.slot_dim, numHeads=numHeads) for _ in range(int(numSlotLayers))])
-        
+
         self.slot_post = self.MakeHead(self.slot_dim, self.slot_dim)
         self.state_head = self.MakeHead(self.slot_dim, self.state_dim)
         self.attribute_head = self.MakeHead(self.slot_dim, self.attr_dim)
@@ -240,12 +459,12 @@ class PhysicalStateExtractor(AGICoreModule):
         self.relation_subject = nn.Linear(self.slot_dim, relation_hidden)
         self.relation_object = nn.Linear(self.slot_dim, relation_hidden)
         self.relation_geometry = nn.Linear(3, relation_hidden)
-        
+
         self.relation_head = nn.Sequential(
             nn.Linear(relation_hidden, relation_hidden),
             nn.SiLU(),
             nn.Linear(relation_hidden, self.relation_classes))
-        
+
         self.external_relation_head = self.MakeHead(self.slot_dim, self.relation_classes)
 
         self.realm_head = self.MakeDeepHead(
@@ -258,8 +477,12 @@ class PhysicalStateExtractor(AGICoreModule):
         self.body_membership_head = self.MakeDeepHead(self.slot_dim, 1)
         descriptor_dim = int(self.self_part_node_descriptor.size(-1))
         self.self_part_semantic_dim = ModuleDim.PstSelfPartSemanticDim
+        descriptor_normalizer = (
+            nn.Identity()
+            if descriptor_dim == 1
+            else nn.LayerNorm(descriptor_dim))
         self.self_part_node_encoder = nn.Sequential(
-            nn.LayerNorm(descriptor_dim),
+            descriptor_normalizer,
             nn.Linear(descriptor_dim, self.slot_dim),
             nn.SiLU(),
             nn.Linear(self.slot_dim, self.slot_dim),
@@ -270,15 +493,23 @@ class PhysicalStateExtractor(AGICoreModule):
         self.self_part_node_key = self.MakeHead(
             self.slot_dim,
             self.slot_dim)
+        semantic_descriptor_normalizer = (
+            nn.Identity()
+            if descriptor_dim == 1
+            else nn.LayerNorm(descriptor_dim))
         self.self_part_semantic_proj = nn.Sequential(
-            nn.LayerNorm(descriptor_dim),
+            semantic_descriptor_normalizer,
             nn.Linear(descriptor_dim, self.slot_dim),
             nn.SiLU(),
             nn.Linear(
                 self.slot_dim,
                 self.self_part_semantic_dim))
-        self.self_part_geometry_log_scale = nn.Parameter(torch.tensor(0.0))
-        self.self_part_geometry_gain = nn.Parameter(torch.tensor(-2.944439))
+        self.contract_body_key = self.MakeHead(
+            self.slot_dim,
+            self.slot_dim)
+        self.contract_body_semantic = self.MakeHead(
+            self.slot_dim,
+            self.self_part_semantic_dim)
 
         self.carrier_motion_head = self.MakeDeepHead(
             self.slot_dim, self.pose_dim)
@@ -325,7 +556,7 @@ class PhysicalStateExtractor(AGICoreModule):
             self.relation_subject(S).unsqueeze(2)
             + self.relation_object(S).unsqueeze(1)
             + self.relation_geometry(relative))
-        
+
         relation_logits = self.relation_head(F.silu(pair))
         relation_prob = F.softmax(relation_logits, dim=-1)
         geometry = torch.cat([relative, distance], dim=-1)
@@ -381,6 +612,44 @@ class PhysicalStateExtractor(AGICoreModule):
         unknown[..., -1] = 1.0
         return torch.where(no_motion, unknown, marginal)
 
+    def ValidateContractBodyState(
+        self,
+        objectTokens: torch.Tensor,
+        slotBodyTokens: Optional[torch.Tensor],
+        slotWeight: Optional[torch.Tensor],
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if slotBodyTokens is None or slotWeight is None:
+            raise ValueError(
+                "contract body schema requires slot body tokens and weights")
+        expected_tokens = (
+            int(objectTokens.size(0)),
+            self.self_part_count,
+            self.slot_dim)
+        expected_weight = (
+            int(objectTokens.size(0)),
+            self.self_part_count)
+        if tuple(slotBodyTokens.shape) != expected_tokens:
+            raise ValueError("slotBodyTokens has invalid shape")
+        if tuple(slotWeight.shape) != expected_weight:
+            raise ValueError("slotWeight has invalid shape")
+        if not slotBodyTokens.is_floating_point():
+            raise TypeError("slotBodyTokens must use floating point values")
+        if not slotWeight.is_floating_point():
+            raise TypeError("slotWeight must use floating point values")
+        if slotBodyTokens.device != objectTokens.device:
+            raise ValueError("slotBodyTokens must share the object token device")
+        if slotWeight.device != objectTokens.device:
+            raise ValueError("slotWeight must share the object token device")
+        if not torch.isfinite(slotBodyTokens).all():
+            raise ValueError("slotBodyTokens must be finite")
+        if not torch.isfinite(slotWeight).all():
+            raise ValueError("slotWeight must be finite")
+        if bool((slotWeight < 0.0).any().item()):
+            raise ValueError("slotWeight must be nonnegative")
+        return (
+            slotBodyTokens.to(dtype=objectTokens.dtype),
+            slotWeight.to(dtype=objectTokens.dtype))
+
     def forward(
         self,
         objectTokens: torch.Tensor, # [B, K, D_obj]
@@ -388,9 +657,8 @@ class PhysicalStateExtractor(AGICoreModule):
         objectGeometry: torch.Tensor, # [B, K, 7]
         nodeMask: torch.Tensor,
         geometryValid: torch.Tensor,
-        bodyNodePoseCamera: Optional[torch.Tensor] = None,
-        bodyNodeObserved: Optional[torch.Tensor] = None,
-        bodyNodeHealthy: Optional[torch.Tensor] = None,
+        slotBodyTokens: torch.Tensor,
+        slotWeight: torch.Tensor,
         ) -> Dict[str, torch.Tensor]:
         observation_mask = (
             nodeMask > self.node_mask_threshold
@@ -399,14 +667,12 @@ class PhysicalStateExtractor(AGICoreModule):
             geometryValid.squeeze(-1) > self.geometry_mask_threshold
         ).to(objectTokens.dtype)
         feature_mask = observation_mask
-        
+
         S_raw = self.in_proj(objectTokens) + self.motion_in_proj(objectMotion) # [B, K, 128]
 
         for layer in self.slot_layers:
             S_raw = layer(S_raw, feature_mask)
 
-        # Keep an unmasked training feature so a missed object can still receive
-        # positive supervision.  Runtime state remains masked at the output seam.
         S_feature = self.slot_post(S_raw) # [B, K, 128]
         S_raw = S_feature * observation_mask.unsqueeze(-1)
 
@@ -419,8 +685,8 @@ class PhysicalStateExtractor(AGICoreModule):
         realm_prob = F.softmax(realm_logits, dim=-1)
         realm_class = realm_prob.argmax(dim=-1)
         independent_3d_mask = (
-            realm_class.ne(int(EntityRealm.VIRTUAL_CONTENT))
-            & realm_class.ne(int(EntityRealm.VISUAL_EFFECT))
+            realm_class.ne(VirtualRealmIndex)
+            & realm_class.ne(EffectRealmIndex)
         ).to(objectTokens.dtype)
         canonical_geometry_mask = geometry_mask * independent_3d_mask
 
@@ -481,7 +747,7 @@ class PhysicalStateExtractor(AGICoreModule):
 
         off_diagonal = 1.0 - torch.eye(
             observation_mask.size(1), device=observation_mask.device, dtype=observation_mask.dtype)
-        
+
         semantic_pair_mask = (
             semantic_pair_mask * off_diagonal.unsqueeze(0))
         geometry_pair_mask = geometry_pair_mask * off_diagonal.unsqueeze(0)
@@ -507,72 +773,53 @@ class PhysicalStateExtractor(AGICoreModule):
             S_feature).squeeze(-1)
         body_membership_prob = (
             torch.sigmoid(body_membership_logits)
-            * realm_prob[..., int(EntityRealm.SELF_BODY)]
+            * realm_prob[..., SelfRealmIndex]
             * perceptual_presence)
         node_descriptor = self.self_part_node_descriptor.to(
+            device=S_feature.device,
             dtype=S_feature.dtype)
+        encoded_node = self.self_part_node_encoder(node_descriptor)
+        contract_body_tokens, contract_slot_weight = (
+            self.ValidateContractBodyState(
+                objectTokens,
+                slotBodyTokens,
+                slotWeight))
+        dynamic_node = self.contract_body_key(contract_body_tokens)
+        dynamic_node = dynamic_node * contract_slot_weight.unsqueeze(-1)
         node_key = self.self_part_node_key(
-            self.self_part_node_encoder(node_descriptor))
+            encoded_node.unsqueeze(0) + dynamic_node)
         slot_query = self.self_part_slot_query(S_feature)
         raw_self_part_logits = torch.einsum(
-            "bkd,nd->bkn",
+            "bkd,bnd->bkn",
             slot_query,
             node_key) * (float(self.slot_dim) ** -0.5)
-        body_state = (
-            bodyNodePoseCamera,
-            bodyNodeObserved,
-            bodyNodeHealthy)
-        if any(value is not None for value in body_state):
-            if any(value is None for value in body_state):
-                raise ValueError("body node state is incomplete")
-            B = int(objectTokens.size(0))
-            expected_pose = (B, self.self_part_count, 7)
-            expected_mask = (B, self.self_part_count)
-            if tuple(bodyNodePoseCamera.shape) != expected_pose:
-                raise ValueError("bodyNodePoseCamera has invalid shape")
-            if tuple(bodyNodeObserved.shape) != expected_mask:
-                raise ValueError("bodyNodeObserved has invalid shape")
-            if tuple(bodyNodeHealthy.shape) != expected_mask:
-                raise ValueError("bodyNodeHealthy has invalid shape")
-            body_pose = bodyNodePoseCamera.to(
-                device=objectTokens.device,
-                dtype=objectTokens.dtype)
-            body_available = (
-                bodyNodeObserved.to(
-                    device=objectTokens.device,
-                    dtype=torch.bool)
-                & bodyNodeHealthy.to(
-                    device=objectTokens.device,
-                    dtype=torch.bool)
-                & torch.isfinite(body_pose).all(dim=-1))
-            body_position = torch.where(
-                body_available.unsqueeze(-1),
-                body_pose[..., :3],
-                torch.zeros_like(body_pose[..., :3]))
-            object_available = (
-                geometry_mask.bool()
-                & torch.isfinite(objectGeometry[..., :3]).all(dim=-1))
-            object_position = torch.where(
-                object_available.unsqueeze(-1),
-                objectGeometry[..., :3],
-                torch.zeros_like(objectGeometry[..., :3]))
-            distance = torch.linalg.vector_norm(
-                object_position.unsqueeze(2)
-                - body_position.unsqueeze(1),
-                dim=-1)
-            scale = F.softplus(self.self_part_geometry_log_scale) + 0.05
-            gain = 4.0 * torch.sigmoid(self.self_part_geometry_gain)
-            geometry_evidence = -gain * torch.tanh(distance / scale)
-            evidence_valid = (
-                object_available.unsqueeze(-1)
-                & body_available.unsqueeze(1))
-            raw_self_part_logits = raw_self_part_logits + torch.where(
-                evidence_valid,
-                geometry_evidence,
-                torch.zeros_like(geometry_evidence))
+        contract_part_valid = contract_slot_weight > 0.0
+        log_weight = torch.log(
+            contract_slot_weight.clamp_min(
+                torch.finfo(contract_slot_weight.dtype).tiny))
+        log_weight = log_weight.masked_fill(
+            ~contract_part_valid,
+            torch.finfo(raw_self_part_logits.dtype).min)
+        raw_self_part_logits = raw_self_part_logits + log_weight.unsqueeze(1)
+        empty_contract_body = ~contract_part_valid.any(dim=-1)
+        raw_self_part_logits = torch.where(
+            empty_contract_body.view(-1, 1, 1),
+            torch.zeros_like(raw_self_part_logits),
+            raw_self_part_logits)
         self_part_logits = raw_self_part_logits
+        self_part_distribution = F.softmax(
+            self_part_logits,
+            dim=-1)
+        self_part_distribution = (
+            self_part_distribution
+            * contract_part_valid.unsqueeze(1).to(
+                dtype=self_part_distribution.dtype))
+        self_part_distribution = torch.where(
+            empty_contract_body.view(-1, 1, 1),
+            torch.zeros_like(self_part_distribution),
+            self_part_distribution)
         self_part_prob = (
-            F.softmax(self_part_logits, dim=-1)
+            self_part_distribution
             * body_membership_prob.unsqueeze(-1))
         weighted_self_part_descriptor = torch.einsum(
             "bkn,nd->bkd",
@@ -582,6 +829,12 @@ class PhysicalStateExtractor(AGICoreModule):
         self_part_semantic = (
             self.self_part_semantic_proj(weighted_self_part_descriptor)
             * self_part_mass)
+        dynamic_semantic = self.contract_body_semantic(contract_body_tokens)
+        dynamic_semantic = dynamic_semantic * contract_slot_weight.unsqueeze(-1)
+        self_part_semantic = self_part_semantic + torch.einsum(
+            "bkn,bnd->bkd",
+            self_part_prob,
+            dynamic_semantic)
 
         carrier_motion_pred = self.NormalizePose(
             self.carrier_motion_head(S_feature))
@@ -589,10 +842,10 @@ class PhysicalStateExtractor(AGICoreModule):
             self.articulation_motion_head(S_feature))
         carrier_weight = (
             geometry_available
-            * motion_layer_prob[..., int(MotionLayer.CARRIER_MOTION)].unsqueeze(-1))
+            * motion_layer_prob[..., CarrierMotionIndex].unsqueeze(-1))
         articulation_weight = (
             geometry_available
-            * motion_layer_prob[..., int(MotionLayer.ARTICULATION_MOTION)].unsqueeze(-1))
+            * motion_layer_prob[..., ArticulationMotionIndex].unsqueeze(-1))
         carrier_motion_raw = self.NormalizePose(
             identity_motion
             + (carrier_motion_pred - identity_motion) * carrier_weight)
@@ -602,7 +855,7 @@ class PhysicalStateExtractor(AGICoreModule):
 
         content_motion_pred = torch.tanh(self.content_motion_head(S_feature))
         content_layer = motion_layer_prob[
-            ..., int(MotionLayer.SURFACE_CONTENT_MOTION)]
+            ..., SurfaceContentMotionIndex]
         content_motion_uv = (
             content_motion_pred
             * content_layer.unsqueeze(-1)
@@ -641,7 +894,7 @@ class PhysicalStateExtractor(AGICoreModule):
         ontology_relation_prob = (
             torch.sigmoid(ontology_relation_logits)
             * semantic_pair_mask.unsqueeze(-1))
-        
+
         return {
             "SlotState": S_raw,
             "ObservationMask": observation_mask,
@@ -660,7 +913,7 @@ class PhysicalStateExtractor(AGICoreModule):
             "AffordanceLogits": affordance_logits,
             "AffordanceRaw": affordance_raw,
             "MotionPred": motion_pred,
-            "MotionCameraRaw": motion_raw,
+            "MotionObserverRaw": motion_raw,
             "MovingLogits": moving_logits,
             "MovingProbRaw": moving_raw,
             "ContactLogits": contact_logits,
@@ -668,8 +921,8 @@ class PhysicalStateExtractor(AGICoreModule):
             "ContactForcePred": contact_force_pred,
             "ContactForceRaw": contact_force_raw,
             "ContactPointPred": contact_point_pred,
-            "ContactPointCameraRaw": contact_point_raw,
-            "PairwiseRelationCamera": pairwise_relation,
+            "ContactPointObserverRaw": contact_point_raw,
+            "PairwiseRelationObserver": pairwise_relation,
             "RelationLogitsRaw": relation_logits_raw,
             "ExternalRelationLogits": external_relation_logits,
             "ExternalRelationProbRaw": external_relation_raw,
@@ -685,10 +938,11 @@ class PhysicalStateExtractor(AGICoreModule):
             "SelfPartLogits": self_part_logits,
             "SelfPartProb": self_part_prob,
             "SelfPartSemantic": self_part_semantic,
+            "SelfPartDynamicWeight": contract_slot_weight,
             "CarrierMotionPred": carrier_motion_pred,
-            "CarrierMotionCameraRaw": carrier_motion_raw,
+            "CarrierMotionObserverRaw": carrier_motion_raw,
             "ArticulationMotionPred": articulation_motion_pred,
-            "ArticulationMotionCameraRaw": articulation_motion_raw,
+            "ArticulationMotionObserverRaw": articulation_motion_raw,
             "ContentMotionPred": content_motion_pred,
             "ContentMotionUV": content_motion_uv,
             "ContentChangeLogits": content_change_logits,
@@ -722,7 +976,8 @@ class PhysicalStateLoss(nn.Module):
         mphysWeight: float = 1.0,
         mphysNegativeWeight: float = 0.05,
         ontologyWeight: float = 1.0,
-        factorMotionWeight: float = 1.0,):
+        factorMotionWeight: float = 1.0,
+        causalAgencyWeight: float = 0.05,):
         super().__init__()
         self.state_weight = float(stateWeight)
         self.attribute_weight = float(attributeWeight)
@@ -734,6 +989,7 @@ class PhysicalStateLoss(nn.Module):
         self.mphys_negative_weight = float(mphysNegativeWeight)
         self.ontology_weight = float(ontologyWeight)
         self.factor_motion_weight = float(factorMotionWeight)
+        self.causal_agency_weight = float(causalAgencyWeight)
 
     @staticmethod
     def QuaternionAngle(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
@@ -767,8 +1023,8 @@ class PhysicalStateLoss(nn.Module):
         part_score = pst["PartClassProb"][b, candidate][:, targets["part_classes"][b, gt]]
         class_score = torch.where((levels == 0).unsqueeze(0), object_score, part_score)
         pose_cost = self.PoseCost(
-            pst["PoseCamera"][b, candidate],
-            targets["pose_camera"][b, gt])
+            pst["SpatialFrame"][b, candidate],
+            targets["spatial_frame"][b, gt])
         pose_cost = pose_cost * targets["pose_valid"][b, gt].unsqueeze(0)
         bbox_cost = torch.cdist(
             pst["BBox2D"][b, candidate],
@@ -792,6 +1048,58 @@ class PhysicalStateLoss(nn.Module):
     def MeanTerms(terms: List[torch.Tensor]) -> torch.Tensor:
         return torch.stack(terms).mean()
 
+    @staticmethod
+    def NormalizeAgencyProbability(
+        probability: torch.Tensor,
+    ) -> torch.Tensor:
+        if not probability.is_floating_point():
+            raise TypeError("causal agency probability must be floating point")
+        if probability.size(-1) != ModuleDim.PstAgencyClasses:
+            raise ValueError("causal agency probability class width is invalid")
+        if not bool(torch.isfinite(probability).all().item()):
+            raise ValueError("causal agency probability must be finite")
+        if bool((probability < 0.0).any().item()):
+            raise ValueError("causal agency probability must be nonnegative")
+        mass = probability.sum(dim=-1, keepdim=True)
+        if bool((mass <= 0.0).any().item()):
+            raise ValueError("causal agency probability mass must be positive")
+        return probability / mass
+
+    def CausalAgencyLoss(
+        self,
+        pst: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+        batchIndex: int,
+        pred: torch.Tensor,
+        gt: torch.Tensor,
+        zero: torch.Tensor,
+    ) -> torch.Tensor:
+        probability = pst.get("CausalLayerAgencyProb")
+        evidence_valid = pst.get("CausalAgencyEvidenceValid")
+        if probability is None or evidence_valid is None:
+            return zero
+        if probability.shape != pst["LayerAgencyProb"].shape:
+            raise ValueError("causal agency probability shape is invalid")
+        if evidence_valid.shape != probability.shape[:2]:
+            raise ValueError("causal agency evidence validity shape is invalid")
+        matched_probability = probability[batchIndex, pred]
+        matched_target = targets["agency_by_layer"][batchIndex, gt]
+        matched_valid = targets[
+            "agency_by_layer_valid"][batchIndex, gt].bool()
+        matched_valid = (
+            matched_valid
+            & evidence_valid[batchIndex, pred].bool().unsqueeze(-1))
+        if not bool(matched_valid.any().item()):
+            return matched_probability.sum() * 0.0
+        selected_probability = self.NormalizeAgencyProbability(
+            matched_probability[matched_valid])
+        selected_target = matched_target[matched_valid]
+        return F.nll_loss(
+            selected_probability.clamp_min(
+                torch.finfo(selected_probability.dtype).tiny).log(),
+            selected_target,
+            reduction="mean")
+
     def forward(self, pst: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         presence_terms: List[torch.Tensor] = []
         mphys_terms: List[torch.Tensor] = []
@@ -799,6 +1107,7 @@ class PhysicalStateLoss(nn.Module):
         realm_terms: List[torch.Tensor] = []
         motion_layer_terms: List[torch.Tensor] = []
         layer_agency_terms: List[torch.Tensor] = []
+        causal_agency_terms: List[torch.Tensor] = []
         body_terms: List[torch.Tensor] = []
         self_part_terms: List[torch.Tensor] = []
         carrier_terms: List[torch.Tensor] = []
@@ -846,6 +1155,7 @@ class PhysicalStateLoss(nn.Module):
                 realm_terms.append(zero)
                 motion_layer_terms.append(zero)
                 layer_agency_terms.append(zero)
+                causal_agency_terms.append(zero)
                 body_terms.append(zero)
                 self_part_terms.append(zero)
                 carrier_terms.append(zero)
@@ -910,6 +1220,13 @@ class PhysicalStateLoss(nn.Module):
                 reduction="none").view_as(agency_valid)
             layer_agency_terms.append(self.MaskedMean(
                 layer_agency_raw, agency_valid))
+            causal_agency_terms.append(self.CausalAgencyLoss(
+                pst,
+                targets,
+                b,
+                pred,
+                gt,
+                zero))
 
             body_valid = targets["body_membership_valid"][b, gt]
             body_terms.append(self.MaskedMean(
@@ -1034,13 +1351,13 @@ class PhysicalStateLoss(nn.Module):
             body_prob = torch.sigmoid(
                 pst["BodyMembershipLogits"][b, pred])
             virtual_or_effect = (
-                realm_prob[..., int(EntityRealm.VIRTUAL_CONTENT)]
-                + realm_prob[..., int(EntityRealm.VISUAL_EFFECT)])
+                realm_prob[..., VirtualRealmIndex]
+                + realm_prob[..., EffectRealmIndex])
             ontology_consistency = (
                 physical_prob * virtual_or_effect
                 + interaction_prob * (1.0 - physical_prob)
                 + body_prob * (
-                    1.0 - realm_prob[..., int(EntityRealm.SELF_BODY)]))
+                    1.0 - realm_prob[..., SelfRealmIndex]))
             consistency_terms.append(ontology_consistency.mean())
             state_valid = targets["node_state_valid"][b, gt]
             state_terms.append(self.MaskedMean(
@@ -1105,7 +1422,7 @@ class PhysicalStateLoss(nn.Module):
             point_terms.append(self.MaskedMean(
                 F.smooth_l1_loss(
                     pst["ContactPointPred"][b, pred],
-                    targets["contact_point_camera"][b, gt],
+                    targets["contact_point_observer"][b, gt],
                     reduction="none").mean(dim=-1),
                 contacted))
 
@@ -1115,6 +1432,7 @@ class PhysicalStateLoss(nn.Module):
         loss_realm = self.MeanTerms(realm_terms)
         loss_motion_layer = self.MeanTerms(motion_layer_terms)
         loss_layer_agency = self.MeanTerms(layer_agency_terms)
+        loss_causal_agency = self.MeanTerms(causal_agency_terms)
         loss_body = self.MeanTerms(body_terms)
         loss_self_part = self.MeanTerms(self_part_terms)
         loss_carrier = self.MeanTerms(carrier_terms)
@@ -1151,6 +1469,7 @@ class PhysicalStateLoss(nn.Module):
                 loss_realm
                 + loss_motion_layer
                 + loss_layer_agency
+                + self.causal_agency_weight * loss_causal_agency
                 + loss_body
                 + loss_self_part
                 + loss_content_change
@@ -1170,6 +1489,7 @@ class PhysicalStateLoss(nn.Module):
             "loss_realm": loss_realm,
             "loss_motion_layer": loss_motion_layer,
             "loss_layer_agency": loss_layer_agency,
+            "loss_causal_agency": loss_causal_agency,
             "loss_body_membership": loss_body,
             "loss_self_part": loss_self_part,
             "loss_carrier_motion": loss_carrier,
@@ -1199,8 +1519,8 @@ class PhysicalStateLoss(nn.Module):
 class PerceptionPhysicalTrainer(nn.Module):
     def __init__(
         self,
-        cameraIntrinsics: torch.Tensor,
-        robotMorphology: CompiledRobotMorphology,
+        projectionMatrix: torch.Tensor,
+        contractView: RobotEmbodimentContractView,
         physicalWeight: float = 1.0,
         recallLossKwargs: Optional[Dict[str, Any]] = None,
         **perceptionKwargs: Any):
@@ -1208,11 +1528,11 @@ class PerceptionPhysicalTrainer(nn.Module):
         perceptionKwargs = dict(perceptionKwargs)
         perceptionKwargs["enableRecallAuxiliary"] = True
         self.perception = PerceiveExtractor(
-            cameraIntrinsics=cameraIntrinsics,
+            projectionMatrix=projectionMatrix,
             **perceptionKwargs)
         self.recall_loss = PerceptionRecallLoss(**({} if recallLossKwargs is None else recallLossKwargs))
         self.physical = PhysicalStateExtractor(
-            robotMorphology=robotMorphology,
+            contractView=contractView,
             inObjectDim=self.perception.embed_dim,
             motionDim=self.perception.embed_dim)
         self.physical_loss = PhysicalStateLoss()
@@ -1225,18 +1545,23 @@ class PerceptionPhysicalTrainer(nn.Module):
         depthValid: torch.Tensor,
         topDownContext: TopDownContext,
         targets: Dict[str, torch.Tensor],
-        cameraMotion: torch.Tensor,
+        observerRotation: torch.Tensor,
         prevVisualValid: torch.Tensor,
-        prevVisualState: Optional[VisualState] = None) -> Dict[str, Any]:
+        slotBodyTokens: torch.Tensor,
+        slotWeight: torch.Tensor,
+        prevVisualState: Optional[VisualState] = None,
+        observerRotationValid: Optional[torch.Tensor] = None,
+        ) -> Dict[str, Any]:
         visual_state = self.perception(
             rgb,
             topDownContext=topDownContext,
             depth=depth,
             depthValid=depthValid,
             prevVisualState=prevVisualState,
-            cameraMotion=cameraMotion,
-            prevVisualValid=prevVisualValid)
-        
+            observerRotation=observerRotation,
+            prevVisualValid=prevVisualValid,
+            observerRotationValid=observerRotationValid)
+
         recall_out = self.perception.recall_heads(visual_state)
 
         representation_loss = self.perception.ComputePerceptionLoss(
@@ -1244,9 +1569,10 @@ class PerceptionPhysicalTrainer(nn.Module):
             depthTarget=targets["depth"],
             depthTargetValid=targets["depth_valid"],
             prevVisualState=prevVisualState,
-            cameraMotion=cameraMotion,
-            prevVisualValid=prevVisualValid)
-        
+            observerRotation=observerRotation,
+            prevVisualValid=prevVisualValid,
+            observerRotationValid=observerRotationValid)
+
         recall_losses = self.recall_loss(recall_out, targets)
 
         semantic_view = self.physical.SemanticWorldView(visual_state.SemanticNodes)
@@ -1260,17 +1586,19 @@ class PerceptionPhysicalTrainer(nn.Module):
             visual_state.Auxiliary["ObjectMotion"],
             visual_state.Auxiliary["ObjectGeometry"],
             node_mask,
-            geometry_valid)
-        
+            geometry_valid,
+            slotBodyTokens,
+            slotWeight)
+
         pst = {
             **physical_out,
             **semantic_view,
             "ObservedSlotMask": physical_out["ObservationMask"]}
-        
+
         physical_losses = self.physical_loss(pst, targets)
         perception_loss = representation_loss + recall_losses["loss"]
         total = perception_loss + self.physical_weight * physical_losses["loss"]
-        
+
         return {
             "visual_state": visual_state,
             "physical_state": pst,
@@ -1289,8 +1617,8 @@ class PSTWorldBinder(AGICoreModule):
         hDim: int = ModuleDim.WorldOutHState,
         zDim: int = ModuleDim.WorldOutZState,
         xDim: int = ModuleDim.WorldOutXState,
-        actionDim: int = 256,
-        robotWorldDim: int = ModuleDim.PstSlotDim,
+        actionDim: int = ModuleDim.DecisionActionFeatureDim,
+        embodimentDim: int = ModuleDim.PstSlotDim,
         slotDim: int = ModuleDim.PstSlotDim,
         idDim: int = ModuleDim.PstIdDim,
         poseDim: int = ModuleDim.PstPoseDim,
@@ -1344,30 +1672,30 @@ class PSTWorldBinder(AGICoreModule):
             + 1
             + ModuleDim.PstOntologyRelationClasses
             + 2)
-        world_dim = int(hDim) + int(zDim) + int(xDim) + int(actionDim) + int(robotWorldDim)
+        world_dim = int(hDim) + int(zDim) + int(xDim) + int(actionDim) + int(embodimentDim)
 
         self.address_proj = nn.Sequential(
             nn.LayerNorm(int(idDim)),
             nn.Linear(int(idDim), self.slot_dim),
             nn.SiLU(),
             nn.Linear(self.slot_dim, self.slot_dim))
-        
+
         self.content_proj = nn.Sequential(
             nn.LayerNorm(content_dim),
             nn.Linear(content_dim, self.slot_dim * 2),
             nn.SiLU(),
             nn.Linear(self.slot_dim * 2, self.slot_dim))
-        
+
         self.query_proj = nn.Sequential(
             nn.LayerNorm(world_dim),
             nn.Linear(world_dim, self.query_count * self.slot_dim))
-        
+
         self.query_offset = nn.Parameter(torch.zeros(self.query_count, self.slot_dim))
 
         self.query_norm = nn.LayerNorm(self.slot_dim)
         self.key_norm = nn.LayerNorm(self.slot_dim)
         self.value_norm = nn.LayerNorm(self.slot_dim)
-        
+
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=self.slot_dim,
             num_heads=int(numHeads),
@@ -1380,31 +1708,31 @@ class PSTWorldBinder(AGICoreModule):
             embed_dim=self.slot_dim,
             num_heads=int(numHeads),
             batch_first=True)
-        
+
         self.query_ffn = nn.Sequential(
             nn.LayerNorm(self.slot_dim),
             nn.Linear(self.slot_dim, self.slot_dim * 2),
             nn.SiLU(),
             nn.Linear(self.slot_dim * 2, self.slot_dim))
-        
+
         self.query_pool = nn.Sequential(
             nn.LayerNorm(self.slot_dim),
             nn.Linear(self.slot_dim, 1))
-        
+
         self.context_post = nn.Sequential(
             nn.LayerNorm(self.slot_dim),
             nn.Linear(self.slot_dim, self.slot_dim),
             nn.SiLU(),
             nn.Linear(self.slot_dim, self.slot_dim))
-        
+
         self.delta_mu = nn.Sequential(
             nn.LayerNorm(self.slot_dim),
             nn.Linear(self.slot_dim, self.z_dim))
-        
+
         self.bind_gate = nn.Sequential(
             nn.LayerNorm(world_dim + self.slot_dim),
             nn.Linear(world_dim + self.slot_dim, self.z_dim))
-        
+
         self.summary_pred = nn.Sequential(
             nn.LayerNorm(self.slot_dim),
             nn.Linear(self.slot_dim, self.slot_dim))
@@ -1434,7 +1762,7 @@ class PSTWorldBinder(AGICoreModule):
             memory_weight)
 
     def RelationSummary(self, physicalState: Dict[str, torch.Tensor], slotWeight: torch.Tensor) -> torch.Tensor:
-        relation = physicalState["PairwiseRelationCamera"]
+        relation = physicalState["PairwiseRelationObserver"]
         pair_last_seen = physicalState["PairRelationLastSeen"]
         pair_age = (
             physicalState["Step"].view(-1, 1, 1).to(pair_last_seen.dtype)
@@ -1512,8 +1840,8 @@ class PSTWorldBinder(AGICoreModule):
         worldX: torch.Tensor,
         physicalState: Dict[str, torch.Tensor],
         actionEnc: torch.Tensor,
-        robotWorldContext: torch.Tensor) -> Dict[str, torch.Tensor]:
-        world_context = torch.cat([worldH, worldZMu, worldX, actionEnc, robotWorldContext], dim=-1)
+        embodimentContext: torch.Tensor) -> Dict[str, torch.Tensor]:
+        world_context = torch.cat([worldH, worldZMu, worldX, actionEnc, embodimentContext], dim=-1)
         slot_binding_weight, observed_weight, memory_weight = self.SlotBindingWeights(physicalState)
         slot_valid = slot_binding_weight > 0.0
         slot_mask = slot_valid.unsqueeze(-1)
@@ -1527,16 +1855,16 @@ class PSTWorldBinder(AGICoreModule):
             surface_parent[..., -1],], dim=-1)
         slot_content = torch.cat([
             physicalState["SlotState"],
-            physicalState["PoseCamera"],
+            physicalState["SpatialFrame"],
             physicalState["ARaw"],
             physicalState["Size"],
             physicalState["StateRaw"],
             physicalState["AffordanceRaw"],
-            physicalState["MotionCameraRaw"],
+            physicalState["MotionObserverRaw"],
             physicalState["MovingProbRaw"].unsqueeze(-1),
             physicalState["ContactProbRaw"].unsqueeze(-1),
             physicalState["ContactForceRaw"],
-            physicalState["ContactPointCameraRaw"],
+            physicalState["ContactPointObserverRaw"],
             physicalState["Visibility"].unsqueeze(-1),
             physicalState["Occlusion"].unsqueeze(-1),
             physicalState["Semantic"],
@@ -1552,8 +1880,8 @@ class PSTWorldBinder(AGICoreModule):
             physicalState["GeometryValidMask"].unsqueeze(-1),
             physicalState["MphysRaw"].unsqueeze(-1),
             physicalState["PhysicalInteractionProb"].unsqueeze(-1),
-            physicalState["CarrierMotionCameraRaw"],
-            physicalState["ArticulationMotionCameraRaw"],
+            physicalState["CarrierMotionObserverRaw"],
+            physicalState["ArticulationMotionObserverRaw"],
             physicalState["ContentMotionUV"],
             physicalState["ContentChangeProb"].unsqueeze(-1),
             physicalState["DisplaySurfaceProb"].unsqueeze(-1),
@@ -1597,925 +1925,3 @@ class PSTWorldBinder(AGICoreModule):
             "memory_weight": memory_weight,
             "query_pool_weight": query_pool_weight.squeeze(-1),
             "pst_summary_pred": self.summary_pred(pst_context) * has_source}
-
-
-class TestPhysicalStateMTool:
-    def __init__(self, device: Optional[torch.device] = None):
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        torch.manual_seed(42)
-
-    def AssertFinite(self, value: torch.Tensor, name: str) -> None:
-        assert torch.isfinite(value).all(), f"{name} contains non-finite values"
-
-    def MakeRobotMorphology(
-        self,
-        nodeCount: int = 4,
-        permutation: Optional[torch.Tensor] = None,
-        ) -> Any:
-        node_count = int(nodeCount)
-        if node_count < 1:
-            raise ValueError("nodeCount must be positive")
-        node_role = torch.empty(node_count, dtype=torch.long)
-        node_side = torch.empty(node_count, dtype=torch.long)
-        node_capability = torch.zeros(
-            node_count,
-            ModuleDim.RobotBodyCapabilityDim,
-            dtype=torch.bool)
-        parent_index = torch.full((node_count,), -1, dtype=torch.long)
-        index = torch.arange(node_count)
-        node_role[:] = index % ModuleDim.RobotBodyRoleClasses
-        node_side[:] = index * 3 % ModuleDim.RobotBodySideClasses
-        node_capability[
-            index,
-            index % ModuleDim.RobotBodyCapabilityDim] = True
-        if node_count > 1:
-            parent_index[1:] = torch.arange(node_count - 1) // 2
-
-        if permutation is not None:
-            order = torch.as_tensor(
-                permutation,
-                dtype=torch.long).reshape(-1)
-            if order.numel() != node_count:
-                raise ValueError("permutation has invalid length")
-            if not torch.equal(
-                torch.sort(order).values,
-                torch.arange(node_count)):
-                raise ValueError("permutation is invalid")
-            inverse = torch.empty_like(order)
-            inverse[order] = torch.arange(node_count)
-            old_parent = parent_index.clone()[order]
-            node_role = node_role.clone()[order]
-            node_side = node_side.clone()[order]
-            node_capability = node_capability.clone()[order]
-            parent_index = torch.where(
-                old_parent.ge(0),
-                inverse[old_parent.clamp_min(0)],
-                old_parent)
-
-        def NodeSemanticDescriptor() -> Dict[str, torch.Tensor]:
-            has_parent = parent_index.ge(0)
-            parent_role = torch.full_like(node_role, -1)
-            parent_side = torch.full_like(node_side, -1)
-            parent_capability = torch.zeros_like(node_capability)
-            parent_role[has_parent] = node_role[parent_index[has_parent]]
-            parent_side[has_parent] = node_side[parent_index[has_parent]]
-            parent_capability[has_parent] = node_capability[
-                parent_index[has_parent]]
-            topology_depth = torch.zeros(node_count, dtype=torch.long)
-            out_degree = torch.zeros(node_count, dtype=torch.long)
-            for node_index in range(node_count):
-                current = node_index
-                while int(parent_index[current].item()) >= 0:
-                    current = int(parent_index[current].item())
-                    topology_depth[node_index] += 1
-            if bool(has_parent.any().item()):
-                out_degree.scatter_add_(
-                    0,
-                    parent_index[has_parent],
-                    torch.ones_like(parent_index[has_parent]))
-            return {
-                "parent_node_index": parent_index,
-                "topology_depth": topology_depth,
-                "is_root": ~has_parent,
-                "is_leaf": out_degree.eq(0),
-                "in_degree": has_parent.to(torch.long),
-                "out_degree": out_degree,
-                "role": node_role,
-                "side": node_side,
-                "capability": node_capability,
-                "parent_role": parent_role,
-                "parent_side": parent_side,
-                "parent_capability": parent_capability,
-                "group_role_membership": torch.zeros(
-                    node_count,
-                    ModuleDim.RobotBodyRoleClasses,
-                    dtype=torch.bool),
-                "group_side_membership": torch.zeros(
-                    node_count,
-                    ModuleDim.RobotBodySideClasses,
-                    dtype=torch.bool),
-                "group_capability": torch.zeros_like(node_capability),}
-
-        return SimpleNamespace(
-            node_count=node_count,
-            parent_index=parent_index,
-            node_role=node_role,
-            node_side=node_side,
-            node_capability=node_capability,
-            NodeSemanticDescriptor=NodeSemanticDescriptor)
-
-    def MakeTopDownContext(self, model, B: int, dtype: torch.dtype = torch.float32) -> TopDownContext:
-        runtime = model.base if hasattr(model, "base") else model
-        return TopDownContext(
-            PredictedVisual=None,
-            Precision=torch.ones(B, device=self.device, dtype=dtype),
-            MemoryCue=torch.zeros(B, int(runtime.integrated_dim), device=self.device, dtype=dtype),)
-
-    def MakeCameraIntrinsics(self, imageSize: int) -> torch.Tensor:
-        focal_length = 0.75 * float(imageSize)
-        principal_point = 0.5 * (float(imageSize) - 1.0)
-        return torch.tensor([
-            [focal_length, 0.0, principal_point],
-            [0.0, focal_length, principal_point],
-            [0.0, 0.0, 1.0],
-        ], device=self.device)
-
-    def MakeExtractorInputs(
-        self,
-        B: int = 2,
-        K: int = 4,
-        tokenDim: int = 32) -> Dict[str, torch.Tensor]:
-        object_tokens = torch.randn(B, K, tokenDim, device=self.device)
-        object_motion = torch.randn(B, K, tokenDim, device=self.device)
-        object_geometry = torch.randn(B, K, 7, device=self.device)
-        object_geometry[..., 6] = 1.0
-        node_mask = torch.ones(B, K, device=self.device)
-        geometry_valid = torch.ones(B, K, 1, device=self.device)
-        return {
-            "object_tokens": object_tokens,
-            "object_motion": object_motion,
-            "object_geometry": object_geometry,
-            "node_mask": node_mask,
-            "geometry_valid": geometry_valid,}
-
-    def MakeSemanticNodes(self, B: int = 2, K: int = 4) -> Dict[str, torch.Tensor]:
-        parent_logits = torch.randn(B, K, K, device=self.device)
-        eye = torch.eye(K, device=self.device, dtype=torch.bool)
-        parent_logits = parent_logits.masked_fill(eye.unsqueeze(0), torch.finfo(parent_logits.dtype).min)
-        pose = torch.randn(B, K, ModuleDim.PstPoseDim, device=self.device) * 0.1
-        pose[..., 2] = 1.0
-        pose[..., 6] = 1.0
-        return {
-            "node_logits": torch.randn(B, K, 2, device=self.device),
-            "level_logits": torch.randn(B, K, 3, device=self.device),
-            "object_class_logits": torch.randn(B, K, ModuleDim.PstObjectClasses, device=self.device),
-            "part_class_logits": torch.randn(B, K, ModuleDim.PstPartClasses, device=self.device),
-            "parent_logits": parent_logits,
-            "pose_camera": pose,
-            "size_3d": torch.rand(B, K, 3, device=self.device).clamp_min(0.05),
-            "bbox_2d": torch.rand(B, K, 4, device=self.device),
-            "visible_ratio": torch.rand(B, K, device=self.device),
-            "occlusion_ratio": torch.rand(B, K, device=self.device) * 0.2,
-            "has_text_logits": torch.randn(B, K, 2, device=self.device),
-            "text_embed": F.normalize(torch.randn(B, K, ModuleDim.PstTextDim, device=self.device), dim=-1, eps=1e-6),
-            "symbol_logits": torch.randn(B, K, ModuleDim.PstSymbolClasses, device=self.device),
-            "identity_embed": F.normalize(torch.randn(B, K, ModuleDim.PstIdentityDim, device=self.device), dim=-1, eps=1e-6),}
-
-    def MakeTargets(
-        self,
-        B: int = 2,
-        K: int = 4,
-        H: int = 32,
-        W: int = 32) -> Dict[str, torch.Tensor]:
-        pose = torch.zeros(B, K, ModuleDim.PstPoseDim, device=self.device)
-        pose[..., 2] = 1.0
-        pose[..., 6] = 1.0
-        valid = torch.ones(B, K, device=self.device, dtype=torch.bool)
-        level = torch.zeros(B, K, device=self.device, dtype=torch.long)
-        parent = torch.full((B, K), -1, device=self.device, dtype=torch.long)
-        object_class = torch.ones(B, K, device=self.device, dtype=torch.long)
-        part_class = torch.zeros(B, K, device=self.device, dtype=torch.long)
-        if K > 1:
-            level[:, 1:] = 1
-            parent[:, 1:] = 0
-            object_class[:, 1:] = 0
-            part_class[:, 1:] = 1
-        relation = torch.zeros(B, K, K, device=self.device, dtype=torch.long)
-        relation_valid = valid.unsqueeze(2) & valid.unsqueeze(1)
-        relation_valid = relation_valid & ~torch.eye(K, device=self.device, dtype=torch.bool).unsqueeze(0)
-        masks = torch.zeros(B, K, H, W, device=self.device, dtype=torch.bool)
-        masks[:, 0, : H // 2, : W // 2] = True
-        if K > 1:
-            masks[:, 1:, H // 2:, W // 2:] = True
-        depth = torch.ones(B, 1, H, W, device=self.device)
-        normal = torch.zeros(B, 3, H, W, device=self.device)
-        normal[:, 2] = 1.0
-        realm = torch.full(
-            (B, K),
-            int(EntityRealm.EXTERNAL_PHYSICAL),
-            device=self.device,
-            dtype=torch.long)
-        motion_layer = torch.zeros(
-            B, K, ModuleDim.PstMotionLayerClasses, device=self.device)
-        motion_layer[..., int(MotionLayer.CARRIER_MOTION)] = 1.0
-        agency_by_layer = torch.full(
-            (B, K, ModuleDim.PstMotionLayerClasses),
-            int(EntityAgency.UNKNOWN),
-            device=self.device,
-            dtype=torch.long)
-        agency_valid = torch.zeros_like(agency_by_layer, dtype=torch.bool)
-        agency_valid[..., int(MotionLayer.CARRIER_MOTION)] = True
-        return {
-            "rgb": torch.rand(B, 3, H, W, device=self.device),
-            "depth": depth,
-            "depth_valid": torch.ones_like(depth, dtype=torch.bool),
-            "normal": normal,
-            "normal_valid": torch.ones_like(depth, dtype=torch.bool),
-            "semantic_segmentation": torch.zeros(B, H, W, device=self.device, dtype=torch.long),
-            "scene_class": torch.ones(B, device=self.device, dtype=torch.long),
-            "global_labels": torch.ones(B, ModuleDim.PstGlobalLabels, device=self.device),
-            "node_valid": valid,
-            "node_level": level,
-            "parent_index": parent,
-            "object_classes": object_class,
-            "part_classes": part_class,
-            "track_id": torch.arange(K, device=self.device).unsqueeze(0).expand(B, -1),
-            "pose_camera": pose,
-            "pose_world": pose.clone(),
-            "pose_valid": valid,
-            "geometry_valid": valid,
-            "size_3d": torch.ones(B, K, 3, device=self.device) * 0.1,
-            "bbox_2d": torch.ones(B, K, 4, device=self.device) * 0.25,
-            "node_instance_masks": masks,
-            "visible_ratio": torch.ones(B, K, device=self.device),
-            "occlusion_ratio": torch.zeros(B, K, device=self.device),
-            "has_text": torch.zeros(B, K, device=self.device, dtype=torch.long),
-            "text_embed": torch.zeros(B, K, ModuleDim.PstTextDim, device=self.device),
-            "symbol_type": torch.zeros(B, K, device=self.device, dtype=torch.long),
-            "node_state": torch.zeros(B, K, ModuleDim.PstStateDim, device=self.device),
-            "node_state_valid": valid,
-            "node_attributes": torch.zeros(B, K, ModuleDim.PstAttrDim, device=self.device),
-            "node_attributes_valid": level == 0,
-            "relation_type": relation,
-            "relation_valid": relation_valid,
-            "external_relation": torch.zeros(B, K, ModuleDim.PstRelationClasses, device=self.device),
-            "external_relation_valid": valid,
-            "motion": pose,
-            "motion_valid": valid,
-            "is_moving": torch.zeros(B, K, device=self.device),
-            "affordance": torch.zeros(B, K, ModuleDim.PstAffordanceDim, device=self.device),
-            "affordance_valid": level == 0,
-            "contact": torch.zeros(B, K, device=self.device),
-            "contact_valid": valid,
-            "contact_force": torch.zeros(B, K, 2, device=self.device),
-            "contact_point_camera": torch.zeros(B, K, 3, device=self.device),
-            "physical_entity": torch.ones(B, K, device=self.device),
-            "physical_entity_valid": valid,
-            "physical_interaction": torch.ones(B, K, device=self.device),
-            "physical_interaction_valid": valid,
-            "realm": realm,
-            "realm_valid": valid,
-            "motion_layer_multi_hot": motion_layer,
-            "motion_layer_valid": valid,
-            "agency_by_layer": agency_by_layer,
-            "agency_by_layer_valid": agency_valid,
-            "body_membership": torch.zeros(B, K, device=self.device),
-            "body_membership_valid": valid,
-            "self_part_id": torch.zeros(B, K, device=self.device, dtype=torch.long),
-            "self_part_valid": torch.zeros_like(valid),
-            "carrier_motion": pose.clone(),
-            "carrier_motion_valid": valid,
-            "articulation_motion": pose.clone(),
-            "articulation_motion_valid": torch.zeros_like(valid),
-            "content_motion_uv": torch.zeros(B, K, 2, device=self.device),
-            "content_motion_uv_valid": torch.zeros_like(valid),
-            "content_change": torch.zeros(B, K, device=self.device),
-            "content_change_valid": valid,
-            "display_surface": torch.zeros(B, K, device=self.device),
-            "display_surface_valid": valid,
-            "surface_parent_index": torch.full(
-                (B, K), -1, device=self.device, dtype=torch.long),
-            "surface_parent_valid": valid,
-            "surface_uv": torch.zeros(B, K, 2, device=self.device),
-            "surface_uv_valid": torch.zeros_like(valid),
-            "verification_confidence": torch.ones(B, K, device=self.device),
-            "verification_confidence_valid": valid,
-            "ontology_relation_multi_hot": torch.zeros(
-                B, K, K, ModuleDim.PstOntologyRelationClasses,
-                device=self.device),
-            "ontology_relation_valid": relation_valid,}
-
-    def MakePhysicalState(
-        self,
-        B: int = 2,
-        K: int = 4,
-        tokenDim: int = 32,
-        robotMorphology: Optional[Any] = None,
-        ) -> Tuple[PhysicalStateExtractor, Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        model = PhysicalStateExtractor(
-            robotMorphology=(
-                self.MakeRobotMorphology()
-                if robotMorphology is None
-                else robotMorphology),
-            inObjectDim=tokenDim,
-            motionDim=tokenDim,
-            numSlotLayers=1,
-            numHeads=4).to(self.device)
-        inputs = self.MakeExtractorInputs(B=B, K=K, tokenDim=tokenDim)
-        out = model(
-            inputs["object_tokens"],
-            inputs["object_motion"],
-            inputs["object_geometry"],
-            inputs["node_mask"],
-            inputs["geometry_valid"])
-        semantic = model.SemanticWorldView(self.MakeSemanticNodes(B=B, K=K))
-        pst = {**out, **semantic, "ObservedSlotMask": out["ObservationMask"]}
-        pst["Observed"] = torch.ones(B, K, device=self.device, dtype=torch.bool)
-        pst["Step"] = torch.full((B,), 8, device=self.device, dtype=torch.long)
-        pst["LastSeen"] = torch.arange(K, device=self.device, dtype=torch.long).unsqueeze(0).expand(B, -1)
-        pst["PairRelationLastSeen"] = torch.zeros(
-            B, K, K, device=self.device, dtype=torch.long)
-        pst["SlotPresence"] = pst["ObservedSlotMask"]
-        return model, pst, self.MakeTargets(B=B, K=K)
-
-    def TestSlotCrossAttention(self) -> bool:
-        try:
-            B, T, N, D = 2, 3, 5, 16
-            layer = SlotCrossAttention(D, D, numHeads=4).to(self.device)
-            query = torch.randn(B, T, D, device=self.device, requires_grad=True)
-            source = torch.randn(B, N, D, device=self.device)
-            weight = torch.rand(B, N, device=self.device)
-            weight[0].zero_()
-            out = layer(query, source, weight)
-            assert tuple(out.shape) == (B, T, D), f"unexpected output shape {tuple(out.shape)}"
-            self.AssertFinite(out, "SlotCrossAttention output")
-            out.square().mean().backward()
-            assert query.grad is not None, "query gradient was not produced"
-            print("SlotCrossAttention test passed.")
-            return True
-        except Exception as e:
-            print(f"SlotCrossAttention test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestSlotRefineLayer(self) -> bool:
-        try:
-            B, K, D = 2, 5, 16
-            layer = SlotRefineLayer(D, numHeads=4).to(self.device)
-            slots = torch.randn(B, K, D, device=self.device)
-            mask = torch.ones(B, K, device=self.device)
-            mask[0].zero_()
-            out = layer(slots, mask)
-            assert tuple(out.shape) == (B, K, D), f"unexpected output shape {tuple(out.shape)}"
-            self.AssertFinite(out, "SlotRefineLayer output")
-            print("SlotRefineLayer test passed.")
-            return True
-        except Exception as e:
-            print(f"SlotRefineLayer test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestPhysicalStateExtractorForwardShapes(self) -> bool:
-        try:
-            B, K, token_dim = 2, 4, 32
-            model = PhysicalStateExtractor(
-                robotMorphology=self.MakeRobotMorphology(),
-                inObjectDim=token_dim,
-                motionDim=token_dim,
-                numSlotLayers=1,
-                numHeads=4).to(self.device)
-            inputs = self.MakeExtractorInputs(B=B, K=K, tokenDim=token_dim)
-            inputs["node_mask"][:, -1] = 0.0
-            out = model(
-                inputs["object_tokens"],
-                inputs["object_motion"],
-                inputs["object_geometry"],
-                inputs["node_mask"],
-                inputs["geometry_valid"])
-            assert tuple(out["SlotState"].shape) == (B, K, ModuleDim.PstSlotDim)
-            assert tuple(out["PairwiseRelationCamera"].shape) == (B, K, K, ModuleDim.PstRelDim)
-            assert tuple(out["RelationLogitsRaw"].shape) == (B, K, K, ModuleDim.PstRelationClasses)
-            assert tuple(out["SelfPartLogits"].shape) == (B, K, 4)
-            assert tuple(out["SelfPartProb"].shape) == (B, K, 4)
-            assert tuple(out["SelfPartSemantic"].shape) == (
-                B,
-                K,
-                ModuleDim.PstSelfPartSemanticDim)
-            assert bool((out["ObservationMask"][:, -1] == 0.0).all().item())
-            quat_norm = out["MotionCameraRaw"][..., 3:7].norm(dim=-1)
-            assert bool(torch.allclose(quat_norm, torch.ones_like(quat_norm), atol=1e-4))
-            assert bool((out["SlotState"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
-            assert bool((out["ARaw"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
-            assert bool((out["StateRaw"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
-            assert bool((out["AffordanceRaw"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
-            assert bool((out["ContactForceRaw"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
-            assert bool((out["ContactPointCameraRaw"][:, -1].abs().sum(dim=-1) == 0.0).all().item())
-            assert bool((out["MotionCameraRaw"][:, -1, :3].abs().sum(dim=-1) == 0.0).all().item())
-            assert bool((out["MotionCameraRaw"][:, -1, 3:6].abs().sum(dim=-1) == 0.0).all().item())
-            assert bool(torch.allclose(out["MotionCameraRaw"][:, -1, 6], torch.ones(B, device=self.device), atol=1e-5))
-            for name, value in out.items():
-                self.AssertFinite(value, f"PhysicalStateExtractor {name}")
-            print("PhysicalStateExtractor forward shape test passed.")
-            return True
-        except Exception as e:
-            print(f"PhysicalStateExtractor forward shape test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestSelfPartMorphologyPermutation(self) -> bool:
-        try:
-            B, K, token_dim, node_count = 2, 3, 32, 5
-            order = torch.tensor([2, 0, 4, 1, 3], dtype=torch.long)
-            reference = PhysicalStateExtractor(
-                robotMorphology=self.MakeRobotMorphology(
-                    nodeCount=node_count),
-                inObjectDim=token_dim,
-                motionDim=token_dim,
-                numSlotLayers=1,
-                numHeads=4).to(self.device).eval()
-            permuted = PhysicalStateExtractor(
-                robotMorphology=self.MakeRobotMorphology(
-                    nodeCount=node_count,
-                    permutation=order),
-                inObjectDim=token_dim,
-                motionDim=token_dim,
-                numSlotLayers=1,
-                numHeads=4).to(self.device).eval()
-            state = reference.state_dict()
-            assert "self_part_node_descriptor" not in state
-            permuted.load_state_dict(state)
-            inputs = self.MakeExtractorInputs(B=B, K=K, tokenDim=token_dim)
-            with torch.no_grad():
-                reference_out = reference(
-                    inputs["object_tokens"],
-                    inputs["object_motion"],
-                    inputs["object_geometry"],
-                    inputs["node_mask"],
-                    inputs["geometry_valid"])
-                permuted_out = permuted(
-                    inputs["object_tokens"],
-                    inputs["object_motion"],
-                    inputs["object_geometry"],
-                    inputs["node_mask"],
-                    inputs["geometry_valid"])
-            full_order = order.to(self.device)
-            assert torch.allclose(
-                permuted_out["SelfPartLogits"],
-                reference_out["SelfPartLogits"].index_select(
-                    -1,
-                    full_order),
-                atol=1e-6,
-                rtol=1e-6)
-            assert torch.allclose(
-                permuted_out["SelfPartProb"],
-                reference_out["SelfPartProb"].index_select(
-                    -1,
-                    full_order),
-                atol=1e-6,
-                rtol=1e-6)
-            assert torch.allclose(
-                permuted_out["SelfPartSemantic"],
-                reference_out["SelfPartSemantic"],
-                atol=1e-6,
-                rtol=1e-6)
-            print("SelfPart morphology permutation test passed.")
-            return True
-        except Exception as e:
-            print(
-                "SelfPart morphology permutation test failed: "
-                f"{type(e).__name__}: {e}")
-            return False
-
-    def TestSelfPartDynamicCardinality(self) -> bool:
-        try:
-            B, K, token_dim = 2, 3, 32
-            small = PhysicalStateExtractor(
-                robotMorphology=self.MakeRobotMorphology(
-                    nodeCount=4),
-                inObjectDim=token_dim,
-                motionDim=token_dim,
-                numSlotLayers=1,
-                numHeads=4).to(self.device).eval()
-            large = PhysicalStateExtractor(
-                robotMorphology=self.MakeRobotMorphology(
-                    nodeCount=7),
-                inObjectDim=token_dim,
-                motionDim=token_dim,
-                numSlotLayers=1,
-                numHeads=4).to(self.device).eval()
-            large.load_state_dict(small.state_dict())
-            inputs = self.MakeExtractorInputs(B=B, K=K, tokenDim=token_dim)
-            with torch.no_grad():
-                small_out = small(
-                    inputs["object_tokens"],
-                    inputs["object_motion"],
-                    inputs["object_geometry"],
-                    inputs["node_mask"],
-                    inputs["geometry_valid"])
-                large_out = large(
-                    inputs["object_tokens"],
-                    inputs["object_motion"],
-                    inputs["object_geometry"],
-                    inputs["node_mask"],
-                    inputs["geometry_valid"])
-            assert tuple(small_out["SelfPartLogits"].shape) == (B, K, 4)
-            assert tuple(large_out["SelfPartLogits"].shape) == (B, K, 7)
-            assert tuple(small_out["SelfPartSemantic"].shape) == (
-                B, K, ModuleDim.PstSelfPartSemanticDim)
-            assert tuple(large_out["SelfPartSemantic"].shape) == (
-                B, K, ModuleDim.PstSelfPartSemanticDim)
-            print("SelfPart dynamic cardinality test passed.")
-            return True
-        except Exception as e:
-            print(
-                "SelfPart dynamic cardinality test failed: "
-                f"{type(e).__name__}: {e}")
-            return False
-
-    def TestSelfPartGeometryEvidence(self) -> bool:
-        try:
-            B, K, L, token_dim = 1, 2, 4, 32
-            model = PhysicalStateExtractor(
-                robotMorphology=self.MakeRobotMorphology(nodeCount=L),
-                inObjectDim=token_dim,
-                motionDim=token_dim,
-                numSlotLayers=1,
-                numHeads=4).to(self.device).eval()
-            inputs = self.MakeExtractorInputs(B=B, K=K, tokenDim=token_dim)
-            inputs["object_geometry"][0, 0, :3] = 0.0
-            body_pose = torch.zeros(B, L, 7, device=self.device)
-            body_pose[..., 6] = 1.0
-            body_pose[0, :, 0] = torch.arange(
-                L,
-                device=self.device,
-                dtype=body_pose.dtype)
-            body_observed = torch.ones(
-                B, L, device=self.device, dtype=torch.bool)
-            body_healthy = torch.ones_like(body_observed)
-            with torch.no_grad():
-                baseline = model(
-                    inputs["object_tokens"],
-                    inputs["object_motion"],
-                    inputs["object_geometry"],
-                    inputs["node_mask"],
-                    inputs["geometry_valid"])
-                grounded = model(
-                    inputs["object_tokens"],
-                    inputs["object_motion"],
-                    inputs["object_geometry"],
-                    inputs["node_mask"],
-                    inputs["geometry_valid"],
-                    bodyNodePoseCamera=body_pose,
-                    bodyNodeObserved=body_observed,
-                    bodyNodeHealthy=body_healthy)
-                invalid_inputs = {
-                    name: value.clone() for name, value in inputs.items()}
-                invalid_inputs["geometry_valid"][0, 0] = False
-                invalid_baseline = model(
-                    invalid_inputs["object_tokens"],
-                    invalid_inputs["object_motion"],
-                    invalid_inputs["object_geometry"],
-                    invalid_inputs["node_mask"],
-                    invalid_inputs["geometry_valid"])
-                invalid_grounded = model(
-                    invalid_inputs["object_tokens"],
-                    invalid_inputs["object_motion"],
-                    invalid_inputs["object_geometry"],
-                    invalid_inputs["node_mask"],
-                    invalid_inputs["geometry_valid"],
-                    bodyNodePoseCamera=body_pose,
-                    bodyNodeObserved=body_observed,
-                    bodyNodeHealthy=body_healthy)
-            delta = (
-                grounded["SelfPartLogits"]
-                - baseline["SelfPartLogits"])
-            assert delta[0, 0, 0] > delta[0, 0, 1]
-            assert delta.min() >= -4.0
-            assert delta.max() <= 0.0
-            assert torch.allclose(
-                invalid_grounded["SelfPartLogits"][0, 0],
-                invalid_baseline["SelfPartLogits"][0, 0],
-                atol=1e-6,
-                rtol=1e-6)
-            model.train()
-            model.zero_grad(set_to_none=True)
-            learned = model(
-                inputs["object_tokens"],
-                inputs["object_motion"],
-                inputs["object_geometry"],
-                inputs["node_mask"],
-                inputs["geometry_valid"],
-                bodyNodePoseCamera=body_pose,
-                bodyNodeObserved=body_observed,
-                bodyNodeHealthy=body_healthy)
-            learned["SelfPartLogits"][..., 1:].mean().backward()
-            assert model.self_part_geometry_gain.grad is not None
-            assert model.self_part_geometry_log_scale.grad is not None
-            assert torch.isfinite(model.self_part_geometry_gain.grad)
-            assert torch.isfinite(model.self_part_geometry_log_scale.grad)
-            print("SelfPart geometry evidence test passed.")
-            return True
-        except Exception as e:
-            print(
-                "SelfPart geometry evidence test failed: "
-                f"{type(e).__name__}: {e}")
-            return False
-
-    def TestSemanticWorldView(self) -> bool:
-        try:
-            B, K = 2, 4
-            view = PhysicalStateExtractor.SemanticWorldView(self.MakeSemanticNodes(B=B, K=K))
-            assert tuple(view["NodePresence"].shape) == (B, K)
-            assert tuple(view["PoseCamera"].shape) == (B, K, ModuleDim.PstPoseDim)
-            assert tuple(view["IdentityKey"].shape) == (B, K, ModuleDim.PstIdDim)
-            assert tuple(view["Semantic"].shape) == (B, K, ModuleDim.PstSemanticDim)
-            assert tuple(view["ParentProb"].shape) == (B, K, K)
-            for name, value in view.items():
-                self.AssertFinite(value, f"SemanticWorldView {name}")
-            print("SemanticWorldView test passed.")
-            return True
-        except Exception as e:
-            print(f"SemanticWorldView test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestIdentityKeySeparatesSameSemanticEntities(self) -> bool:
-        try:
-            nodes = self.MakeSemanticNodes(B=1, K=2)
-            nodes["identity_embed"].zero_()
-            nodes["identity_embed"][0, 0, 0] = 1.0
-            nodes["identity_embed"][0, 1, 1] = 10.0
-            for name in ("level_logits", "object_class_logits", "part_class_logits"):
-                nodes[name].fill_(-100.0)
-                nodes[name][..., 0] = 100.0
-
-            identity_key = PhysicalStateExtractor.SemanticWorldView(nodes)["IdentityKey"]
-            identity_dim = int(nodes["identity_embed"].size(-1))
-            identity_norm = identity_key[..., :identity_dim].norm(dim=-1)
-            similarity = F.cosine_similarity(identity_key[:, 0], identity_key[:, 1], dim=-1)
-
-            assert torch.allclose(
-                identity_norm[:, 0], identity_norm[:, 1], atol=1e-6), (
-                "IdentityKey must normalize identity embeddings before semantic fusion")
-            assert float(similarity.item()) < 0.5, (
-                f"orthogonal identities with equal semantics are too similar: {float(similarity.item()):.6f}")
-            print("IdentityKey same-semantic separation test passed.")
-            return True
-        except Exception as e:
-            print(f"IdentityKey same-semantic separation test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestPhysicalStateLossFiniteAndBackward(self) -> bool:
-        try:
-            model, pst, targets = self.MakePhysicalState(B=2, K=4, tokenDim=32)
-            loss_mod = PhysicalStateLoss().to(self.device)
-            losses = loss_mod(pst, targets)
-            expected = {
-                "loss_mphys",
-                "loss_state",
-                "loss_attributes",
-                "loss_affordance",
-                "loss_relation",
-                "loss_external_relation",
-                "loss_motion",
-                "loss_moving",
-                "loss_contact",
-                "loss_contact_force",
-                "loss_contact_point",
-                "loss",}
-            assert expected.issubset(losses.keys()), f"missing losses: {expected.difference(losses.keys())}"
-            self.AssertFinite(losses["loss"], "PhysicalStateLoss total")
-            model.zero_grad(set_to_none=True)
-            losses["loss"].backward()
-            grad_norm = sum(
-                float(p.grad.detach().abs().sum().item())
-                for p in model.parameters()
-                if p.grad is not None)
-            assert grad_norm > 0.0, "no gradients flowed through PhysicalStateExtractor"
-            print("PhysicalStateLoss finite/backward test passed.")
-            return True
-        except Exception as e:
-            print(f"PhysicalStateLoss finite/backward test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestMissedObservationStillReceivesPositiveSupervision(self) -> bool:
-        try:
-            B, K, token_dim = 1, 1, 32
-            model = PhysicalStateExtractor(
-                robotMorphology=self.MakeRobotMorphology(),
-                inObjectDim=token_dim,
-                motionDim=token_dim,
-                numSlotLayers=1,
-                numHeads=4).to(self.device)
-            inputs = self.MakeExtractorInputs(B=B, K=K, tokenDim=token_dim)
-            inputs["node_mask"].zero_()
-            physical = model(
-                inputs["object_tokens"],
-                inputs["object_motion"],
-                inputs["object_geometry"],
-                inputs["node_mask"],
-                inputs["geometry_valid"])
-            pst = {
-                **physical,
-                **model.SemanticWorldView(self.MakeSemanticNodes(B=B, K=K)),}
-            losses = PhysicalStateLoss().to(self.device)(
-                pst,
-                self.MakeTargets(B=B, K=K))
-            model.zero_grad(set_to_none=True)
-            (
-                losses["loss_perceptual_presence"]
-                + losses["loss_state"]
-            ).backward()
-            objectness_grad = sum(
-                float(parameter.grad.abs().sum().item())
-                for parameter in model.objectness_head.parameters()
-                if parameter.grad is not None)
-            state_grad = sum(
-                float(parameter.grad.abs().sum().item())
-                for parameter in model.state_head.parameters()
-                if parameter.grad is not None)
-            ok = bool(
-                torch.count_nonzero(physical["ObservationMask"]).item() == 0
-                and losses["loss_perceptual_presence"].item() > 0.0
-                and objectness_grad > 0.0
-                and state_grad > 0.0)
-            print(
-                f"MissedObservationPositiveSupervision "
-                f"{'passed' if ok else 'failed'}.")
-            return ok
-        except Exception as e:
-            print(f"MissedObservationPositiveSupervision failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestPSTWorldBinderShapes(self) -> bool:
-        try:
-            B, K = 2, 4
-            _, pst, _ = self.MakePhysicalState(B=B, K=K, tokenDim=32)
-            observed = torch.tensor(
-                [[True, False, True, False], [False, True, False, True]],
-                device=self.device)
-            pst["Observed"] = observed
-            pst["SlotPresence"] = torch.ones(B, K, device=self.device)
-            pst["MphysRaw"] = torch.ones(B, K, device=self.device)
-            pst["LastSeen"] = torch.tensor([[8, 4, 8, 0], [2, 8, 3, 8]], device=self.device)
-            pst["Step"] = torch.full((B,), 8, device=self.device, dtype=torch.long)
-            binder = PSTWorldBinder().to(self.device)
-            out = binder(
-                torch.randn(B, ModuleDim.WorldOutHState, device=self.device),
-                torch.randn(B, ModuleDim.WorldOutZState, device=self.device),
-                torch.randn(B, ModuleDim.WorldOutXState, device=self.device),
-                pst,
-                torch.randn(B, 256, device=self.device),
-                torch.randn(B, ModuleDim.PstSlotDim, device=self.device))
-            assert tuple(out["bound_mu"].shape) == (B, ModuleDim.WorldOutZState)
-            assert tuple(out["pst_context"].shape) == (B, ModuleDim.PstSlotDim)
-            assert tuple(out["slot_binding_weight"].shape) == (B, K)
-            assert bool((out["memory_weight"][observed] == 0.0).all().item())
-            query_sum = out["query_pool_weight"].sum(dim=-1)
-            assert bool(torch.allclose(query_sum, torch.ones_like(query_sum), atol=1e-5))
-            for name, value in out.items():
-                self.AssertFinite(value, f"PSTWorldBinder {name}")
-            print("PSTWorldBinder shape/memory test passed.")
-            return True
-        except Exception as e:
-            print(f"PSTWorldBinder shape/memory test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestVirtualRealmCanonicalPhysicalProjection(self) -> bool:
-        try:
-            B, K, token_dim = 1, 2, 32
-            model = PhysicalStateExtractor(
-                robotMorphology=self.MakeRobotMorphology(),
-                inObjectDim=token_dim,
-                motionDim=token_dim,
-                numSlotLayers=1,
-                numHeads=4).to(self.device).eval()
-            with torch.no_grad():
-                for parameter in model.realm_head.parameters():
-                    parameter.zero_()
-                model.realm_head[-1].bias.fill_(-10.0)
-                model.realm_head[-1].bias[
-                    int(EntityRealm.VIRTUAL_CONTENT)] = 10.0
-                for head in (
-                    model.objectness_head,
-                    model.physicality_head,
-                    model.interaction_head,
-                    model.moving_head,
-                    model.contact_head,
-                ):
-                    for parameter in head.parameters():
-                        parameter.zero_()
-                    head[-1].bias.fill_(10.0)
-                inputs = self.MakeExtractorInputs(
-                    B=B, K=K, tokenDim=token_dim)
-                out = model(
-                    inputs["object_tokens"],
-                    inputs["object_motion"],
-                    inputs["object_geometry"],
-                    inputs["node_mask"],
-                    inputs["geometry_valid"])
-            identity = torch.zeros_like(out["MotionCameraRaw"])
-            identity[..., 6] = 1.0
-            ok = bool(
-                out["PerceptualPresence"].amin().item() > 0.99
-                and torch.count_nonzero(out["GeometryValidMask"]).item() == 0
-                and torch.count_nonzero(out["MphysRaw"]).item() == 0
-                and torch.count_nonzero(
-                    out["PhysicalInteractionProb"]).item() == 0
-                and torch.equal(out["MotionCameraRaw"], identity)
-                and torch.equal(out["CarrierMotionCameraRaw"], identity)
-                and torch.equal(out["ArticulationMotionCameraRaw"], identity)
-                and torch.count_nonzero(out["MovingProbRaw"]).item() == 0
-                and torch.count_nonzero(out["ContactProbRaw"]).item() == 0
-                and torch.count_nonzero(
-                    out["PairwiseRelationCamera"][..., :4]).item() == 0)
-            print(
-                "Virtual realm canonical physical projection "
-                f"{'passed' if ok else 'failed'}.")
-            return ok
-        except Exception as e:
-            print(
-                "Virtual realm canonical physical projection failed: "
-                f"{type(e).__name__}: {e}")
-            return False
-
-    def TestPSTWorldBinderEmptyAndInvalidMask(self) -> bool:
-        try:
-            B, K = 2, 4
-            _, pst, _ = self.MakePhysicalState(B=B, K=K, tokenDim=32)
-            pst["Observed"][0].zero_()
-            pst["SlotPresence"][0].zero_()
-            pst["MphysRaw"][0].fill_(float("nan"))
-            vector_fields = (
-                "SlotState", "PoseCamera", "ARaw", "Size", "StateRaw",
-                "AffordanceRaw", "MotionCameraRaw", "ContactForceRaw", "ContactPointCameraRaw",
-                "Semantic", "ExternalRelationProbRaw", "IdentityKey")
-            scalar_fields = (
-                "MovingProbRaw", "ContactProbRaw", "Visibility", "Occlusion")
-            for key in vector_fields:
-                pst[key][0].fill_(float("nan"))
-            for key in scalar_fields:
-                pst[key][0].fill_(float("nan"))
-            pst["PairwiseRelationCamera"][0].fill_(float("nan"))
-
-            binder = PSTWorldBinder().to(self.device).eval()
-            world_z = torch.randn(B, ModuleDim.WorldOutZState, device=self.device)
-            out = binder(
-                torch.randn(B, ModuleDim.WorldOutHState, device=self.device),
-                world_z,
-                torch.randn(B, ModuleDim.WorldOutXState, device=self.device),
-                pst,
-                torch.randn(B, 256, device=self.device),
-                torch.randn(B, ModuleDim.PstSlotDim, device=self.device))
-            for name, value in out.items():
-                self.AssertFinite(value, f"PSTWorldBinder masked {name}")
-            ok = (
-                float(out["slot_binding_weight"][0].abs().sum().item()) == 0.0
-                and float(out["pst_context"][0].abs().sum().item()) == 0.0
-                and float(out["bind_gate"][0].abs().sum().item()) == 0.0
-                and float(out["delta_mu"][0].abs().sum().item()) == 0.0
-                and torch.equal(out["bound_mu"][0], world_z[0]))
-            print(f"PSTWorldBinder empty/invalid mask {'passed' if ok else 'failed'}")
-            return bool(ok)
-        except Exception as e:
-            print(f"PSTWorldBinder empty/invalid mask failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestPerceptionPhysicalTrainerForwardSmoke(self) -> bool:
-        try:
-            B, H, W, K = 1, 32, 32, 4
-            trainer = PerceptionPhysicalTrainer(
-                cameraIntrinsics=self.MakeCameraIntrinsics(H),
-                robotMorphology=self.MakeRobotMorphology(),
-                physicalWeight=0.25,
-                recallLossKwargs={"identityBankSize": 16},
-                imgSize=H,
-                patchSize=1,
-                embedDim=32,
-                numHeads=4,
-                numLayers=1,
-                baseChannels=8,
-                objectTokenCount=K,).to(self.device)
-            frames = torch.rand(B, 3, H, W, device=self.device)
-            depth = torch.ones(B, 1, H, W, device=self.device)
-            depth_valid = torch.ones_like(depth, dtype=torch.bool)
-            targets = self.MakeTargets(B=B, K=K, H=H, W=W)
-            targets["rgb"] = frames
-            targets["depth"] = depth
-            targets["depth_valid"] = depth_valid
-            camera_motion = torch.zeros(
-                B, ModuleDim.ObserverMotionDim, device=self.device)
-            camera_motion[:, 6] = 1.0
-            out = trainer(
-                frames,
-                depth,
-                depth_valid,
-                self.MakeTopDownContext(trainer.perception, B, frames.dtype),
-                targets,
-                cameraMotion=camera_motion,
-                prevVisualValid=torch.zeros(B, device=self.device, dtype=torch.bool))
-            assert "physical_state" in out and "physical_losses" in out
-            assert tuple(out["physical_state"]["SlotState"].shape[:2]) == (B, K)
-            self.AssertFinite(out["loss"], "PerceptionPhysicalTrainer loss")
-            out["loss"].backward()
-            print("PerceptionPhysicalTrainer forward smoke test passed.")
-            return True
-        except Exception as e:
-            print(f"PerceptionPhysicalTrainer forward smoke test failed: {type(e).__name__}: {e}")
-            return False
-
-    def RunAll(self) -> Dict[str, bool]:
-        results = {
-            "SlotCrossAttention": self.TestSlotCrossAttention(),
-            "SlotRefineLayer": self.TestSlotRefineLayer(),
-            "PhysicalStateExtractorForwardShapes": self.TestPhysicalStateExtractorForwardShapes(),
-            "SelfPartMorphologyPermutation": self.TestSelfPartMorphologyPermutation(),
-            "SelfPartDynamicCardinality": self.TestSelfPartDynamicCardinality(),
-            "SelfPartGeometryEvidence": self.TestSelfPartGeometryEvidence(),
-            "SemanticWorldView": self.TestSemanticWorldView(),
-            "IdentityKeySeparatesSameSemanticEntities": self.TestIdentityKeySeparatesSameSemanticEntities(),
-            "PhysicalStateLossFiniteAndBackward": self.TestPhysicalStateLossFiniteAndBackward(),
-            "MissedObservationPositiveSupervision": self.TestMissedObservationStillReceivesPositiveSupervision(),
-            "PSTWorldBinderShapes": self.TestPSTWorldBinderShapes(),
-            "VirtualRealmCanonicalPhysicalProjection": self.TestVirtualRealmCanonicalPhysicalProjection(),
-            "PSTWorldBinderEmptyAndInvalidMask": self.TestPSTWorldBinderEmptyAndInvalidMask(),
-            "PerceptionPhysicalTrainerForwardSmoke": self.TestPerceptionPhysicalTrainerForwardSmoke(),}
-        passed = sum(1 for value in results.values() if value)
-        print(f"\n[PhysicalStateModule Tests] {passed}/{len(results)} passed.")
-        return results

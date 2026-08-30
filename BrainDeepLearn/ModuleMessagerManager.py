@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
 import json
@@ -11,31 +11,29 @@ import threading
 import time
 import numpy as np
 import torch
-from RobotMorphologyModule import (
-    AGENCY_NAMES,
-    BODY_CAPABILITY_NAMES,
-    BODY_ROLE_NAMES,
-    BODY_SIDE_NAMES,
-    DEFAULT_VIRTUAL_SLOT_COUNT,
-    JOINT_TYPE_NAMES,
-    MOTION_LAYER_NAMES,
-    ONTOLOGY_RELATION_NAMES,
-    REALM_NAMES,
-)
 
+
+@dataclass(frozen=True)
+class CognitiveDimProfile:
+    perception_dim: int
+    attention_dim: int
+    world_dim: int
+    memory_dim: int
+    consciousness_dim: int
+    intention_dim: int
+    goal_dim: int
+    value_dim: int
+    decision_dim: int
+
+    def __post_init__(self) -> None:
+        for dim_field in fields(self):
+            value = getattr(self, dim_field.name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(
+                    f"cognitive dimension {dim_field.name} must be a positive integer")
 
 
 class ModuleDim:
-    RobotControlAxisDim: int = 6
-    RobotBodyRoleNames: Tuple[str, ...] = BODY_ROLE_NAMES
-    RobotBodyRoleClasses: int = len(RobotBodyRoleNames)
-    RobotBodySideNames: Tuple[str, ...] = BODY_SIDE_NAMES
-    RobotBodySideClasses: int = len(RobotBodySideNames)
-    RobotBodyCapabilityNames: Tuple[str, ...] = BODY_CAPABILITY_NAMES
-    RobotBodyCapabilityDim: int = len(RobotBodyCapabilityNames)
-    RobotJointTypeNames: Tuple[str, ...] = JOINT_TYPE_NAMES
-    RobotJointTypeClasses: int = len(RobotJointTypeNames)
-
     PerceptionEmbed: int = 512
     PerceptionFeat: int = 2 * PerceptionEmbed
 
@@ -56,25 +54,26 @@ class ModuleDim:
     IntentionFeat: int = 512
 
     ValueEstimationOutEmotion = 64
+    ValueTensorDim: int = 512
 
-    # Decision active-inference / continuous-time control extensions
+
     LatentControlDim: int = 64
     DecisionBeliefDim: int = 1024
     DecisionDynDim: int = 256
     MapperHiddenDim: int = 256
 
-    # Embodied-AGI v2 extensions ------------------------------------------------
-    # Physical State Tensor (slot-structured object-centric scene state)
+
+
     PstObservedSlots: int = 128 # K_o: current-frame observed object/part candidates
-    PstVirtualSlots: int = DEFAULT_VIRTUAL_SLOT_COUNT
-    PstSlots: int = 256         # K_w: persistent world physical memory slots
-    PstSlotDim: int = 128       # D_s: per-node physical latent
-    PstPoseDim: int = 7         #      camera/world SE(3): xyz plus quaternion
+    PstVirtualSlots: int = 32
+    PstSlots: int = 256 # K_w: persistent world physical memory slots
+    PstSlotDim: int = 128 # D_s: per-node physical latent
+    PstPoseDim: int = 7
     PstObjectClasses: int = 256
     PstPartClasses: int = 128
     PstRelationClasses: int = 32
     PstStateDim: int = 16
-    PstAttrDim: int = 32        # object material/mechanical attributes
+    PstAttrDim: int = 32
     PstAffordanceDim: int = 8
     PstIdentityDim: int = 128
     PstTextDim: int = 4
@@ -82,42 +81,35 @@ class ModuleDim:
     PstActionTypes: int = 16
     PstSceneClasses: int = 32
     PstGlobalLabels: int = 8
-    PstSemanticDim: int = 387   # level (3) + object class (256) + part class (128)
-    PstIdDim: int = 515         # tracked identity (128) + supervised semantic descriptor (387)
-    PstRelDim: int = 36         # relative xyz/distance (4) + relation probabilities (32)
-    PstUsageDim: int = 64       # D_u: per-slot usage-bank readout
-    PstRealmNames: Tuple[str, ...] = REALM_NAMES
-    PstRealmClasses: int = len(PstRealmNames)
-    PstAgencyNames: Tuple[str, ...] = AGENCY_NAMES
-    PstAgencyClasses: int = len(PstAgencyNames)
-    PstMotionLayerNames: Tuple[str, ...] = MOTION_LAYER_NAMES
-    PstMotionLayerClasses: int = len(PstMotionLayerNames)
+    PstSemanticDim: int = 387 # level (3) + object class (256) + part class (128)
+    PstIdDim: int = 515 # tracked identity (128) + supervised semantic descriptor (387)
+    PstRelDim: int = 36 # relative xyz/distance (4) + relation probabilities (32)
+    PstUsageDim: int = 64 # D_u: per-slot usage-bank readout
+    PstRealmClasses: int = 5
+    PstAgencyClasses: int = 5
+    PstMotionLayerClasses: int = 5
     PstLayerAgencyDim: int = PstMotionLayerClasses * PstAgencyClasses
-    PstOntologyRelationNames: Tuple[str, ...] = ONTOLOGY_RELATION_NAMES
-    PstOntologyRelationClasses: int = len(PstOntologyRelationNames)
+    PstOntologyRelationClasses: int = 9
     PstSelfPartSemanticDim: int = 128
 
-    # Four-level hierarchical goal stack (mission -> long -> mid -> short)
+
     GoalUltimateDim: int = 256
     GoalLongDim: int = 256
     GoalMidDim: int = 128
     GoalShortDim: int = 64
     GoalUltimateCodebookGroups: int = 16
     GoalUltimateCodebookCodes: int = 16
-    GoalLongCodebookGroups: int = 16   # 16 groups x 16 codes = 256
+    GoalLongCodebookGroups: int = 16 # 16 groups x 16 codes = 256
     GoalLongCodebookCodes: int = 16
-    GoalMidCodebookGroups: int = 8     # 8 groups x 8 codes = 64
+    GoalMidCodebookGroups: int = 8 # 8 groups x 8 codes = 64
     GoalMidCodebookCodes: int = 8
 
-    # Gather-vs-act decoder
-    DecisionGateDim: int = 2           # {gather, act}
+
+    DecisionGateDim: int = 2 # {gather, act}
     GatherTypeDim: int = 8
     ActTypeDim: int = 8
-    DecisionEndpointPoseDim: int = 7
-    DecisionActionDim: int = RobotControlAxisDim
-    DecisionEndpointPoseFeatDim: int = 128
-    RobotPhysicalReferenceDim: int = 8
-    EndpointActionEmbedDim: int = 256
+    DecisionLocalFeatureDim: int = 128
+    DecisionActionFeatureDim: int = 256
     TemporalPrimitiveCount: int = 6
     TemporalContextDim: int = 20
     TemporalReasonDim: int = 8
@@ -128,13 +120,25 @@ class ModuleDim:
         "CANCEL",
         "FAILSAFE_STOP",
         "REDISPATCH",)
-    ObserverMotionDim: int = 7
     GatherParamDim: int = 32
 
-    # Object usage knowledge bank
-    UsageNumObjects: int = 1024        # N_obj
-    UsageNumSkills: int = 64           # N_skills
-    UsageParamDim: int = 8             # P
+
+    UsageNumObjects: int = 1024 # N_obj
+    UsageNumSkills: int = 64 # N_skills
+    UsageParamDim: int = 8 # P
+
+    @classmethod
+    def CognitiveProfile(cls) -> CognitiveDimProfile:
+        return CognitiveDimProfile(
+            perception_dim=cls.PerceptionFeat,
+            attention_dim=cls.AttentionFeat,
+            world_dim=cls.WorldFeat,
+            memory_dim=cls.MemoryFeat,
+            consciousness_dim=cls.ConsciousnessState,
+            intention_dim=cls.IntentionFeat,
+            goal_dim=cls.GoalUltimateDim,
+            value_dim=cls.ValueTensorDim,
+            decision_dim=cls.DecisionBeliefDim,)
 
 
 class TensorVisualProcessor:

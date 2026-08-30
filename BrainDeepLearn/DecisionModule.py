@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import math
-from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from DecisionDecoupler import ApplyPoseDelta, DecisionDecouplerV2, NormalizePose, QuatMultiply, QuatRotate, RelativePoseError
 from FunctionTools import AGICoreModule
 from ModuleMessagerManager import ModuleDim
 from NeuroSymbolicModule import FAILURE_CAUSES, OPERATORS, NeuroSymbolicOutput
@@ -74,9 +72,6 @@ class BeliefAssembler(AGICoreModule):
         worldHzx: torch.Tensor,) -> torch.Tensor:
         scalars = torch.stack([uncertainty, confidence, precision, risk], dim=-1)
 
-        # Critic contract: only coordinate 0 of value/valueNext is the bounded
-        # Bellman-return coordinate; all remaining coordinates are geometric and
-        # risk representation consumed jointly as belief evidence.
         m = self.p_mem(self.ln_mem(memFeat))
         i = self.p_intent(self.ln_intent(intentFeat))
         v = self.p_value(self.ln_value(valueTensor))
@@ -201,8 +196,6 @@ class PredictionErrorHead(AGICoreModule):
 
 
 class OptionTransitionPrior(AGICoreModule):
-    """Learned option-to-option prior with a neutral uniform initialization."""
-
     def __init__(self, optionCount: int):
         super().__init__()
         self.option_count = int(optionCount)
@@ -283,7 +276,7 @@ class NeuroSymbolicConditioner(AGICoreModule):
         self,
         beliefDim: int,
         planDim: int = 256,
-        subgoalFeatureDim: int = ModuleDim.DecisionEndpointPoseFeatDim,
+        subgoalFeatureDim: int = 128,
         constraintTokens: int = 8,
         constraintTokenDim: int = 128,
         operatorDim: int = len(OPERATORS),
@@ -379,8 +372,6 @@ class NeuroSymbolicConditioner(AGICoreModule):
 
 
 class TemporalDecisionHead(AGICoreModule):
-    """Combines symbolic/goal timing without changing temporal label meanings."""
-
     def __init__(
         self,
         primitiveCount: int = ModuleDim.TemporalPrimitiveCount,):
@@ -407,6 +398,110 @@ class TemporalDecisionHead(AGICoreModule):
             "reference_drift": neuroSymbolic.reference_drift,}
 
 
+class FastDecisionPolicy(AGICoreModule):
+    def __init__(
+        self,
+        sourceDims: Tuple[int, ...],
+        beliefDim: int,
+        dynDim: int,
+        latentDim: int,
+        optionCount: int,
+        mapperDim: int,
+        sourceDim: int,
+        hiddenDim: int,
+    ):
+        super().__init__()
+        self.source_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(int(source_dim)),
+                nn.Linear(int(source_dim), int(sourceDim)),
+                nn.SiLU())
+            for source_dim in sourceDims])
+        fused_dim = len(sourceDims) * int(sourceDim)
+        self.trunk = nn.Sequential(
+            nn.LayerNorm(fused_dim),
+            nn.Linear(fused_dim, int(hiddenDim)),
+            nn.SiLU(),
+            nn.Linear(int(hiddenDim), int(hiddenDim)),
+            nn.SiLU())
+        self.output_dims = (
+            int(beliefDim),
+            int(dynDim),
+            int(latentDim),
+            int(latentDim),
+            int(optionCount),
+            int(mapperDim),
+            int(beliefDim))
+        self.residual_head = nn.Linear(
+            int(hiddenDim),
+            sum(self.output_dims))
+        nn.init.zeros_(self.residual_head.weight)
+        nn.init.zeros_(self.residual_head.bias)
+
+    def forward(
+        self,
+        sources: Tuple[torch.Tensor, ...],
+    ) -> Tuple[torch.Tensor, ...]:
+        if len(sources) != len(self.source_encoders):
+            raise ValueError("Fast decision source count does not match")
+        encoded = [
+            encoder(source)
+            for encoder, source in zip(self.source_encoders, sources)]
+        hidden = self.trunk(torch.cat(encoded, dim=-1))
+        residual = self.residual_head(hidden)
+        return tuple(torch.split(residual, self.output_dims, dim=-1))
+
+
+class DetailDecisionPolicy(AGICoreModule):
+    def __init__(
+        self,
+        beliefDim: int,
+        contextDim: int,
+        dynDim: int,
+        latentDim: int,
+        optionCount: int,
+        mapperDim: int,
+        hiddenDim: int,
+    ):
+        super().__init__()
+        self.belief_encoder = nn.Sequential(
+            nn.LayerNorm(int(beliefDim)),
+            nn.Linear(int(beliefDim), int(hiddenDim)),
+            nn.SiLU())
+        self.context_encoder = nn.Sequential(
+            nn.LayerNorm(int(contextDim)),
+            nn.Linear(int(contextDim), int(hiddenDim)),
+            nn.SiLU())
+        self.trunk = nn.Sequential(
+            nn.LayerNorm(2 * int(hiddenDim)),
+            nn.Linear(2 * int(hiddenDim), int(hiddenDim)),
+            nn.SiLU())
+        self.output_dims = (
+            int(beliefDim),
+            int(dynDim),
+            int(latentDim),
+            int(latentDim),
+            int(optionCount),
+            int(mapperDim),
+            int(beliefDim))
+        self.residual_head = nn.Linear(
+            int(hiddenDim),
+            sum(self.output_dims))
+        nn.init.zeros_(self.residual_head.weight)
+        nn.init.zeros_(self.residual_head.bias)
+
+    def forward(
+        self,
+        belief: torch.Tensor,
+        detailContext: torch.Tensor,
+    ) -> Tuple[torch.Tensor, ...]:
+        hidden = self.trunk(torch.cat([
+            self.belief_encoder(belief),
+            self.context_encoder(detailContext)], dim=-1))
+        residual = self.residual_head(hidden)
+        return tuple(torch.split(residual, self.output_dims, dim=-1))
+
+
 
 
 class DecisionExtractor(AGICoreModule):
@@ -428,8 +523,51 @@ class DecisionExtractor(AGICoreModule):
         decisionDynDim: int = 256,
         latentControlDim: int = 64,
         mapperEmbedDim: int = 256,
-        actionEmbedDim: int = ModuleDim.EndpointActionEmbedDim,):
+        actionEmbedDim: int = 256,
+        planFeatureDim: int = 256,
+        subgoalFeatureDim: int = 128,
+        constraintTokenCount: int = 8,
+        constraintTokenDim: int = 128,
+        bodyStateFeatureDim: int = 128,
+        controlFeedbackFeatureDim: int = 128,
+        embodimentContextFeatureDim: int = 8,
+        embodimentStateFeatureDim: int = 128,
+        sceneStateFeatureDim: int = 128,
+        goalDecisionContextDim: Optional[int] = None,):
         super().__init__()
+        dimensions = {
+            "state": stateDim,
+            "intent": intentDim,
+            "value tensor": valueTensorDim,
+            "next value tensor": vNextTensorDim,
+            "world deterministic": worldHDim,
+            "world stochastic": worldZDim,
+            "world sequence": worldXDim,
+            "belief": beliefDim,
+            "decision dynamics": decisionDynDim,
+            "latent control": latentControlDim,
+            "mapper embedding": mapperEmbedDim,
+            "action embedding": actionEmbedDim,
+            "plan feature": planFeatureDim,
+            "subgoal feature": subgoalFeatureDim,
+            "constraint token count": constraintTokenCount,
+            "constraint token": constraintTokenDim,
+            "body-state feature": bodyStateFeatureDim,
+            "control-feedback feature": controlFeedbackFeatureDim,
+            "embodiment-context feature": embodimentContextFeatureDim,
+            "embodiment-state feature": embodimentStateFeatureDim,
+            "scene-state feature": sceneStateFeatureDim,
+        }
+        if goalDecisionContextDim is not None:
+            dimensions["goal-decision context"] = goalDecisionContextDim
+        invalid_dimensions = [
+            name
+            for name, value in dimensions.items()
+            if type(value) is not int or int(value) < 1]
+        if invalid_dimensions:
+            raise ValueError(
+                "Decision cognitive dimensions must be positive integers: "
+                + ", ".join(invalid_dimensions))
         self.stateDim = int(stateDim)
         self.intentDim = int(intentDim)
         self.includeNoSkill = bool(includeNoSkill)
@@ -446,6 +584,20 @@ class DecisionExtractor(AGICoreModule):
         self.mapper_hidden_dim = int(mapperEmbedDim)
         self.num_options = int(optionNum)
         self.psi_dim = int(psiDim)
+        self.plan_feature_dim = int(planFeatureDim)
+        self.subgoal_feature_dim = int(subgoalFeatureDim)
+        self.constraint_token_count = int(constraintTokenCount)
+        self.constraint_token_dim = int(constraintTokenDim)
+        self.body_state_feature_dim = int(bodyStateFeatureDim)
+        self.control_feedback_feature_dim = int(controlFeedbackFeatureDim)
+        self.embodiment_context_feature_dim = int(
+            embodimentContextFeatureDim)
+        self.embodiment_state_feature_dim = int(embodimentStateFeatureDim)
+        self.scene_state_feature_dim = int(sceneStateFeatureDim)
+        self.goal_decision_context_dim = int(
+            self.belief_dim
+            if goalDecisionContextDim is None
+            else goalDecisionContextDim)
 
         self.belief_assembler = BeliefAssembler(
             memDim=self.stateDim,
@@ -497,30 +649,31 @@ class DecisionExtractor(AGICoreModule):
 
         self.nesy_conditioner = NeuroSymbolicConditioner(
             beliefDim=self.belief_dim,
-            planDim=256,
-            subgoalFeatureDim=ModuleDim.DecisionEndpointPoseFeatDim,
-            constraintTokens=8,
-            constraintTokenDim=128,)
+            planDim=self.plan_feature_dim,
+            subgoalFeatureDim=self.subgoal_feature_dim,
+            constraintTokens=self.constraint_token_count,
+            constraintTokenDim=self.constraint_token_dim,)
         embodied_state_input_dim = (
-            2 * ModuleDim.DecisionEndpointPoseFeatDim
-            + ModuleDim.RobotPhysicalReferenceDim)
+            self.body_state_feature_dim
+            + self.control_feedback_feature_dim
+            + self.embodiment_context_feature_dim)
         self.embodied_state_encoder = nn.Sequential(
             nn.LayerNorm(embodied_state_input_dim),
             nn.Linear(embodied_state_input_dim, hiddenDim // 2),
             nn.SiLU(),
             nn.Linear(
                 hiddenDim // 2,
-                ModuleDim.DecisionEndpointPoseFeatDim),
-            nn.LayerNorm(ModuleDim.DecisionEndpointPoseFeatDim),)
+                self.embodiment_state_feature_dim),
+            nn.LayerNorm(self.embodiment_state_feature_dim),)
         refine_in_dim = (
             self.belief_dim
             + self.dyn_dim
             + self.u_dim
             + self.world_hzx_dim
-            + ModuleDim.PstSlotDim
+            + self.scene_state_feature_dim
+            + self.goal_decision_context_dim
             + self.belief_dim
-            + self.belief_dim
-            + ModuleDim.DecisionEndpointPoseFeatDim)
+            + self.embodiment_state_feature_dim)
         self.nesy_decision_refiner = nn.Sequential(
             nn.LayerNorm(refine_in_dim),
             nn.Linear(refine_in_dim, hiddenDim),
@@ -533,42 +686,76 @@ class DecisionExtractor(AGICoreModule):
             nn.Sigmoid(),)
         self.final_decision_norm = nn.LayerNorm(self.belief_dim)
         self.decoder_plan_head = nn.Sequential(
-            nn.LayerNorm(self.belief_dim + 256),
-            nn.Linear(self.belief_dim + 256, hiddenDim),
+            nn.LayerNorm(self.belief_dim + self.plan_feature_dim),
+            nn.Linear(self.belief_dim + self.plan_feature_dim, hiddenDim),
             nn.SiLU(),
-            nn.Linear(hiddenDim, 256),
-            nn.LayerNorm(256),)
+            nn.Linear(hiddenDim, self.plan_feature_dim),
+            nn.LayerNorm(self.plan_feature_dim),)
         self.decoder_subgoal_head = nn.Sequential(
             nn.LayerNorm(
                 self.belief_dim
-                + 2 * ModuleDim.DecisionEndpointPoseFeatDim),
+                + self.subgoal_feature_dim
+                + self.embodiment_state_feature_dim),
             nn.Linear(
                 self.belief_dim
-                + 2 * ModuleDim.DecisionEndpointPoseFeatDim,
+                + self.subgoal_feature_dim
+                + self.embodiment_state_feature_dim,
                 hiddenDim // 2),
             nn.SiLU(),
-            nn.Linear(hiddenDim // 2, ModuleDim.DecisionEndpointPoseFeatDim),
-            nn.LayerNorm(ModuleDim.DecisionEndpointPoseFeatDim),)
-        self.decoder_constraint_seed = nn.Linear(self.belief_dim, 8 * 128)
+            nn.Linear(hiddenDim // 2, self.subgoal_feature_dim),
+            nn.LayerNorm(self.subgoal_feature_dim),)
+        self.decoder_constraint_seed = nn.Linear(
+            self.belief_dim,
+            self.constraint_token_count * self.constraint_token_dim)
         self.decoder_constraint_head = nn.Sequential(
-            nn.LayerNorm(2 * 128),
-            nn.Linear(2 * 128, hiddenDim // 2),
+            nn.LayerNorm(2 * self.constraint_token_dim),
+            nn.Linear(2 * self.constraint_token_dim, hiddenDim // 2),
             nn.SiLU(),
-            nn.Linear(hiddenDim // 2, 128),
-            nn.LayerNorm(128),)
+            nn.Linear(hiddenDim // 2, self.constraint_token_dim),
+            nn.LayerNorm(self.constraint_token_dim),)
         self.decision_energy_head = nn.Sequential(
             nn.LayerNorm(
                 self.belief_dim
                 + self.world_hzx_dim
-                + ModuleDim.DecisionEndpointPoseFeatDim),
+                + self.embodiment_state_feature_dim),
             nn.Linear(
                 self.belief_dim
                 + self.world_hzx_dim
-                + ModuleDim.DecisionEndpointPoseFeatDim,
+                + self.embodiment_state_feature_dim,
                 hiddenDim // 2),
             nn.SiLU(),
             nn.Linear(hiddenDim // 2, 1),)
         self.temporal_decision_head = TemporalDecisionHead()
+        fast_source_dim = max(8, min(32, self.belief_dim // 32))
+        fast_hidden_dim = max(32, min(128, self.belief_dim // 4))
+        self.fast_policy = FastDecisionPolicy(
+            sourceDims=(
+                self.stateDim,
+                self.intentDim,
+                self.value_tensor_dim,
+                self.v_next_tensor_dim,
+                self.world_hzx_dim,
+                self.dyn_dim,
+                self.u_dim,
+                self.action_embed_dim,
+                self.mapper_hidden_dim,
+                self.belief_dim,
+                5),
+            beliefDim=self.belief_dim,
+            dynDim=self.dyn_dim,
+            latentDim=self.u_dim,
+            optionCount=self.num_options,
+            mapperDim=self.mapper_hidden_dim,
+            sourceDim=fast_source_dim,
+            hiddenDim=fast_hidden_dim)
+        self.detail_policy = DetailDecisionPolicy(
+            beliefDim=self.belief_dim,
+            contextDim=self.goal_decision_context_dim,
+            dynDim=self.dyn_dim,
+            latentDim=self.u_dim,
+            optionCount=self.num_options,
+            mapperDim=self.mapper_hidden_dim,
+            hiddenDim=fast_hidden_dim)
 
     def OptionLogits(
         self,
@@ -597,11 +784,699 @@ class DecisionExtractor(AGICoreModule):
         executeMask: torch.Tensor,) -> None:
         self.elig_plasticity.Commit(eligibilityPre, eligibilityPost, executeMask)
 
+    def CommitEligibilityRows(
+        self,
+        eligibilityPre: torch.Tensor,
+        eligibilityPost: torch.Tensor,
+        executeMask: torch.Tensor,
+        updateMask: torch.Tensor,
+    ) -> None:
+        if (
+            updateMask.dtype != torch.bool
+            or updateMask.dim() != 1
+            or int(updateMask.numel()) != int(eligibilityPre.size(0))
+            or updateMask.device != eligibilityPre.device
+        ):
+            raise ValueError("Decision eligibility update mask is invalid")
+        previous_trace = self.elig_plasticity.trace.detach().clone()
+        self.elig_plasticity.Commit(
+            eligibilityPre,
+            eligibilityPost,
+            executeMask & updateMask)
+        self.elig_plasticity.trace = torch.where(
+            updateMask.view(-1, 1, 1),
+            self.elig_plasticity.trace,
+            previous_trace)
+
     def ClearInvalidEligibility(self, invalidMask: torch.Tensor) -> None:
         self.elig_plasticity.ClearTrace(invalidMask)
 
+    @torch.no_grad()
+    def ExportEligibilityState(self) -> Dict[str, torch.Tensor]:
+        return {
+            "trace": self.elig_plasticity.trace.detach().clone(),
+            "fast": self.elig_plasticity.fast.detach().clone()}
+
+    @torch.no_grad()
+    def ImportEligibilityState(
+        self,
+        state: Dict[str, torch.Tensor],
+        batchSize: int,
+    ) -> None:
+        if type(state) is not dict or set(state) != {"trace", "fast"}:
+            raise ValueError("Decision eligibility state fields do not match")
+        trace = state["trace"]
+        fast = state["fast"]
+        expected = (int(batchSize), self.u_dim, self.u_dim)
+        if (
+            not torch.is_tensor(trace)
+            or not torch.is_tensor(fast)
+            or tuple(trace.shape) != expected
+            or tuple(fast.shape) != expected
+            or trace.device != self.elig_plasticity.base.device
+            or fast.device != self.elig_plasticity.base.device
+            or trace.dtype != self.elig_plasticity.base.dtype
+            or fast.dtype != self.elig_plasticity.base.dtype
+            or not bool(torch.isfinite(trace).all().item())
+            or not bool(torch.isfinite(fast).all().item())
+        ):
+            raise ValueError("Decision eligibility state does not match")
+        self.elig_plasticity.trace = trace.detach().clone()
+        self.elig_plasticity.fast = fast.detach().clone()
+
     def EnsureB(self, B: int) -> None:
         self.elig_plasticity.EnsureB(B)
+
+    def SelectFullBatchRows(
+        self,
+        value: torch.Tensor,
+        rowIndex: torch.Tensor,
+        fullBatchSize: int,
+        fieldName: str,
+    ) -> torch.Tensor:
+        if (
+            not torch.is_tensor(value)
+            or value.dim() < 1
+            or int(value.size(0)) != fullBatchSize
+        ):
+            raise ValueError(
+                f"Decision {fieldName} must have full batch size {fullBatchSize}")
+        if value.device != rowIndex.device:
+            raise ValueError(
+                f"Decision {fieldName} must share the rowIndex device")
+        return value.index_select(0, rowIndex)
+
+    def ValidateStatelessRows(
+        self,
+        rowIndex: torch.Tensor,
+        fullBatchSize: int,
+        device: torch.device,
+    ) -> None:
+        if (
+            not torch.is_tensor(rowIndex)
+            or rowIndex.dim() != 1
+            or rowIndex.dtype != torch.long
+            or rowIndex.device != device
+        ):
+            raise ValueError(
+                "Decision rowIndex must be a one-dimensional long tensor on the input device")
+        if bool(((rowIndex < 0) | (rowIndex >= fullBatchSize)).any().item()):
+            raise IndexError("Decision rowIndex contains an out-of-range row")
+        if int(torch.unique(rowIndex).numel()) != int(rowIndex.numel()):
+            raise ValueError("Decision rowIndex must not contain duplicate rows")
+
+    def ValidateStatelessFeature(
+        self,
+        value: torch.Tensor,
+        rowCount: int,
+        featureDim: int,
+        fieldName: str,
+    ) -> None:
+        if (
+            not torch.is_tensor(value)
+            or value.dim() != 2
+            or tuple(value.shape) != (int(rowCount), int(featureDim))
+            or not value.is_floating_point()
+            or not bool(torch.isfinite(value).all().item())
+        ):
+            raise ValueError(
+                f"Decision {fieldName} must be finite with shape "
+                f"({int(rowCount)}, {int(featureDim)})")
+
+    def PrepareStatelessRows(
+        self,
+        rowIndex: torch.Tensor,
+        cachedDecisionFeature: torch.Tensor,
+        fullInputs: Dict[str, torch.Tensor],
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        state_feat = fullInputs["stateFeat"]
+        if not torch.is_tensor(state_feat) or state_feat.dim() != 2:
+            raise ValueError("Decision stateFeat must have two dimensions")
+        full_batch_size = int(state_feat.size(0))
+        if full_batch_size < 1:
+            raise ValueError("Decision full batch must contain at least one row")
+        self.ValidateStatelessRows(
+            rowIndex,
+            full_batch_size,
+            state_feat.device)
+        if (
+            not torch.is_tensor(cachedDecisionFeature)
+            or cachedDecisionFeature.dim() != 2
+            or tuple(cachedDecisionFeature.shape) != (
+                full_batch_size,
+                self.belief_dim)
+            or cachedDecisionFeature.device != state_feat.device
+            or not cachedDecisionFeature.is_floating_point()
+            or not bool(torch.isfinite(cachedDecisionFeature).all().item())
+        ):
+            raise ValueError(
+                "Decision cachedDecisionFeature must be a finite full-batch belief feature")
+        selected = {
+            name: self.SelectFullBatchRows(
+                value,
+                rowIndex,
+                full_batch_size,
+                name)
+            for name, value in fullInputs.items()}
+        row_count = int(rowIndex.numel())
+        selected["valueTensor"] = selected["valueTensor"].reshape(
+            row_count,
+            self.value_tensor_dim)
+        selected["vNextTensor"] = selected["vNextTensor"].reshape(
+            row_count,
+            self.v_next_tensor_dim)
+        expected_features = (
+            ("stateFeat", self.stateDim),
+            ("intentFeat", self.intentDim),
+            ("valueTensor", self.value_tensor_dim),
+            ("vNextTensor", self.v_next_tensor_dim),
+            ("worldHzx", self.world_hzx_dim),
+            ("prevDecisionState", self.dyn_dim),
+            ("prevLatentControl", self.u_dim),
+            ("prevActionEmbed", self.action_embed_dim),
+            ("prevMapperHidden", self.mapper_hidden_dim),
+            ("prevOptionLogit", self.num_options))
+        for field_name, feature_dim in expected_features:
+            self.ValidateStatelessFeature(
+                selected[field_name],
+                row_count,
+                feature_dim,
+                field_name)
+        for field_name in (
+            "uncertainty",
+            "confidence",
+            "precision",
+            "risk",
+            "feedbackTdError",
+        ):
+            value = selected[field_name]
+            if (
+                not torch.is_tensor(value)
+                or tuple(value.shape) != (row_count,)
+                or not value.is_floating_point()
+                or not bool(torch.isfinite(value).all().item())
+            ):
+                raise ValueError(
+                    f"Decision {field_name} must be a finite row scalar")
+        cached = cachedDecisionFeature.index_select(0, rowIndex)
+        return selected, cached
+
+    def BuildStatelessOutput(
+        self,
+        selected: Dict[str, torch.Tensor],
+        cachedDecisionFeature: torch.Tensor,
+        residuals: Tuple[torch.Tensor, ...],
+        sample: bool,
+        deterministic: bool,
+    ) -> Dict[str, Any]:
+        (
+            belief_residual,
+            state_residual,
+            latent_residual,
+            logvar_residual,
+            option_residual,
+            mapper_residual,
+            option_context_residual,
+        ) = residuals
+        belief = cachedDecisionFeature + torch.tanh(belief_residual)
+        decision_state = (
+            selected["prevDecisionState"]
+            + torch.tanh(state_residual))
+        latent_control = (
+            selected["prevLatentControl"]
+            + torch.tanh(latent_residual))
+        latent_logvar = (-1.0 + logvar_residual).clamp(-8.0, 4.0)
+        mapper_hidden = (
+            selected["prevMapperHidden"]
+            + torch.tanh(mapper_residual))
+        option_prior_logits = selected["prevOptionLogit"].detach()
+        option_logits = option_prior_logits + option_residual
+        option_log_probs = F.log_softmax(option_logits, dim=-1)
+        option_weights = option_log_probs.exp()
+        row_count = int(belief.size(0))
+        if row_count == 0:
+            option_index = torch.empty(
+                0,
+                dtype=torch.long,
+                device=belief.device)
+        elif sample and not deterministic:
+            option_index = torch.distributions.Categorical(
+                probs=option_weights).sample()
+        else:
+            option_index = option_logits.argmax(dim=-1)
+        option_psi = belief.new_zeros(
+            row_count,
+            self.num_options,
+            self.psi_dim)
+        selected_psi = belief.new_zeros(row_count, self.psi_dim)
+        option_context = torch.tanh(option_context_residual)
+        option_log_probability = (
+            option_log_probs.gather(
+                1,
+                option_index.view(-1, 1)).squeeze(1)
+            if row_count > 0
+            else belief.new_empty(0))
+        gaussian_entropy = (
+            0.5 * (1.0 + math.log(2.0 * math.pi))
+            + 0.5 * latent_logvar).sum(dim=-1)
+        option_entropy = -(
+            option_weights * option_log_probs).sum(dim=-1)
+        policy_input = torch.cat([
+            decision_state,
+            latent_control,
+            mapper_hidden], dim=-1)
+        return {
+            "z": decision_state,
+            "entropy": gaussian_entropy + option_entropy,
+            "option": {
+                "logits": option_logits,
+                "psi_all": option_psi,
+                "w_t": option_weights,
+                "psi_selected": selected_psi,
+                "option_context": option_context,
+                "opt_idx": option_index,
+                "logp_option": option_log_probability,
+                "policy_input": policy_input,
+                "prior_logits": option_prior_logits,},
+            "prevOptionLogit_next": option_logits.detach(),
+            "belief": belief,
+            "decision_state": decision_state,
+            "decision_state_next": decision_state.detach(),
+            "decision_uncertainty": selected["uncertainty"],
+            "latent_control": {
+                "u": latent_control,
+                "mu": latent_control,
+                "logvar": latent_logvar,},
+            "latent_control_next": latent_control.detach(),
+            "mapper": {
+                "hidden": mapper_hidden,
+                "hidden_next": mapper_hidden.detach(),},
+            "eligibility": {
+                "pre": selected["prevLatentControl"].detach(),
+                "post": torch.zeros_like(selected["prevLatentControl"]),},}
+
+    def ComputeStatelessResiduals(
+        self,
+        selected: Dict[str, torch.Tensor],
+        cachedDecisionFeature: torch.Tensor,
+        detailContext: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, ...]:
+        scalar_source = torch.stack([
+            selected["uncertainty"],
+            selected["confidence"],
+            selected["precision"],
+            selected["risk"],
+            selected["feedbackTdError"],
+        ], dim=-1)
+        residuals = self.fast_policy((
+            selected["stateFeat"],
+            selected["intentFeat"],
+            selected["valueTensor"],
+            selected["vNextTensor"],
+            selected["worldHzx"],
+            selected["prevDecisionState"],
+            selected["prevLatentControl"],
+            selected["prevActionEmbed"],
+            selected["prevMapperHidden"],
+            cachedDecisionFeature,
+            scalar_source))
+        if detailContext is None:
+            return residuals
+        fast_belief = cachedDecisionFeature + torch.tanh(residuals[0])
+        detail_residuals = self.detail_policy(
+            fast_belief,
+            detailContext)
+        return tuple(
+            fast_residual + detail_residual
+            for fast_residual, detail_residual in zip(
+                residuals,
+                detail_residuals))
+
+    def ForwardFastRows(
+        self,
+        rowIndex: torch.Tensor,
+        cachedDecisionFeature: torch.Tensor,
+        stateFeat: torch.Tensor,
+        intentFeat: torch.Tensor,
+        *,
+        valueTensor: torch.Tensor,
+        vNextTensor: torch.Tensor,
+        uncertainty: torch.Tensor,
+        confidence: torch.Tensor,
+        precision: torch.Tensor,
+        risk: torch.Tensor,
+        worldHzx: torch.Tensor,
+        prevDecisionState: torch.Tensor,
+        prevLatentControl: torch.Tensor,
+        prevActionEmbed: torch.Tensor,
+        prevMapperHidden: torch.Tensor,
+        feedbackTdError: torch.Tensor,
+        prevOptionLogit: torch.Tensor,
+        sample: bool = False,
+        deterministic: bool = True,
+    ) -> Dict[str, Any]:
+        full_inputs = {
+            "stateFeat": stateFeat,
+            "intentFeat": intentFeat,
+            "valueTensor": valueTensor,
+            "vNextTensor": vNextTensor,
+            "uncertainty": uncertainty,
+            "confidence": confidence,
+            "precision": precision,
+            "risk": risk,
+            "worldHzx": worldHzx,
+            "prevDecisionState": prevDecisionState,
+            "prevLatentControl": prevLatentControl,
+            "prevActionEmbed": prevActionEmbed,
+            "prevMapperHidden": prevMapperHidden,
+            "feedbackTdError": feedbackTdError,
+            "prevOptionLogit": prevOptionLogit}
+        selected, cached = self.PrepareStatelessRows(
+            rowIndex,
+            cachedDecisionFeature,
+            full_inputs)
+        residuals = self.ComputeStatelessResiduals(selected, cached)
+        return self.BuildStatelessOutput(
+            selected,
+            cached,
+            residuals,
+            sample,
+            deterministic)
+
+    def ForwardDetailRows(
+        self,
+        rowIndex: torch.Tensor,
+        cachedDecisionFeature: torch.Tensor,
+        detailContext: torch.Tensor,
+        stateFeat: torch.Tensor,
+        intentFeat: torch.Tensor,
+        *,
+        valueTensor: torch.Tensor,
+        vNextTensor: torch.Tensor,
+        uncertainty: torch.Tensor,
+        confidence: torch.Tensor,
+        precision: torch.Tensor,
+        risk: torch.Tensor,
+        worldHzx: torch.Tensor,
+        prevDecisionState: torch.Tensor,
+        prevLatentControl: torch.Tensor,
+        prevActionEmbed: torch.Tensor,
+        prevMapperHidden: torch.Tensor,
+        feedbackTdError: torch.Tensor,
+        prevOptionLogit: torch.Tensor,
+        sample: bool = False,
+        deterministic: bool = True,
+    ) -> Dict[str, Any]:
+        full_inputs = {
+            "stateFeat": stateFeat,
+            "intentFeat": intentFeat,
+            "valueTensor": valueTensor,
+            "vNextTensor": vNextTensor,
+            "uncertainty": uncertainty,
+            "confidence": confidence,
+            "precision": precision,
+            "risk": risk,
+            "worldHzx": worldHzx,
+            "prevDecisionState": prevDecisionState,
+            "prevLatentControl": prevLatentControl,
+            "prevActionEmbed": prevActionEmbed,
+            "prevMapperHidden": prevMapperHidden,
+            "feedbackTdError": feedbackTdError,
+            "prevOptionLogit": prevOptionLogit}
+        selected, cached = self.PrepareStatelessRows(
+            rowIndex,
+            cachedDecisionFeature,
+            full_inputs)
+        full_batch_size = int(stateFeat.size(0))
+        selected_detail = self.SelectFullBatchRows(
+            detailContext,
+            rowIndex,
+            full_batch_size,
+            "detailContext")
+        self.ValidateStatelessFeature(
+            selected_detail,
+            int(rowIndex.numel()),
+            self.goal_decision_context_dim,
+            "detailContext")
+        residuals = self.ComputeStatelessResiduals(
+            selected,
+            cached,
+            selected_detail)
+        return self.BuildStatelessOutput(
+            selected,
+            cached,
+            residuals,
+            sample,
+            deterministic)
+
+    def FastDistillationLoss(
+        self,
+        fastActOut: Dict[str, Any],
+        fullActOut: Dict[str, Any],
+        stableMask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        fast_refined = "decision_feature" in fastActOut
+        full_refined = "decision_feature" in fullActOut
+        if fast_refined != full_refined:
+            raise ValueError(
+                "Decision distillation representations must be at the same refinement stage")
+        fast_feature = (
+            fastActOut["decision_feature"]
+            if fast_refined
+            else fastActOut["belief"])
+        teacher_feature = (
+            fullActOut["decision_feature"]
+            if full_refined
+            else fullActOut["belief"]).detach()
+        if (
+            not torch.is_tensor(stableMask)
+            or stableMask.dim() != 1
+            or stableMask.dtype != torch.bool
+            or int(stableMask.numel()) != int(fast_feature.size(0))
+            or stableMask.device != fast_feature.device
+        ):
+            raise ValueError(
+                "Decision stableMask must be a full-batch boolean tensor")
+        if tuple(fast_feature.shape) != tuple(teacher_feature.shape):
+            raise ValueError(
+                "Decision fast and full feature shapes do not match")
+        if not bool(stableMask.any().item()):
+            zero = fast_feature.sum() * 0.0
+            return {
+                "total": zero,
+                "feature": zero,
+                "dynamics": zero,
+                "latent": zero,
+                "option": zero,
+                "context": zero,}
+        fast_feature = fast_feature[stableMask]
+        teacher_feature = teacher_feature[stableMask]
+        feature_loss = F.l1_loss(fast_feature, teacher_feature)
+        dynamics_loss = F.smooth_l1_loss(
+            fastActOut["decision_state"][stableMask],
+            fullActOut["decision_state"].detach()[stableMask])
+        latent_loss = F.smooth_l1_loss(
+            fastActOut["latent_control"]["u"][stableMask],
+            fullActOut["latent_control"]["u"].detach()[stableMask])
+        fast_log_prob = F.log_softmax(
+            fastActOut["option"]["logits"][stableMask],
+            dim=-1)
+        teacher_log_prob = F.log_softmax(
+            fullActOut["option"]["logits"].detach()[stableMask],
+            dim=-1)
+        option_loss = (
+            fast_log_prob.exp()
+            * (fast_log_prob - teacher_log_prob)).sum(dim=-1).mean()
+        context_loss = F.smooth_l1_loss(
+            fastActOut["option"]["option_context"][stableMask],
+            fullActOut["option"]["option_context"].detach()[stableMask])
+        total = (
+            feature_loss
+            + 0.25 * dynamics_loss
+            + 0.25 * latent_loss
+            + 0.1 * option_loss
+            + 0.1 * context_loss)
+        return {
+            "total": total,
+            "feature": feature_loss,
+            "dynamics": dynamics_loss,
+            "latent": latent_loss,
+            "option": option_loss,
+            "context": context_loss,}
+
+    def BuildBeliefContextRows(
+        self,
+        rowIndex: torch.Tensor,
+        stateFeat: torch.Tensor,
+        intentFeat: torch.Tensor,
+        *,
+        valueTensor: torch.Tensor,
+        vNextTensor: torch.Tensor,
+        uncertainty: torch.Tensor,
+        confidence: torch.Tensor,
+        precision: torch.Tensor,
+        risk: torch.Tensor,
+        worldHzx: torch.Tensor,
+    ) -> torch.Tensor:
+        if not torch.is_tensor(stateFeat) or stateFeat.dim() != 2:
+            raise ValueError("Decision stateFeat must have two dimensions")
+        full_batch_size = int(stateFeat.size(0))
+        self.ValidateStatelessRows(
+            rowIndex,
+            full_batch_size,
+            stateFeat.device)
+        selected_state = self.SelectFullBatchRows(
+            stateFeat,
+            rowIndex,
+            full_batch_size,
+            "stateFeat")
+        selected_intent = self.SelectFullBatchRows(
+            intentFeat,
+            rowIndex,
+            full_batch_size,
+            "intentFeat")
+        selected_value = self.SelectFullBatchRows(
+            valueTensor,
+            rowIndex,
+            full_batch_size,
+            "valueTensor").reshape(-1, self.value_tensor_dim)
+        selected_next_value = self.SelectFullBatchRows(
+            vNextTensor,
+            rowIndex,
+            full_batch_size,
+            "vNextTensor").reshape(-1, self.v_next_tensor_dim)
+        return self.belief_assembler(
+            memFeat=selected_state,
+            intentFeat=selected_intent,
+            valueTensor=selected_value,
+            vNextTensor=selected_next_value,
+            uncertainty=self.SelectFullBatchRows(
+                uncertainty,
+                rowIndex,
+                full_batch_size,
+                "uncertainty"),
+            confidence=self.SelectFullBatchRows(
+                confidence,
+                rowIndex,
+                full_batch_size,
+                "confidence"),
+            precision=self.SelectFullBatchRows(
+                precision,
+                rowIndex,
+                full_batch_size,
+                "precision"),
+            risk=self.SelectFullBatchRows(
+                risk,
+                rowIndex,
+                full_batch_size,
+                "risk"),
+            worldHzx=self.SelectFullBatchRows(
+                worldHzx,
+                rowIndex,
+                full_batch_size,
+                "worldHzx"))
+
+    def ForwardContractRows(
+        self,
+        rowIndex: torch.Tensor,
+        stateFeat: torch.Tensor,
+        intentFeat: torch.Tensor,
+        *,
+        valueTensor: torch.Tensor,
+        vNextTensor: torch.Tensor,
+        uncertainty: torch.Tensor,
+        confidence: torch.Tensor,
+        precision: torch.Tensor,
+        risk: torch.Tensor,
+        worldHzx: torch.Tensor,
+        prevDecisionState: torch.Tensor,
+        prevLatentControl: torch.Tensor,
+        prevActionEmbed: torch.Tensor,
+        prevMapperHidden: torch.Tensor,
+        feedbackTdError: torch.Tensor,
+        prevOptionLogit: torch.Tensor,
+        sample: bool = True,
+        deterministic: bool = False,
+    ) -> Dict[str, Any]:
+        if not torch.is_tensor(stateFeat) or stateFeat.dim() < 1:
+            raise ValueError("Decision stateFeat must have a batch dimension")
+        fullBatchSize = int(stateFeat.size(0))
+        if fullBatchSize < 1:
+            raise ValueError("Decision full batch must contain at least one row")
+        if (
+            not torch.is_tensor(rowIndex)
+            or rowIndex.dim() != 1
+            or rowIndex.dtype != torch.long
+            or rowIndex.device != stateFeat.device
+        ):
+            raise ValueError(
+                "Decision rowIndex must be a one-dimensional long tensor on the input device")
+        if rowIndex.numel() < 1:
+            raise ValueError("Decision rowIndex must select at least one row")
+        if bool(((rowIndex < 0) | (rowIndex >= fullBatchSize)).any().item()):
+            raise IndexError("Decision rowIndex contains an out-of-range row")
+        if int(torch.unique(rowIndex).numel()) != int(rowIndex.numel()):
+            raise ValueError("Decision rowIndex must not contain duplicate rows")
+        fullInputs = {
+            "stateFeat": stateFeat,
+            "intentFeat": intentFeat,
+            "valueTensor": valueTensor,
+            "vNextTensor": vNextTensor,
+            "uncertainty": uncertainty,
+            "confidence": confidence,
+            "precision": precision,
+            "risk": risk,
+            "worldHzx": worldHzx,
+            "prevDecisionState": prevDecisionState,
+            "prevLatentControl": prevLatentControl,
+            "prevActionEmbed": prevActionEmbed,
+            "prevMapperHidden": prevMapperHidden,
+            "feedbackTdError": feedbackTdError,
+            "prevOptionLogit": prevOptionLogit}
+        selectedInputs = {
+            name: self.SelectFullBatchRows(
+                value,
+                rowIndex,
+                fullBatchSize,
+                name)
+            for name, value in fullInputs.items()}
+        fullRows = torch.arange(
+            fullBatchSize,
+            dtype=torch.long,
+            device=rowIndex.device)
+        if torch.equal(rowIndex, fullRows):
+            return self(
+                **fullInputs,
+                sample=sample,
+                deterministic=deterministic)
+
+        originalState = self.ExportEligibilityState()
+        try:
+            self.EnsureB(fullBatchSize)
+            fullState = self.ExportEligibilityState()
+            selectedState = {
+                name: value.index_select(0, rowIndex)
+                for name, value in fullState.items()}
+            self.ImportEligibilityState(
+                selectedState,
+                int(rowIndex.numel()))
+            output = self(
+                **selectedInputs,
+                sample=sample,
+                deterministic=deterministic)
+            updatedState = self.ExportEligibilityState()
+            mergedState = {
+                name: fullState[name].index_copy(
+                    0,
+                    rowIndex,
+                    updatedState[name])
+                for name in fullState}
+            self.ImportEligibilityState(mergedState, fullBatchSize)
+        except BaseException:
+            self.elig_plasticity.trace = originalState["trace"]
+            self.elig_plasticity.fast = originalState["fast"]
+            raise
+        return output
 
     def forward(
         self,
@@ -626,9 +1501,6 @@ class DecisionExtractor(AGICoreModule):
 
         B = stateFeat.size(0)
         self.EnsureB(B)
-        # Preserve the critic coordinate contract when flattening for belief
-        # assembly; this module does not reinterpret the remaining coordinates as
-        # additional scalar returns.
         value_in = valueTensor.reshape(B, self.value_tensor_dim)
         v_next_in = vNextTensor.reshape(B, self.v_next_tensor_dim)
         belief = self.belief_assembler(
@@ -722,28 +1594,52 @@ class DecisionExtractor(AGICoreModule):
         baseActOut: Dict[str, Any],
         neuroSymbolic: NeuroSymbolicOutput,
         worldHzx: torch.Tensor,
-        pstSummary: torch.Tensor,
+        sceneStateFeature: torch.Tensor,
         goalDecisionContext: torch.Tensor,
         temporalGoal: Dict[str, torch.Tensor],
-        bodyPoseFeature: torch.Tensor,
+        bodyStateFeature: torch.Tensor,
         controlFeedbackFeature: torch.Tensor,
-        robotPhysicalReference: torch.Tensor,) -> Dict[str, Any]:
+        embodimentContextFeature: torch.Tensor,) -> Dict[str, Any]:
+        expected_features = (
+            ("world", worldHzx, self.world_hzx_dim),
+            ("scene state", sceneStateFeature, self.scene_state_feature_dim),
+            (
+                "goal-decision context",
+                goalDecisionContext,
+                self.goal_decision_context_dim),
+            ("body state", bodyStateFeature, self.body_state_feature_dim),
+            (
+                "control feedback",
+                controlFeedbackFeature,
+                self.control_feedback_feature_dim),
+            (
+                "embodiment context",
+                embodimentContextFeature,
+                self.embodiment_context_feature_dim),)
+        batch_size = int(baseActOut["belief"].size(0))
+        for feature_name, feature, feature_dim in expected_features:
+            if (
+                not torch.is_tensor(feature)
+                or feature.dim() != 2
+                or tuple(feature.shape) != (batch_size, feature_dim)
+                or not feature.is_floating_point()
+                or not bool(torch.isfinite(feature).all().item())
+            ):
+                raise ValueError(
+                    f"Decision {feature_name} feature must be finite with "
+                    f"shape ({batch_size}, {feature_dim})")
         nesy = self.nesy_conditioner(neuroSymbolic)
         latent_u = baseActOut["latent_control"]["u"]
-        reference_valid = robotPhysicalReference[:, -1:]
-        effective_reference = torch.cat([
-            robotPhysicalReference[:, :-1] * reference_valid,
-            reference_valid], dim=-1)
         embodied_state_feature = self.embodied_state_encoder(torch.cat([
-            bodyPoseFeature,
+            bodyStateFeature,
             controlFeedbackFeature,
-            effective_reference], dim=-1))
+            embodimentContextFeature], dim=-1))
         refine_in = torch.cat([
             baseActOut["belief"],
             baseActOut["decision_state"],
             latent_u,
             worldHzx,
-            pstSummary,
+            sceneStateFeature,
             goalDecisionContext,
             nesy["context"],
             embodied_state_feature,
@@ -764,7 +1660,10 @@ class DecisionExtractor(AGICoreModule):
             embodied_state_feature,
         ], dim=-1))
         B = decision_feature.size(0)
-        constraint_seed = self.decoder_constraint_seed(decision_feature).view(B, 8, 128)
+        constraint_seed = self.decoder_constraint_seed(decision_feature).view(
+            B,
+            self.constraint_token_count,
+            self.constraint_token_dim)
         decoder_constraint_tokens = self.decoder_constraint_head(torch.cat([
             nesy["constraint_tokens"],
             constraint_seed,
@@ -804,8 +1703,7 @@ class DecisionExtractor(AGICoreModule):
 class CEMPlanner(AGICoreModule):
     def __init__(
         self,
-        worldModel: nn.Module,
-        decisionDecoupler: DecisionDecouplerV2,
+        decisionDim: int = ModuleDim.DecisionBeliefDim,
         N: int = 64,
         elite: int = 8,
         iters: int = 3,
@@ -813,1822 +1711,723 @@ class CEMPlanner(AGICoreModule):
         momentum: float = 0.15,
         minVar: float = 1e-4,
         candidateChunkSize: int = 8,
-    ):
+    ) -> None:
         super().__init__()
-        object.__setattr__(self, "wm", worldModel)
-        object.__setattr__(self, "decision_decoupler", decisionDecoupler)
-        self.N = int(N)
-        self.elite = int(elite)
-        self.iters = int(iters)
-        self.temperature = float(temperature)
-        self.momentum = float(momentum)
-        self.min_var = float(minVar)
-        self.candidate_chunk_size = max(1, int(candidateChunkSize))
+        if type(decisionDim) is not int or decisionDim < 1:
+            raise ValueError("CEM decision dimension must be positive")
+        if type(N) is not int or N < 1:
+            raise ValueError("CEM population must be positive")
+        if type(elite) is not int or elite < 1:
+            raise ValueError("CEM elite count must be positive")
+        if type(iters) is not int or iters < 1:
+            raise ValueError("CEM iteration count must be positive")
+        if not math.isfinite(float(temperature)):
+            raise ValueError("CEM temperature must be finite")
+        if not math.isfinite(float(momentum)) or not 0.0 <= momentum <= 1.0:
+            raise ValueError("CEM momentum must be in [0, 1]")
+        if not math.isfinite(float(minVar)) or minVar <= 0.0:
+            raise ValueError("CEM minimum variance must be positive and finite")
+        if type(candidateChunkSize) is not int or candidateChunkSize < 1:
+            raise ValueError("CEM candidate chunk size must be positive")
+        self.DecisionDim = int(decisionDim)
+        self.Population = int(N)
+        self.Elite = min(int(elite), int(N))
+        self.Iterations = int(iters)
+        self.Temperature = float(temperature)
+        self.Momentum = float(momentum)
+        self.MinimumVariance = float(minVar)
+        self.CandidateChunkSize = int(candidateChunkSize)
+
+    def ValidateDecisionFeature(self, decisionFeature: torch.Tensor) -> None:
+        if (
+            not torch.is_tensor(decisionFeature)
+            or decisionFeature.dim() != 2
+            or int(decisionFeature.size(-1)) != self.DecisionDim
+            or not decisionFeature.is_floating_point()
+            or not bool(torch.isfinite(decisionFeature).all().item())
+        ):
+            raise ValueError(
+                "CEM input must be a finite batched decision feature")
+
+    def ScoreFeatureCandidates(
+        self,
+        featureCandidates: torch.Tensor,
+        candidateEvaluator: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        scores, _ = self.EvaluateFeatureCandidates(
+            featureCandidates,
+            candidateEvaluator)
+        return scores
+
+    def NormalizeCandidateEvaluation(
+        self,
+        evaluation: Any,
+        reference: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if torch.is_tensor(evaluation):
+            scores = evaluation
+            valid = torch.ones(
+                reference.size(0),
+                device=reference.device,
+                dtype=torch.bool)
+        elif (
+            isinstance(evaluation, tuple)
+            and len(evaluation) == 2
+        ):
+            scores, valid = evaluation
+        else:
+            raise TypeError(
+                "candidate evaluator must return scores or scores with validity")
+        if (
+            not torch.is_tensor(scores)
+            or tuple(scores.shape) != (reference.size(0),)
+            or not scores.is_floating_point()
+            or not bool(torch.isfinite(scores).all().item())
+            or scores.device != reference.device
+            or scores.dtype != reference.dtype
+        ):
+            raise ValueError(
+                "candidate evaluator must return one finite score per feature")
+        if (
+            not torch.is_tensor(valid)
+            or tuple(valid.shape) != (reference.size(0),)
+            or valid.dtype != torch.bool
+            or valid.device != reference.device
+        ):
+            raise ValueError(
+                "candidate evaluator validity must match the feature batch")
+        return scores, valid
+
+    def EvaluateFeatureCandidates(
+        self,
+        featureCandidates: torch.Tensor,
+        candidateEvaluator: Callable[[torch.Tensor], Any],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            not torch.is_tensor(featureCandidates)
+            or featureCandidates.dim() != 3
+            or int(featureCandidates.size(-1)) != self.DecisionDim
+            or not featureCandidates.is_floating_point()
+            or not bool(torch.isfinite(featureCandidates).all().item())
+        ):
+            raise ValueError("CEM candidates must be decision features")
+        if not callable(candidateEvaluator):
+            raise TypeError("CEM candidate evaluator must be callable")
+        batch_size = int(featureCandidates.size(0))
+        candidate_count = int(featureCandidates.size(1))
+        if batch_size < 1 or candidate_count < 1:
+            raise ValueError("CEM candidate population cannot be empty")
+        score_chunks = []
+        valid_chunks = []
+        for start in range(0, candidate_count, self.CandidateChunkSize):
+            end = min(start + self.CandidateChunkSize, candidate_count)
+            chunk_size = end - start
+            candidate_feature = featureCandidates[:, start:end].reshape(
+                batch_size * chunk_size,
+                self.DecisionDim)
+            score, valid = self.NormalizeCandidateEvaluation(
+                candidateEvaluator(candidate_feature),
+                candidate_feature)
+            score_chunks.append(score.reshape(batch_size, chunk_size))
+            valid_chunks.append(valid.reshape(batch_size, chunk_size))
+        return (
+            torch.cat(score_chunks, dim=1),
+            torch.cat(valid_chunks, dim=1))
 
     @torch.no_grad()
     def Plan(
         self,
         decisionFeature: torch.Tensor,
-        h0: torch.Tensor,
-        z0: torch.Tensor,
-        x0: torch.Tensor,
-        physicalState: Dict[str, torch.Tensor],
-        worldRobotPhysicalEncoding: torch.Tensor,
+        candidateEvaluator: Callable[[torch.Tensor], Any],
         returnDiagnostics: bool = False,
-    ) -> Dict[str, torch.Tensor]:
-        B = int(decisionFeature.size(0))
-        N = self.N
-        elite_count = min(self.elite, N)
-        if tuple(decisionFeature.shape) != (
-            B, ModuleDim.DecisionBeliefDim
-        ):
-            raise ValueError("decision feature has an invalid shape")
+    ) -> Dict[str, Any]:
+        self.ValidateDecisionFeature(decisionFeature)
+        batch_size = int(decisionFeature.size(0))
         mu = decisionFeature
         std = torch.ones_like(mu)
-
-        def score_feature_candidates(
-            feature_candidates: torch.Tensor,
-        ) -> torch.Tensor:
-            candidate_count = int(feature_candidates.size(1))
-            score_chunks = []
-            for start in range(0, candidate_count, self.candidate_chunk_size):
-                end = min(start + self.candidate_chunk_size, candidate_count)
-                chunk_size = end - start
-
-                def expand_candidates(value: torch.Tensor) -> torch.Tensor:
-                    return value.unsqueeze(1).expand(
-                        B, chunk_size, *value.shape[1:]).reshape(
-                            B * chunk_size, *value.shape[1:]).contiguous()
-
-                h = expand_candidates(h0)
-                z = expand_candidates(z0)
-                x = expand_candidates(x0)
-                feature = feature_candidates[:, start:end].reshape(
-                    B * chunk_size,
-                    ModuleDim.DecisionBeliefDim)
-                action_enc = (
-                    self.decision_decoupler.EncodeInternalDecisionFeature(
-                        feature))
-                observer_motion = feature.new_zeros(
-                    B * chunk_size,
-                    ModuleDim.ObserverMotionDim)
-                observer_motion[:, 6] = 1.0
-                physical_state_candidates = {
-                    key: expand_candidates(value)
-                    for key, value in physicalState.items()}
-                prior = self.wm.StepPriorOnly(
-                    h,
-                    z,
-                    x,
-                    action_enc,
-                    physicalState=physical_state_candidates,
-                    robotPhysicalState=expand_candidates(
-                        worldRobotPhysicalEncoding),
-                    cameraMotion=observer_motion,
-                    observerMotionValid=torch.zeros(
-                        B * chunk_size,
-                        device=feature.device,
-                        dtype=torch.bool),
-                    sample=False)
-                score_chunks.append(
-                    (prior["r_pred"] - prior["d_prob"]).view(B, chunk_size))
-            return torch.cat(score_chunks, dim=1)
-
-        b_idx = torch.arange(
-            B, device=decisionFeature.device).unsqueeze(1).expand(
-                B, elite_count)
-        for _ in range(self.iters):
-            noise = torch.randn_like(std.unsqueeze(1).expand(B, N, -1))
-            feature_samples = mu.unsqueeze(1) + noise * std.unsqueeze(1)
-            score = score_feature_candidates(feature_samples)
-
-            topk = torch.topk(score, k=elite_count, dim=1).indices
-            elite_scores = score.gather(1, topk)
-            if self.temperature <= 0.0:
-                weights = torch.full_like(
-                    elite_scores,
-                    1.0 / float(elite_count))
+        batch_index = torch.arange(
+            batch_size,
+            device=decisionFeature.device).unsqueeze(1).expand(
+                batch_size,
+                self.Elite)
+        weights = decisionFeature.new_full(
+            (batch_size, self.Elite),
+            1.0 / float(self.Elite))
+        elite_scores = decisionFeature.new_zeros(
+            batch_size,
+            self.Elite)
+        elite_valid = torch.zeros(
+            batch_size,
+            self.Elite,
+            device=decisionFeature.device,
+            dtype=torch.bool)
+        best_feature = decisionFeature.clone()
+        best_score = decisionFeature.new_full(
+            (batch_size,),
+            -torch.inf)
+        best_valid = torch.zeros(
+            batch_size,
+            device=decisionFeature.device,
+            dtype=torch.bool)
+        for _ in range(self.Iterations):
+            noise = torch.randn_like(std.unsqueeze(1).expand(
+                batch_size,
+                self.Population,
+                self.DecisionDim))
+            candidates = mu.unsqueeze(1) + noise * std.unsqueeze(1)
+            score, valid = self.EvaluateFeatureCandidates(
+                candidates,
+                candidateEvaluator)
+            ranked_score = score.masked_fill(~valid, -torch.inf)
+            iteration_score, iteration_index = ranked_score.max(dim=1)
+            iteration_valid = valid.any(dim=1)
+            iteration_feature = candidates[
+                torch.arange(
+                    batch_size,
+                    device=decisionFeature.device),
+                iteration_index]
+            better = (
+                iteration_valid
+                & (~best_valid | iteration_score.gt(best_score)))
+            best_feature = torch.where(
+                better.unsqueeze(-1),
+                iteration_feature,
+                best_feature)
+            best_score = torch.where(
+                better,
+                iteration_score,
+                best_score)
+            best_valid = best_valid | iteration_valid
+            top_index = torch.topk(
+                ranked_score,
+                k=self.Elite,
+                dim=1).indices
+            elite_scores = score.gather(1, top_index)
+            elite_valid = valid.gather(1, top_index)
+            has_valid_elite = elite_valid.any(dim=1)
+            if self.Temperature <= 0.0:
+                weights = elite_valid.to(dtype=elite_scores.dtype)
+                weights = weights / weights.sum(
+                    dim=1,
+                    keepdim=True).clamp_min(1.0)
             else:
-                weights = F.softmax(elite_scores / float(self.temperature), dim=1)
-            w = weights.unsqueeze(-1)
-            elite_feature = feature_samples[b_idx, topk]
-            mu_new = (w * elite_feature).sum(dim=1)
-            var_new = (
-                (w * (elite_feature - mu_new.unsqueeze(1)).square())
-                .sum(dim=1)
-                .clamp_min(self.min_var))
-            std_new = var_new.sqrt()
-            mu = (
-                self.momentum * mu
-                + (1.0 - self.momentum) * mu_new)
-            std = (
-                self.momentum * std
-                + (1.0 - self.momentum) * std_new)
+                logits = (elite_scores / self.Temperature).masked_fill(
+                    ~elite_valid,
+                    -torch.inf)
+                logits = torch.where(
+                    has_valid_elite.unsqueeze(-1),
+                    logits,
+                    torch.zeros_like(logits))
+                weights = F.softmax(logits, dim=1)
+                weights = weights * elite_valid.to(dtype=weights.dtype)
+                weights = weights / weights.sum(
+                    dim=1,
+                    keepdim=True).clamp_min(1.0)
+            elite_features = candidates[batch_index, top_index]
+            weighted = weights.unsqueeze(-1)
+            new_mu = (weighted * elite_features).sum(dim=1)
+            new_variance = (
+                weighted
+                * (elite_features - new_mu.unsqueeze(1)).square()
+            ).sum(dim=1).clamp_min(self.MinimumVariance)
+            updated_mu = (
+                self.Momentum * mu
+                + (1.0 - self.Momentum) * new_mu)
+            updated_std = (
+                self.Momentum * std
+                + (1.0 - self.Momentum) * new_variance.sqrt())
+            mu = torch.where(
+                has_valid_elite.unsqueeze(-1),
+                updated_mu,
+                mu)
+            std = torch.where(
+                has_valid_elite.unsqueeze(-1),
+                updated_std,
+                std)
 
-        population_return = (weights * elite_scores).sum(dim=1)
-        final_score = score_feature_candidates(mu.unsqueeze(1))
-        out = {
-            "decision_feature": mu,
-            "expected_return": final_score[:, 0],}
+        verification_score, verification_valid = (
+            self.EvaluateFeatureCandidates(
+                torch.stack([
+                    best_feature,
+                    decisionFeature,
+                ], dim=1),
+                candidateEvaluator))
+        planner_valid = best_valid & verification_valid[:, 0]
+        selected_feature = torch.where(
+            planner_valid.unsqueeze(-1),
+            best_feature,
+            decisionFeature)
+        final_score = torch.where(
+            planner_valid,
+            verification_score[:, 0],
+            verification_score[:, 1])
+        final_valid = torch.where(
+            planner_valid,
+            verification_valid[:, 0],
+            verification_valid[:, 1])
+        result: Dict[str, Any] = {
+            "decision_feature": selected_feature,
+            "expected_return": final_score,
+            "valid": planner_valid,
+            "fallback_used": ~planner_valid,
+        }
         if returnDiagnostics:
-            out["diagnostics"] = {
+            result["diagnostics"] = {
                 "std": std,
-                "elite_population_return": population_return,}
-        return out
+                "elite_population_return": (
+                    weights * elite_scores).sum(dim=1),
+                "elite_valid": elite_valid,
+                "selected_feature_valid": final_valid,
+            }
+        return result
 
 
 class DecisionPlannerExtractor:
     def BuildPlanner(
         self,
-        worldModel: nn.Module,
-        decisionDecoupler: DecisionDecouplerV2,
-        **cemKwargs: Any,
+        decisionDim: int = ModuleDim.DecisionBeliefDim,
+        N: int = 64,
+        elite: int = 8,
+        iters: int = 3,
+        temperature: float = 1.0,
+        momentum: float = 0.15,
+        minVar: float = 1e-4,
+        candidateChunkSize: int = 8,
     ) -> CEMPlanner:
         return CEMPlanner(
-            worldModel=worldModel,
-            decisionDecoupler=decisionDecoupler,
-            **cemKwargs,
-        )
+            decisionDim=decisionDim,
+            N=N,
+            elite=elite,
+            iters=iters,
+            temperature=temperature,
+            momentum=momentum,
+            minVar=minVar,
+            candidateChunkSize=candidateChunkSize)
 
 
 class TestDecisionMTool:
-    @staticmethod
-    def MakeRobotMorphology(
-        endpointCount: int = 4,
-        jointDofCount: int = 6,
-        gripperCount: int = 2,
-        observer: bool = True,
-        ) -> Any:
-        endpoint_count = int(endpointCount)
-        joint_count = int(jointDofCount)
-        gripper_count = int(gripperCount)
-        observer_index = endpoint_count - 1 if observer else -1
-        endpoint_task_mask = torch.ones(
-            endpoint_count,
-            ModuleDim.RobotControlAxisDim,
-            dtype=torch.bool)
-        if observer:
-            endpoint_task_mask[observer_index, :3] = False
-        endpoint_role = (
-            torch.arange(endpoint_count)
-            % ModuleDim.RobotBodyRoleClasses)
-        endpoint_side = (
-            torch.arange(endpoint_count) * 2
-            % ModuleDim.RobotBodySideClasses)
-        endpoint_capability = torch.zeros(
-            endpoint_count,
-            ModuleDim.RobotBodyCapabilityDim,
-            dtype=torch.bool)
-        if endpoint_count:
-            endpoint_capability[
-                torch.arange(endpoint_count),
-                torch.arange(endpoint_count)
-                % ModuleDim.RobotBodyCapabilityDim] = True
-        node_count = endpoint_count + 1
-        endpoint_to_node = torch.arange(endpoint_count) + 1
-        parent_index = torch.full(
-            (node_count,),
-            -1,
-            dtype=torch.long)
-        parent_index[1:] = 0
-        joint_commandable = (
-            torch.arange(joint_count).remainder(4) != 3)
-        joint_lower = torch.full((joint_count,), -1.0)
-        joint_upper = torch.full((joint_count,), 1.0)
-        joint_effort = torch.full((joint_count,), 8.0)
-        joint_velocity = torch.full((joint_count,), 2.0)
-        local_index = torch.arange(joint_count).remainder(6)
-        joint_type = torch.ones(joint_count, dtype=torch.long)
-        joint_axis = torch.zeros(joint_count, 3)
-        if joint_count:
-            joint_axis[
-                torch.arange(joint_count),
-                torch.arange(joint_count).remainder(3)] = 1.0
-        child_role = (
-            torch.arange(joint_count)
-            % ModuleDim.RobotBodyRoleClasses)
-        child_side = (
-            torch.arange(joint_count) * 2
-            % ModuleDim.RobotBodySideClasses)
-        child_capability = torch.zeros(
-            joint_count,
-            ModuleDim.RobotBodyCapabilityDim)
-        if joint_count:
-            child_capability[
-                torch.arange(joint_count),
-                torch.arange(joint_count)
-                % ModuleDim.RobotBodyCapabilityDim] = 1.0
-        group_role = F.one_hot(
-            child_role,
-            num_classes=ModuleDim.RobotBodyRoleClasses).float()
-        group_side = F.one_hot(
-            child_side,
-            num_classes=ModuleDim.RobotBodySideClasses).float()
-        endpoint_group_role = F.one_hot(
-            endpoint_role,
-            num_classes=ModuleDim.RobotBodyRoleClasses).float()
-        endpoint_group_side = F.one_hot(
-            endpoint_side,
-            num_classes=ModuleDim.RobotBodySideClasses).float()
-        endpoint_descriptor = {
-            "controllable": endpoint_task_mask.any(dim=-1),
-            "topology_depth": torch.ones(endpoint_count),
-            "task_mask": endpoint_task_mask,
-            "role": endpoint_role,
-            "side": endpoint_side,
-            "capability": endpoint_capability.float(),
-            "node_role": endpoint_role,
-            "node_side": endpoint_side,
-            "node_capability": endpoint_capability.float(),
-            "parent_node_index": torch.zeros(
-                endpoint_count, dtype=torch.long),
-            "parent_role": torch.zeros(
-                endpoint_count, dtype=torch.long),
-            "parent_side": torch.zeros(
-                endpoint_count, dtype=torch.long),
-            "parent_capability": torch.zeros(
-                endpoint_count,
-                ModuleDim.RobotBodyCapabilityDim),
-            "group_role_membership": endpoint_group_role,
-            "group_side_membership": endpoint_group_side,
-            "group_capability": endpoint_capability.float(),}
-        descriptor = {
-            "commandable": joint_commandable,
-            "local_index": local_index,
-            "topology_depth": torch.ones(joint_count),
-            "joint_type": joint_type,
-            "joint_axis": joint_axis,
-            "child_role": child_role,
-            "child_side": child_side,
-            "child_capability": child_capability,
-            "parent_node_index": torch.zeros(
-                joint_count, dtype=torch.long),
-            "parent_role": torch.zeros(
-                joint_count, dtype=torch.long),
-            "parent_side": torch.zeros(
-                joint_count, dtype=torch.long),
-            "parent_capability": torch.zeros_like(child_capability),
-            "group_role_membership": group_role,
-            "group_side_membership": group_side,
-            "group_capability": child_capability.clone(),
-            "lower_limit_normalized": torch.full(
-                (joint_count,), -0.5),
-            "upper_limit_normalized": torch.full(
-                (joint_count,), 0.5),
-            "position_lower_limit_valid": torch.ones(
-                joint_count, dtype=torch.bool),
-            "position_upper_limit_valid": torch.ones(
-                joint_count, dtype=torch.bool),
-            "effort_limit_normalized": torch.full(
-                (joint_count,), 8.0 / 9.0),
-            "effort_limit_valid": torch.ones(
-                joint_count, dtype=torch.bool),
-            "velocity_limit_normalized": torch.full(
-                (joint_count,), 2.0 / 3.0),
-            "velocity_limit_valid": torch.ones(
-                joint_count, dtype=torch.bool),
-            "command_delta_scale": torch.full(
-                (joint_count,), 2.0),}
-        endpoint_names = tuple(
-            "observer_endpoint"
-            if index == observer_index
-            else f"endpoint_{index}"
-            for index in range(endpoint_count))
-        return SimpleNamespace(
-            node_count=node_count,
-            parent_index=parent_index,
-            endpoint_task_mask=endpoint_task_mask,
-            endpoint_names=endpoint_names,
-            endpoint_count=endpoint_count,
-            endpoint_role=endpoint_role,
-            endpoint_side=endpoint_side,
-            endpoint_capability=endpoint_capability,
-            endpoint_to_node=endpoint_to_node,
-            gripper_names=tuple(
-                f"gripper_{index}" for index in range(gripper_count)),
-            gripper_count=gripper_count,
-            joint_dof_count=joint_count,
-            joint_variable_names=tuple(
-                f"joint_{index}" for index in range(joint_count)),
-            joint_variable_commandable=joint_commandable,
-            joint_lower=joint_lower,
-            joint_upper=joint_upper,
-            joint_effort_limit=joint_effort,
-            joint_velocity_limit=joint_velocity,
-            joint_variable_command_delta_scale=torch.full(
-                (joint_count,), 2.0),
-            joint_variable_unit=tuple(
-                "radian" for _ in range(joint_count)),
-            joint_variable_command_representation=(
-                "normalized_position_delta"),
-            joint_variable_command_reference=(
-                "current_measured_position_at_sensor_frame_exposure"),
-            joint_variable_command_range=(-1.0, 1.0),
-            joint_variable_command_limit_policy=(
-                "clamp_finite_limits_wrap_unbounded_rotation"),
-            EndpointSemanticDescriptor=lambda: endpoint_descriptor,
-            JointSemanticDescriptor=lambda: descriptor,
-            observer_valid=observer,
-            observer_controllable=observer,
-            observer_attachment_kind=("endpoint" if observer else ""),
-            observer_endpoint_index=observer_index,)
-
     def __init__(self, device: Optional[torch.device] = None):
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.robot_morphology = self.MakeRobotMorphology()
+        self.device = device or torch.device("cpu")
 
-    def MakeDecoupler(self) -> DecisionDecouplerV2:
-        return DecisionDecouplerV2(
-            decisionDim=32,
-            robotMorphology=self.robot_morphology).to(self.device)
-
-    def EncodeRobotState(
-        self,
-        decoupler: DecisionDecouplerV2,
-        endpointPose: torch.Tensor,
-        targetError: torch.Tensor,
-        plannerError: Optional[torch.Tensor] = None,
-        ) -> Any:
-        B = endpointPose.size(0)
-        endpoint_valid = torch.ones(
-            B,
-            decoupler.endpoint_count,
-            device=endpointPose.device,
-            dtype=torch.bool)
-        endpoint_controllable = (
-            decoupler.endpoint_task_mask.any(dim=-1).to(
-                device=endpointPose.device).expand(B, -1))
-        joint_position = endpointPose.new_zeros(B, decoupler.joint_count)
-        joint_velocity = torch.zeros_like(joint_position)
-        joint_effort = torch.zeros_like(joint_position)
-        joint_observed = torch.ones(
-            B,
-            decoupler.joint_count,
-            device=endpointPose.device,
-            dtype=torch.bool)
-        joint_healthy = joint_observed.clone()
-        joint_controllable = (
-            decoupler.joint_variable_commandable.to(
-                device=endpointPose.device).expand(B, -1))
-        return decoupler.EncodeRobotState(
-            endpointPose,
-            targetError,
-            targetError if plannerError is None else plannerError,
-            jointPosition=joint_position,
-            jointVelocity=joint_velocity,
-            jointEffort=joint_effort,
-            jointObserved=joint_observed,
-            jointHealthy=joint_healthy,
-            jointControllable=joint_controllable,
-            endpointStateValid=endpoint_valid,
-            endpointControllable=endpoint_controllable,)
-
-    def TestDecisionExtractorIOShapes(self) -> bool:
-        B = 2
-        model = DecisionExtractor(
-            stateDim=ModuleDim.MemoryFeat,
-            intentDim=ModuleDim.IntentionFeat,
-            hiddenDim=256,
-            psiDim=256,
-            optionNum=8,
-        ).to(self.device)
-        out = model(
-            torch.randn(B, ModuleDim.MemoryFeat, device=self.device),
-            torch.randn(B, ModuleDim.IntentionFeat, device=self.device),
-            valueTensor=torch.randn(B, model.value_tensor_dim, device=self.device),
-            vNextTensor=torch.randn(B, model.v_next_tensor_dim, device=self.device),
-            prevOptionLogit=torch.zeros(B, 8, device=self.device),
-            uncertainty=torch.zeros(B, device=self.device),
-            confidence=torch.ones(B, device=self.device),
-            precision=torch.ones(B, device=self.device),
-            risk=torch.zeros(B, device=self.device),
-            worldHzx=torch.randn(B, ModuleDim.WorldOutHState + ModuleDim.WorldOutZState + ModuleDim.WorldOutXState, device=self.device),
-            prevDecisionState=torch.zeros(B, ModuleDim.DecisionDynDim, device=self.device),
-            prevLatentControl=torch.zeros(B, ModuleDim.LatentControlDim, device=self.device),
-            prevActionEmbed=torch.zeros(B, ModuleDim.EndpointActionEmbedDim, device=self.device),
-            prevMapperHidden=torch.zeros(B, ModuleDim.MapperHiddenDim, device=self.device),
-            feedbackTdError=torch.zeros(B, device=self.device),
-        )
-        return (
-            set(out) == {
-                "z", "entropy", "option", "prevOptionLogit_next", "belief",
-                "decision_state", "decision_state_next", "decision_uncertainty",
-                "latent_control", "latent_control_next", "mapper", "eligibility"}
-            and set(out["option"]) == {
-                "logits", "psi_all", "w_t", "psi_selected", "option_context",
-                "opt_idx", "logp_option", "policy_input", "prior_logits"}
-            and set(out["latent_control"]) == {"u", "mu", "logvar"}
-            and set(out["mapper"]) == {"hidden", "hidden_next"}
-            and set(out["eligibility"]) == {"pre", "post"}
-            and out["belief"].shape == (B, ModuleDim.DecisionBeliefDim)
-            and out["decision_state_next"].shape == (B, ModuleDim.DecisionDynDim)
-            and out["latent_control_next"].shape == (B, ModuleDim.LatentControlDim)
-            and out["mapper"]["hidden_next"].shape == (B, ModuleDim.MapperHiddenDim)
-        )
-
-    def TestAdaptiveBeliefSourceGate(self) -> bool:
-        torch.manual_seed(17)
-        model = BeliefAssembler(
-            memDim=4,
-            intentDim=4,
-            valueDim=4,
-            vNextDim=4,
-            worldHzxDim=4,
-            beliefDim=8,
-            hidden=8,
-            drop=0.0).to(self.device).eval()
-        inputs = {
-            "memFeat": torch.randn(2, 4, device=self.device),
-            "intentFeat": torch.randn(2, 4, device=self.device),
-            "valueTensor": torch.randn(2, 4, device=self.device),
-            "vNextTensor": torch.randn(2, 4, device=self.device),
-            "uncertainty": torch.rand(2, device=self.device),
-            "confidence": torch.rand(2, device=self.device),
-            "precision": torch.rand(2, device=self.device),
-            "risk": torch.rand(2, device=self.device),
-            "worldHzx": torch.randn(2, 4, device=self.device),}
-        with torch.no_grad():
-            m = model.p_mem(model.ln_mem(inputs["memFeat"]))
-            i = model.p_intent(model.ln_intent(inputs["intentFeat"]))
-            v = model.p_value(model.ln_value(inputs["valueTensor"]))
-            vn = model.p_vnext(model.ln_vnext(inputs["vNextTensor"]))
-            w = model.p_world(model.ln_world(inputs["worldHzx"]))
-            scalars = torch.stack([
-                inputs["uncertainty"],
-                inputs["confidence"],
-                inputs["precision"],
-                inputs["risk"],
-            ], dim=-1)
-            s = model.p_scalar(scalars)
-            fused = torch.cat([m, i, v, vn, w, s], dim=-1)
-            expected = model.ln_out(
-                m + i + v + vn + w + s
-                + model.gate(fused) * model.layerscale * model.fuse(fused))
-            neutral = model(**inputs)
-
-            changed_inputs = dict(inputs)
-            changed_inputs["intentFeat"] = (
-                inputs["intentFeat"]
-                * inputs["intentFeat"].new_tensor([4.0, -3.0, 2.0, -1.0])
-                + inputs["intentFeat"].new_tensor([3.0, -2.0, 1.0, 0.0]))
-            changed_neutral = model(**changed_inputs)
-
-            model.fuse[-1].weight.normal_(0.0, 0.1)
-            model.source_gate.bias.copy_(
-                torch.tensor([20.0, -20.0, -20.0, -20.0, -20.0, -20.0], device=self.device))
-            intent_a = model(**inputs)
-            intent_b = model(**changed_inputs)
-        return bool(
-            torch.allclose(neutral, expected, atol=1e-6, rtol=1e-6)
-            and not torch.allclose(neutral, changed_neutral)
-            and torch.allclose(intent_a, intent_b, atol=1e-5, rtol=1e-5))
-
-    def TestLearnedOptionTransitionPrior(self) -> bool:
-        torch.manual_seed(19)
-        model = DecisionExtractor(
-            stateDim=8,
-            intentDim=8,
-            valueTensorDim=4,
-            vNextTensorDim=4,
-            worldHDim=2,
-            worldZDim=1,
-            worldXDim=1,
+    def MakeExtractor(self) -> DecisionExtractor:
+        return DecisionExtractor(
+            stateDim=12,
+            optionNum=5,
+            hiddenDim=32,
+            psiDim=16,
+            intentDim=10,
+            valueTensorDim=8,
+            vNextTensorDim=8,
+            worldHDim=9,
+            worldZDim=4,
+            worldXDim=3,
             beliefDim=16,
-            decisionDynDim=4,
-            latentControlDim=2,
-            mapperEmbedDim=4,
-            actionEmbedDim=4,
-            hiddenDim=16,
-            psiDim=4,
-            optionNum=3,).to(self.device)
-        policy_input = torch.randn(1, 10, device=self.device)
-        previous_logits = torch.tensor(
-            [[12.0, -12.0, -12.0]], device=self.device)
-        base_logits = model.option_head(policy_input) + 0.05 * previous_logits
-        neutral_logits = model.OptionLogits(policy_input, previous_logits)
-        with torch.no_grad():
-            model.option_transition_prior.transition_logits[0, 2] = 8.0
-        learned_logits = model.OptionLogits(policy_input, previous_logits)
-        transition_bias = learned_logits - base_logits
-        loss = -model.OptionLogProb(
-            policy_input,
-            previous_logits,
-            torch.tensor([1], device=self.device)).mean()
-        loss.backward()
-        transition_grad = model.option_transition_prior.transition_logits.grad
-        transition_row_grad = transition_grad.norm(dim=-1)
-        return bool(
-            torch.allclose(neutral_logits, base_logits, atol=1e-6, rtol=1e-6)
-            and int(transition_bias.argmax(dim=-1).item()) == 2
-            and transition_grad is not None
-            and torch.isfinite(transition_grad).all().item()
-            and torch.count_nonzero(transition_grad).item() > 0
-            and transition_row_grad[0] > 1000.0 * transition_row_grad[1:].amax())
-
-    def TestEndpointTokensDirectlyConditionLocalAction(self) -> bool:
-        torch.manual_seed(21)
-        decoupler = self.MakeDecoupler().eval()
-        with torch.no_grad():
-            initially_neutral = (
-                torch.count_nonzero(
-                    decoupler.endpoint_action_refiner.net[-1].weight).item() == 0
-                and torch.count_nonzero(
-                    decoupler.endpoint_action_refiner.net[-1].bias).item() == 0)
-            decoupler.endpoint_action_refiner.net[-1].weight.normal_(0.0, 0.05)
-        B = 1
-        endpoint_tokens = torch.randn(
-            B,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.DecisionEndpointPoseFeatDim,
-            device=self.device)
-        changed_tokens = endpoint_tokens.clone()
-        changed_tokens[:, 0] = changed_tokens[:, 0] + 0.25
-        common = {
-            "endpointControlTokens": torch.zeros_like(endpoint_tokens),
-            "zMotion": torch.randn(B, 256, device=self.device),
-            "zDynamics": torch.randn(B, 128, device=self.device),
-            "zUncertainty": torch.randn(B, 64, device=self.device),
-            "subgoalFeature": torch.randn(
-                B, ModuleDim.DecisionEndpointPoseFeatDim, device=self.device),}
-        first = decoupler.endpoint_action_refiner(
-            endpointPoseTokens=endpoint_tokens,
-            **common)
-        second = decoupler.endpoint_action_refiner(
-            endpointPoseTokens=changed_tokens,
-            **common)
-        difference = (second - first).abs()
-        observer_index = self.robot_morphology.observer_endpoint_index
-        changed_observer_tokens = endpoint_tokens.clone()
-        changed_observer_tokens[:, observer_index] += 0.25
-        changed_observer = decoupler.endpoint_action_refiner(
-            endpointPoseTokens=changed_observer_tokens,
-            **common)
-        observer_difference = (changed_observer - first).abs()
-        return bool(
-            initially_neutral
-            and difference[:, 0].amax().item() > 1e-7
-            and torch.count_nonzero(difference[:, 1:] > 1e-7).item() == 0
-            and torch.count_nonzero(first[
-                :, observer_index, :3]).item() == 0
-            and torch.count_nonzero(changed_observer[
-                :, observer_index, :3]).item() == 0
-            and observer_difference[
-                :, observer_index, 3:6].amax().item()
-                > 1e-7
-            and torch.count_nonzero(observer_difference[
-                :, :observer_index] > 1e-7).item() == 0
-            and torch.count_nonzero(observer_difference[
-                :, observer_index + 1:] > 1e-7).item() == 0)
-
-    def TestEndpointControlTokenDirectlyConditionsLocalAction(self) -> bool:
-        torch.manual_seed(22)
-        decoupler = self.MakeDecoupler().eval()
-        with torch.no_grad():
-            decoupler.endpoint_action_refiner.net[-1].weight.normal_(0.0, 0.05)
-        B = 1
-        endpoint_tokens = torch.randn(
-            B,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.DecisionEndpointPoseFeatDim,
-            device=self.device)
-        control_tokens = torch.randn_like(endpoint_tokens)
-        changed_control_tokens = control_tokens.clone()
-        changed_control_tokens[:, 0] = changed_control_tokens[:, 0] + 0.25
-        common = {
-            "endpointPoseTokens": endpoint_tokens,
-            "zMotion": torch.randn(B, 256, device=self.device),
-            "zDynamics": torch.randn(B, 128, device=self.device),
-            "zUncertainty": torch.randn(B, 64, device=self.device),
-            "subgoalFeature": torch.randn(
-                B, ModuleDim.DecisionEndpointPoseFeatDim, device=self.device),}
-        original = decoupler.endpoint_action_refiner(
-            endpointControlTokens=control_tokens,
-            **common)
-        changed = decoupler.endpoint_action_refiner(
-            endpointControlTokens=changed_control_tokens,
-            **common)
-        difference = (changed - original).abs()
-        return bool(
-            difference[:, 0].amax().item() > 1e-7
-            and torch.count_nonzero(difference[:, 1:] > 1e-7).item() == 0)
-
-    def TestWorldPoseOnlyRebasesDecodedTarget(self) -> bool:
-        torch.manual_seed(23)
-        decoupler = self.MakeDecoupler().eval()
-        B = 1
-        body_pose = torch.zeros(
-            B,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.DecisionEndpointPoseDim,
-            device=self.device)
-        body_pose[..., 6] = 1.0
-        zero_error = body_pose.new_zeros(
-            B,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.RobotControlAxisDim)
-        physical_reference = torch.zeros(
-            B, ModuleDim.RobotPhysicalReferenceDim, device=self.device)
-        physical_reference[:, 3] = 1.0
-        physical_reference[:, 6] = -1.0
-        physical_reference[:, 7] = 1.0
-        learned_inputs = {
-            "decisionBackbone": torch.randn(B, 32, device=self.device),
-            "planLatent": torch.randn(B, 256, device=self.device),
-            "subgoalFeature": torch.randn(
-                B, ModuleDim.DecisionEndpointPoseFeatDim, device=self.device),
-            "constraintTokens": torch.randn(B, 8, 128, device=self.device),
-            "robotStateEncoding": self.EncodeRobotState(decoupler,
-                body_pose,
-                zero_error,
-                zero_error),
-            "robotPhysicalReference": physical_reference,
-            "risk": torch.zeros(B, device=self.device),
-            "confidence": torch.ones(B, device=self.device),
-            "precision": torch.ones(B, device=self.device),}
-        original_pose_world = torch.zeros(
-            B,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.DecisionEndpointPoseDim,
-            device=self.device)
-        original_pose_world[..., 6] = 1.0
-        sqrt_half = math.sqrt(0.5)
-        world_gauge = body_pose.new_tensor([
-            0.7, -0.4, 0.2,
-            0.0, 0.0, sqrt_half, sqrt_half]).view(1, 1, 7)
-
-        def ComposePose(
-            parent: torch.Tensor,
-            child: torch.Tensor,) -> torch.Tensor:
-            return NormalizePose(torch.cat([
-                parent[..., :3] + QuatRotate(
-                    parent[..., 3:7], child[..., :3]),
-                QuatMultiply(
-                    parent[..., 3:7], child[..., 3:7])], dim=-1))
-
-        transformed_pose_world = ComposePose(
-            world_gauge,
-            original_pose_world)
-        original = decoupler(**learned_inputs)
-        transformed = decoupler(**learned_inputs)
-        original_target = ApplyPoseDelta(
-            original_pose_world,
-            original.decision_tensor)
-        transformed_target = ApplyPoseDelta(
-            transformed_pose_world,
-            transformed.decision_tensor)
-        expected_target = ComposePose(
-            world_gauge,
-            original_target)
-        return bool(
-            torch.equal(original.decision_latent, transformed.decision_latent)
-            and torch.equal(original.decision_tensor, transformed.decision_tensor)
-            and torch.allclose(
-                transformed_target,
-                expected_target,
-                atol=1e-6,
-                rtol=1e-6))
-
-    def TestSeparatedRobotInputsConditionAction(self) -> bool:
-        torch.manual_seed(23)
-        decoupler = self.MakeDecoupler().eval()
-        B = 1
-        endpoint_pose = torch.zeros(
-            B,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.DecisionEndpointPoseDim,
-            device=self.device)
-        endpoint_pose[..., 6] = 1.0
-        endpoint_pose.requires_grad_()
-        target_error = torch.zeros(
-            B,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.RobotControlAxisDim,
-            device=self.device,
-            requires_grad=True)
-        planner_error = torch.zeros_like(target_error, requires_grad=True)
-        physical_reference = torch.zeros(
-            B, ModuleDim.RobotPhysicalReferenceDim, device=self.device)
-        physical_reference[:, 3] = 1.0
-        physical_reference[:, 6] = -1.0
-        physical_reference[:, 7] = 1.0
-        physical_reference.requires_grad_()
-        common = {
-            "decisionBackbone": torch.randn(B, 32, device=self.device),
-            "planLatent": torch.randn(B, 256, device=self.device),
-            "subgoalFeature": torch.randn(
-                B, ModuleDim.DecisionEndpointPoseFeatDim, device=self.device),
-            "constraintTokens": torch.randn(B, 8, 128, device=self.device),
-            "risk": torch.zeros(B, device=self.device),
-            "confidence": torch.ones(B, device=self.device),
-            "precision": torch.ones(B, device=self.device),}
-        original = decoupler(
-            robotStateEncoding=self.EncodeRobotState(decoupler,
-                endpoint_pose,
-                target_error,
-                planner_error),
-            robotPhysicalReference=physical_reference,
-            **common)
-        original.decision_latent.square().mean().backward()
-
-        changed_pose = endpoint_pose.detach().clone()
-        changed_pose[:, 0, 0] = 0.25
-        changed_body = decoupler(
-            robotStateEncoding=self.EncodeRobotState(decoupler,
-                changed_pose,
-                target_error.detach(),
-                planner_error.detach()),
-            robotPhysicalReference=physical_reference.detach(),
-            **common)
-        changed_reference = physical_reference.detach().clone()
-        changed_reference[:, 0] = 0.25
-        changed_physical = decoupler(
-            robotStateEncoding=self.EncodeRobotState(decoupler,
-                endpoint_pose.detach(),
-                target_error.detach(),
-                planner_error.detach()),
-            robotPhysicalReference=changed_reference,
-            **common)
-        rotated_reference = physical_reference.detach().clone()
-        sqrt_half = math.sqrt(0.5)
-        rotated_reference[:, 0:4] = rotated_reference.new_tensor([
-            0.0, 0.0, sqrt_half, sqrt_half])
-        changed_rotation = decoupler(
-            robotStateEncoding=self.EncodeRobotState(decoupler,
-                endpoint_pose.detach(),
-                target_error.detach(),
-                planner_error.detach()),
-            robotPhysicalReference=rotated_reference,
-            **common)
-        changed_gravity_reference = physical_reference.detach().clone()
-        changed_gravity_reference[:, 4:7] = (
-            changed_gravity_reference.new_tensor([0.0, -1.0, 0.0]))
-        changed_gravity = decoupler(
-            robotStateEncoding=self.EncodeRobotState(decoupler,
-                endpoint_pose.detach(),
-                target_error.detach(),
-                planner_error.detach()),
-            robotPhysicalReference=changed_gravity_reference,
-            **common)
-        changed_target_error = target_error.detach().clone()
-        changed_target_error[:, 0, 0] = 0.25
-        changed_control = decoupler(
-            robotStateEncoding=self.EncodeRobotState(decoupler,
-                endpoint_pose.detach(),
-                changed_target_error,
-                planner_error.detach()),
-            robotPhysicalReference=physical_reference.detach(),
-            **common)
-        changed_planner_error = planner_error.detach().clone()
-        changed_planner_error[:, 0, 1] = 0.25
-        changed_planner_control = decoupler(
-            robotStateEncoding=self.EncodeRobotState(decoupler,
-                endpoint_pose.detach(),
-                target_error.detach(),
-                changed_planner_error),
-            robotPhysicalReference=physical_reference.detach(),
-            **common)
-        observer_index = self.robot_morphology.observer_endpoint_index
-        masked_observer_error = target_error.detach().clone()
-        masked_observer_error[:, observer_index, 0] = 0.25
-        masked_observer_control = decoupler(
-            robotStateEncoding=self.EncodeRobotState(decoupler,
-                endpoint_pose.detach(),
-                masked_observer_error,
-                planner_error.detach()),
-            robotPhysicalReference=physical_reference.detach(),
-            **common)
-        observer_rotation_error = target_error.detach().clone()
-        observer_rotation_error[:, observer_index, 5] = 0.25
-        observer_rotation_control = decoupler(
-            robotStateEncoding=self.EncodeRobotState(decoupler,
-                endpoint_pose.detach(),
-                observer_rotation_error,
-                planner_error.detach()),
-            robotPhysicalReference=physical_reference.detach(),
-            **common)
-        return bool(
-            endpoint_pose.grad is not None
-            and endpoint_pose.grad.abs().amax().item() > 1e-8
-            and target_error.grad is not None
-            and target_error.grad.abs().amax().item() > 1e-8
-            and planner_error.grad is not None
-            and planner_error.grad.abs().amax().item() > 1e-8
-            and torch.count_nonzero(
-                target_error.grad[:, observer_index, :3]).item() == 0
-            and torch.count_nonzero(
-                planner_error.grad[:, observer_index, :3]).item() == 0
-            and torch.count_nonzero(
-                target_error.grad[:, observer_index, 3:6]).item() == 3
-            and torch.count_nonzero(
-                planner_error.grad[:, observer_index, 3:6]).item() == 3
-            and physical_reference.grad is not None
-            and physical_reference.grad.abs().amax().item() > 1e-8
-            and not torch.allclose(
-                original.decision_tensor,
-                changed_body.decision_tensor,
-                atol=1e-7,
-                rtol=1e-6)
-            and not torch.allclose(
-                original.decision_tensor,
-                changed_physical.decision_tensor,
-                atol=1e-7,
-                rtol=1e-6)
-            and not torch.allclose(
-                original.decision_tensor,
-                changed_rotation.decision_tensor,
-                atol=1e-7,
-                rtol=1e-6)
-            and not torch.allclose(
-                original.decision_tensor,
-                changed_gravity.decision_tensor,
-                atol=1e-7,
-                rtol=1e-6)
-            and not torch.allclose(
-                original.decision_tensor,
-                changed_control.decision_tensor,
-                atol=1e-7,
-                rtol=1e-6)
-            and not torch.allclose(
-                original.decision_tensor,
-                changed_planner_control.decision_tensor,
-                atol=1e-7,
-                rtol=1e-6)
-            and torch.equal(
-                original.decision_tensor,
-                masked_observer_control.decision_tensor)
-            and not torch.allclose(
-                original.decision_tensor,
-                observer_rotation_control.decision_tensor,
-                atol=1e-7,
-                rtol=1e-6))
-
-    def TestEndpointActionEncodingIsStateFree(self) -> bool:
-        torch.manual_seed(24)
-        decoupler = self.MakeDecoupler().eval()
-        action = torch.zeros(
-            2,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.RobotControlAxisDim,
-            device=self.device,
-            requires_grad=True)
-        encoded = decoupler.EncodeEndpointAction(action)
-        encoded.square().mean().backward()
-        changed_action = action.detach().clone()
-        changed_action[:, 0, 0] = 0.25
-        changed = decoupler.EncodeEndpointAction(changed_action)
-        observer_index = self.robot_morphology.observer_endpoint_index
-        masked_observer_action = action.detach().clone()
-        masked_observer_action[:, observer_index, 0] = 0.25
-        masked_observer_encoded = decoupler.EncodeEndpointAction(
-            masked_observer_action)
-        observer_rotation_action = action.detach().clone()
-        observer_rotation_action[:, observer_index, 5] = 0.25
-        observer_rotation_encoded = decoupler.EncodeEndpointAction(
-            observer_rotation_action)
-        return bool(
-            tuple(encoded.shape) == (2, ModuleDim.EndpointActionEmbedDim)
-            and action.grad is not None
-            and action.grad.abs().amax().item() > 1e-8
-            and torch.count_nonzero(
-                action.grad[
-                    :, observer_index, :3]).item() == 0
-            and torch.count_nonzero(
-                action.grad[
-                    :, observer_index, 3:6]).item() == 6
-            and not torch.allclose(encoded, changed, atol=1e-7, rtol=1e-6)
-            and torch.equal(encoded, masked_observer_encoded)
-            and not torch.allclose(
-                encoded,
-                observer_rotation_encoded,
-                atol=1e-7,
-                rtol=1e-6))
-
-    def TestStructuralEnhancementsReceiveActionGradient(self) -> bool:
-        torch.manual_seed(22)
-        model = DecisionExtractor(
-            stateDim=16,
-            intentDim=16,
-            valueTensorDim=8,
-            vNextTensorDim=8,
-            worldHDim=4,
-            worldZDim=2,
-            worldXDim=2,
-            beliefDim=32,
-            decisionDynDim=8,
-            latentControlDim=4,
-            mapperEmbedDim=8,
+            decisionDynDim=7,
+            latentControlDim=5,
+            mapperEmbedDim=11,
             actionEmbedDim=6,
-            hiddenDim=32,
-            psiDim=8,
-            optionNum=3,).to(self.device)
-        decoupler = self.MakeDecoupler()
-        B = 2
-        out = model(
-            torch.randn(B, 16, device=self.device),
-            torch.randn(B, 16, device=self.device),
-            valueTensor=torch.randn(B, 8, device=self.device),
-            vNextTensor=torch.randn(B, 8, device=self.device),
-            prevOptionLogit=torch.randn(B, 3, device=self.device),
-            uncertainty=torch.rand(B, device=self.device),
-            confidence=torch.rand(B, device=self.device),
-            precision=torch.rand(B, device=self.device),
-            risk=torch.rand(B, device=self.device),
-            worldHzx=torch.randn(B, 8, device=self.device),
-            prevDecisionState=torch.randn(B, 8, device=self.device),
-            prevLatentControl=torch.randn(B, 4, device=self.device),
-            prevActionEmbed=torch.randn(B, 6, device=self.device),
-            prevMapperHidden=torch.randn(B, 8, device=self.device),
-            feedbackTdError=torch.zeros(B, device=self.device),
-            sample=True,
-            deterministic=False,)
-        decision_feature = model.final_decision_norm(
-            out["belief"] + out["option"]["option_context"])
-        base_pose = torch.zeros(
-            B,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.DecisionEndpointPoseDim,
-            device=self.device)
-        base_pose[..., 6] = 1.0
-        base_pose.requires_grad_()
-        zero_error = torch.zeros(
-            B,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.RobotControlAxisDim,
-            device=self.device,
-            requires_grad=True)
-        planner_error = torch.zeros_like(zero_error, requires_grad=True)
-        physical_reference = torch.zeros(
-            B, ModuleDim.RobotPhysicalReferenceDim, device=self.device)
-        physical_reference[:, 3] = 1.0
-        physical_reference[:, 6] = -1.0
-        physical_reference[:, 7] = 1.0
-        physical_reference.requires_grad_()
-        decision = decoupler(
-            decisionBackbone=decision_feature,
-            planLatent=torch.randn(B, 256, device=self.device),
-            subgoalFeature=torch.randn(
-                B, ModuleDim.DecisionEndpointPoseFeatDim, device=self.device),
-            constraintTokens=torch.randn(B, 8, 128, device=self.device),
-            robotStateEncoding=self.EncodeRobotState(decoupler,
-                base_pose,
-                zero_error,
-                planner_error),
-            robotPhysicalReference=physical_reference,
-            risk=torch.rand(B, device=self.device),
-            confidence=torch.rand(B, device=self.device),
-            precision=torch.rand(B, device=self.device))
-        target = torch.randn_like(decision.decision_tensor)
-        F.smooth_l1_loss(decision.decision_tensor, target).backward()
-        gradients = (
-            model.belief_assembler.source_gate.weight.grad,
-            model.option_transition_prior.transition_logits.grad,
-            decoupler.endpoint_action_refiner.net[-1].weight.grad,
-            base_pose.grad,
-            zero_error.grad,
-            planner_error.grad,
-            physical_reference.grad,)
-        return all(
-            grad is not None
-            and torch.isfinite(grad).all().item()
-            and torch.count_nonzero(grad).item() > 0
-            for grad in gradients)
+            planFeatureDim=8,
+            subgoalFeatureDim=7,
+            constraintTokenCount=3,
+            constraintTokenDim=5,
+            bodyStateFeatureDim=6,
+            controlFeedbackFeatureDim=4,
+            embodimentContextFeatureDim=2,
+            embodimentStateFeatureDim=8,
+            sceneStateFeatureDim=9,
+            goalDecisionContextDim=10).to(self.device)
 
-    def TestPredictiveCoreContractsForAnyPrecision(self) -> bool:
-        torch.manual_seed(23)
-        core = PredictiveDecisionCore(
-            beliefDim=8,
-            uDim=4,
-            dynDim=8,
-            nSteps=2,
-            hidden=16,
-            drop=0.0).to(self.device).eval()
-        belief = torch.randn(4, 8, device=self.device)
-        target = core.belief_to_dyn(belief)
-        offset = torch.randn_like(target)
-        prev = target + offset
-        u = torch.zeros(4, 4, device=self.device)
-        precision = torch.tensor([0.1, 1.0, 20.0, 100.0], device=self.device).view(-1, 1)
-        out = core(prev, belief, u, precision)
-        ratio = (out - target).norm(dim=-1) / offset.norm(dim=-1)
-        h = prev[-1:]
-        for _ in range(1000):
-            h = core(h, belief[-1:], u[-1:], precision[-1:])
-        return bool(
-            torch.all(ratio[1:] < ratio[:-1]).item()
-            and torch.all(ratio < 1.0).item()
-            and torch.isfinite(h).all().item()
-            and F.softplus(core.drift_scale).item() > 0.0)
+    def MakeBaseInputs(
+        self,
+        model: DecisionExtractor,
+        batchSize: int = 2,
+    ) -> Dict[str, Any]:
+        batch_size = int(batchSize)
+        return {
+            "stateFeat": torch.randn(
+                batch_size,
+                model.stateDim,
+                device=self.device,
+                requires_grad=True),
+            "intentFeat": torch.randn(
+                batch_size,
+                model.intentDim,
+                device=self.device,
+                requires_grad=True),
+            "valueTensor": torch.randn(
+                batch_size,
+                model.value_tensor_dim,
+                device=self.device),
+            "vNextTensor": torch.randn(
+                batch_size,
+                model.v_next_tensor_dim,
+                device=self.device),
+            "uncertainty": torch.full(
+                (batch_size,),
+                0.2,
+                device=self.device),
+            "confidence": torch.full(
+                (batch_size,),
+                0.8,
+                device=self.device),
+            "precision": torch.full(
+                (batch_size,),
+                0.7,
+                device=self.device),
+            "risk": torch.full(
+                (batch_size,),
+                0.1,
+                device=self.device),
+            "worldHzx": torch.randn(
+                batch_size,
+                model.world_hzx_dim,
+                device=self.device),
+            "prevDecisionState": torch.zeros(
+                batch_size,
+                model.dyn_dim,
+                device=self.device),
+            "prevLatentControl": torch.zeros(
+                batch_size,
+                model.u_dim,
+                device=self.device),
+            "prevActionEmbed": torch.zeros(
+                batch_size,
+                model.action_embed_dim,
+                device=self.device),
+            "prevMapperHidden": torch.zeros(
+                batch_size,
+                model.mapper_hidden_dim,
+                device=self.device),
+            "feedbackTdError": torch.ones(
+                batch_size,
+                device=self.device),
+            "prevOptionLogit": torch.zeros(
+                batch_size,
+                model.num_options,
+                device=self.device),
+            "sample": False,
+            "deterministic": True,
+        }
 
-    def TestEligibilityUsesOldTraceAndReset(self) -> bool:
-        x = torch.ones(2, 3, device=self.device)
-        layer = EligibilityTracePlasticityLayer(3, 2).to(self.device)
-        layer.EnsureB(2)
-        layer.trace.fill_(1.0)
-        layer.fast.zero_()
-        expected = F.linear(x, layer.base)
-        post = layer(x, torch.tensor([1.0, 0.0], device=self.device))
-        fast_after_feedback = layer.fast.detach().clone()
-        layer.Commit(x, post, torch.tensor([1.0, 0.0], device=self.device))
-        layer.fast[1].fill_(1.0)
-        layer.ClearTrace(torch.tensor([False, True], device=self.device))
-        behavior_ok = bool(
-            torch.allclose(post, expected, atol=1e-7, rtol=1e-6)
-            and not {"trace", "fast"} & set(layer.state_dict())
-            and torch.allclose(
-                fast_after_feedback[0],
-                torch.full_like(fast_after_feedback[0], 1e-3))
-            and torch.count_nonzero(fast_after_feedback[1]).item() == 0
-            and torch.count_nonzero(layer.trace[1]).item() == 0
-            and torch.all(layer.fast[1] == 1.0).item())
-        row_one = layer.fast[1].detach().clone()
-        layer.Reset(doneMask=torch.tensor([True, False], device=self.device))
-        reset_ok = bool(
-            torch.count_nonzero(layer.trace[0]).item() == 0
-            and torch.count_nonzero(layer.fast[0]).item() == 0
-            and torch.equal(layer.fast[1], row_one))
-        return behavior_ok and reset_ok
-
-    def TestOptionSelectionChangesPhysicalAction(self) -> bool:
-        torch.manual_seed(29)
-        model = DecisionExtractor(
-            stateDim=16,
-            intentDim=16,
-            valueTensorDim=8,
-            vNextTensorDim=8,
-            worldHDim=4,
-            worldZDim=2,
-            worldXDim=2,
-            beliefDim=32,
-            decisionDynDim=8,
-            latentControlDim=4,
-            mapperEmbedDim=8,
-            actionEmbedDim=6,
-            hiddenDim=32,
-            psiDim=8,
-            optionNum=2,).to(self.device).eval()
-        decoupler = self.MakeDecoupler().eval()
-        with torch.no_grad():
-            model.option_head[-1].weight.zero_()
-            model.option_psi_head[-1].weight.zero_()
-            psi_bias = model.option_psi_head[-1].bias.view(2, 8)
-            psi_bias[0].copy_(torch.linspace(-1.0, 1.0, 8, device=self.device))
-            psi_bias[1].copy_(torch.linspace(1.0, -1.0, 8, device=self.device))
-
-        inputs = {
-            "stateFeat": torch.randn(1, 16, device=self.device),
-            "intentFeat": torch.randn(1, 16, device=self.device),
-            "valueTensor": torch.randn(1, 8, device=self.device),
-            "vNextTensor": torch.randn(1, 8, device=self.device),
-            "uncertainty": torch.zeros(1, device=self.device),
-            "confidence": torch.ones(1, device=self.device),
-            "precision": torch.ones(1, device=self.device),
-            "risk": torch.zeros(1, device=self.device),
-            "worldHzx": torch.randn(1, 8, device=self.device),
-            "prevDecisionState": torch.zeros(1, 8, device=self.device),
-            "prevLatentControl": torch.zeros(1, 4, device=self.device),
-            "prevActionEmbed": torch.zeros(1, 6, device=self.device),
-            "prevMapperHidden": torch.zeros(1, 8, device=self.device),
-            "feedbackTdError": torch.zeros(1, device=self.device),
-            "prevOptionLogit": torch.zeros(1, 2, device=self.device),
-            "sample": True,
-            "deterministic": True,}
-        pose = torch.zeros(
-            1,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.DecisionEndpointPoseDim,
-            device=self.device)
-        pose[..., 6] = 1.0
-        zero_error = pose.new_zeros(
-            1,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.RobotControlAxisDim)
-        plan = torch.randn(1, 256, device=self.device)
-        subgoal = torch.randn(1, ModuleDim.DecisionEndpointPoseFeatDim, device=self.device)
-        constraints = torch.randn(1, 8, 128, device=self.device)
-        physical_reference = torch.zeros(
-            1, ModuleDim.RobotPhysicalReferenceDim, device=self.device)
-        physical_reference[:, 3] = 1.0
-        physical_reference[:, 6] = -1.0
-        physical_reference[:, 7] = 1.0
-        robot_state_encoding = self.EncodeRobotState(decoupler,
-            pose,
-            zero_error,
-            zero_error)
-
-        def action_for(option: int):
-            with torch.no_grad():
-                model.option_head[-1].bias.copy_(
-                    torch.tensor([10.0, -10.0] if option == 0 else [-10.0, 10.0], device=self.device))
-            out = model(**inputs)
-            feature = model.final_decision_norm(
-                out["belief"] + out["option"]["option_context"])
-            action = decoupler(
-                decisionBackbone=feature,
-                planLatent=plan,
-                subgoalFeature=subgoal,
-                constraintTokens=constraints,
-                robotStateEncoding=robot_state_encoding,
-                robotPhysicalReference=physical_reference,
-                risk=inputs["risk"],
-                confidence=inputs["confidence"],
-                precision=inputs["precision"])
-            return out, action.decision_tensor
-
-        _, action0 = action_for(0)
-        out1, action1 = action_for(1)
-        model.zero_grad(set_to_none=True)
-        decoupler.zero_grad(set_to_none=True)
-        action1.square().mean().backward()
-        psi_grad = model.option_psi_head[-1].bias.grad
-        return bool(
-            not torch.allclose(action0, action1)
-            and psi_grad is not None
-            and torch.count_nonzero(psi_grad).item() > 0
-            and int(out1["option"]["opt_idx"].item()) == 1)
-
-    def TestPhysicalProjectionAndSafetySemantics(self) -> bool:
-        decoupler = self.MakeDecoupler().eval()
-        latent = torch.full(
-            (
-                2,
-                self.robot_morphology.endpoint_count,
-                ModuleDim.RobotControlAxisDim),
-            100.0,
-            device=self.device)
-        action = decoupler.ProjectDecisionLatent(latent)
-        normalized = decoupler.NormalizeDecisionTensor(action)
-        zero_latent = torch.zeros_like(latent, requires_grad=True)
-        decoupler.ProjectDecisionLatent(zero_latent).sum().backward()
-        zero_jacobian_probe = zero_latent.grad
-        safety_zero = decoupler.SafetyScores(
-            torch.zeros_like(action),
-            torch.zeros(2, device=self.device),
-            torch.ones(2, device=self.device),
-            torch.ones(2, device=self.device))
-        safety_edge = decoupler.SafetyScores(
-            action,
-            torch.zeros(2, device=self.device),
-            torch.ones(2, device=self.device),
-            torch.ones(2, device=self.device))
-        action_mask = decoupler.action_projector.action_mask
-        active_coordinate_count = int(action_mask.sum().item())
-        action_heads_parameterize_actual = all(
-            head.endpoint_count == self.robot_morphology.endpoint_count
-            and head.net[-1].out_features
-            == ModuleDim.RobotControlAxisDim
-            for head in (
-                decoupler.action_head,
-                decoupler.dynamics_head,
-                decoupler.residual_compensator))
-        base_pose = torch.zeros(
-            1,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.DecisionEndpointPoseDim,
-            device=self.device)
-        half_turn = math.pi / 4.0
-        base_pose[..., 2] = 0.2
-        base_pose[..., 5] = math.sin(half_turn)
-        base_pose[..., 6] = math.cos(half_turn)
-        local_delta = torch.zeros(
-            1,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.RobotControlAxisDim,
-            device=self.device)
-        local_delta[..., 0] = 0.03
-        local_delta[..., 3] = 0.1
-        local_delta = decoupler.MaskDecisionTensor(local_delta)
-        target_pose = ApplyPoseDelta(base_pose, local_delta)
-        recovered_delta = RelativePoseError(base_pose, target_pose)
-        current_pose = base_pose.clone()
-        current_pose[..., :3] = (
-            base_pose[..., :3]
-            + base_pose.new_tensor([0.0, 0.02, 0.0]))
-        rebased_delta = RelativePoseError(current_pose, target_pose)
-        translation_endpoint_mask = action_mask[0, :, 0].bool()
-        observer_index = self.robot_morphology.observer_endpoint_index
-        expected_rebased_delta = local_delta.clone()
-        expected_rebased_delta[..., 0] = torch.where(
-            translation_endpoint_mask,
-            expected_rebased_delta.new_tensor(0.01),
-            expected_rebased_delta.new_tensor(-0.02))
-        return bool(
-            action_heads_parameterize_actual
-            and active_coordinate_count
-            == int(self.robot_morphology.endpoint_task_mask.sum().item())
-            and active_coordinate_count
-            < (
-                self.robot_morphology.endpoint_count
-                * ModuleDim.RobotControlAxisDim)
-            and torch.all(
-                zero_jacobian_probe[action_mask.expand_as(zero_jacobian_probe).bool()]
-                > 0.0).item()
-            and torch.count_nonzero(
-                zero_jacobian_probe[
-                    ~action_mask.expand_as(zero_jacobian_probe).bool()]).item() == 0
-            and torch.count_nonzero(
-                action[..., observer_index, :3]).item() == 0
-            and torch.count_nonzero(
-                action[..., observer_index, 3:6]).item()
-                == 2 * 3
-            and torch.all(normalized.abs() <= 1.0).item()
-            and torch.all(normalized[..., :3].norm(dim=-1) <= 1.0 + 1e-6).item()
-            and torch.all(normalized[..., 3:].norm(dim=-1) <= 1.0 + 1e-6).item()
-            and torch.all(safety_edge[:, :2] < safety_zero[:, :2]).item()
-            and torch.allclose(recovered_delta, local_delta, atol=1e-5, rtol=1e-5)
-            and torch.allclose(
-                target_pose[:, translation_endpoint_mask, :2],
-                base_pose[:, translation_endpoint_mask, :2]
-                + base_pose.new_tensor([0.0, 0.03]),
-                atol=1e-5,
-                rtol=1e-5)
-            and torch.allclose(
-                target_pose[:, ~translation_endpoint_mask, :3],
-                base_pose[:, ~translation_endpoint_mask, :3],
-                atol=1e-5,
-                rtol=1e-5)
-            and torch.allclose(
-                rebased_delta,
-                expected_rebased_delta,
-                atol=1e-5,
-                rtol=1e-5))
-
-    def TestNeuroSymbolicRefineShapes(self) -> bool:
-        B = 2
-        model = DecisionExtractor(
-            stateDim=ModuleDim.MemoryFeat,
-            intentDim=ModuleDim.IntentionFeat,
-            hiddenDim=256,
-            psiDim=256,
-            optionNum=8,
-        ).to(self.device)
-        base = model(
-            torch.randn(B, ModuleDim.MemoryFeat, device=self.device),
-            torch.randn(B, ModuleDim.IntentionFeat, device=self.device),
-            valueTensor=torch.randn(B, model.value_tensor_dim, device=self.device),
-            vNextTensor=torch.randn(B, model.v_next_tensor_dim, device=self.device),
-            prevOptionLogit=torch.zeros(B, 8, device=self.device),
-            uncertainty=torch.zeros(B, device=self.device),
-            confidence=torch.ones(B, device=self.device),
-            precision=torch.ones(B, device=self.device),
-            risk=torch.zeros(B, device=self.device),
-            worldHzx=torch.randn(B, ModuleDim.WorldOutHState + ModuleDim.WorldOutZState + ModuleDim.WorldOutXState, device=self.device),
-            prevDecisionState=torch.zeros(B, ModuleDim.DecisionDynDim, device=self.device),
-            prevLatentControl=torch.zeros(B, ModuleDim.LatentControlDim, device=self.device),
-            prevActionEmbed=torch.zeros(B, ModuleDim.EndpointActionEmbedDim, device=self.device),
-            prevMapperHidden=torch.zeros(B, ModuleDim.MapperHiddenDim, device=self.device),
-            feedbackTdError=torch.zeros(B, device=self.device),
-        )
-        nesy = NeuroSymbolicOutput(
+    def MakeNeuroSymbolic(
+        self,
+        model: DecisionExtractor,
+        batchSize: int,
+    ) -> NeuroSymbolicOutput:
+        batch_size = int(batchSize)
+        temporal_count = int(ModuleDim.TemporalPrimitiveCount)
+        failure_count = len(FAILURE_CAUSES)
+        return NeuroSymbolicOutput(
             facts=[],
-            operator_logits=torch.randn(B, len(OPERATORS), device=self.device),
+            operator_logits=torch.randn(
+                batch_size,
+                len(OPERATORS),
+                device=self.device,
+                requires_grad=True),
             plan_steps=[],
             operator_rationales=[],
-            plan_latent=torch.randn(B, 256, device=self.device),
-            subgoal_feature=torch.randn(B, ModuleDim.DecisionEndpointPoseFeatDim, device=self.device),
-            constraint_tokens=torch.randn(B, 8, 128, device=self.device),
-            risk_cause_logits=torch.randn(B, len(FAILURE_CAUSES), device=self.device),
-            risk_cause_raw_logits=torch.randn(B, len(FAILURE_CAUSES), device=self.device),
-            failure_cause_logits=torch.randn(B, len(FAILURE_CAUSES), device=self.device),
-            failure_cause_raw_logits=torch.randn(B, len(FAILURE_CAUSES), device=self.device),
-            failure_gate_logits=torch.randn(B, device=self.device),
-            failure_gate=torch.sigmoid(torch.randn(B, device=self.device)),
-            invoke_mask=torch.sigmoid(torch.randn(B, device=self.device)),
-            same_operator=torch.zeros(B, device=self.device),
-            operator_changed=torch.zeros(B, device=self.device),
-            invoke_delta=torch.zeros(B, device=self.device),
-            reference_drift=torch.zeros(B, device=self.device),
-            temporal_logits=torch.randn(B, ModuleDim.TemporalPrimitiveCount, device=self.device),
-            temporal_reason_logits=torch.randn(B, ModuleDim.TemporalReasonDim, device=self.device),
-            continue_guard_score=torch.sigmoid(torch.randn(B, device=self.device)),
-            interrupt_guard_score=torch.sigmoid(torch.randn(B, device=self.device)),
-            redispatch_guard_score=torch.sigmoid(torch.randn(B, device=self.device)),)
-        temporal_goal = {
-            "goal_mode_logits": torch.randn(B, ModuleDim.TemporalPrimitiveCount, device=self.device),
-            "goal_timeout_soft_ms": torch.rand(B, device=self.device) * 1000.0,
-            "goal_timeout_hard_ms": torch.rand(B, device=self.device) * 2000.0,}
-        body_pose_feature = torch.randn(
-            B,
-            ModuleDim.DecisionEndpointPoseFeatDim,
-            device=self.device,
-            requires_grad=True)
-        control_feedback_feature = torch.randn(
-            B,
-            ModuleDim.DecisionEndpointPoseFeatDim,
-            device=self.device,
-            requires_grad=True)
-        robot_physical_reference = torch.randn(
-            B,
-            ModuleDim.RobotPhysicalReferenceDim,
-            device=self.device,
-            requires_grad=True)
-        out = model.RefineWithNeuroSymbolic(
-            base,
-            nesy,
-            torch.randn(B, ModuleDim.WorldOutHState + ModuleDim.WorldOutZState + ModuleDim.WorldOutXState, device=self.device),
-            torch.randn(B, ModuleDim.PstSlotDim, device=self.device),
-            torch.randn(B, ModuleDim.DecisionBeliefDim, device=self.device),
-            temporal_goal,
-            body_pose_feature,
-            control_feedback_feature,
-            robot_physical_reference,)
-        (
-            out["decision_feature"].square().mean()
-            + out["decoder_subgoal_feature"].square().mean()
-            + out["decision_energy"].square().mean()
-        ).backward()
-        return bool(
-            out["decision_feature"].shape == (B, ModuleDim.DecisionBeliefDim)
-            and out["decoder_plan_latent"].shape == (B, 256)
-            and out["decoder_subgoal_feature"].shape == (B, ModuleDim.DecisionEndpointPoseFeatDim)
-            and out["decoder_constraint_tokens"].shape == (B, 8, 128)
-            and out["embodied_state_feature"].shape == (
-                B, ModuleDim.DecisionEndpointPoseFeatDim)
-            and out["decision_energy"].shape == (B,)
-            and out["temporal_decision"]["kind_logits"].shape == (B, ModuleDim.TemporalPrimitiveCount)
-            and all(
-                value.grad is not None
-                and torch.isfinite(value.grad).all().item()
-                and torch.count_nonzero(value.grad).item() > 0
-                for value in (
-                    body_pose_feature,
-                    control_feedback_feature,
-                    robot_physical_reference)))
+            plan_latent=torch.randn(
+                batch_size,
+                model.plan_feature_dim,
+                device=self.device,
+                requires_grad=True),
+            subgoal_feature=torch.randn(
+                batch_size,
+                model.subgoal_feature_dim,
+                device=self.device,
+                requires_grad=True),
+            constraint_tokens=torch.randn(
+                batch_size,
+                model.constraint_token_count,
+                model.constraint_token_dim,
+                device=self.device,
+                requires_grad=True),
+            risk_cause_logits=torch.randn(
+                batch_size,
+                failure_count,
+                device=self.device,
+                requires_grad=True),
+            risk_cause_raw_logits=torch.randn(
+                batch_size,
+                failure_count,
+                device=self.device),
+            failure_cause_logits=torch.randn(
+                batch_size,
+                failure_count,
+                device=self.device),
+            failure_cause_raw_logits=torch.randn(
+                batch_size,
+                failure_count,
+                device=self.device),
+            failure_gate_logits=torch.randn(
+                batch_size,
+                device=self.device),
+            failure_gate=torch.sigmoid(torch.randn(
+                batch_size,
+                device=self.device)),
+            invoke_mask=torch.ones(
+                batch_size,
+                device=self.device),
+            same_operator=torch.ones(
+                batch_size,
+                device=self.device),
+            operator_changed=torch.zeros(
+                batch_size,
+                device=self.device),
+            invoke_delta=torch.zeros(
+                batch_size,
+                device=self.device),
+            reference_drift=torch.zeros(
+                batch_size,
+                device=self.device),
+            temporal_logits=torch.randn(
+                batch_size,
+                temporal_count,
+                device=self.device),
+            temporal_reason_logits=torch.randn(
+                batch_size,
+                temporal_count,
+                device=self.device),
+            continue_guard_score=torch.zeros(
+                batch_size,
+                device=self.device),
+            interrupt_guard_score=torch.zeros(
+                batch_size,
+                device=self.device),
+            redispatch_guard_score=torch.zeros(
+                batch_size,
+                device=self.device))
 
-    @staticmethod
-    def MakeCEMDecoupler(robotMorphology: Any) -> nn.Module:
-        class FakeDecoupler(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.topology = (
-                    int(robotMorphology.endpoint_count),
-                    int(robotMorphology.joint_dof_count),
-                    int(robotMorphology.gripper_count))
-                self.internal_features: List[torch.Tensor] = []
-                self.action_encodings: List[torch.Tensor] = []
-
-            def EncodeInternalDecisionFeature(self, feature):
-                if tuple(feature.shape[1:]) != (
-                    ModuleDim.DecisionBeliefDim,
-                ):
-                    raise ValueError("internal decision feature shape is invalid")
-                encoding = torch.tanh(
-                    feature[:, :ModuleDim.EndpointActionEmbedDim])
-                self.internal_features.append(feature.detach().clone())
-                self.action_encodings.append(encoding.detach().clone())
-                return encoding
-
-        return FakeDecoupler()
-
-    @staticmethod
-    def CEMObserverInputsAreIdentity(world: nn.Module) -> bool:
-        return bool(
-            len(world.observer_motions) == len(world.observer_valid)
-            and all(
-                motion.size(-1) == ModuleDim.ObserverMotionDim
-                and torch.count_nonzero(motion[:, :6]).item() == 0
-                and torch.all(motion[:, 6] == 1.0).item()
-                and not valid.any().item()
-                for motion, valid in zip(
-                    world.observer_motions,
-                    world.observer_valid)))
-
-    def TestCEMPlannerUsesUnifiedPrior(self) -> bool:
+    def TestDecisionExtractorRelationshipsAndGradient(self) -> bool:
         try:
-            morphology = self.robot_morphology
+            torch.manual_seed(31)
+            model = self.MakeExtractor()
+            inputs = self.MakeBaseInputs(model)
+            output = model(**inputs)
+            loss = (
+                output["belief"].square().mean()
+                + output["decision_state"].square().mean()
+                + output["latent_control"]["u"].square().mean()
+                + output["option"]["logits"].square().mean())
+            loss.backward()
+            state_gradient = inputs["stateFeat"].grad
+            intent_gradient = inputs["intentFeat"].grad
+            return bool(
+                tuple(output["belief"].shape) == (2, model.belief_dim)
+                and tuple(output["decision_state"].shape) == (
+                    2,
+                    model.dyn_dim)
+                and tuple(output["latent_control"]["u"].shape) == (
+                    2,
+                    model.u_dim)
+                and tuple(output["option"]["logits"].shape) == (
+                    2,
+                    model.num_options)
+                and tuple(output["mapper"]["hidden"].shape) == (
+                    2,
+                    model.mapper_hidden_dim)
+                and state_gradient is not None
+                and intent_gradient is not None
+                and bool(torch.isfinite(state_gradient).all().item())
+                and bool(torch.isfinite(intent_gradient).all().item())
+                and float(state_gradient.abs().sum().item()) > 0.0
+                and float(intent_gradient.abs().sum().item()) > 0.0)
+        except Exception:
+            return False
 
-            class FakeWorld(nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    self.calls = 0
-                    self.action_encodings: List[torch.Tensor] = []
-                    self.observer_motions: List[torch.Tensor] = []
-                    self.observer_valid: List[torch.Tensor] = []
+    def TestNeuroSymbolicRefinementAndGradient(self) -> bool:
+        try:
+            torch.manual_seed(37)
+            model = self.MakeExtractor()
+            inputs = self.MakeBaseInputs(model)
+            base_output = model(**inputs)
+            batch_size = int(inputs["stateFeat"].size(0))
+            symbolic = self.MakeNeuroSymbolic(model, batch_size)
+            scene_feature = torch.randn(
+                batch_size,
+                model.scene_state_feature_dim,
+                device=self.device,
+                requires_grad=True)
+            goal_context = torch.randn(
+                batch_size,
+                model.goal_decision_context_dim,
+                device=self.device,
+                requires_grad=True)
+            body_feature = torch.randn(
+                batch_size,
+                model.body_state_feature_dim,
+                device=self.device,
+                requires_grad=True)
+            feedback_feature = torch.randn(
+                batch_size,
+                model.control_feedback_feature_dim,
+                device=self.device,
+                requires_grad=True)
+            context_feature = torch.randn(
+                batch_size,
+                model.embodiment_context_feature_dim,
+                device=self.device,
+                requires_grad=True)
+            temporal_goal = {
+                "goal_mode_logits": torch.randn(
+                    batch_size,
+                    ModuleDim.TemporalPrimitiveCount,
+                    device=self.device),
+                "goal_timeout_soft_ms": torch.full(
+                    (batch_size,),
+                    250.0,
+                    device=self.device),
+                "goal_timeout_hard_ms": torch.full(
+                    (batch_size,),
+                    500.0,
+                    device=self.device),
+            }
+            refined = model.RefineWithNeuroSymbolic(
+                baseActOut=base_output,
+                neuroSymbolic=symbolic,
+                worldHzx=inputs["worldHzx"],
+                sceneStateFeature=scene_feature,
+                goalDecisionContext=goal_context,
+                temporalGoal=temporal_goal,
+                bodyStateFeature=body_feature,
+                controlFeedbackFeature=feedback_feature,
+                embodimentContextFeature=context_feature)
+            loss = (
+                refined["decision_feature"].square().mean()
+                + refined["decoder_plan_latent"].square().mean()
+                + refined["decoder_subgoal_feature"].square().mean()
+                + refined["decoder_constraint_tokens"].square().mean()
+                + refined["decision_energy"].square().mean())
+            loss.backward()
+            return bool(
+                tuple(refined["decision_feature"].shape) == (
+                    batch_size,
+                    model.belief_dim)
+                and tuple(refined["decoder_plan_latent"].shape) == (
+                    batch_size,
+                    model.plan_feature_dim)
+                and tuple(refined["decoder_subgoal_feature"].shape) == (
+                    batch_size,
+                    model.subgoal_feature_dim)
+                and tuple(refined["decoder_constraint_tokens"].shape) == (
+                    batch_size,
+                    model.constraint_token_count,
+                    model.constraint_token_dim)
+                and symbolic.plan_latent.grad is not None
+                and body_feature.grad is not None
+                and feedback_feature.grad is not None
+                and context_feature.grad is not None
+                and float(symbolic.plan_latent.grad.abs().sum().item()) > 0.0
+                and float(body_feature.grad.abs().sum().item()) > 0.0
+                and float(feedback_feature.grad.abs().sum().item()) > 0.0
+                and float(context_feature.grad.abs().sum().item()) > 0.0)
+        except Exception:
+            return False
 
-                def StepPriorOnly(
-                    self,
-                    h,
-                    z,
-                    x,
-                    actionEnc,
-                    *,
-                    physicalState,
-                    robotPhysicalState,
-                    cameraMotion,
-                    observerMotionValid,
-                    sample=False,):
-                    self.calls += 1
-                    self.action_encodings.append(actionEnc.detach().clone())
-                    self.observer_motions.append(cameraMotion.detach().clone())
-                    self.observer_valid.append(
-                        observerMotionValid.detach().clone())
-                    return {
-                        "r_pred": actionEnc.new_zeros(actionEnc.size(0)),
-                        "d_prob": actionEnc.new_zeros(actionEnc.size(0)),}
+    def TestOptionAndEligibilityState(self) -> bool:
+        try:
+            model = self.MakeExtractor()
+            batch_size = 2
+            model.EnsureB(batch_size)
+            pre = torch.randn(batch_size, model.u_dim, device=self.device)
+            post = torch.randn(batch_size, model.u_dim, device=self.device)
+            model.CommitEligibility(
+                pre,
+                post,
+                torch.tensor([True, False], device=self.device))
+            first_written = float(
+                model.elig_plasticity.trace[0].abs().sum().item()) > 0.0
+            second_empty = float(
+                model.elig_plasticity.trace[1].abs().sum().item()) == 0.0
+            model.ClearInvalidEligibility(torch.tensor(
+                [True, False],
+                device=self.device))
+            cleared = float(
+                model.elig_plasticity.trace.abs().sum().item()) == 0.0
+            prior = model.option_transition_prior(torch.zeros(
+                batch_size,
+                model.num_options,
+                device=self.device))
+            return bool(
+                first_written
+                and second_empty
+                and cleared
+                and tuple(prior.shape) == (batch_size, model.num_options)
+                and bool(torch.isfinite(prior).all().item()))
+        except Exception:
+            return False
 
-            B = 2
-            world = FakeWorld()
-            decoupler = self.MakeCEMDecoupler(morphology)
+    def TestCEMFeatureSearch(self) -> bool:
+        try:
+            torch.manual_seed(41)
             planner = CEMPlanner(
-                worldModel=world,
-                decisionDecoupler=decoupler,
-                N=2,
-                elite=1,
-                iters=1)
-            out = planner.Plan(
-                decisionFeature=torch.zeros(
-                    B, ModuleDim.DecisionBeliefDim),
-                h0=torch.zeros(B, 2),
-                z0=torch.zeros(B, 2),
-                x0=torch.zeros(B, 2),
-                physicalState={"SlotPresence": torch.ones(B, 1)},
-                worldRobotPhysicalEncoding=torch.zeros(B, 2),
+                decisionDim=4,
+                N=48,
+                elite=8,
+                iters=4,
+                temperature=0.5,
+                candidateChunkSize=5)
+            observed_shapes: List[Tuple[int, ...]] = []
+
+            def EvaluateFeatures(features: torch.Tensor) -> torch.Tensor:
+                observed_shapes.append(tuple(features.shape))
+                return -features.square().sum(dim=-1)
+
+            initial_feature = torch.full(
+                (2, 4),
+                2.0,
+                device=self.device)
+            result = planner.Plan(
+                initial_feature,
+                EvaluateFeatures,
                 returnDiagnostics=True)
-            ok = (
-                world.calls == 2
-                and set(out) == {
-                    "decision_feature", "expected_return", "diagnostics"}
-                and set(out["diagnostics"]) == {
-                    "std", "elite_population_return"}
-                and tuple(out["decision_feature"].shape) == (
-                    B, ModuleDim.DecisionBeliefDim)
-                and tuple(out["diagnostics"]["std"].shape) == (
-                    B, ModuleDim.DecisionBeliefDim)
-                and tuple(out["expected_return"].shape) == (B,)
-                and len(decoupler.internal_features)
-                    == len(world.action_encodings)
+            optimized = result["decision_feature"]
+            return bool(
+                observed_shapes
                 and all(
-                    torch.equal(expected, observed)
-                    for expected, observed in zip(
-                        decoupler.action_encodings,
-                        world.action_encodings))
-                and [tuple(value.shape) for value in world.observer_motions]
-                    == [
-                        (B * 2, ModuleDim.ObserverMotionDim),
-                        (B, ModuleDim.ObserverMotionDim)]
-                and self.CEMObserverInputsAreIdentity(world))
-            print(f"CEM unified prior contract {'passed' if ok else 'failed'}.")
-            return bool(ok)
-        except Exception as e:
-            print(f"CEM unified prior contract error: {e}")
+                    len(shape) == 2 and shape[1] == 4
+                    for shape in observed_shapes)
+                and max(shape[0] for shape in observed_shapes) <= 10
+                and tuple(optimized.shape) == (2, 4)
+                and tuple(result["expected_return"].shape) == (2,)
+                and tuple(result["diagnostics"]["std"].shape) == (2, 4)
+                and float(optimized.square().mean().item())
+                < float(initial_feature.square().mean().item()))
+        except Exception:
             return False
 
-    def TestCEMPlannerChunksCandidateBatch(self) -> bool:
+    def TestCEMFeatureValidation(self) -> bool:
         try:
-            morphology = self.MakeRobotMorphology(
-                endpointCount=3,
-                jointDofCount=5,
-                gripperCount=1,
-                observer=False)
-
-            class FakeWorld(nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    self.batch_sizes: List[int] = []
-                    self.observer_motions: List[torch.Tensor] = []
-                    self.observer_valid: List[torch.Tensor] = []
-
-                def StepPriorOnly(
-                    self,
-                    h,
-                    z,
-                    x,
-                    actionEnc,
-                    *,
-                    physicalState,
-                    robotPhysicalState,
-                    cameraMotion,
-                    observerMotionValid,
-                    sample=False,):
-                    self.batch_sizes.append(int(actionEnc.size(0)))
-                    self.observer_motions.append(cameraMotion.detach().clone())
-                    self.observer_valid.append(
-                        observerMotionValid.detach().clone())
-                    assert physicalState["SlotPresence"].size(0) == actionEnc.size(0)
-                    return {
-                        "r_pred": actionEnc.new_zeros(actionEnc.size(0)),
-                        "d_prob": actionEnc.new_zeros(actionEnc.size(0)),}
-
-            B = 2
-            world = FakeWorld()
             planner = CEMPlanner(
-                worldModel=world,
-                decisionDecoupler=self.MakeCEMDecoupler(morphology),
-                N=5,
-                elite=1,
-                iters=1,
-                candidateChunkSize=2)
-            planner.Plan(
-                decisionFeature=torch.zeros(
-                    B, ModuleDim.DecisionBeliefDim),
-                h0=torch.zeros(B, 2),
-                z0=torch.zeros(B, 2),
-                x0=torch.zeros(B, 2),
-                physicalState={"SlotPresence": torch.ones(B, 3)},
-                worldRobotPhysicalEncoding=torch.zeros(B, 2))
-            expected_batch_sizes = [B * 2, B * 2, B, B]
-            ok = (
-                world.batch_sizes == expected_batch_sizes
-                and [int(value.size(0)) for value in world.observer_motions]
-                    == expected_batch_sizes
-                and self.CEMObserverInputsAreIdentity(world))
-            print(f"CEM candidate chunking {'passed' if ok else 'failed'}.")
-            return bool(ok)
-        except Exception as e:
-            print(f"CEM candidate chunking error: {e}")
-            return False
-
-    def TestCEMPlannerUsesPureCandidateActions(self) -> bool:
-        try:
-            morphology = self.MakeRobotMorphology(
-                endpointCount=5,
-                jointDofCount=9,
-                gripperCount=3,
-                observer=True)
-
-            class FakeWorld(nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    self.action_encodings: List[torch.Tensor] = []
-                    self.observer_motions: List[torch.Tensor] = []
-                    self.observer_valid: List[torch.Tensor] = []
-
-                def StepPriorOnly(
-                    self,
-                    h,
-                    z,
-                    x,
-                    actionEnc,
-                    *,
-                    physicalState,
-                    robotPhysicalState,
-                    cameraMotion,
-                    observerMotionValid,
-                    sample=False,):
-                    self.action_encodings.append(actionEnc.detach().clone())
-                    self.observer_motions.append(cameraMotion.detach().clone())
-                    self.observer_valid.append(
-                        observerMotionValid.detach().clone())
-                    return {
-                        "r_pred": actionEnc.new_zeros(actionEnc.size(0)),
-                        "d_prob": actionEnc.new_zeros(actionEnc.size(0)),}
-
-            B = 2
-            decoupler = self.MakeCEMDecoupler(morphology)
-            world = FakeWorld()
-            planner = CEMPlanner(
-                worldModel=world,
-                decisionDecoupler=decoupler,
-                N=3,
-                elite=1,
-                iters=1,
-                candidateChunkSize=2)
-            planner.Plan(
-                decisionFeature=torch.zeros(
-                    B, ModuleDim.DecisionBeliefDim),
-                h0=torch.zeros(B, 2),
-                z0=torch.zeros(B, 2),
-                x0=torch.zeros(B, 2),
-                physicalState={"SlotPresence": torch.ones(B, 1)},
-                worldRobotPhysicalEncoding=torch.zeros(B, 2))
-            expected_batch_sizes = [B * 2, B, B]
-            ok = (
-                [int(feature.size(0)) for feature in decoupler.internal_features]
-                    == expected_batch_sizes
-                and len(world.action_encodings)
-                    == len(decoupler.action_encodings)
-                and all(
-                    torch.equal(expected, observed)
-                    for expected, observed in zip(
-                        decoupler.action_encodings,
-                        world.action_encodings))
-                and self.CEMObserverInputsAreIdentity(world))
-            print(f"CEM pure candidate action encoding {'passed' if ok else 'failed'}.")
-            return bool(ok)
-        except Exception as e:
-            print(f"CEM pure candidate action encoding error: {e}")
-            return False
-
-    def TestCEMPlannerScoresImmediateRewardBeforeDone(self) -> bool:
-        try:
-            morphology = self.MakeRobotMorphology(
-                endpointCount=2,
-                jointDofCount=3,
-                gripperCount=1,
-                observer=False)
-
-            class FakeWorld(nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    self.observer_motions: List[torch.Tensor] = []
-                    self.observer_valid: List[torch.Tensor] = []
-
-                def StepPriorOnly(
-                    self,
-                    h,
-                    z,
-                    x,
-                    actionEnc,
-                    *,
-                    physicalState,
-                    robotPhysicalState,
-                    cameraMotion,
-                    observerMotionValid,
-                    sample=False,):
-                    self.observer_motions.append(cameraMotion.detach().clone())
-                    self.observer_valid.append(
-                        observerMotionValid.detach().clone())
-                    if int(actionEnc.size(0)) == 1:
-                        return {
-                            "r_pred": actionEnc.new_tensor([10.0]),
-                            "d_prob": actionEnc.new_tensor([1.0]),}
-                    return {
-                        "r_pred": actionEnc.new_tensor([1.0, 10.0]),
-                        "d_prob": actionEnc.new_tensor([0.0, 1.0]),}
-
-            torch.manual_seed(7)
-            B = 1
-            decoupler = self.MakeCEMDecoupler(morphology)
-            world = FakeWorld()
-            planner = CEMPlanner(
-                worldModel=world,
-                decisionDecoupler=decoupler,
-                N=2,
-                elite=1,
-                iters=1,
-                momentum=0.0,
-                candidateChunkSize=2)
-            out = planner.Plan(
-                decisionFeature=torch.zeros(
-                    B, ModuleDim.DecisionBeliefDim),
-                h0=torch.zeros(B, 2),
-                z0=torch.zeros(B, 2),
-                x0=torch.zeros(B, 2),
-                physicalState={"SlotPresence": torch.ones(B, 1)},
-                worldRobotPhysicalEncoding=torch.zeros(B, 2))
-            expected_feature = decoupler.internal_features[0][1:2]
-            ok = (
-                torch.allclose(
-                    out["decision_feature"],
-                    expected_feature)
-                and torch.allclose(
-                    out["expected_return"],
-                    out["expected_return"].new_tensor([9.0]))
-                and self.CEMObserverInputsAreIdentity(world))
-            print(f"CEM immediate terminal reward {'passed' if ok else 'failed'}.")
-            return bool(ok)
-        except Exception as e:
-            print(f"CEM immediate terminal reward error: {e}")
-            return False
-
-    def TestCEMPlannerActualTopologies(self) -> bool:
-        try:
-            topologies = (
-                self.MakeRobotMorphology(
-                    endpointCount=2,
-                    jointDofCount=3,
-                    gripperCount=1,
-                    observer=False),
-                self.MakeRobotMorphology(
-                    endpointCount=5,
-                    jointDofCount=9,
-                    gripperCount=3,
-                    observer=True),)
-            decouplers = tuple(
-                DecisionDecouplerV2(
-                    decisionDim=ModuleDim.DecisionBeliefDim,
-                    robotMorphology=morphology)
-                for morphology in topologies)
-            decouplers[1].internal_decision_feature_encoder.load_state_dict(
-                decouplers[0].internal_decision_feature_encoder.state_dict(),
-                strict=True)
-            valid = []
-            outputs = []
-            state_shapes = []
-            for morphology, decoupler in zip(topologies, decouplers):
-                class FakeWorld(nn.Module):
-                    def __init__(self):
-                        super().__init__()
-                        self.observer_motions: List[torch.Tensor] = []
-                        self.observer_valid: List[torch.Tensor] = []
-                        self.action_widths: List[int] = []
-
-                    def StepPriorOnly(
-                        self,
-                        h,
-                        z,
-                        x,
-                        actionEnc,
-                        *,
-                        physicalState,
-                        robotPhysicalState,
-                        cameraMotion,
-                        observerMotionValid,
-                        sample=False,):
-                        self.action_widths.append(int(actionEnc.size(-1)))
-                        self.observer_motions.append(
-                            cameraMotion.detach().clone())
-                        self.observer_valid.append(
-                            observerMotionValid.detach().clone())
-                        return {
-                            "r_pred": actionEnc[:, 0],
-                            "d_prob": actionEnc.new_zeros(actionEnc.size(0)),}
-
-                B = 1
-                world = FakeWorld()
-                planner = CEMPlanner(
-                    worldModel=world,
-                    decisionDecoupler=decoupler,
-                    N=2,
-                    elite=1,
-                    iters=1)
-                torch.manual_seed(23)
-                out = planner.Plan(
-                    decisionFeature=torch.zeros(
-                        B, ModuleDim.DecisionBeliefDim),
-                    h0=torch.zeros(B, 2),
-                    z0=torch.zeros(B, 2),
-                    x0=torch.zeros(B, 2),
-                    physicalState={"SlotPresence": torch.ones(B, 1)},
-                    worldRobotPhysicalEncoding=torch.zeros(B, 2),
-                    returnDiagnostics=True)
-                outputs.append(out)
-                state_shapes.append({
-                    name: tuple(value.shape)
-                    for name, value in planner.state_dict().items()})
-                valid.append(bool(
-                    set(out) == {
-                        "decision_feature", "expected_return", "diagnostics"}
-                    and tuple(out["decision_feature"].shape) == (
-                        B, ModuleDim.DecisionBeliefDim)
-                    and tuple(out["diagnostics"]["std"].shape)
-                        == (B, ModuleDim.DecisionBeliefDim)
-                    and all(
-                        width == ModuleDim.EndpointActionEmbedDim
-                        for width in world.action_widths)
-                    and self.CEMObserverInputsAreIdentity(world)))
-            ok = (
-                all(valid)
-                and state_shapes[0] == state_shapes[1]
-                and torch.equal(
-                    outputs[0]["decision_feature"],
-                    outputs[1]["decision_feature"])
-                and torch.equal(
-                    outputs[0]["diagnostics"]["std"],
-                    outputs[1]["diagnostics"]["std"])
-                and torch.equal(
-                    outputs[0]["expected_return"],
-                    outputs[1]["expected_return"]))
-            print(f"CEM topology-invariant internal contract {'passed' if ok else 'failed'}.")
-            return bool(ok)
-        except Exception as e:
-            print(f"CEM topology-invariant internal contract error: {e}")
-            return False
-
-    def TestCEMPlannerDependenciesAreUnregistered(self) -> bool:
-        try:
-            world = nn.Linear(3, 3)
-            decoupler = nn.Linear(3, 3)
-            planner = CEMPlanner(
-                world,
-                decisionDecoupler=decoupler,
-                N=2,
-                elite=1,
+                decisionDim=3,
+                N=4,
+                elite=2,
                 iters=1)
-            state = planner.state_dict()
-            ok = (
-                planner.wm is world
-                and planner.decision_decoupler is decoupler
-                and "wm" not in planner._modules
-                and "decision_decoupler" not in planner._modules
-                and not any(name.startswith((
-                    "wm.",
-                    "decision_decoupler.",
-                )) for name in state))
-            print(f"CEM unregistered dependencies {'passed' if ok else 'failed'}.")
-            return bool(ok)
-        except Exception as e:
-            print(f"CEM unregistered dependencies error: {e}")
+            invalid_input_rejected = False
+            invalid_score_rejected = False
+            try:
+                planner.Plan(
+                    torch.zeros(3),
+                    lambda value: value.sum(dim=-1))
+            except ValueError:
+                invalid_input_rejected = True
+            try:
+                planner.Plan(
+                    torch.zeros(2, 3),
+                    lambda value: value)
+            except ValueError:
+                invalid_score_rejected = True
+            return bool(invalid_input_rejected and invalid_score_rejected)
+        except Exception:
             return False
 
     def RunAllTests(self) -> Dict[str, bool]:
         return {
-            "DecisionExtractorIOShapes": self.TestDecisionExtractorIOShapes(),
-            "AdaptiveBeliefSourceGate": self.TestAdaptiveBeliefSourceGate(),
-            "LearnedOptionTransitionPrior": self.TestLearnedOptionTransitionPrior(),
-            "EndpointTokensDirectlyConditionLocalAction": self.TestEndpointTokensDirectlyConditionLocalAction(),
-            "EndpointControlTokenDirectlyConditionsLocalAction": self.TestEndpointControlTokenDirectlyConditionsLocalAction(),
-            "WorldPoseOnlyRebasesDecodedTarget": self.TestWorldPoseOnlyRebasesDecodedTarget(),
-            "SeparatedRobotInputsConditionAction": self.TestSeparatedRobotInputsConditionAction(),
-            "EndpointActionEncodingIsStateFree": self.TestEndpointActionEncodingIsStateFree(),
-            "StructuralEnhancementsReceiveActionGradient": self.TestStructuralEnhancementsReceiveActionGradient(),
-            "PredictiveCoreContractsForAnyPrecision": self.TestPredictiveCoreContractsForAnyPrecision(),
-            "EligibilityUsesOldTraceAndReset": self.TestEligibilityUsesOldTraceAndReset(),
-            "OptionSelectionChangesPhysicalAction": self.TestOptionSelectionChangesPhysicalAction(),
-            "PhysicalProjectionAndSafetySemantics": self.TestPhysicalProjectionAndSafetySemantics(),
-            "NeuroSymbolicRefineShapes": self.TestNeuroSymbolicRefineShapes(),
-            "CEMPlannerUsesUnifiedPrior": self.TestCEMPlannerUsesUnifiedPrior(),
-            "CEMPlannerChunksCandidateBatch": self.TestCEMPlannerChunksCandidateBatch(),
-            "CEMPlannerUsesPureCandidateActions": self.TestCEMPlannerUsesPureCandidateActions(),
-            "CEMPlannerScoresImmediateRewardBeforeDone": self.TestCEMPlannerScoresImmediateRewardBeforeDone(),
-            "CEMPlannerActualTopologies": self.TestCEMPlannerActualTopologies(),
-            "CEMPlannerDependenciesAreUnregistered": self.TestCEMPlannerDependenciesAreUnregistered(),}
+            "DecisionExtractorRelationshipsAndGradient": (
+                self.TestDecisionExtractorRelationshipsAndGradient()),
+            "NeuroSymbolicRefinementAndGradient": (
+                self.TestNeuroSymbolicRefinementAndGradient()),
+            "OptionAndEligibilityState": self.TestOptionAndEligibilityState(),
+            "CEMFeatureSearch": self.TestCEMFeatureSearch(),
+            "CEMFeatureValidation": self.TestCEMFeatureValidation(),
+        }

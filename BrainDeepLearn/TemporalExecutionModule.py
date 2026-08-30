@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import SimpleNamespace
-from typing import Any, Dict, Tuple
+from typing import Tuple
 
 import torch
-import torch.nn.functional as F
 
-from DecisionDecoupler import DecisionActionMask, MotionCommand, SAFETY_MARGIN_NAMES
 from FunctionTools import AGICoreModule
-from ModuleMessagerManager import ModuleDim
+from RobotMorphologyModule import (
+    BrainFeedbackPacket,
+    PackedEndEffectorTarget,
+    RobotEmbodimentContractView,
+)
 
 
 OBSERVE = 0
@@ -19,24 +20,531 @@ CANCEL = 3
 FAILSAFE_STOP = 4
 REDISPATCH = 5
 
-TEMPORAL_REASON_NAMES = (
-    "no_slot_probability",
-    "reference_uncertainty",
-    "goal_satisfaction",
-    "active_command_safety_risk",
-    "interrupt_risk",
-    "observation_staleness",
-    "planner_tracking_error",
-    "planner_failure",
+PACKED_TEMPORAL_KIND_NAMES = (
+    "OBSERVE",
+    "DISPATCH",
+    "CONTINUE",
+    "CANCEL",
+    "FAILSAFE_STOP",
+    "REDISPATCH",
 )
 
 
-@dataclass
+@dataclass(frozen=True)
+class PackedTemporalProposal:
+    kind_scores: torch.Tensor
+    same_operator: torch.Tensor
+    operator_changed: torch.Tensor
+    invoke_delta: torch.Tensor
+    reference_drift: torch.Tensor
+    redispatch_score: torch.Tensor
+    interrupt_score: torch.Tensor
+    duration_ms: torch.Tensor
+    soft_timeout_ms: torch.Tensor
+    hard_timeout_ms: torch.Tensor
+    action_epoch: torch.Tensor
+
+    def Validate(self, batchSize: int, device: torch.device) -> None:
+        batch_size = int(batchSize)
+        if (
+            not torch.is_tensor(self.kind_scores)
+            or tuple(self.kind_scores.shape) != (
+                batch_size,
+                len(PACKED_TEMPORAL_KIND_NAMES),
+            )
+            or not self.kind_scores.is_floating_point()
+            or self.kind_scores.device != device
+            or bool(torch.isnan(self.kind_scores).any().item())
+            or bool(torch.isposinf(self.kind_scores).any().item())
+            or not bool(
+                torch.isfinite(self.kind_scores).any(dim=-1).all().item())
+        ):
+            raise ValueError(
+                "packed temporal proposal scores must cover every state")
+        scalar_fields = (
+            self.same_operator,
+            self.operator_changed,
+            self.invoke_delta,
+            self.reference_drift,
+            self.redispatch_score,
+            self.interrupt_score,
+            self.duration_ms,
+            self.soft_timeout_ms,
+            self.hard_timeout_ms,
+        )
+        if any(
+            not torch.is_tensor(value)
+            or tuple(value.shape) != (batch_size,)
+            or not value.is_floating_point()
+            or value.device != device
+            or not bool(torch.isfinite(value).all().item())
+            for value in scalar_fields
+        ):
+            raise ValueError(
+                "packed temporal proposal metadata must match the batch")
+        if any(
+            bool((value < 0.0).any().item())
+            for value in (
+                self.duration_ms,
+                self.soft_timeout_ms,
+                self.hard_timeout_ms,
+            )
+        ):
+            raise ValueError("packed temporal timeouts cannot be negative")
+        if bool((self.soft_timeout_ms > self.hard_timeout_ms).any().item()):
+            raise ValueError(
+                "packed temporal soft timeout cannot exceed hard timeout")
+        if (
+            not torch.is_tensor(self.action_epoch)
+            or tuple(self.action_epoch.shape) != (batch_size,)
+            or self.action_epoch.dtype != torch.long
+            or self.action_epoch.device != device
+            or bool((self.action_epoch < 0).any().item())
+        ):
+            raise ValueError(
+                "packed temporal action epoch must be non-negative")
+
+
+@dataclass(frozen=True)
+class PackedTemporalEvent:
+    cache_executing: torch.Tensor
+    candidate_ready: torch.Tensor
+    redispatch_requested: torch.Tensor
+    cancel_requested: torch.Tensor
+    planner_failed: torch.Tensor
+    plan_reached: torch.Tensor
+    hard_stop: torch.Tensor
+    active_risk: torch.Tensor
+    candidate_risk: torch.Tensor
+
+    def Validate(self, batchSize: int, device: torch.device) -> None:
+        expected_shape = (int(batchSize),)
+        boolean_fields = (
+            self.cache_executing,
+            self.candidate_ready,
+            self.redispatch_requested,
+            self.cancel_requested,
+            self.planner_failed,
+            self.plan_reached,
+            self.hard_stop,
+        )
+        risk_fields = (
+            self.active_risk,
+            self.candidate_risk,
+        )
+        if any(
+            not torch.is_tensor(value)
+            or tuple(value.shape) != expected_shape
+            or value.dtype != torch.bool
+            or value.device != device
+            for value in boolean_fields
+        ):
+            raise ValueError(
+                "packed temporal boolean events must match the feedback batch")
+        if any(
+            not torch.is_tensor(value)
+            or tuple(value.shape) != expected_shape
+            or not value.is_floating_point()
+            or value.device != device
+            or not bool(torch.isfinite(value).all().item())
+            or bool((value < 0.0).any().item())
+            or bool((value > 1.0).any().item())
+            for value in risk_fields
+        ):
+            raise ValueError(
+                "packed temporal risks must be finite normalized batch tensors")
+
+
+@dataclass(frozen=True)
+class PackedTemporalDecision:
+    proposal_scores: torch.Tensor
+    execution_kind_scores: torch.Tensor
+    proposal_kind_id: torch.Tensor
+    kind_id: torch.Tensor
+    kind_names: Tuple[str, ...]
+    override_applied: torch.Tensor
+    proposal_action_epoch: torch.Tensor
+    action_epoch: torch.Tensor
+    duration_ms: torch.Tensor
+    soft_timeout_ms: torch.Tensor
+    hard_timeout_ms: torch.Tensor
+    same_operator: torch.Tensor
+    operator_changed: torch.Tensor
+    invoke_delta: torch.Tensor
+    reference_drift: torch.Tensor
+    redispatch_score: torch.Tensor
+    interrupt_score: torch.Tensor
+    selected_target: PackedEndEffectorTarget
+    candidate_selected: torch.Tensor
+    cache_selected: torch.Tensor
+    hold_requested: torch.Tensor
+    stop_requested: torch.Tensor
+    failsafe: torch.Tensor
+
+
+class PackedTemporalExecutionGate:
+    def __init__(
+        self,
+        contractView: RobotEmbodimentContractView,
+        *,
+        dispatchRiskThreshold: float = 0.5,
+        failsafeRiskThreshold: float = 0.98,
+        ageNormSteps: float = 100.0,
+        stepDurationMs: float = 1.0,
+    ) -> None:
+        if type(contractView) is not RobotEmbodimentContractView:
+            raise TypeError(
+                "packed temporal execution requires a contract view")
+        contractView.Validate()
+        dispatch_threshold = float(dispatchRiskThreshold)
+        failsafe_threshold = float(failsafeRiskThreshold)
+        if not 0.0 <= dispatch_threshold <= 1.0:
+            raise ValueError("dispatch risk threshold must be normalized")
+        if not 0.0 <= failsafe_threshold <= 1.0:
+            raise ValueError("failsafe risk threshold must be normalized")
+        if failsafe_threshold < dispatch_threshold:
+            raise ValueError(
+                "failsafe risk threshold cannot be below dispatch threshold")
+        age_norm_steps = float(ageNormSteps)
+        if not torch.isfinite(torch.tensor(age_norm_steps)) or age_norm_steps <= 0.0:
+            raise ValueError("packed temporal age normalization must be positive")
+        step_duration_ms = float(stepDurationMs)
+        if (
+            not torch.isfinite(torch.tensor(step_duration_ms))
+            or step_duration_ms <= 0.0
+        ):
+            raise ValueError("packed temporal step duration must be positive")
+        self.contract_view = contractView
+        self.dispatch_risk_threshold = dispatch_threshold
+        self.failsafe_risk_threshold = failsafe_threshold
+        self.age_norm_steps = age_norm_steps
+        self.step_duration_ms = step_duration_ms
+
+    def BuildContext(
+        self,
+        activeMask: torch.Tensor,
+        actionAgeSteps: torch.Tensor,
+        noReferenceProb: torch.Tensor,
+        referenceConfidence: torch.Tensor,
+        satisfactionProb: torch.Tensor,
+        safetyRisk: torch.Tensor,
+        candidateSafetyRisk: torch.Tensor,
+        interruptRisk: torch.Tensor,
+        observationFreshness: torch.Tensor,
+        canInterrupt: torch.Tensor,
+        hardStop: torch.Tensor,
+        plannerProgress: torch.Tensor,
+        plannerTrackingError: torch.Tensor,
+        plannerExecuting: torch.Tensor,
+        plannerReached: torch.Tensor,
+        plannerFailed: torch.Tensor,
+    ) -> "TemporalContext":
+        active = activeMask.view(-1)
+        action_age_steps = actionAgeSteps.view(-1)
+        no_reference = noReferenceProb.view(-1)
+        reference_confidence = referenceConfidence.view(-1)
+        satisfaction = satisfactionProb.view(-1)
+        safety = safetyRisk.view(-1)
+        candidate_safety = candidateSafetyRisk.view(-1)
+        interrupt = interruptRisk.view(-1)
+        freshness = observationFreshness.view(-1)
+        can_interrupt = canInterrupt.view(-1)
+        hard_stop = hardStop.view(-1)
+        planner_progress = plannerProgress.view(-1)
+        planner_tracking_error = plannerTrackingError.view(-1)
+        planner_executing = plannerExecuting.view(-1)
+        planner_reached = plannerReached.view(-1)
+        planner_failed = plannerFailed.view(-1)
+        feature = torch.stack((
+            active,
+            action_age_steps / self.age_norm_steps,
+            no_reference,
+            reference_confidence,
+            satisfaction,
+            safety,
+            interrupt,
+            freshness,
+            can_interrupt,
+            hard_stop,
+            active * (1.0 - satisfaction),
+            no_reference * (1.0 - active),
+            interrupt * active,
+            safety * can_interrupt,
+            reference_confidence * freshness,
+            planner_progress,
+            planner_tracking_error,
+            planner_executing,
+            planner_reached,
+            planner_failed,
+        ), dim=-1)
+        return TemporalContext(
+            feat=feature,
+            active_mask=active,
+            action_age_steps=action_age_steps,
+            no_reference_prob=no_reference,
+            reference_confidence=reference_confidence,
+            satisfaction_prob=satisfaction,
+            safety_risk=safety,
+            candidate_safety_risk=candidate_safety,
+            interrupt_risk=interrupt,
+            observation_freshness=freshness,
+            can_interrupt=can_interrupt,
+            hard_stop=hard_stop,
+            planner_progress=planner_progress,
+            planner_tracking_error=planner_tracking_error,
+            planner_executing=planner_executing,
+            planner_reached=planner_reached,
+            planner_failed=planner_failed)
+
+    def ValidateTarget(
+        self,
+        target: PackedEndEffectorTarget,
+        feedback: BrainFeedbackPacket,
+        fieldName: str,
+    ) -> None:
+        if type(target) is not PackedEndEffectorTarget:
+            raise TypeError(fieldName + " must be a PackedEndEffectorTarget")
+        target.Validate(self.contract_view)
+        if target.values.size(0) != feedback.values.size(0):
+            raise ValueError(fieldName + " batch does not match feedback")
+        if target.values.device != feedback.values.device:
+            raise ValueError(fieldName + " device does not match feedback")
+        if target.values.dtype != feedback.values.dtype:
+            raise ValueError(fieldName + " dtype does not match feedback")
+
+    def TargetAvailable(
+        self,
+        target: PackedEndEffectorTarget,
+        feedback: BrainFeedbackPacket,
+    ) -> torch.Tensor:
+        available = (
+            feedback.endpoint_valid
+            & feedback.child_enabled
+        )
+        return ((~target.active) | available).all(dim=-1)
+
+    def TargetCriticalFailure(
+        self,
+        target: PackedEndEffectorTarget,
+        feedback: BrainFeedbackPacket,
+    ) -> torch.Tensor:
+        critical = (
+            ~feedback.endpoint_valid
+            | ~feedback.child_enabled
+        )
+        return (target.active & critical).any(dim=-1)
+
+    def NeutralTarget(
+        self,
+        template: PackedEndEffectorTarget,
+    ) -> PackedEndEffectorTarget:
+        return PackedEndEffectorTarget(
+            values=torch.zeros_like(template.values),
+            active=torch.zeros_like(template.active),
+            contract_id=self.contract_view.contract_id,
+            model_signature=self.contract_view.model_signature,
+            target_version=template.target_version,
+            timestamp=template.timestamp,
+        )
+
+    def Step(
+        self,
+        feedback: BrainFeedbackPacket,
+        candidateTarget: PackedEndEffectorTarget,
+        cachedTarget: PackedEndEffectorTarget,
+        proposal: PackedTemporalProposal,
+        events: PackedTemporalEvent,
+        actionAgeSteps: torch.Tensor,
+    ) -> PackedTemporalDecision:
+        if type(feedback) is not BrainFeedbackPacket:
+            raise TypeError(
+                "packed temporal execution accepts only BrainFeedbackPacket")
+        feedback.Validate(self.contract_view)
+        self.ValidateTarget(candidateTarget, feedback, "candidate target")
+        self.ValidateTarget(cachedTarget, feedback, "cached target")
+        if type(proposal) is not PackedTemporalProposal:
+            raise TypeError(
+                "packed temporal execution requires a learned proposal")
+        if type(events) is not PackedTemporalEvent:
+            raise TypeError("packed temporal execution requires packed events")
+        batch_size = int(feedback.values.size(0))
+        proposal.Validate(batch_size, feedback.values.device)
+        events.Validate(batch_size, feedback.values.device)
+        action_age_steps = actionAgeSteps.reshape(-1)
+        if (
+            tuple(action_age_steps.shape) != (batch_size,)
+            or not action_age_steps.is_floating_point()
+            or action_age_steps.device != feedback.values.device
+            or not bool(torch.isfinite(action_age_steps).all().item())
+            or bool((action_age_steps < 0.0).any().item())
+        ):
+            raise ValueError(
+                "packed temporal action age must match the feedback batch")
+        elapsed_ms = action_age_steps * self.step_duration_ms
+
+        candidate_present = candidateTarget.active.any(dim=-1)
+        cache_present = (
+            events.cache_executing
+            & cachedTarget.active.any(dim=-1)
+        )
+        candidate_available = (
+            events.candidate_ready
+            & candidate_present
+            & self.TargetAvailable(candidateTarget, feedback)
+            & events.candidate_risk.lt(self.dispatch_risk_threshold)
+        )
+        cache_available = self.TargetAvailable(cachedTarget, feedback)
+        active_failure = self.TargetCriticalFailure(cachedTarget, feedback)
+        hard_timeout = (
+            cache_present
+            & proposal.hard_timeout_ms.gt(0.0)
+            & elapsed_ms.ge(proposal.hard_timeout_ms)
+        )
+        soft_timeout = (
+            cache_present
+            & ~hard_timeout
+            & proposal.soft_timeout_ms.gt(0.0)
+            & elapsed_ms.ge(proposal.soft_timeout_ms)
+        )
+
+        legal_states = torch.stack((
+            torch.ones_like(cache_present),
+            ~cache_present & candidate_available,
+            cache_present & cache_available,
+            cache_present,
+            torch.ones_like(cache_present),
+            cache_present & candidate_available,
+        ), dim=-1)
+        execution_kind_scores = proposal.kind_scores.masked_fill(
+            ~legal_states,
+            -torch.inf,
+        )
+        proposal_kind_id = proposal.kind_scores.argmax(dim=-1)
+        kind_id = execution_kind_scores.argmax(dim=-1)
+
+        rule_failsafe = (
+            events.hard_stop
+            | events.active_risk.ge(self.failsafe_risk_threshold)
+            | (cache_present & active_failure)
+            | hard_timeout
+        )
+        rule_cancel = (
+            ~rule_failsafe
+            & cache_present
+            & (
+                events.cancel_requested
+                | events.planner_failed
+                | events.plan_reached
+                | ~cache_available
+                | (soft_timeout & ~candidate_available)
+            )
+        )
+        rule_redispatch = (
+            ~rule_failsafe
+            & ~rule_cancel
+            & cache_present
+            & (events.redispatch_requested | soft_timeout)
+            & candidate_available
+        )
+        kind_id = torch.where(
+            rule_redispatch,
+            torch.full_like(kind_id, REDISPATCH),
+            kind_id,
+        )
+        kind_id = torch.where(
+            rule_cancel,
+            torch.full_like(kind_id, CANCEL),
+            kind_id,
+        )
+        kind_id = torch.where(
+            rule_failsafe,
+            torch.full_like(kind_id, FAILSAFE_STOP),
+            kind_id,
+        )
+
+        dispatch = kind_id.eq(DISPATCH)
+        keep_cache = kind_id.eq(CONTINUE)
+        cancel = kind_id.eq(CANCEL)
+        failsafe = kind_id.eq(FAILSAFE_STOP)
+        redispatch = kind_id.eq(REDISPATCH)
+        observe = kind_id.eq(OBSERVE)
+        neutral = self.NeutralTarget(candidateTarget)
+        candidate_rows = (dispatch | redispatch).unsqueeze(-1)
+        cache_rows = keep_cache.unsqueeze(-1)
+        selected_target = PackedEndEffectorTarget(
+            values=torch.where(
+                candidate_rows,
+                candidateTarget.values,
+                torch.where(
+                    cache_rows,
+                    cachedTarget.values,
+                    neutral.values,
+                ),
+            ),
+            active=torch.where(
+                candidate_rows,
+                candidateTarget.active,
+                torch.where(
+                    cache_rows,
+                    cachedTarget.active,
+                    neutral.active,
+                ),
+            ),
+            contract_id=self.contract_view.contract_id,
+            model_signature=self.contract_view.model_signature,
+            target_version=torch.where(
+                dispatch | redispatch,
+                candidateTarget.target_version,
+                torch.where(
+                    keep_cache,
+                    cachedTarget.target_version,
+                    neutral.target_version)),
+            timestamp=torch.where(
+                dispatch | redispatch,
+                candidateTarget.timestamp,
+                torch.where(
+                    keep_cache,
+                    cachedTarget.timestamp,
+                    neutral.timestamp)),
+        )
+        candidate_selected = dispatch | redispatch
+        next_epoch = (
+            proposal.action_epoch
+            + candidate_selected.to(proposal.action_epoch.dtype)
+        )
+        return PackedTemporalDecision(
+            proposal_scores=proposal.kind_scores,
+            execution_kind_scores=execution_kind_scores,
+            proposal_kind_id=proposal_kind_id,
+            kind_id=kind_id,
+            kind_names=PACKED_TEMPORAL_KIND_NAMES,
+            override_applied=kind_id.ne(proposal_kind_id),
+            proposal_action_epoch=proposal.action_epoch,
+            action_epoch=next_epoch,
+            duration_ms=proposal.duration_ms,
+            soft_timeout_ms=proposal.soft_timeout_ms,
+            hard_timeout_ms=proposal.hard_timeout_ms,
+            same_operator=proposal.same_operator,
+            operator_changed=proposal.operator_changed,
+            invoke_delta=proposal.invoke_delta,
+            reference_drift=proposal.reference_drift,
+            redispatch_score=proposal.redispatch_score,
+            interrupt_score=proposal.interrupt_score,
+            selected_target=selected_target,
+            candidate_selected=candidate_selected,
+            cache_selected=keep_cache,
+            hold_requested=observe,
+            stop_requested=cancel | failsafe,
+            failsafe=failsafe,
+        )
+
+
+@dataclass(frozen=True)
 class TemporalContext:
     feat: torch.Tensor
     active_mask: torch.Tensor
     action_age_steps: torch.Tensor
-    no_slot_prob: torch.Tensor
+    no_reference_prob: torch.Tensor
     reference_confidence: torch.Tensor
     satisfaction_prob: torch.Tensor
     safety_risk: torch.Tensor
@@ -51,81 +559,94 @@ class TemporalContext:
     planner_reached: torch.Tensor
     planner_failed: torch.Tensor
 
-
-@dataclass
-class TemporalDecisionEnvelope:
-    """Learned execution proposal; FAILSAFE_STOP is a software stop request."""
-
-    kind_logits: torch.Tensor
-    execution_kind_scores: torch.Tensor
-    kind_id: torch.Tensor
-    kind_names: Tuple[str, ...]
-    override_applied: torch.Tensor
-    action_id: torch.Tensor
-    action_epoch: torch.Tensor
-    reason_scores: torch.Tensor
-    reason_names: Tuple[str, ...]
-    duration_ms: torch.Tensor
-    soft_timeout_ms: torch.Tensor
-    hard_timeout_ms: torch.Tensor
-    publish_motion_command: torch.Tensor
-    reuse_active_motion_command: torch.Tensor
-    publish_stop_command: torch.Tensor
-    publish_hold_command: torch.Tensor
-    same_operator: torch.Tensor
-    operator_changed: torch.Tensor
-    invoke_delta: torch.Tensor
-    reference_drift: torch.Tensor
-    invoke_drift: torch.Tensor
-    motion_command: MotionCommand
-
-    @property
-    def reason_logits(self) -> torch.Tensor:
-        """Compatibility alias; these values are named evidence scores, not logits."""
-        return self.reason_scores
+    def Validate(
+        self,
+        batchSize: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        B = int(batchSize)
+        if (
+            not torch.is_tensor(self.feat)
+            or tuple(self.feat.shape) != (B, 20)
+            or self.feat.device != device
+            or self.feat.dtype != dtype
+            or not bool(torch.isfinite(self.feat).all().item())
+        ):
+            raise ValueError("temporal context feature is invalid")
+        values = (
+            self.active_mask,
+            self.action_age_steps,
+            self.no_reference_prob,
+            self.reference_confidence,
+            self.satisfaction_prob,
+            self.safety_risk,
+            self.candidate_safety_risk,
+            self.interrupt_risk,
+            self.observation_freshness,
+            self.can_interrupt,
+            self.hard_stop,
+            self.planner_progress,
+            self.planner_tracking_error,
+            self.planner_executing,
+            self.planner_reached,
+            self.planner_failed,
+        )
+        if any(
+            not torch.is_tensor(value)
+            or tuple(value.shape) != (B,)
+            or value.device != device
+            or value.dtype != dtype
+            or not bool(torch.isfinite(value).all().item())
+            for value in values
+        ):
+            raise ValueError("temporal context values are invalid")
+        normalized = (
+            self.active_mask,
+            self.no_reference_prob,
+            self.reference_confidence,
+            self.satisfaction_prob,
+            self.safety_risk,
+            self.candidate_safety_risk,
+            self.interrupt_risk,
+            self.observation_freshness,
+            self.can_interrupt,
+            self.hard_stop,
+            self.planner_progress,
+            self.planner_executing,
+            self.planner_reached,
+            self.planner_failed,
+        )
+        if any(
+            bool((value < 0.0).any().item())
+            or bool((value > 1.0).any().item())
+            for value in normalized
+        ):
+            raise ValueError("temporal context values must be normalized")
+        if (
+            bool((self.action_age_steps < 0.0).any().item())
+            or bool((self.planner_tracking_error < 0.0).any().item())
+        ):
+            raise ValueError("temporal magnitudes cannot be negative")
 
 
 class TemporalExecutionGateExtractor(AGICoreModule):
     def __init__(
         self,
+        contractView: RobotEmbodimentContractView,
         *,
-        robotMorphology: Any,
-        primitiveCount: int = ModuleDim.TemporalPrimitiveCount,
-        contextDim: int = ModuleDim.TemporalContextDim,
-        reasonDim: int = ModuleDim.TemporalReasonDim,
-        actionDim: int = ModuleDim.RobotControlAxisDim,
-        poseDim: int = ModuleDim.DecisionEndpointPoseDim,
-        ageNormSteps: float = 128.0,):
+        dispatchRiskThreshold: float = 0.5,
+        failsafeRiskThreshold: float = 0.98,
+        ageNormSteps: float = 128.0,
+        stepDurationMs: float = 1.0,
+    ) -> None:
         super().__init__()
-        self.primitive_count = int(primitiveCount)
-        self.context_dim = int(contextDim)
-        self.reason_dim = int(reasonDim)
-        self.endpoint_count = int(robotMorphology.endpoint_count)
-        self.gripper_count = int(robotMorphology.gripper_count)
-        self.joint_dof_count = int(robotMorphology.joint_dof_count)
-        self.action_dim = int(actionDim)
-        self.pose_dim = int(poseDim)
-        self.age_norm_steps = float(ageNormSteps)
-        decision_action_mask = DecisionActionMask(
-            endpointCount=self.endpoint_count,
-            actionDim=self.action_dim,
-            robotMorphology=robotMorphology).bool()
-        self.endpoint_names = tuple(robotMorphology.endpoint_names)
-        self.joint_variable_names = tuple(
-            robotMorphology.joint_variable_names)
-        joint_variable_commandable = torch.as_tensor(
-            robotMorphology.joint_variable_commandable,
-            dtype=torch.bool).reshape(self.joint_dof_count)
-        self.register_buffer(
-            "decision_action_mask",
-            decision_action_mask.view(
-                1, self.endpoint_count, self.action_dim),
-            persistent=False)
-        self.register_buffer(
-            "joint_variable_commandable",
-            joint_variable_commandable.view(1, self.joint_dof_count),
-            persistent=False)
- 
+        self.execution_gate = PackedTemporalExecutionGate(
+            contractView=contractView,
+            dispatchRiskThreshold=dispatchRiskThreshold,
+            failsafeRiskThreshold=failsafeRiskThreshold,
+            ageNormSteps=ageNormSteps,
+            stepDurationMs=stepDurationMs)
         self.register_buffer(
             "rule_gain",
             torch.tensor([2.0, 2.0, 2.0, 3.0, 8.0, 3.0]),
@@ -134,30 +655,60 @@ class TemporalExecutionGateExtractor(AGICoreModule):
             "inactive_penalty",
             torch.tensor([4.0, 4.0, 4.0]),
             persistent=True)
-        self.register_buffer("continue_base", torch.tensor(3.0), persistent=True)
-        self.register_buffer("continue_penalty", torch.tensor([
-            1.4,  # invoke_delta
-            1.6,  # reference_drift
-            2.0,  # planner_tracking_error
-            2.0,  # safety_risk
-            1.6,  # satisfaction_prob
-            4.0,  # planner_failed
-            2.0,  # planner_reached
-            1.2,  # stale observation
-            1.5,  # interrupt_risk
-        ]), persistent=True)
+        self.register_buffer(
+            "continue_base",
+            torch.tensor(3.0),
+            persistent=True)
+        self.register_buffer(
+            "continue_penalty",
+            torch.tensor([
+                1.4,
+                1.6,
+                2.0,
+                2.0,
+                1.6,
+                4.0,
+                2.0,
+                1.2,
+                1.5,
+            ]),
+            persistent=True)
+        self.register_buffer(
+            "drift_threshold",
+            torch.tensor(4.0),
+            persistent=True)
 
-        self.register_buffer("drift_threshold", torch.tensor(4.0), persistent=True)
+    @property
+    def ContractView(self) -> RobotEmbodimentContractView:
+        return self.execution_gate.contract_view
 
     @torch.no_grad()
-    def CalibrateDriftThreshold(self, driftSamples: torch.Tensor, quantile: float = 0.95):
-        self.drift_threshold.copy_(torch.quantile(driftSamples.view(-1), quantile))
+    def CalibrateDriftThreshold(
+        self,
+        driftSamples: torch.Tensor,
+        quantile: float = 0.95,
+    ) -> None:
+        samples = driftSamples.reshape(-1)
+        if (
+            samples.numel() < 1
+            or not samples.is_floating_point()
+            or not bool(torch.isfinite(samples).all().item())
+            or bool((samples < 0.0).any().item())
+        ):
+            raise ValueError("drift samples must be finite and non-negative")
+        q = float(quantile)
+        if not 0.0 <= q <= 1.0:
+            raise ValueError("drift quantile must be normalized")
+        calibrated = torch.quantile(samples, q).clamp_min(1e-6)
+        self.drift_threshold.copy_(calibrated.to(
+            device=self.drift_threshold.device,
+            dtype=self.drift_threshold.dtype))
 
     def BuildContext(
         self,
         activeMask: torch.Tensor,
         actionAgeSteps: torch.Tensor,
-        noSlotProb: torch.Tensor,
+        noReferenceProb: torch.Tensor,
         referenceConfidence: torch.Tensor,
         satisfactionProb: torch.Tensor,
         safetyRisk: torch.Tensor,
@@ -170,842 +721,178 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         plannerTrackingError: torch.Tensor,
         plannerExecuting: torch.Tensor,
         plannerReached: torch.Tensor,
-        plannerFailed: torch.Tensor,) -> TemporalContext:
-        active = activeMask.view(-1)
-        action_age_steps = actionAgeSteps.view(-1)
-        no_slot = noSlotProb.view(-1)
-        ref_conf = referenceConfidence.view(-1)
-        satisfied = satisfactionProb.view(-1)
-        safety = safetyRisk.view(-1)
-        candidate_safety = candidateSafetyRisk.view(-1)
-        interrupt = interruptRisk.view(-1)
-        freshness = observationFreshness.view(-1)
-        can_interrupt = canInterrupt.view(-1)
-        hard_stop = hardStop.view(-1)
-        planner_progress = plannerProgress.view(-1)
-        planner_tracking_error = plannerTrackingError.view(-1)
-        planner_executing = plannerExecuting.view(-1)
-        planner_reached = plannerReached.view(-1)
-        planner_failed = plannerFailed.view(-1)
+        plannerFailed: torch.Tensor,
+    ) -> TemporalContext:
+        return self.execution_gate.BuildContext(
+            activeMask=activeMask,
+            actionAgeSteps=actionAgeSteps,
+            noReferenceProb=noReferenceProb,
+            referenceConfidence=referenceConfidence,
+            satisfactionProb=satisfactionProb,
+            safetyRisk=safetyRisk,
+            candidateSafetyRisk=candidateSafetyRisk,
+            interruptRisk=interruptRisk,
+            observationFreshness=observationFreshness,
+            canInterrupt=canInterrupt,
+            hardStop=hardStop,
+            plannerProgress=plannerProgress,
+            plannerTrackingError=plannerTrackingError,
+            plannerExecuting=plannerExecuting,
+            plannerReached=plannerReached,
+            plannerFailed=plannerFailed)
 
-        feat = torch.stack([
-            active,
-            action_age_steps / self.age_norm_steps,
-            no_slot,
-            ref_conf,
-            satisfied,
-            safety,
-            interrupt,
-            freshness,
-            can_interrupt,
-            hard_stop,
-            active * (1.0 - satisfied),
-            no_slot * (1.0 - active),
-            interrupt * active,
-            safety * can_interrupt,
-            ref_conf * freshness,
-            planner_progress,
-            planner_tracking_error,
-            planner_executing,
-            planner_reached,
-            planner_failed,], dim=-1)
-        
-        return TemporalContext(
-            feat=feat,
-            active_mask=active,
-            action_age_steps=action_age_steps,
-            no_slot_prob=no_slot,
-            reference_confidence=ref_conf,
-            satisfaction_prob=satisfied,
-            safety_risk=safety,
-            candidate_safety_risk=candidate_safety,
-            interrupt_risk=interrupt,
-            observation_freshness=freshness,
-            can_interrupt=can_interrupt,
-            hard_stop=hard_stop,
-            planner_progress=planner_progress,
-            planner_tracking_error=planner_tracking_error,
-            planner_executing=planner_executing,
-            planner_reached=planner_reached,
-            planner_failed=planner_failed,)
-
-    def HoldCommand(self, endpointPose: torch.Tensor, template: MotionCommand) -> MotionCommand:
-        B = endpointPose.size(0)
-        decision_tensor = endpointPose.new_zeros(B, self.endpoint_count, self.action_dim)
-        safety_scores = template.safety_scores.clone()
-        safety_scores[:, :2] = 1.0
-        return MotionCommand(
-            decision_tensor=decision_tensor,
-            target_endpoint_pose=endpointPose,
-            endpoint_names=self.endpoint_names,
-            decision_dof_mask=self.decision_action_mask.expand(B, -1, -1),
-            gripper_cmd=template.gripper_cmd,
-            gripper_valid=torch.zeros(
-                B,
-                self.gripper_count,
-                device=endpointPose.device,
-                dtype=torch.bool),
-            mode_logits=template.mode_logits,
-            mode_valid=torch.zeros(B, device=endpointPose.device, dtype=torch.bool),
-            safety_scores=safety_scores,
-            safety_names=template.safety_names,
-            joint_variable_command=endpointPose.new_zeros(
-                B,
-                self.joint_dof_count),
-            joint_variable_command_mask=torch.zeros(
-                B,
-                self.joint_dof_count,
-                device=endpointPose.device,
-                dtype=torch.bool),
-            joint_variable_names=self.joint_variable_names,)
-
-    def SelectCommand(
-        self,
-        candidate: MotionCommand,
-        active: MotionCommand,
-        hold: MotionCommand,
-        kindWeight: torch.Tensor,) -> MotionCommand:
-        w_candidate = kindWeight[:, DISPATCH] + kindWeight[:, REDISPATCH]
-        w_active = kindWeight[:, CONTINUE]
-        w_hold = kindWeight[:, OBSERVE] + kindWeight[:, CANCEL] + kindWeight[:, FAILSAFE_STOP]
-        use_candidate = w_candidate.view(-1, 1, 1)
-        use_active = w_active.view(-1, 1, 1)
-        use_hold = w_hold.view(-1, 1, 1)
-        
-        decision_tensor = (
-            candidate.decision_tensor * use_candidate
-            + active.decision_tensor * use_active
-            + hold.decision_tensor * use_hold
-        ) * self.decision_action_mask.to(
-            device=candidate.decision_tensor.device,
-            dtype=candidate.decision_tensor.dtype)
-        
-        target_pose = (
-            candidate.target_endpoint_pose * use_candidate
-            + active.target_endpoint_pose * use_active
-            + hold.target_endpoint_pose * use_hold)
-        
-        flat_candidate = w_candidate.view(-1, 1)
-        flat_active = w_active.view(-1, 1)
-        flat_hold = w_hold.view(-1, 1)
-        select_candidate = w_candidate.detach() > 0.5
-        select_active = w_active.detach() > 0.5
-        select_hold = w_hold.detach() > 0.5
-        commands = (candidate, active, hold)
-        for command in commands:
-            if tuple(command.joint_variable_command.shape) != (
-                candidate.decision_tensor.size(0),
-                self.joint_dof_count,
-            ):
-                raise ValueError("motion command joint variables have invalid shape")
-            if tuple(command.joint_variable_command_mask.shape) != (
-                candidate.decision_tensor.size(0),
-                self.joint_dof_count,
-            ):
-                raise ValueError("motion command joint variable mask has invalid shape")
-            if tuple(command.joint_variable_names) != self.joint_variable_names:
-                raise ValueError("motion command joint variable names do not match morphology")
-        joint_variable_command = (
-            candidate.joint_variable_command * flat_candidate
-            + active.joint_variable_command * flat_active
-            + hold.joint_variable_command * flat_hold)
-        joint_variable_command_mask = (
-            (
-                (candidate.joint_variable_command_mask
-                 & select_candidate.view(-1, 1))
-                | (active.joint_variable_command_mask
-                   & select_active.view(-1, 1))
-                | (hold.joint_variable_command_mask
-                   & select_hold.view(-1, 1))
-            ) & self.joint_variable_commandable.to(
-                device=candidate.decision_tensor.device))
-        
-        return MotionCommand(
-            decision_tensor=decision_tensor,
-            target_endpoint_pose=target_pose,
-            endpoint_names=self.endpoint_names,
-            decision_dof_mask=self.decision_action_mask.expand(
-                candidate.decision_tensor.size(0), -1, -1),
-            gripper_cmd=candidate.gripper_cmd * use_candidate + active.gripper_cmd * use_active + hold.gripper_cmd * use_hold,
-            gripper_valid=(
-                (candidate.gripper_valid & select_candidate.view(-1, 1))
-                | (active.gripper_valid & select_active.view(-1, 1))
-                | (hold.gripper_valid & select_hold.view(-1, 1))),
-            mode_logits=candidate.mode_logits * flat_candidate + active.mode_logits * flat_active + hold.mode_logits * flat_hold,
-            mode_valid=(
-                (candidate.mode_valid & select_candidate)
-                | (active.mode_valid & select_active)
-                | (hold.mode_valid & select_hold)),
-            safety_scores=candidate.safety_scores * flat_candidate + active.safety_scores * flat_active + hold.safety_scores * flat_hold,
-            safety_names=candidate.safety_names,
-            joint_variable_command=joint_variable_command,
-            joint_variable_command_mask=joint_variable_command_mask,
-            joint_variable_names=self.joint_variable_names,)
-
-    def forward(
+    def RefineProposal(
         self,
         temporalContext: TemporalContext,
-        decisionTemporal: dict,
-        candidateCommand: MotionCommand,
-        activeCommand: MotionCommand,
-        endpointPose: torch.Tensor,
-        actionEpoch: torch.Tensor,
-        invokeDrift: torch.Tensor,) -> TemporalDecisionEnvelope:
-        logits = decisionTemporal["kind_logits"]
+        proposal: PackedTemporalProposal,
+        invokeDrift: torch.Tensor,
+    ) -> PackedTemporalProposal:
+        B = int(proposal.kind_scores.size(0))
+        proposal.Validate(B, proposal.kind_scores.device)
+        temporalContext.Validate(
+            B,
+            proposal.kind_scores.device,
+            proposal.kind_scores.dtype)
+        invoke_drift = invokeDrift.reshape(-1).to(
+            device=proposal.kind_scores.device,
+            dtype=proposal.kind_scores.dtype)
+        if (
+            tuple(invoke_drift.shape) != (B,)
+            or not bool(torch.isfinite(invoke_drift).all().item())
+            or bool((invoke_drift < 0.0).any().item())
+        ):
+            raise ValueError("invoke drift must be finite and non-negative")
+
         active = temporalContext.active_mask
-        same_operator = decisionTemporal["same_operator"].view(-1)
-        operator_changed = decisionTemporal["operator_changed"].view(-1)
-        invoke_delta = decisionTemporal["invoke_delta"].view(-1)
-        reference_drift = decisionTemporal["reference_drift"].view(-1)
- 
-        invoke_drift = invokeDrift.view(-1)
-        drift_signal = (invoke_drift / self.drift_threshold).clamp(0.0, 1.0)
-        observe_needed = temporalContext.no_slot_prob * (1.0 - temporalContext.reference_confidence)
+        drift_signal = (
+            invoke_drift
+            / self.drift_threshold.to(
+                device=invoke_drift.device,
+                dtype=invoke_drift.dtype)
+        ).clamp(0.0, 1.0)
+        observe_needed = (
+            temporalContext.no_reference_prob
+            * (1.0 - temporalContext.reference_confidence))
         continue_gate = (
             active
-            * same_operator
+            * proposal.same_operator
             * temporalContext.planner_executing
             * (1.0 - temporalContext.planner_failed)
             * (1.0 - temporalContext.hard_stop))
-        
         continue_penalty_terms = torch.stack([
-            invoke_delta,
-            reference_drift,
+            proposal.invoke_delta,
+            proposal.reference_drift,
             temporalContext.planner_tracking_error,
             temporalContext.safety_risk,
             temporalContext.satisfaction_prob,
             temporalContext.planner_failed,
             temporalContext.planner_reached,
             1.0 - temporalContext.observation_freshness,
-            temporalContext.interrupt_risk,], dim=-1)
-        
+            temporalContext.interrupt_risk,
+        ], dim=-1)
         continue_penalty = (
             continue_penalty_terms
-            * self.continue_penalty.view(1, -1)).sum(dim=-1)
-        
-        continue_ok = continue_gate * torch.sigmoid(self.continue_base - continue_penalty)
-        
-        cancel_need = active * temporalContext.can_interrupt * torch.maximum(
-            temporalContext.interrupt_risk,
-            temporalContext.safety_risk)
-        
+            * self.continue_penalty.to(
+                device=continue_penalty_terms.device,
+                dtype=continue_penalty_terms.dtype).view(1, -1)
+        ).sum(dim=-1)
+        continue_ok = continue_gate * torch.sigmoid(
+            self.continue_base.to(
+                device=continue_penalty.device,
+                dtype=continue_penalty.dtype)
+            - continue_penalty)
+        cancel_need = (
+            active
+            * temporalContext.can_interrupt
+            * torch.maximum(
+                temporalContext.interrupt_risk,
+                temporalContext.safety_risk))
         redispatch_signal = torch.maximum(
-            decisionTemporal["redispatch_score"],
+            proposal.redispatch_score,
             torch.maximum(
-                torch.maximum(operator_changed, invoke_delta),
+                torch.maximum(proposal.operator_changed, proposal.invoke_delta),
                 torch.maximum(
-                    torch.maximum(drift_signal, reference_drift),
+                    torch.maximum(drift_signal, proposal.reference_drift),
                     torch.maximum(
-                        torch.maximum(temporalContext.planner_tracking_error, temporalContext.planner_failed),
-                        temporalContext.planner_reached * (1.0 - temporalContext.satisfaction_prob)))))
-        
-        redispatch_need = active * redispatch_signal * (1.0 - temporalContext.candidate_safety_risk)
+                        torch.maximum(
+                            temporalContext.planner_tracking_error,
+                            temporalContext.planner_failed),
+                        temporalContext.planner_reached
+                        * (1.0 - temporalContext.satisfaction_prob)))))
+        redispatch_need = (
+            active
+            * redispatch_signal
+            * (1.0 - temporalContext.candidate_safety_risk))
         dispatch_need = (
             (1.0 - active) * temporalContext.reference_confidence
-            + active * temporalContext.satisfaction_prob) * (1.0 - temporalContext.candidate_safety_risk)
-        gain = self.rule_gain
-        inactive_penalty = self.inactive_penalty * (1.0 - active).unsqueeze(-1)
-        
+            + active * temporalContext.satisfaction_prob
+        ) * (1.0 - temporalContext.candidate_safety_risk)
+        gain = self.rule_gain.to(
+            device=proposal.kind_scores.device,
+            dtype=proposal.kind_scores.dtype)
+        inactive_penalty = self.inactive_penalty.to(
+            device=proposal.kind_scores.device,
+            dtype=proposal.kind_scores.dtype) * (1.0 - active).unsqueeze(-1)
         rule_bias = torch.stack([
             gain[0] * observe_needed,
             gain[1] * dispatch_need,
             gain[2] * continue_ok - inactive_penalty[:, 0],
             gain[3] * cancel_need - inactive_penalty[:, 1],
             gain[4] * temporalContext.hard_stop,
-            gain[5] * redispatch_need - inactive_penalty[:, 2],], dim=-1)
-        
-        kind_logits = logits + rule_bias
-        execution_kind_scores = kind_logits.clone()
-        continue_legal = active > 0.5
-        execution_kind_scores[:, CONTINUE] = execution_kind_scores[:, CONTINUE].masked_fill(
-            ~continue_legal,
-            -torch.inf)
-        inactive_mask = active <= 0.5
-        execution_kind_scores[:, CANCEL] = execution_kind_scores[:, CANCEL].masked_fill(
-            inactive_mask,
-            -torch.inf)
-        execution_kind_scores[:, REDISPATCH] = execution_kind_scores[:, REDISPATCH].masked_fill(
-            inactive_mask,
-            -torch.inf)
-        kind_id = execution_kind_scores.argmax(dim=-1)
-        selects_candidate = (kind_id == DISPATCH) | (kind_id == REDISPATCH)
-        selects_active = kind_id == CONTINUE
-        selected_safety_risk = torch.where(
-            selects_candidate,
-            temporalContext.candidate_safety_risk,
-            torch.where(
-                selects_active,
-                temporalContext.safety_risk,
-                torch.zeros_like(temporalContext.safety_risk)))
-        hard_id = kind_id.new_full(kind_id.shape, FAILSAFE_STOP)
-        override_applied = (
-            (temporalContext.hard_stop > 0.5)
-            | (selected_safety_risk > 0.98))
-        kind_id = torch.where(
-            override_applied,
-            hard_id,
-            kind_id)
-        start_mask = ((kind_id == DISPATCH) | (kind_id == REDISPATCH)).to(actionEpoch.dtype)
-        action_id = actionEpoch + start_mask
- 
-        if self.training:
-            kind_soft = F.softmax(execution_kind_scores, dim=-1)
-            kind_hard = torch.zeros_like(kind_soft).scatter_(-1, kind_id.unsqueeze(-1), 1.0)
-            kind_weight = kind_hard + kind_soft - kind_soft.detach()
-        else:
-            kind_weight = torch.zeros_like(kind_logits).scatter_(-1, kind_id.unsqueeze(-1), 1.0)
-        
-        hold_command = self.HoldCommand(endpointPose, candidateCommand)
-        motion_command = self.SelectCommand(candidateCommand, activeCommand, hold_command, kind_weight)
-        publish_motion_command = kind_weight[:, DISPATCH] + kind_weight[:, REDISPATCH]
-        reuse_active_motion_command = kind_weight[:, CONTINUE]
-        publish_stop_command = kind_weight[:, CANCEL] + kind_weight[:, FAILSAFE_STOP]
- 
-        publish_hold_command = kind_weight[:, OBSERVE]
-        reason_scores = torch.stack([
-            temporalContext.no_slot_prob,
-            1.0 - temporalContext.reference_confidence,
-            temporalContext.satisfaction_prob,
-            temporalContext.safety_risk,
-            temporalContext.interrupt_risk,
-            1.0 - temporalContext.observation_freshness,
-            temporalContext.planner_tracking_error,
-            temporalContext.planner_failed,], dim=-1)
-        
-        return TemporalDecisionEnvelope(
-            kind_logits=kind_logits,
-            execution_kind_scores=execution_kind_scores,
-            kind_id=kind_id,
-            kind_names=ModuleDim.TemporalPrimitiveNames,
-            override_applied=override_applied,
-            action_id=action_id,
-            action_epoch=action_id,
-            reason_scores=reason_scores,
-            reason_names=TEMPORAL_REASON_NAMES,
-            duration_ms=decisionTemporal["duration_ms"],
-            soft_timeout_ms=decisionTemporal["soft_timeout_ms"],
-            hard_timeout_ms=decisionTemporal["hard_timeout_ms"],
-            publish_motion_command=publish_motion_command,
-            reuse_active_motion_command=reuse_active_motion_command,
-            publish_stop_command=publish_stop_command,
-            publish_hold_command=publish_hold_command,
-            same_operator=same_operator,
-            operator_changed=operator_changed,
-            invoke_delta=invoke_delta,
-            reference_drift=reference_drift,
-            invoke_drift=invoke_drift,
-            motion_command=motion_command,)
+            gain[5] * redispatch_need - inactive_penalty[:, 2],
+        ], dim=-1)
+        return PackedTemporalProposal(
+            kind_scores=proposal.kind_scores + rule_bias,
+            same_operator=proposal.same_operator,
+            operator_changed=proposal.operator_changed,
+            invoke_delta=proposal.invoke_delta,
+            reference_drift=proposal.reference_drift,
+            redispatch_score=redispatch_signal,
+            interrupt_score=torch.maximum(
+                proposal.interrupt_score,
+                cancel_need),
+            duration_ms=proposal.duration_ms,
+            soft_timeout_ms=proposal.soft_timeout_ms,
+            hard_timeout_ms=proposal.hard_timeout_ms,
+            action_epoch=proposal.action_epoch)
 
-
-class TestTemporalExecutionGateExtractorMTool:
-    def __init__(self, device: torch.device = None):
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        torch.manual_seed(42)
-        endpoint_count = 5
-        gripper_count = 3
-        joint_dof_count = 7
-        observer_index = 2
-        endpoint_task_mask = torch.zeros(
-            endpoint_count,
-            ModuleDim.RobotControlAxisDim,
-            dtype=torch.bool)
-        endpoint_task_mask[:] = True
-        endpoint_task_mask[observer_index, :3] = False
-        joint_variable_commandable = torch.tensor(
-            [True, True, False, True, True, False, True],
-            dtype=torch.bool)
-        self.robot_morphology = SimpleNamespace(
-            endpoint_task_mask=endpoint_task_mask,
-            observer_valid=True,
-            observer_endpoint_index=observer_index,
-            endpoint_names=tuple(
-                f"endpoint_{index}" for index in range(endpoint_count)),
-            endpoint_count=endpoint_count,
-            gripper_names=tuple(
-                f"gripper_{index}" for index in range(gripper_count)),
-            gripper_count=gripper_count,
-            joint_dof_count=joint_dof_count,
-            joint_variable_names=tuple(
-                f"joint_{index}" for index in range(joint_dof_count)),
-            joint_variable_commandable=joint_variable_commandable)
-
-    def MakeGate(self) -> TemporalExecutionGateExtractor:
-        return TemporalExecutionGateExtractor(
-            robotMorphology=self.robot_morphology).to(self.device)
-
-    def MakeEndpointPose(self, B: int) -> torch.Tensor:
-        endpoint_pose = torch.zeros(
-            B,
-            self.robot_morphology.endpoint_count,
-            ModuleDim.DecisionEndpointPoseDim,
-            device=self.device)
-        endpoint_pose[..., 6] = 1.0
-        return endpoint_pose
-
-    def MakeMotionCommand(self, B: int, value: float) -> MotionCommand:
-        endpoint_pose = self.MakeEndpointPose(B)
-        decision_dof_mask = DecisionActionMask(
-            robotMorphology=self.robot_morphology).to(
-                self.device).view(
-                    1,
-                    self.robot_morphology.endpoint_count,
-                    ModuleDim.RobotControlAxisDim).expand(B, -1, -1).bool()
-        joint_mask = self.robot_morphology.joint_variable_commandable.to(
-            self.device).view(1, -1).expand(B, -1)
-        return MotionCommand(
-            decision_tensor=torch.full(
-                (
-                    B,
-                    self.robot_morphology.endpoint_count,
-                    ModuleDim.RobotControlAxisDim),
-                float(value),
-                device=self.device) * decision_dof_mask,
-            target_endpoint_pose=endpoint_pose + float(value) * 0.01,
-            endpoint_names=self.robot_morphology.endpoint_names,
-            decision_dof_mask=decision_dof_mask,
-            gripper_cmd=torch.full((
-                B, self.robot_morphology.gripper_count, 1),
-                float(value), device=self.device),
-            gripper_valid=torch.ones(
-                B,
-                self.robot_morphology.gripper_count,
-                device=self.device,
-                dtype=torch.bool),
-            mode_logits=torch.full((B, ModuleDim.ActTypeDim), float(value), device=self.device),
-            mode_valid=torch.ones(B, device=self.device, dtype=torch.bool),
-            safety_scores=torch.full((B, 5), float(value), device=self.device),
-            safety_names=SAFETY_MARGIN_NAMES,
-            joint_variable_command=torch.full(
-                (B, self.robot_morphology.joint_dof_count),
-                float(value),
-                device=self.device) * joint_mask,
-            joint_variable_command_mask=joint_mask,
-            joint_variable_names=self.robot_morphology.joint_variable_names,)
-
-    def MakeContext(
+    def Step(
         self,
-        gate: TemporalExecutionGateExtractor,
-        B: int,
-        *,
-        active: float = 1.0,
-        satisfied: float = 0.0,
-        trackingError: float = 0.0,
-        safetyRisk: float = 0.0,
-        candidateSafetyRisk: float = 0.0,
-        hardStop: float = 0.0,) -> TemporalContext:
-        return gate.BuildContext(
-            activeMask=torch.full((B,), float(active), device=self.device),
-            actionAgeSteps=torch.ones(B, device=self.device, dtype=torch.long),
-            noSlotProb=torch.zeros(B, device=self.device),
-            referenceConfidence=torch.ones(B, device=self.device),
-            satisfactionProb=torch.full((B,), float(satisfied), device=self.device),
-            safetyRisk=torch.full((B,), float(safetyRisk), device=self.device),
-            candidateSafetyRisk=torch.full((B,), float(candidateSafetyRisk), device=self.device),
-            interruptRisk=torch.zeros(B, device=self.device),
-            observationFreshness=torch.ones(B, device=self.device),
-            canInterrupt=torch.ones(B, device=self.device),
-            hardStop=torch.full((B,), float(hardStop), device=self.device),
-            plannerProgress=torch.zeros(B, device=self.device),
-            plannerTrackingError=torch.full((B,), float(trackingError), device=self.device),
-            plannerExecuting=torch.ones(B, device=self.device),
-            plannerReached=torch.zeros(B, device=self.device),
-            plannerFailed=torch.zeros(B, device=self.device),)
+        feedbackPacket: BrainFeedbackPacket,
+        candidateTarget: PackedEndEffectorTarget,
+        cachedTarget: PackedEndEffectorTarget,
+        temporalContext: TemporalContext,
+        proposal: PackedTemporalProposal,
+        events: PackedTemporalEvent,
+        invokeDrift: torch.Tensor,
+    ) -> PackedTemporalDecision:
+        refined = self.RefineProposal(
+            temporalContext=temporalContext,
+            proposal=proposal,
+            invokeDrift=invokeDrift)
+        return self.execution_gate.Step(
+            feedback=feedbackPacket,
+            candidateTarget=candidateTarget,
+            cachedTarget=cachedTarget,
+            proposal=refined,
+            events=events,
+            actionAgeSteps=temporalContext.action_age_steps)
 
-    def MakeDecisionTemporal(
+    def forward(
         self,
-        B: int,
-        *,
-        sameOperator: float = 1.0,
-        redispatchScore: float = 0.0,
-        requiresGrad: bool = False,) -> Dict[str, torch.Tensor]:
-        kind_logits = torch.zeros(
-            B,
-            ModuleDim.TemporalPrimitiveCount,
-            device=self.device,
-            requires_grad=requiresGrad)
-        return {
-            "kind_logits": kind_logits,
-            "same_operator": torch.full((B,), float(sameOperator), device=self.device),
-            "operator_changed": torch.full((B,), 1.0 - float(sameOperator), device=self.device),
-            "invoke_delta": torch.zeros(B, device=self.device),
-            "reference_drift": torch.zeros(B, device=self.device),
-            "redispatch_score": torch.full((B,), float(redispatchScore), device=self.device),
-            "duration_ms": torch.zeros(B, device=self.device),
-            "soft_timeout_ms": torch.zeros(B, device=self.device),
-            "hard_timeout_ms": torch.zeros(B, device=self.device),}
-
-    def TestBuildContextShapes(self) -> bool:
-        try:
-            B = 3
-            gate = self.MakeGate()
-            ctx = self.MakeContext(gate, B)
-            assert tuple(ctx.feat.shape) == (B, ModuleDim.TemporalContextDim)
-            assert tuple(ctx.active_mask.shape) == (B,)
-            assert tuple(ctx.planner_tracking_error.shape) == (B,)
-            assert tuple(gate.decision_action_mask.shape) == (
-                1,
-                self.robot_morphology.endpoint_count,
-                ModuleDim.RobotControlAxisDim)
-            assert int(gate.decision_action_mask.sum().item()) == int(
-                self.robot_morphology.endpoint_task_mask.sum().item())
-            assert "decision_action_mask" not in gate.state_dict()
-            assert "joint_variable_commandable" not in gate.state_dict()
-            assert torch.isfinite(ctx.feat).all()
-            print("TemporalExecutionGateExtractor BuildContext shape test passed.")
-            return True
-        except Exception as e:
-            print(f"TemporalExecutionGateExtractor BuildContext shape test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestHoldCommandShapes(self) -> bool:
-        try:
-            B = 2
-            gate = self.MakeGate()
-            endpoint_pose = self.MakeEndpointPose(B)
-            template = self.MakeMotionCommand(B, 1.0)
-            hold = gate.HoldCommand(endpoint_pose, template)
-            assert tuple(hold.decision_tensor.shape) == (
-                B,
-                self.robot_morphology.endpoint_count,
-                ModuleDim.RobotControlAxisDim)
-            assert tuple(hold.target_endpoint_pose.shape) == (
-                B,
-                self.robot_morphology.endpoint_count,
-                ModuleDim.DecisionEndpointPoseDim)
-            assert tuple(hold.gripper_valid.shape) == (
-                B, self.robot_morphology.gripper_count)
-            assert tuple(hold.joint_variable_command.shape) == (
-                B, self.robot_morphology.joint_dof_count)
-            assert tuple(hold.joint_variable_command_mask.shape) == (
-                B, self.robot_morphology.joint_dof_count)
-            assert hold.joint_variable_names == (
-                self.robot_morphology.joint_variable_names)
-            assert torch.allclose(hold.decision_tensor, torch.zeros_like(hold.decision_tensor))
-            assert torch.allclose(hold.target_endpoint_pose, endpoint_pose)
-            assert torch.count_nonzero(hold.joint_variable_command) == 0
-            assert torch.count_nonzero(hold.joint_variable_command_mask) == 0
-            assert torch.all(hold.safety_scores[:, :2] == 1.0)
-            assert torch.equal(hold.safety_scores[:, 2:], template.safety_scores[:, 2:])
-            print("TemporalExecutionGateExtractor HoldCommand shape test passed.")
-            return True
-        except Exception as e:
-            print(f"TemporalExecutionGateExtractor HoldCommand shape test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestSelectCommandRoutes(self) -> bool:
-        try:
-            B = 1
-            gate = self.MakeGate()
-            candidate = self.MakeMotionCommand(B, 1.0)
-            active = self.MakeMotionCommand(B, 2.0)
-            hold = self.MakeMotionCommand(B, 3.0)
-            weights = [
-                (DISPATCH, candidate),
-                (REDISPATCH, candidate),
-                (CONTINUE, active),
-                (OBSERVE, hold),
-                (CANCEL, hold),
-                (FAILSAFE_STOP, hold),]
-            for kind, expected in weights:
-                kind_weight = torch.zeros(B, ModuleDim.TemporalPrimitiveCount, device=self.device)
-                kind_weight[:, kind] = 1.0
-                out = gate.SelectCommand(candidate, active, hold, kind_weight)
-                assert torch.allclose(out.decision_tensor, expected.decision_tensor)
-                assert torch.allclose(out.target_endpoint_pose, expected.target_endpoint_pose)
-                assert torch.allclose(
-                    out.joint_variable_command,
-                    expected.joint_variable_command)
-                assert torch.equal(
-                    out.joint_variable_command_mask,
-                    expected.joint_variable_command_mask)
-                assert out.joint_variable_names == expected.joint_variable_names
-            print("TemporalExecutionGateExtractor SelectCommand route test passed.")
-            return True
-        except Exception as e:
-            print(f"TemporalExecutionGateExtractor SelectCommand route test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestForwardShapesAndPublishFlags(self) -> bool:
-        try:
-            B = 2
-            gate = self.MakeGate().eval()
-            endpoint_pose = self.MakeEndpointPose(B)
-            candidate = self.MakeMotionCommand(B, 1.0)
-            active = self.MakeMotionCommand(B, 2.0)
-            ctx = self.MakeContext(gate, B)
-            temporal = self.MakeDecisionTemporal(B)
-            with torch.no_grad():
-                out = gate(
-                    ctx,
-                    temporal,
-                    candidate,
-                    active,
-                    endpoint_pose,
-                    torch.zeros(B, dtype=torch.long, device=self.device),
-                    torch.zeros(B, device=self.device),)
-            assert tuple(out.kind_logits.shape) == (B, ModuleDim.TemporalPrimitiveCount)
-            assert tuple(out.execution_kind_scores.shape) == (B, ModuleDim.TemporalPrimitiveCount)
-            assert tuple(out.kind_id.shape) == (B,)
-            assert out.action_id.dtype == torch.long
-            assert tuple(out.reason_scores.shape) == (B, ModuleDim.TemporalReasonDim)
-            assert len(out.reason_names) == ModuleDim.TemporalReasonDim
-            assert tuple(out.motion_command.decision_tensor.shape) == (
-                B,
-                self.robot_morphology.endpoint_count,
-                ModuleDim.RobotControlAxisDim)
-            assert tuple(out.motion_command.joint_variable_command.shape) == (
-                B, self.robot_morphology.joint_dof_count)
-            flag_sum = (
-                out.publish_motion_command
-                + out.reuse_active_motion_command
-                + out.publish_stop_command
-                + out.publish_hold_command)
-            assert torch.allclose(flag_sum, torch.ones_like(flag_sum))
-            print("TemporalExecutionGateExtractor forward shape/publish flag test passed.")
-            return True
-        except Exception as e:
-            print(f"TemporalExecutionGateExtractor forward shape/publish flag test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestHardStopOverride(self) -> bool:
-        try:
-            B = 2
-            gate = self.MakeGate().eval()
-            endpoint_pose = self.MakeEndpointPose(B)
-            cmd = self.MakeMotionCommand(B, 1.0)
-            ctx = self.MakeContext(gate, B, hardStop=1.0)
-            temporal = self.MakeDecisionTemporal(B)
-            with torch.no_grad():
-                out = gate(
-                    ctx,
-                    temporal,
-                    cmd,
-                    cmd,
-                    endpoint_pose,
-                    torch.zeros(B, dtype=torch.long, device=self.device),
-                    torch.zeros(B, device=self.device),)
-            assert bool((out.kind_id == FAILSAFE_STOP).all().item())
-            assert bool(out.override_applied.all().item())
-            assert bool((out.publish_stop_command == 1.0).all().item())
-            print("TemporalExecutionGateExtractor hard stop override test passed.")
-            return True
-        except Exception as e:
-            print(f"TemporalExecutionGateExtractor hard stop override test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestActionIdStableAcrossContinue(self) -> bool:
-        try:
-            B = 1
-            gate = self.MakeGate().eval()
-            endpoint_pose = self.MakeEndpointPose(B)
-            candidate = self.MakeMotionCommand(B, 1.0)
-            temporal = self.MakeDecisionTemporal(B, sameOperator=1.0)
-            first = gate(
-                self.MakeContext(gate, B, active=0.0),
-                temporal,
-                candidate,
-                candidate,
-                endpoint_pose,
-                torch.zeros(B, device=self.device),
-                torch.zeros(B, device=self.device))
-            second = gate(
-                self.MakeContext(gate, B, active=1.0),
-                temporal,
-                candidate,
-                first.motion_command,
-                endpoint_pose,
-                first.action_epoch,
-                torch.zeros(B, device=self.device))
-            ok = (
-                int(first.kind_id.item()) == DISPATCH
-                and int(second.kind_id.item()) == CONTINUE
-                and float(first.action_id.item()) == 1.0
-                and torch.equal(first.action_id, second.action_id))
-            print(f"TemporalExecutionGateExtractor stable action id {'passed' if ok else 'failed'}.")
-            return bool(ok)
-        except Exception as e:
-            print(f"TemporalExecutionGateExtractor stable action id failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestContinuePenaltyResponse(self) -> bool:
-        try:
-            B = 1
-            gate = self.MakeGate().eval()
-            endpoint_pose = self.MakeEndpointPose(B)
-            cmd = self.MakeMotionCommand(B, 1.0)
-            temporal = self.MakeDecisionTemporal(B)
-            ctx_good = self.MakeContext(gate, B, trackingError=0.0)
-            ctx_bad = self.MakeContext(gate, B, trackingError=1.0)
-            with torch.no_grad():
-                out_good = gate(ctx_good, temporal, cmd, cmd, endpoint_pose, torch.zeros(B, dtype=torch.long, device=self.device), torch.zeros(B, device=self.device))
-                out_bad = gate(ctx_bad, temporal, cmd, cmd, endpoint_pose, torch.zeros(B, dtype=torch.long, device=self.device), torch.zeros(B, device=self.device))
-            assert out_good.kind_logits[0, CONTINUE] > out_bad.kind_logits[0, CONTINUE]
-            print("TemporalExecutionGateExtractor continue penalty response test passed.")
-            return True
-        except Exception as e:
-            print(f"TemporalExecutionGateExtractor continue penalty response test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestInactiveCannotContinue(self) -> bool:
-        try:
-            B = 1
-            gate = self.MakeGate().eval()
-            endpoint_pose = self.MakeEndpointPose(B)
-            command = self.MakeMotionCommand(B, 1.0)
-            temporal = self.MakeDecisionTemporal(B)
-            temporal["kind_logits"][:, CONTINUE] = 100.0
-            out = gate(
-                self.MakeContext(gate, B, active=0.0),
-                temporal,
-                command,
-                command,
-                endpoint_pose,
-                torch.zeros(B, device=self.device),
-                torch.zeros(B, device=self.device))
-            ok = (
-                int(out.kind_id.item()) != CONTINUE
-                and float(out.reuse_active_motion_command.item()) == 0.0)
-            print(f"TemporalExecutionGateExtractor inactive legality {'passed' if ok else 'failed'}.")
-            return bool(ok)
-        except Exception as e:
-            print(f"TemporalExecutionGateExtractor inactive legality failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestBranchSpecificSafety(self) -> bool:
-        try:
-            B = 1
-            gate = self.MakeGate().eval()
-            endpoint_pose = self.MakeEndpointPose(B)
-            candidate = self.MakeMotionCommand(B, 1.0)
-            active = self.MakeMotionCommand(B, 2.0)
-
-            continue_temporal = self.MakeDecisionTemporal(B)
-            continue_temporal["kind_logits"][:, CONTINUE] = 20.0
-            safe_active = gate(
-                self.MakeContext(
-                    gate,
-                    B,
-                    safetyRisk=0.0,
-                    candidateSafetyRisk=0.99),
-                continue_temporal,
-                candidate,
-                active,
-                endpoint_pose,
-                torch.zeros(B, device=self.device),
-                torch.zeros(B, device=self.device))
-            unsafe_active = gate(
-                self.MakeContext(
-                    gate,
-                    B,
-                    safetyRisk=0.99,
-                    candidateSafetyRisk=0.0),
-                continue_temporal,
-                candidate,
-                active,
-                endpoint_pose,
-                torch.zeros(B, device=self.device),
-                torch.zeros(B, device=self.device))
-
-            redispatch_temporal = self.MakeDecisionTemporal(B)
-            redispatch_temporal["kind_logits"][:, REDISPATCH] = 20.0
-            safe_redispatch = gate(
-                self.MakeContext(
-                    gate,
-                    B,
-                    safetyRisk=0.99,
-                    candidateSafetyRisk=0.0),
-                redispatch_temporal,
-                candidate,
-                active,
-                endpoint_pose,
-                torch.zeros(B, device=self.device),
-                torch.zeros(B, device=self.device))
-            unsafe_redispatch = gate(
-                self.MakeContext(
-                    gate,
-                    B,
-                    safetyRisk=0.0,
-                    candidateSafetyRisk=0.99),
-                redispatch_temporal,
-                candidate,
-                active,
-                endpoint_pose,
-                torch.zeros(B, device=self.device),
-                torch.zeros(B, device=self.device))
-            ok = (
-                int(safe_active.kind_id.item()) == CONTINUE
-                and int(unsafe_active.kind_id.item()) == FAILSAFE_STOP
-                and int(safe_redispatch.kind_id.item()) == REDISPATCH
-                and int(unsafe_redispatch.kind_id.item()) == FAILSAFE_STOP)
-            print(f"TemporalExecutionGateExtractor branch safety {'passed' if ok else 'failed'}.")
-            return bool(ok)
-        except Exception as e:
-            print(f"TemporalExecutionGateExtractor branch safety failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestTrainEvalSelectionConsistency(self) -> bool:
-        try:
-            B = 1
-            gate = self.MakeGate()
-            endpoint_pose = self.MakeEndpointPose(B)
-            cmd = self.MakeMotionCommand(B, 1.0)
-            ctx = self.MakeContext(gate, B)
-            temporal = self.MakeDecisionTemporal(B)
-            gate.train()
-            out_train = gate(ctx, temporal, cmd, cmd, endpoint_pose, torch.zeros(B, dtype=torch.long, device=self.device), torch.zeros(B, device=self.device))
-            gate.eval()
-            with torch.no_grad():
-                out_eval = gate(ctx, temporal, cmd, cmd, endpoint_pose, torch.zeros(B, dtype=torch.long, device=self.device), torch.zeros(B, device=self.device))
-            assert torch.equal(out_train.kind_id, out_eval.kind_id)
-            assert torch.allclose(out_train.motion_command.decision_tensor, out_eval.motion_command.decision_tensor)
-            print("TemporalExecutionGateExtractor train/eval selection consistency test passed.")
-            return True
-        except Exception as e:
-            print(f"TemporalExecutionGateExtractor train/eval selection consistency test failed: {type(e).__name__}: {e}")
-            return False
-
-    def TestTrainingGradient(self) -> bool:
-        try:
-            B = 1
-            gate = self.MakeGate().train()
-            endpoint_pose = self.MakeEndpointPose(B)
-            candidate = self.MakeMotionCommand(B, 1.0)
-            active = self.MakeMotionCommand(B, 0.0)
-            ctx = self.MakeContext(gate, B, active=0.0)
-            temporal = self.MakeDecisionTemporal(B, requiresGrad=True)
-            out = gate(
-                ctx,
-                temporal,
-                candidate,
-                active,
-                endpoint_pose,
-                torch.zeros(B, dtype=torch.long, device=self.device),
-                torch.zeros(B, device=self.device),)
-            loss = out.motion_command.decision_tensor.sum()
-            loss.backward()
-            grad = temporal["kind_logits"].grad
-            assert grad is not None
-            assert torch.isfinite(grad).all()
-            assert grad.abs().sum() > 0
-            print("TemporalExecutionGateExtractor training gradient test passed.")
-            return True
-        except Exception as e:
-            print(f"TemporalExecutionGateExtractor training gradient test failed: {type(e).__name__}: {e}")
-            return False
-
-    def RunAll(self) -> Dict[str, bool]:
-        results = {
-            "BuildContextShapes": self.TestBuildContextShapes(),
-            "HoldCommandShapes": self.TestHoldCommandShapes(),
-            "SelectCommandRoutes": self.TestSelectCommandRoutes(),
-            "ForwardShapesAndPublishFlags": self.TestForwardShapesAndPublishFlags(),
-            "HardStopOverride": self.TestHardStopOverride(),
-            "ActionIdStableAcrossContinue": self.TestActionIdStableAcrossContinue(),
-            "ContinuePenaltyResponse": self.TestContinuePenaltyResponse(),
-            "InactiveCannotContinue": self.TestInactiveCannotContinue(),
-            "BranchSpecificSafety": self.TestBranchSpecificSafety(),
-            "TrainEvalSelectionConsistency": self.TestTrainEvalSelectionConsistency(),
-            "TrainingGradient": self.TestTrainingGradient(),}
-        passed = sum(1 for ok in results.values() if ok)
-        print(f"\n[TemporalExecutionGateExtractor Tests] {passed}/{len(results)} passed.")
-        return results
+        feedbackPacket: BrainFeedbackPacket,
+        candidateTarget: PackedEndEffectorTarget,
+        cachedTarget: PackedEndEffectorTarget,
+        temporalContext: TemporalContext,
+        proposal: PackedTemporalProposal,
+        events: PackedTemporalEvent,
+        invokeDrift: torch.Tensor,
+    ) -> PackedTemporalDecision:
+        return self.Step(
+            feedbackPacket=feedbackPacket,
+            candidateTarget=candidateTarget,
+            cachedTarget=cachedTarget,
+            temporalContext=temporalContext,
+            proposal=proposal,
+            events=events,
+            invokeDrift=invokeDrift)

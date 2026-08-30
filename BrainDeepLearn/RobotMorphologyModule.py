@@ -1,2930 +1,2908 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import IntEnum
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Mapping, Optional, Protocol, Sequence, Tuple, Union
 import json
 import math
-import xml.etree.ElementTree as ET
 
 import torch
 
 
-class Realm(IntEnum):
-    SELF_BODY = 0
-    EXTERNAL_PHYSICAL = 1
-    VIRTUAL_CONTENT = 2
-    VISUAL_EFFECT = 3
-    UNKNOWN = 4
+ROBOT_EMBODIMENT_SCHEMA_VERSION = 13
+FEEDBACK_TIMESTAMP_UNIT = "s"
+FEEDBACK_TIMESTAMP_REFERENCE = "monotonic_relative"
 
 
-class Agency(IntEnum):
-    SELF_CAUSED = 0
-    EXTERNAL_CAUSED = 1
-    AUTONOMOUS = 2
-    MIXED = 3
-    UNKNOWN = 4
+class ModelSignatureCompiler:
+    @staticmethod
+    def CanonicalJson(value: Any) -> str:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False)
+
+    @classmethod
+    def Compile(cls, payload: Mapping[str, Any]) -> str:
+        if not isinstance(payload, Mapping):
+            raise TypeError("model signature payload must be a mapping")
+        canonical = cls.CanonicalJson(dict(payload)).encode("utf-8")
+        return sha256(canonical).hexdigest()
+
+    @classmethod
+    def CompileBrainBuild(
+        cls,
+        cognitivePayload: Mapping[str, Any],
+        contractView: Any,
+        schemaVersion: int,
+    ) -> str:
+        if not isinstance(cognitivePayload, Mapping) or not cognitivePayload:
+            raise TypeError("cognitive signature payload must be non-empty")
+        if type(contractView) is not RobotEmbodimentContractView:
+            raise TypeError("brain signature requires a contract view")
+        if type(schemaVersion) is not int or schemaVersion < 1:
+            raise ValueError("brain build schema version must be positive")
+        return cls.Compile({
+            "schema_version": schemaVersion,
+            "cognitive": dict(cognitivePayload),
+            "contract": {
+                "schema_version": contractView.schema_version,
+                "contract_id": contractView.contract_id,
+                "model_shape_id": contractView.model_shape_id,
+                "model_signature": contractView.model_signature,
+            },
+            "embodiment": {
+                name: getattr(contractView.model_shape, name)
+                for name in contractView.model_shape.__dataclass_fields__
+            },
+        })
 
 
-class MotionLayer(IntEnum):
-    OBSERVER_MOTION = 0
-    CARRIER_MOTION = 1
-    ARTICULATION_MOTION = 2
-    SURFACE_CONTENT_MOTION = 3
-    PHOTOMETRIC_CHANGE = 4
+class JointType(IntEnum):
+    FIXED = 0
+    REVOLUTE = 1
+    CONTINUOUS = 2
+    PRISMATIC = 3
 
 
-class OntologyRelation(IntEnum):
-    DISPLAYED_ON = 0
-    HELD_BY = 1
-    MOVING_WITH = 2
-    ATTACHED_TO_SELF = 3
-    CONTACTING_SELF = 4
-    REFLECTED_IN = 5
-    SHADOW_OF = 6
-    OCCLUDES = 7
-    INSIDE_DISPLAY_REGION = 8
-
-
-EntityRealm = Realm
-EntityAgency = Agency
-
-
-REALM_NAMES: Tuple[str, ...] = tuple(item.name.lower() for item in Realm)
-AGENCY_NAMES: Tuple[str, ...] = tuple(item.name.lower() for item in Agency)
-MOTION_LAYER_NAMES: Tuple[str, ...] = tuple(
-    item.name.lower() for item in MotionLayer)
-ONTOLOGY_RELATION_NAMES: Tuple[str, ...] = tuple(
-    item.name.lower() for item in OntologyRelation)
-
-
-CONTROL_DOF_NAMES: Tuple[str, ...] = (
-    "translation_x",
-    "translation_y",
-    "translation_z",
-    "rotation_x",
-    "rotation_y",
-    "rotation_z",
-)
-
-
-JOINT_TYPE_NAMES: Tuple[str, ...] = (
-    "fixed",
-    "revolute",
-    "continuous",
-    "prismatic",
-    "planar",
-    "floating",
-)
-
-
-BODY_ROLE_NAMES: Tuple[str, ...] = (
-    "root",
-    "torso",
-    "head",
-    "arm",
-    "hand",
-    "finger",
-    "leg",
-    "foot",
-    "sensor",
-    "tool",
-    "other",
-)
-
-
-BODY_SIDE_NAMES: Tuple[str, ...] = (
-    "left",
-    "right",
-    "center",
-    "none",
-)
-
-
-BODY_CAPABILITY_NAMES: Tuple[str, ...] = (
-    "manipulation",
-    "support",
-    "locomotion",
-    "grasp",
-    "observe",
-    "contact",
-    "balance",
-)
-
-
-DEFAULT_VIRTUAL_SLOT_COUNT = 32
-
-ENTITY_ONTOLOGY_BASE_DIM = (
-    len(REALM_NAMES)
-    + len(MOTION_LAYER_NAMES)
-    + len(MOTION_LAYER_NAMES) * len(AGENCY_NAMES)
-    + len(AGENCY_NAMES)
-    + 1
-    + 1
-    + 1
-    + 1
-    + 1
-    + 2
-    + 1
-    + 2
-    + 1
-    + 1
-)
-
-
-def EntityOntologyTokenDim(selfPartSemanticDim: int) -> int:
-    if type(selfPartSemanticDim) is not int or selfPartSemanticDim < 1:
-        raise ValueError("selfPartSemanticDim must be a positive integer")
-    return ENTITY_ONTOLOGY_BASE_DIM + selfPartSemanticDim
-
-
-def _ValidateContiguousEnum(enumType) -> None:
-    values = tuple(int(item.value) for item in enumType)
-    expected = tuple(range(len(values)))
-    if values != expected:
-        raise ValueError(
-            f"{enumType.__name__} values must be contiguous from zero: "
-            f"expected {expected}, got {values}")
-
-
-def _ValidateRobotEntityOntology() -> None:
-    for enum_type in (Realm, Agency, MotionLayer, OntologyRelation):
-        _ValidateContiguousEnum(enum_type)
-
-    if not (
-        len(Realm) == 5
-        and len(Agency) == 5
-        and len(MotionLayer) == 5
-        and len(OntologyRelation) == 9
-    ):
-        raise ValueError("entity-motion ontology cardinalities changed")
-
-    expected_names = {
-        Realm: (
-            "self_body",
-            "external_physical",
-            "virtual_content",
-            "visual_effect",
-            "unknown"),
-        Agency: (
-            "self_caused",
-            "external_caused",
-            "autonomous",
-            "mixed",
-            "unknown"),
-        MotionLayer: (
-            "observer_motion",
-            "carrier_motion",
-            "articulation_motion",
-            "surface_content_motion",
-            "photometric_change"),
-        OntologyRelation: (
-            "displayed_on",
-            "held_by",
-            "moving_with",
-            "attached_to_self",
-            "contacting_self",
-            "reflected_in",
-            "shadow_of",
-            "occludes",
-            "inside_display_region"),
-    }
-    for enum_type, names in expected_names.items():
-        actual = tuple(item.name.lower() for item in enum_type)
-        if actual != names:
-            raise ValueError(
-                f"{enum_type.__name__} stable names changed: "
-                f"expected {names}, got {actual}")
-
-    if CONTROL_DOF_NAMES != (
-        "translation_x",
-        "translation_y",
-        "translation_z",
-        "rotation_x",
-        "rotation_y",
-        "rotation_z",
-    ):
-        raise ValueError("self-body control-axis order changed")
-    if EntityOntologyTokenDim(1) != ENTITY_ONTOLOGY_BASE_DIM + 1:
-        raise ValueError("entity ontology token dimension is invalid")
-
-    if DEFAULT_VIRTUAL_SLOT_COUNT != 32:
-        raise ValueError("the virtual-content slot budget must remain 32")
-
-
-_ValidateRobotEntityOntology()
-
-
-ROBOT_MORPHOLOGY_SCHEMA_VERSION = 3
-ROBOT_MORPHOLOGY_PARSER_VERSION = 5
-ROBOT_MODEL_CONTRACT_VERSION = 7
+class EndEffectorType(IntEnum):
+    WRIST = 0
+    FINGERTIP = 1
+    TOOL = 2
+    SENSOR_ACTUATOR = 3
+    OTHER = 4
 
 
 @dataclass(frozen=True)
-class CompiledRobotMorphology:
-    description_id: str
-    model_contract_id: str
-    adapter_id: str
+class PackedLayout:
+    offsets: Tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.offsets or self.offsets[0] != 0:
+            raise ValueError("packed offsets must start at zero")
+        if any(type(value) is not int for value in self.offsets):
+            raise TypeError("packed offsets must be integers")
+        if any(
+            right < left
+            for left, right in zip(self.offsets[:-1], self.offsets[1:])
+        ):
+            raise ValueError("packed offsets must be monotonic")
+
+    @property
+    def SlotCount(self) -> int:
+        return len(self.offsets) - 1
+
+    @property
+    def PackedDim(self) -> int:
+        return self.offsets[-1]
+
+    def Width(self, slotIndex: int) -> int:
+        index = int(slotIndex)
+        if index < 0 or index >= self.SlotCount:
+            raise IndexError("packed slot index is out of range")
+        return self.offsets[index + 1] - self.offsets[index]
+
+    def Slice(self, slotIndex: int) -> slice:
+        index = int(slotIndex)
+        self.Width(index)
+        return slice(self.offsets[index], self.offsets[index + 1])
+
+    @classmethod
+    def FromWidths(cls, widths: Sequence[int]) -> "PackedLayout":
+        offsets = [0]
+        for width in widths:
+            if type(width) is not int or width < 0:
+                raise ValueError("packed widths must be non-negative integers")
+            offsets.append(offsets[-1] + width)
+        return cls(tuple(offsets))
+
+
+@dataclass(frozen=True)
+class PackedView:
+    source_slot_count: int
+    indices: Tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.source_slot_count) is not int or self.source_slot_count < 0:
+            raise ValueError("packed view source count must be non-negative")
+        if any(type(index) is not int for index in self.indices):
+            raise TypeError("packed view indices must be integers")
+        if len(set(self.indices)) != len(self.indices):
+            raise ValueError("packed view indices must be unique")
+        if any(
+            index < 0 or index >= self.source_slot_count
+            for index in self.indices
+        ):
+            raise ValueError("packed view index is out of range")
+
+@dataclass(frozen=True)
+class PackedTensor:
+    values: Tuple[float, ...]
+    offsets: Tuple[int, ...]
+    shapes: Tuple[Tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        layout = PackedLayout(self.offsets)
+        if layout.SlotCount != len(self.shapes):
+            raise ValueError("packed tensor shape count is inconsistent")
+        if layout.PackedDim != len(self.values):
+            raise ValueError("packed tensor value count is inconsistent")
+        if any(not math.isfinite(float(value)) for value in self.values):
+            raise ValueError("packed tensor values must be finite")
+        for index, shape in enumerate(self.shapes):
+            if (
+                len(shape) != 2
+                or any(type(value) is not int or value < 0 for value in shape)
+                or shape[0] * shape[1] != layout.Width(index)
+            ):
+                raise ValueError("packed tensor matrix shape is invalid")
+
+    def Matrix(
+        self,
+        slotIndex: int,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        index = int(slotIndex)
+        if index < 0 or index >= len(self.shapes):
+            raise IndexError("packed tensor slot index is out of range")
+        start = self.offsets[index]
+        end = self.offsets[index + 1]
+        return torch.tensor(
+            self.values[start:end],
+            device=device,
+            dtype=dtype).reshape(self.shapes[index])
+
+    @classmethod
+    def FromMatrices(
+        cls,
+        matrices: Sequence[Sequence[Sequence[float]]],
+    ) -> "PackedTensor":
+        values = []
+        widths = []
+        shapes = []
+        for matrix in matrices:
+            rows = tuple(tuple(float(value) for value in row) for row in matrix)
+            if not rows or any(len(row) != len(rows[0]) for row in rows):
+                raise ValueError("packed matrices must be non-empty rectangular matrices")
+            flat = tuple(value for row in rows for value in row)
+            if any(not math.isfinite(value) for value in flat):
+                raise ValueError("packed matrices must be finite")
+            values.extend(flat)
+            widths.append(len(flat))
+            shapes.append((len(rows), len(rows[0])))
+        layout = PackedLayout.FromWidths(widths)
+        return cls(tuple(values), layout.offsets, tuple(shapes))
+
+
+@dataclass(frozen=True)
+class EmbodimentShape:
+    joint_token_count: int
+    joint_static_descriptor_dim: int
+    joint_feedback_packed_dim: int
+    end_effector_token_count: int
+    end_effector_static_descriptor_dim: int
+    end_effector_target_packed_dim: int
+    hierarchy_edge_count: int
+    perception_view_dim: int
+
+    def __post_init__(self) -> None:
+        for name in self.__dataclass_fields__:
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"embodiment shape {name} must be non-negative")
+        if self.joint_token_count < 1:
+            raise ValueError("embodiment must contain joint coordinates")
+        if self.end_effector_token_count < 1:
+            raise ValueError("embodiment must contain end effectors")
+        if self.joint_static_descriptor_dim < 1:
+            raise ValueError("joint static descriptors must be non-empty")
+        if self.end_effector_static_descriptor_dim < 1:
+            raise ValueError("end-effector static descriptors must be non-empty")
+        if self.joint_feedback_packed_dim < 1:
+            raise ValueError("joint feedback encoding must be non-empty")
+
+@dataclass(frozen=True)
+class UrdfJointDescription:
+    joint_id: str
+    joint_type: JointType
+    parent_link_id: str
+    child_link_id: str
+    parent_joint_id: Optional[str]
+    origin_translation: Tuple[float, float, float]
+    origin_quaternion_xyzw: Tuple[float, float, float, float]
+    translation_axis: Tuple[float, float, float]
+    rotation_axis: Tuple[float, float, float]
+    position_lower: float
+    position_upper: float
+    velocity_limit: float
+    periodic: bool
+
+    def __post_init__(self) -> None:
+        RobotMorphologyModule.ValidateIdentifier(self.joint_id, "joint_id")
+        if type(self.joint_type) is not JointType:
+            raise TypeError("joint_type must be JointType")
+        RobotMorphologyModule.ValidateIdentifier(self.parent_link_id, "parent_link_id")
+        RobotMorphologyModule.ValidateIdentifier(self.child_link_id, "child_link_id")
+        if self.parent_joint_id is not None:
+            RobotMorphologyModule.ValidateIdentifier(self.parent_joint_id, "parent_joint_id")
+            if self.parent_joint_id == self.joint_id:
+                raise ValueError("a joint cannot be its own parent")
+        RobotMorphologyModule.ValidateFiniteTuple(self.origin_translation, 3, "origin_translation")
+        quaternion = RobotMorphologyModule.ValidateFiniteTuple(
+            self.origin_quaternion_xyzw, 4, "origin_quaternion_xyzw")
+        if abs(sum(value * value for value in quaternion) - 1.0) > 1e-6:
+            raise ValueError("origin_quaternion_xyzw must be a unit quaternion")
+        translation = RobotMorphologyModule.ValidateFiniteTuple(
+            self.translation_axis, 3, "translation_axis")
+        rotation = RobotMorphologyModule.ValidateFiniteTuple(
+            self.rotation_axis, 3, "rotation_axis")
+        translationNorm = math.sqrt(sum(value * value for value in translation))
+        rotationNorm = math.sqrt(sum(value * value for value in rotation))
+        if self.joint_type is JointType.FIXED:
+            if translationNorm > 1e-12 or rotationNorm > 1e-12:
+                raise ValueError("fixed joints cannot expose a motion axis")
+        elif self.joint_type is JointType.PRISMATIC:
+            if abs(translationNorm - 1.0) > 1e-6 or rotationNorm > 1e-12:
+                raise ValueError("prismatic joints require one translation axis")
+        else:
+            if abs(rotationNorm - 1.0) > 1e-6 or translationNorm > 1e-12:
+                raise ValueError("rotational joints require one rotation axis")
+        for value in (
+            self.position_lower,
+            self.position_upper,
+            self.velocity_limit,
+        ):
+            if not math.isfinite(float(value)):
+                raise ValueError("joint limits must be finite")
+        if float(self.position_lower) >= float(self.position_upper):
+            raise ValueError("joint position limits must be ordered")
+        if float(self.velocity_limit) <= 0.0:
+            raise ValueError("joint velocity limit must be positive")
+        if type(self.periodic) is not bool:
+            raise TypeError("joint periodic flag must be boolean")
+        if self.periodic and self.joint_type not in (
+            JointType.REVOLUTE,
+            JointType.CONTINUOUS,
+        ):
+            raise ValueError("only rotational joints can be periodic")
+
+
+JointDefinition = UrdfJointDescription
+
+
+@dataclass(frozen=True)
+class SrdfEndEffectorDescription:
+    effector_id: str
+    effector_type: EndEffectorType
+    parent_effector_id: Optional[str]
+    joint_ids: Tuple[str, ...]
+    translation_basis: Tuple[Tuple[float, ...], ...]
+    rotation_basis: Tuple[Tuple[float, ...], ...]
+    target_lower: Tuple[float, ...]
+    target_upper: Tuple[float, ...]
+    terminal_translation: Tuple[float, float, float]
+    terminal_quaternion_xyzw: Tuple[float, float, float, float]
+    reference_frame_id: str
+    is_perception_slot: bool
+    progress_enter: float
+    progress_exit: float
+    dwell_cycles: int
+    translation_error_scale: float = 1.0
+    rotation_error_scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        RobotMorphologyModule.ValidateIdentifier(self.effector_id, "effector_id")
+        if type(self.effector_type) is not EndEffectorType:
+            raise TypeError("effector_type must be EndEffectorType")
+        if self.parent_effector_id is not None:
+            RobotMorphologyModule.ValidateIdentifier(self.parent_effector_id, "parent_effector_id")
+            if self.parent_effector_id == self.effector_id:
+                raise ValueError("an end effector cannot parent itself")
+        if not self.joint_ids:
+            raise ValueError("an end effector must reference a joint chain")
+        if any(type(value) is not str or not value for value in self.joint_ids):
+            raise ValueError("end-effector joint identifiers must be non-empty")
+        if len(set(self.joint_ids)) != len(self.joint_ids):
+            raise ValueError("end-effector joint identifiers must be unique")
+        translation = RobotMorphologyModule.ValidateBasis(self.translation_basis, "translation_basis")
+        rotation = RobotMorphologyModule.ValidateBasis(self.rotation_basis, "rotation_basis")
+        targetDim = len(translation[0]) + len(rotation[0])
+        if targetDim < 1:
+            raise ValueError("an end effector must expose a target coordinate")
+        lower = RobotMorphologyModule.ValidateFiniteTuple(
+            self.target_lower,
+            targetDim,
+            "target_lower")
+        upper = RobotMorphologyModule.ValidateFiniteTuple(
+            self.target_upper,
+            targetDim,
+            "target_upper")
+        if any(
+            lowerValue >= upperValue
+            for lowerValue, upperValue in zip(lower, upper)
+        ):
+            raise ValueError("end-effector target limits must be ordered")
+        RobotMorphologyModule.ValidateFiniteTuple(
+            self.terminal_translation, 3, "terminal_translation")
+        quaternion = RobotMorphologyModule.ValidateFiniteTuple(
+            self.terminal_quaternion_xyzw, 4, "terminal_quaternion_xyzw")
+        if abs(sum(value * value for value in quaternion) - 1.0) > 1e-6:
+            raise ValueError("terminal_quaternion_xyzw must be a unit quaternion")
+        RobotMorphologyModule.ValidateIdentifier(self.reference_frame_id, "reference_frame_id")
+        if type(self.is_perception_slot) is not bool:
+            raise TypeError("is_perception_slot must be boolean")
+        if self.is_perception_slot:
+            if len(translation[0]) != 0 or len(rotation[0]) < 1:
+                raise ValueError("perception actuators must be pure rotation")
+            if self.effector_type is not EndEffectorType.SENSOR_ACTUATOR:
+                raise ValueError("perception actuators require sensor semantics")
+        if (
+            not math.isfinite(float(self.progress_enter))
+            or not math.isfinite(float(self.progress_exit))
+            or float(self.progress_enter) <= 0.0
+            or float(self.progress_exit) <= float(self.progress_enter)
+        ):
+            raise ValueError("progress thresholds must define positive hysteresis")
+        if type(self.dwell_cycles) is not int or self.dwell_cycles < 1:
+            raise ValueError("dwell_cycles must be a positive integer")
+        if (
+            not math.isfinite(float(self.translation_error_scale))
+            or not math.isfinite(float(self.rotation_error_scale))
+            or float(self.translation_error_scale) <= 0.0
+            or float(self.rotation_error_scale) <= 0.0
+        ):
+            raise ValueError("end-effector error scales must be positive")
+
+    @property
+    def TargetDim(self) -> int:
+        return len(self.translation_basis[0]) + len(self.rotation_basis[0])
+
+
+EndEffector = SrdfEndEffectorDescription
+
+
+@dataclass(frozen=True)
+class PerceptionCalibrationBinding:
+    component_id: str
+    calibration_id: str
+    frame_id: str
+    projection_matrix: Tuple[Tuple[float, ...], ...]
+    reference_size: Tuple[int, int]
+    primary: bool
+
+    def __post_init__(self) -> None:
+        RobotMorphologyModule.ValidateIdentifier(self.component_id, "component_id")
+        RobotMorphologyModule.ValidateIdentifier(self.calibration_id, "calibration_id")
+        RobotMorphologyModule.ValidateIdentifier(self.frame_id, "frame_id")
+        matrix = tuple(
+            tuple(float(value) for value in row)
+            for row in self.projection_matrix)
+        if (
+            len(matrix) != 3
+            or any(len(row) != 3 for row in matrix)
+            or any(not math.isfinite(value) for row in matrix for value in row)
+            or matrix[0][0] <= 0.0
+            or matrix[1][1] <= 0.0
+            or matrix[2] != (0.0, 0.0, 1.0)
+        ):
+            raise ValueError("perception projection must be a calibrated matrix")
+        if (
+            len(self.reference_size) != 2
+            or any(type(value) is not int or value < 1 for value in self.reference_size)
+        ):
+            raise ValueError("perception reference size must be positive")
+        if type(self.primary) is not bool:
+            raise TypeError("perception primary flag must be boolean")
+
+
+@dataclass(frozen=True)
+class PerceptionProjectionView:
+    calibration_id: str
+    reference_frame_id: str
+    projection_matrix: Tuple[Tuple[float, ...], ...]
+    reference_size: Tuple[int, int]
+
+
+@dataclass(frozen=True)
+class UrdfRobotDescription:
     robot_name: str
-    node_names: Tuple[str, ...]
-    joint_names: Tuple[str, ...]
-    joint_variable_names: Tuple[str, ...]
-    group_names: Tuple[str, ...]
-    endpoint_names: Tuple[str, ...]
-    gripper_names: Tuple[str, ...]
-    sensor_names: Tuple[str, ...]
-    sensor_types: Tuple[str, ...]
-    node_count: int
+    description_id: str
+    joints: Tuple[UrdfJointDescription, ...]
+
+    def __post_init__(self) -> None:
+        RobotMorphologyModule.ValidateIdentifier(self.robot_name, "robot_name")
+        RobotMorphologyModule.ValidateIdentifier(self.description_id, "description_id")
+        if not self.joints:
+            raise ValueError("URDF description must expose joint coordinates")
+        if any(type(value) is not UrdfJointDescription for value in self.joints):
+            raise TypeError("URDF joints must be UrdfJointDescription values")
+        identifiers = tuple(value.joint_id for value in self.joints)
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("URDF joint identifiers must be unique")
+
+
+@dataclass(frozen=True)
+class SrdfSemanticDescription:
+    robot_name: str
+    description_id: str
+    semantic_definition_id: str
+    end_effectors: Tuple[SrdfEndEffectorDescription, ...]
+    perception_calibrations: Tuple[PerceptionCalibrationBinding, ...] = ()
+
+    def __post_init__(self) -> None:
+        RobotMorphologyModule.ValidateIdentifier(self.robot_name, "robot_name")
+        RobotMorphologyModule.ValidateIdentifier(self.description_id, "description_id")
+        RobotMorphologyModule.ValidateIdentifier(
+            self.semantic_definition_id, "semantic_definition_id")
+        if not self.end_effectors:
+            raise ValueError("SRDF description must expose end effectors")
+        if any(
+            type(value) is not SrdfEndEffectorDescription
+            for value in self.end_effectors
+        ):
+            raise TypeError("SRDF end effectors have the wrong type")
+
+
+class UrdfReaderProtocol(Protocol):
+    def Read(self, source: Union[str, Path]) -> UrdfRobotDescription:
+        ...
+
+
+class SrdfReaderProtocol(Protocol):
+    def Read(self, source: Union[str, Path]) -> SrdfSemanticDescription:
+        ...
+
+
+@dataclass(frozen=True)
+class RobotDefinition:
+    profile_id: str
+    description_id: str
+    semantic_definition_id: str
+    adapter_id: str
+    joints: Tuple[JointDefinition, ...]
+    end_effectors: Tuple[EndEffector, ...]
+    perception_calibrations: Tuple[PerceptionCalibrationBinding, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in (
+            "profile_id",
+            "description_id",
+            "semantic_definition_id",
+            "adapter_id",
+        ):
+            RobotMorphologyModule.ValidateIdentifier(getattr(self, name), name)
+        if not self.joints or any(
+            type(value) is not JointDefinition for value in self.joints
+        ):
+            raise TypeError("robot joints must be JointDefinition values")
+        if any(value.joint_type is JointType.FIXED for value in self.joints):
+            raise ValueError(
+                "fixed URDF transforms must be folded before coordinate compilation")
+        if not self.end_effectors or any(
+            type(value) is not EndEffector for value in self.end_effectors
+        ):
+            raise TypeError("robot end effectors must be EndEffector values")
+        jointIds = tuple(value.joint_id for value in self.joints)
+        effectorIds = tuple(value.effector_id for value in self.end_effectors)
+        if len(set(jointIds)) != len(jointIds):
+            raise ValueError("robot joint identifiers must be unique")
+        if len(set(effectorIds)) != len(effectorIds):
+            raise ValueError("robot end-effector identifiers must be unique")
+        jointSet = set(jointIds)
+        effectorSet = set(effectorIds)
+        if any(
+            jointId not in jointSet
+            for effector in self.end_effectors
+            for jointId in effector.joint_ids
+        ):
+            raise ValueError("end-effector chains must reference robot joints")
+        if any(
+            effector.parent_effector_id is not None
+            and effector.parent_effector_id not in effectorSet
+            for effector in self.end_effectors
+        ):
+            raise ValueError("end-effector parents must reference end effectors")
+        jointById = {value.joint_id: value for value in self.joints}
+        effectorById = {
+            value.effector_id: value for value in self.end_effectors}
+        for effector in self.end_effectors:
+            chain = tuple(jointById[value] for value in effector.joint_ids)
+            if chain[0].parent_joint_id is not None or any(
+                child.parent_joint_id != parent.joint_id
+                for parent, child in zip(chain[:-1], chain[1:])
+            ):
+                raise ValueError("end-effector joint chains must be continuous from a root")
+            if effector.parent_effector_id is not None:
+                parentChain = effectorById[
+                    effector.parent_effector_id].joint_ids
+                if effector.joint_ids[:len(parentChain)] != parentChain:
+                    raise ValueError("child end-effector chains must extend their parent chain")
+            if (
+                effector.reference_frame_id != "world"
+                and (
+                    effector.reference_frame_id not in effectorSet
+                    or effector.reference_frame_id == effector.effector_id)
+            ):
+                raise ValueError("end-effector reference frames must be world or another endpoint")
+            if effector.is_perception_slot:
+                if any(
+                    joint.joint_type not in (
+                        JointType.REVOLUTE,
+                        JointType.CONTINUOUS)
+                    for joint in chain
+                ):
+                    raise ValueError("pure-rotation perception chains require rotational joints")
+                if any(
+                    math.sqrt(sum(value * value for value in joint.origin_translation))
+                    > 1e-9
+                    for joint in chain[1:]
+                ) or math.sqrt(sum(
+                    value * value
+                    for value in effector.terminal_translation)) > 1e-9:
+                    raise ValueError("perception rotation axes and optical center must share one pivot")
+        calibrationIds = tuple(
+            value.calibration_id for value in self.perception_calibrations)
+        if len(set(calibrationIds)) != len(calibrationIds):
+            raise ValueError("perception calibration identifiers must be unique")
+        perceptionIds = {
+            value.effector_id
+            for value in self.end_effectors
+            if value.is_perception_slot
+        }
+        if any(
+            value.component_id not in perceptionIds
+            for value in self.perception_calibrations
+        ):
+            raise ValueError("calibration must reference a perception end effector")
+        if sum(
+            int(value.primary) for value in self.perception_calibrations
+        ) != int(bool(perceptionIds)):
+            raise ValueError("robot definition requires one primary projection")
+
+@dataclass(frozen=True)
+class RobotEmbodimentContractView:
+    schema_version: int
+    description_id: str
+    semantic_definition_id: str
+    contract_id: str
+    model_shape_id: str
+    adapter_id: str
+    model_signature: str
+    timestamp_unit: str
+    timestamp_reference: str
     joint_count: int
-    joint_dof_count: int
-    commandable_joint_dof_count: int
-    task_control_coordinate_count: int
-    group_count: int
-    endpoint_count: int
-    gripper_count: int
-    sensor_count: int
-    parent_index: torch.Tensor
-    joint_parent_node: torch.Tensor
-    joint_child_node: torch.Tensor
-    joint_type: torch.Tensor
-    joint_variable_commandable: torch.Tensor
-    joint_variable_joint_index: torch.Tensor
-    joint_variable_child_node: torch.Tensor
-    joint_variable_local_index: torch.Tensor
-    joint_lower: torch.Tensor
-    joint_upper: torch.Tensor
-    joint_effort_limit: torch.Tensor
-    joint_velocity_limit: torch.Tensor
-    joint_variable_command_delta_scale: torch.Tensor
-    joint_variable_unit: Tuple[str, ...]
-    joint_variable_command_representation: str
-    joint_variable_command_reference: str
-    joint_variable_command_range: Tuple[float, float]
-    joint_variable_command_limit_policy: str
-    group_node_mask: torch.Tensor
-    group_joint_mask: torch.Tensor
-    node_role: torch.Tensor
-    node_side: torch.Tensor
-    node_capability: torch.Tensor
-    group_role: torch.Tensor
-    group_side: torch.Tensor
-    group_capability: torch.Tensor
-    endpoint_to_node: torch.Tensor
-    endpoint_task_mask: torch.Tensor
-    endpoint_role: torch.Tensor
-    endpoint_side: torch.Tensor
-    endpoint_capability: torch.Tensor
-    gripper_endpoint_index: torch.Tensor
-    sensor_to_node: torch.Tensor
-    sensor_role: torch.Tensor
-    sensor_side: torch.Tensor
-    sensor_capability: torch.Tensor
-    observer_valid: bool
-    observer_controllable: bool
-    observer_attachment_name: str
-    observer_frame_name: str
-    observer_calibration_id: str
-    observer_attachment_kind: str
-    observer_attachment_index: int
-    observer_node_index: int
-    observer_sensor_index: int
-    observer_endpoint_index: int
-    observer_control_joint_indices: torch.Tensor
-    observer_control_group_index: int
-    group_dof_count: Tuple[int, ...]
-    diagnostics: Tuple[str, ...]
-    canonical_json: str
+    end_effector_count: int
+    joint_feedback_layout: PackedLayout
+    end_effector_target_layout: PackedLayout
+    static_joint_tokens: Tuple[Tuple[float, ...], ...]
+    static_end_effector_tokens: Tuple[Tuple[float, ...], ...]
+    joint_translation_basis: PackedTensor
+    joint_rotation_basis: PackedTensor
+    joint_lower: Tuple[float, ...]
+    joint_upper: Tuple[float, ...]
+    joint_velocity_limit: Tuple[float, ...]
+    joint_periodic: Tuple[bool, ...]
+    joint_rotational: Tuple[bool, ...]
+    end_effector_translation_basis: PackedTensor
+    end_effector_rotation_basis: PackedTensor
+    end_effector_target_lower: Tuple[float, ...]
+    end_effector_target_upper: Tuple[float, ...]
+    end_effector_joint_chain_offsets: Tuple[int, ...]
+    end_effector_joint_chain_indices: Tuple[int, ...]
+    parent_index: Tuple[int, ...]
+    topological_layers: Tuple[Tuple[int, ...], ...]
+    root_mask: Tuple[bool, ...]
+    child_mask: Tuple[bool, ...]
+    independent_mask: Tuple[bool, ...]
+    subtree_offsets: Tuple[int, ...]
+    subtree_indices: Tuple[int, ...]
+    perception_view: PackedView
+    perception_projection: Optional[PerceptionProjectionView]
+    primary_perception_view_index: Optional[int]
+    progress_enter: Tuple[float, ...]
+    progress_exit: Tuple[float, ...]
+    dwell_cycles: Tuple[int, ...]
+    translation_error_scale: Tuple[float, ...]
+    rotation_error_scale: Tuple[float, ...]
+    model_shape: EmbodimentShape
 
-    def ToJson(self) -> Dict[str, Any]:
-        return json.loads(self.canonical_json)
+    def __post_init__(self) -> None:
+        self.Validate()
 
-    def _NodeDepth(self) -> torch.Tensor:
-        depth = torch.full_like(self.parent_index, -1)
-        for node_index in range(self.node_count):
-            current = node_index
-            value = 0
-            while int(self.parent_index[current].item()) >= 0:
-                current = int(self.parent_index[current].item())
-                value += 1
-            depth[node_index] = value
-        return depth
+    def Validate(self) -> None:
+        for name in (
+            "description_id",
+            "semantic_definition_id",
+            "contract_id",
+            "model_shape_id",
+            "adapter_id",
+            "model_signature",
+            "timestamp_unit",
+            "timestamp_reference",
+        ):
+            RobotMorphologyModule.ValidateIdentifier(getattr(self, name), name)
+        if type(self.schema_version) is not int or self.schema_version < 1:
+            raise ValueError("contract schema version must be positive")
+        if type(self.joint_count) is not int or self.joint_count < 1:
+            raise ValueError("contract joint count must be positive")
+        if type(self.end_effector_count) is not int or self.end_effector_count < 1:
+            raise ValueError("contract end-effector count must be positive")
+        if self.joint_feedback_layout.SlotCount != self.joint_count:
+            raise ValueError("joint feedback layout does not match joint count")
+        if self.end_effector_target_layout.SlotCount != self.end_effector_count:
+            raise ValueError("target layout does not match end-effector count")
+        if len(self.static_joint_tokens) != self.joint_count:
+            raise ValueError("joint static tokens do not match joint count")
+        if len(self.static_end_effector_tokens) != self.end_effector_count:
+            raise ValueError("end-effector static tokens do not match endpoint count")
+        if len({len(value) for value in self.static_joint_tokens}) != 1:
+            raise ValueError("joint static token widths must be uniform")
+        if len({len(value) for value in self.static_end_effector_tokens}) != 1:
+            raise ValueError("end-effector static token widths must be uniform")
+        if any(
+            not math.isfinite(float(value))
+            for token in self.static_joint_tokens + self.static_end_effector_tokens
+            for value in token
+        ):
+            raise ValueError("static tokens must be finite")
+        if self.joint_translation_basis.shapes != ((3, 1),) * self.joint_count:
+            raise ValueError("joint translation bases must be three by one")
+        if self.joint_rotation_basis.shapes != ((3, 1),) * self.joint_count:
+            raise ValueError("joint rotation bases must be three by one")
+        if len(self.end_effector_translation_basis.shapes) != self.end_effector_count:
+            raise ValueError("endpoint translation basis count is invalid")
+        if len(self.end_effector_rotation_basis.shapes) != self.end_effector_count:
+            raise ValueError("endpoint rotation basis count is invalid")
+        for index in range(self.end_effector_count):
+            translationShape = self.end_effector_translation_basis.shapes[index]
+            rotationShape = self.end_effector_rotation_basis.shapes[index]
+            if translationShape[0] != 3 or rotationShape[0] != 3:
+                raise ValueError("endpoint motion bases must have three rows")
+            if self.end_effector_target_layout.Width(index) != (
+                translationShape[1] + rotationShape[1]
+            ):
+                raise ValueError("endpoint target layout width is inconsistent")
+        if (
+            len(self.end_effector_target_lower)
+            != self.end_effector_target_layout.PackedDim
+            or len(self.end_effector_target_upper)
+            != self.end_effector_target_layout.PackedDim
+            or any(
+                not math.isfinite(float(lower))
+                or not math.isfinite(float(upper))
+                or float(lower) >= float(upper)
+                for lower, upper in zip(
+                    self.end_effector_target_lower,
+                    self.end_effector_target_upper)
+            )
+        ):
+            raise ValueError("endpoint compact target limits are invalid")
+        for values, name in (
+            (self.joint_lower, "joint_lower"),
+            (self.joint_upper, "joint_upper"),
+            (self.joint_velocity_limit, "joint_velocity_limit"),
+            (self.joint_periodic, "joint_periodic"),
+            (self.joint_rotational, "joint_rotational"),
+        ):
+            if len(values) != self.joint_count:
+                raise ValueError(f"{name} does not match joint count")
+        if any(
+            not math.isfinite(float(value))
+            for values in (
+                self.joint_lower,
+                self.joint_upper,
+                self.joint_velocity_limit,
+            )
+            for value in values
+        ):
+            raise ValueError("joint contract limits must be finite")
+        if any(
+            lower >= upper or velocity <= 0.0
+            for lower, upper, velocity in zip(
+                self.joint_lower,
+                self.joint_upper,
+                self.joint_velocity_limit)
+        ):
+            raise ValueError("joint contract limits are invalid")
+        if any(
+            type(value) is not bool
+            for values in (self.joint_periodic, self.joint_rotational)
+            for value in values
+        ):
+            raise ValueError("joint contract motion flags must be boolean")
+        for index in range(self.joint_count):
+            expectedWidth = (
+                3
+                if self.joint_periodic[index]
+                else 4
+                if self.joint_rotational[index]
+                else 2)
+            if self.joint_feedback_layout.Width(index) != expectedWidth:
+                raise ValueError("joint feedback layout does not match joint motion")
+            translation = self.joint_translation_basis.Matrix(
+                index,
+                dtype=torch.float64)
+            rotation = self.joint_rotation_basis.Matrix(
+                index,
+                dtype=torch.float64)
+            hasTranslation = bool(torch.count_nonzero(translation).item())
+            hasRotation = bool(torch.count_nonzero(rotation).item())
+            if (
+                self.joint_rotational[index] != hasRotation
+                or self.joint_rotational[index] == hasTranslation
+                or self.joint_periodic[index] and not hasRotation
+            ):
+                raise ValueError("joint motion flags do not match joint bases")
+        if len(self.end_effector_joint_chain_offsets) != self.end_effector_count + 1:
+            raise ValueError("endpoint chain offsets do not match endpoint count")
+        chainLayout = PackedLayout(self.end_effector_joint_chain_offsets)
+        if (
+            chainLayout.PackedDim != len(self.end_effector_joint_chain_indices)
+            or any(
+                chainLayout.Width(index) < 1
+                for index in range(self.end_effector_count))
+        ):
+            raise ValueError("endpoint chain offsets do not match indices")
+        if any(
+            value < 0 or value >= self.joint_count
+            for value in self.end_effector_joint_chain_indices
+        ):
+            raise ValueError("endpoint chain joint index is out of range")
+        for endpointIndex in range(self.end_effector_count):
+            chain = self.end_effector_joint_chain_indices[
+                chainLayout.Slice(endpointIndex)]
+            if any(right <= left for left, right in zip(chain[:-1], chain[1:])):
+                raise ValueError("endpoint joint chains must be strictly ordered")
+        if len(self.parent_index) != self.end_effector_count:
+            raise ValueError("endpoint parent index count is invalid")
+        if any(
+            type(parentIndex) is not int
+            or parentIndex < -1
+            or parentIndex >= self.end_effector_count
+            or parentIndex == endpointIndex
+            for endpointIndex, parentIndex in enumerate(self.parent_index)
+        ):
+            raise ValueError("endpoint parent indices are invalid")
+        (
+            expectedLayers,
+            expectedRoot,
+            expectedChild,
+            expectedIndependent,
+            expectedSubtreeOffsets,
+            expectedSubtreeIndices,
+        ) = RobotMorphologyModule.CompileHierarchyIndices(self.parent_index)
+        if (
+            self.topological_layers != expectedLayers
+            or self.root_mask != expectedRoot
+            or self.child_mask != expectedChild
+            or self.independent_mask != expectedIndependent
+            or self.subtree_offsets != expectedSubtreeOffsets
+            or self.subtree_indices != expectedSubtreeIndices
+        ):
+            raise ValueError("endpoint hierarchy compilation is inconsistent")
+        if self.perception_view.source_slot_count != self.end_effector_count:
+            raise ValueError("perception view source count is invalid")
+        for index in self.perception_view.indices:
+            if self.end_effector_translation_basis.shapes[index][1] != 0:
+                raise ValueError("perception endpoint cannot translate")
+            if self.end_effector_rotation_basis.shapes[index][1] < 1:
+                raise ValueError("perception endpoint must rotate")
+        if self.perception_projection is None:
+            if self.primary_perception_view_index is not None:
+                raise ValueError("empty perception projection cannot have a primary view")
+        elif (
+            type(self.primary_perception_view_index) is not int
+            or self.primary_perception_view_index < 0
+            or self.primary_perception_view_index >= len(self.perception_view.indices)
+        ):
+            raise ValueError("primary perception view index is out of range")
+        if len(self.progress_enter) != self.end_effector_count:
+            raise ValueError("progress enter thresholds are invalid")
+        if len(self.progress_exit) != self.end_effector_count:
+            raise ValueError("progress exit thresholds are invalid")
+        if len(self.dwell_cycles) != self.end_effector_count:
+            raise ValueError("progress dwell counts are invalid")
+        if (
+            len(self.translation_error_scale) != self.end_effector_count
+            or len(self.rotation_error_scale) != self.end_effector_count
+            or any(
+                not math.isfinite(float(value)) or float(value) <= 0.0
+                for values in (
+                    self.translation_error_scale,
+                    self.rotation_error_scale)
+                for value in values)
+        ):
+            raise ValueError("endpoint error scales are invalid")
+        if any(
+            enter <= 0.0 or exitValue <= enter
+            for enter, exitValue in zip(self.progress_enter, self.progress_exit)
+        ):
+            raise ValueError("progress hysteresis thresholds are invalid")
+        if any(type(value) is not int or value < 1 for value in self.dwell_cycles):
+            raise ValueError("progress dwell counts must be positive")
+        if type(self.model_shape) is not EmbodimentShape:
+            raise TypeError("contract model shape has the wrong type")
+        expectedShape = EmbodimentShape(
+            joint_token_count=self.joint_count,
+            joint_static_descriptor_dim=len(self.static_joint_tokens[0]),
+            joint_feedback_packed_dim=self.joint_feedback_layout.PackedDim,
+            end_effector_token_count=self.end_effector_count,
+            end_effector_static_descriptor_dim=len(
+                self.static_end_effector_tokens[0]),
+            end_effector_target_packed_dim=self.end_effector_target_layout.PackedDim,
+            hierarchy_edge_count=sum(value >= 0 for value in self.parent_index),
+            perception_view_dim=len(self.perception_view.indices))
+        if self.model_shape != expectedShape:
+            raise ValueError("contract model shape is inconsistent")
+
+
+@dataclass(frozen=True)
+class RobotEmbodimentContract:
+    schema_version: int
+    description_id: str
+    semantic_definition_id: str
+    contract_id: str
+    model_shape_id: str
+    adapter_id: str
+    model_signature: str
+    joint_ids: Tuple[str, ...]
+    end_effector_ids: Tuple[str, ...]
+    joint_parent_index: Tuple[int, ...]
+    joint_origin_translation: Tuple[Tuple[float, float, float], ...]
+    joint_origin_quaternion_xyzw: Tuple[Tuple[float, float, float, float], ...]
+    end_effector_terminal_translation: Tuple[Tuple[float, float, float], ...]
+    end_effector_terminal_quaternion_xyzw: Tuple[Tuple[float, float, float, float], ...]
+    end_effector_reference_frame: Tuple[str, ...]
+    view: RobotEmbodimentContractView
+
+    def __post_init__(self) -> None:
+        for name in (
+            "description_id",
+            "semantic_definition_id",
+            "contract_id",
+            "model_shape_id",
+            "adapter_id",
+            "model_signature",
+        ):
+            if getattr(self, name) != getattr(self.view, name):
+                raise ValueError(f"contract and view {name} values differ")
+        if self.schema_version != self.view.schema_version:
+            raise ValueError("contract and view schema versions differ")
+        if len(self.joint_ids) != self.view.joint_count:
+            raise ValueError("contract joint identifiers do not match view")
+        if len(self.end_effector_ids) != self.view.end_effector_count:
+            raise ValueError("contract endpoint identifiers do not match view")
+        if len(set(self.joint_ids)) != len(self.joint_ids):
+            raise ValueError("contract joint identifiers must be unique")
+        if len(set(self.end_effector_ids)) != len(self.end_effector_ids):
+            raise ValueError("contract endpoint identifiers must be unique")
+        for identifier in self.joint_ids + self.end_effector_ids:
+            RobotMorphologyModule.ValidateIdentifier(identifier, "contract component identifier")
+        if len(self.joint_parent_index) != self.view.joint_count:
+            raise ValueError("joint parent indices do not match joint count")
+        if any(
+            type(parentIndex) is not int
+            or parentIndex < -1
+            or parentIndex >= jointIndex
+            for jointIndex, parentIndex in enumerate(self.joint_parent_index)
+        ):
+            raise ValueError("joint parent indices must be topologically ordered")
+        if len(self.joint_origin_translation) != self.view.joint_count:
+            raise ValueError("joint origins do not match joint count")
+        if len(self.joint_origin_quaternion_xyzw) != self.view.joint_count:
+            raise ValueError("joint orientations do not match joint count")
+        if len(self.end_effector_terminal_translation) != self.view.end_effector_count:
+            raise ValueError("endpoint translations do not match endpoint count")
+        if len(self.end_effector_terminal_quaternion_xyzw) != self.view.end_effector_count:
+            raise ValueError("endpoint orientations do not match endpoint count")
+        if len(self.end_effector_reference_frame) != self.view.end_effector_count:
+            raise ValueError("endpoint reference frames do not match endpoint count")
+        for values in (
+            self.joint_origin_translation,
+            self.end_effector_terminal_translation,
+        ):
+            for value in values:
+                RobotMorphologyModule.ValidateFiniteTuple(value, 3, "contract translation")
+        for values in (
+            self.joint_origin_quaternion_xyzw,
+            self.end_effector_terminal_quaternion_xyzw,
+        ):
+            for value in values:
+                quaternion = RobotMorphologyModule.ValidateFiniteTuple(
+                    value,
+                    4,
+                    "contract quaternion")
+                if abs(sum(component * component for component in quaternion) - 1.0) > 1e-6:
+                    raise ValueError("contract quaternions must have unit norm")
+        endpointSet = set(self.end_effector_ids)
+        if any(
+            type(reference) is not str
+            or not reference
+            or reference != "world" and reference not in endpointSet
+            for reference in self.end_effector_reference_frame
+        ):
+            raise ValueError("contract endpoint reference frames are invalid")
+        endpointChains = []
+        chainLayout = PackedLayout(
+            self.view.end_effector_joint_chain_offsets)
+        for endpointIndex in range(self.view.end_effector_count):
+            chain = self.view.end_effector_joint_chain_indices[
+                chainLayout.Slice(endpointIndex)]
+            if self.joint_parent_index[chain[0]] != -1 or any(
+                self.joint_parent_index[childIndex] != parentIndex
+                for parentIndex, childIndex in zip(chain[:-1], chain[1:])
+            ):
+                raise ValueError("endpoint chains must follow the joint hierarchy")
+            endpointChains.append(chain)
+        for endpointIndex, parentIndex in enumerate(self.view.parent_index):
+            if parentIndex >= 0 and endpointChains[endpointIndex][
+                :len(endpointChains[parentIndex])
+            ] != endpointChains[parentIndex]:
+                raise ValueError("child endpoint chains must extend parent endpoint chains")
+        expectedShapeId = ModelSignatureCompiler.Compile({
+            "kind": "embodiment_shape",
+            "shape": {
+                name: getattr(self.view.model_shape, name)
+                for name in self.view.model_shape.__dataclass_fields__
+            },
+        })
+        if self.model_shape_id != expectedShapeId:
+            raise ValueError("contract model shape identity is inconsistent")
+        expectedSignature = self.CompileContentSignature(
+            self.schema_version,
+            self.description_id,
+            self.semantic_definition_id,
+            self.adapter_id,
+            self.joint_ids,
+            self.end_effector_ids,
+            self.joint_parent_index,
+            self.joint_origin_translation,
+            self.joint_origin_quaternion_xyzw,
+            self.end_effector_terminal_translation,
+            self.end_effector_terminal_quaternion_xyzw,
+            self.end_effector_reference_frame,
+            self.view)
+        if self.model_signature != expectedSignature:
+            raise ValueError("contract content does not match its model signature")
+        expectedContractId = ModelSignatureCompiler.Compile({
+            "kind": "robot_contract",
+            "model_signature": expectedSignature,
+        })
+        if self.contract_id != expectedContractId:
+            raise ValueError("contract identity does not match its model signature")
 
     @staticmethod
-    def _NormalizedFinite(value: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        valid = torch.isfinite(value)
-        normalized = torch.zeros_like(value)
-        normalized[valid] = value[valid] / (1.0 + value[valid].abs())
-        return normalized, valid
-
-    def JointSemanticDescriptor(self) -> Dict[str, torch.Tensor]:
-        count = self.joint_dof_count
-        device = self.joint_variable_joint_index.device
-        child_node = self.joint_variable_child_node.clone()
-        parent_node = self.parent_index[child_node].clone()
-        node_depth = self._NodeDepth()
-        topology_depth = node_depth[child_node].clone()
-        child_role = self.node_role[child_node].clone()
-        child_side = self.node_side[child_node].clone()
-        child_capability = self.node_capability[child_node].clone()
-        parent_role = torch.full_like(child_role, -1)
-        parent_side = torch.full_like(child_side, -1)
-        parent_capability = torch.zeros_like(child_capability)
-        has_parent = parent_node.ge(0)
-        if bool(has_parent.any().item()):
-            parent_role[has_parent] = self.node_role[parent_node[has_parent]]
-            parent_side[has_parent] = self.node_side[parent_node[has_parent]]
-            parent_capability[has_parent] = self.node_capability[
-                parent_node[has_parent]]
-        group_role = torch.zeros(
-            count,
-            len(BODY_ROLE_NAMES),
-            dtype=torch.bool,
-            device=device)
-        group_side = torch.zeros(
-            count,
-            len(BODY_SIDE_NAMES),
-            dtype=torch.bool,
-            device=device)
-        group_capability = torch.zeros_like(child_capability)
-        for variable_index in range(self.joint_dof_count):
-            joint_index = int(
-                self.joint_variable_joint_index[variable_index].item())
-            groups = torch.nonzero(
-                self.group_joint_mask[:, joint_index],
-                as_tuple=False).flatten()
-            for group_index in groups.tolist():
-                group_role[
-                    variable_index,
-                    int(self.group_role[group_index].item())] = True
-                group_side[
-                    variable_index,
-                    int(self.group_side[group_index].item())] = True
-                group_capability[variable_index] |= self.group_capability[
-                    group_index]
-        source = self.ToJson()
-        joints = {item["name"]: item for item in source["urdf"]["joints"]}
-        joint_type = self.joint_type[
-            self.joint_variable_joint_index].clone()
-        joint_axis = torch.zeros(count, 3, dtype=torch.float32, device=device)
-        for variable_index in range(self.joint_dof_count):
-            joint_index = int(
-                self.joint_variable_joint_index[variable_index].item())
-            joint_name = self.joint_names[joint_index]
-            local_index = int(
-                self.joint_variable_local_index[variable_index].item())
-            if int(self.joint_parent_node[joint_index].item()) < 0:
-                axis = [0.0, 0.0, 0.0]
-                if int(joint_type[variable_index].item()) == JOINT_TYPE_NAMES.index(
-                    "planar"
-                ):
-                    axis[local_index if local_index < 2 else 2] = 1.0
-                elif int(joint_type[variable_index].item()) == JOINT_TYPE_NAMES.index(
-                    "floating"
-                ):
-                    axis[local_index % 3] = 1.0
-                else:
-                    raise ValueError("SRDF virtual joint variable type is invalid")
-            else:
-                joint_kind = joints[joint_name]["type"]
-                if joint_kind == "planar":
-                    normal = torch.as_tensor(
-                        joints[joint_name]["axis"],
-                        dtype=torch.float32,
-                        device=device)
-                    normal = normal / normal.norm()
-                    reference = normal.new_tensor([1.0, 0.0, 0.0])
-                    if float(normal[0].abs().item()) > 0.9:
-                        reference = normal.new_tensor([0.0, 1.0, 0.0])
-                    tangent_x = reference - (reference * normal).sum() * normal
-                    tangent_x = tangent_x / tangent_x.norm()
-                    tangent_y = torch.linalg.cross(normal, tangent_x)
-                    axis = (tangent_x, tangent_y, normal)[local_index]
-                elif joint_kind == "floating":
-                    axis = torch.eye(
-                        3,
-                        dtype=torch.float32,
-                        device=device)[local_index % 3]
-                else:
-                    axis = joints[joint_name]["axis"]
-            axis_tensor = torch.as_tensor(
-                axis,
-                dtype=torch.float32,
-                device=device)
-            joint_axis[variable_index] = axis_tensor / axis_tensor.norm()
-        lower, position_lower_valid = self._NormalizedFinite(self.joint_lower)
-        upper, position_upper_valid = self._NormalizedFinite(self.joint_upper)
-        effort, effort_valid = self._NormalizedFinite(self.joint_effort_limit)
-        velocity, velocity_valid = self._NormalizedFinite(
-            self.joint_velocity_limit)
-        return {
-            "commandable": self.joint_variable_commandable.clone(),
-            "joint_index": self.joint_variable_joint_index.clone(),
-            "local_index": self.joint_variable_local_index.clone(),
-            "child_node_index": child_node,
-            "parent_node_index": parent_node,
-            "topology_depth": topology_depth,
-            "joint_type": joint_type,
-            "joint_axis": joint_axis,
-            "child_role": child_role,
-            "child_side": child_side,
-            "child_capability": child_capability,
-            "parent_role": parent_role,
-            "parent_side": parent_side,
-            "parent_capability": parent_capability,
-            "group_role_membership": group_role,
-            "group_side_membership": group_side,
-            "group_capability": group_capability,
-            "lower_limit_normalized": lower,
-            "upper_limit_normalized": upper,
-            "position_lower_limit_valid": position_lower_valid,
-            "position_upper_limit_valid": position_upper_valid,
-            "effort_limit_normalized": effort,
-            "effort_limit_valid": effort_valid,
-            "velocity_limit_normalized": velocity,
-            "velocity_limit_valid": velocity_valid,
-            "command_delta_scale": (
-                self.joint_variable_command_delta_scale.clone()),
-        }
-
-    def NodeSemanticDescriptor(self) -> Dict[str, torch.Tensor]:
-        device = self.parent_index.device
-        parent_node = self.parent_index.clone()
-        topology_depth = self._NodeDepth()
-        parent_role = torch.full_like(self.node_role, -1)
-        parent_side = torch.full_like(self.node_side, -1)
-        parent_capability = torch.zeros_like(self.node_capability)
-        has_parent = parent_node.ge(0)
-        if bool(has_parent.any().item()):
-            parent_role[has_parent] = self.node_role[parent_node[has_parent]]
-            parent_side[has_parent] = self.node_side[parent_node[has_parent]]
-            parent_capability[has_parent] = self.node_capability[
-                parent_node[has_parent]]
-        in_degree = has_parent.to(dtype=torch.long)
-        out_degree = torch.zeros(
-            self.node_count,
-            dtype=torch.long,
-            device=device)
-        if bool(has_parent.any().item()):
-            out_degree.scatter_add_(
-                0,
-                parent_node[has_parent],
-                torch.ones_like(parent_node[has_parent]))
-        group_role = torch.zeros(
-            self.node_count,
-            len(BODY_ROLE_NAMES),
-            dtype=torch.bool,
-            device=device)
-        group_side = torch.zeros(
-            self.node_count,
-            len(BODY_SIDE_NAMES),
-            dtype=torch.bool,
-            device=device)
-        group_capability = torch.zeros_like(self.node_capability)
-        for node_index in range(self.node_count):
-            groups = torch.nonzero(
-                self.group_node_mask[:, node_index],
-                as_tuple=False).flatten()
-            for group_index in groups.tolist():
-                group_role[
-                    node_index,
-                    int(self.group_role[group_index].item())] = True
-                group_side[
-                    node_index,
-                    int(self.group_side[group_index].item())] = True
-                group_capability[node_index] |= self.group_capability[
-                    group_index]
-        return {
-            "node_index": torch.arange(
-                self.node_count,
-                dtype=torch.long,
-                device=device),
-            "parent_node_index": parent_node,
-            "topology_depth": topology_depth,
-            "is_root": parent_node.lt(0),
-            "is_leaf": out_degree.eq(0),
-            "in_degree": in_degree,
-            "out_degree": out_degree,
-            "role": self.node_role.clone(),
-            "side": self.node_side.clone(),
-            "capability": self.node_capability.clone(),
-            "parent_role": parent_role,
-            "parent_side": parent_side,
-            "parent_capability": parent_capability,
-            "group_role_membership": group_role,
-            "group_side_membership": group_side,
-            "group_capability": group_capability,
-        }
-
-    def EndpointSemanticDescriptor(self) -> Dict[str, torch.Tensor]:
-        count = self.endpoint_count
-        device = self.endpoint_to_node.device
-        node_index = self.endpoint_to_node.clone()
-        parent_node = self.parent_index[node_index].clone()
-        node_depth = self._NodeDepth()
-        topology_depth = node_depth[node_index].clone()
-        node_role = self.node_role[node_index].clone()
-        node_side = self.node_side[node_index].clone()
-        node_capability = self.node_capability[node_index].clone()
-        parent_role = torch.full_like(node_role, -1)
-        parent_side = torch.full_like(node_side, -1)
-        parent_capability = torch.zeros_like(node_capability)
-        has_parent = parent_node.ge(0)
-        parent_role[has_parent] = self.node_role[parent_node[has_parent]]
-        parent_side[has_parent] = self.node_side[parent_node[has_parent]]
-        parent_capability[has_parent] = self.node_capability[
-            parent_node[has_parent]]
-        group_role = torch.zeros(
-            count,
-            len(BODY_ROLE_NAMES),
-            dtype=torch.bool,
-            device=device)
-        group_side = torch.zeros(
-            count,
-            len(BODY_SIDE_NAMES),
-            dtype=torch.bool,
-            device=device)
-        group_capability = torch.zeros_like(node_capability)
-        for endpoint_index in range(self.endpoint_count):
-            endpoint_node = int(node_index[endpoint_index].item())
-            groups = torch.nonzero(
-                self.group_node_mask[:, endpoint_node],
-                as_tuple=False).flatten()
-            for group_index in groups.tolist():
-                group_role[
-                    endpoint_index,
-                    int(self.group_role[group_index].item())] = True
-                group_side[
-                    endpoint_index,
-                    int(self.group_side[group_index].item())] = True
-                group_capability[endpoint_index] |= self.group_capability[
-                    group_index]
-        return {
-            "controllable": self.endpoint_task_mask.any(dim=-1),
-            "node_index": node_index,
-            "parent_node_index": parent_node,
-            "topology_depth": topology_depth,
-            "task_mask": self.endpoint_task_mask.clone(),
-            "role": self.endpoint_role.clone(),
-            "side": self.endpoint_side.clone(),
-            "capability": self.endpoint_capability.clone(),
-            "node_role": node_role,
-            "node_side": node_side,
-            "node_capability": node_capability,
-            "parent_role": parent_role,
-            "parent_side": parent_side,
-            "parent_capability": parent_capability,
-            "group_role_membership": group_role,
-            "group_side_membership": group_side,
-            "group_capability": group_capability,
-        }
-
+    def CompileContentSignature(
+        schemaVersion: int,
+        descriptionId: str,
+        semanticDefinitionId: str,
+        adapterId: str,
+        jointIds: Sequence[str],
+        endEffectorIds: Sequence[str],
+        jointParentIndex: Sequence[int],
+        jointOriginTranslation: Sequence[Sequence[float]],
+        jointOriginQuaternionXyzw: Sequence[Sequence[float]],
+        endEffectorTerminalTranslation: Sequence[Sequence[float]],
+        endEffectorTerminalQuaternionXyzw: Sequence[Sequence[float]],
+        endEffectorReferenceFrame: Sequence[str],
+        contractView: Union[RobotEmbodimentContractView, Mapping[str, Any]],
+    ) -> str:
+        viewPayload = (
+            asdict(contractView)
+            if type(contractView) is RobotEmbodimentContractView
+            else {
+                name: asdict(value)
+                if hasattr(value, "__dataclass_fields__")
+                else value
+                for name, value in contractView.items()
+            })
+        for name in ("contract_id", "model_shape_id", "model_signature"):
+            viewPayload.pop(name, None)
+        return ModelSignatureCompiler.Compile({
+            "schema_version": schemaVersion,
+            "description_id": descriptionId,
+            "semantic_definition_id": semanticDefinitionId,
+            "adapter_id": adapterId,
+            "joint_ids": tuple(jointIds),
+            "end_effector_ids": tuple(endEffectorIds),
+            "joint_parent_index": tuple(jointParentIndex),
+            "joint_origin_translation": tuple(map(tuple, jointOriginTranslation)),
+            "joint_origin_quaternion_xyzw": tuple(map(tuple, jointOriginQuaternionXyzw)),
+            "end_effector_terminal_translation": tuple(map(tuple, endEffectorTerminalTranslation)),
+            "end_effector_terminal_quaternion_xyzw": tuple(map(tuple, endEffectorTerminalQuaternionXyzw)),
+            "end_effector_reference_frame": tuple(endEffectorReferenceFrame),
+            "view": viewPayload,
+        })
 
 class RobotMorphologyModule:
+    IdentityBasis = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    EmptyBasis = ((), (), ())
+
     @staticmethod
-    def _ReadJson(source: Union[str, Path, Mapping[str, Any]]) -> Dict[str, Any]:
-        if isinstance(source, Mapping):
-            return dict(source)
-        value = json.loads(Path(source).read_text(encoding="utf-8"))
-        if type(value) is not dict:
-            raise TypeError("robot morphology JSON root must be an object")
+    def ValidateIdentifier(value: Any, fieldName: str) -> str:
+        if type(value) is not str or not value:
+            raise ValueError(f"{fieldName} must be a non-empty string")
         return value
 
     @staticmethod
-    def _FiniteVector(value: Optional[str], size: int, default: Sequence[float]) -> List[float]:
-        if value is None:
-            result = [float(item) for item in default]
-        else:
-            parts = value.split()
-            if len(parts) != size:
-                raise ValueError("robot vector has an invalid dimension")
-            result = [float(item) for item in parts]
-        if any(not math.isfinite(item) for item in result):
-            raise ValueError("robot vector must be finite")
+    def ValidateFiniteTuple(
+        values: Sequence[float],
+        width: int,
+        fieldName: str,
+    ) -> Tuple[float, ...]:
+        result = tuple(float(value) for value in values)
+        if len(result) != width or any(not math.isfinite(value) for value in result):
+            raise ValueError(f"{fieldName} must contain {width} finite values")
         return result
 
     @staticmethod
-    def _Canonical(value: Any) -> Any:
-        if isinstance(value, dict):
-            return {
-                str(key): RobotMorphologyModule._Canonical(value[key])
-                for key in sorted(value)
-            }
-        if isinstance(value, (list, tuple)):
-            return [RobotMorphologyModule._Canonical(item) for item in value]
-        if isinstance(value, float):
-            if not math.isfinite(value):
-                raise ValueError("robot morphology contains a non-finite number")
-            if value == 0.0:
-                return 0.0
-            return float(format(value, ".17g"))
-        if value is None or type(value) in (str, int, bool):
-            return value
-        raise TypeError("robot morphology contains an unsupported value")
-
-    @classmethod
-    def _CanonicalJson(cls, value: Dict[str, Any]) -> str:
-        return json.dumps(
-            cls._Canonical(value),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False)
-
-    @staticmethod
-    def _JointDof(joint_type: str) -> int:
-        dof = {
-            "fixed": 0,
-            "revolute": 1,
-            "continuous": 1,
-            "prismatic": 1,
-            "planar": 3,
-            "floating": 6,
-        }
-        if joint_type not in dof:
-            raise ValueError(f"unsupported URDF joint type {joint_type!r}")
-        return dof[joint_type]
-
-    @staticmethod
-    def _VariableNames(joint: Dict[str, Any]) -> Tuple[str, ...]:
-        if joint.get("mimic") is not None:
-            return ()
-        dof = RobotMorphologyModule._JointDof(joint["type"])
-        if dof == 0:
-            return ()
-        if dof == 1:
-            return (joint["name"],)
-        suffixes = (
-            ("x", "y", "theta")
-            if dof == 3
-            else ("x", "y", "z", "roll", "pitch", "yaw"))
-        return tuple(f"{joint['name']}/{suffix}" for suffix in suffixes)
-
-    @staticmethod
-    def _ParseUrdf(path: Union[str, Path]) -> Dict[str, Any]:
-        root = ET.fromstring(Path(path).read_text(encoding="utf-8"))
-        if root.tag != "robot" or not root.attrib.get("name"):
-            raise ValueError("URDF root must be a named robot")
-        links = []
-        for element in root.findall("link"):
-            name = element.attrib.get("name")
-            if not name:
-                raise ValueError("URDF link must have a name")
-            links.append({"name": name})
-        joints = []
-        for element in root.findall("joint"):
-            name = element.attrib.get("name")
-            joint_type = element.attrib.get("type")
-            parent_element = element.find("parent")
-            child_element = element.find("child")
-            if (
-                not name
-                or not joint_type
-                or parent_element is None
-                or child_element is None
-                or not parent_element.attrib.get("link")
-                or not child_element.attrib.get("link")
-            ):
-                raise ValueError("URDF joint is incomplete")
-            origin_element = element.find("origin")
-            axis_element = element.find("axis")
-            limit_element = element.find("limit")
-            mimic_element = element.find("mimic")
-            limit = None
-            if limit_element is not None:
-                limit = {
-                    key: float(limit_element.attrib[key])
-                    for key in ("lower", "upper", "effort", "velocity")
-                    if key in limit_element.attrib
-                }
-                if any(not math.isfinite(value) for value in limit.values()):
-                    raise ValueError("URDF joint limit must be finite")
-            mimic = None
-            if mimic_element is not None:
-                target = mimic_element.attrib.get("joint")
-                if not target:
-                    raise ValueError("URDF mimic joint must name its source")
-                mimic = {
-                    "joint": target,
-                    "multiplier": float(mimic_element.attrib.get("multiplier", "1")),
-                    "offset": float(mimic_element.attrib.get("offset", "0")),
-                }
-                if any(not math.isfinite(value) for value in (
-                    mimic["multiplier"], mimic["offset"]
-                )):
-                    raise ValueError("URDF mimic parameters must be finite")
-            joint = {
-                "name": name,
-                "type": joint_type,
-                "parent": parent_element.attrib["link"],
-                "child": child_element.attrib["link"],
-                "origin_xyz": RobotMorphologyModule._FiniteVector(
-                    None if origin_element is None else origin_element.attrib.get("xyz"),
-                    3,
-                    (0.0, 0.0, 0.0)),
-                "origin_rpy": RobotMorphologyModule._FiniteVector(
-                    None if origin_element is None else origin_element.attrib.get("rpy"),
-                    3,
-                    (0.0, 0.0, 0.0)),
-                "axis": RobotMorphologyModule._FiniteVector(
-                    None if axis_element is None else axis_element.attrib.get("xyz"),
-                    3,
-                    (1.0, 0.0, 0.0)),
-                "limit": limit,
-                "mimic": mimic,
-            }
-            RobotMorphologyModule._JointDof(joint_type)
-            joints.append(joint)
-        return {
-            "name": root.attrib["name"],
-            "links": sorted(links, key=lambda item: item["name"]),
-            "joints": sorted(joints, key=lambda item: item["name"]),
-        }
-
-    @staticmethod
-    def _ParseSrdf(path: Union[str, Path]) -> Dict[str, Any]:
-        root = ET.fromstring(Path(path).read_text(encoding="utf-8"))
-        if root.tag != "robot" or not root.attrib.get("name"):
-            raise ValueError("SRDF root must be a named robot")
-        groups = []
-        for element in root.findall("group"):
-            name = element.attrib.get("name")
-            if not name:
-                raise ValueError("SRDF group must have a name")
-            groups.append({
-                "name": name,
-                "joints": sorted(
-                    item.attrib["name"] for item in element.findall("joint")),
-                "links": sorted(
-                    item.attrib["name"] for item in element.findall("link")),
-                "subgroups": sorted(
-                    item.attrib["name"] for item in element.findall("group")),
-                "chains": sorted([
-                    {
-                        "base_link": item.attrib["base_link"],
-                        "tip_link": item.attrib["tip_link"],
-                    }
-                    for item in element.findall("chain")
-                ], key=lambda item: (item["base_link"], item["tip_link"])),
-            })
-        passive_joints = sorted(
-            item.attrib["name"] for item in root.findall("passive_joint"))
-        end_effectors = []
-        for item in root.findall("end_effector"):
-            required = ("name", "parent_link", "group")
-            if any(not item.attrib.get(name) for name in required):
-                raise ValueError("SRDF end_effector is incomplete")
-            end_effectors.append({
-                "name": item.attrib["name"],
-                "parent_link": item.attrib["parent_link"],
-                "group": item.attrib["group"],
-                "parent_group": item.attrib.get("parent_group"),
-            })
-        virtual_joints = []
-        for item in root.findall("virtual_joint"):
-            required = ("name", "type", "parent_frame", "child_link")
-            if any(not item.attrib.get(name) for name in required):
-                raise ValueError("SRDF virtual_joint is incomplete")
-            virtual_joints.append({name: item.attrib[name] for name in required})
-        group_states = []
-        for item in root.findall("group_state"):
-            if not item.attrib.get("name") or not item.attrib.get("group"):
-                raise ValueError("SRDF group_state is incomplete")
-            group_states.append({
-                "name": item.attrib["name"],
-                "group": item.attrib["group"],
-                "joints": sorted([
-                    {
-                        "name": joint.attrib["name"],
-                        "value": [float(value) for value in joint.attrib["value"].split()],
-                    }
-                    for joint in item.findall("joint")
-                ], key=lambda joint: joint["name"]),
-            })
-            if any(
-                not math.isfinite(value)
-                for joint in group_states[-1]["joints"]
-                for value in joint["value"]
-            ):
-                raise ValueError("SRDF group_state values must be finite")
-        disabled_collisions = sorted([
-            {
-                "link1": item.attrib["link1"],
-                "link2": item.attrib["link2"],
-                "reason": item.attrib.get("reason", ""),
-            }
-            for item in root.findall("disable_collisions")
-        ], key=lambda item: (item["link1"], item["link2"], item["reason"]))
-        return {
-            "name": root.attrib["name"],
-            "groups": sorted(groups, key=lambda item: item["name"]),
-            "passive_joints": passive_joints,
-            "end_effectors": sorted(end_effectors, key=lambda item: item["name"]),
-            "virtual_joints": sorted(virtual_joints, key=lambda item: item["name"]),
-            "group_states": sorted(group_states, key=lambda item: item["name"]),
-            "disabled_collisions": disabled_collisions,
-        }
-
-    def FromMoveIt(
-        self,
-        urdfPath: Union[str, Path],
-        srdfPath: Union[str, Path],
-        overlay: Optional[Union[str, Path, Mapping[str, Any]]] = None,
-    ) -> CompiledRobotMorphology:
-        control = {} if overlay is None else self._ReadJson(overlay)
-        return self.Compile({
-            "schema_version": ROBOT_MORPHOLOGY_SCHEMA_VERSION,
-            "urdf": self._ParseUrdf(urdfPath),
-            "srdf": self._ParseSrdf(srdfPath),
-            "control": control,
-        })
-
-    def FromJson(
-        self,
-        source: Union[str, Path, Mapping[str, Any]],
-    ) -> CompiledRobotMorphology:
-        return self.Compile(self._ReadJson(source))
-
-    @staticmethod
-    def _UniqueNames(items: Iterable[Dict[str, Any]], field: str) -> Dict[str, Dict[str, Any]]:
-        output: Dict[str, Dict[str, Any]] = {}
-        for item in items:
-            if type(item) is not dict:
-                raise TypeError("robot morphology named items must be objects")
-            name = item.get(field)
-            if type(name) is not str or not name:
-                raise ValueError(f"robot morphology {field} must be a non-empty string")
-            if name in output:
-                raise ValueError(f"duplicate robot morphology name {name!r}")
-            output[name] = dict(item)
-        return output
-
-    @staticmethod
-    def _SemanticValues(
-        item: Mapping[str, Any],
-        *,
-        defaultRole: str,
-        defaultCapabilities: Sequence[str] = (),
-    ) -> Tuple[str, str, Tuple[str, ...]]:
-        role = item.get("role", defaultRole)
-        side = item.get("side", "none")
-        capabilities = item.get("capabilities", list(defaultCapabilities))
-        if role not in BODY_ROLE_NAMES:
-            raise ValueError(f"unsupported robot body role {role!r}")
-        if side not in BODY_SIDE_NAMES:
-            raise ValueError(f"unsupported robot body side {side!r}")
-        if (
-            type(capabilities) is not list
-            or any(
-                type(capability) is not str
-                or capability not in BODY_CAPABILITY_NAMES
-                for capability in capabilities)
-            or len(set(capabilities)) != len(capabilities)
-        ):
-            raise ValueError("robot body capabilities are invalid")
-        ordered = tuple(
-            capability for capability in BODY_CAPABILITY_NAMES
-            if capability in capabilities)
-        return role, side, ordered
-
-    @classmethod
-    def _SemanticOverlay(
-        cls,
-        items: Any,
-        names: Sequence[str],
-        *,
-        kind: str,
-        defaultRole: str,
-    ) -> Dict[str, Tuple[str, str, Tuple[str, ...]]]:
-        result = {
-            name: cls._SemanticValues({}, defaultRole=defaultRole)
-            for name in names}
-        if items is None:
-            return result
-        if type(items) is not list:
-            raise TypeError(f"control {kind} semantics must be an array")
-        specs = cls._UniqueNames(items, "name")
-        unknown = sorted(set(specs) - set(names))
-        if unknown:
-            raise ValueError(
-                f"control {kind} semantics reference unknown names: {unknown}")
-        for name, spec in specs.items():
-            if set(spec) - {"name", "role", "side", "capabilities"}:
-                raise ValueError(f"control {kind} semantic fields are invalid")
-            result[name] = cls._SemanticValues(
-                spec,
-                defaultRole=defaultRole)
+    def ValidateBasis(
+        basis: Sequence[Sequence[float]],
+        fieldName: str,
+    ) -> Tuple[Tuple[float, ...], ...]:
+        result = tuple(tuple(float(value) for value in row) for row in basis)
+        if len(result) != 3 or any(len(row) != len(result[0]) for row in result):
+            raise ValueError(f"{fieldName} must be a rectangular three-row basis")
+        if any(not math.isfinite(value) for row in result for value in row):
+            raise ValueError(f"{fieldName} must be finite")
+        if result[0] and int(torch.linalg.matrix_rank(
+            torch.tensor(result, dtype=torch.float64)
+        ).item()) != len(result[0]):
+            raise ValueError(f"{fieldName} columns must be linearly independent")
         return result
 
     @staticmethod
-    def _TopologicalLinks(
-        links: Dict[str, Dict[str, Any]],
-        joints: Dict[str, Dict[str, Any]],
-    ) -> Tuple[Tuple[str, ...], Dict[str, Optional[str]], Dict[str, str]]:
-        parent_of: Dict[str, Optional[str]] = {name: None for name in links}
-        parent_joint: Dict[str, str] = {}
-        children: Dict[str, List[str]] = {name: [] for name in links}
-        for joint in joints.values():
-            parent = joint["parent"]
-            child = joint["child"]
-            if parent not in links or child not in links:
-                raise ValueError("URDF joint references an unknown link")
-            if parent_of[child] is not None:
-                raise ValueError("URDF link has more than one parent joint")
-            parent_of[child] = parent
-            parent_joint[child] = joint["name"]
-            children[parent].append(child)
-        roots = sorted(name for name, parent in parent_of.items() if parent is None)
-        if len(roots) != 1:
-            raise ValueError("URDF must contain exactly one kinematic root")
-        ordered: List[str] = []
-        queue: List[str] = roots[:]
-        while queue:
-            node = queue.pop(0)
-            ordered.append(node)
-            queue.extend(sorted(children[node]))
-        if len(ordered) != len(links):
-            raise ValueError("URDF kinematic graph contains a cycle")
-        return tuple(ordered), parent_of, parent_joint
-
-    @staticmethod
-    def _PathLinks(
-        base: str,
-        tip: str,
-        parent_of: Dict[str, Optional[str]],
-    ) -> Tuple[str, ...]:
-        path: List[str] = []
-        current: Optional[str] = tip
-        while current is not None and current != base:
-            path.append(current)
-            current = parent_of[current]
-        if current != base:
-            raise ValueError("SRDF chain is not a directed kinematic path")
-        path.append(base)
-        return tuple(reversed(path))
-
-    def _ResolveGroups(
-        self,
-        group_items: Sequence[Dict[str, Any]],
-        links: Dict[str, Dict[str, Any]],
-        joints: Dict[str, Dict[str, Any]],
-        parent_of: Dict[str, Optional[str]],
-        parent_joint: Dict[str, str],
-    ) -> Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]]:
-        groups = self._UniqueNames(group_items, "name")
-        resolved: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {}
-        active: set = set()
-
-        def resolve(name: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-            if name in resolved:
-                return resolved[name]
-            if name not in groups:
-                raise ValueError(f"SRDF references unknown subgroup {name!r}")
-            if name in active:
-                raise ValueError("SRDF subgroup graph contains a cycle")
-            active.add(name)
-            group = groups[name]
-            for field in ("links", "joints", "subgroups", "chains"):
-                if type(group.get(field, [])) is not list:
-                    raise TypeError(f"SRDF group {field} must be an array")
-            for field in ("links", "joints", "subgroups"):
-                values = group.get(field, [])
-                if (
-                    any(type(value) is not str or not value for value in values)
-                    or len(set(values)) != len(values)
-                ):
-                    raise ValueError(f"SRDF group {field} is invalid")
-            chains = group.get("chains", [])
-            chain_keys = []
-            for chain in chains:
-                if (
-                    type(chain) is not dict
-                    or set(chain) != {"base_link", "tip_link"}
-                    or type(chain["base_link"]) is not str
-                    or not chain["base_link"]
-                    or type(chain["tip_link"]) is not str
-                    or not chain["tip_link"]
-                ):
-                    raise ValueError("SRDF group chain is invalid")
-                chain_keys.append((chain["base_link"], chain["tip_link"]))
-            if len(set(chain_keys)) != len(chain_keys):
-                raise ValueError("duplicate SRDF group chain")
-            link_names = set(group.get("links", []))
-            joint_names = set(group.get("joints", []))
-            for link_name in tuple(link_names):
-                if link_name not in links:
-                    raise ValueError("SRDF group references an unknown link")
-                if link_name in parent_joint:
-                    joint_names.add(parent_joint[link_name])
-            for joint_name in tuple(joint_names):
-                if joint_name not in joints:
-                    virtual_joints = {
-                        item["name"]: item
-                        for item in self._current_srdf.get("virtual_joints", [])}
-                    if joint_name in virtual_joints:
-                        link_names.add(
-                            virtual_joints[joint_name]["child_link"])
-                        continue
-                    raise ValueError("SRDF group references an unknown joint")
-                link_names.add(joints[joint_name]["child"])
-            for chain in group.get("chains", []):
-                base = chain["base_link"]
-                tip = chain["tip_link"]
-                if base not in links or tip not in links:
-                    raise ValueError("SRDF chain references an unknown link")
-                chain_links = self._PathLinks(base, tip, parent_of)
-                link_names.update(chain_links)
-                joint_names.update(
-                    parent_joint[link]
-                    for link in chain_links[1:])
-            for subgroup in group.get("subgroups", []):
-                sub_links, sub_joints = resolve(subgroup)
-                link_names.update(sub_links)
-                joint_names.update(sub_joints)
-            active.remove(name)
-            result = (tuple(sorted(link_names)), tuple(sorted(joint_names)))
-            resolved[name] = result
-            return result
-
-        for group_name in groups:
-            resolve(group_name)
-        return resolved
-
-    @staticmethod
-    def _EndpointLink(
-        endpoint: Dict[str, Any],
-        resolved_groups: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]],
-        parent_of: Dict[str, Optional[str]],
-    ) -> Tuple[str, Optional[str]]:
-        group_name = endpoint["group"]
-        if group_name not in resolved_groups:
-            raise ValueError("SRDF end_effector references an unknown group")
-        group_links = set(resolved_groups[group_name][0])
-        leaves = sorted(
-            link for link in group_links
-            if not any(parent_of.get(other) == link for other in group_links))
-        if len(leaves) == 1:
-            return leaves[0], None
-        raise ValueError(
-            f"SRDF end_effector {endpoint['name']!r} has ambiguous group leaves")
-
-    def Compile(self, source: Mapping[str, Any]) -> CompiledRobotMorphology:
-        source = dict(source)
-        if source.get("schema_version") != ROBOT_MORPHOLOGY_SCHEMA_VERSION:
-            raise ValueError("unsupported robot morphology schema")
-        if type(source.get("urdf")) is not dict or type(source.get("srdf")) is not dict:
-            raise TypeError("robot morphology requires urdf and srdf objects")
-        urdf = dict(source["urdf"])
-        srdf = dict(source["srdf"])
-        control = dict(source.get("control", {}))
-        if set(control) - {
-            "nodes",
-            "groups",
-            "endpoints",
-            "sensors",
-            "observer",
-            "observer_endpoint",
-            "observer_frame_name",
-            "observer_calibration_id",
-            "grippers",
-        }:
-            raise ValueError("robot control semantics contain unsupported fields")
-        if urdf.get("name") != srdf.get("name"):
-            raise ValueError("URDF and SRDF robot names do not match")
-        robot_name = urdf.get("name")
-        if type(robot_name) is not str or not robot_name:
-            raise ValueError("robot morphology name must be non-empty")
-        for owner, fields in (
-            (urdf, ("links", "joints")),
-            (srdf, (
-                "groups",
-                "passive_joints",
-                "end_effectors",
-                "virtual_joints",
-                "group_states",
-                "disabled_collisions",
-            )),
+    def ValidateTensor(
+        value: torch.Tensor,
+        shape: Tuple[int, ...],
+        fieldName: str,
+        floating: bool,
+    ) -> None:
+        if not torch.is_tensor(value) or tuple(value.shape) != shape:
+            raise ValueError(f"{fieldName} has the wrong shape")
+        if floating and (
+            not value.is_floating_point()
+            or not bool(torch.isfinite(value).all().item())
         ):
-            for field in fields:
-                if type(owner.get(field, [])) is not list:
-                    raise TypeError(f"robot morphology {field} must be an array")
-        links = self._UniqueNames(urdf.get("links", []), "name")
-        joints = self._UniqueNames(urdf.get("joints", []), "name")
-        if not links:
-            raise ValueError("robot morphology must contain at least one link")
-        for joint in joints.values():
-            if not {"name", "type", "parent", "child"}.issubset(joint):
-                raise ValueError("URDF joint is incomplete")
-            if (
-                type(joint["parent"]) is not str
-                or not joint["parent"]
-                or type(joint["child"]) is not str
-                or not joint["child"]
-            ):
-                raise ValueError("URDF joint links are invalid")
-            self._JointDof(joint["type"])
-        node_names, parent_of, parent_joint = self._TopologicalLinks(links, joints)
-        node_index = {name: index for index, name in enumerate(node_names)}
-        node_semantics = self._SemanticOverlay(
-            control.get("nodes"),
-            node_names,
-            kind="node",
-            defaultRole="other")
-        for joint in joints.values():
-            if joint["parent"] not in links or joint["child"] not in links:
-                raise ValueError("URDF joint references an unknown link")
-            for field in ("origin_xyz", "origin_rpy"):
-                value = joint.get(field, [0.0, 0.0, 0.0])
-                if (
-                    type(value) is not list
-                    or len(value) != 3
-                    or any(type(item) not in (int, float) for item in value)
-                    or any(not math.isfinite(float(item)) for item in value)
-                ):
-                    raise ValueError(f"URDF joint {field} must contain three finite values")
-            joint_type = joint["type"]
-            dof = self._JointDof(joint_type)
-            axis = joint.get("axis")
-            if (
-                type(axis) is not list
-                or len(axis) != 3
-                or any(type(value) not in (int, float) for value in axis)
-                or any(not math.isfinite(float(value)) for value in axis)
-            ):
-                raise ValueError("URDF joint axis must contain three finite values")
-            if dof > 0:
-                axis_norm = math.sqrt(sum(float(value) ** 2 for value in axis))
-                if axis_norm <= 1e-8:
-                    raise ValueError("URDF movable joint axis must be non-zero")
-                joint["axis"] = [float(value) / axis_norm for value in axis]
-            limit = joint.get("limit")
-            if type(limit) is dict and set(limit) - {
-                "lower", "upper", "effort", "velocity"
-            }:
-                raise ValueError("URDF joint limit fields are invalid")
-            if joint_type in ("revolute", "prismatic"):
-                if (
-                    type(limit) is not dict
-                    or not {"lower", "upper", "effort", "velocity"}.issubset(limit)
-                ):
-                    raise ValueError(
-                        "URDF revolute and prismatic joints require complete limits")
-            elif joint_type == "continuous":
-                if (
-                    type(limit) is not dict
-                    or not {"effort", "velocity"}.issubset(limit)
-                    or "lower" in limit
-                    or "upper" in limit
-                ):
-                    raise ValueError(
-                        "URDF continuous joints require effort and velocity limits")
-            elif limit is not None:
-                raise ValueError(
-                    "URDF fixed, planar, and floating joints cannot declare limits")
-            if limit is not None:
-                if (
-                    type(limit) is not dict
-                    or any(type(value) not in (int, float) for value in limit.values())
-                    or any(not math.isfinite(float(value)) for value in limit.values())
-                ):
-                    raise ValueError("URDF joint limits must be finite numbers")
-                if (
-                    float(limit.get("effort", 0.0)) < 0.0
-                    or float(limit.get("velocity", 0.0)) < 0.0
-                ):
-                    raise ValueError(
-                        "URDF joint effort and velocity limits must be non-negative")
-                if (
-                    joint_type in ("revolute", "prismatic")
-                    and float(limit["lower"]) > float(limit["upper"])
-                ):
-                    raise ValueError("URDF joint lower limit exceeds upper limit")
-            if joint.get("mimic") is not None:
-                mimic = joint["mimic"]
-                if (
-                    type(mimic) is not dict
-                    or set(mimic) != {"joint", "multiplier", "offset"}
-                    or type(mimic.get("multiplier")) not in (int, float)
-                    or type(mimic.get("offset")) not in (int, float)
-                    or not math.isfinite(float(mimic["multiplier"]))
-                    or not math.isfinite(float(mimic["offset"]))
-                ):
-                    raise ValueError("URDF mimic parameters are invalid")
-                target = mimic.get("joint")
-                if target not in joints:
-                    raise ValueError("URDF mimic references an unknown joint")
-                target_type = joints[target]["type"]
-                rotational = {"revolute", "continuous"}
-                compatible = (
-                    joint_type in rotational and target_type in rotational
-                ) or (
-                    joint_type == "prismatic" and target_type == "prismatic")
-                if not compatible:
-                    raise ValueError("URDF mimic joint dimension does not match source")
-        for joint_name in joints:
+            raise ValueError(f"{fieldName} must be finite floating point")
+        if not floating and value.dtype != torch.bool:
+            raise ValueError(f"{fieldName} must be boolean")
+
+    @staticmethod
+    def FromUrdfSrdf(
+        urdfSource: Union[str, Path],
+        srdfSource: Union[str, Path],
+        profileId: str,
+        adapterId: str,
+        urdfReader: UrdfReaderProtocol,
+        srdfReader: SrdfReaderProtocol,
+    ) -> RobotDefinition:
+        urdf = urdfReader.Read(urdfSource)
+        srdf = srdfReader.Read(srdfSource)
+        if type(urdf) is not UrdfRobotDescription or type(srdf) is not SrdfSemanticDescription:
+            raise TypeError("robot readers returned an invalid description")
+        if urdf.robot_name != srdf.robot_name or urdf.description_id != srdf.description_id:
+            raise ValueError("URDF and SRDF identities do not match")
+        return RobotDefinition(
+            profile_id=RobotMorphologyModule.ValidateIdentifier(profileId, "profileId"),
+            description_id=urdf.description_id,
+            semantic_definition_id=srdf.semantic_definition_id,
+            adapter_id=RobotMorphologyModule.ValidateIdentifier(adapterId, "adapterId"),
+            joints=urdf.joints,
+            end_effectors=srdf.end_effectors,
+            perception_calibrations=srdf.perception_calibrations)
+
+    @staticmethod
+    def CompileHierarchyIndices(
+        parentIndex: Sequence[int],
+    ) -> Tuple[
+        Tuple[Tuple[int, ...], ...],
+        Tuple[bool, ...],
+        Tuple[bool, ...],
+        Tuple[bool, ...],
+        Tuple[int, ...],
+        Tuple[int, ...],
+    ]:
+        count = len(parentIndex)
+        depths = []
+        for index in range(count):
             visited = set()
-            current = joint_name
-            while joints[current].get("mimic") is not None:
-                if current in visited:
-                    raise ValueError("URDF mimic graph contains a cycle")
-                visited.add(current)
-                current = joints[current]["mimic"]["joint"]
-        virtual_joints = srdf.get("virtual_joints", [])
-        virtual_joint_by_name = self._UniqueNames(virtual_joints, "name")
-        if set(virtual_joint_by_name) & set(joints):
-            raise ValueError("SRDF virtual_joint conflicts with a URDF joint name")
-        virtual_children = set()
-        for virtual_joint in virtual_joints:
-            if set(virtual_joint) != {
-                "name", "type", "parent_frame", "child_link"
-            }:
-                raise ValueError("SRDF virtual_joint fields are invalid")
-            child_link = virtual_joint["child_link"]
-            if child_link not in links:
-                raise ValueError("SRDF virtual_joint child_link is unknown")
-            if parent_of[child_link] is not None:
-                raise ValueError("SRDF virtual_joint child_link must be the URDF root")
-            if child_link in virtual_children:
-                raise ValueError("SRDF virtual_joint child_link is duplicated")
-            virtual_children.add(child_link)
-            if virtual_joint["type"] not in ("fixed", "floating", "planar"):
-                raise ValueError("SRDF virtual_joint type is unsupported")
-            if (
-                type(virtual_joint["parent_frame"]) is not str
-                or not virtual_joint["parent_frame"]
-            ):
-                raise ValueError("SRDF virtual_joint parent_frame is invalid")
-            if virtual_joint["parent_frame"] in links:
-                raise ValueError("SRDF virtual_joint parent_frame must be external")
-        joint_definitions = dict(joints)
-        for virtual_joint in virtual_joints:
-            joint_definitions[virtual_joint["name"]] = {
-                "name": virtual_joint["name"],
-                "type": virtual_joint["type"],
-                "parent": None,
-                "child": virtual_joint["child_link"],
-                "origin_xyz": [0.0, 0.0, 0.0],
-                "origin_rpy": [0.0, 0.0, 0.0],
-                "axis": [0.0, 0.0, 0.0],
-                "limit": None,
-                "mimic": None,
-            }
-        self._current_srdf = srdf
-        try:
-            resolved_groups = self._ResolveGroups(
-                srdf.get("groups", []), links, joints, parent_of, parent_joint)
-        finally:
-            del self._current_srdf
-        independent_joints = {
-            name
-            for name, joint in joints.items()
-            if self._JointDof(joint["type"]) > 0
-            and joint.get("mimic") is None
+            cursor = index
+            depth = -1
+            while cursor >= 0:
+                if cursor in visited:
+                    raise ValueError("end-effector hierarchy must be acyclic")
+                visited.add(cursor)
+                depth += 1
+                cursor = parentIndex[cursor]
+            depths.append(depth)
+        layers = tuple(
+            tuple(index for index, depth in enumerate(depths) if depth == layer)
+            for layer in range(max(depths) + 1))
+        rootMask = tuple(value < 0 for value in parentIndex)
+        childMask = tuple(value >= 0 for value in parentIndex)
+        independentMask = tuple(
+            rootMask[index] and index not in parentIndex
+            for index in range(count))
+        subtrees = []
+        for root in range(count):
+            subtree = []
+            for candidate in range(count):
+                cursor = candidate
+                while cursor >= 0 and cursor != root:
+                    cursor = parentIndex[cursor]
+                if cursor == root:
+                    subtree.append(candidate)
+            subtrees.append(tuple(subtree))
+        layout = PackedLayout.FromWidths(tuple(map(len, subtrees)))
+        return (
+            layers,
+            rootMask,
+            childMask,
+            independentMask,
+            layout.offsets,
+            tuple(index for subtree in subtrees for index in subtree),
+        )
+
+    @staticmethod
+    def CompileJointTokens(
+        joints: Sequence[JointDefinition],
+    ) -> Tuple[Tuple[float, ...], ...]:
+        indexById = {joint.joint_id: index for index, joint in enumerate(joints)}
+        depths = []
+        for index, joint in enumerate(joints):
+            depth = 0
+            parentId = joint.parent_joint_id
+            while parentId is not None:
+                parentIndex = indexById.get(parentId, index)
+                if parentIndex >= index:
+                    raise ValueError("joint parents must precede child coordinates")
+                depth += 1
+                parentId = joints[parentIndex].parent_joint_id
+            depths.append(depth)
+        maxDepth = max(depths)
+        return tuple(tuple(float(value) for value in (
+            *(float(typeIndex == int(joint.joint_type)) for typeIndex in range(len(JointType))),
+            *joint.translation_axis,
+            *joint.rotation_axis,
+            joint.position_lower,
+            joint.position_upper,
+            joint.velocity_limit,
+            float(joint.periodic),
+            float(depths[index]) / float(max(maxDepth, 1)),
+        )) for index, joint in enumerate(joints))
+
+    @staticmethod
+    def CompileEndEffectorTokens(
+        endEffectors: Sequence[EndEffector],
+        parentIndex: Sequence[int],
+        layers: Sequence[Sequence[int]],
+    ) -> Tuple[Tuple[float, ...], ...]:
+        depths = [0] * len(endEffectors)
+        for depth, layer in enumerate(layers):
+            for index in layer:
+                depths[index] = depth
+        maxDepth = max(depths)
+        maxChain = max(len(effector.joint_ids) for effector in endEffectors)
+        tokens = []
+        for index, effector in enumerate(endEffectors):
+            translation = torch.tensor(effector.translation_basis, dtype=torch.float64)
+            rotation = torch.tensor(effector.rotation_basis, dtype=torch.float64)
+            tokens.append(tuple(float(value) for value in (
+                *(float(typeIndex == int(effector.effector_type)) for typeIndex in range(len(EndEffectorType))),
+                *(float(bool(torch.linalg.vector_norm(translation[row]).item())) for row in range(3)),
+                *(float(bool(torch.linalg.vector_norm(rotation[row]).item())) for row in range(3)),
+                float(parentIndex[index] < 0),
+                float(parentIndex[index] >= 0),
+                float(effector.is_perception_slot),
+                float(depths[index]) / float(max(maxDepth, 1)),
+                float(len(effector.joint_ids)) / float(maxChain),
+            )))
+        return tuple(tokens)
+
+    @staticmethod
+    def CompileDefinition(
+        definition: RobotDefinition,
+    ) -> RobotEmbodimentContract:
+        if type(definition) is not RobotDefinition:
+            raise TypeError("definition must be RobotDefinition")
+        parentIndexById = {
+            value.joint_id: index for index, value in enumerate(definition.joints)
         }
-        covered_joints = {
-            name
-            for _, group_joints in resolved_groups.values()
-            for name in group_joints
-            if name in joints
+        jointParentIndex = tuple(
+            -1
+            if value.parent_joint_id is None
+            else parentIndexById[value.parent_joint_id]
+            for value in definition.joints)
+        effectorIndexById = {
+            value.effector_id: index
+            for index, value in enumerate(definition.end_effectors)
         }
-        uncovered_joints = sorted(independent_joints - covered_joints)
-        if uncovered_joints:
-            raise ValueError(
-                "independent URDF joints are missing from SRDF planning groups: "
-                f"{uncovered_joints}")
-        end_effectors = self._UniqueNames(srdf.get("end_effectors", []), "name")
-        for end_effector in end_effectors.values():
-            if not {"name", "parent_link", "group"}.issubset(end_effector):
-                raise ValueError("SRDF end_effector is incomplete")
-            if end_effector["parent_link"] not in links:
-                raise ValueError("SRDF end_effector parent_link is unknown")
-            if end_effector["group"] not in resolved_groups:
-                raise ValueError("SRDF end_effector group is unknown")
-            parent_group = end_effector.get("parent_group")
-            if parent_group is not None and parent_group not in resolved_groups:
-                raise ValueError("SRDF end_effector parent_group is unknown")
-            if (
-                parent_group is not None
-                and end_effector["parent_link"]
-                not in resolved_groups[parent_group][0]
-            ):
-                raise ValueError(
-                    "SRDF end_effector parent_link is outside parent_group")
-        for collision in srdf.get("disabled_collisions", []):
-            if type(collision) is not dict or not {"link1", "link2"}.issubset(collision):
-                raise ValueError("SRDF disabled collision is incomplete")
-            if collision["link1"] not in links or collision["link2"] not in links:
-                raise ValueError("SRDF disabled collision references an unknown link")
-        passive_items = srdf.get("passive_joints", [])
-        if any(type(name) is not str or not name for name in passive_items):
-            raise ValueError("SRDF passive_joint name is invalid")
-        passive = set(passive_items)
-        if len(passive) != len(passive_items):
-            raise ValueError("duplicate SRDF passive_joint")
-        if any(name not in joints for name in passive):
-            raise ValueError("SRDF passive_joint references an unknown joint")
-        invalid_passive = sorted(passive - independent_joints)
-        if invalid_passive:
-            raise ValueError(
-                "SRDF passive_joint must reference an independent movable joint: "
-                f"{invalid_passive}")
-        joint_names = tuple(sorted(
-            joint_definitions,
-            key=lambda name: (
-                node_index[joint_definitions[name]["child"]],
-                name)))
-        variable_names: List[str] = []
-        variable_limits: List[Tuple[float, float]] = []
-        variable_effort_limits: List[float] = []
-        variable_velocity_limits: List[float] = []
-        variable_command_delta_scales: List[float] = []
-        variable_units: List[str] = []
-        variable_commandable: List[bool] = []
-        joint_type_indices: List[int] = []
-        variable_joint_indices: List[int] = []
-        variable_child_nodes: List[int] = []
-        variable_local_indices: List[int] = []
-        joint_variable_slices: Dict[str, Tuple[int, int]] = {}
-        for joint_index, joint_name in enumerate(joint_names):
-            joint = joint_definitions[joint_name]
-            joint_type_indices.append(JOINT_TYPE_NAMES.index(joint["type"]))
-            start = len(variable_names)
-            names = self._VariableNames(joint)
-            variable_names.extend(names)
-            variable_commandable.extend(
-                joint_name in joints and joint_name not in passive
-                for _ in names)
-            dof = len(names)
-            limit = joint.get("limit")
-            effort_limit = (
-                float(limit.get("effort", math.inf))
-                if limit is not None else math.inf)
-            velocity_limit = (
-                float(limit.get("velocity", math.inf))
-                if limit is not None else math.inf)
-            if effort_limit < 0.0 or velocity_limit < 0.0:
-                raise ValueError("URDF joint effort and velocity limits must be non-negative")
-            if dof == 1 and joint["type"] != "continuous" and limit is not None:
-                lower = float(limit.get("lower", -math.inf))
-                upper = float(limit.get("upper", math.inf))
-            else:
-                lower = -math.inf
-                upper = math.inf
-            if lower > upper:
-                raise ValueError("URDF joint lower limit exceeds upper limit")
-            variable_limits.extend((lower, upper) for _ in range(dof))
-            variable_effort_limits.extend(effort_limit for _ in range(dof))
-            variable_velocity_limits.extend(velocity_limit for _ in range(dof))
-            for local_index in range(dof):
-                joint_type = joint["type"]
-                rotational = (
-                    joint_type in ("revolute", "continuous")
-                    or joint_type == "planar" and local_index == 2
-                    or joint_type == "floating" and local_index >= 3
-                )
-                variable_units.append("radian" if rotational else "meter")
-                if math.isfinite(lower) and math.isfinite(upper):
-                    command_scale = upper - lower
-                else:
-                    command_scale = math.pi if rotational else 1.0
-                if not math.isfinite(command_scale) or command_scale <= 0.0:
-                    raise ValueError("joint command delta scale must be positive")
-                variable_command_delta_scales.append(command_scale)
-            variable_joint_indices.extend(joint_index for _ in range(dof))
-            variable_child_nodes.extend(
-                node_index[joint["child"]] for _ in range(dof))
-            variable_local_indices.extend(range(dof))
-            joint_variable_slices[joint_name] = (start, len(variable_names))
-        if len(set(variable_names)) != len(variable_names):
-            raise ValueError("robot joint variable names are not unique")
-        group_state_keys = set()
-        for state in srdf.get("group_states", []):
-            if type(state) is not dict or not {"name", "group", "joints"}.issubset(state):
-                raise ValueError("SRDF group_state is incomplete")
-            if (
-                type(state["name"]) is not str
-                or not state["name"]
-                or type(state["group"]) is not str
-                or not state["group"]
-                or type(state["joints"]) is not list
-            ):
-                raise ValueError("SRDF group_state fields are invalid")
-            state_key = (state["group"], state["name"])
-            if state_key in group_state_keys:
-                raise ValueError("duplicate SRDF group_state")
-            group_state_keys.add(state_key)
-            if state["group"] not in resolved_groups:
-                raise ValueError("SRDF group_state references an unknown group")
-            allowed_joints = set(resolved_groups[state["group"]][1])
-            state_joints = self._UniqueNames(state["joints"], "name")
-            for item in state_joints.values():
-                joint_name = item["name"]
-                if (
-                    joint_name not in joint_definitions
-                    or joint_name not in allowed_joints
-                ):
-                    raise ValueError("SRDF group_state references an invalid joint")
-                if (
-                    joint_name not in independent_joints
-                    and not (
-                        joint_name in virtual_joint_by_name
-                        and self._JointDof(
-                            joint_definitions[joint_name]["type"]) > 0)
-                ):
-                    raise ValueError(
-                        "SRDF group_state must reference an independent movable joint")
-                expected_dof = self._JointDof(
-                    joint_definitions[joint_name]["type"])
-                value = item.get("value")
-                if (
-                    type(value) is not list
-                    or len(value) != expected_dof
-                    or any(type(entry) not in (int, float) for entry in value)
-                    or any(not math.isfinite(float(entry)) for entry in value)
-                ):
-                    raise ValueError("SRDF group_state joint value dimension is invalid")
-                limit = joint_definitions[joint_name].get("limit")
-                if expected_dof == 1 and joint_definitions[joint_name]["type"] != "continuous" and limit is not None:
-                    scalar_value = float(value[0])
-                    if scalar_value < float(limit["lower"]) or scalar_value > float(limit["upper"]):
-                        raise ValueError("SRDF group_state joint value exceeds URDF limits")
-        group_names = tuple(sorted(resolved_groups))
-        group_semantics = self._SemanticOverlay(
-            control.get("groups"),
-            group_names,
-            kind="group",
-            defaultRole="other")
-        group_dof_count = tuple(
-            sum(
-                joint_variable_slices[name][1] - joint_variable_slices[name][0]
-                for name in resolved_groups[group_name][1]
-                if name in joint_variable_slices)
-            for group_name in group_names)
-        diagnostics: List[str] = [
-            f"virtual_joint {item['name']} {item['type']} state requires external joint runtime fields"
-            for item in virtual_joints
-            if item["type"] != "fixed"]
-        overlay_endpoints = control.get("endpoints")
-        endpoint_specs: List[Dict[str, Any]] = []
-        endpoint_semantic_overrides: Dict[str, Dict[str, Any]] = {}
-        semantic_endpoint_fields = {
-            "name",
-            "role",
-            "side",
-            "capabilities",
-            "task_mask",
+        parentIndex = tuple(
+            -1
+            if value.parent_effector_id is None
+            else effectorIndexById[value.parent_effector_id]
+            for value in definition.end_effectors)
+        (
+            topologicalLayers,
+            rootMask,
+            childMask,
+            independentMask,
+            subtreeOffsets,
+            subtreeIndices,
+        ) = RobotMorphologyModule.CompileHierarchyIndices(parentIndex)
+        jointStaticTokens = RobotMorphologyModule.CompileJointTokens(
+            definition.joints)
+        endpointStaticTokens = RobotMorphologyModule.CompileEndEffectorTokens(
+            definition.end_effectors,
+            parentIndex,
+            topologicalLayers)
+        jointFeedbackLayout = PackedLayout.FromWidths(tuple(
+            3
+            if value.periodic
+            else 4
+            if value.joint_type in (JointType.REVOLUTE, JointType.CONTINUOUS)
+            else 2
+            for value in definition.joints))
+        endpointTargetLayout = PackedLayout.FromWidths(tuple(
+            value.TargetDim for value in definition.end_effectors))
+        jointIndexById = {
+            value.joint_id: index
+            for index, value in enumerate(definition.joints)
         }
-        if overlay_endpoints is None or (
-            type(overlay_endpoints) is list
-            and all(
-                type(item) is dict
-                and set(item).issubset(semantic_endpoint_fields)
-                for item in overlay_endpoints)
+        endpointChains = tuple(
+            tuple(jointIndexById[jointId] for jointId in value.joint_ids)
+            for value in definition.end_effectors)
+        endpointChainLayout = PackedLayout.FromWidths(tuple(map(len, endpointChains)))
+        perceptionIndices = tuple(
+            index
+            for index, value in enumerate(definition.end_effectors)
+            if value.is_perception_slot)
+        projectionBinding = next(
+            (
+                value
+                for value in definition.perception_calibrations
+                if value.primary
+            ),
+            None)
+        projection = (
+            None
+            if projectionBinding is None
+            else PerceptionProjectionView(
+                calibration_id=projectionBinding.calibration_id,
+                reference_frame_id=projectionBinding.frame_id,
+                projection_matrix=projectionBinding.projection_matrix,
+                reference_size=projectionBinding.reference_size)
+        )
+        primaryPerceptionViewIndex = (
+            None
+            if projectionBinding is None
+            else perceptionIndices.index(next(
+                index
+                for index, value in enumerate(definition.end_effectors)
+                if value.effector_id == projectionBinding.component_id))
+        )
+        shape = EmbodimentShape(
+            joint_token_count=len(definition.joints),
+            joint_static_descriptor_dim=len(jointStaticTokens[0]),
+            joint_feedback_packed_dim=jointFeedbackLayout.PackedDim,
+            end_effector_token_count=len(definition.end_effectors),
+            end_effector_static_descriptor_dim=len(endpointStaticTokens[0]),
+            end_effector_target_packed_dim=endpointTargetLayout.PackedDim,
+            hierarchy_edge_count=sum(value >= 0 for value in parentIndex),
+            perception_view_dim=len(perceptionIndices))
+        shapeId = ModelSignatureCompiler.Compile({
+            "kind": "embodiment_shape",
+            "shape": {
+                name: getattr(shape, name) for name in shape.__dataclass_fields__
+            },
+        })
+        viewFields = dict(
+            schema_version=ROBOT_EMBODIMENT_SCHEMA_VERSION,
+            description_id=definition.description_id,
+            semantic_definition_id=definition.semantic_definition_id,
+            model_shape_id=shapeId,
+            adapter_id=definition.adapter_id,
+            timestamp_unit=FEEDBACK_TIMESTAMP_UNIT,
+            timestamp_reference=FEEDBACK_TIMESTAMP_REFERENCE,
+            joint_count=len(definition.joints),
+            end_effector_count=len(definition.end_effectors),
+            joint_feedback_layout=jointFeedbackLayout,
+            end_effector_target_layout=endpointTargetLayout,
+            static_joint_tokens=jointStaticTokens,
+            static_end_effector_tokens=endpointStaticTokens,
+            joint_translation_basis=PackedTensor.FromMatrices(tuple(
+                tuple((value.translation_axis[row],) for row in range(3))
+                for value in definition.joints)),
+            joint_rotation_basis=PackedTensor.FromMatrices(tuple(
+                tuple((value.rotation_axis[row],) for row in range(3))
+                for value in definition.joints)),
+            joint_lower=tuple(value.position_lower for value in definition.joints),
+            joint_upper=tuple(value.position_upper for value in definition.joints),
+            joint_velocity_limit=tuple(
+                value.velocity_limit for value in definition.joints),
+            joint_periodic=tuple(value.periodic for value in definition.joints),
+            joint_rotational=tuple(
+                value.joint_type in (JointType.REVOLUTE, JointType.CONTINUOUS)
+                for value in definition.joints),
+            end_effector_translation_basis=PackedTensor.FromMatrices(tuple(
+                value.translation_basis for value in definition.end_effectors)),
+            end_effector_rotation_basis=PackedTensor.FromMatrices(tuple(
+                value.rotation_basis for value in definition.end_effectors)),
+            end_effector_target_lower=tuple(
+                coordinate
+                for value in definition.end_effectors
+                for coordinate in value.target_lower),
+            end_effector_target_upper=tuple(
+                coordinate
+                for value in definition.end_effectors
+                for coordinate in value.target_upper),
+            end_effector_joint_chain_offsets=endpointChainLayout.offsets,
+            end_effector_joint_chain_indices=tuple(
+                index for chain in endpointChains for index in chain),
+            parent_index=parentIndex,
+            topological_layers=topologicalLayers,
+            root_mask=rootMask,
+            child_mask=childMask,
+            independent_mask=independentMask,
+            subtree_offsets=subtreeOffsets,
+            subtree_indices=subtreeIndices,
+            perception_view=PackedView(
+                source_slot_count=len(definition.end_effectors),
+                indices=perceptionIndices),
+            perception_projection=projection,
+            primary_perception_view_index=primaryPerceptionViewIndex,
+            progress_enter=tuple(
+                value.progress_enter for value in definition.end_effectors),
+            progress_exit=tuple(
+                value.progress_exit for value in definition.end_effectors),
+            dwell_cycles=tuple(
+                value.dwell_cycles for value in definition.end_effectors),
+            translation_error_scale=tuple(
+                value.translation_error_scale for value in definition.end_effectors),
+            rotation_error_scale=tuple(
+                value.rotation_error_scale for value in definition.end_effectors),
+            model_shape=shape)
+        jointIds = tuple(value.joint_id for value in definition.joints)
+        endEffectorIds = tuple(
+            value.effector_id for value in definition.end_effectors)
+        jointOriginTranslation = tuple(
+            value.origin_translation for value in definition.joints)
+        jointOriginQuaternionXyzw = tuple(
+            value.origin_quaternion_xyzw for value in definition.joints)
+        endEffectorTerminalTranslation = tuple(
+            value.terminal_translation for value in definition.end_effectors)
+        endEffectorTerminalQuaternionXyzw = tuple(
+            value.terminal_quaternion_xyzw for value in definition.end_effectors)
+        endEffectorReferenceFrame = tuple(
+            value.reference_frame_id for value in definition.end_effectors)
+        modelSignature = RobotEmbodimentContract.CompileContentSignature(
+            ROBOT_EMBODIMENT_SCHEMA_VERSION,
+            definition.description_id,
+            definition.semantic_definition_id,
+            definition.adapter_id,
+            jointIds,
+            endEffectorIds,
+            jointParentIndex,
+            jointOriginTranslation,
+            jointOriginQuaternionXyzw,
+            endEffectorTerminalTranslation,
+            endEffectorTerminalQuaternionXyzw,
+            endEffectorReferenceFrame,
+            viewFields)
+        contractId = ModelSignatureCompiler.Compile({
+            "kind": "robot_contract",
+            "model_signature": modelSignature,
+        })
+        view = RobotEmbodimentContractView(
+            contract_id=contractId,
+            model_signature=modelSignature,
+            **viewFields)
+        return RobotEmbodimentContract(
+            schema_version=ROBOT_EMBODIMENT_SCHEMA_VERSION,
+            description_id=definition.description_id,
+            semantic_definition_id=definition.semantic_definition_id,
+            contract_id=contractId,
+            model_shape_id=shapeId,
+            adapter_id=definition.adapter_id,
+            model_signature=modelSignature,
+            joint_ids=jointIds,
+            end_effector_ids=endEffectorIds,
+            joint_parent_index=jointParentIndex,
+            joint_origin_translation=jointOriginTranslation,
+            joint_origin_quaternion_xyzw=jointOriginQuaternionXyzw,
+            end_effector_terminal_translation=endEffectorTerminalTranslation,
+            end_effector_terminal_quaternion_xyzw=(
+                endEffectorTerminalQuaternionXyzw),
+            end_effector_reference_frame=endEffectorReferenceFrame,
+            view=view)
+
+
+    @staticmethod
+    def CreateRevoluteJoint(
+        jointId: str,
+        parentJointId: Optional[str],
+        originTranslation: Sequence[float],
+        rotationAxis: Sequence[float],
+        lower: float,
+        upper: float,
+        velocity: float,
+        periodic: bool = False,
+    ) -> JointDefinition:
+        parentLink = "robot_base" if parentJointId is None else f"{parentJointId}_link"
+        return JointDefinition(
+            joint_id=jointId,
+            joint_type=(JointType.CONTINUOUS if periodic else JointType.REVOLUTE),
+            parent_link_id=parentLink,
+            child_link_id=f"{jointId}_link",
+            parent_joint_id=parentJointId,
+            origin_translation=tuple(float(value) for value in originTranslation),
+            origin_quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+            translation_axis=(0.0, 0.0, 0.0),
+            rotation_axis=tuple(float(value) for value in rotationAxis),
+            position_lower=float(lower),
+            position_upper=float(upper),
+            velocity_limit=float(velocity),
+            periodic=bool(periodic))
+
+
+    @staticmethod
+    def CreateAnthropomorphicArm(
+        sideId: str,
+        sideSign: float,
+    ) -> Tuple[Tuple[JointDefinition, ...], Tuple[EndEffector, ...]]:
+        upperNames = (
+            "shoulder_flexion",
+            "shoulder_abduction",
+            "shoulder_rotation",
+            "elbow_flexion",
+            "forearm_rotation",
+            "wrist_flexion",
+            "wrist_deviation",
+        )
+        upperAxes = (
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 0.0, 1.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+        )
+        upperOrigins = (
+            (0.24 * sideSign, 0.0, 0.45),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, -0.30, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, -0.26, 0.0),
+            (0.0, 0.0, 0.0),
+        )
+        upperLimits = (
+            (-2.79, 2.09, 2.4),
+            (-1.57, 2.79, 2.4),
+            (-1.57, 1.57, 2.4),
+            (0.0, 2.62, 2.8),
+            (-1.57, 1.57, 3.0),
+            (-1.22, 1.22, 3.0),
+            (-0.61, 0.61, 3.0),
+        )
+        joints = []
+        upperIds = []
+        parentId = None
+        for name, axis, origin, limits in zip(
+            upperNames,
+            upperAxes,
+            upperOrigins,
+            upperLimits,
         ):
-            for endpoint in srdf.get("end_effectors", []):
-                link, diagnostic = self._EndpointLink(
-                    endpoint, resolved_groups, parent_of)
-                if diagnostic is not None:
-                    diagnostics.append(diagnostic)
-                endpoint_specs.append({
-                    "name": endpoint["name"],
-                    "link": link,
-                    "task_mask": [False] * len(CONTROL_DOF_NAMES),
-                })
-            endpoint_specs.sort(key=lambda item: item["name"])
-            if overlay_endpoints is not None:
-                endpoint_semantic_overrides = self._UniqueNames(
-                    overlay_endpoints,
-                    "name")
-            for endpoint in endpoint_specs:
-                override = endpoint_semantic_overrides.get(
-                    endpoint["name"], {})
-                if "task_mask" in override:
-                    endpoint["task_mask"] = override["task_mask"]
-                else:
-                    diagnostics.append(
-                        f"endpoint {endpoint['name']} has no declared task axes and is non-commandable")
-        else:
-            if type(overlay_endpoints) is not list:
-                raise TypeError("control endpoints must be an array")
-            endpoint_specs = [dict(item) for item in overlay_endpoints]
-        endpoint_by_name = self._UniqueNames(endpoint_specs, "name")
-        endpoint_names = tuple(endpoint_by_name)
-        unknown_endpoint_semantics = sorted(
-            set(endpoint_semantic_overrides) - set(endpoint_names))
-        if unknown_endpoint_semantics:
-            raise ValueError(
-                "control endpoint semantics reference unknown names: "
-                f"{unknown_endpoint_semantics}")
-        endpoint_links: List[str] = []
-        endpoint_masks: List[Tuple[bool, ...]] = []
-        endpoint_semantics: Dict[str, Tuple[str, str, Tuple[str, ...]]] = {}
-        for endpoint_name in endpoint_names:
-            endpoint = endpoint_by_name[endpoint_name]
-            if (
-                not {"name", "link", "task_mask"}.issubset(endpoint)
-                or set(endpoint) - {
-                    "name",
-                    "link",
-                    "task_mask",
-                    "role",
-                    "side",
-                    "capabilities",
-                }
-            ):
-                raise ValueError("control endpoint fields are invalid")
-            link = endpoint.get("link")
-            if link not in links:
-                raise ValueError("control endpoint references an unknown link")
-            task_mask = endpoint.get("task_mask")
-            if (
-                type(task_mask) is not list
-                or len(task_mask) != len(CONTROL_DOF_NAMES)
-                or any(type(value) is not bool for value in task_mask)
-            ):
-                raise ValueError("control endpoint task_mask is invalid")
-            endpoint_links.append(link)
-            endpoint_masks.append(tuple(task_mask))
-            endpoint_semantic = dict(endpoint)
-            endpoint_semantic.update(
-                endpoint_semantic_overrides.get(endpoint_name, {}))
-            endpoint_semantics[endpoint_name] = self._SemanticValues(
-                endpoint_semantic,
-                defaultRole="other")
-        sensor_specs = control.get("sensors", [])
-        if type(sensor_specs) is not list:
-            raise TypeError("control sensors must be an array")
-        sensor_by_name = self._UniqueNames(sensor_specs, "name")
-        sensor_names = tuple(sensor_by_name)
-        sensor_types: List[str] = []
-        sensor_links: List[str] = []
-        sensor_semantics: Dict[str, Tuple[str, str, Tuple[str, ...]]] = {}
-        for sensor_name in sensor_names:
-            sensor = sensor_by_name[sensor_name]
-            if (
-                not {"name", "type", "link"}.issubset(sensor)
-                or set(sensor) - {
-                    "name",
-                    "type",
-                    "link",
-                    "role",
-                    "side",
-                    "capabilities",
-                }
-            ):
-                raise ValueError("control sensor fields are invalid")
-            sensor_type = sensor.get("type")
-            sensor_link = sensor.get("link")
-            if type(sensor_type) is not str or not sensor_type:
-                raise ValueError("control sensor type must be a non-empty string")
-            if sensor_link not in links:
-                raise ValueError("control sensor references an unknown link")
-            sensor_types.append(sensor_type)
-            sensor_links.append(sensor_link)
-            sensor_semantics[sensor_name] = self._SemanticValues(
-                sensor,
-                defaultRole="sensor",
-                defaultCapabilities=("observe",))
-        if control.get("observer") is not None and control.get("observer_endpoint") is not None:
-            raise ValueError("observer and observer_endpoint cannot both be configured")
-        observer_spec = control.get("observer")
-        if observer_spec is None and control.get("observer_endpoint") is not None:
-            observer_spec = {"endpoint": control["observer_endpoint"]}
-        if type(observer_spec) is str:
-            matches = []
-            if observer_spec in sensor_by_name:
-                matches.append("sensor")
-            if observer_spec in endpoint_by_name:
-                matches.append("endpoint")
-            if observer_spec in links:
-                matches.append("link")
-            if len(matches) != 1:
-                raise ValueError("observer name must resolve to one attachment")
-            observer_spec = {matches[0]: observer_spec}
-        observer_control_variables: List[str] = []
-        observer_control_group: Optional[str] = None
-        if observer_spec is not None:
-            if type(observer_spec) is not dict:
-                raise ValueError("observer attachment is invalid")
-            attachment_keys = tuple(
-                key for key in ("sensor", "endpoint", "link")
-                if key in observer_spec)
-            if (
-                len(attachment_keys) != 1
-                or set(observer_spec) - {
-                    "sensor",
-                    "endpoint",
-                    "link",
-                    "control_joint_variables",
-                    "control_group",
-                }
-            ):
-                raise ValueError("observer attachment is invalid")
-            observer_control_variables = observer_spec.get(
-                "control_joint_variables", [])
-            observer_control_group = observer_spec.get("control_group")
-            if (
-                type(observer_control_variables) is not list
-                or any(
-                    type(name) is not str or not name
-                    for name in observer_control_variables)
-                or len(set(observer_control_variables))
-                != len(observer_control_variables)
-            ):
-                raise ValueError(
-                    "observer control_joint_variables are invalid")
-            if observer_control_group is not None and (
-                type(observer_control_group) is not str
-                or not observer_control_group
-                or observer_control_group not in resolved_groups
-            ):
-                raise ValueError("observer control_group is invalid")
-            observer_spec = {
-                attachment_keys[0]: observer_spec[attachment_keys[0]]}
-        observer_attachment_kind = "none"
-        observer_attachment_index = -1
-        observer_node_index = -1
-        observer_sensor_index = -1
-        observer_endpoint_index = -1
-        observer_control_group_index = -1
-        observer_control_joint_indices: List[int] = []
-        observer_attachment_name: Optional[str] = None
-        if observer_spec is not None:
-            observer_attachment_kind, observer_name = next(iter(observer_spec.items()))
-            if type(observer_name) is not str or not observer_name:
-                raise ValueError("observer attachment name must be non-empty")
-            observer_attachment_name = observer_name
-            if observer_attachment_kind == "sensor":
-                if observer_name not in sensor_by_name:
-                    raise ValueError("observer references an unknown sensor")
-                observer_sensor_index = sensor_names.index(observer_name)
-                observer_attachment_index = observer_sensor_index
-                observer_node_index = node_index[sensor_links[observer_sensor_index]]
-            elif observer_attachment_kind == "endpoint":
-                if observer_name not in endpoint_by_name:
-                    raise ValueError("observer references an unknown endpoint")
-                observer_endpoint_index = endpoint_names.index(observer_name)
-                observer_attachment_index = observer_endpoint_index
-                observer_node_index = node_index[endpoint_links[observer_endpoint_index]]
-            else:
-                if observer_name not in links:
-                    raise ValueError("observer references an unknown link")
-                observer_node_index = node_index[observer_name]
-                observer_attachment_index = observer_node_index
-            observer_node_name = node_names[observer_node_index]
-            if observer_control_group is not None:
-                observer_control_group_index = group_names.index(
-                    observer_control_group)
-                group_joint_names = resolved_groups[
-                    observer_control_group][1]
-                group_variables = [
-                    variable_names[variable_index]
-                    for joint_name in group_joint_names
-                    if joint_name in joint_variable_slices
-                    for variable_index in range(
-                        joint_variable_slices[joint_name][0],
-                        joint_variable_slices[joint_name][1])
-                ]
-                if observer_control_variables:
-                    if set(observer_control_variables) != set(group_variables):
-                        raise ValueError(
-                            "observer control variables do not match control_group")
-                else:
-                    observer_control_variables = group_variables
-            variable_index_by_name = {
-                name: index for index, name in enumerate(variable_names)}
-            unknown_observer_variables = sorted(
-                set(observer_control_variables) - set(variable_index_by_name))
-            if unknown_observer_variables:
-                raise ValueError(
-                    "observer controls reference unknown joint variables: "
-                    f"{unknown_observer_variables}")
-            ancestor_joints = set()
-            current_node = observer_node_name
-            while parent_of[current_node] is not None:
-                ancestor_joints.add(parent_joint[current_node])
-                current_node = parent_of[current_node]
-            for variable_name in observer_control_variables:
-                variable_index = variable_index_by_name[variable_name]
-                joint_name = joint_names[
-                    variable_joint_indices[variable_index]]
-                if joint_definitions[joint_name]["type"] not in (
-                    "revolute", "continuous"
-                ):
-                    raise ValueError(
-                        "observer controls must be revolute or continuous")
-                if joint_name not in ancestor_joints:
-                    raise ValueError(
-                        "observer control joint must affect the observer attachment")
-                if not variable_commandable[variable_index]:
-                    raise ValueError(
-                        "observer control joint variable is not commandable")
-                observer_control_joint_indices.append(variable_index)
-            observer_control_joint_indices.sort()
-        observer_valid = observer_spec is not None
-        observer_frame_name = control.get("observer_frame_name")
-        observer_calibration_id = control.get("observer_calibration_id")
-        if observer_valid:
-            if type(observer_frame_name) is not str or not observer_frame_name:
-                raise ValueError("observer_frame_name must be configured")
-            if (
-                type(observer_calibration_id) is not str
-                or not observer_calibration_id
-            ):
-                raise ValueError("observer_calibration_id must be configured")
-        else:
-            if observer_frame_name is not None or observer_calibration_id is not None:
-                raise ValueError(
-                    "observer frame and calibration require an observer attachment")
-            observer_frame_name = ""
-            observer_calibration_id = ""
+            jointId = f"{sideId}_{name}"
+            joints.append(RobotMorphologyModule.CreateRevoluteJoint(
+                jointId,
+                parentId,
+                origin,
+                axis,
+                limits[0],
+                limits[1],
+                limits[2]))
+            upperIds.append(jointId)
+            parentId = jointId
+        fingerSpecifications = (
+            (
+                "thumb",
+                (0.045 * sideSign, -0.015, -0.005),
+                ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+                ((-0.70, 0.70), (-0.35, 1.40), (0.0, 1.40), (0.0, 1.40)),
+                (0.0, -0.025, 0.0),
+            ),
+            (
+                "index",
+                (0.030 * sideSign, -0.040, 0.0),
+                ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+                ((-0.35, 1.57), (-0.35, 0.35), (0.0, 1.75), (0.0, 1.40)),
+                (0.0, -0.025, 0.0),
+            ),
+            (
+                "middle",
+                (0.010 * sideSign, -0.045, 0.0),
+                ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+                ((-0.35, 1.57), (-0.25, 0.25), (0.0, 1.75), (0.0, 1.40)),
+                (0.0, -0.027, 0.0),
+            ),
+            (
+                "ring",
+                (-0.010 * sideSign, -0.042, 0.0),
+                ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+                ((-0.35, 1.57), (-0.30, 0.30), (0.0, 1.75), (0.0, 1.40)),
+                (0.0, -0.024, 0.0),
+            ),
+            (
+                "little",
+                (-0.030 * sideSign, -0.035, 0.0),
+                ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+                ((-0.35, 1.57), (-0.40, 0.40), (0.0, 1.75), (0.0, 1.40)),
+                (0.0, -0.021, 0.0),
+            ),
+        )
+        fingerChains = []
+        for fingerName, baseOrigin, axes, limits, terminal in fingerSpecifications:
+            chain = []
+            parentId = upperIds[-1]
+            origins = (
+                baseOrigin,
+                (0.0, -0.035, 0.0),
+                (0.0, -0.025, 0.0),
+                (0.0, -0.020, 0.0),
+            )
+            for coordinateIndex in range(4):
+                jointId = f"{sideId}_{fingerName}_{coordinateIndex}"
+                joints.append(RobotMorphologyModule.CreateRevoluteJoint(
+                    jointId,
+                    parentId,
+                    origins[coordinateIndex],
+                    axes[coordinateIndex],
+                    limits[coordinateIndex][0],
+                    limits[coordinateIndex][1],
+                    4.0))
+                chain.append(jointId)
+                parentId = jointId
+            fingerChains.append((fingerName, tuple(chain), terminal))
+        wristId = f"{sideId}_wrist"
+        endEffectors = [EndEffector(
+            effector_id=wristId,
+            effector_type=EndEffectorType.WRIST,
+            parent_effector_id=None,
+            joint_ids=tuple(upperIds),
+            translation_basis=RobotMorphologyModule.IdentityBasis,
+            rotation_basis=RobotMorphologyModule.IdentityBasis,
+            target_lower=(-1.5, -1.5, -1.5, -math.pi, -math.pi, -math.pi),
+            target_upper=(1.5, 1.5, 1.5, math.pi, math.pi, math.pi),
+            terminal_translation=(0.0, 0.0, 0.0),
+            terminal_quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+            reference_frame_id="world",
+            is_perception_slot=False,
+            progress_enter=0.025,
+            progress_exit=0.040,
+            dwell_cycles=3)]
+        for fingerName, chain, terminal in fingerChains:
+            endEffectors.append(EndEffector(
+                effector_id=f"{sideId}_{fingerName}_tip",
+                effector_type=EndEffectorType.FINGERTIP,
+                parent_effector_id=wristId,
+                joint_ids=tuple(upperIds) + chain,
+                translation_basis=RobotMorphologyModule.IdentityBasis,
+                rotation_basis=RobotMorphologyModule.IdentityBasis,
+                target_lower=(-0.35, -0.35, -0.35, -math.pi, -math.pi, -math.pi),
+                target_upper=(0.35, 0.35, 0.35, math.pi, math.pi, math.pi),
+                terminal_translation=terminal,
+                terminal_quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                reference_frame_id=wristId,
+                is_perception_slot=False,
+                progress_enter=0.012,
+                progress_exit=0.020,
+                dwell_cycles=3))
+        return tuple(joints), tuple(endEffectors)
+
+
+    @staticmethod
+    def TemporaryDefinition() -> RobotDefinition:
+        leftJoints, leftEffectors = RobotMorphologyModule.CreateAnthropomorphicArm(
+            "left", 1.0)
+        rightJoints, rightEffectors = RobotMorphologyModule.CreateAnthropomorphicArm(
+            "right", -1.0)
+        cameraJoints = (
+            RobotMorphologyModule.CreateRevoluteJoint(
+                "camera_yaw",
+                None,
+                (0.0, 0.0, 0.65),
+                (0.0, 0.0, 1.0),
+                -math.pi,
+                math.pi,
+                1.5,
+                True),
+            RobotMorphologyModule.CreateRevoluteJoint(
+                "camera_pitch",
+                "camera_yaw",
+                (0.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                -0.5 * math.pi,
+                0.5 * math.pi,
+                1.5),
+            RobotMorphologyModule.CreateRevoluteJoint(
+                "camera_roll",
+                "camera_pitch",
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                -math.pi,
+                math.pi,
+                1.5,
+                True),
+        )
+        camera = EndEffector(
+            effector_id="camera",
+            effector_type=EndEffectorType.SENSOR_ACTUATOR,
+            parent_effector_id=None,
+            joint_ids=tuple(value.joint_id for value in cameraJoints),
+            translation_basis=RobotMorphologyModule.EmptyBasis,
+            rotation_basis=RobotMorphologyModule.IdentityBasis,
+            target_lower=(-math.pi, -math.pi, -math.pi),
+            target_upper=(math.pi, math.pi, math.pi),
+            terminal_translation=(0.0, 0.0, 0.0),
+            terminal_quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+            reference_frame_id="world",
+            is_perception_slot=True,
+            progress_enter=0.02,
+            progress_exit=0.04,
+            dwell_cycles=2)
+        definition = RobotDefinition(
+            profile_id="temporary_dual_anthropomorphic_arm_camera",
+            description_id="temporary_dual_anthropomorphic_arm_camera_urdf",
+            semantic_definition_id="temporary_dual_anthropomorphic_arm_camera_srdf",
+            adapter_id="external_endpoint_ik_adapter",
+            joints=leftJoints + rightJoints + cameraJoints,
+            end_effectors=leftEffectors + rightEffectors + (camera,),
+            perception_calibrations=(PerceptionCalibrationBinding(
+                component_id="camera",
+                calibration_id="temporary_camera_projection",
+                frame_id="camera_optical_pivot",
+                projection_matrix=(
+                    (384.0, 0.0, 255.5),
+                    (0.0, 384.0, 255.5),
+                    (0.0, 0.0, 1.0),
+                ),
+                reference_size=(512, 512),
+                primary=True),))
+        return definition
+
+
+    @staticmethod
+    def CompileTemporary() -> RobotEmbodimentContract:
+        return RobotMorphologyModule.CompileDefinition(
+            RobotMorphologyModule.TemporaryDefinition())
+
+
+    @staticmethod
+    def CompileActive() -> RobotEmbodimentContract:
+        return RobotMorphologyModule.CompileTemporary()
+
+
+@dataclass(frozen=True)
+class RawJointFeedback:
+    position: torch.Tensor
+    velocity: torch.Tensor
+    contract_id: str
+    timestamp: torch.Tensor
+    sample_index: torch.Tensor
+
+    def Validate(self, contractView: RobotEmbodimentContractView) -> None:
+        if type(contractView) is not RobotEmbodimentContractView:
+            raise TypeError("raw feedback validation requires a contract view")
+        if self.contract_id != contractView.contract_id:
+            raise ValueError("raw feedback contract identity does not match")
+        if not torch.is_tensor(self.position) or self.position.dim() != 2:
+            raise ValueError("joint position must be a batched matrix")
+        batchSize = int(self.position.size(0))
+        expected = (batchSize, contractView.joint_count)
+        RobotMorphologyModule.ValidateTensor(self.position, expected, "joint position", True)
+        RobotMorphologyModule.ValidateTensor(self.velocity, expected, "joint velocity", True)
+        if self.velocity.device != self.position.device:
+            raise ValueError("joint position and velocity must share a device")
+        if self.velocity.dtype != self.position.dtype:
+            raise ValueError("joint position and velocity must share a dtype")
+        RobotMorphologyModule.ValidateTensor(
+            self.timestamp,
+            (batchSize,),
+            "feedback timestamp",
+            True)
+        if self.timestamp.device != self.position.device:
+            raise ValueError("feedback timestamp must share the feedback device")
+        if self.timestamp.dtype != self.position.dtype:
+            raise ValueError("feedback timestamp must share the feedback dtype")
+        if bool((self.timestamp < 0.0).any().item()):
+            raise ValueError("feedback timestamp cannot be negative")
         if (
-            observer_attachment_kind == "endpoint"
-            and any(endpoint_masks[observer_endpoint_index])
+            not torch.is_tensor(self.sample_index)
+            or tuple(self.sample_index.shape) != (batchSize,)
+            or self.sample_index.dtype != torch.long
+            or self.sample_index.device != self.position.device
+            or bool((self.sample_index < 0).any().item())
         ):
-            raise ValueError(
-                "observer endpoint task axes cannot define camera joint control")
-        observer_controllable = bool(observer_control_joint_indices)
-        gripper_specs = control.get("grippers", [])
-        if type(gripper_specs) is not list:
-            raise TypeError("control grippers must be an array")
-        gripper_by_name = self._UniqueNames(gripper_specs, "name")
-        gripper_names = tuple(gripper_by_name)
-        gripper_endpoint_indices: List[int] = []
-        for name in gripper_names:
-            if set(gripper_by_name[name]) != {"name", "endpoint"}:
-                raise ValueError("control gripper fields are invalid")
-            endpoint_name = gripper_by_name[name].get("endpoint")
-            if endpoint_name not in endpoint_by_name:
-                raise ValueError("gripper references an unknown endpoint")
-            gripper_endpoint_indices.append(endpoint_names.index(endpoint_name))
-        canonical = {
-            "schema_version": ROBOT_MORPHOLOGY_SCHEMA_VERSION,
-            "parser_version": ROBOT_MORPHOLOGY_PARSER_VERSION,
-            "urdf": urdf,
-            "srdf": srdf,
-            "control": control,
-            "compiled": {
-                "node_names": list(node_names),
-                "joint_names": list(joint_names),
-                "joint_variable_names": variable_names,
-                "joint_variable_commandable": variable_commandable,
-                "joint_variable_joint_index": variable_joint_indices,
-                "joint_variable_child_node": variable_child_nodes,
-                "joint_variable_local_index": variable_local_indices,
-                "joint_type": joint_type_indices,
-                "joint_variable_command_delta_scale": (
-                    variable_command_delta_scales),
-                "joint_variable_unit": variable_units,
-                "group_names": list(group_names),
-                "endpoint_names": list(endpoint_names),
-                "endpoint_links": endpoint_links,
-                "endpoint_task_mask": [list(mask) for mask in endpoint_masks],
-                "node_semantics": node_semantics,
-                "group_semantics": group_semantics,
-                "endpoint_semantics": endpoint_semantics,
-                "sensor_names": list(sensor_names),
-                "sensor_types": sensor_types,
-                "sensor_links": sensor_links,
-                "sensor_semantics": sensor_semantics,
-                "observer_attachment": (
-                    None
-                    if observer_attachment_name is None
-                    else {
-                        observer_attachment_kind: observer_attachment_name}),
-                "observer_frame_name": observer_frame_name,
-                "observer_calibration_id": observer_calibration_id,
-                "observer_control_joint_indices": (
-                    observer_control_joint_indices),
-                "observer_control_group": observer_control_group,
-                "gripper_names": list(gripper_names),
-                "gripper_endpoint_indices": gripper_endpoint_indices,
-            },
-        }
-        canonical_json = self._CanonicalJson(canonical)
-        description_id = sha256(canonical_json.encode("utf-8")).hexdigest()
-        model_contract_json = self._CanonicalJson({
-            "model_contract_version": ROBOT_MODEL_CONTRACT_VERSION,
-            "actual_dimensions": {
-                "links": len(node_names),
-                "joints": len(joint_names),
-                "joint_variables": len(variable_names),
-                "groups": len(group_names),
-                "endpoints": len(endpoint_names),
-                "grippers": len(gripper_names),
-                "sensors": len(sensor_names),
-                "control_axes": len(CONTROL_DOF_NAMES),
-            },
-            "semantics": {
-                "roles": BODY_ROLE_NAMES,
-                "sides": BODY_SIDE_NAMES,
-                "capabilities": BODY_CAPABILITY_NAMES,
-                "control_axes": CONTROL_DOF_NAMES,
-                "joint_types": JOINT_TYPE_NAMES,
-                "joint_dof_source": (
-                    "urdf_joint_type_axis_limits_and_srdf_virtual_joint_type"),
-                "virtual_joint_variables": {
-                    "fixed": (),
-                    "planar": ("x", "y", "theta"),
-                    "floating": (
-                        "x", "y", "z", "roll", "pitch", "yaw"),
-                    "frame": "srdf_parent_frame_to_urdf_root",
-                    "rotation_convention": (
-                        "fixed_axis_roll_x_pitch_y_yaw_z"),
-                    "velocity": "time_derivative_of_position_coordinates",
-                    "effort": (
-                        "generalized_force_newton_and_torque_newton_meter"),
-                    "state_source": (
-                        "external_robot_state_only_no_node_pose_inference"),
-                    "commandable": False,
-                },
-                "endpoint_task_axes": (
-                    "external_explicit_only_default_false"),
-                "endpoint_task_command": {
-                    "representation": "local_body_se3_delta",
-                    "component_order": CONTROL_DOF_NAMES,
-                    "translation_unit": "meter",
-                    "rotation_representation": "axis_angle",
-                    "rotation_unit": "radian",
-                    "reference": (
-                        "current_endpoint_pose_at_sensor_frame_exposure"),
-                    "composition": (
-                        "T_world_target_equals_T_world_endpoint_times_T_endpoint_delta"),
-                },
-                "observer_control": "urdf_joint_variables_only",
-                "joint_variable_command": {
-                    "representation": "normalized_position_delta",
-                    "range": (-1.0, 1.0),
-                    "reference": (
-                        "current_measured_position_at_sensor_frame_exposure"),
-                    "delta_scale": (
-                        "finite_position_span_else_pi_radian_or_one_meter"),
-                    "target": "reference_plus_command_times_delta_scale",
-                    "limit_policy": (
-                        "clamp_finite_limits_wrap_unbounded_rotation"),
-                },
-                "pose": {
-                    "dimension": 7,
-                    "translation_axes": ("x", "y", "z"),
-                    "translation_unit": "meter",
-                    "quaternion_order": "xyzw",
-                    "handedness": "right_handed",
-                    "world_transform_convention": "T_world_entity",
-                },
-                "twist": {
-                    "dimension": 6,
-                    "component_order": (
-                        "linear_x",
-                        "linear_y",
-                        "linear_z",
-                        "angular_x",
-                        "angular_y",
-                        "angular_z"),
-                    "frame": "world",
-                    "linear_unit": "meter_per_second",
-                    "angular_unit": "radian_per_second",
-                },
-                "time_reference": "sensor_frame_exposure",
-                "base_orientation_convention": "q_world_base_xyzw",
-                "gravity_convention": (
-                    "unit_acceleration_direction_world"),
-                "joint_descriptor_version": 2,
-                "node_descriptor_version": 1,
-                "endpoint_descriptor_version": 1,
-                "limit_normalization": (
-                    "finite_x_over_one_plus_abs_x_with_valid_mask"),
-            },
-            "static_tensor_fields": {
-                "parent_index": ("L",),
-                "joint_parent_node": ("J",),
-                "joint_child_node": ("J",),
-                "joint_type": ("J",),
-                "joint_variable_commandable": ("Q",),
-                "joint_variable_joint_index": ("Q",),
-                "joint_variable_child_node": ("Q",),
-                "joint_variable_local_index": ("Q",),
-                "joint_lower": ("Q",),
-                "joint_upper": ("Q",),
-                "joint_effort_limit": ("Q",),
-                "joint_velocity_limit": ("Q",),
-                "joint_variable_command_delta_scale": ("Q",),
-                "group_node_mask": ("G", "L"),
-                "group_joint_mask": ("G", "J"),
-                "node_role": ("L",),
-                "node_side": ("L",),
-                "node_capability": ("L", "capability"),
-                "group_role": ("G",),
-                "group_side": ("G",),
-                "group_capability": ("G", "capability"),
-                "endpoint_to_node": ("E",),
-                "endpoint_task_mask": ("E", "control_axis"),
-                "endpoint_role": ("E",),
-                "endpoint_side": ("E",),
-                "endpoint_capability": ("E", "capability"),
-                "gripper_endpoint_index": ("R",),
-                "sensor_to_node": ("S",),
-                "sensor_role": ("S",),
-                "sensor_side": ("S",),
-                "sensor_capability": ("S", "capability"),
-            },
-            "node_runtime_fields": (
-                "node_pose_world",
-                "node_twist_world",
-                "node_observed",
-                "node_healthy",
-            ),
-            "joint_runtime_fields": (
-                "joint_position",
-                "joint_velocity",
-                "joint_effort",
-                "joint_observed",
-                "joint_healthy",
-                "joint_controllable",
-            ),
-            "endpoint_runtime_fields": (
-                "endpoint_pose",
-                "endpoint_observed",
-                "endpoint_healthy",
-                "endpoint_controllable",
-            ),
-            "observer_runtime_fields": (
-                "observer_pose_world",
-                "observer_pose_valid",
-            ),
-            "observer_motion": {
-                "dimension": 7,
-                "representation": "relative_se3_translation_xyzw",
-                "transform_convention": (
-                    "T_previous_observer_current_observer"),
-                "translation_frame": "previous_observer",
-                "time_pair": (
-                    "previous_sensor_exposure_to_current_sensor_exposure"),
-                "translation_unit": "meter",
-                "quaternion_order": "xyzw",
-            },
-            "physical_reference_fields": (
-                "base_orientation_world",
-                "gravity_direction_world",
-            ),
-            "planner_runtime_fields": (
-                "planner_expected_endpoint_pose",
-                "planner_progress",
-                "planner_tracking_error",
-                "planner_executing",
-                "planner_reached",
-                "planner_failed",
-            ),
-            "execution_feedback_fields": (
-                "model_command_executed",
-                "executed_action_id",
-            ),
-        })
-        model_contract_id = sha256(
-            model_contract_json.encode("utf-8")).hexdigest()
-        def contract_number(value: float) -> Union[float, str]:
-            if math.isnan(value):
-                raise ValueError("robot contract limit cannot be NaN")
-            if value == math.inf:
-                return "positive_infinity"
-            if value == -math.inf:
-                return "negative_infinity"
-            return value
-        adapter_json = self._CanonicalJson({
-            "model_contract_id": model_contract_id,
-            "robot_name": robot_name,
-            "node_names": node_names,
-            "parent_index": [
-                -1 if parent_of[name] is None else node_index[parent_of[name]]
-                for name in node_names],
-            "joint_names": joint_names,
-            "joint_types": [
-                joint_definitions[name]["type"] for name in joint_names],
-            "joint_axes": [
-                joint_definitions[name].get("axis", [])
-                for name in joint_names],
-            "joint_origins_xyz": [
-                joint_definitions[name].get(
-                    "origin_xyz", [0.0, 0.0, 0.0])
-                for name in joint_names],
-            "joint_origins_rpy": [
-                joint_definitions[name].get(
-                    "origin_rpy", [0.0, 0.0, 0.0])
-                for name in joint_names],
-            "joint_mimic": [
-                joint_definitions[name].get("mimic")
-                for name in joint_names],
-            "joint_variable_names": variable_names,
-            "joint_variable_commandable": variable_commandable,
-            "joint_variable_joint_index": variable_joint_indices,
-            "joint_variable_child_node": variable_child_nodes,
-            "joint_variable_local_index": variable_local_indices,
-            "joint_variable_limits": [
-                [contract_number(lower), contract_number(upper)]
-                for lower, upper in variable_limits],
-            "joint_variable_effort_limits": [
-                contract_number(value) for value in variable_effort_limits],
-            "joint_variable_velocity_limits": [
-                contract_number(value) for value in variable_velocity_limits],
-            "joint_variable_command_delta_scale": (
-                variable_command_delta_scales),
-            "joint_variable_unit": variable_units,
-            "group_names": group_names,
-            "group_nodes": {
-                name: sorted(resolved_groups[name][0])
-                for name in group_names},
-            "group_joints": {
-                name: sorted(resolved_groups[name][1])
-                for name in group_names},
-            "virtual_joints": virtual_joints,
-            "endpoint_names": endpoint_names,
-            "endpoint_links": endpoint_links,
-            "endpoint_task_mask": endpoint_masks,
-            "node_semantics": node_semantics,
-            "group_semantics": group_semantics,
-            "endpoint_semantics": endpoint_semantics,
-            "sensor_names": sensor_names,
-            "sensor_types": sensor_types,
-            "sensor_links": sensor_links,
-            "sensor_semantics": sensor_semantics,
-            "observer_attachment": (
-                None
-                if observer_attachment_name is None
-                else {observer_attachment_kind: observer_attachment_name}),
-            "observer_frame_name": observer_frame_name,
-            "observer_calibration_id": observer_calibration_id,
-            "observer_control_joint_indices": observer_control_joint_indices,
-            "observer_control_group": observer_control_group,
-            "gripper_names": gripper_names,
-            "gripper_endpoint_indices": gripper_endpoint_indices,
-        })
-        adapter_id = sha256(adapter_json.encode("utf-8")).hexdigest()
+            raise ValueError("sample_index must be a non-negative long vector")
+        lower = torch.tensor(
+            contractView.joint_lower,
+            device=self.position.device,
+            dtype=self.position.dtype).unsqueeze(0)
+        upper = torch.tensor(
+            contractView.joint_upper,
+            device=self.position.device,
+            dtype=self.position.dtype).unsqueeze(0)
+        periodic = torch.tensor(
+            contractView.joint_periodic,
+            device=self.position.device,
+            dtype=torch.bool).unsqueeze(0)
+        tolerance = 16.0 * torch.finfo(self.position.dtype).eps
+        outside = (~periodic) & (
+            (self.position < lower - tolerance)
+            | (self.position > upper + tolerance))
+        if bool(outside.any().item()):
+            raise ValueError("joint position exceeds the morphology limits")
+        velocityLimit = torch.tensor(
+            contractView.joint_velocity_limit,
+            device=self.velocity.device,
+            dtype=self.velocity.dtype).unsqueeze(0)
+        if bool((self.velocity.abs() > velocityLimit + tolerance).any().item()):
+            raise ValueError("joint velocity exceeds the morphology limits")
 
-        def semantic_tensors(
-            names: Sequence[str],
-            semantics: Mapping[str, Tuple[str, str, Tuple[str, ...]]],
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            role = torch.full((len(names),), -1, dtype=torch.long)
-            side = torch.full((len(names),), -1, dtype=torch.long)
-            capability = torch.zeros(
-                len(names),
-                len(BODY_CAPABILITY_NAMES),
+
+@dataclass(frozen=True)
+class ExpandedEndEffectorTarget:
+    translation: torch.Tensor
+    rotation_vector: torch.Tensor
+    translation_active: torch.Tensor
+    rotation_active: torch.Tensor
+    active: torch.Tensor
+    contract_id: str
+    model_signature: str
+    target_version: torch.Tensor
+    timestamp: torch.Tensor
+
+
+@dataclass(frozen=True)
+class PackedEndEffectorTarget:
+    values: torch.Tensor
+    active: torch.Tensor
+    contract_id: str
+    model_signature: str
+    target_version: torch.Tensor
+    timestamp: torch.Tensor
+
+    def Validate(self, contractView: RobotEmbodimentContractView) -> None:
+        if type(contractView) is not RobotEmbodimentContractView:
+            raise TypeError("target validation requires a contract view")
+        if self.contract_id != contractView.contract_id:
+            raise ValueError("target contract identity does not match")
+        if self.model_signature != contractView.model_signature:
+            raise ValueError("target model signature does not match")
+        if not torch.is_tensor(self.values) or self.values.dim() != 2:
+            raise ValueError("packed endpoint targets must be a batched matrix")
+        batchSize = int(self.values.size(0))
+        RobotMorphologyModule.ValidateTensor(
+            self.values,
+            (batchSize, contractView.end_effector_target_layout.PackedDim),
+            "packed endpoint targets",
+            True)
+        RobotMorphologyModule.ValidateTensor(
+            self.active,
+            (batchSize, contractView.end_effector_count),
+            "endpoint active mask",
+            False)
+        if self.active.device != self.values.device:
+            raise ValueError("target active mask must share the target device")
+        lower = torch.tensor(
+            contractView.end_effector_target_lower,
+            device=self.values.device,
+            dtype=self.values.dtype).unsqueeze(0)
+        upper = torch.tensor(
+            contractView.end_effector_target_upper,
+            device=self.values.device,
+            dtype=self.values.dtype).unsqueeze(0)
+        tolerance = 16.0 * torch.finfo(self.values.dtype).eps
+        for endpointIndex in range(contractView.end_effector_count):
+            targetSlice = contractView.end_effector_target_layout.Slice(
+                endpointIndex)
+            active = self.active[:, endpointIndex]
+            if bool((
+                active.unsqueeze(-1)
+                & (
+                    (self.values[:, targetSlice] < lower[:, targetSlice] - tolerance)
+                    | (self.values[:, targetSlice] > upper[:, targetSlice] + tolerance)
+                )
+            ).any().item()):
+                raise ValueError("active endpoint targets exceed morphology limits")
+        for endpointIndex, parentIndex in enumerate(contractView.parent_index):
+            if parentIndex >= 0 and bool((
+                self.active[:, endpointIndex]
+                & ~self.active[:, parentIndex]
+            ).any().item()):
+                raise ValueError("active child targets require an active parent target")
+        if (
+            not torch.is_tensor(self.target_version)
+            or tuple(self.target_version.shape) != (batchSize,)
+            or self.target_version.dtype != torch.long
+            or self.target_version.device != self.values.device
+            or bool((self.target_version < 0).any().item())
+        ):
+            raise ValueError("target_version must be a non-negative long vector")
+        RobotMorphologyModule.ValidateTensor(
+            self.timestamp,
+            (batchSize,),
+            "target timestamp",
+            True)
+        if self.timestamp.device != self.values.device:
+            raise ValueError("target timestamp must share the target device")
+        if self.timestamp.dtype != self.values.dtype:
+            raise ValueError("target timestamp must share the target dtype")
+        if bool((self.timestamp < 0.0).any().item()):
+            raise ValueError("target timestamp cannot be negative")
+
+    def Expand(
+        self,
+        contractView: RobotEmbodimentContractView,
+    ) -> ExpandedEndEffectorTarget:
+        self.Validate(contractView)
+        return self.ExpandValidated(contractView)
+
+    def ExpandValidated(
+        self,
+        contractView: RobotEmbodimentContractView,
+    ) -> ExpandedEndEffectorTarget:
+        batchSize = int(self.values.size(0))
+        translations = []
+        rotationVectors = []
+        translationActive = []
+        rotationActive = []
+        for endpointIndex in range(contractView.end_effector_count):
+            targetSlice = contractView.end_effector_target_layout.Slice(
+                endpointIndex)
+            coordinates = torch.where(
+                self.active[:, endpointIndex].unsqueeze(-1),
+                self.values[:, targetSlice],
+                torch.zeros_like(self.values[:, targetSlice]))
+            translationBasis = contractView.end_effector_translation_basis.Matrix(
+                endpointIndex,
+                device=self.values.device,
+                dtype=self.values.dtype)
+            rotationBasis = contractView.end_effector_rotation_basis.Matrix(
+                endpointIndex,
+                device=self.values.device,
+                dtype=self.values.dtype)
+            translationWidth = int(translationBasis.size(1))
+            rotationWidth = int(rotationBasis.size(1))
+            translationCoordinates = coordinates[:, :translationWidth]
+            rotationCoordinates = coordinates[
+                :,
+                translationWidth:translationWidth + rotationWidth]
+            translations.append(
+                translationCoordinates @ translationBasis.transpose(0, 1))
+            rotationVectors.append(
+                rotationCoordinates @ rotationBasis.transpose(0, 1))
+            translationActive.append(translationWidth > 0)
+            rotationActive.append(rotationWidth > 0)
+        return ExpandedEndEffectorTarget(
+            translation=torch.stack(translations, dim=1),
+            rotation_vector=torch.stack(rotationVectors, dim=1),
+            translation_active=torch.tensor(
+                translationActive,
+                device=self.values.device,
+                dtype=torch.bool).unsqueeze(0).expand(batchSize, -1),
+            rotation_active=torch.tensor(
+                rotationActive,
+                device=self.values.device,
+                dtype=torch.bool).unsqueeze(0).expand(batchSize, -1),
+            active=self.active,
+            contract_id=self.contract_id,
+            model_signature=self.model_signature,
+            target_version=self.target_version,
+            timestamp=self.timestamp)
+
+
+@dataclass(frozen=True)
+class BrainFeedbackPacket:
+    joint_features: torch.Tensor
+    joint_valid: torch.Tensor
+    endpoint_valid: torch.Tensor
+    progress: torch.Tensor
+    reached: torch.Tensor
+    child_enabled: torch.Tensor
+    target_active: torch.Tensor
+    target_version: torch.Tensor
+    perception_rotation: torch.Tensor
+    perception_rotation_delta: torch.Tensor
+    perception_angular_velocity: torch.Tensor
+    perception_valid: torch.Tensor
+    contract_id: str
+    model_signature: str
+    timestamp: torch.Tensor
+    sample_index: torch.Tensor
+
+    @property
+    def values(self) -> torch.Tensor:
+        return self.joint_features
+
+    def Validate(self, contractView: RobotEmbodimentContractView) -> None:
+        if type(contractView) is not RobotEmbodimentContractView:
+            raise TypeError("feedback validation requires a contract view")
+        if self.contract_id != contractView.contract_id:
+            raise ValueError("feedback contract identity does not match")
+        if self.model_signature != contractView.model_signature:
+            raise ValueError("feedback model signature does not match")
+        if not torch.is_tensor(self.joint_features) or self.joint_features.dim() != 2:
+            raise ValueError("joint features must be a batched matrix")
+        batchSize = int(self.joint_features.size(0))
+        device = self.joint_features.device
+        RobotMorphologyModule.ValidateTensor(
+            self.joint_features,
+            (batchSize, contractView.joint_feedback_layout.PackedDim),
+            "joint features",
+            True)
+        for value, shape, name in (
+            (
+                self.joint_valid,
+                (batchSize, contractView.joint_count),
+                "joint_valid"),
+            (
+                self.endpoint_valid,
+                (batchSize, contractView.end_effector_count),
+                "endpoint_valid"),
+            (
+                self.reached,
+                (batchSize, contractView.end_effector_count),
+                "reached"),
+            (
+                self.child_enabled,
+                (batchSize, contractView.end_effector_count),
+                "child_enabled"),
+            (
+                self.target_active,
+                (batchSize, contractView.end_effector_count),
+                "target_active"),
+            (
+                self.perception_valid,
+                (batchSize, len(contractView.perception_view.indices)),
+                "perception_valid"),
+        ):
+            RobotMorphologyModule.ValidateTensor(value, shape, name, False)
+            if value.device != device:
+                raise ValueError(f"{name} must share the packet device")
+        RobotMorphologyModule.ValidateTensor(
+            self.progress,
+            (batchSize, contractView.end_effector_count),
+            "progress",
+            True)
+        RobotMorphologyModule.ValidateTensor(
+            self.perception_rotation,
+            (batchSize, len(contractView.perception_view.indices), 4),
+            "perception_rotation",
+            True)
+        RobotMorphologyModule.ValidateTensor(
+            self.perception_rotation_delta,
+            (batchSize, len(contractView.perception_view.indices), 4),
+            "perception_rotation_delta",
+            True)
+        RobotMorphologyModule.ValidateTensor(
+            self.perception_angular_velocity,
+            (batchSize, len(contractView.perception_view.indices), 3),
+            "perception_angular_velocity",
+            True)
+        for value in (
+            self.progress,
+            self.perception_rotation,
+            self.perception_rotation_delta,
+            self.perception_angular_velocity,
+        ):
+            if value.device != device:
+                raise ValueError("feedback tensors must share one device")
+            if value.dtype != self.joint_features.dtype:
+                raise ValueError("feedback tensors must share one dtype")
+        for quaternion, fieldName in (
+            (self.perception_rotation, "perception rotations"),
+            (self.perception_rotation_delta, "perception rotation deltas"),
+        ):
+            quaternionNorm = torch.linalg.vector_norm(
+                quaternion,
+                dim=-1)
+            if quaternionNorm.numel() > 0 and not bool(
+                torch.isclose(
+                    quaternionNorm,
+                    torch.ones_like(quaternionNorm),
+                    atol=1e-5,
+                    rtol=1e-5).all().item()
+            ):
+                raise ValueError(f"{fieldName} must be unit quaternions")
+        if bool(((self.progress < 0.0) | (self.progress > 1.0)).any().item()):
+            raise ValueError("hierarchy progress must lie in the unit interval")
+        if (
+            not torch.is_tensor(self.target_version)
+            or tuple(self.target_version.shape) != (batchSize,)
+            or self.target_version.dtype != torch.long
+            or self.target_version.device != device
+            or bool((self.target_version < -1).any().item())
+        ):
+            raise ValueError("target_version must be a long vector greater than or equal to minus one")
+        RobotMorphologyModule.ValidateTensor(
+            self.timestamp,
+            (batchSize,),
+            "feedback timestamp",
+            True)
+        if self.timestamp.device != device:
+            raise ValueError("feedback timestamp must share the packet device")
+        if self.timestamp.dtype != self.joint_features.dtype:
+            raise ValueError("feedback timestamp must share the packet dtype")
+        if (
+            not torch.is_tensor(self.sample_index)
+            or tuple(self.sample_index.shape) != (batchSize,)
+            or self.sample_index.dtype != torch.long
+            or self.sample_index.device != device
+            or bool((self.sample_index < 0).any().item())
+        ):
+            raise ValueError("sample_index must be a non-negative long vector")
+
+    def IndexSelectRows(self, rowIndex: torch.Tensor) -> "BrainFeedbackPacket":
+        if (
+            not torch.is_tensor(rowIndex)
+            or rowIndex.dim() != 1
+            or rowIndex.dtype != torch.long
+            or rowIndex.device != self.joint_features.device
+        ):
+            raise ValueError("feedback row indices must be a compatible long vector")
+        return BrainFeedbackPacket(
+            joint_features=self.joint_features.index_select(0, rowIndex),
+            joint_valid=self.joint_valid.index_select(0, rowIndex),
+            endpoint_valid=self.endpoint_valid.index_select(0, rowIndex),
+            progress=self.progress.index_select(0, rowIndex),
+            reached=self.reached.index_select(0, rowIndex),
+            child_enabled=self.child_enabled.index_select(0, rowIndex),
+            target_active=self.target_active.index_select(0, rowIndex),
+            target_version=self.target_version.index_select(0, rowIndex),
+            perception_rotation=(
+                self.perception_rotation.index_select(0, rowIndex)),
+            perception_rotation_delta=(
+                self.perception_rotation_delta.index_select(0, rowIndex)),
+            perception_angular_velocity=(
+                self.perception_angular_velocity.index_select(0, rowIndex)),
+            perception_valid=self.perception_valid.index_select(0, rowIndex),
+            contract_id=self.contract_id,
+            model_signature=self.model_signature,
+            timestamp=self.timestamp.index_select(0, rowIndex),
+            sample_index=self.sample_index.index_select(0, rowIndex))
+
+    def RepeatCandidates(self, candidateCount: int) -> "BrainFeedbackPacket":
+        if type(candidateCount) is not int or candidateCount < 1:
+            raise ValueError("candidateCount must be a positive integer")
+        batchSize = int(self.joint_features.size(0))
+        rowIndex = torch.arange(
+            batchSize,
+            device=self.joint_features.device,
+            dtype=torch.long).repeat_interleave(candidateCount)
+        return self.IndexSelectRows(rowIndex)
+
+
+@dataclass(frozen=True)
+class HierarchyProgress:
+    progress: torch.Tensor
+    reached: torch.Tensor
+    child_enabled: torch.Tensor
+
+
+@dataclass(frozen=True)
+class EndEffectorPose:
+    translation: torch.Tensor
+    rotation: torch.Tensor
+
+
+class RobotEmbodimentRuntime:
+    @staticmethod
+    def QuaternionToMatrix(quaternion: torch.Tensor) -> torch.Tensor:
+        normalized = quaternion / torch.linalg.vector_norm(
+            quaternion,
+            dim=-1,
+            keepdim=True).clamp_min(torch.finfo(quaternion.dtype).eps)
+        x, y, z, w = normalized.unbind(dim=-1)
+        return torch.stack((
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ), dim=-1).reshape(quaternion.shape[:-1] + (3, 3))
+
+
+    @staticmethod
+    def RotationVectorToMatrix(rotationVector: torch.Tensor) -> torch.Tensor:
+        angle = torch.linalg.vector_norm(rotationVector, dim=-1, keepdim=True)
+        epsilon = torch.finfo(rotationVector.dtype).eps
+        axis = rotationVector / angle.clamp_min(epsilon)
+        x, y, z = axis.unbind(dim=-1)
+        zero = torch.zeros_like(x)
+        skew = torch.stack((
+            zero, -z, y,
+            z, zero, -x,
+            -y, x, zero,
+        ), dim=-1).reshape(rotationVector.shape[:-1] + (3, 3))
+        identity = torch.eye(
+            3,
+            device=rotationVector.device,
+            dtype=rotationVector.dtype).expand(rotationVector.shape[:-1] + (3, 3))
+        sinAngle = torch.sin(angle).unsqueeze(-1)
+        oneMinusCosine = (1.0 - torch.cos(angle)).unsqueeze(-1)
+        matrix = identity + sinAngle * skew + oneMinusCosine * (skew @ skew)
+        small = angle.squeeze(-1) < math.sqrt(epsilon)
+        smallVector = rotationVector
+        sx, sy, sz = smallVector.unbind(dim=-1)
+        smallSkew = torch.stack((
+            zero, -sz, sy,
+            sz, zero, -sx,
+            -sy, sx, zero,
+        ), dim=-1).reshape(rotationVector.shape[:-1] + (3, 3))
+        smallMatrix = identity + smallSkew + 0.5 * (smallSkew @ smallSkew)
+        return torch.where(small.unsqueeze(-1).unsqueeze(-1), smallMatrix, matrix)
+
+
+    @staticmethod
+    def MatrixToRotationVector(matrix: torch.Tensor) -> torch.Tensor:
+        if (
+            not torch.is_tensor(matrix)
+            or matrix.dim() < 2
+            or tuple(matrix.shape[-2:]) != (3, 3)
+            or not matrix.is_floating_point()
+            or not bool(torch.isfinite(matrix).all().item())
+        ):
+            raise ValueError("rotation logarithm requires finite three by three matrices")
+        epsilon = torch.finfo(matrix.dtype).eps
+        trace = matrix.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+        cosine = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+        angle = torch.acos(cosine)
+        vector = torch.stack((
+            matrix[..., 2, 1] - matrix[..., 1, 2],
+            matrix[..., 0, 2] - matrix[..., 2, 0],
+            matrix[..., 1, 0] - matrix[..., 0, 1],
+        ), dim=-1)
+        sine = torch.sin(angle)
+        scale = angle / (2.0 * sine).clamp_min(epsilon)
+        result = vector * scale.unsqueeze(-1)
+        small = angle < math.sqrt(epsilon)
+        smallResult = 0.5 * vector
+        diagonal = matrix.diagonal(dim1=-2, dim2=-1)
+        root = torch.sqrt(((diagonal + 1.0) * 0.5).clamp_min(0.0))
+        denominator = (4.0 * root).clamp_min(math.sqrt(epsilon))
+        symmetricXy = matrix[..., 0, 1] + matrix[..., 1, 0]
+        symmetricXz = matrix[..., 0, 2] + matrix[..., 2, 0]
+        symmetricYz = matrix[..., 1, 2] + matrix[..., 2, 1]
+        candidateX = torch.stack((
+            root[..., 0],
+            symmetricXy / denominator[..., 0],
+            symmetricXz / denominator[..., 0],
+        ), dim=-1)
+        candidateY = torch.stack((
+            symmetricXy / denominator[..., 1],
+            root[..., 1],
+            symmetricYz / denominator[..., 1],
+        ), dim=-1)
+        candidateZ = torch.stack((
+            symmetricXz / denominator[..., 2],
+            symmetricYz / denominator[..., 2],
+            root[..., 2],
+        ), dim=-1)
+        candidates = torch.stack((candidateX, candidateY, candidateZ), dim=-2)
+        largest = diagonal.argmax(dim=-1)
+        gatherIndex = largest.unsqueeze(-1).unsqueeze(-1).expand(
+            largest.shape + (1, 3))
+        axis = candidates.gather(-2, gatherIndex).squeeze(-2)
+        axis = axis / torch.linalg.vector_norm(
+            axis,
+            dim=-1,
+            keepdim=True).clamp_min(math.sqrt(epsilon))
+        orientation = (axis * vector).sum(dim=-1, keepdim=True)
+        axis = torch.where(orientation < 0.0, -axis, axis)
+        nearPiResult = axis * angle.unsqueeze(-1)
+        nearPi = angle > math.pi - max(1e-4, 32.0 * epsilon)
+        result = torch.where(small.unsqueeze(-1), smallResult, result)
+        return torch.where(nearPi.unsqueeze(-1), nearPiResult, result)
+
+
+    @staticmethod
+    def RotationVectorToQuaternion(rotationVector: torch.Tensor) -> torch.Tensor:
+        angle = torch.linalg.vector_norm(rotationVector, dim=-1, keepdim=True)
+        half = 0.5 * angle
+        scale = torch.sin(half) / angle.clamp_min(torch.finfo(rotationVector.dtype).eps)
+        small = angle < math.sqrt(torch.finfo(rotationVector.dtype).eps)
+        scale = torch.where(small, 0.5 - angle * angle / 48.0, scale)
+        quaternion = torch.cat((rotationVector * scale, torch.cos(half)), dim=-1)
+        return quaternion / torch.linalg.vector_norm(
+            quaternion,
+            dim=-1,
+            keepdim=True).clamp_min(torch.finfo(rotationVector.dtype).eps)
+
+    def __init__(self, contract: RobotEmbodimentContract) -> None:
+        if type(contract) is not RobotEmbodimentContract:
+            raise TypeError("runtime requires a RobotEmbodimentContract")
+        self.Contract = contract
+        self.ContractView = contract.view
+        self.CachedTargetValues: Optional[torch.Tensor] = None
+        self.CachedTargetActive: Optional[torch.Tensor] = None
+        self.CachedTargetVersion: Optional[torch.Tensor] = None
+        self.CachedTargetTimestamp: Optional[torch.Tensor] = None
+        self.DwellState: Optional[torch.Tensor] = None
+        self.ReachedState: Optional[torch.Tensor] = None
+        self.LastTimestamp: Optional[torch.Tensor] = None
+        self.LastSampleIndex: Optional[torch.Tensor] = None
+        self.LastPerceptionRotation: Optional[torch.Tensor] = None
+        self.KinematicTensorCache = {}
+
+    def ResetRuntimeState(self) -> None:
+        self.CachedTargetValues = None
+        self.CachedTargetActive = None
+        self.CachedTargetVersion = None
+        self.CachedTargetTimestamp = None
+        self.DwellState = None
+        self.ReachedState = None
+        self.LastTimestamp = None
+        self.LastSampleIndex = None
+        self.LastPerceptionRotation = None
+
+    def BuildNeutralFeedback(
+        self,
+        timestamp: float,
+        sampleIndex: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> RawJointFeedback:
+        if not math.isfinite(float(timestamp)) or float(timestamp) < 0.0:
+            raise ValueError("neutral feedback timestamp must be non-negative")
+        if type(sampleIndex) is not int or sampleIndex < 0:
+            raise ValueError("neutral feedback sample index must be non-negative")
+        position = torch.tensor([
+            0.0 if periodic else 0.5 * (lower + upper)
+            for lower, upper, periodic in zip(
+                self.ContractView.joint_lower,
+                self.ContractView.joint_upper,
+                self.ContractView.joint_periodic)
+        ], device=device, dtype=dtype).unsqueeze(0)
+        return RawJointFeedback(
+            position=position,
+            velocity=torch.zeros_like(position),
+            contract_id=self.ContractView.contract_id,
+            timestamp=torch.tensor(
+                [float(timestamp)],
+                device=device,
+                dtype=dtype),
+            sample_index=torch.tensor(
+                [sampleIndex],
+                device=device,
+                dtype=torch.long))
+
+    def EncodeTargetPayload(
+        self,
+        target: PackedEndEffectorTarget,
+    ) -> Mapping[str, Any]:
+        expanded = target.Expand(self.ContractView)
+        batchSize = int(target.values.size(0))
+        translation = []
+        rotation = []
+        for batchIndex in range(batchSize):
+            translationRow = []
+            rotationRow = []
+            for endpointIndex in range(self.ContractView.end_effector_count):
+                translationRow.append(
+                    expanded.translation[batchIndex, endpointIndex]
+                    .detach().cpu().tolist()
+                    if bool((
+                        expanded.translation_active[batchIndex, endpointIndex]
+                        & target.active[batchIndex, endpointIndex]
+                    ).item())
+                    else None)
+                rotationRow.append(
+                    expanded.rotation_vector[batchIndex, endpointIndex]
+                    .detach().cpu().tolist()
+                    if bool((
+                        expanded.rotation_active[batchIndex, endpointIndex]
+                        & target.active[batchIndex, endpointIndex]
+                    ).item())
+                    else None)
+            translation.append(translationRow)
+            rotation.append(rotationRow)
+        return {
+            "contract_id": target.contract_id,
+            "model_signature": target.model_signature,
+            "target_version": target.target_version.detach().cpu().tolist(),
+            "timestamp": target.timestamp.detach().cpu().tolist(),
+            "slot_ids": list(self.Contract.end_effector_ids),
+            "reference_frame_ids": list(
+                self.Contract.end_effector_reference_frame),
+            "active": target.active.detach().cpu().tolist(),
+            "translation": translation,
+            "rotation_vector": rotation,
+        }
+
+    def ValidateTemporalOrder(self, rawFeedback: RawJointFeedback) -> None:
+        if self.LastTimestamp is None:
+            return
+        if (
+            tuple(self.LastTimestamp.shape) != tuple(rawFeedback.timestamp.shape)
+            or self.LastTimestamp.device != rawFeedback.timestamp.device
+        ):
+            raise ValueError("runtime feedback batch identity changed without reset")
+        if bool((rawFeedback.timestamp <= self.LastTimestamp).any().item()):
+            raise ValueError("feedback timestamps must increase monotonically")
+        if self.LastSampleIndex is None or bool(
+            (rawFeedback.sample_index <= self.LastSampleIndex).any().item()
+        ):
+            raise ValueError("feedback sample indices must increase monotonically")
+
+    def EncodeJointFeatures(self, rawFeedback: RawJointFeedback) -> torch.Tensor:
+        view = self.ContractView
+        features = []
+        for jointIndex in range(view.joint_count):
+            position = rawFeedback.position[:, jointIndex]
+            velocity = rawFeedback.velocity[:, jointIndex]
+            normalizedVelocity = velocity / float(
+                view.joint_velocity_limit[jointIndex])
+            if view.joint_periodic[jointIndex]:
+                token = torch.stack((
+                    torch.sin(position),
+                    torch.cos(position),
+                    normalizedVelocity,
+                ), dim=-1)
+            else:
+                lower = float(view.joint_lower[jointIndex])
+                upper = float(view.joint_upper[jointIndex])
+                normalizedPosition = (
+                    2.0 * (position - lower) / (upper - lower) - 1.0)
+                if view.joint_rotational[jointIndex]:
+                    token = torch.stack((
+                        normalizedPosition,
+                        torch.sin(position),
+                        torch.cos(position),
+                        normalizedVelocity,
+                    ), dim=-1)
+                else:
+                    token = torch.stack((
+                        normalizedPosition,
+                        normalizedVelocity,
+                    ), dim=-1)
+            features.append(token)
+        return torch.cat(features, dim=-1)
+
+    def GetKinematicTensors(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, ...]:
+        key = (device.type, device.index, dtype)
+        cached = self.KinematicTensorCache.get(key)
+        if cached is not None:
+            return cached
+        view = self.ContractView
+        jointTranslationAxis = torch.tensor(
+            view.joint_translation_basis.values,
+            device=device,
+            dtype=dtype).reshape(view.joint_count, 3)
+        jointRotationAxis = torch.tensor(
+            view.joint_rotation_basis.values,
+            device=device,
+            dtype=dtype).reshape(view.joint_count, 3)
+        jointOriginTranslation = torch.tensor(
+            self.Contract.joint_origin_translation,
+            device=device,
+            dtype=dtype)
+        jointOriginRotation = RobotEmbodimentRuntime.QuaternionToMatrix(torch.tensor(
+            self.Contract.joint_origin_quaternion_xyzw,
+            device=device,
+            dtype=dtype))
+        endpointTerminalTranslation = torch.tensor(
+            self.Contract.end_effector_terminal_translation,
+            device=device,
+            dtype=dtype)
+        endpointTerminalRotation = RobotEmbodimentRuntime.QuaternionToMatrix(torch.tensor(
+            self.Contract.end_effector_terminal_quaternion_xyzw,
+            device=device,
+            dtype=dtype))
+        endpointJointIndex = torch.tensor(tuple(
+            view.end_effector_joint_chain_indices[
+                view.end_effector_joint_chain_offsets[index + 1] - 1]
+            for index in range(view.end_effector_count)
+        ), device=device, dtype=torch.long)
+        endpointIndexById = {
+            identifier: index
+            for index, identifier in enumerate(self.Contract.end_effector_ids)
+        }
+        referenceIndex = torch.tensor(tuple(
+            -1
+            if reference == "world"
+            else endpointIndexById[reference]
+            for reference in self.Contract.end_effector_reference_frame
+        ), device=device, dtype=torch.long)
+        perceptionIndex = torch.tensor(
+            view.perception_view.indices,
+            device=device,
+            dtype=torch.long)
+        cached = (
+            jointTranslationAxis,
+            jointRotationAxis,
+            jointOriginTranslation,
+            jointOriginRotation,
+            endpointTerminalTranslation,
+            endpointTerminalRotation,
+            endpointJointIndex,
+            referenceIndex,
+            perceptionIndex,
+        )
+        self.KinematicTensorCache[key] = cached
+        return cached
+
+    def ForwardKinematics(self, position: torch.Tensor) -> EndEffectorPose:
+        if (
+            not torch.is_tensor(position)
+            or position.dim() != 2
+            or int(position.size(1)) != self.ContractView.joint_count
+            or not position.is_floating_point()
+            or not bool(torch.isfinite(position).all().item())
+        ):
+            raise ValueError("forward kinematics requires finite batched joint positions")
+        batchSize = int(position.size(0))
+        device = position.device
+        dtype = position.dtype
+        (
+            jointTranslationAxis,
+            jointRotationAxis,
+            jointOriginTranslation,
+            jointOriginRotation,
+            endpointTerminalTranslation,
+            endpointTerminalRotation,
+            endpointJointIndex,
+            referenceIndex,
+            _,
+        ) = self.GetKinematicTensors(device, dtype)
+        identity = torch.eye(
+            3,
+            device=device,
+            dtype=dtype).unsqueeze(0).expand(batchSize, -1, -1)
+        zero = torch.zeros(batchSize, 3, device=device, dtype=dtype)
+        jointTranslations = []
+        jointRotations = []
+        for jointIndex, parentIndex in enumerate(self.Contract.joint_parent_index):
+            parentTranslation = (
+                zero
+                if parentIndex < 0
+                else jointTranslations[parentIndex])
+            parentRotation = (
+                identity
+                if parentIndex < 0
+                else jointRotations[parentIndex])
+            originTranslation = parentTranslation + torch.matmul(
+                parentRotation,
+                jointOriginTranslation[jointIndex]
+                .reshape(1, 3, 1)
+                .expand(batchSize, -1, -1)).squeeze(-1)
+            originRotation = (
+                parentRotation
+                @ jointOriginRotation[jointIndex]
+                .unsqueeze(0)
+                .expand(batchSize, -1, -1))
+            coordinate = position[:, jointIndex].unsqueeze(-1)
+            translation = originTranslation + torch.matmul(
+                originRotation,
+                (coordinate * jointTranslationAxis[jointIndex])
+                .unsqueeze(-1)).squeeze(-1)
+            rotation = originRotation @ RobotEmbodimentRuntime.RotationVectorToMatrix(
+                coordinate * jointRotationAxis[jointIndex])
+            jointTranslations.append(translation)
+            jointRotations.append(rotation)
+        jointTranslation = torch.stack(jointTranslations, dim=1)
+        jointRotation = torch.stack(jointRotations, dim=1)
+        worldTranslation = jointTranslation.index_select(
+            1,
+            endpointJointIndex)
+        worldRotation = jointRotation.index_select(1, endpointJointIndex)
+        worldTranslation = worldTranslation + torch.matmul(
+            worldRotation,
+            endpointTerminalTranslation.unsqueeze(0).unsqueeze(-1),
+        ).squeeze(-1)
+        worldRotation = (
+            worldRotation
+            @ endpointTerminalRotation.unsqueeze(0))
+        worldReference = referenceIndex.lt(0)
+        safeReferenceIndex = referenceIndex.clamp_min(0)
+        referenceTranslation = worldTranslation.index_select(
+            1,
+            safeReferenceIndex)
+        referenceRotation = worldRotation.index_select(
+            1,
+            safeReferenceIndex)
+        referenceTranslation = torch.where(
+            worldReference.reshape(1, -1, 1),
+            torch.zeros_like(referenceTranslation),
+            referenceTranslation)
+        referenceRotation = torch.where(
+            worldReference.reshape(1, -1, 1, 1),
+            torch.eye(3, device=device, dtype=dtype).reshape(1, 1, 3, 3),
+            referenceRotation)
+        outputRotation = referenceRotation.transpose(-1, -2) @ worldRotation
+        outputTranslation = torch.matmul(
+            referenceRotation.transpose(-1, -2),
+            (worldTranslation - referenceTranslation).unsqueeze(-1),
+        ).squeeze(-1)
+        return EndEffectorPose(
+            translation=outputTranslation,
+            rotation=outputRotation)
+
+    def AllocateTargetState(
+        self,
+        target: PackedEndEffectorTarget,
+    ) -> None:
+        batchSize = int(target.values.size(0))
+        endpointCount = self.ContractView.end_effector_count
+        self.CachedTargetValues = torch.zeros_like(target.values)
+        self.CachedTargetActive = torch.zeros(
+            batchSize,
+            endpointCount,
+            device=target.values.device,
+            dtype=torch.bool)
+        self.CachedTargetVersion = torch.full(
+            (batchSize,),
+            -1,
+            device=target.values.device,
+            dtype=torch.long)
+        self.CachedTargetTimestamp = torch.zeros_like(target.timestamp)
+        self.DwellState = torch.zeros(
+            batchSize,
+            endpointCount,
+            device=target.values.device,
+            dtype=torch.long)
+        self.ReachedState = torch.zeros(
+            batchSize,
+            endpointCount,
+            device=target.values.device,
+            dtype=torch.bool)
+
+    def SetDispatchedTargets(
+        self,
+        target: PackedEndEffectorTarget,
+        dispatchedMask: Optional[torch.Tensor] = None,
+    ) -> None:
+        target.Validate(self.ContractView)
+        batchSize = int(target.values.size(0))
+        if dispatchedMask is None:
+            dispatched = torch.ones(
+                batchSize,
+                device=target.values.device,
                 dtype=torch.bool)
-            for index, name in enumerate(names):
-                role_name, side_name, capability_names = semantics[name]
-                role[index] = BODY_ROLE_NAMES.index(role_name)
-                side[index] = BODY_SIDE_NAMES.index(side_name)
-                for capability_name in capability_names:
-                    capability[
-                        index,
-                        BODY_CAPABILITY_NAMES.index(capability_name)] = True
-            return role, side, capability
+        else:
+            RobotMorphologyModule.ValidateTensor(
+                dispatchedMask,
+                (batchSize,),
+                "dispatched mask",
+                False)
+            if dispatchedMask.device != target.values.device:
+                raise ValueError("dispatched mask must share the target device")
+            dispatched = dispatchedMask
+        if not bool(dispatched.any().item()):
+            return
+        canonicalTargetValues = torch.zeros_like(target.values)
+        for endpointIndex in range(self.ContractView.end_effector_count):
+            targetSlice = self.ContractView.end_effector_target_layout.Slice(
+                endpointIndex)
+            canonicalTargetValues[:, targetSlice] = torch.where(
+                target.active[:, endpointIndex].unsqueeze(-1),
+                target.values[:, targetSlice],
+                torch.zeros_like(target.values[:, targetSlice]))
+        if self.CachedTargetValues is None:
+            self.AllocateTargetState(target)
+        if (
+            tuple(self.CachedTargetValues.shape) != tuple(target.values.shape)
+            or self.CachedTargetValues.device != target.values.device
+            or self.CachedTargetValues.dtype != target.values.dtype
+        ):
+            raise ValueError("target batch identity changed without runtime reset")
+        currentVersion = self.CachedTargetVersion
+        if bool((dispatched & (target.target_version < currentVersion)).any().item()):
+            raise ValueError("dispatched target versions cannot move backwards")
+        sameVersion = dispatched & target.target_version.eq(currentVersion)
+        if bool(sameVersion.any().item()):
+            rows = torch.nonzero(sameVersion, as_tuple=False).squeeze(-1)
+            if not bool(torch.equal(
+                canonicalTargetValues.index_select(0, rows),
+                self.CachedTargetValues.index_select(0, rows))
+            ) or not bool(torch.equal(
+                target.active.index_select(0, rows),
+                self.CachedTargetActive.index_select(0, rows))
+            ):
+                raise ValueError("one target version cannot identify different targets")
+        changedSlots = torch.zeros_like(self.CachedTargetActive)
+        for endpointIndex in range(self.ContractView.end_effector_count):
+            targetSlice = self.ContractView.end_effector_target_layout.Slice(
+                endpointIndex)
+            changedSlots[:, endpointIndex] = dispatched & (
+                target.active[:, endpointIndex].ne(
+                    self.CachedTargetActive[:, endpointIndex])
+                | canonicalTargetValues[:, targetSlice].ne(
+                    self.CachedTargetValues[:, targetSlice]).any(dim=-1))
+        resetSlots = changedSlots.clone()
+        for endpointIndex in range(self.ContractView.end_effector_count):
+            start = self.ContractView.subtree_offsets[endpointIndex]
+            end = self.ContractView.subtree_offsets[endpointIndex + 1]
+            subtree = self.ContractView.subtree_indices[start:end]
+            resetSlots[:, list(subtree)] |= changedSlots[
+                :, endpointIndex].unsqueeze(-1)
+        rows = torch.nonzero(dispatched, as_tuple=False).squeeze(-1)
+        self.CachedTargetValues.index_copy_(
+            0,
+            rows,
+            canonicalTargetValues.index_select(0, rows).detach())
+        self.CachedTargetActive.index_copy_(
+            0,
+            rows,
+            target.active.index_select(0, rows).detach())
+        self.CachedTargetVersion.index_copy_(
+            0,
+            rows,
+            target.target_version.index_select(0, rows).detach())
+        self.CachedTargetTimestamp.index_copy_(
+            0,
+            rows,
+            target.timestamp.index_select(0, rows).detach())
+        self.DwellState.masked_fill_(resetSlots, 0)
+        self.ReachedState.masked_fill_(resetSlots, False)
 
-        node_role, node_side, node_capability = semantic_tensors(
-            node_names,
-            node_semantics)
-        parent_index = torch.full(
-            (len(node_names),), -1, dtype=torch.long)
-        for index, name in enumerate(node_names):
-            parent = parent_of[name]
-            parent_index[index] = -1 if parent is None else node_index[parent]
-        joint_parent_node = torch.full(
-            (len(joint_names),), -1, dtype=torch.long)
-        joint_child_node = torch.full_like(joint_parent_node, -1)
-        for index, name in enumerate(joint_names):
-            joint = joint_definitions[name]
-            joint_parent_node[index] = (
-                -1
-                if joint["parent"] is None
-                else node_index[joint["parent"]])
-            joint_child_node[index] = node_index[joint["child"]]
-        joint_type = torch.tensor(joint_type_indices, dtype=torch.long)
-        joint_variable_commandable = torch.tensor(
-            variable_commandable, dtype=torch.bool)
-        joint_variable_joint_index = torch.tensor(
-            variable_joint_indices, dtype=torch.long)
-        joint_variable_child_node = torch.tensor(
-            variable_child_nodes, dtype=torch.long)
-        joint_variable_local_index = torch.tensor(
-            variable_local_indices, dtype=torch.long)
-        joint_lower = torch.tensor(
-            [value[0] for value in variable_limits], dtype=torch.float32)
-        joint_upper = torch.tensor(
-            [value[1] for value in variable_limits], dtype=torch.float32)
-        joint_effort_limit = torch.tensor(
-            variable_effort_limits, dtype=torch.float32)
-        joint_velocity_limit = torch.tensor(
-            variable_velocity_limits, dtype=torch.float32)
-        joint_variable_command_delta_scale = torch.tensor(
-            variable_command_delta_scales, dtype=torch.float32)
-        observer_control_joint_index = torch.tensor(
-            observer_control_joint_indices, dtype=torch.long)
-        group_node_mask = torch.zeros(
-            len(group_names),
-            len(node_names),
+    def EvaluateHierarchy(
+        self,
+        pose: EndEffectorPose,
+        endpointValid: torch.Tensor,
+    ) -> HierarchyProgress:
+        batchSize = int(pose.translation.size(0))
+        endpointCount = self.ContractView.end_effector_count
+        device = pose.translation.device
+        dtype = pose.translation.dtype
+        RobotMorphologyModule.ValidateTensor(
+            endpointValid,
+            (batchSize, endpointCount),
+            "endpointValid",
+            False)
+        progress = torch.zeros(
+            batchSize,
+            endpointCount,
+            device=device,
+            dtype=dtype)
+        reached = torch.zeros(
+            batchSize,
+            endpointCount,
+            device=device,
             dtype=torch.bool)
-        group_joint_mask = torch.zeros(
-            len(group_names),
-            len(joint_names),
-            dtype=torch.bool)
-        group_role, group_side, group_capability = semantic_tensors(
-            group_names,
-            group_semantics)
-        joint_index = {name: index for index, name in enumerate(joint_names)}
-        for group_index, group_name in enumerate(group_names):
-            group_links, group_joints = resolved_groups[group_name]
-            for link in group_links:
-                group_node_mask[group_index, node_index[link]] = True
-            for joint in group_joints:
-                if joint in joint_index:
-                    group_joint_mask[group_index, joint_index[joint]] = True
-        endpoint_to_node = torch.full(
-            (len(endpoint_names),), -1, dtype=torch.long)
-        endpoint_task_mask = torch.zeros(
-            len(endpoint_names),
-            len(CONTROL_DOF_NAMES),
-            dtype=torch.bool)
-        endpoint_role, endpoint_side, endpoint_capability = semantic_tensors(
-            endpoint_names,
-            endpoint_semantics)
-        for index, (link, mask) in enumerate(zip(endpoint_links, endpoint_masks)):
-            endpoint_to_node[index] = node_index[link]
-            endpoint_task_mask[index] = torch.tensor(mask, dtype=torch.bool)
-        gripper_endpoint_index = torch.full(
-            (len(gripper_names),), -1, dtype=torch.long)
-        for index, endpoint_index in enumerate(gripper_endpoint_indices):
-            gripper_endpoint_index[index] = endpoint_index
-        sensor_to_node = torch.full(
-            (len(sensor_names),), -1, dtype=torch.long)
-        for index, link in enumerate(sensor_links):
-            sensor_to_node[index] = node_index[link]
-        sensor_role, sensor_side, sensor_capability = semantic_tensors(
-            sensor_names,
-            sensor_semantics)
-        return CompiledRobotMorphology(
-            description_id=description_id,
-            model_contract_id=model_contract_id,
-            adapter_id=adapter_id,
-            robot_name=robot_name,
-            node_names=node_names,
-            joint_names=joint_names,
-            joint_variable_names=tuple(variable_names),
-            group_names=group_names,
-            endpoint_names=endpoint_names,
-            gripper_names=gripper_names,
-            sensor_names=sensor_names,
-            sensor_types=tuple(sensor_types),
-            node_count=len(node_names),
-            joint_count=len(joint_names),
-            joint_dof_count=len(variable_names),
-            commandable_joint_dof_count=sum(variable_commandable),
-            task_control_coordinate_count=sum(
-                sum(mask) for mask in endpoint_masks),
-            group_count=len(group_names),
-            endpoint_count=len(endpoint_names),
-            gripper_count=len(gripper_names),
-            sensor_count=len(sensor_names),
-            parent_index=parent_index,
-            joint_parent_node=joint_parent_node,
-            joint_child_node=joint_child_node,
-            joint_type=joint_type,
-            joint_variable_commandable=joint_variable_commandable,
-            joint_variable_joint_index=joint_variable_joint_index,
-            joint_variable_child_node=joint_variable_child_node,
-            joint_variable_local_index=joint_variable_local_index,
-            joint_lower=joint_lower,
-            joint_upper=joint_upper,
-            joint_effort_limit=joint_effort_limit,
-            joint_velocity_limit=joint_velocity_limit,
-            joint_variable_command_delta_scale=(
-                joint_variable_command_delta_scale),
-            joint_variable_unit=tuple(variable_units),
-            joint_variable_command_representation=(
-                "normalized_position_delta"),
-            joint_variable_command_reference=(
-                "current_measured_position_at_sensor_frame_exposure"),
-            joint_variable_command_range=(-1.0, 1.0),
-            joint_variable_command_limit_policy=(
-                "clamp_finite_limits_wrap_unbounded_rotation"),
-            group_node_mask=group_node_mask,
-            group_joint_mask=group_joint_mask,
-            node_role=node_role,
-            node_side=node_side,
-            node_capability=node_capability,
-            group_role=group_role,
-            group_side=group_side,
-            group_capability=group_capability,
-            endpoint_to_node=endpoint_to_node,
-            endpoint_task_mask=endpoint_task_mask,
-            endpoint_role=endpoint_role,
-            endpoint_side=endpoint_side,
-            endpoint_capability=endpoint_capability,
-            gripper_endpoint_index=gripper_endpoint_index,
-            sensor_to_node=sensor_to_node,
-            sensor_role=sensor_role,
-            sensor_side=sensor_side,
-            sensor_capability=sensor_capability,
-            observer_valid=observer_valid,
-            observer_controllable=observer_controllable,
-            observer_attachment_name=(observer_attachment_name or ""),
-            observer_frame_name=observer_frame_name,
-            observer_calibration_id=observer_calibration_id,
-            observer_attachment_kind=observer_attachment_kind,
-            observer_attachment_index=observer_attachment_index,
-            observer_node_index=observer_node_index,
-            observer_sensor_index=observer_sensor_index,
-            observer_endpoint_index=observer_endpoint_index,
-            observer_control_joint_indices=observer_control_joint_index,
-            observer_control_group_index=observer_control_group_index,
-            group_dof_count=group_dof_count,
-            diagnostics=tuple(sorted(set(diagnostics))),
-            canonical_json=canonical_json)
+        enabled = torch.zeros_like(reached)
+        rootMask = torch.tensor(
+            self.ContractView.root_mask,
+            device=device,
+            dtype=torch.bool).unsqueeze(0).expand(batchSize, -1)
+        if self.CachedTargetValues is None:
+            enabled = rootMask & endpointValid
+            return HierarchyProgress(
+                progress=progress,
+                reached=reached,
+                child_enabled=enabled)
+        if (
+            tuple(self.CachedTargetValues.shape[:1]) != (batchSize,)
+            or self.CachedTargetValues.device != device
+            or self.CachedTargetValues.dtype != dtype
+        ):
+            raise ValueError("cached targets do not match feedback batch identity")
+        target = PackedEndEffectorTarget(
+            values=self.CachedTargetValues,
+            active=self.CachedTargetActive,
+            contract_id=self.ContractView.contract_id,
+            model_signature=self.ContractView.model_signature,
+            target_version=self.CachedTargetVersion,
+            timestamp=self.CachedTargetTimestamp)
+        expanded = target.ExpandValidated(self.ContractView)
+        for layer in self.ContractView.topological_layers:
+            for endpointIndex in layer:
+                parentIndex = self.ContractView.parent_index[endpointIndex]
+                if parentIndex < 0:
+                    hierarchyEnabled = endpointValid[:, endpointIndex]
+                else:
+                    hierarchyEnabled = (
+                        reached[:, parentIndex]
+                        & endpointValid[:, endpointIndex])
+                enabled[:, endpointIndex] = hierarchyEnabled
+                endpointExecuting = (
+                    hierarchyEnabled
+                    & self.CachedTargetActive[:, endpointIndex])
+                translationWidth = self.ContractView.end_effector_translation_basis.shapes[
+                    endpointIndex][1]
+                rotationWidth = self.ContractView.end_effector_rotation_basis.shapes[
+                    endpointIndex][1]
+                errorSquared = torch.zeros(
+                    batchSize,
+                    device=device,
+                    dtype=dtype)
+                if translationWidth > 0:
+                    translationError = (
+                        expanded.translation[:, endpointIndex]
+                        - pose.translation[:, endpointIndex])
+                    translationScale = float(
+                        self.ContractView.translation_error_scale[endpointIndex])
+                    errorSquared = errorSquared + (
+                        translationError / translationScale).square().sum(dim=-1)
+                if rotationWidth > 0:
+                    targetRotation = RobotEmbodimentRuntime.RotationVectorToMatrix(
+                        expanded.rotation_vector[:, endpointIndex])
+                    relativeRotation = targetRotation @ pose.rotation[
+                        :, endpointIndex].transpose(-1, -2)
+                    rotationError = RobotEmbodimentRuntime.MatrixToRotationVector(relativeRotation)
+                    rotationScale = float(
+                        self.ContractView.rotation_error_scale[endpointIndex])
+                    errorSquared = errorSquared + (
+                        rotationError / rotationScale).square().sum(dim=-1)
+                error = torch.sqrt(errorSquared)
+                enter = float(self.ContractView.progress_enter[endpointIndex])
+                exitValue = float(self.ContractView.progress_exit[endpointIndex])
+                progress[:, endpointIndex] = torch.where(
+                    endpointExecuting,
+                    (1.0 + error / exitValue).reciprocal(),
+                    torch.zeros_like(error))
+                wasReached = self.ReachedState[:, endpointIndex]
+                insideEnter = endpointExecuting & error.le(enter)
+                remainReached = endpointExecuting & wasReached & error.le(exitValue)
+                dwell = torch.where(
+                    insideEnter & ~wasReached,
+                    self.DwellState[:, endpointIndex] + 1,
+                    torch.zeros_like(self.DwellState[:, endpointIndex]))
+                newlyReached = dwell.ge(
+                    int(self.ContractView.dwell_cycles[endpointIndex]))
+                endpointReached = remainReached | newlyReached
+                self.DwellState[:, endpointIndex] = dwell
+                self.ReachedState[:, endpointIndex] = endpointReached
+                reached[:, endpointIndex] = endpointReached
+        return HierarchyProgress(
+            progress=progress,
+            reached=reached,
+            child_enabled=enabled)
 
-class TestRobotMorphologyMTool:
-    def RunSyntheticTopologies(self) -> Dict[str, bool]:
-        module = RobotMorphologyModule()
-        minimal = module.FromJson({
-            "schema_version": ROBOT_MORPHOLOGY_SCHEMA_VERSION,
-            "urdf": {
-                "name": "minimal",
-                "links": [{"name": "root"}],
-                "joints": [],
-            },
-            "srdf": {
-                "name": "minimal",
-                "groups": [],
-                "passive_joints": [],
-                "end_effectors": [],
-                "virtual_joints": [],
-                "group_states": [],
-                "disabled_collisions": [],
-            },
-            "control": {},
-        })
-        virtual_morphologies = {}
-        for joint_type in ("fixed", "planar", "floating"):
-            virtual_source = minimal.ToJson()
-            virtual_source["srdf"]["virtual_joints"] = [{
-                "name": "world_joint",
-                "type": joint_type,
-                "parent_frame": "world",
-                "child_link": "root",
-            }]
-            virtual_morphologies[joint_type] = module.FromJson(
-                virtual_source)
-        fixed_virtual = virtual_morphologies["fixed"]
-        planar_virtual = virtual_morphologies["planar"]
-        floating_virtual = virtual_morphologies["floating"]
-        invalid_virtual_parent = fixed_virtual.ToJson()
-        invalid_virtual_parent["srdf"]["virtual_joints"][0][
-            "parent_frame"] = "root"
-        invalid_virtual_parent_rejected = False
-        try:
-            module.FromJson(invalid_virtual_parent)
-        except ValueError:
-            invalid_virtual_parent_rejected = True
-        rich = module.FromJson({
-            "schema_version": ROBOT_MORPHOLOGY_SCHEMA_VERSION,
-            "urdf": {
-                "name": "rich",
-                "links": [
-                    {"name": "root"},
-                    {"name": "shoulder_link"},
-                    {"name": "camera_link"},
-                    {"name": "tool_link"},
-                ],
-                "joints": [
-                    {
-                        "name": "shoulder",
-                        "type": "revolute",
-                        "parent": "root",
-                        "child": "shoulder_link",
-                        "origin_xyz": [0.0, 0.0, 0.0],
-                        "origin_rpy": [0.0, 0.0, 0.0],
-                        "axis": [0.0, 0.0, 2.0],
-                        "limit": {
-                            "lower": -1.0,
-                            "upper": 1.0,
-                            "effort": 2.0,
-                            "velocity": 3.0,
-                        },
-                        "mimic": None,
-                    },
-                    {
-                        "name": "camera_pan",
-                        "type": "revolute",
-                        "parent": "shoulder_link",
-                        "child": "camera_link",
-                        "origin_xyz": [0.0, 0.0, 0.1],
-                        "origin_rpy": [0.0, 0.0, 0.0],
-                        "axis": [0.0, 1.0, 0.0],
-                        "limit": {
-                            "lower": -0.5,
-                            "upper": 0.5,
-                            "effort": 1.0,
-                            "velocity": 1.0,
-                        },
-                        "mimic": None,
-                    },
-                    {
-                        "name": "tool_spin",
-                        "type": "continuous",
-                        "parent": "shoulder_link",
-                        "child": "tool_link",
-                        "origin_xyz": [0.0, 0.0, 0.2],
-                        "origin_rpy": [0.0, 0.0, 0.0],
-                        "axis": [1.0, 0.0, 0.0],
-                        "limit": {"effort": 1.0, "velocity": 2.0},
-                        "mimic": None,
-                    },
-                ],
-            },
-            "srdf": {
-                "name": "rich",
-                "groups": [
-                    {
-                        "name": "arm",
-                        "joints": ["shoulder", "tool_spin"],
-                        "links": [],
-                        "subgroups": [],
-                        "chains": [],
-                    },
-                    {
-                        "name": "camera",
-                        "joints": ["camera_pan"],
-                        "links": [],
-                        "subgroups": [],
-                        "chains": [],
-                    },
-                ],
-                "passive_joints": [],
-                "end_effectors": [
-                    {
-                        "name": "tool_endpoint",
-                        "parent_link": "tool_link",
-                        "group": "arm",
-                        "parent_group": None,
-                    },
-                    {
-                        "name": "camera_endpoint",
-                        "parent_link": "camera_link",
-                        "group": "camera",
-                        "parent_group": None,
-                    },
-                ],
-                "virtual_joints": [],
-                "group_states": [{
-                    "name": "home",
-                    "group": "arm",
-                    "joints": [
-                        {"name": "shoulder", "value": [0.0]},
-                        {"name": "tool_spin", "value": [0.0]},
-                    ],
-                }],
-                "disabled_collisions": [],
-            },
-            "control": {
-                "nodes": [{
-                    "name": "camera_link",
-                    "role": "sensor",
-                    "side": "center",
-                    "capabilities": ["observe"],
-                }],
-                "groups": [{
-                    "name": "arm",
-                    "role": "arm",
-                    "side": "right",
-                    "capabilities": ["manipulation"],
-                }],
-                "endpoints": [
-                    {
-                        "name": "camera_endpoint",
-                        "task_mask": [False, False, False, False, False, False],
-                    },
-                    {
-                        "name": "tool_endpoint",
-                        "task_mask": [True, False, False, False, False, True],
-                    },
-                ],
-                "grippers": [{
-                    "name": "tool_gripper",
-                    "endpoint": "tool_endpoint",
-                }],
-                "sensors": [
-                    {"name": "camera", "type": "rgbd", "link": "camera_link"},
-                    {"name": "force", "type": "force", "link": "tool_link"},
-                ],
-                "observer": {
-                    "sensor": "camera",
-                    "control_group": "camera",
-                },
-                "observer_frame_name": "camera_optical",
-                "observer_calibration_id": "rich-camera",
-            },
-        })
-        multidof = module.FromJson({
-            "schema_version": ROBOT_MORPHOLOGY_SCHEMA_VERSION,
-            "urdf": {
-                "name": "multidof",
-                "links": [
-                    {"name": "root"},
-                    {"name": "plane"},
-                    {"name": "slide"},
-                ],
-                "joints": [
-                    {
-                        "name": "planar_base",
-                        "type": "planar",
-                        "parent": "root",
-                        "child": "plane",
-                        "origin_xyz": [0.0, 0.0, 0.0],
-                        "origin_rpy": [0.0, 0.0, 0.0],
-                        "axis": [0.0, 0.0, 1.0],
-                        "limit": None,
-                        "mimic": None,
-                    },
-                    {
-                        "name": "slide_axis",
-                        "type": "prismatic",
-                        "parent": "plane",
-                        "child": "slide",
-                        "origin_xyz": [0.0, 0.0, 0.0],
-                        "origin_rpy": [0.0, 0.0, 0.0],
-                        "axis": [1.0, 0.0, 0.0],
-                        "limit": {
-                            "lower": 0.0,
-                            "upper": 0.5,
-                            "effort": 4.0,
-                            "velocity": 0.5,
-                        },
-                        "mimic": None,
-                    },
-                ],
-            },
-            "srdf": {
-                "name": "multidof",
-                "groups": [{
-                    "name": "body",
-                    "joints": ["planar_base", "slide_axis"],
-                    "links": [],
-                    "subgroups": [],
-                    "chains": [],
-                }],
-                "passive_joints": [],
-                "end_effectors": [],
-                "virtual_joints": [],
-                "group_states": [{
-                    "name": "home",
-                    "group": "body",
-                    "joints": [
-                        {"name": "planar_base", "value": [0.0, 0.0, 0.0]},
-                        {"name": "slide_axis", "value": [0.0]},
-                    ],
-                }],
-                "disabled_collisions": [],
-            },
-            "control": {},
-        })
-        invalid_observer_control_source = rich.ToJson()
-        for joint in invalid_observer_control_source["urdf"]["joints"]:
-            if joint["name"] == "camera_pan":
-                joint["type"] = "prismatic"
-        invalid_observer_control_rejected = False
-        try:
-            module.FromJson(invalid_observer_control_source)
-        except ValueError:
-            invalid_observer_control_rejected = True
-        carrier_motion_source = rich.ToJson()
-        for joint in carrier_motion_source["urdf"]["joints"]:
-            if joint["name"] == "camera_pan":
-                joint["type"] = "prismatic"
-        carrier_motion_source["control"]["observer"].pop("control_group")
-        carrier_motion = module.FromJson(carrier_motion_source)
-        mimic_source = rich.ToJson()
-        mimic_source["urdf"]["links"].append({"name": "mirror_link"})
-        mimic_source["urdf"]["joints"].append({
-            "name": "mirror_joint",
-            "type": "revolute",
-            "parent": "root",
-            "child": "mirror_link",
-            "origin_xyz": [0.0, 0.0, 0.0],
-            "origin_rpy": [0.0, 0.0, 0.0],
-            "axis": [0.0, 0.0, 1.0],
-            "limit": {
-                "lower": -1.0,
-                "upper": 1.0,
-                "effort": 1.0,
-                "velocity": 1.0,
-            },
-            "mimic": {
-                "joint": "shoulder",
-                "multiplier": 1.0,
-                "offset": 0.0,
-            },
-        })
-        mimic_one = module.FromJson(mimic_source)
-        mimic_source["urdf"]["joints"][-1]["mimic"]["multiplier"] = -1.0
-        mimic_two = module.FromJson(mimic_source)
-        invalid_virtual_state = planar_virtual.ToJson()
-        invalid_virtual_state["srdf"]["groups"] = [{
-            "name": "root",
-            "joints": ["world_joint"],
-            "links": [],
-            "subgroups": [],
-            "chains": [],
-        }]
-        invalid_virtual_state["srdf"]["group_states"] = [{
-            "name": "home",
-            "group": "root",
-            "joints": [{"name": "world_joint", "value": [0.0, 0.0]}],
-        }]
-        invalid_virtual_state_rejected = False
-        try:
-            module.FromJson(invalid_virtual_state)
-        except ValueError:
-            invalid_virtual_state_rejected = True
-        rich_node_descriptor = rich.NodeSemanticDescriptor()
-        return {
-            "minimal_actual_dimensions": (
-                (minimal.node_count, minimal.joint_count, minimal.joint_dof_count)
-                == (1, 0, 0)
-                and (minimal.group_count, minimal.endpoint_count)
-                == (0, 0)
-                and (minimal.gripper_count, minimal.sensor_count) == (0, 0)),
-            "fixed_virtual_actual_dimensions": (
-                fixed_virtual.node_count == 1
-                and fixed_virtual.joint_count == 1
-                and fixed_virtual.joint_dof_count == 0
-                and tuple(fixed_virtual.joint_type.shape) == (1,)
-                and tuple(fixed_virtual.joint_parent_node.tolist()) == (-1,)
-                and tuple(fixed_virtual.joint_child_node.tolist()) == (0,)),
-            "planar_virtual_actual_dimensions": (
-                planar_virtual.node_count == 1
-                and planar_virtual.joint_count == 1
-                and planar_virtual.joint_dof_count == 3
-                and planar_virtual.joint_variable_names == (
-                    "world_joint/x",
-                    "world_joint/y",
-                    "world_joint/theta")
-                and torch.equal(
-                    planar_virtual.joint_variable_local_index,
-                    torch.tensor([0, 1, 2]))
-                and bool((~planar_virtual.joint_variable_commandable).all().item())
-                and bool((planar_virtual.JointSemanticDescriptor()[
-                    "joint_type"] == JOINT_TYPE_NAMES.index("planar")).all().item())
-                and torch.equal(
-                    planar_virtual.JointSemanticDescriptor()["joint_axis"],
-                    torch.eye(3))),
-            "floating_virtual_actual_dimensions": (
-                floating_virtual.node_count == 1
-                and floating_virtual.joint_count == 1
-                and floating_virtual.joint_dof_count == 6
-                and floating_virtual.joint_variable_names == (
-                    "world_joint/x",
-                    "world_joint/y",
-                    "world_joint/z",
-                    "world_joint/roll",
-                    "world_joint/pitch",
-                    "world_joint/yaw")
-                and torch.equal(
-                    floating_virtual.joint_variable_local_index,
-                    torch.arange(6))
-                and bool((~floating_virtual.joint_variable_commandable).all().item())
-                and bool((floating_virtual.JointSemanticDescriptor()[
-                    "joint_type"] == JOINT_TYPE_NAMES.index("floating")).all().item())
-                and torch.equal(
-                    floating_virtual.JointSemanticDescriptor()["joint_axis"],
-                    torch.cat((torch.eye(3), torch.eye(3)), dim=0))),
-            "virtual_dimension_model_isolation": len({
-                minimal.model_contract_id,
-                fixed_virtual.model_contract_id,
-                planar_virtual.model_contract_id,
-                floating_virtual.model_contract_id,
-            }) == 4,
-            "virtual_state_dimension_strict": (
-                invalid_virtual_state_rejected
-                and invalid_virtual_parent_rejected
-                and any(
-                    "external joint runtime fields" in item
-                    for item in floating_virtual.diagnostics)),
-            "rich_actual_dimensions": (
-                (rich.node_count, rich.joint_count, rich.joint_dof_count)
-                == (4, 3, 3)
-                and (rich.group_count, rich.endpoint_count) == (2, 2)
-                and (rich.gripper_count, rich.sensor_count) == (1, 2)),
-            "multidof_actual_dimensions": (
-                (multidof.node_count, multidof.joint_count, multidof.joint_dof_count)
-                == (3, 2, 4)
-                and (multidof.group_count, multidof.endpoint_count) == (1, 0)),
-            "multidof_axis_basis": torch.equal(
-                multidof.JointSemanticDescriptor()["joint_axis"],
-                torch.cat((torch.eye(3), torch.tensor([[1.0, 0.0, 0.0]])))),
-            "actual_dimension_model_isolation": len({
-                minimal.model_contract_id,
-                rich.model_contract_id,
-                multidof.model_contract_id,
-            }) == 3,
-            "external_semantic_control": (
-                rich.task_control_coordinate_count == 2
-                and rich.commandable_joint_dof_count == 3
-                and rich.observer_valid
-                and rich.observer_controllable
-                and rich.observer_control_joint_indices.numel() == 1
-                and tuple(rich.endpoint_task_mask.shape) == (2, 6)),
-            "axis_and_node_descriptor": (
-                torch.allclose(
-                    rich.JointSemanticDescriptor()["joint_axis"][0].norm(),
-                    torch.tensor(1.0))
-                and tuple(rich_node_descriptor["role"].shape) == (4,)
-                and int(rich_node_descriptor["is_root"].sum().item()) == 1),
-            "observer_control_vs_carrier_motion": (
-                invalid_observer_control_rejected
-                and carrier_motion.observer_valid
-                and not carrier_motion.observer_controllable
-                and carrier_motion.observer_control_joint_indices.numel() == 0),
-            "mimic_adapter_identity": (
-                mimic_one.model_contract_id == mimic_two.model_contract_id
-                and mimic_one.adapter_id != mimic_two.adapter_id
-                and mimic_one.description_id != mimic_two.description_id),
-        }
+    def ComputePerceptionMotion(
+        self,
+        pose: EndEffectorPose,
+        timestamp: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batchSize = int(pose.rotation.size(0))
+        perceptionIndices = self.GetKinematicTensors(
+            pose.rotation.device,
+            pose.rotation.dtype)[8]
+        current = pose.rotation.index_select(1, perceptionIndices)
+        perceptionCount = int(current.size(1))
+        currentQuaternion = RobotEmbodimentRuntime.RotationVectorToQuaternion(
+            RobotEmbodimentRuntime.MatrixToRotationVector(current))
+        identityQuaternion = torch.zeros(
+            batchSize,
+            perceptionCount,
+            4,
+            device=pose.rotation.device,
+            dtype=pose.rotation.dtype)
+        identityQuaternion[..., -1] = 1.0
+        angularVelocity = torch.zeros(
+            batchSize,
+            perceptionCount,
+            3,
+            device=pose.rotation.device,
+            dtype=pose.rotation.dtype)
+        valid = torch.zeros(
+            batchSize,
+            perceptionCount,
+            device=pose.rotation.device,
+            dtype=torch.bool)
+        if perceptionCount == 0:
+            self.LastPerceptionRotation = current.detach().clone()
+            return currentQuaternion, identityQuaternion, angularVelocity, valid
+        if self.LastPerceptionRotation is not None:
+            deltaMatrix = self.LastPerceptionRotation.transpose(-1, -2) @ current
+            rotationVector = RobotEmbodimentRuntime.MatrixToRotationVector(deltaMatrix)
+            deltaTime = (timestamp - self.LastTimestamp).reshape(
+                batchSize, 1, 1)
+            angularVelocity = rotationVector / deltaTime
+            identityQuaternion = RobotEmbodimentRuntime.RotationVectorToQuaternion(rotationVector)
+            valid = torch.ones_like(valid)
+        self.LastPerceptionRotation = current.detach().clone()
+        return currentQuaternion, identityQuaternion, angularVelocity, valid
 
-    def RunCurrentMoveIt(self, projectRoot: Union[str, Path]) -> Dict[str, bool]:
-        module = RobotMorphologyModule()
-        root = Path(projectRoot)
-        compiled = module.FromMoveIt(
-            root / "Configure/Arm_R_SLDASM.urdf",
-            root / "Configure/Arm_R_SLDASM.srdf")
-        roundtrip = module.FromJson(compiled.ToJson())
-        runtime_joint_name = compiled.joint_names[int(
-            compiled.joint_variable_joint_index[0].item())]
-        passive_source = compiled.ToJson()
-        passive_source["srdf"]["passive_joints"] = [runtime_joint_name]
-        passive = module.FromJson(passive_source)
-        planar_root_source = compiled.ToJson()
-        planar_root_source["srdf"]["virtual_joints"][0]["type"] = "planar"
-        planar_root = module.FromJson(planar_root_source)
-        floating_root_source = compiled.ToJson()
-        floating_root_source["srdf"]["virtual_joints"][0]["type"] = "floating"
-        floating_root = module.FromJson(floating_root_source)
-        continuous_source = compiled.ToJson()
-        for joint in continuous_source["urdf"]["joints"]:
-            if joint["name"] == runtime_joint_name:
-                joint["type"] = "continuous"
-                joint["limit"].pop("lower", None)
-                joint["limit"].pop("upper", None)
-                break
-        continuous = module.FromJson(continuous_source)
-        limit_source = compiled.ToJson()
-        for joint in limit_source["urdf"]["joints"]:
-            if joint["name"] == runtime_joint_name:
-                joint["limit"]["velocity"] += 0.5
-                break
-        changed_limit = module.FromJson(limit_source)
-        group_source = compiled.ToJson()
-        group_source["srdf"]["groups"][0]["links"].extend((
-            "base_link",
-            "WristArth_Link",
-            "Palm_Link",
-        ))
-        changed_group = module.FromJson(group_source)
-        multidof_source = compiled.ToJson()
-        multidof_joint_name = runtime_joint_name
-        for joint in multidof_source["urdf"]["joints"]:
-            if joint["name"] == multidof_joint_name:
-                joint["type"] = "planar"
-                joint["limit"] = None
-                break
-        for state in multidof_source["srdf"]["group_states"]:
-            for joint in state["joints"]:
-                if joint["name"] == multidof_joint_name:
-                    joint["value"] = [joint["value"][0], 0.0, 0.0]
-        multidof = module.FromJson(multidof_source)
-        observer_name = compiled.endpoint_names[3]
-        future_observer = module.FromMoveIt(
-            root / "Configure/Arm_R_SLDASM.urdf",
-            root / "Configure/Arm_R_SLDASM.srdf",
-            {
-                "observer_endpoint": observer_name,
-                "observer_frame_name": "camera_optical",
-                "observer_calibration_id": "test-camera",
-            })
-        controlled_endpoint = module.FromMoveIt(
-            root / "Configure/Arm_R_SLDASM.urdf",
-            root / "Configure/Arm_R_SLDASM.srdf",
-            {
-                "endpoints": [{
-                    "name": observer_name,
-                    "task_mask": [False, False, False, True, True, True],
-                }],
-            })
-        controlled_endpoint_index = controlled_endpoint.endpoint_names.index(
-            observer_name)
-        observer_task_axes_rejected = False
-        try:
-            module.FromMoveIt(
-                root / "Configure/Arm_R_SLDASM.urdf",
-                root / "Configure/Arm_R_SLDASM.srdf",
-                {
-                    "endpoints": [{
-                        "name": observer_name,
-                        "task_mask": [False, False, False, True, True, True],
-                    }],
-                    "observer_endpoint": observer_name,
-                    "observer_frame_name": "camera_optical",
-                    "observer_calibration_id": "test-camera",
-                })
-        except ValueError:
-            observer_task_axes_rejected = True
-        semantic = module.FromMoveIt(
-            root / "Configure/Arm_R_SLDASM.urdf",
-            root / "Configure/Arm_R_SLDASM.srdf",
-            {
-                "nodes": [{
-                    "name": "base_link",
-                    "role": "root",
-                    "side": "center",
-                    "capabilities": ["balance"],
-                }],
-                "groups": [{
-                    "name": "r_arm",
-                    "role": "arm",
-                    "side": "right",
-                    "capabilities": ["manipulation"],
-                }],
-                "endpoints": [{
-                    "name": "wrist_end",
-                    "role": "hand",
-                    "side": "right",
-                    "capabilities": ["manipulation", "grasp"],
-                }],
-                "sensors": [{
-                    "name": "head_camera",
-                    "type": "rgbd",
-                    "link": "base_link",
-                }],
-                "observer": {"sensor": "head_camera"},
-                "observer_frame_name": "camera_optical",
-                "observer_calibration_id": "test-camera",
-            })
-        semantic_roundtrip = module.FromJson(semantic.ToJson())
-        joint_descriptor = semantic.JointSemanticDescriptor()
-        node_descriptor = semantic.NodeSemanticDescriptor()
-        endpoint_descriptor = semantic.EndpointSemanticDescriptor()
-        passive_joint_descriptor = passive.JointSemanticDescriptor()
-        base_index = semantic.node_names.index("base_link")
-        arm_index = semantic.group_names.index("r_arm")
-        wrist_index = semantic.endpoint_names.index("wrist_end")
-        return {
-            "links_28": compiled.node_count == 28,
-            "joints_28": compiled.joint_count == 28,
-            "joint_dof_22": compiled.joint_dof_count == 22,
-            "commandable_joint_dof_22": (
-                compiled.commandable_joint_dof_count == 22),
-            "task_coordinates_default_zero": (
-                compiled.task_control_coordinate_count == 0),
-            "groups_12": compiled.group_count == 12,
-            "endpoints_11": compiled.endpoint_count == 11,
-            "observer_absent": (
-                not compiled.observer_valid
-                and compiled.observer_endpoint_index == -1),
-            "external_observer_seam": (
-                future_observer.observer_valid
-                and not future_observer.observer_controllable
-                and future_observer.observer_attachment_name == observer_name
-                and future_observer.observer_frame_name == "camera_optical"
-                and future_observer.observer_calibration_id == "test-camera"
-                and future_observer.observer_endpoint_index == 3
-                and future_observer.description_id != compiled.description_id),
-            "external_task_axes_only": (
-                not controlled_endpoint.observer_valid
-                and controlled_endpoint.task_control_coordinate_count == 3
-                and not bool(controlled_endpoint.endpoint_task_mask[
-                    controlled_endpoint_index, :3].any().item())
-                and bool(controlled_endpoint.endpoint_task_mask[
-                    controlled_endpoint_index, 3:].all().item())
-                and observer_task_axes_rejected),
-            "adapter_execution_semantics": (
-                passive.model_contract_id == compiled.model_contract_id
-                and passive.adapter_id != compiled.adapter_id
-                and passive.description_id != compiled.description_id
-                and passive.commandable_joint_dof_count
-                < compiled.commandable_joint_dof_count),
-            "adapter_limits_and_groups": (
-                changed_limit.model_contract_id == compiled.model_contract_id
-                and changed_limit.adapter_id != compiled.adapter_id
-                and changed_group.model_contract_id == compiled.model_contract_id
-                and changed_group.adapter_id != compiled.adapter_id),
-            "adapter_multidof_layout": (
-                multidof.model_contract_id != compiled.model_contract_id
-                and multidof.adapter_id != compiled.adapter_id
-                and multidof.joint_dof_count == compiled.joint_dof_count + 2
-                and torch.equal(
-                    multidof.joint_variable_local_index[:3],
-                    torch.tensor([0, 1, 2]))),
-            "external_virtual_root_seam": (
-                planar_root.model_contract_id != compiled.model_contract_id
-                and floating_root.model_contract_id != compiled.model_contract_id
-                and floating_root.model_contract_id
-                != planar_root.model_contract_id
-                and planar_root.adapter_id != compiled.adapter_id
-                and floating_root.adapter_id != compiled.adapter_id
-                and planar_root.joint_count == compiled.joint_count
-                and floating_root.joint_count == compiled.joint_count
-                and planar_root.joint_dof_count
-                == compiled.joint_dof_count + 3
-                and floating_root.joint_dof_count
-                == compiled.joint_dof_count + 6
-                and not bool(planar_root.joint_variable_commandable[:3].any().item())
-                and not bool(floating_root.joint_variable_commandable[:6].any().item())
-                and any(
-                    "external joint runtime fields" in item
-                    for item in floating_root.diagnostics)),
-            "unbounded_limit_adapter_identity": (
-                continuous.model_contract_id == compiled.model_contract_id
-                and continuous.adapter_id != compiled.adapter_id
-                and not bool(continuous.JointSemanticDescriptor()[
-                    "position_lower_limit_valid"][0].item())
-                and not bool(continuous.JointSemanticDescriptor()[
-                    "position_upper_limit_valid"][0].item())),
-            "undeclared_endpoint_axes_masked": (
-                not bool(compiled.endpoint_task_mask[:11].any().item())
-                and sum(
-                    "has no declared task axes" in item
-                    for item in compiled.diagnostics) == 11),
-            "json_roundtrip": (
-                roundtrip.description_id == compiled.description_id
-                and torch.equal(
-                    roundtrip.endpoint_task_mask,
-                    compiled.endpoint_task_mask)),
-            "actual_dimension_contract_isolation": (
-                semantic.model_contract_id != compiled.model_contract_id
-                and semantic.adapter_id != compiled.adapter_id
-                and semantic.description_id != compiled.description_id),
-            "semantic_overlay": (
-                int(semantic.node_role[base_index].item())
-                == BODY_ROLE_NAMES.index("root")
-                and int(semantic.node_side[base_index].item())
-                == BODY_SIDE_NAMES.index("center")
-                and bool(semantic.node_capability[
-                    base_index,
-                    BODY_CAPABILITY_NAMES.index("balance")].item())
-                and int(semantic.group_role[arm_index].item())
-                == BODY_ROLE_NAMES.index("arm")
-                and int(semantic.endpoint_role[wrist_index].item())
-                == BODY_ROLE_NAMES.index("hand")),
-            "sensor_observer_attachment": (
-                semantic.sensor_count == 1
-                and semantic.observer_valid
-                and not semantic.observer_controllable
-                and semantic.observer_attachment_kind == "sensor"
-                and semantic.observer_attachment_name == "head_camera"
-                and semantic.observer_frame_name == "camera_optical"
-                and semantic.observer_calibration_id == "test-camera"
-                and semantic.observer_sensor_index == 0
-                and semantic.observer_endpoint_index == -1
-                and semantic.observer_node_index == base_index),
-            "joint_runtime_layout": (
-                bool((semantic.joint_variable_joint_index >= 0).all().item())
-                and bool((semantic.joint_variable_child_node >= 0).all().item())
-                and bool((semantic.joint_variable_local_index >= 0).all().item())),
-            "shared_semantic_descriptors": (
-                tuple(node_descriptor["capability"].shape)
-                == (semantic.node_count, len(BODY_CAPABILITY_NAMES))
-                and int(node_descriptor["is_root"].sum().item()) == 1
-                and torch.equal(
-                    node_descriptor["is_leaf"],
-                    node_descriptor["out_degree"].eq(0))
-                and bool((node_descriptor["topology_depth"] >= 0).all().item())
-                and tuple(node_descriptor["group_capability"].shape)
-                == (semantic.node_count, len(BODY_CAPABILITY_NAMES))
-                and
-                tuple(joint_descriptor["joint_axis"].shape)
-                == (semantic.joint_dof_count, 3)
-                and tuple(joint_descriptor["group_capability"].shape)
-                == (
-                    semantic.joint_dof_count,
-                    len(BODY_CAPABILITY_NAMES))
-                and bool((joint_descriptor[
-                    "topology_depth"] >= 0).all().item())
-                and torch.equal(
-                    passive_joint_descriptor["commandable"],
-                    passive.joint_variable_commandable)
-                and tuple(endpoint_descriptor["task_mask"].shape)
-                == (
-                    semantic.endpoint_count,
-                    len(CONTROL_DOF_NAMES))
-                and torch.equal(
-                    endpoint_descriptor["task_mask"],
-                    semantic.endpoint_task_mask)),
-            "semantic_json_roundtrip": (
-                semantic_roundtrip.description_id == semantic.description_id
-                and semantic_roundtrip.adapter_id == semantic.adapter_id
-                and semantic_roundtrip.model_contract_id
-                == semantic.model_contract_id
-                and semantic_roundtrip.observer_attachment_name
-                == semantic.observer_attachment_name
-                and semantic_roundtrip.observer_frame_name
-                == semantic.observer_frame_name
-                and semantic_roundtrip.observer_calibration_id
-                == semantic.observer_calibration_id),
-        }
+    def EncodeFeedback(
+        self,
+        rawFeedback: RawJointFeedback,
+    ) -> BrainFeedbackPacket:
+        if type(rawFeedback) is not RawJointFeedback:
+            raise TypeError("runtime feedback must be RawJointFeedback")
+        rawFeedback.Validate(self.ContractView)
+        self.ValidateTemporalOrder(rawFeedback)
+        jointFeatures = self.EncodeJointFeatures(rawFeedback)
+        jointValid = torch.ones(
+            rawFeedback.position.shape,
+            device=rawFeedback.position.device,
+            dtype=torch.bool)
+        endpointValid = torch.ones(
+            int(rawFeedback.position.size(0)),
+            self.ContractView.end_effector_count,
+            device=rawFeedback.position.device,
+            dtype=torch.bool)
+        pose = self.ForwardKinematics(rawFeedback.position)
+        hierarchy = self.EvaluateHierarchy(pose, endpointValid)
+        (
+            perceptionRotation,
+            perceptionRotationDelta,
+            perceptionAngularVelocity,
+            perceptionValid,
+        ) = self.ComputePerceptionMotion(pose, rawFeedback.timestamp)
+        batchSize = int(rawFeedback.position.size(0))
+        if self.CachedTargetActive is None:
+            targetActive = torch.zeros(
+                batchSize,
+                self.ContractView.end_effector_count,
+                device=rawFeedback.position.device,
+                dtype=torch.bool)
+            targetVersion = torch.full(
+                (batchSize,),
+                -1,
+                device=rawFeedback.position.device,
+                dtype=torch.long)
+        else:
+            targetActive = self.CachedTargetActive.clone()
+            targetVersion = self.CachedTargetVersion.clone()
+        packet = BrainFeedbackPacket(
+            joint_features=jointFeatures,
+            joint_valid=jointValid,
+            endpoint_valid=endpointValid,
+            progress=hierarchy.progress,
+            reached=hierarchy.reached,
+            child_enabled=hierarchy.child_enabled,
+            target_active=targetActive,
+            target_version=targetVersion,
+            perception_rotation=perceptionRotation,
+            perception_rotation_delta=perceptionRotationDelta,
+            perception_angular_velocity=perceptionAngularVelocity,
+            perception_valid=perceptionValid,
+            contract_id=self.ContractView.contract_id,
+            model_signature=self.ContractView.model_signature,
+            timestamp=rawFeedback.timestamp,
+            sample_index=rawFeedback.sample_index)
+        self.LastTimestamp = rawFeedback.timestamp.detach().clone()
+        self.LastSampleIndex = rawFeedback.sample_index.detach().clone()
+        return packet
