@@ -177,7 +177,6 @@ class OfflineGameDataset(Dataset):
         if contractView is not None:
             if type(contractView) is not RobotEmbodimentContractView:
                 raise TypeError("contractView must be an immutable contract view")
-            contractView.Validate()
         self.contract_view = contractView
         if isTest:
             root = Path(BasicParameters.DATA_ROOT_PATH_TEST)
@@ -661,7 +660,6 @@ class DataPreprocessor:
     ) -> Dict[str, Any]:
         if type(contractView) is not RobotEmbodimentContractView:
             raise TypeError("synthetic supervision requires a contract view")
-        contractView.Validate()
         if type(maxNodes) is not int or maxNodes < 1:
             raise ValueError("synthetic observed capacity must be positive")
         return {

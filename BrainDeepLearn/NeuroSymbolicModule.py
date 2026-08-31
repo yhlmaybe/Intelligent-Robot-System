@@ -106,7 +106,7 @@ CONTRACT_SLOT_PREDICATES: Tuple[str, ...] = (
     "HAS_PARENT",
     "PARENT_READY",
     "SLOT_ENABLED",
-    "VALID",
+    "PRESENT",
     "COMMAND_IN_ALLOWED_SUBSPACE",
 )
 
@@ -125,10 +125,10 @@ CONTRACT_EVIDENCE_FIELDS: Tuple[str, ...] = (
     "progress",
     "reached",
     "child_enabled",
-    "endpoint_valid",
+    "endpoint_present",
     "target_active",
     "target_known",
-    "joint_chain_valid_fraction",
+    "endpoint_state_present",
     "parent_ready",
     "execution_progress",
     "execution_active",
@@ -270,10 +270,6 @@ class ContractGroundingOutput:
 class ContractNeuroSymbolicGrounder(AGICoreModule):
     def __init__(self, contractView: RobotEmbodimentContractView):
         super().__init__()
-        if type(contractView) is not RobotEmbodimentContractView:
-            raise TypeError(
-                "contract neuro-symbolic grounding requires a contract view")
-        contractView.Validate()
         self.contract_view = contractView
 
     def CommandPredicate(
@@ -290,8 +286,8 @@ class ContractNeuroSymbolicGrounder(AGICoreModule):
         planStale: Optional[torch.Tensor],
         planStaleKnown: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = int(packet.values.size(0))
-        device = packet.values.device
+        batch_size = int(packet.joint_features.size(0))
+        device = packet.joint_features.device
         if planStale is None and planStaleKnown is None:
             return (
                 torch.zeros(batch_size, dtype=torch.bool, device=device),
@@ -352,11 +348,10 @@ class ContractNeuroSymbolicGrounder(AGICoreModule):
     ) -> ContractGroundingOutput:
         if type(packet) is not BrainFeedbackPacket:
             raise TypeError("contract grounding requires a BrainFeedbackPacket")
-        packet.Validate(self.contract_view)
-        batch_size = int(packet.values.size(0))
+        batch_size = int(packet.joint_features.size(0))
         slot_count = self.contract_view.end_effector_count
-        device = packet.values.device
-        dtype = packet.values.dtype
+        device = packet.joint_features.device
+        dtype = packet.joint_features.dtype
 
         parent_index = torch.tensor(
             self.contract_view.parent_index,
@@ -374,7 +369,7 @@ class ContractNeuroSymbolicGrounder(AGICoreModule):
             parent_ready[:, child_index] = packet.reached.index_select(
                 1, selected_parent_index)
             parent_ready_known[:, child_index] = (
-                packet.endpoint_valid.index_select(
+                packet.endpoint_present.index_select(
                     1, selected_parent_index))
 
         command_allowed, command_known = self.CommandPredicate(packet)
@@ -384,17 +379,17 @@ class ContractNeuroSymbolicGrounder(AGICoreModule):
             planStaleKnown)
         execution_active = packet.target_active
         active_present = execution_active.any(dim=-1)
-        active_valid = execution_active & packet.endpoint_valid
-        active_count = active_valid.to(dtype=dtype).sum(
+        active_present = execution_active & packet.endpoint_present
+        active_count = active_present.to(dtype=dtype).sum(
             dim=-1).clamp_min(1.0)
         execution_progress = (
-            packet.progress * active_valid.to(dtype=dtype)
+            packet.progress * active_present.to(dtype=dtype)
         ).sum(dim=-1) / active_count
         execution_reached = (
             active_present
             & (packet.reached | ~execution_active).all(dim=-1))
         execution_failed = (
-            execution_active & ~packet.endpoint_valid).any(dim=-1)
+            execution_active & ~packet.endpoint_present).any(dim=-1)
         aggregate_safe = ~execution_failed
         aggregate_safe_known = execution_failed
 
@@ -402,14 +397,14 @@ class ContractNeuroSymbolicGrounder(AGICoreModule):
             has_parent,
             parent_ready,
             packet.child_enabled,
-            packet.endpoint_valid,
+            packet.endpoint_present,
             command_allowed,
         ], dim=-1)
         slot_predicate_known = torch.stack([
             torch.ones_like(has_parent),
             parent_ready_known,
             torch.ones_like(packet.child_enabled),
-            torch.ones_like(packet.endpoint_valid),
+            torch.ones_like(packet.endpoint_present),
             command_known,
         ], dim=-1)
         slot_predicate_prob = torch.where(
@@ -438,29 +433,16 @@ class ContractNeuroSymbolicGrounder(AGICoreModule):
         def Broadcast(value: torch.Tensor) -> torch.Tensor:
             return value.to(dtype=dtype).unsqueeze(-1).expand(-1, slot_count)
 
-        chain_valid_fraction = []
-        for slot_index in range(slot_count):
-            start = self.contract_view.end_effector_joint_chain_offsets[
-                slot_index]
-            end = self.contract_view.end_effector_joint_chain_offsets[
-                slot_index + 1]
-            indices = torch.tensor(
-                self.contract_view.end_effector_joint_chain_indices[start:end],
-                device=device,
-                dtype=torch.long)
-            chain_valid_fraction.append(
-                packet.joint_valid.index_select(1, indices).to(
-                    dtype=dtype).mean(dim=-1))
-        chain_valid = torch.stack(chain_valid_fraction, dim=-1)
+        endpoint_state_present = packet.endpoint_present.to(dtype=dtype)
 
         evidence = torch.stack([
             packet.progress,
             packet.reached.to(dtype=dtype),
             packet.child_enabled.to(dtype=dtype),
-            packet.endpoint_valid.to(dtype=dtype),
+            packet.endpoint_present.to(dtype=dtype),
             packet.target_active.to(dtype=dtype),
             Broadcast(packet.target_version.ge(0)),
-            chain_valid,
+            endpoint_state_present,
             parent_ready.to(dtype=dtype),
             Broadcast(execution_progress),
             Broadcast(active_present),

@@ -9,8 +9,8 @@ from ModuleMessagerManager import CognitiveDimProfile
 from RobotMorphologyModule import (
     BrainFeedbackPacket,
     EmbodimentShape,
-    ModelSignatureCompiler,
     PackedEndEffectorTarget,
+    Robot,
     RobotEmbodimentContractView,
 )
 
@@ -20,7 +20,7 @@ TEXT_TRUST_OPERATOR_COMMAND = "operator_command"
 TEXT_TRUST_UNSAFE_EXTERNAL = "unsafe_external"
 SENSOR_PACKET_WIRE_SCHEMA_VERSION = 5
 DECISION_WIRE_SCHEMA_VERSION = 11
-BRAIN_BUILD_SPEC_SCHEMA_VERSION = 5
+BRAIN_BUILD_SPEC_SCHEMA_VERSION = 12
 
 
 @dataclass(frozen=True)
@@ -29,9 +29,6 @@ class BrainBuildSpec:
     embodiment: EmbodimentShape
     contract_view: RobotEmbodimentContractView
     model_signature: str
-
-    def __post_init__(self) -> None:
-        self.Validate()
 
     @staticmethod
     def CompileModelSignature(
@@ -48,7 +45,7 @@ class BrainBuildSpec:
         if type(embodiment) is not EmbodimentShape:
             raise TypeError("contractView.model_shape must be an EmbodimentShape")
 
-        return ModelSignatureCompiler.CompileBrainBuild(
+        return Robot.CompileBrainBuildSignature(
             {
                 name: getattr(cognitive, name)
                 for name in cognitive.__dataclass_fields__
@@ -69,24 +66,6 @@ class BrainBuildSpec:
             contract_view=contractView,
             model_signature=model_signature,
         )
-
-    def Validate(self) -> None:
-        if type(self.cognitive) is not CognitiveDimProfile:
-            raise TypeError("cognitive must be a CognitiveDimProfile")
-        if type(self.embodiment) is not EmbodimentShape:
-            raise TypeError("embodiment must be an EmbodimentShape")
-        if type(self.contract_view) is not RobotEmbodimentContractView:
-            raise TypeError(
-                "contract_view must be a RobotEmbodimentContractView")
-        self.contract_view.Validate()
-        if self.embodiment != self.contract_view.model_shape:
-            raise ValueError(
-                "embodiment must exactly match contract_view.model_shape")
-        expected = self.CompileModelSignature(
-            self.cognitive, self.contract_view)
-        if type(self.model_signature) is not str or self.model_signature != expected:
-            raise ValueError(
-                "model_signature does not match the cognitive and embodiment contract")
 
     def IsCheckpointCompatible(self, checkpointModelSignature: Any) -> bool:
         return (
@@ -132,16 +111,13 @@ class BrainBuildSpec:
         if type(feedbackPacket) is not BrainFeedbackPacket:
             raise TypeError("brain input requires a BrainFeedbackPacket")
         feedbackPacket.Validate(self.contract_view)
-        if feedbackPacket.timestamp.device != feedbackPacket.values.device:
-            raise ValueError(
-                "feedback packet timestamp must share the packet device")
-        packet_batch_size = int(feedbackPacket.values.size(0))
+        packet_batch_size = int(feedbackPacket.joint_features.size(0))
         if batchSize is not None and packet_batch_size != int(batchSize):
             raise ValueError(
                 "feedback packet batch size does not match sensory input")
         if (
             device is not None
-            and feedbackPacket.values.device != torch.device(device)
+            and feedbackPacket.joint_features.device != torch.device(device)
         ):
             raise ValueError(
                 "feedback packet device does not match the brain input device")

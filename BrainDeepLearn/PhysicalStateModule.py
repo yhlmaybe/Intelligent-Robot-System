@@ -28,9 +28,6 @@ class ContractPhysicalStateAdapter(nn.Module):
         embodimentContextDim: Optional[int] = None,
     ) -> None:
         super().__init__()
-        if type(contractView) is not RobotEmbodimentContractView:
-            raise TypeError("physical state adapter requires a contract view")
-        contractView.Validate()
         if type(bodyDim) is not int or bodyDim < 1:
             raise ValueError("bodyDim must be a positive integer")
         if controlFeedbackDim is None:
@@ -53,18 +50,6 @@ class ContractPhysicalStateAdapter(nn.Module):
         static_slot_tokens = torch.tensor(
             contractView.static_end_effector_tokens,
             dtype=torch.float32)
-        endpoint_joint_mask = torch.zeros(
-            contractView.end_effector_count,
-            contractView.joint_count,
-            dtype=torch.bool)
-        for endpointIndex in range(contractView.end_effector_count):
-            begin = contractView.end_effector_joint_chain_offsets[endpointIndex]
-            end = contractView.end_effector_joint_chain_offsets[
-                endpointIndex + 1]
-            endpoint_joint_mask[
-                endpointIndex,
-                list(contractView.end_effector_joint_chain_indices[begin:end])
-            ] = True
         self.register_buffer(
             "StaticJointTokens",
             static_joint_tokens,
@@ -72,10 +57,6 @@ class ContractPhysicalStateAdapter(nn.Module):
         self.register_buffer(
             "StaticSlotTokens",
             static_slot_tokens,
-            persistent=True)
-        self.register_buffer(
-            "EndpointJointMask",
-            endpoint_joint_mask,
             persistent=True)
         self.JointStaticAdapter = nn.Linear(
             contractView.model_shape.joint_static_descriptor_dim,
@@ -93,14 +74,27 @@ class ContractPhysicalStateAdapter(nn.Module):
                 nn.SiLU())
             for jointIndex in range(contractView.joint_count)
         ])
+        self.EndpointFeedbackAdapters = nn.ModuleList([
+            nn.Sequential(
+                (
+                    nn.Identity()
+                    if contractView.end_effector_feedback_layout.Width(
+                        endpointIndex) == 1
+                    else nn.LayerNorm(
+                        contractView.end_effector_feedback_layout.Width(
+                            endpointIndex))),
+                nn.Linear(
+                    contractView.end_effector_feedback_layout.Width(
+                        endpointIndex),
+                    self.BodyDim),
+                nn.SiLU())
+            for endpointIndex in range(contractView.end_effector_count)
+        ])
         self.JointOutputNorm = (
             nn.Identity()
             if self.BodyDim == 1
             else nn.LayerNorm(self.BodyDim))
         self.StaticAdapter = nn.Linear(
-            contractView.model_shape.end_effector_static_descriptor_dim,
-            self.BodyDim)
-        self.EndpointQueryAdapter = nn.Linear(
             contractView.model_shape.end_effector_static_descriptor_dim,
             self.BodyDim)
         self.StatusAdapter = nn.Sequential(
@@ -138,19 +132,6 @@ class ContractPhysicalStateAdapter(nn.Module):
             if self.EmbodimentContextDim == 1
             else nn.LayerNorm(self.EmbodimentContextDim))
 
-    def ValidatePacket(self, feedback: BrainFeedbackPacket) -> None:
-        if type(feedback) is not BrainFeedbackPacket:
-            raise TypeError("physical state adapter requires BrainFeedbackPacket")
-        feedback.Validate(self.ContractView)
-        if feedback.joint_features.device != self.StaticJointTokens.device:
-            raise ValueError(
-                "physical state packet and adapter must share one device")
-        if feedback.joint_features.dtype != self.StaticJointTokens.dtype:
-            raise ValueError(
-                "physical state packet and adapter must share one floating dtype")
-        if feedback.progress.dtype != feedback.joint_features.dtype:
-            raise ValueError("progress and joint features must share one dtype")
-
     def EncodeJointState(
         self,
         feedback: BrainFeedbackPacket,
@@ -164,7 +145,10 @@ class ContractPhysicalStateAdapter(nn.Module):
             self.StaticJointTokens.to(
                 device=dynamic.device,
                 dtype=dynamic.dtype)).unsqueeze(0)
-        joint_weight = feedback.joint_valid.to(dtype=dynamic.dtype)
+        joint_weight = torch.ones(
+            dynamic.shape[:2],
+            device=dynamic.device,
+            dtype=dynamic.dtype)
         joint_tokens = self.JointOutputNorm(dynamic + static)
         joint_tokens = joint_tokens * joint_weight.unsqueeze(-1)
         joint_summary = joint_tokens.sum(dim=1) / joint_weight.sum(
@@ -172,39 +156,24 @@ class ContractPhysicalStateAdapter(nn.Module):
             keepdim=True).clamp_min(1.0)
         return joint_tokens, joint_weight, joint_summary
 
-    def PoolEndpointChains(
+    def EncodeEndpointState(
         self,
-        jointTokens: torch.Tensor,
         feedback: BrainFeedbackPacket,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        queries = self.EndpointQueryAdapter(
-            self.StaticSlotTokens.to(
-                device=jointTokens.device,
-                dtype=jointTokens.dtype))
-        score = torch.einsum(
-            "bjd,ed->bej",
-            jointTokens,
-            queries) / float(self.BodyDim) ** 0.5
-        chain_mask = self.EndpointJointMask.to(
-            device=jointTokens.device).unsqueeze(0)
-        valid_mask = chain_mask & feedback.joint_valid.unsqueeze(1)
-        score = score.masked_fill(
-            ~valid_mask,
-            torch.finfo(score.dtype).min)
-        weight = torch.softmax(score, dim=-1)
-        weight = weight * valid_mask.to(dtype=weight.dtype)
-        weight = weight / weight.sum(dim=-1, keepdim=True).clamp_min(
-            torch.finfo(weight.dtype).eps)
-        endpoint_tokens = torch.bmm(weight, jointTokens)
-        chain_size = chain_mask.sum(dim=-1).clamp_min(1)
-        chain_ratio = valid_mask.sum(dim=-1).to(
-            dtype=jointTokens.dtype) / chain_size.to(dtype=jointTokens.dtype)
-        return endpoint_tokens, chain_ratio
+        endpointTokens = torch.stack(tuple(
+            adapter(feedback.end_effector_features[
+                ...,
+                self.ContractView.end_effector_feedback_layout.Slice(
+                    endpointIndex)])
+            for endpointIndex, adapter in enumerate(
+                self.EndpointFeedbackAdapters)), dim=1)
+        endpointWeight = feedback.endpoint_present.to(dtype=endpointTokens.dtype)
+        return endpointTokens * endpointWeight.unsqueeze(-1), endpointWeight
 
     @staticmethod
     def EncodeEndpointStatus(
         feedback: BrainFeedbackPacket,
-        chainRatio: torch.Tensor,
+        endpointStatePresent: torch.Tensor,
     ) -> torch.Tensor:
         dtype = feedback.joint_features.dtype
         target_active = feedback.target_active.to(dtype=dtype)
@@ -215,8 +184,8 @@ class ContractPhysicalStateAdapter(nn.Module):
             feedback.reached.to(dtype=dtype),
             child_enabled,
             target_active,
-            feedback.endpoint_valid.to(dtype=dtype),
-            chainRatio,
+            feedback.endpoint_present.to(dtype=dtype),
+            endpointStatePresent,
             progress * child_enabled,
             target_active * (1.0 - progress),
         ), dim=-1)
@@ -261,18 +230,16 @@ class ContractPhysicalStateAdapter(nn.Module):
         self,
         feedback: BrainFeedbackPacket,
     ) -> Dict[str, torch.Tensor]:
-        self.ValidatePacket(feedback)
         joint_tokens, joint_weight, joint_summary = self.EncodeJointState(
             feedback)
-        endpoint_dynamic, chain_ratio = self.PoolEndpointChains(
-            joint_tokens,
+        endpoint_dynamic, endpoint_state_present = self.EncodeEndpointState(
             feedback)
         static = self.StaticAdapter(
             self.StaticSlotTokens.to(
                 device=endpoint_dynamic.device,
                 dtype=endpoint_dynamic.dtype)).unsqueeze(0)
-        status = self.EncodeEndpointStatus(feedback, chain_ratio)
-        slot_weight = feedback.endpoint_valid.to(dtype=endpoint_dynamic.dtype)
+        status = self.EncodeEndpointStatus(feedback, endpoint_state_present)
+        slot_weight = feedback.endpoint_present.to(dtype=endpoint_dynamic.dtype)
         slot_tokens = self.OutputNorm(
             endpoint_dynamic + static + self.StatusAdapter(status))
         slot_tokens = slot_tokens * slot_weight.unsqueeze(-1)
@@ -426,10 +393,6 @@ class PhysicalStateExtractor(AGICoreModule):
         self.relation_classes = int(relationClasses)
         self.node_mask_threshold = float(nodeMaskThreshold)
         self.geometry_mask_threshold = float(geometryMaskThreshold)
-        if type(contractView) is not RobotEmbodimentContractView:
-            raise TypeError(
-                "physical state requires an immutable contract view")
-        contractView.Validate()
         node_descriptor = torch.tensor(
             contractView.static_end_effector_tokens,
             dtype=torch.float32)

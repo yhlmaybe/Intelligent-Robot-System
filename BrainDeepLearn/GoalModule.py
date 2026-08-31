@@ -559,9 +559,6 @@ class FourLevelGoalManager(AGICoreModule):
         capabilityDim: int = 32,
         taskContextDim: int = 128,):
         super().__init__()
-        if type(contractView) is not RobotEmbodimentContractView:
-            raise TypeError("goal manager requires an embodiment contract view")
-        contractView.Validate()
         self.contract_view = contractView
         self.endpoint_count = int(contractView.end_effector_count)
         static_end_effector_tokens = torch.tensor(
@@ -974,7 +971,6 @@ class TestGoalMTool:
     ):
         if type(contractView) is not RobotEmbodimentContractView:
             raise TypeError("goal tests require an embodiment contract view")
-        contractView.Validate()
         self.contract_view = contractView
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

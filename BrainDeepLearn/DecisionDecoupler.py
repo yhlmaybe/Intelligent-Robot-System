@@ -111,7 +111,7 @@ class PackedDecoupledDecision:
 @dataclass(frozen=True)
 class PackedPerceptionRotationEfference:
     rotation_delta: torch.Tensor
-    valid: torch.Tensor
+    present: torch.Tensor
     contract_id: str
 
 
@@ -137,9 +137,6 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         worldActionDim: Optional[int] = None,
     ) -> None:
         super().__init__()
-        if type(contractView) is not RobotEmbodimentContractView:
-            raise TypeError("packed decoder requires an embodiment contract view")
-        contractView.Validate()
         worldActionDim = decisionDim if worldActionDim is None else worldActionDim
         planDim = decisionDim if planDim is None else planDim
         subgoalDim = decisionDim if subgoalDim is None else subgoalDim
@@ -197,8 +194,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         self.joint_count = int(contractView.joint_count)
         self.target_packed_dim = int(
             contractView.end_effector_target_layout.PackedDim)
-        self.feedback_packed_dim = int(
-            contractView.joint_feedback_layout.PackedDim)
+        self.rotation_chart_limit = float(contractView.rotation_chart_limit)
         self.topological_layers = tuple(
             tuple(int(slotIndex) for slotIndex in layer)
             for layer in contractView.topological_layers)
@@ -212,14 +208,17 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         self.target_offsets = tuple(
             int(value)
             for value in contractView.end_effector_target_layout.offsets)
+        self.translation_widths = tuple(
+            int(shape[1])
+            for shape in contractView.end_effector_translation_basis.shapes)
+        self.rotation_widths = tuple(
+            int(shape[1])
+            for shape in contractView.end_effector_rotation_basis.shapes)
         self.feedback_offsets = tuple(
             int(value) for value in contractView.joint_feedback_layout.offsets)
-        self.endpoint_joint_chain_offsets = tuple(
+        self.endpoint_feedback_offsets = tuple(
             int(value)
-            for value in contractView.end_effector_joint_chain_offsets)
-        self.endpoint_joint_chain_indices = tuple(
-            int(value)
-            for value in contractView.end_effector_joint_chain_indices)
+            for value in contractView.end_effector_feedback_layout.offsets)
         self.slot_relevance_gain = nn.Parameter(torch.tensor(0.0))
 
         static_slot_tokens = torch.tensor(
@@ -241,14 +240,6 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             torch.tensor(contractView.root_mask, dtype=torch.bool),
             persistent=True)
         self.register_buffer(
-            "child_mask",
-            torch.tensor(contractView.child_mask, dtype=torch.bool),
-            persistent=True)
-        self.register_buffer(
-            "independent_mask",
-            torch.tensor(contractView.independent_mask, dtype=torch.bool),
-            persistent=True)
-        self.register_buffer(
             "target_lower",
             torch.tensor(
                 contractView.end_effector_target_lower,
@@ -259,6 +250,19 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             torch.tensor(
                 contractView.end_effector_target_upper,
                 dtype=torch.float32),
+            persistent=True)
+        rotationBases = []
+        for slotIndex, rotationWidth in enumerate(self.rotation_widths):
+            basis = contractView.end_effector_rotation_basis.Matrix(
+                slotIndex,
+                dtype=torch.float32)
+            rotationBases.append(torch.cat((
+                basis,
+                torch.zeros(3, 3 - rotationWidth, dtype=torch.float32)),
+                dim=1))
+        self.register_buffer(
+            "rotation_basis",
+            torch.stack(rotationBases, dim=0),
             persistent=True)
 
         descriptor_dim = int(static_slot_tokens.size(-1))
@@ -284,7 +288,14 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             nn.LayerNorm(self.feedback_token_dim),
         )
         self.joint_feedback_adapters = nn.ModuleList()
+        self.endpoint_feedback_adapters = nn.ModuleList()
         self.joint_token_fuser = nn.Sequential(
+            nn.LayerNorm(2 * self.feedback_token_dim),
+            nn.Linear(2 * self.feedback_token_dim, self.feedback_token_dim),
+            nn.SiLU(),
+            nn.LayerNorm(self.feedback_token_dim),
+        )
+        self.endpoint_feedback_fuser = nn.Sequential(
             nn.LayerNorm(2 * self.feedback_token_dim),
             nn.Linear(2 * self.feedback_token_dim, self.feedback_token_dim),
             nn.SiLU(),
@@ -376,6 +387,20 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
                 nn.LayerNorm(self.feedback_token_dim),
             ))
         for slotIndex in range(self.slot_count):
+            endpointFeedbackWidth = (
+                contractView.end_effector_feedback_layout.Width(slotIndex))
+            if endpointFeedbackWidth < 1:
+                raise ValueError("end-effector feedback widths must be positive")
+            endpointFeedbackNormalizer = (
+                nn.Identity()
+                if endpointFeedbackWidth == 1
+                else nn.LayerNorm(endpointFeedbackWidth))
+            self.endpoint_feedback_adapters.append(nn.Sequential(
+                endpointFeedbackNormalizer,
+                nn.Linear(endpointFeedbackWidth, self.feedback_token_dim),
+                nn.SiLU(),
+                nn.LayerNorm(self.feedback_token_dim),
+            ))
             target_width = contractView.end_effector_target_layout.Width(
                 slotIndex)
             if target_width < 1:
@@ -570,7 +595,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
                         | (previous_values[:, targetSlice] > upper + tolerance)
                     )
                 ).any().item()):
-                    raise ValueError("previous active targets exceed morphology limits")
+                    raise ValueError("previous active targets exceed contract limits")
         for value in (
             decisionContext.risk,
             decisionContext.confidence,
@@ -609,6 +634,67 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         ):
             raise ValueError("decision backbone must be finite floating point")
 
+    def ProjectPrincipalRotation(
+        self,
+        slotIndex: int,
+        values: torch.Tensor,
+    ) -> torch.Tensor:
+        translationWidth = self.translation_widths[slotIndex]
+        rotationWidth = self.rotation_widths[slotIndex]
+        if rotationWidth == 0:
+            return values
+        rotation = values[
+            :,
+            translationWidth:translationWidth + rotationWidth]
+        basis = self.rotation_basis[
+            slotIndex,
+            :,
+            :rotationWidth].to(device=values.device, dtype=values.dtype)
+        physicalRotation = rotation @ basis.transpose(0, 1)
+        physicalNorm = torch.linalg.vector_norm(
+            physicalRotation,
+            dim=-1,
+            keepdim=True)
+        targetStart = self.target_offsets[slotIndex] + translationWidth
+        targetEnd = targetStart + rotationWidth
+        lower = self.target_lower[targetStart:targetEnd].to(
+            device=values.device,
+            dtype=values.dtype)
+        upper = self.target_upper[targetStart:targetEnd].to(
+            device=values.device,
+            dtype=values.dtype)
+        anchor = torch.minimum(
+            torch.maximum(torch.zeros_like(lower), lower),
+            upper)
+        direction = rotation - anchor.unsqueeze(0)
+        physicalAnchor = anchor @ basis.transpose(0, 1)
+        physicalDirection = direction @ basis.transpose(0, 1)
+        quadratic = physicalDirection.square().sum(
+            dim=-1,
+            keepdim=True)
+        linear = 2.0 * (
+            physicalDirection
+            * physicalAnchor.unsqueeze(0)).sum(dim=-1, keepdim=True)
+        constant = (
+            physicalAnchor.square().sum()
+            - self.rotation_chart_limit ** 2)
+        discriminant = (
+            linear.square()
+            - 4.0 * quadratic * constant).clamp_min(0.0)
+        boundaryScale = (
+            (-linear + torch.sqrt(discriminant))
+            / (2.0 * quadratic).clamp_min(
+                torch.finfo(values.dtype).eps)).clamp(0.0, 1.0)
+        scale = torch.where(
+            physicalNorm <= self.rotation_chart_limit,
+            torch.ones_like(boundaryScale),
+            boundaryScale)
+        projectedRotation = anchor.unsqueeze(0) + scale * direction
+        return torch.cat((
+            values[:, :translationWidth],
+            projectedRotation,
+            values[:, translationWidth + rotationWidth:]), dim=-1)
+
     def ResolveExecutionState(
         self,
         decisionBackbone: torch.Tensor,
@@ -617,15 +703,12 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         batch_size = int(decisionBackbone.size(0))
         device = decisionBackbone.device
         dtype = decisionBackbone.dtype
-        if type(feedbackPacket) is not BrainFeedbackPacket:
-            raise TypeError("feedback must be a BrainFeedbackPacket")
-        feedbackPacket.Validate(self.contract_view)
         if int(feedbackPacket.joint_features.size(0)) != batch_size:
             raise ValueError("feedback batch does not match decision backbone")
         if feedbackPacket.joint_features.device != device:
             raise ValueError("feedback must share the decision device")
         feedback_values = feedbackPacket.joint_features.to(dtype=dtype)
-        available = feedbackPacket.endpoint_valid
+        available = feedbackPacket.endpoint_present
         enabled = feedbackPacket.child_enabled
 
         root_mask = self.root_mask.to(device=device).unsqueeze(0)
@@ -648,13 +731,13 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         batch_size = int(decisionBackbone.size(0))
         dtype = decisionBackbone.dtype
         device = decisionBackbone.device
-        available = feedbackPacket.endpoint_valid
+        available = feedbackPacket.endpoint_present
         dynamic_state = torch.stack([
             feedbackPacket.progress,
             feedbackPacket.reached.to(dtype=dtype),
             feedbackPacket.child_enabled.to(dtype=dtype),
             feedbackPacket.target_active.to(dtype=dtype),
-            feedbackPacket.endpoint_valid.to(dtype=dtype),
+            feedbackPacket.endpoint_present.to(dtype=dtype),
         ], dim=-1).to(dtype=dtype)
 
         dynamic_tokens = self.dynamic_state_encoder(dynamic_state)
@@ -672,26 +755,20 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
                 static_joint_tokens[jointIndex].unsqueeze(0).expand(
                     batch_size, -1),
             ], dim=-1))
-            joint_token = joint_token * feedbackPacket.joint_valid[
-                :, jointIndex].to(dtype=dtype).unsqueeze(-1)
             joint_tokens.append(joint_token)
         joint_token_tensor = torch.stack(joint_tokens, dim=1)
+        joint_summary = joint_token_tensor.mean(dim=1)
 
         feedback_tokens = []
-        for slotIndex in range(self.slot_count):
-            chain_start = self.endpoint_joint_chain_offsets[slotIndex]
-            chain_end = self.endpoint_joint_chain_offsets[slotIndex + 1]
-            chain_index = torch.tensor(
-                self.endpoint_joint_chain_indices[chain_start:chain_end],
-                dtype=torch.long,
-                device=device)
-            chain_tokens = joint_token_tensor.index_select(1, chain_index)
-            chain_valid = feedbackPacket.joint_valid.index_select(
-                1, chain_index)
-            chain_weight = chain_valid.to(dtype=dtype).unsqueeze(-1)
-            feedback_token = (
-                chain_tokens * chain_weight).sum(dim=1) / chain_weight.sum(
-                    dim=1).clamp_min(1.0)
+        for slotIndex, adapter in enumerate(self.endpoint_feedback_adapters):
+            feedbackSlice = slice(
+                self.endpoint_feedback_offsets[slotIndex],
+                self.endpoint_feedback_offsets[slotIndex + 1])
+            endpointToken = adapter(
+                feedbackPacket.end_effector_features[:, feedbackSlice])
+            feedback_token = self.endpoint_feedback_fuser(torch.cat((
+                endpointToken,
+                joint_summary), dim=-1))
             feedback_token = feedback_token * available[:, slotIndex].to(
                 dtype=dtype).unsqueeze(-1)
             feedback_tokens.append(feedback_token)
@@ -708,8 +785,8 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
                 continue
             child_index = torch.tensor(children, dtype=torch.long, device=device)
             child_tokens = feedback_token_tensor.index_select(1, child_index)
-            child_valid = available.index_select(1, child_index)
-            child_weight = child_valid.to(dtype=dtype).unsqueeze(-1)
+            child_present = available.index_select(1, child_index)
+            child_weight = child_present.to(dtype=dtype).unsqueeze(-1)
             child_mean = (child_tokens * child_weight).sum(dim=1) / child_weight.sum(
                 dim=1).clamp_min(1.0)
             child_contexts.append(self.child_feedback_encoder(child_mean))
@@ -849,9 +926,6 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         self,
         target: PackedEndEffectorTarget,
     ) -> torch.Tensor:
-        if type(target) is not PackedEndEffectorTarget:
-            raise TypeError("world action encoding requires an end-effector target")
-        target.Validate(self.contract_view)
         if (
             target.values.device != self.static_slot_tokens.device
             or target.values.dtype != self.static_slot_tokens.dtype
@@ -880,12 +954,6 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         target: PackedEndEffectorTarget,
         feedbackPacket: BrainFeedbackPacket,
     ) -> PackedPerceptionRotationEfference:
-        if type(target) is not PackedEndEffectorTarget:
-            raise TypeError("perception efference requires an end-effector target")
-        target.Validate(self.contract_view)
-        if type(feedbackPacket) is not BrainFeedbackPacket:
-            raise TypeError("perception efference requires encoded feedback")
-        feedbackPacket.Validate(self.contract_view)
         batch_size = int(target.values.size(0))
         if (
             int(feedbackPacket.joint_features.size(0)) != batch_size
@@ -894,9 +962,9 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         ):
             raise ValueError("perception efference target and feedback must match")
         rotations = []
-        validity = []
+        presence = []
         for view_index, slot_index in enumerate(
-            self.contract_view.perception_view.indices
+            self.contract_view.perception_view_indices
         ):
             target_slice = self.contract_view.end_effector_target_layout.Slice(
                 slot_index)
@@ -943,26 +1011,26 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
                 quaternion)
             active = (
                 target.active[:, slot_index]
-                & feedbackPacket.endpoint_valid[:, slot_index])
+                & feedbackPacket.endpoint_present[:, slot_index])
             identity = torch.zeros_like(quaternion)
             identity[:, -1] = 1.0
             rotations.append(torch.where(
                 active.unsqueeze(-1), quaternion, identity))
-            validity.append(active)
+            presence.append(active)
 
         if rotations:
             rotation_delta = torch.stack(rotations, dim=1)
-            valid = torch.stack(validity, dim=1)
+            present = torch.stack(presence, dim=1)
         else:
             rotation_delta = target.values.new_zeros(batch_size, 0, 4)
-            valid = torch.zeros(
+            present = torch.zeros(
                 batch_size,
                 0,
                 dtype=torch.bool,
                 device=target.values.device)
         return PackedPerceptionRotationEfference(
             rotation_delta=rotation_delta,
-            valid=valid,
+            present=present,
             contract_id=target.contract_id)
 
     def Decode(
@@ -992,7 +1060,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             dynamic_tokens,
             child_context,
             global_feedback,
-            endpoint_validity,
+            endpoint_presence,
         ) = self.EncodeFeedbackState(
             decisionBackbone,
             feedbackPacket,
@@ -1101,8 +1169,6 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
                     held_slots[:, slotIndex],
                     as_tuple=False).flatten()
                 if held_rows.numel() > 0:
-                    if decisionContext.previous_target_values is None:
-                        raise RuntimeError("held targets require previous target values")
                     held_output = decisionContext.previous_target_values[
                         :, target_slice].index_select(0, held_rows)
                     slot_outputs[slotIndex] = slot_outputs[
@@ -1155,6 +1221,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
                     + 0.5
                     * (normalized + 1.0)
                     * (upper - lower).unsqueeze(0))
+                decoded = self.ProjectPrincipalRotation(slotIndex, decoded)
                 slot_outputs[slotIndex] = slot_outputs[slotIndex].index_copy(
                     0,
                     active_rows,
@@ -1171,11 +1238,10 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             model_signature=self.contract_view.model_signature,
             target_version=feedbackPacket.target_version + 1,
             timestamp=feedbackPacket.timestamp)
-        target.Validate(self.contract_view)
         world_action_feature = self.EncodeWorldAction(target)
         safety_scores = torch.stack([
             torch.sigmoid(safety_logits),
-            endpoint_validity,
+            endpoint_presence,
             (1.0 - decisionContext.risk).unsqueeze(-1).expand(
                 -1, self.slot_count),
             decisionContext.confidence.unsqueeze(-1).expand(
@@ -1296,9 +1362,7 @@ class DecisionDecouplerV2(AGICoreModule):
             raise TypeError("constraint loss requires PackedDecoupledDecision")
         if type(decisionContext) is not PackedDecisionContext:
             raise TypeError("constraint loss requires PackedDecisionContext")
-        feedbackPacket.Validate(self.ContractView)
         target = decision.target
-        target.Validate(self.ContractView)
         if target.contract_id != self.ContractView.contract_id:
             raise ValueError("constraint loss contract identity mismatch")
         batch_size = int(feedbackPacket.joint_features.size(0))
@@ -1446,7 +1510,7 @@ class DecisionDecouplerV2(AGICoreModule):
             / continuity_count.clamp_min(1.0))
 
         operational_target = (
-            feedbackPacket.endpoint_valid
+            feedbackPacket.endpoint_present
             & decision.hierarchy_enabled
             & decision.slot_legal)
         classification_mask = torch.ones_like(operational_target)
@@ -1458,7 +1522,7 @@ class DecisionDecouplerV2(AGICoreModule):
             classification_mask)
         safety_target = (
             (1.0 - decisionContext.risk).unsqueeze(-1)
-            * feedbackPacket.endpoint_valid.to(dtype=target.values.dtype))
+            * feedbackPacket.endpoint_present.to(dtype=target.values.dtype))
         safety_prediction_loss = MaskedMean(
             F.binary_cross_entropy_with_logits(
                 decision.safety_logits,

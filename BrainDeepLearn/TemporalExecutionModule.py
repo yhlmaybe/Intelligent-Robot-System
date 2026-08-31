@@ -192,10 +192,6 @@ class PackedTemporalExecutionGate:
         ageNormSteps: float = 100.0,
         stepDurationMs: float = 1.0,
     ) -> None:
-        if type(contractView) is not RobotEmbodimentContractView:
-            raise TypeError(
-                "packed temporal execution requires a contract view")
-        contractView.Validate()
         dispatch_threshold = float(dispatchRiskThreshold)
         failsafe_threshold = float(failsafeRiskThreshold)
         if not 0.0 <= dispatch_threshold <= 1.0:
@@ -302,14 +298,11 @@ class PackedTemporalExecutionGate:
         feedback: BrainFeedbackPacket,
         fieldName: str,
     ) -> None:
-        if type(target) is not PackedEndEffectorTarget:
-            raise TypeError(fieldName + " must be a PackedEndEffectorTarget")
-        target.Validate(self.contract_view)
-        if target.values.size(0) != feedback.values.size(0):
+        if target.values.size(0) != feedback.joint_features.size(0):
             raise ValueError(fieldName + " batch does not match feedback")
-        if target.values.device != feedback.values.device:
+        if target.values.device != feedback.joint_features.device:
             raise ValueError(fieldName + " device does not match feedback")
-        if target.values.dtype != feedback.values.dtype:
+        if target.values.dtype != feedback.joint_features.dtype:
             raise ValueError(fieldName + " dtype does not match feedback")
 
     def TargetAvailable(
@@ -318,7 +311,7 @@ class PackedTemporalExecutionGate:
         feedback: BrainFeedbackPacket,
     ) -> torch.Tensor:
         available = (
-            feedback.endpoint_valid
+            feedback.endpoint_present
             & feedback.child_enabled
         )
         return ((~target.active) | available).all(dim=-1)
@@ -329,7 +322,7 @@ class PackedTemporalExecutionGate:
         feedback: BrainFeedbackPacket,
     ) -> torch.Tensor:
         critical = (
-            ~feedback.endpoint_valid
+            ~feedback.endpoint_present
             | ~feedback.child_enabled
         )
         return (target.active & critical).any(dim=-1)
@@ -356,10 +349,6 @@ class PackedTemporalExecutionGate:
         events: PackedTemporalEvent,
         actionAgeSteps: torch.Tensor,
     ) -> PackedTemporalDecision:
-        if type(feedback) is not BrainFeedbackPacket:
-            raise TypeError(
-                "packed temporal execution accepts only BrainFeedbackPacket")
-        feedback.Validate(self.contract_view)
         self.ValidateTarget(candidateTarget, feedback, "candidate target")
         self.ValidateTarget(cachedTarget, feedback, "cached target")
         if type(proposal) is not PackedTemporalProposal:
@@ -367,14 +356,14 @@ class PackedTemporalExecutionGate:
                 "packed temporal execution requires a learned proposal")
         if type(events) is not PackedTemporalEvent:
             raise TypeError("packed temporal execution requires packed events")
-        batch_size = int(feedback.values.size(0))
-        proposal.Validate(batch_size, feedback.values.device)
-        events.Validate(batch_size, feedback.values.device)
+        batch_size = int(feedback.joint_features.size(0))
+        proposal.Validate(batch_size, feedback.joint_features.device)
+        events.Validate(batch_size, feedback.joint_features.device)
         action_age_steps = actionAgeSteps.reshape(-1)
         if (
             tuple(action_age_steps.shape) != (batch_size,)
             or not action_age_steps.is_floating_point()
-            or action_age_steps.device != feedback.values.device
+            or action_age_steps.device != feedback.joint_features.device
             or not bool(torch.isfinite(action_age_steps).all().item())
             or bool((action_age_steps < 0.0).any().item())
         ):

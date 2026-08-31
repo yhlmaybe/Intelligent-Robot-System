@@ -65,10 +65,7 @@ from ModuleMessagerManager import ModuleDim
 from RobotMorphologyModule import (
     BrainFeedbackPacket,
     PackedEndEffectorTarget,
-    RawJointFeedback,
-    RobotEmbodimentContract,
-    RobotEmbodimentRuntime,
-    RobotMorphologyModule)
+    Robot)
 
 
 TRAIN_CHECKPOINT_SCHEMA_VERSION = BRAIN_RUNTIME_SCHEMA_VERSION
@@ -371,21 +368,13 @@ class ManagerFunction:
         self,
         device: Optional[str] = None,
         *,
-        robotContract: Optional[RobotEmbodimentContract] = None,
+        robot: Optional[Robot] = None,
     ):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.robot_contract = (
-            robotContract
-            if robotContract is not None
-            else RobotMorphologyModule.CompileActive())
-        if type(self.robot_contract) is not RobotEmbodimentContract:
-            raise TypeError("robotContract must be a RobotEmbodimentContract")
-        self.robot_contract.view.Validate()
-        self.robot_runtime = RobotEmbodimentRuntime(self.robot_contract)
+        self.robot = robot if robot is not None else Robot.CreateDefault()
         self.brain_build_spec = BrainBuildSpec.Compile(
             ModuleDim.CognitiveProfile(),
-            self.robot_contract.view)
-        self.brain_build_spec.Validate()
+            self.robot.ContractView)
         self.controller = ModuleController()
 
         self.br_thread: Optional[threading.Thread] = None
@@ -418,113 +407,20 @@ class ManagerFunction:
         *,
         batchSize: Optional[int] = None,
     ) -> BrainFeedbackPacket:
-        rawFeedback = self.BuildRawJointFeedback(
+        return self.robot.EncodeFeedback(
             rawPayload,
+            self.device,
             batchSize=batchSize)
-        return self.robot_runtime.EncodeFeedback(rawFeedback)
 
-    def BuildRawJointFeedback(
-        self,
-        rawPayload: Any,
-        *,
-        batchSize: Optional[int] = None,
-    ) -> RawJointFeedback:
-        requiredFields = {
-            "position",
-            "velocity",
-            "contract_id",
-            "timestamp",
-            "sample_index",
-        }
-        if isinstance(rawPayload, (tuple, list)):
-            if len(rawPayload) < 1:
-                raise ValueError("joint feedback payload sequence cannot be empty")
-            if any(
-                type(payload) is not dict
-                or set(payload) != requiredFields
-                for payload in rawPayload
-            ):
-                raise ValueError("joint feedback payload fields do not match")
-            contractIds = {payload["contract_id"] for payload in rawPayload}
-            if len(contractIds) != 1:
-                raise ValueError("joint feedback batch must share one contract")
-            position = torch.stack([
-                torch.as_tensor(
-                    payload["position"],
-                    device=self.device,
-                    dtype=torch.float32).reshape(-1)
-                for payload in rawPayload])
-            velocity = torch.stack([
-                torch.as_tensor(
-                    payload["velocity"],
-                    device=self.device,
-                    dtype=torch.float32).reshape(-1)
-                for payload in rawPayload])
-            timestamp = torch.tensor(
-                [payload["timestamp"] for payload in rawPayload],
-                device=self.device,
-                dtype=torch.float32)
-            sampleIndex = torch.tensor(
-                [payload["sample_index"] for payload in rawPayload],
-                device=self.device,
-                dtype=torch.long)
-            contractId = next(iter(contractIds))
-        else:
-            if type(rawPayload) is not dict or set(rawPayload) != requiredFields:
-                raise ValueError("joint feedback payload fields do not match")
-            position = torch.as_tensor(
-                rawPayload["position"],
-                device=self.device,
-                dtype=torch.float32)
-            velocity = torch.as_tensor(
-                rawPayload["velocity"],
-                device=self.device,
-                dtype=torch.float32)
-            if position.dim() == 1:
-                position = position.unsqueeze(0)
-            if velocity.dim() == 1:
-                velocity = velocity.unsqueeze(0)
-            timestamp = torch.as_tensor(
-                rawPayload["timestamp"],
-                device=self.device,
-                dtype=torch.float32).reshape(-1)
-            sampleIndex = torch.as_tensor(
-                rawPayload["sample_index"],
-                device=self.device,
-                dtype=torch.long).reshape(-1)
-            contractId = rawPayload["contract_id"]
-        if type(contractId) is not str or not contractId:
-            raise ValueError("joint feedback contract_id must be non-empty")
-        actualBatch = int(position.size(0)) if position.dim() == 2 else 0
-        if batchSize is not None and actualBatch != batchSize:
-            raise ValueError("joint feedback batch does not match sensory batch")
-        rawFeedback = RawJointFeedback(
-            position=position,
-            velocity=velocity,
-            contract_id=contractId,
-            timestamp=timestamp,
-            sample_index=sampleIndex)
-        rawFeedback.Validate(self.robot_contract.view)
-        return rawFeedback
-
-    def BuildNeutralJointPayload(
+    def BuildNeutralRobotFeedbackPayload(
         self,
         *,
         timestamp: float,
-        sampleIndex: int,
     ) -> Dict[str, Any]:
-        feedback = self.robot_runtime.BuildNeutralFeedback(
-            timestamp=timestamp,
-            sampleIndex=sampleIndex,
-            device=self.device,
-            dtype=torch.float32)
-        return {
-            "position": feedback.position[0].detach().cpu().tolist(),
-            "velocity": feedback.velocity[0].detach().cpu().tolist(),
-            "contract_id": feedback.contract_id,
-            "timestamp": float(feedback.timestamp[0].item()),
-            "sample_index": int(feedback.sample_index[0].item()),
-        }
+        return dict(self.robot.BuildNeutralFeedbackPayload(
+            timestamp,
+            self.device,
+            torch.float32))
 
     def PrepareContractOfflineBatch(
         self,
@@ -554,10 +450,6 @@ class ManagerFunction:
         feedback_packet = self.EncodeBrainFeedback(
             tuple(sample.feedback_payload for sample in samples),
             batchSize=batch_size)
-        self.brain_build_spec.ValidateFeedbackPacket(
-            feedback_packet,
-            batchSize=batch_size,
-            device=self.device)
         target_payloads = tuple(
             sample.perception_targets for sample in samples)
         perception_targets = (
@@ -582,18 +474,13 @@ class ManagerFunction:
         if type(batch) is not ContractOfflineBatch:
             raise TypeError("batch must be a ContractOfflineBatch")
         batch_size = int(batch.frames.size(0))
-        batch.feedback_packet.Validate(self.robot_contract.view)
-        self.brain_build_spec.ValidateFeedbackPacket(
-            batch.feedback_packet,
-            batchSize=batch_size,
-            device=self.device)
         if batch.dones is None:
             return
         done_mask = batch.dones.to(dtype=torch.bool)
         if tuple(done_mask.shape) != (batch_size,):
             raise ValueError("offline done mask must match the sensory batch")
         if bool(done_mask.any().item()):
-            self.robot_runtime.ResetRuntimeState()
+            self.robot.Reset()
 
     def RunContractOfflineTransition(
         self,
@@ -629,11 +516,6 @@ class ManagerFunction:
         feedback = self.EncodeBrainFeedback(
             rawPayload,
             batchSize=batchSize)
-        feedback.Validate(self.robot_contract.view)
-        self.brain_build_spec.ValidateFeedbackPacket(
-            feedback,
-            batchSize=batchSize,
-            device=self.device)
         return self.agent_handle.EncodeEmbodimentFeedback(
             feedback,
             batchSize=batchSize)
@@ -711,14 +593,13 @@ class ManagerFunction:
         self,
         usePlanner: bool = True,
     ):
-        projection = self.robot_contract.view.perception_projection
+        projection = self.robot.ContractView.perception_projection
         if projection is None:
             raise RuntimeError("robot contract has no perception calibration")
         self.perception_calibration_id = projection.calibration_id
         self.agent_handle = AgentHandle(
             brainBuildSpec=self.brain_build_spec,
-            robotContract=self.robot_contract,
-            robotRuntime=self.robot_runtime,
+            robot=self.robot,
             usePlanner=usePlanner,
             device=self.device)
         self.active_sensor_stream_id = None
@@ -832,11 +713,6 @@ class ManagerFunction:
         feedback_packet = self.EncodeBrainFeedback(
             feedbackPayload,
             batchSize=batch_size)
-        feedback_packet.Validate(self.robot_contract.view)
-        self.brain_build_spec.ValidateFeedbackPacket(
-            feedback_packet,
-            batchSize=batch_size,
-            device=self.device)
         self.agent_handle.agent.BindWorldMemoryContext(
             requestProvenance["world_frame_id"],
             batchSize=batch_size)
@@ -852,7 +728,7 @@ class ManagerFunction:
             depthValid=converted["depth_valid"],
             feedbackPacket=feedback_packet)
         target = act_output.packed_target
-        targetPayload = self.robot_runtime.EncodeTargetPayload(target)
+        targetPayload = self.robot.DecodeTarget(target)
         result = json.dumps({
             "schema_version": 2,
             "request_provenance": dict(requestProvenance),
@@ -866,13 +742,13 @@ class ManagerFunction:
         ):
             raise TypeError(
                 "contract Agent output requires temporal dispatch selection")
-        self.robot_runtime.SetDispatchedTargets(
+        self.robot.CommitDispatchedTarget(
             target,
             packedTemporal.candidate_selected)
         if converted["dones"] is not None and bool(
             converted["dones"].gt(0.5).any().item()
         ):
-            self.robot_runtime.ResetRuntimeState()
+            self.robot.Reset()
         return result
 
     def AgentHandleForwardJson(
@@ -908,6 +784,8 @@ class ManagerFunction:
         if sensor_packet["rgb_encoding"] != "rgb8" or sensor_packet["depth_unit"] != "meter":
             raise ValueError("sensor packet must contain rgb8 and metre depth")
         sequence_index = sensor_packet["sequence_index"]
+        if type(feedback_payload) is not dict:
+            raise TypeError("external robot feedback must be an object")
         if self.active_sensor_stream_id is None:
             if sequence_index != 0:
                 raise ValueError("a sensor stream must begin at sequence_index 0")
@@ -1285,7 +1163,7 @@ class ManagerFunction:
         ):
             return False
         try:
-            projection = self.robot_contract.view.perception_projection
+            projection = self.robot.ContractView.perception_projection
             if projection is None:
                 return False
             manifest = json.loads(
@@ -1598,7 +1476,6 @@ class ManagerFunction:
         brainBuildSpec: BrainBuildSpec,) -> Tuple[str, str, str]:
         if type(brainBuildSpec) is not BrainBuildSpec:
             raise TypeError("deployment resolution requires BrainBuildSpec")
-        brainBuildSpec.Validate()
         contract_view = brainBuildSpec.contract_view
         manifest_path = cls.DeploymentManifestPath(modelPath)
         if not manifest_path.exists():
@@ -2930,13 +2807,13 @@ class ManagerFunction:
                     if isTest
                     else BasicParameters.MODULEPARAMETER_PATH))
             self.ResetControllerFlags()
-            projection = self.robot_contract.view.perception_projection
+            projection = self.robot.ContractView.perception_projection
             if projection is None:
                 raise RuntimeError("robot contract has no perception calibration")
             dataset = OfflineGameDataset(
                 calibrationId=projection.calibration_id,
                 sensorFrameName=projection.reference_frame_id,
-                contractView=self.robot_contract.view,
+                contractView=self.robot.ContractView,
                 isTest=isTest)
             brain = BrainCore(
                 brainBuildSpec=self.brain_build_spec,
@@ -3189,7 +3066,7 @@ class ManagerFunction:
                     for name, source in required.items()}
 
             def Evaluate(loader: SequentialTrajectoryLoader) -> float:
-                self.robot_runtime.ResetRuntimeState()
+                self.robot.Reset()
                 agent.ResetBrainState(batchSize=batchSize)
                 total = 0.0
                 count = 0
@@ -3373,7 +3250,7 @@ class ManagerFunction:
                             lambda: Evaluate(validation_loader),
                             lambda: Evaluate(test_loader)))
                 finally:
-                    self.robot_runtime.ResetRuntimeState()
+                    self.robot.Reset()
                 improved = (
                     best_validation - average_validation > min_delta)
                 if improved:
@@ -3623,7 +3500,7 @@ class ManagerFunction:
             batchSize=batchSize)
         brain.mem.ImportDurableState(checkpoint["memory_durable"])
         brain.ImportBuffers(checkpoint["buffers"])
-        self.robot_runtime.ResetRuntimeState()
+        self.robot.Reset()
         self.RestoreRngState(checkpoint["rng"])
 
     def BuildContractTestFeedback(
@@ -3632,28 +3509,19 @@ class ManagerFunction:
     ) -> BrainFeedbackPacket:
         if type(batchSize) is not int or batchSize < 1:
             raise ValueError("batchSize must be a positive integer")
-        self.robot_contract.view.Validate()
-        self.brain_build_spec.Validate()
-        self.robot_runtime.ResetRuntimeState()
+        self.robot.Reset()
         payloads = tuple(
-            self.BuildNeutralJointPayload(
-                timestamp=float(index + 1),
-                sampleIndex=index)
+            self.BuildNeutralRobotFeedbackPayload(
+                timestamp=float(index + 1))
             for index in range(batchSize))
         feedback = self.EncodeBrainFeedback(
             payloads,
             batchSize=batchSize)
-        self.brain_build_spec.ValidateFeedbackPacket(
-            feedback,
-            batchSize=batchSize,
-            device=self.device)
         return feedback
 
     def RunContractWorldSmoke(self) -> bool:
         rng_state = self.CaptureRngState()
         try:
-            self.robot_contract.view.Validate()
-            self.brain_build_spec.Validate()
             contract_view = self.brain_build_spec.contract_view
             cognitive_dim = 16
             feedback = self.BuildContractTestFeedback(batchSize=2)
@@ -3666,7 +3534,7 @@ class ManagerFunction:
                 2,
                 cognitive_dim,
                 device=self.device,
-                dtype=feedback.values.dtype,
+                dtype=feedback.joint_features.dtype,
                 requires_grad=True)
             prediction = adapter.PredictFeedback(prior_world_state)
             losses = adapter.ComputeFeedbackLoss(prediction, feedback)
@@ -3727,8 +3595,6 @@ class ManagerFunction:
         production_root = Path(BasicParameters.DATA_ROOT_PATH).resolve()
         if root == production_root:
             raise ValueError("training smoke cannot read the production data root")
-        self.robot_contract.view.Validate()
-        self.brain_build_spec.Validate()
         if not self.HasGameDataset(root):
             raise RuntimeError(
                 "contract test dataset is missing or does not match the active contract")
@@ -3829,7 +3695,7 @@ class ManagerFunction:
             ))
         for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
-        projection = self.robot_contract.view.perception_projection
+        projection = self.robot.ContractView.perception_projection
         if projection is None:
             raise RuntimeError("robot contract has no perception calibration")
         manifest = {
@@ -3869,9 +3735,8 @@ class ManagerFunction:
             np.save(
                 root / "depth_valid" / f"{frame_id}.npy",
                 depth_valid)
-            payload = self.BuildNeutralJointPayload(
-                timestamp=float(index + 1),
-                sampleIndex=index)
+            payload = self.BuildNeutralRobotFeedbackPayload(
+                timestamp=float(index + 1))
             (root / "feedback" / f"{frame_id}.json").write_text(
                 json.dumps(payload, allow_nan=False, sort_keys=True),
                 encoding="utf-8")
@@ -3993,7 +3858,7 @@ class ManagerFunction:
                         "recur",
                         "Training or Deploy is already running")
                     return False
-                self.robot_runtime.ResetRuntimeState()
+                self.robot.Reset()
                 rng_state = self.CaptureRngState()
                 with tempfile.TemporaryDirectory(
                     prefix="brain-contract-training-",
@@ -4092,7 +3957,7 @@ class ManagerFunction:
                         setattr(BasicParameters, name, value)
             finally:
                 try:
-                    self.robot_runtime.ResetRuntimeState()
+                    self.robot.Reset()
                 finally:
                     if rng_state is not None:
                         self.RestoreRngState(rng_state)
@@ -4700,10 +4565,10 @@ class TestManagerMTool:
             import tempfile as tempfile_module
 
             manager = ManagerFunction.__new__(ManagerFunction)
-            robot_contract = RobotMorphologyModule.CompileActive()
+            robot = Robot.CreateDefault()
             brain_build_spec = BrainBuildSpec.Compile(
                 ModuleDim.CognitiveProfile(),
-                robot_contract.view)
+                robot.ContractView)
             with tempfile_module.TemporaryDirectory() as directory:
                 root = Path(directory)
                 configured_model = root / "model.pth"
@@ -4871,18 +4736,11 @@ class TestManagerMTool:
             manager = ManagerFunction.__new__(ManagerFunction)
             manager.device = torch.device("cpu")
 
-            class FakeRuntime:
-                def ValidateRuntimeState(self, state, *, expectedBatch):
-                    if state != (None,) * 7 or expectedBatch != 1:
-                        raise ValueError("invalid runtime state")
-                    events.append("runtime_validate")
-
-                def RestoreRuntimeState(self, state):
-                    if state != (None,) * 7:
-                        raise ValueError("invalid runtime state")
+            class FakeRobot:
+                def Reset(self):
                     events.append("runtime")
 
-            manager.robot_runtime = FakeRuntime()
+            manager.robot = FakeRobot()
             checkpoint = {
                 "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                 "calibration_id": "test-calibration",
@@ -4947,7 +4805,7 @@ class TestManagerMTool:
                 missing_rejected = True
 
             extra = dict(checkpoint)
-            extra["obsolete_perception_pose"] = torch.zeros(7)
+            extra["unexpected_checkpoint_field"] = torch.zeros(())
             try:
                 manager.LoadCheckpoint(
                     FakeBrain(), FakeAgent(), dataset, serialized(extra),
@@ -5077,7 +4935,6 @@ class TestManagerMTool:
                     "world_validate",
                     "memory_validate",
                     "buffers_validate",
-                    "runtime_validate",
                     "brain_load:False",
                     "candidates",
                     "sync",
@@ -5270,12 +5127,6 @@ class TestManagerMTool:
 
     def TestTemporalEnvelopeProjection(self) -> bool:
         try:
-            captured: Dict[str, Any] = {}
-
-            class FakeBuildSpec:
-                def ValidateFeedbackPacket(self, packet, **kwargs):
-                    captured["validated"] = kwargs
-
             class FakeTemporal:
                 action_epoch = torch.tensor([3], dtype=torch.long)
                 kind_id = torch.tensor([5], dtype=torch.long)
@@ -5294,18 +5145,12 @@ class TestManagerMTool:
                         ocr=None,
                         intention_texts=[])
 
-            class FakeContract:
-                View = "contract"
-
             class FakeFeedback:
-                def Validate(self, contractView):
-                    captured["feedback_contract"] = contractView
+                pass
 
             handle = AgentHandle.__new__(AgentHandle)
             handle.device = torch.device("cpu")
-            handle.brain_build_spec = FakeBuildSpec()
             handle.agent = FakeAgent()
-            handle.robot_contract = FakeContract()
             output = handle.ForwardStep(
                 torch.zeros(1, 3, 2, 2),
                 depth=torch.zeros(1, 1, 2, 2),
@@ -5313,8 +5158,8 @@ class TestManagerMTool:
                 feedbackPacket=FakeFeedback())
             ok = (
                 output.packed_target == "target"
-                and captured["feedback_contract"] == "contract"
-                and captured["validated"]["batchSize"] == 1)
+                and output.packed_temporal is not None
+                and bool(output.packed_temporal.failsafe.item()))
             print(
                 f"Manager temporal envelope projection "
                 f"{'passed' if ok else 'failed'}")
@@ -5581,10 +5426,10 @@ class TestManagerMTool:
         try:
             manager = object.__new__(ManagerFunction)
             manager.device = torch.device("cpu")
-            manager.robot_contract = RobotMorphologyModule.CompileActive()
+            manager.robot = Robot.CreateDefault()
             manager.brain_build_spec = BrainBuildSpec.Compile(
                 ModuleDim.CognitiveProfile(),
-                manager.robot_contract.view)
+                manager.robot.ContractView)
             manager.perception_calibration_id = "test-calibration"
             manager.active_sensor_stream_id = None
             manager.active_world_frame_id = None
@@ -5597,11 +5442,10 @@ class TestManagerMTool:
                 return "ok"
 
             manager.ForwardContractBatch = CaptureForward
-            feedback_payload = {
-                "opaque": {
-                    "nested": ["runtime", "owned"],
-                },
-            }
+            feedback_payload = dict(
+                manager.robot.BuildNeutralFeedbackPayload(
+                    0.0,
+                    manager.device))
             sensor_packet = {
                 "schema_version": SENSOR_PACKET_WIRE_SCHEMA_VERSION,
                 "stream_id": "stream-1",
@@ -5870,7 +5714,6 @@ class ContractInferenceAgent(Agent):
     ) -> None:
         if type(brainBuildSpec) is not BrainBuildSpec:
             raise TypeError("contract inference Agent requires BrainBuildSpec")
-        brainBuildSpec.Validate()
         self.brain_build_spec = brainBuildSpec
         super().__init__(
             brain,
@@ -5911,10 +5754,6 @@ class ContractInferenceAgent(Agent):
             raise TypeError("sample_actions must be a boolean")
         if type(request.deterministic_actor) is not bool:
             raise TypeError("deterministic_actor must be a boolean")
-        self.brain_build_spec.ValidateFeedbackPacket(
-            request.feedback_packet,
-            batchSize=batch_size,
-            device=self.device)
         return batch_size
 
     def Act(
@@ -5942,9 +5781,6 @@ class ContractInferenceAgent(Agent):
         if type(packedTarget) is not PackedEndEffectorTarget:
             raise TypeError(
                 "contract brain must return PackedEndEffectorTarget")
-        if packedTarget.contract_id != request.feedback_packet.contract_id:
-            raise ValueError("contract brain target belongs to another contract")
-        packedTarget.Validate(self.brain_build_spec.contract_view)
         self.CommitPendingWorldAutosave()
         return ContractAgentActOutput(
             packed_target=packedTarget,
@@ -5960,8 +5796,7 @@ class AgentHandle:
         self,
         brainBuildSpec: Optional[BrainBuildSpec] = None,
         *,
-        robotContract: Optional[RobotEmbodimentContract] = None,
-        robotRuntime: Optional[RobotEmbodimentRuntime] = None,
+        robot: Optional[Robot] = None,
         brainParameterPath: str = BasicParameters.MODULEPARAMETER_PATH,
         device: Optional[Union[str, torch.device]] = None,
         seqLen: int = BasicParameters.IMAGE_SEQ_LEN,
@@ -5969,36 +5804,16 @@ class AgentHandle:
         prioritizeExtStr: bool = True,
         saveModuleMessagerOutput: bool = True,):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.robot_contract = (
-            robotContract
-            if robotContract is not None
-            else RobotMorphologyModule.CompileActive())
-        if type(self.robot_contract) is not RobotEmbodimentContract:
-            raise TypeError("robotContract must be a RobotEmbodimentContract")
-        self.robot_contract.view.Validate()
-        self.robot_runtime = (
-            robotRuntime
-            if robotRuntime is not None
-            else RobotEmbodimentRuntime(self.robot_contract))
-        if type(self.robot_runtime) is not RobotEmbodimentRuntime:
-            raise TypeError("robotRuntime must be a RobotEmbodimentRuntime")
+        self.robot = robot if robot is not None else Robot.CreateDefault()
         self.brain_build_spec = (
             brainBuildSpec
             if brainBuildSpec is not None
             else BrainBuildSpec.Compile(
                 ModuleDim.CognitiveProfile(),
-                self.robot_contract.view))
+                self.robot.ContractView))
         if type(self.brain_build_spec) is not BrainBuildSpec:
             raise TypeError("brainBuildSpec must be a BrainBuildSpec")
-        self.brain_build_spec.Validate()
-        contract_view = self.robot_contract.view
-        if (
-            self.robot_runtime.ContractView.contract_id
-            != contract_view.contract_id
-            or self.robot_runtime.ContractView.model_signature
-            != contract_view.model_signature
-        ):
-            raise ValueError("runtime does not match the selected contract")
+        contract_view = self.robot.ContractView
         if (
             self.brain_build_spec.contract_view.contract_id
             != contract_view.contract_id
@@ -6059,11 +5874,6 @@ class AgentHandle:
         depthValid: torch.Tensor,
         feedbackPacket: BrainFeedbackPacket,
     ) -> ContractAgentActOutput:
-        feedbackPacket.Validate(self.robot_contract.view)
-        self.brain_build_spec.ValidateFeedbackPacket(
-            feedbackPacket,
-            batchSize=int(frame.size(0)),
-            device=self.device)
         act_output = self.agent.Act(ContractAgentActInput(
             frame=frame,
             text_ext=textExt,
@@ -6083,11 +5893,6 @@ class AgentHandle:
         *,
         batchSize: Optional[int] = None,
     ) -> Dict[str, Any]:
-        feedbackPacket.Validate(self.robot_contract.view)
-        self.brain_build_spec.ValidateFeedbackPacket(
-            feedbackPacket,
-            batchSize=batchSize,
-            device=self.device)
         return self.agent.EncodeEmbodimentFeedback(
             feedbackPacket,
             batchSize=batchSize)

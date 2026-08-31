@@ -274,7 +274,6 @@ def ExportCognitiveBackboneState(brain: nn.Module) -> Dict[str, Any]:
     build_spec = getattr(brain, "brain_build_spec", None)
     if type(build_spec) is not BrainBuildSpec:
         raise TypeError("cognitive backbone source requires BrainBuildSpec")
-    build_spec.Validate()
     entries = []
     for name, value in sorted(CognitiveBackboneParameters(brain).items()):
         if not value.is_floating_point():
@@ -298,7 +297,6 @@ def LoadCognitiveBackboneState(
     build_spec = getattr(brain, "brain_build_spec", None)
     if type(build_spec) is not BrainBuildSpec:
         raise TypeError("cognitive backbone target requires BrainBuildSpec")
-    build_spec.Validate()
     if type(artifact) is not dict or set(artifact) != COGNITIVE_BACKBONE_ARTIFACT_FIELDS:
         raise ValueError("cognitive backbone artifact fields do not match")
     if (
@@ -478,14 +476,11 @@ class CognitiveComputeGate(nn.Module):
         evcThreshold: float = 0.0,
     ) -> None:
         super().__init__()
-        if type(contractView) is not RobotEmbodimentContractView:
-            raise TypeError("compute gate requires a contract view")
         if (
             len(COGNITIVE_COMPUTE_REASON_NAMES)
             != COGNITIVE_COMPUTE_REASON_COUNT
         ):
             raise RuntimeError("compute reason schema does not match Value")
-        contractView.Validate()
         positive_thresholds = {
             "maxCacheAge": maxCacheAge,
             "worldSurpriseThreshold": worldSurpriseThreshold,
@@ -530,13 +525,6 @@ class CognitiveComputeGate(nn.Module):
         previous = self.PreviousChildEnabled.clone()
         previous[doneMask] = False
         self.PreviousChildEnabled = previous
-
-    @staticmethod
-    def BatchSize(feedbackPacket: Any) -> int:
-        values = getattr(feedbackPacket, "values", None)
-        if torch.is_tensor(values) and values.dim() >= 1:
-            return int(values.size(0))
-        return 1
 
     @staticmethod
     def BooleanEvent(
@@ -652,21 +640,9 @@ class CognitiveComputeGate(nn.Module):
         safetyViolation: Optional[torch.Tensor] = None,
         criticalInfeasible: Optional[torch.Tensor] = None,
     ) -> CognitiveComputeDecision:
-        batch_size = self.BatchSize(feedbackPacket)
-        values = getattr(feedbackPacket, "values", None)
-        device = (
-            values.device
-            if torch.is_tensor(values)
-            else self.PreviousChildEnabled.device)
-        try:
-            if type(feedbackPacket) is not BrainFeedbackPacket:
-                raise TypeError("compute gate requires BrainFeedbackPacket")
-            feedbackPacket.Validate(self.ContractView)
-        except (TypeError, ValueError, RuntimeError):
-            self.Reset()
-            return self.BuildFailsafe(batch_size, device)
-
-        dtype = feedbackPacket.values.dtype
+        batch_size = int(feedbackPacket.joint_features.size(0))
+        device = feedbackPacket.joint_features.device
+        dtype = feedbackPacket.joint_features.dtype
         try:
             plan_valid = self.BooleanEvent(
                 planValid, "planValid", batch_size, device)
@@ -716,7 +692,7 @@ class CognitiveComputeGate(nn.Module):
         activated_child_mask = self.ChildActivation(child_enabled)
         feedback_failure = (
             feedbackPacket.target_active
-            & ~feedbackPacket.endpoint_valid).any(dim=-1)
+            & ~feedbackPacket.endpoint_present).any(dim=-1)
         failsafe = (
             safety_violation
             | critical_infeasible
@@ -800,7 +776,6 @@ class BrainCore(nn.Module):
         super().__init__()
         if type(brainBuildSpec) is not BrainBuildSpec:
             raise TypeError("brainBuildSpec must be BrainBuildSpec")
-        brainBuildSpec.Validate()
         if brainBuildSpec.cognitive != ModuleDim.CognitiveProfile():
             raise ValueError(
                 "BrainBuildSpec cognitive profile does not match the constructed architecture")
@@ -1125,25 +1100,31 @@ class BrainCore(nn.Module):
     def EncodeEmbodimentFeedback(
             self,
             feedbackPacket: BrainFeedbackPacket,
+            *,
+            batchSize: Optional[int] = None,
+            device: Optional[torch.device] = None,
         ) -> Dict[str, Any]:
             if (
                 self.robot_contract_view is None
                 or self.contract_physical_adapter is None
             ):
                 raise RuntimeError("brain instance is not bound to an embodiment contract")
-            self.ValidateFeedbackPacket(feedbackPacket)
+            self.ValidateFeedbackPacket(
+                feedbackPacket,
+                batchSize=batchSize,
+                device=device)
             world = self.ContractWorld()
             world_transition = world.EncodeContractEmbodiment(feedbackPacket)
             return {
                 "Physical": self.contract_physical_adapter(feedbackPacket),
                 "World": world_transition,
-                "WorldPhysical": self.EncodeWorldContractTransition(
+                "WorldPhysical": world.EncodeContractTransition(
                     feedbackPacket),
                 "Perception": {
                     "Rotation": feedbackPacket.perception_rotation,
                     "RotationDelta": feedbackPacket.perception_rotation_delta,
                     "AngularVelocity": feedbackPacket.perception_angular_velocity,
-                    "Valid": feedbackPacket.perception_valid,
+                    "MotionPresent": feedbackPacket.perception_motion_present,
                 },
             }
 
@@ -1530,7 +1511,7 @@ class BrainCore(nn.Module):
             self,
             feedbackPacket: BrainFeedbackPacket,
             rotationDelta: Optional[torch.Tensor] = None,
-            rotationValid: Optional[torch.Tensor] = None,
+            rotationPresent: Optional[torch.Tensor] = None,
         ) -> Tuple[torch.Tensor, torch.Tensor]:
             if self.robot_contract_view is None:
                 raise RuntimeError("contract rotation selection requires a contract view")
@@ -1538,80 +1519,80 @@ class BrainCore(nn.Module):
                 feedbackPacket.perception_rotation_delta
                 if rotationDelta is None
                 else rotationDelta)
-            valid = (
-                feedbackPacket.perception_valid
-                if rotationValid is None
-                else rotationValid)
-            batch_size = int(feedbackPacket.values.size(0))
+            present = (
+                feedbackPacket.perception_motion_present
+                if rotationPresent is None
+                else rotationPresent)
+            batch_size = int(feedbackPacket.joint_features.size(0))
             perception_count = len(
-                self.robot_contract_view.perception_view.indices)
+                self.robot_contract_view.perception_view_indices)
             if (
                 tuple(candidates.shape) != (batch_size, perception_count, 4)
-                or candidates.device != feedbackPacket.values.device
-                or candidates.dtype != feedbackPacket.values.dtype
+                or candidates.device != feedbackPacket.joint_features.device
+                or candidates.dtype != feedbackPacket.joint_features.dtype
                 or not bool(torch.isfinite(candidates).all().item())
             ):
                 raise ValueError("contract perception rotations are invalid")
             if (
-                tuple(valid.shape) != (batch_size, perception_count)
-                or valid.dtype != torch.bool
-                or valid.device != feedbackPacket.values.device
+                tuple(present.shape) != (batch_size, perception_count)
+                or present.dtype != torch.bool
+                or present.device != feedbackPacket.joint_features.device
             ):
-                raise ValueError("contract perception rotation validity is invalid")
-            identity = feedbackPacket.values.new_zeros(batch_size, 4)
+                raise ValueError("contract perception rotation presence is invalid")
+            identity = feedbackPacket.joint_features.new_zeros(batch_size, 4)
             identity[:, -1] = 1.0
             if perception_count == 0:
                 return identity, torch.zeros(
                     batch_size,
                     dtype=torch.bool,
-                    device=feedbackPacket.values.device)
+                    device=feedbackPacket.joint_features.device)
             selected_index = int(
                 self.robot_contract_view.primary_perception_view_index)
-            selectable = valid
+            selectable = present
             selected = candidates[:, selected_index]
-            selected_valid = selectable[:, selected_index]
+            selected_present = selectable[:, selected_index]
             selected = torch.where(
-                selected_valid.unsqueeze(-1),
+                selected_present.unsqueeze(-1),
                 NormalizeRotation(selected),
                 identity)
-            return selected, selected_valid
+            return selected, selected_present
 
     def SelectContractPerceptionMotion(
             self,
             feedbackPacket: BrainFeedbackPacket,
         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            selected_rotation, selected_valid = (
+            selected_rotation, selected_present = (
                 self.SelectContractPerceptionRotation(feedbackPacket))
             angular_velocity = feedbackPacket.perception_angular_velocity
-            batch_size = int(feedbackPacket.values.size(0))
+            batch_size = int(feedbackPacket.joint_features.size(0))
             perception_count = len(
-                self.robot_contract_view.perception_view.indices)
+                self.robot_contract_view.perception_view_indices)
             if perception_count == 0:
                 return (
                     selected_rotation,
-                    feedbackPacket.values.new_zeros(batch_size, 3),
-                    selected_valid)
+                    feedbackPacket.joint_features.new_zeros(batch_size, 3),
+                    selected_present)
             selected_index = int(
                 self.robot_contract_view.primary_perception_view_index)
-            selectable = feedbackPacket.perception_valid
+            selectable = feedbackPacket.perception_motion_present
             selected_velocity = angular_velocity[:, selected_index]
             selected_velocity = torch.where(
                 selectable[:, selected_index].unsqueeze(-1),
                 selected_velocity,
                 torch.zeros_like(selected_velocity))
-            return selected_rotation, selected_velocity, selected_valid
+            return selected_rotation, selected_velocity, selected_present
 
     def BuildContractObserverGauge(
             self,
             rotationDelta: torch.Tensor,
-            rotationValid: torch.Tensor,
+            rotationPresent: torch.Tensor,
         ) -> Tuple[torch.Tensor, torch.Tensor]:
             previous = NormalizeRotation(
                 self.ContractObserverRotationGauge)
             advanced = NormalizeRotation(
                 ComposeRotation(previous, rotationDelta))
             current = torch.where(
-                rotationValid.unsqueeze(-1),
+                rotationPresent.unsqueeze(-1),
                 advanced,
                 previous)
             return previous, current
@@ -1624,7 +1605,10 @@ class BrainCore(nn.Module):
             measured = self.contract_joint_motion_action_adapter(
                 physicalFeedback["ControlFeedbackFeature"])
             batch_size = int(measured.size(0))
-            measured_available = feedbackPacket.joint_valid.any(dim=-1)
+            measured_available = torch.ones(
+                batch_size,
+                device=measured.device,
+                dtype=torch.bool)
             target_matches = torch.zeros(
                 batch_size,
                 device=measured.device,
@@ -1635,7 +1619,7 @@ class BrainCore(nn.Module):
             else:
                 comparison_active = (
                     self.ContractCachedTarget.active
-                    & feedbackPacket.endpoint_valid)
+                    & feedbackPacket.endpoint_present)
                 commanded_valid = comparison_active.any(dim=-1)
                 target_matches = feedbackPacket.target_version.eq(
                     self.ContractCachedTarget.target_version)
@@ -2043,9 +2027,9 @@ class BrainCore(nn.Module):
         ) -> Any:
             if self.packed_temporal_gate is None:
                 raise RuntimeError("failsafe requires a temporal execution gate")
-            batch_size = int(feedbackPacket.values.size(0))
-            device = feedbackPacket.values.device
-            dtype = feedbackPacket.values.dtype
+            batch_size = int(feedbackPacket.joint_features.size(0))
+            device = feedbackPacket.joint_features.device
+            dtype = feedbackPacket.joint_features.dtype
             template = PackedEndEffectorTarget(
                 values=torch.zeros(
                     batch_size,
@@ -2313,9 +2297,9 @@ class BrainCore(nn.Module):
         ) -> CognitiveComputeDecision:
             if self.cognitive_compute_gate is None:
                 raise RuntimeError("contract inference requires a compute gate")
-            batch_size = int(feedbackPacket.values.size(0))
-            device = feedbackPacket.values.device
-            dtype = feedbackPacket.values.dtype
+            batch_size = int(feedbackPacket.joint_features.size(0))
+            device = feedbackPacket.joint_features.device
+            dtype = feedbackPacket.joint_features.dtype
             cache_present = (
                 self.ContractCachedTarget is not None
                 and self.ContractSlowCognitiveCache is not None
@@ -2378,7 +2362,7 @@ class BrainCore(nn.Module):
                 dtype=torch.bool)
             enabled_weight = (
                 feedbackPacket.child_enabled
-                & feedbackPacket.endpoint_valid).to(dtype=dtype)
+                & feedbackPacket.endpoint_present).to(dtype=dtype)
             progress_regression = (
                 self.ContractPreviousProgress
                 - feedbackPacket.progress).clamp_min(0.0)
@@ -2387,7 +2371,7 @@ class BrainCore(nn.Module):
             ).sum(dim=-1) / enabled_weight.sum(dim=-1).clamp_min(1.0))
             critical_invalid = (
                 feedbackPacket.target_active
-                & ~feedbackPacket.endpoint_valid).any(dim=-1)
+                & ~feedbackPacket.endpoint_present).any(dim=-1)
             reached = (
                 feedbackPacket.reached
                 & feedbackPacket.target_active).any(dim=-1)
@@ -2430,7 +2414,7 @@ class BrainCore(nn.Module):
             preserveReachedTargets: Optional[torch.Tensor] = None,
         ) -> PackedDecisionContext:
             constraint_tokens = actOut["decoder_constraint_tokens"]
-            slot_legal = feedbackPacket.endpoint_valid
+            slot_legal = feedbackPacket.endpoint_present
             previous_target_active = None
             if preserveReachedTargets is not None and (
                 not torch.is_tensor(preserveReachedTargets)
@@ -2854,7 +2838,7 @@ class BrainCore(nn.Module):
                     self.SelectContractPerceptionRotation(
                         candidate_packet,
                         rotationDelta=efference.rotation_delta,
-                        rotationValid=efference.valid))
+                        rotationPresent=efference.present))
                 expanded_physical_state = {
                     name: ExpandCandidates(value)
                     for name, value in physicalState.items()
@@ -2885,7 +2869,7 @@ class BrainCore(nn.Module):
                         base_utility,
                         predicted_feedback,
                         decoded.target.active,
-                        candidate_packet.endpoint_valid
+                        candidate_packet.endpoint_present
                         & candidate_packet.child_enabled))
                 return candidate_score, candidate_valid
 
@@ -4903,7 +4887,7 @@ class BrainCore(nn.Module):
                     timeRequirement=task_requirements[:, 1],
                     terminationRequirement=task_requirements[:, 2],
                     activePerceptionRequirement=task_requirements[:, 3],
-                    endpointAvailable=feedback_packet.endpoint_valid.index_select(
+                    endpointAvailable=feedback_packet.endpoint_present.index_select(
                         0, slow_row_index),
                     hierarchyEnabled=feedback_packet.child_enabled.index_select(
                         0, slow_row_index))
@@ -4980,7 +4964,7 @@ class BrainCore(nn.Module):
                     observed_pst)
             goals["endpoint_active"] = (
                 self.goal_manager.ResolveEndpointActivity(
-                    endpointAvailable=feedback_packet.endpoint_valid,
+                    endpointAvailable=feedback_packet.endpoint_present,
                     hierarchyEnabled=feedback_packet.child_enabled,
                     batchSize=batch_size,
                     device=device))
@@ -5092,7 +5076,7 @@ class BrainCore(nn.Module):
             cache_executing = cache_active & target_matches
             progress_weight = (
                 feedback_packet.target_active
-                & feedback_packet.endpoint_valid).to(dtype=dtype)
+                & feedback_packet.endpoint_present).to(dtype=dtype)
             planner_progress = (
                 feedback_packet.progress * progress_weight
             ).sum(dim=-1) / progress_weight.sum(dim=-1).clamp_min(1.0)
@@ -5103,7 +5087,7 @@ class BrainCore(nn.Module):
                     | ~feedback_packet.target_active).all(dim=-1))
             planner_failed = (
                 feedback_packet.target_active
-                & ~feedback_packet.endpoint_valid).any(dim=-1)
+                & ~feedback_packet.endpoint_present).any(dim=-1)
             planner_tracking_error = (
                 (1.0 - feedback_packet.progress) * progress_weight
             ).sum(dim=-1) / progress_weight.sum(dim=-1).clamp_min(1.0)
@@ -5820,7 +5804,7 @@ class BrainCore(nn.Module):
                 self.SelectContractPerceptionRotation(
                     feedback_packet,
                     rotationDelta=selected_efference.rotation_delta,
-                    rotationValid=selected_efference.valid))
+                    rotationPresent=selected_efference.present))
             cached_world_action = self.packed_decision_decoupler.EncodeWorldAction(
                 cached_target)
             prospective_action = torch.where(
@@ -6125,7 +6109,7 @@ class BrainCore(nn.Module):
                     device=device,
                     dtype=dtype).unsqueeze(0)
                 valid_progress = (
-                    feedback_packet.endpoint_valid
+                    feedback_packet.endpoint_present
                     & feedback_packet.target_active
                     & feedback_packet.child_enabled).to(dtype=dtype)
                 coarse_weight = valid_progress * root_mask
@@ -6138,7 +6122,7 @@ class BrainCore(nn.Module):
                 ).sum(dim=-1) / detail_weight.sum(dim=-1).clamp_min(1.0)
                 enabled_weight = (
                     feedback_packet.child_enabled
-                    & feedback_packet.endpoint_valid).to(dtype=dtype)
+                    & feedback_packet.endpoint_present).to(dtype=dtype)
                 coarse_supervision = coarse_weight.sum(dim=-1).gt(0.0).to(
                     dtype=dtype) * loss_sample_mask.to(dtype=dtype)
                 detail_supervision = detail_weight.sum(dim=-1).gt(0.0).to(
@@ -6553,7 +6537,7 @@ class BrainCore(nn.Module):
                     device=device,
                     dtype=dtype).unsqueeze(0)
                 hierarchy_valid = (
-                    feedback_packet.endpoint_valid
+                    feedback_packet.endpoint_present
                     & feedback_packet.target_active
                     & feedback_packet.child_enabled).to(dtype=dtype)
                 hierarchy_coarse_weight = hierarchy_valid * hierarchy_root
@@ -9058,11 +9042,10 @@ class Agent:
         *,
         batchSize: Optional[int] = None,
     ) -> Dict[str, Any]:
-        self.brain.ValidateFeedbackPacket(
+        return self.brain.EncodeEmbodimentFeedback(
             feedbackPacket,
             batchSize=batchSize,
             device=self.device)
-        return self.brain.EncodeEmbodimentFeedback(feedbackPacket)
 
     def ExportModuleMessagerData(
         self,
