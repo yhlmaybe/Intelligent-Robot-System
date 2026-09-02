@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Callable, Tuple, List, Dict, Any, Optional, Sequence, Union
+from typing import Callable, Tuple, List, Dict, Any, Optional, Sequence, Union, Protocol
 from pathlib import Path
 from dataclasses import dataclass
 import threading
@@ -7,6 +7,8 @@ import random
 import time
 import json
 import math
+import copy
+import pickle
 
 import numpy as np
 import torch
@@ -21,9 +23,12 @@ from torch.utils.data import Dataset, DataLoader
 from PerceptionModule import TestPerceptionMTool
 from AttentionModule import  TestAttentionMTool
 from MemoryModule import  TestMemoryMTool
-from DecisionModule import TestDecisionMTool
+from DecisionModule import DecisionExtractor, TestDecisionMTool
 from WorldModule import ContractWorldEmbodimentAdapter
-from ValueEstimationModule import  TestValueEstimationMTool
+from ValueEstimationModule import (
+    SensorimotorPotentialShaper,
+    SmdpReturnEstimator,
+    TestValueEstimationMTool)
 from ConsciousnessModule import TestConsciousMTool
 from IntentionModule import TestIntentionMTool
 from OCRModule import TestOCRMTool, OCREngineExtractor, IouXyxy
@@ -50,12 +55,18 @@ from AGICore import (
 from Config import BasicParameters
 from CoreTypes import (
     BrainBuildSpec,
+    COGNITIVE_READOUT_SCHEMA_VERSION,
+    CognitiveReadout,
     ContractAgentActInput,
     ContractAgentActOutput,
     ContractBrainStepInput,
     ContractOfflineBatch,
     ContractOfflineSample,
+    DECISION_WIRE_SCHEMA_VERSION,
     DECISION_REQUEST_PROVENANCE_FIELDS,
+    POLICY_PATH_DETAIL,
+    POLICY_PATH_FAST,
+    POLICY_PATH_FULL,
     SENSOR_PACKET_WIRE_FIELDS,
     SENSOR_PACKET_WIRE_SCHEMA_VERSION,
     TEXT_TRUST_OCR_OBSERVED,
@@ -63,14 +74,16 @@ from CoreTypes import (
     TEXT_TRUST_UNSAFE_EXTERNAL)
 from ModuleMessagerManager import ModuleDim
 from RobotMorphologyModule import (
+    ActionExecutionResult,
+    ActionRequest,
     BrainFeedbackPacket,
     PackedEndEffectorTarget,
-    Robot)
+    Robot,
+    SlotExecutionStatus)
 
 
 TRAIN_CHECKPOINT_SCHEMA_VERSION = BRAIN_RUNTIME_SCHEMA_VERSION
 OCR_CHECKPOINT_SCHEMA_VERSION = 16
-OCR_COMPATIBLE_CHECKPOINT_SCHEMA_VERSIONS = frozenset({15, 16})
 
 CONTRACT_TRAINING_TEST_CONFIG_FIELDS = (
     "DATA_ROOT_PATH_TEST",
@@ -202,6 +215,1400 @@ class TrainingResumeState:
     train_dataset: Dataset
     validation_dataset: Dataset
     test_dataset: Dataset
+
+
+@dataclass(frozen=True)
+class EmbodiedEnvironmentTransition:
+    observation: Any
+    execution_result: ActionExecutionResult
+    reward: torch.Tensor
+    terminated: torch.Tensor
+    truncated: torch.Tensor
+
+
+class EmbodiedEnvironmentProtocol(Protocol):
+    def Reset(self) -> Any:
+        ...
+
+    def MaterializeObservation(
+        self,
+        observation: Any,
+        robot: Robot,
+    ) -> Any:
+        ...
+
+    def Step(
+        self,
+        actionRequest: ActionRequest,
+    ) -> EmbodiedEnvironmentTransition:
+        ...
+
+
+@dataclass(frozen=True)
+class AutonomousDecisionSnapshot:
+    conditioning: Dict[str, torch.Tensor]
+    policy: Dict[str, Any]
+    value_conditioning: Dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class AutonomousPolicyOutput:
+    action_request: ActionRequest
+    value_baseline: torch.Tensor
+    behavior_log_probability: torch.Tensor
+    actor_credit_mask: torch.Tensor
+    candidate_selected: torch.Tensor
+    cache_selected: torch.Tensor
+    neutral_selected: torch.Tensor
+    controller_override: torch.Tensor
+    sensorimotor_inconsistency: torch.Tensor
+    sensorimotor_valid: torch.Tensor
+    policy_snapshot: AutonomousDecisionSnapshot
+
+
+class AutonomousPolicyProtocol(Protocol):
+    def Reset(self, observation: Any) -> None:
+        ...
+
+    def PlannerEnabled(self) -> bool:
+        ...
+
+    def SetPlannerEnabled(self, enabled: bool) -> None:
+        ...
+
+    def Step(self, observation: Any) -> AutonomousPolicyOutput:
+        ...
+
+    def Value(self, observation: Any) -> torch.Tensor:
+        ...
+
+    def ValueAndReadout(
+        self,
+        observation: Any,
+    ) -> Tuple[torch.Tensor, CognitiveReadout]:
+        ...
+
+    def ReevaluateValue(
+        self,
+        valueConditioning: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        ...
+
+    def AfterOptimizerStep(self) -> None:
+        ...
+
+
+class AutonomousBrainPolicy:
+    def __init__(
+        self,
+        agent: Agent,
+    ) -> None:
+        if not isinstance(agent, Agent) or not agent.is_train:
+            raise TypeError("autonomous policy requires a training Agent")
+        actor = agent.brain.RuntimeModule(agent.brain.actor)
+        critic = agent.brain.RuntimeModule(agent.brain.critic)
+        if not isinstance(actor, DecisionExtractor):
+            raise TypeError("autonomous policy requires DecisionExtractor")
+        if not callable(getattr(critic, "RecomputeReturnValue", None)):
+            raise TypeError("autonomous policy critic cannot recompute value")
+        self.agent = agent
+        self.actor = actor
+        self.critic = critic
+        self.pending_reset = True
+
+    def Reset(self, observation: Any) -> None:
+        if type(observation) is not ContractAgentActInput:
+            raise TypeError(
+                "autonomous brain observation must be ContractAgentActInput")
+        self.agent.ResetBrainState(int(observation.frame.size(0)))
+        self.pending_reset = False
+
+    def PlannerEnabled(self) -> bool:
+        return bool(self.agent.brain.use_planner)
+
+    def SetPlannerEnabled(self, enabled: bool) -> None:
+        self.agent.brain.use_planner = bool(enabled)
+
+    def CaptureTrainingModes(self) -> Dict[nn.Module, bool]:
+        return {
+            module: bool(module.training)
+            for module in self.agent.brain.modules()}
+
+    def RestoreTrainingModes(
+        self,
+        modes: Dict[nn.Module, bool],
+    ) -> None:
+        for module, training in modes.items():
+            module.training = training
+
+    def BuildOutput(self, output: Any) -> AutonomousPolicyOutput:
+        if type(output.decision) is not dict:
+            raise TypeError("autonomous brain decision must be a dictionary")
+        decision = output.decision
+        required = {
+            "actor_credit_mask",
+            "behavior_log_probability",
+            "evaluated_policy_path",
+            "packed_temporal",
+            "policy_conditioning",
+            "policy_path",
+            "policy_snapshot",
+            "value_baseline",
+            "value_conditioning",
+        }
+        if not required.issubset(decision):
+            raise ValueError("autonomous brain decision fields do not match")
+        request = output.action_request
+        if type(request) is not ActionRequest:
+            raise TypeError("autonomous brain output requires ActionRequest")
+        policy_path = decision["policy_path"]
+        if not torch.equal(request.policy_path, policy_path):
+            raise ValueError("autonomous request policy path does not match")
+        raw_snapshot = decision["policy_snapshot"]
+        conditioning = decision["policy_conditioning"]
+        value_conditioning = decision["value_conditioning"]
+        if type(raw_snapshot) is not dict:
+            raise TypeError("autonomous policy snapshot must be a dictionary")
+        if type(conditioning) is not dict or type(value_conditioning) is not dict:
+            raise TypeError("autonomous conditioning must be dictionaries")
+        if (
+            not torch.equal(
+                raw_snapshot["policyPath"],
+                decision["evaluated_policy_path"])
+            or not torch.equal(raw_snapshot["uRaw"], conditioning["uRaw"])
+            or not torch.equal(
+                raw_snapshot["optionIndex"],
+                conditioning["optionIndex"])
+        ):
+            raise ValueError("autonomous snapshot does not match behavior policy")
+        temporal = decision["packed_temporal"]
+        candidate = temporal.candidate_selected | request.help_requested
+        cache = temporal.cache_selected & ~request.help_requested
+        neutral = ~(candidate | cache)
+        readout = output.cognitive_readout
+        if not isinstance(readout, CognitiveReadout):
+            raise TypeError("autonomous brain output requires CognitiveReadout")
+        return AutonomousPolicyOutput(
+            action_request=request,
+            value_baseline=decision["value_baseline"],
+            behavior_log_probability=decision["behavior_log_probability"],
+            actor_credit_mask=decision["actor_credit_mask"],
+            candidate_selected=candidate,
+            cache_selected=cache,
+            neutral_selected=neutral,
+            controller_override=(
+                temporal.override_applied & ~request.help_requested),
+            sensorimotor_inconsistency=(
+                readout.sensorimotor_evidence[:, 0]),
+            sensorimotor_valid=readout.sensorimotor_valid,
+            policy_snapshot=AutonomousDecisionSnapshot(
+                conditioning=conditioning,
+                policy=raw_snapshot,
+                value_conditioning=value_conditioning))
+
+    def Step(self, observation: Any) -> AutonomousPolicyOutput:
+        if type(observation) is not ContractAgentActInput:
+            raise TypeError(
+                "autonomous brain observation must be ContractAgentActInput")
+        if not observation.sample_actions or observation.deterministic_actor:
+            raise ValueError("autonomous rollout requires sampled actor actions")
+        if self.pending_reset:
+            raise RuntimeError("autonomous policy must be reset before rollout")
+        modes = self.CaptureTrainingModes()
+        try:
+            output = self.agent.RunStep(
+                observation,
+                enableGrad=False,
+                modelTraining=False)
+        finally:
+            self.RestoreTrainingModes(modes)
+        return self.BuildOutput(output)
+
+    def Value(self, observation: Any) -> torch.Tensor:
+        modes = self.CaptureTrainingModes()
+        try:
+            return self.agent.EvaluateValue(observation)
+        finally:
+            self.RestoreTrainingModes(modes)
+
+    def ValueAndReadout(
+        self,
+        observation: Any,
+    ) -> Tuple[torch.Tensor, CognitiveReadout]:
+        modes = self.CaptureTrainingModes()
+        try:
+            return self.agent.EvaluateValueAndReadout(observation)
+        finally:
+            self.RestoreTrainingModes(modes)
+
+    def ReevaluateValue(
+        self,
+        valueConditioning: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        return self.critic.RecomputeReturnValue(valueConditioning)
+
+    def AfterOptimizerStep(self) -> None:
+        self.agent.AfterOptimizerStep()
+
+
+@dataclass(frozen=True)
+class AutonomousPpoConfig:
+    full_policy_path: int = POLICY_PATH_FULL
+    fast_policy_path: int = POLICY_PATH_FAST
+    detail_policy_path: int = POLICY_PATH_DETAIL
+    rollout_steps: int = 128
+    ppo_epochs: int = 4
+    minibatch_size: int = 32
+    discount: float = 0.99
+    trace_decay: float = 0.95
+    clip_ratio: float = 0.2
+    value_clip: float = 0.2
+    value_coefficient: float = 0.5
+    entropy_coefficient: float = 0.01
+    max_log_ratio: float = 20.0
+    potential_scale: float = 0.0
+    applied_action_cost: float = 0.0
+    help_request_cost: float = 0.0
+    open_loop_cost: float = 0.0
+    gradient_norm: float = 1.0
+
+
+@dataclass
+class AutonomousRolloutRecord:
+    environment_index: int
+    policy_path: int
+    snapshot: AutonomousDecisionSnapshot
+    old_log_probability: torch.Tensor
+    value: torch.Tensor
+    reward: torch.Tensor
+    duration: int
+    terminated: bool
+    truncated: bool
+    next_value: torch.Tensor
+    trace_continues: bool
+    help_requested: bool
+    help_accepted: bool
+    help_pending: bool
+    applied_target_values: torch.Tensor
+    applied_target_active: torch.Tensor
+    applied_action_epoch: int
+    advantage: torch.Tensor
+    return_target: torch.Tensor
+    predecessor: Optional["AutonomousRolloutRecord"] = None
+
+
+class AutonomousInteractionTrainer:
+    @classmethod
+    def FromAgent(
+        cls,
+        environment: EmbodiedEnvironmentProtocol,
+        agent: Agent,
+        robot: Robot,
+        config: Optional[AutonomousPpoConfig] = None,
+    ) -> "AutonomousInteractionTrainer":
+        policy = AutonomousBrainPolicy(agent)
+        return cls(
+            environment=environment,
+            policy=policy,
+            actor=policy.actor,
+            robot=robot,
+            actorOptimizer=agent.opt_actor,
+            criticOptimizer=agent.opt_critic,
+            config=(
+                AutonomousPpoConfig()
+                if config is None
+                else config))
+
+    def __init__(
+        self,
+        environment: EmbodiedEnvironmentProtocol,
+        policy: AutonomousPolicyProtocol,
+        actor: DecisionExtractor,
+        robot: Robot,
+        actorOptimizer: torch.optim.Optimizer,
+        criticOptimizer: torch.optim.Optimizer,
+        config: AutonomousPpoConfig,
+    ) -> None:
+        self.environment = environment
+        self.policy = policy
+        self.actor = actor
+        self.robot = robot
+        self.actor_optimizer = actorOptimizer
+        self.critic_optimizer = criticOptimizer
+        self.config = config
+        self.ValidateConfiguration()
+        self.potential_shaper = SensorimotorPotentialShaper(
+            discount=self.config.discount,
+            scale=self.config.potential_scale)
+
+    def ValidateConfiguration(self) -> None:
+        path_ids = (
+            self.config.full_policy_path,
+            self.config.fast_policy_path,
+            self.config.detail_policy_path)
+        if any(type(value) is not int or value < 0 for value in path_ids):
+            raise ValueError("autonomous policy path ids must be non-negative integers")
+        if len(set(path_ids)) != 3:
+            raise ValueError("autonomous policy path ids must be distinct")
+        if (
+            self.config.rollout_steps < 1
+            or self.config.ppo_epochs < 1
+            or self.config.minibatch_size < 1
+            or not 0.0 < self.config.discount <= 1.0
+            or not 0.0 <= self.config.trace_decay <= 1.0
+            or not 0.0 < self.config.clip_ratio < 1.0
+            or not 0.0 < self.config.value_clip < 1.0
+            or self.config.value_coefficient < 0.0
+            or self.config.entropy_coefficient < 0.0
+            or not math.isfinite(self.config.max_log_ratio)
+            or self.config.max_log_ratio <= 0.0
+            or self.config.gradient_norm <= 0.0
+            or any(
+                not math.isfinite(value) or value < 0.0
+                for value in (
+                    self.config.potential_scale,
+                    self.config.applied_action_cost,
+                    self.config.help_request_cost,
+                    self.config.open_loop_cost))
+        ):
+            raise ValueError("autonomous PPO configuration is invalid")
+
+    def ValidateMask(
+        self,
+        value: torch.Tensor,
+        batchSize: int,
+        device: torch.device,
+        name: str,
+    ) -> None:
+        if (
+            not torch.is_tensor(value)
+            or tuple(value.shape) != (batchSize,)
+            or value.dtype != torch.bool
+            or value.device != device
+        ):
+            raise ValueError(f"autonomous {name} must match the policy batch")
+
+    def ValidatePolicyOutput(
+        self,
+        output: AutonomousPolicyOutput,
+    ) -> int:
+        if type(output) is not AutonomousPolicyOutput:
+            raise TypeError("autonomous policy must return AutonomousPolicyOutput")
+        request = output.action_request
+        if type(request) is not ActionRequest:
+            raise TypeError("autonomous policy output requires ActionRequest")
+        request.Validate(self.robot.ContractView)
+        batch_size = int(request.target.values.size(0))
+        device = request.target.values.device
+        if (
+            not torch.is_tensor(output.value_baseline)
+            or tuple(output.value_baseline.shape) != (batch_size,)
+            or output.value_baseline.device != device
+            or not output.value_baseline.is_floating_point()
+            or not bool(torch.isfinite(output.value_baseline).all().item())
+        ):
+            raise ValueError("autonomous value baseline must match the policy batch")
+        if (
+            not torch.is_tensor(output.behavior_log_probability)
+            or tuple(output.behavior_log_probability.shape) != (batch_size,)
+            or output.behavior_log_probability.device != device
+            or not output.behavior_log_probability.is_floating_point()
+            or not bool(torch.isfinite(
+                output.behavior_log_probability).all().item())
+        ):
+            raise ValueError("autonomous behavior log probability is invalid")
+        if (
+            not torch.is_tensor(output.sensorimotor_inconsistency)
+            or tuple(output.sensorimotor_inconsistency.shape) != (batch_size,)
+            or output.sensorimotor_inconsistency.device != device
+            or not output.sensorimotor_inconsistency.is_floating_point()
+            or not bool(torch.isfinite(
+                output.sensorimotor_inconsistency).all().item())
+        ):
+            raise ValueError("autonomous sensorimotor inconsistency is invalid")
+        masks = {
+            "actor credit": output.actor_credit_mask,
+            "candidate selection": output.candidate_selected,
+            "cache selection": output.cache_selected,
+            "neutral selection": output.neutral_selected,
+            "controller override": output.controller_override,
+            "sensorimotor validity": output.sensorimotor_valid}
+        for name, value in masks.items():
+            self.ValidateMask(value, batch_size, device, name)
+        selection_count = (
+            output.candidate_selected.to(dtype=torch.int8)
+            + output.cache_selected.to(dtype=torch.int8)
+            + output.neutral_selected.to(dtype=torch.int8))
+        if bool(selection_count.ne(1).any().item()):
+            raise ValueError("autonomous temporal selections must be exclusive and complete")
+        if bool((output.actor_credit_mask & ~output.candidate_selected).any().item()):
+            raise ValueError("an autonomous actor request must be a new candidate")
+        if bool(request.planner_override.any().item()):
+            raise RuntimeError("CEM must be disabled during autonomous rollout")
+        valid_paths = torch.zeros_like(request.policy_path, dtype=torch.bool)
+        for path_id in (
+            self.config.full_policy_path,
+            self.config.fast_policy_path,
+            self.config.detail_policy_path,
+        ):
+            valid_paths |= request.policy_path.eq(path_id)
+        if bool((output.actor_credit_mask & ~valid_paths).any().item()):
+            raise ValueError("autonomous actor request has an unknown policy path")
+        snapshot = output.policy_snapshot
+        if type(snapshot) is not AutonomousDecisionSnapshot:
+            raise TypeError("autonomous output requires a decision snapshot")
+        if set(snapshot.conditioning) != {
+            "uRaw",
+            "mu",
+            "logvar",
+            "optionLogits",
+            "optionIndex",
+        }:
+            raise ValueError("autonomous policy conditioning fields do not match")
+        if set(snapshot.value_conditioning) != {
+            "valueHidden",
+            "valueBaseline",
+        }:
+            raise ValueError("autonomous value conditioning fields do not match")
+        batched_values = tuple(snapshot.conditioning.values()) + tuple(
+            snapshot.value_conditioning.values())
+        if any(
+            not torch.is_tensor(value)
+            or value.dim() < 1
+            or int(value.size(0)) != batch_size
+            or value.device != device
+            for value in batched_values
+        ):
+            raise ValueError("autonomous decision snapshot must match the policy batch")
+        conditioned = self.actor.RecomputeActionLogProbability(
+            snapshot.conditioning)["combinedActionLogProbability"]
+        replayed = self.actor.RecomputePolicySnapshot(snapshot.policy)
+        snapshot_path_matches = snapshot.policy["policyPath"].eq(
+            request.policy_path)
+        if (
+            bool((output.actor_credit_mask & ~snapshot_path_matches).any().item())
+            or bool((output.actor_credit_mask & ~replayed["valid"]).any().item())
+        ):
+            raise ValueError("autonomous policy snapshot path does not match")
+        if not torch.allclose(
+            output.behavior_log_probability,
+            conditioned,
+            atol=1e-6,
+            rtol=1e-6,
+        ) or not torch.allclose(
+            output.behavior_log_probability[output.actor_credit_mask],
+            replayed["combinedActionLogProbability"][
+                output.actor_credit_mask],
+            atol=1e-6,
+            rtol=1e-6,
+        ):
+            raise ValueError("autonomous behavior probability does not match conditioning")
+        return batch_size
+
+    def ValidateEnvironmentTransition(
+        self,
+        transition: EmbodiedEnvironmentTransition,
+        request: ActionRequest,
+        batchSize: int,
+    ) -> None:
+        if type(transition) is not EmbodiedEnvironmentTransition:
+            raise TypeError("environment must return EmbodiedEnvironmentTransition")
+        result = transition.execution_result
+        if type(result) is not ActionExecutionResult:
+            raise TypeError("environment transition requires ActionExecutionResult")
+        result.Validate(request, self.robot.ContractView)
+        device = request.target.values.device
+        if (
+            not torch.is_tensor(transition.reward)
+            or tuple(transition.reward.shape) != (batchSize,)
+            or transition.reward.device != device
+            or not transition.reward.is_floating_point()
+            or not bool(torch.isfinite(transition.reward).all().item())
+        ):
+            raise ValueError("environment reward must be a finite policy-batch vector")
+        self.ValidateMask(
+            transition.terminated,
+            batchSize,
+            device,
+            "terminated")
+        self.ValidateMask(
+            transition.truncated,
+            batchSize,
+            device,
+            "truncated")
+        if bool((transition.terminated & transition.truncated).any().item()):
+            raise ValueError("one environment row cannot terminate and truncate together")
+
+    def IndexSnapshot(
+        self,
+        snapshot: AutonomousDecisionSnapshot,
+        rowIndex: int,
+    ) -> AutonomousDecisionSnapshot:
+        index = torch.tensor(
+            [rowIndex],
+            device=snapshot.conditioning["uRaw"].device,
+            dtype=torch.long)
+        batch_size = int(snapshot.conditioning["uRaw"].size(0))
+        return AutonomousDecisionSnapshot(
+            conditioning={
+                name: value.index_select(0, index).detach().clone()
+                for name, value in snapshot.conditioning.items()},
+            policy=self.IndexPolicyValue(
+                snapshot.policy,
+                index,
+                batch_size),
+            value_conditioning={
+                name: value.index_select(0, index).detach().clone()
+                for name, value in snapshot.value_conditioning.items()})
+
+    def IndexPolicyValue(
+        self,
+        value: Any,
+        rowIndex: torch.Tensor,
+        batchSize: int,
+    ) -> Any:
+        if torch.is_tensor(value):
+            selected = (
+                value.index_select(0, rowIndex)
+                if value.dim() > 0 and int(value.size(0)) == batchSize
+                else value)
+            return selected.detach().clone()
+        if type(value) is dict:
+            return {
+                name: self.IndexPolicyValue(item, rowIndex, batchSize)
+                for name, item in value.items()}
+        return value
+
+    def CreateRecord(
+        self,
+        output: AutonomousPolicyOutput,
+        result: ActionExecutionResult,
+        rowIndex: int,
+        predecessor: Optional[AutonomousRolloutRecord],
+    ) -> AutonomousRolloutRecord:
+        snapshot = self.IndexSnapshot(output.policy_snapshot, rowIndex)
+        old_probability = output.behavior_log_probability[rowIndex]
+        request = output.action_request
+        return AutonomousRolloutRecord(
+            environment_index=rowIndex,
+            policy_path=int(request.policy_path[rowIndex].item()),
+            snapshot=snapshot,
+            old_log_probability=old_probability.detach().clone(),
+            value=output.value_baseline[rowIndex].detach().clone(),
+            reward=output.value_baseline.new_zeros(()),
+            duration=0,
+            terminated=False,
+            truncated=False,
+            next_value=output.value_baseline.new_zeros(()),
+            trace_continues=False,
+            help_requested=bool(request.help_requested[rowIndex].item()),
+            help_accepted=bool(result.help_accepted[rowIndex].item()),
+            help_pending=bool(
+                request.help_requested[rowIndex].item()
+                and not result.help_accepted[rowIndex].item()),
+            applied_target_values=self.robot.CanonicalizeTarget(
+                result.applied_target)[rowIndex].detach().clone(),
+            applied_target_active=result.applied_target.active[
+                rowIndex].detach().clone(),
+            applied_action_epoch=int(result.action_epoch[rowIndex].item()),
+            advantage=output.value_baseline.new_zeros(()),
+            return_target=output.value_baseline.new_zeros(()),
+            predecessor=predecessor)
+
+    def AddReward(
+        self,
+        record: AutonomousRolloutRecord,
+        reward: torch.Tensor,
+    ) -> None:
+        discount = self.config.discount ** record.duration
+        record.reward = record.reward + discount * reward.detach()
+        record.duration += 1
+
+    def FinalizeRecord(
+        self,
+        record: AutonomousRolloutRecord,
+        nextValue: torch.Tensor,
+        terminated: bool,
+        truncated: bool,
+        records: List[AutonomousRolloutRecord],
+    ) -> None:
+        if record.duration < 1:
+            raise RuntimeError("an autonomous option record has no executed step")
+        record.terminated = bool(terminated)
+        record.truncated = bool(truncated)
+        record.next_value = (
+            nextValue.new_zeros(())
+            if record.terminated
+            else nextValue.detach().clone())
+        records.append(record)
+
+    def ComputeAdvantages(
+        self,
+        records: List[AutonomousRolloutRecord],
+    ) -> None:
+        for environment_index in sorted({
+            record.environment_index for record in records
+        }):
+            sequence = [
+                record for record in records
+                if record.environment_index == environment_index]
+            start = 0
+            while start < len(sequence):
+                end = start + 1
+                while (
+                    end < len(sequence)
+                    and sequence[end - 1].trace_continues
+                ):
+                    end += 1
+                chain = sequence[start:end]
+                option_reward = torch.stack([
+                    record.reward for record in chain]).unsqueeze(-1)
+                values = torch.stack(
+                    [record.value for record in chain]
+                    + [chain[-1].next_value]).unsqueeze(-1)
+                duration = torch.tensor(
+                    [record.duration for record in chain],
+                    device=option_reward.device,
+                    dtype=option_reward.dtype).unsqueeze(-1)
+                terminated = torch.tensor(
+                    [record.terminated for record in chain],
+                    device=option_reward.device,
+                    dtype=torch.bool).unsqueeze(-1)
+                truncated = torch.tensor(
+                    [record.truncated for record in chain],
+                    device=option_reward.device,
+                    dtype=torch.bool).unsqueeze(-1)
+                estimate = SmdpReturnEstimator.EstimateAdvantages(
+                    option_reward,
+                    values,
+                    duration,
+                    terminated,
+                    truncated,
+                    discount=self.config.discount,
+                    traceDecay=self.config.trace_decay)
+                for index, record in enumerate(chain):
+                    record.advantage = estimate.advantage[index, 0]
+                    record.return_target = estimate.returnTarget[index, 0]
+                start = end
+
+    def NormalizeAppliedTarget(
+        self,
+        values: torch.Tensor,
+        active: torch.Tensor,
+    ) -> torch.Tensor:
+        lower = values.new_tensor(
+            self.robot.ContractView.end_effector_target_lower).unsqueeze(0)
+        upper = values.new_tensor(
+            self.robot.ContractView.end_effector_target_upper).unsqueeze(0)
+        normalized = 2.0 * (values - lower) / (upper - lower) - 1.0
+        masked = torch.zeros_like(normalized)
+        for slot_index in range(self.robot.ContractView.end_effector_count):
+            target_slice = self.robot.ContractView.end_effector_target_layout.Slice(
+                slot_index)
+            masked[:, target_slice] = torch.where(
+                active[:, slot_index].unsqueeze(-1),
+                normalized[:, target_slice],
+                torch.zeros_like(normalized[:, target_slice]))
+        return masked
+
+    def CausalExecutionMasks(
+        self,
+        request: ActionRequest,
+        result: ActionExecutionResult,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        relevant = request.target.active | result.applied_target.active
+        any_relevant = relevant.any(dim=-1)
+        known = torch.where(
+            any_relevant,
+            (result.execution_known | ~relevant).all(dim=-1),
+            result.execution_known.all(dim=-1))
+        modified = result.execution_status.eq(
+            int(SlotExecutionStatus.MODIFIED))
+        overridden = torch.where(
+            any_relevant,
+            (modified & relevant).any(dim=-1),
+            modified.any(dim=-1))
+        return known, overridden
+
+    def TargetsMatch(
+        self,
+        request: ActionRequest,
+        result: ActionExecutionResult,
+    ) -> torch.Tensor:
+        requested_values = self.robot.CanonicalizeTarget(request.target)
+        applied_values = self.robot.CanonicalizeTarget(
+            result.applied_target)
+        return self.robot.ContractView.TargetRowsMatch(
+            requested_values,
+            request.target.active,
+            applied_values,
+            result.applied_target.active)
+
+    def ExecutionMatchesRequest(
+        self,
+        request: ActionRequest,
+        result: ActionExecutionResult,
+    ) -> torch.Tensor:
+        stop_confirmed = (
+            request.stop_requested
+            & ~result.applied_target.active.any(dim=-1)
+            & result.execution_status.eq(
+                int(SlotExecutionStatus.STOPPED)).all(dim=-1))
+        active_applied = (
+            ~request.target.active
+            | result.execution_status.eq(
+                int(SlotExecutionStatus.APPLIED))).all(dim=-1)
+        execution_semantics = torch.where(
+            request.stop_requested,
+            stop_confirmed,
+            active_applied)
+        return self.TargetsMatch(request, result) & execution_semantics
+
+    def ExecutionContinuesRequest(
+        self,
+        request: ActionRequest,
+        result: ActionExecutionResult,
+    ) -> torch.Tensor:
+        stop_confirmed = (
+            request.stop_requested
+            & ~result.applied_target.active.any(dim=-1)
+            & result.execution_status.eq(
+                int(SlotExecutionStatus.STOPPED)).all(dim=-1))
+        active_continued = (
+            ~request.target.active
+            | result.execution_status.eq(
+                int(SlotExecutionStatus.APPLIED))
+            | result.execution_status.eq(
+                int(SlotExecutionStatus.HELD))).all(dim=-1)
+        execution_semantics = torch.where(
+            request.stop_requested,
+            stop_confirmed,
+            active_continued)
+        return self.TargetsMatch(request, result) & execution_semantics
+
+    def RequestStartsExecution(
+        self,
+        output: AutonomousPolicyOutput,
+        result: ActionExecutionResult,
+    ) -> torch.Tensor:
+        request = output.action_request
+        known, modified = self.CausalExecutionMasks(request, result)
+        candidate = output.candidate_selected & ~result.hard_stop
+        standard = (
+            candidate
+            & ~request.help_requested
+            & request.command_active
+            & request.target.active.any(dim=-1)
+            & known
+            & ~modified
+            & self.ExecutionMatchesRequest(request, result))
+        help_execution = (
+            candidate
+            & request.help_requested
+            & output.actor_credit_mask)
+        return standard | help_execution
+
+    def ActorOwnsExecution(
+        self,
+        output: AutonomousPolicyOutput,
+        startsExecution: torch.Tensor,
+    ) -> torch.Tensor:
+        return (
+            startsExecution
+            & output.actor_credit_mask
+            & ~output.neutral_selected
+            & ~output.controller_override
+            & ~output.action_request.planner_override)
+
+    def RecordTargetMatches(
+        self,
+        record: AutonomousRolloutRecord,
+        result: ActionExecutionResult,
+        rowIndex: int,
+    ) -> bool:
+        applied_values = self.robot.CanonicalizeTarget(
+            result.applied_target)[rowIndex]
+        return bool(self.robot.ContractView.TargetRowsMatch(
+            record.applied_target_values.unsqueeze(0),
+            record.applied_target_active.unsqueeze(0),
+            applied_values.unsqueeze(0),
+            result.applied_target.active[rowIndex].unsqueeze(0)).item())
+
+    def RecordExecutionContinues(
+        self,
+        record: AutonomousRolloutRecord,
+        request: ActionRequest,
+        result: ActionExecutionResult,
+        rowIndex: int,
+    ) -> bool:
+        if bool(result.hard_stop[rowIndex].item()):
+            return False
+        if record.help_requested:
+            if not bool(request.help_requested[rowIndex].item()):
+                return False
+            record.help_accepted = (
+                record.help_accepted
+                or bool(result.help_accepted[rowIndex].item()))
+            record.help_pending = not record.help_accepted
+            return True
+        if bool(request.help_requested[rowIndex].item()):
+            return False
+        if not self.RecordTargetMatches(record, result, rowIndex):
+            return False
+        relevant = (
+            record.applied_target_active
+            | request.target.active[rowIndex]
+            | result.applied_target.active[rowIndex])
+        status = result.execution_status[rowIndex]
+        allowed = (
+            status.eq(int(SlotExecutionStatus.APPLIED))
+            | status.eq(int(SlotExecutionStatus.REJECTED))
+            | status.eq(int(SlotExecutionStatus.HELD)))
+        return bool((result.execution_known[rowIndex] & allowed | ~relevant).all().item())
+
+    def OpenLoopCost(
+        self,
+        normalizedApplied: torch.Tensor,
+        active: torch.Tensor,
+        observation: Any,
+    ) -> torch.Tensor:
+        if self.config.open_loop_cost == 0.0:
+            return normalizedApplied.new_zeros(normalizedApplied.size(0))
+        if type(observation) is not ContractAgentActInput:
+            raise TypeError("open-loop cost requires ContractAgentActInput")
+        feedback = observation.feedback_packet
+        slot_magnitude = normalizedApplied.new_zeros(active.shape)
+        for slot_index in range(self.robot.ContractView.end_effector_count):
+            target_slice = self.robot.ContractView.end_effector_target_layout.Slice(
+                slot_index)
+            slot_magnitude[:, slot_index] = torch.linalg.vector_norm(
+                normalizedApplied[:, target_slice],
+                dim=-1) / math.sqrt(target_slice.stop - target_slice.start)
+        dependency = active.to(dtype=normalizedApplied.dtype)
+        missing = (~feedback.endpoint_present).to(
+            dtype=normalizedApplied.dtype)
+        weighted = (
+            dependency
+            * missing
+            * feedback.observation_age
+            * slot_magnitude)
+        return weighted.sum(dim=-1) / dependency.sum(
+            dim=-1).clamp_min(1.0)
+
+    def PrimePotential(self, output: AutonomousPolicyOutput) -> None:
+        reference = output.sensorimotor_inconsistency
+        self.potential_shaper(
+            reference.new_zeros(reference.shape),
+            reference.unsqueeze(-1),
+            output.sensorimotor_valid,
+            reference.new_zeros(reference.shape),
+            torch.zeros_like(output.sensorimotor_valid),
+            torch.zeros_like(output.sensorimotor_valid))
+
+    def BuildInteractionReward(
+        self,
+        output: AutonomousPolicyOutput,
+        transition: EmbodiedEnvironmentTransition,
+        nextReadout: Optional[CognitiveReadout],
+        previousApplied: torch.Tensor,
+        nextObservation: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        result = transition.execution_result
+        execution_known, _ = self.CausalExecutionMasks(
+            output.action_request,
+            result)
+        current_applied = self.NormalizeAppliedTarget(
+            result.applied_target.values,
+            result.applied_target.active)
+        action_cost = (current_applied - previousApplied).square().mean(dim=-1)
+        action_cost = torch.where(
+            execution_known,
+            action_cost,
+            torch.zeros_like(action_cost))
+        open_loop_cost = self.OpenLoopCost(
+            current_applied,
+            result.applied_target.active,
+            nextObservation)
+        open_loop_cost = torch.where(
+            execution_known,
+            open_loop_cost,
+            torch.zeros_like(open_loop_cost))
+        reward = transition.reward
+        if self.config.potential_scale > 0.0:
+            if nextReadout is None and bool(transition.terminated.all().item()):
+                next_inconsistency = reward.new_zeros(
+                    reward.size(0),
+                    1)
+                next_valid = torch.zeros_like(transition.terminated)
+            elif isinstance(nextReadout, CognitiveReadout):
+                next_inconsistency = torch.where(
+                    transition.terminated.unsqueeze(-1),
+                    torch.zeros_like(
+                        nextReadout.sensorimotor_evidence[:, :1]),
+                    nextReadout.sensorimotor_evidence[:, :1])
+                next_valid = (
+                    nextReadout.sensorimotor_valid
+                    & ~transition.terminated)
+            else:
+                raise TypeError("potential shaping requires CognitiveReadout")
+            reward = self.potential_shaper(
+                reward,
+                next_inconsistency,
+                next_valid,
+                reward.new_ones(reward.shape),
+                transition.terminated,
+                transition.truncated).shapedReward
+        help_cost = output.action_request.help_requested.to(
+            dtype=reward.dtype)
+        reward = (
+            reward
+            - self.config.applied_action_cost * action_cost
+            - self.config.help_request_cost * help_cost
+            - self.config.open_loop_cost * open_loop_cost)
+        next_applied = torch.where(
+            execution_known.unsqueeze(-1),
+            current_applied,
+            previousApplied)
+        return reward, next_applied
+
+    def CollectRollout(
+        self,
+        stepCount: Optional[int] = None,
+    ) -> List[AutonomousRolloutRecord]:
+        steps = self.config.rollout_steps if stepCount is None else int(stepCount)
+        if steps < 1:
+            raise ValueError("autonomous rollout step count must be positive")
+        records: List[AutonomousRolloutRecord] = []
+        active: List[Optional[AutonomousRolloutRecord]] = []
+        planner_enabled = self.policy.PlannerEnabled()
+        actor_training = bool(self.actor.training)
+        eligibility_frozen = self.actor.EligibilityFrozen()
+        eligibility_state = self.actor.ExportEligibilityState()
+        eligibility_batch_size = int(eligibility_state["trace"].size(0))
+        try:
+            self.policy.SetPlannerEnabled(False)
+            self.robot.Reset()
+            observation = self.environment.MaterializeObservation(
+                self.environment.Reset(),
+                self.robot)
+            self.policy.Reset(observation)
+            self.potential_shaper.ResetState()
+            previous_applied = (
+                self.NormalizeAppliedTarget(
+                    observation.feedback_packet.applied_target_values,
+                    observation.feedback_packet.applied_target_active)
+                if type(observation) is ContractAgentActInput
+                else None)
+            potential_primed = False
+            self.actor.eval()
+            self.actor.SetEligibilityFrozen(True)
+            for step_index in range(steps):
+                output = self.policy.Step(observation)
+                batch_size = self.ValidatePolicyOutput(output)
+                if self.config.potential_scale > 0.0 and not potential_primed:
+                    self.PrimePotential(output)
+                    potential_primed = True
+                if not active:
+                    active = [None for _ in range(batch_size)]
+                elif len(active) != batch_size:
+                    raise ValueError("autonomous environment batch size changed")
+                transition = self.environment.Step(output.action_request)
+                self.ValidateEnvironmentTransition(
+                    transition,
+                    output.action_request,
+                    batch_size)
+                self.robot.CommitAppliedTarget(
+                    output.action_request,
+                    transition.execution_result)
+                next_observation = self.environment.MaterializeObservation(
+                    transition.observation,
+                    self.robot)
+                result = transition.execution_result
+                evaluated_next_value: Optional[torch.Tensor] = None
+                next_readout: Optional[CognitiveReadout] = None
+                if (
+                    self.config.potential_scale > 0.0
+                    and not bool(transition.terminated.all().item())
+                ):
+                    evaluated_next_value, next_readout = (
+                        self.policy.ValueAndReadout(next_observation))
+                if previous_applied is None:
+                    previous_applied = result.applied_target.values.new_zeros(
+                        result.applied_target.values.shape)
+                effective_reward, previous_applied = self.BuildInteractionReward(
+                    output,
+                    transition,
+                    next_readout,
+                    previous_applied,
+                    next_observation)
+                starts_execution = self.RequestStartsExecution(
+                    output,
+                    result)
+                actor_owns_execution = self.ActorOwnsExecution(
+                    output,
+                    starts_execution)
+                for row_index in range(batch_size):
+                    current_record = active[row_index]
+                    if (
+                        current_record is not None
+                        and current_record.help_requested
+                        and bool(output.action_request.help_requested[
+                            row_index].item())
+                        and self.RecordExecutionContinues(
+                            current_record,
+                            output.action_request,
+                            result,
+                            row_index)
+                    ):
+                        self.AddReward(
+                            current_record,
+                            effective_reward[row_index])
+                        continue
+                    if bool(starts_execution[row_index].item()):
+                        predecessor = current_record
+                        if predecessor is not None:
+                            self.FinalizeRecord(
+                                predecessor,
+                                output.value_baseline[row_index],
+                                False,
+                                False,
+                                records)
+                        active[row_index] = None
+                        if not bool(actor_owns_execution[row_index].item()):
+                            continue
+                        record = self.CreateRecord(
+                            output,
+                            result,
+                            row_index,
+                            predecessor)
+                        if predecessor is not None:
+                            predecessor.trace_continues = True
+                        self.AddReward(
+                            record,
+                            effective_reward[row_index])
+                        active[row_index] = record
+                        continue
+                    if current_record is None:
+                        continue
+                    if self.RecordExecutionContinues(
+                        current_record,
+                        output.action_request,
+                        result,
+                        row_index,
+                    ):
+                        self.AddReward(
+                            current_record,
+                            effective_reward[row_index])
+                    else:
+                        self.FinalizeRecord(
+                            current_record,
+                            output.value_baseline[row_index],
+                            False,
+                            False,
+                            records)
+                        active[row_index] = None
+                observation = next_observation
+                environment_end = transition.terminated | transition.truncated
+                rollout_end = bool(environment_end.any().item()) or step_index + 1 == steps
+                if rollout_end:
+                    next_value = (
+                        evaluated_next_value
+                        if evaluated_next_value is not None
+                        else (
+                            output.value_baseline.new_zeros(batch_size)
+                            if bool(transition.terminated.all().item())
+                            else self.policy.Value(observation)))
+                    next_value = torch.where(
+                        transition.terminated,
+                        output.value_baseline.new_zeros(batch_size),
+                        next_value)
+                    if (
+                        not torch.is_tensor(next_value)
+                        or tuple(next_value.shape) != (batch_size,)
+                        or next_value.device != output.value_baseline.device
+                        or not bool(torch.isfinite(next_value).all().item())
+                    ):
+                        raise ValueError("autonomous bootstrap value is invalid")
+                    for row_index in range(batch_size):
+                        if active[row_index] is None:
+                            continue
+                        terminated = bool(transition.terminated[row_index].item())
+                        truncated = bool(transition.truncated[row_index].item())
+                        if not terminated and not truncated:
+                            truncated = True
+                        self.FinalizeRecord(
+                            active[row_index],
+                            next_value[row_index],
+                            terminated,
+                            truncated,
+                            records)
+                        active[row_index] = None
+                    break
+        finally:
+            self.actor.ImportEligibilityState(
+                eligibility_state,
+                eligibility_batch_size)
+            self.actor.SetEligibilityFrozen(eligibility_frozen)
+            self.actor.train(actor_training)
+            self.policy.SetPlannerEnabled(planner_enabled)
+        self.ComputeAdvantages(records)
+        return records
+
+    def ConcatenatePolicyValues(self, values: Sequence[Any]) -> Any:
+        first = values[0]
+        if torch.is_tensor(first):
+            return torch.cat(list(values), dim=0)
+        if type(first) is dict:
+            if any(type(value) is not dict or set(value) != set(first) for value in values):
+                raise ValueError("autonomous policy snapshot structures do not match")
+            return {
+                name: self.ConcatenatePolicyValues([
+                    value[name] for value in values])
+                for name in first}
+        if any(value != first for value in values[1:]):
+            raise ValueError("autonomous policy snapshot constants do not match")
+        return first
+
+    def ReevaluatePolicy(
+        self,
+        records: Sequence[AutonomousRolloutRecord],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[int, int]]:
+        if len(records) < 1:
+            raise ValueError("autonomous policy reevaluation requires records")
+        path_counts = {
+            path_id: sum(
+                int(record.policy_path == path_id)
+                for record in records)
+            for path_id in (
+                self.config.full_policy_path,
+                self.config.fast_policy_path,
+                self.config.detail_policy_path)}
+        snapshot = self.ConcatenatePolicyValues([
+            record.snapshot.policy for record in records])
+        replayed = self.actor.RecomputePolicySnapshot(snapshot)
+        if not bool(replayed["valid"].all().item()):
+            raise RuntimeError("autonomous policy path reevaluation is incomplete")
+        return (
+            replayed["combinedActionLogProbability"],
+            replayed["entropy"],
+            path_counts)
+
+    def OptimizerParameters(
+        self,
+        optimizer: torch.optim.Optimizer,
+    ) -> List[nn.Parameter]:
+        return [
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+            if parameter.requires_grad]
+
+    def StateTensorsFinite(self, value: Any) -> bool:
+        if torch.is_tensor(value):
+            return bool(
+                not (value.is_floating_point() or value.is_complex())
+                or torch.isfinite(value).all().item())
+        if type(value) is dict:
+            return all(self.StateTensorsFinite(item) for item in value.values())
+        if isinstance(value, (tuple, list)):
+            return all(self.StateTensorsFinite(item) for item in value)
+        return True
+
+    def OptimizePpo(
+        self,
+        records: List[AutonomousRolloutRecord],
+    ) -> Dict[str, float]:
+        if len(records) < 1:
+            return {
+                "sample_count": 0.0,
+                "policy_loss": 0.0,
+                "value_loss": 0.0,
+                "entropy": 0.0,
+                "clip_fraction": 0.0,
+                "full_count": 0.0,
+                "fast_count": 0.0,
+                "detail_count": 0.0,
+                "help_acceptance": 0.0}
+        advantages = torch.stack([
+            record.advantage for record in records])
+        if not bool(torch.isfinite(advantages).all().item()):
+            raise ValueError("autonomous PPO advantages must be finite")
+        if len(records) > 1:
+            advantages = (
+                advantages - advantages.mean()
+            ) / advantages.std(unbiased=False).clamp_min(1e-6)
+        normalized_advantages = {
+            id(record): advantages[index].detach()
+            for index, record in enumerate(records)}
+        eligibility_state = self.actor.ExportEligibilityState()
+        eligibility_batch_size = int(eligibility_state["trace"].size(0))
+        eligibility_frozen = self.actor.EligibilityFrozen()
+        actor_training = bool(self.actor.training)
+        actor_parameters = self.OptimizerParameters(self.actor_optimizer)
+        critic_parameters = self.OptimizerParameters(self.critic_optimizer)
+        parameter_state = []
+        parameter_ids = set()
+        for parameter in actor_parameters + critic_parameters:
+            if id(parameter) not in parameter_ids:
+                parameter_ids.add(id(parameter))
+                parameter_state.append((parameter, parameter.detach().clone()))
+        actor_optimizer_state = copy.deepcopy(
+            self.actor_optimizer.state_dict())
+        critic_optimizer_state = copy.deepcopy(
+            self.critic_optimizer.state_dict())
+        self.actor.SetEligibilityFrozen(True)
+        self.actor.eval()
+        totals = {
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "entropy": 0.0,
+            "clip_fraction": 0.0}
+        path_totals = {
+            self.config.full_policy_path: 0,
+            self.config.fast_policy_path: 0,
+            self.config.detail_policy_path: 0}
+        update_count = 0
+        try:
+            for _ in range(self.config.ppo_epochs):
+                order = torch.randperm(len(records)).tolist()
+                for start in range(0, len(records), self.config.minibatch_size):
+                    selected = [
+                        records[index]
+                        for index in order[
+                            start:start + self.config.minibatch_size]]
+                    new_log_probability, entropy, path_counts = (
+                        self.ReevaluatePolicy(selected))
+                    old_log_probability = torch.stack([
+                        record.old_log_probability
+                        for record in selected]).to(new_log_probability.device)
+                    advantage = torch.stack([
+                        normalized_advantages[id(record)]
+                        for record in selected]).to(new_log_probability.device)
+                    return_target = torch.stack([
+                        record.return_target
+                        for record in selected]).to(new_log_probability.device)
+                    old_value = torch.stack([
+                        record.value
+                        for record in selected]).to(new_log_probability.device)
+                    value_conditioning = {
+                        name: torch.cat([
+                            record.snapshot.value_conditioning[name]
+                            for record in selected], dim=0)
+                        for name in ("valueHidden", "valueBaseline")}
+                    current_value = self.policy.ReevaluateValue(
+                        value_conditioning).reshape(-1)
+                    if tuple(current_value.shape) != tuple(old_value.shape):
+                        raise ValueError(
+                            "autonomous reevaluated value shape does not match")
+                    if not all(bool(torch.isfinite(value).all().item()) for value in (
+                            new_log_probability,
+                            old_log_probability,
+                            entropy,
+                            advantage,
+                            return_target,
+                            old_value,
+                            current_value)):
+                        raise FloatingPointError(
+                            "autonomous PPO minibatch is non-finite")
+                    log_ratio = new_log_probability - old_log_probability
+                    ratio = torch.exp(log_ratio.clamp(
+                        -self.config.max_log_ratio,
+                        self.config.max_log_ratio))
+                    unclipped = ratio * advantage
+                    clipped = ratio.clamp(
+                        1.0 - self.config.clip_ratio,
+                        1.0 + self.config.clip_ratio) * advantage
+                    policy_loss = -torch.minimum(unclipped, clipped).mean()
+                    value_clipped = old_value + (
+                        current_value - old_value).clamp(
+                            -self.config.value_clip,
+                            self.config.value_clip)
+                    value_loss = 0.5 * torch.maximum(
+                        (current_value - return_target).square(),
+                        (value_clipped - return_target).square()).mean()
+                    entropy_mean = entropy.mean()
+                    loss = (
+                        policy_loss
+                        + self.config.value_coefficient * value_loss
+                        - self.config.entropy_coefficient * entropy_mean)
+                    if not all(bool(torch.isfinite(value).item()) for value in (
+                        policy_loss,
+                        value_loss,
+                        entropy_mean,
+                        loss,
+                    )):
+                        raise FloatingPointError(
+                            "autonomous PPO objective is non-finite")
+                    self.actor_optimizer.zero_grad(set_to_none=True)
+                    self.critic_optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        actor_parameters,
+                        self.config.gradient_norm,
+                        error_if_nonfinite=True)
+                    torch.nn.utils.clip_grad_norm_(
+                        critic_parameters,
+                        self.config.gradient_norm,
+                        error_if_nonfinite=True)
+                    self.actor_optimizer.step()
+                    self.critic_optimizer.step()
+                    self.policy.AfterOptimizerStep()
+                    if (
+                        not all(bool(torch.isfinite(
+                            parameter).all().item()) for parameter, _ in parameter_state)
+                        or not self.StateTensorsFinite(
+                            self.actor_optimizer.state_dict())
+                        or not self.StateTensorsFinite(
+                            self.critic_optimizer.state_dict())
+                    ):
+                        raise FloatingPointError(
+                            "autonomous PPO update is non-finite")
+                    totals["policy_loss"] += float(policy_loss.detach().item())
+                    totals["value_loss"] += float(value_loss.detach().item())
+                    totals["entropy"] += float(entropy_mean.detach().item())
+                    totals["clip_fraction"] += float(
+                        ratio.detach().sub(1.0).abs().gt(
+                            self.config.clip_ratio).to(
+                                dtype=ratio.dtype).mean().item())
+                    for path_id, count in path_counts.items():
+                        path_totals[path_id] += count
+                    update_count += 1
+        except Exception:
+            with torch.no_grad():
+                for parameter, value in parameter_state:
+                    parameter.copy_(value)
+            self.actor_optimizer.load_state_dict(actor_optimizer_state)
+            self.critic_optimizer.load_state_dict(critic_optimizer_state)
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            self.critic_optimizer.zero_grad(set_to_none=True)
+            raise
+        finally:
+            self.actor.ImportEligibilityState(
+                eligibility_state,
+                eligibility_batch_size)
+            self.actor.SetEligibilityFrozen(eligibility_frozen)
+            self.actor.train(actor_training)
+        help_requested = sum(
+            1 for record in records if record.help_requested)
+        help_accepted = sum(
+            1 for record in records
+            if record.help_requested and record.help_accepted)
+        denominator = float(max(1, update_count))
+        return {
+            "sample_count": float(len(records)),
+            "policy_loss": totals["policy_loss"] / denominator,
+            "value_loss": totals["value_loss"] / denominator,
+            "entropy": totals["entropy"] / denominator,
+            "clip_fraction": totals["clip_fraction"] / denominator,
+            "full_count": float(path_totals[self.config.full_policy_path]),
+            "fast_count": float(path_totals[self.config.fast_policy_path]),
+            "detail_count": float(path_totals[self.config.detail_policy_path]),
+            "help_acceptance": (
+                float(help_accepted) / float(max(1, help_requested)))}
+
+    def TrainIteration(self) -> Dict[str, float]:
+        records = self.CollectRollout()
+        return self.OptimizePpo(records)
 
 try:
     import imageio.v3 as iio
@@ -387,6 +1794,8 @@ class ManagerFunction:
         self.active_sensor_stream_id: Optional[str] = None
         self.active_world_frame_id: Optional[str] = None
         self.last_sensor_sequence_index: Optional[int] = None
+        self.pending_action_request: Optional[ActionRequest] = None
+        self.stream_terminated = False
         self.json_queue = None
 
         self.test = {
@@ -605,7 +2014,17 @@ class ManagerFunction:
         self.active_sensor_stream_id = None
         self.active_world_frame_id = None
         self.last_sensor_sequence_index = None
+        self.pending_action_request = None
+        self.stream_terminated = False
         return True
+
+    def TerminateSensorStream(self) -> None:
+        self.robot.Reset()
+        self.pending_action_request = None
+        self.active_sensor_stream_id = None
+        self.active_world_frame_id = None
+        self.last_sensor_sequence_index = None
+        self.stream_terminated = True
 
     def SetJsonQueue(self, queue):
         self.json_queue = queue
@@ -662,6 +2081,20 @@ class ManagerFunction:
                     "contract request {} does not match BrainBuildSpec".format(
                         name))
 
+    def EncodeCognitiveReadout(
+        self,
+        readout: CognitiveReadout,
+    ) -> Dict[str, Any]:
+        readout.Validate(self.brain_build_spec)
+        return {
+            name: (
+                value.detach().cpu().tolist()
+                if torch.is_tensor(value)
+                else value)
+            for name, value in (
+                (fieldName, getattr(readout, fieldName))
+                for fieldName in readout.__dataclass_fields__)}
+
     def ForwardContractBatch(
         self,
         bitmap: Union[List[Any], np.ndarray, torch.Tensor],
@@ -676,7 +2109,7 @@ class ManagerFunction:
         depthValid: Union[List[Any], np.ndarray, torch.Tensor],
         feedbackPayload: Any,
         requestProvenance: Dict[str, Any],
-    ) -> str:
+    ) -> ContractAgentActOutput:
         if self.agent_handle is None:
             raise RuntimeError("agent_handle has not been initialized")
         self.ValidateContractRequestProvenance(requestProvenance)
@@ -713,43 +2146,45 @@ class ManagerFunction:
         feedback_packet = self.EncodeBrainFeedback(
             feedbackPayload,
             batchSize=batch_size)
+        return self.ForwardMaterializedContractBatch(
+            ContractAgentActInput(
+                frame=converted["frames"],
+                text_ext=textExt,
+                reward=converted["rewards"],
+                done=converted["dones"],
+                sample_actions=sampleActions,
+                deterministic_actor=deterministicActor,
+                depth=converted["depths"],
+                depth_valid=converted["depth_valid"],
+                feedback_packet=feedback_packet,
+                text_trust=textTrust),
+            requestProvenance)
+
+    def ForwardMaterializedContractBatch(
+        self,
+        request: ContractAgentActInput,
+        requestProvenance: Dict[str, Any],
+    ) -> ContractAgentActOutput:
+        if self.agent_handle is None:
+            raise RuntimeError("agent_handle has not been initialized")
+        if type(request) is not ContractAgentActInput:
+            raise TypeError(
+                "materialized contract input must be ContractAgentActInput")
         self.agent_handle.agent.BindWorldMemoryContext(
             requestProvenance["world_frame_id"],
-            batchSize=batch_size)
+            batchSize=int(request.frame.size(0)))
         act_output = self.agent_handle.ForwardStep(
-            converted["frames"],
-            textExt=textExt,
-            textTrust=textTrust,
-            reward=converted["rewards"],
-            done=converted["dones"],
-            sampleActions=sampleActions,
-            deterministicActor=deterministicActor,
-            depth=converted["depths"],
-            depthValid=converted["depth_valid"],
-            feedbackPacket=feedback_packet)
-        target = act_output.packed_target
-        targetPayload = self.robot.DecodeTarget(target)
-        result = json.dumps({
-            "schema_version": 2,
-            "request_provenance": dict(requestProvenance),
-            "end_effector_target": targetPayload,
-            "intention_texts": list(act_output.intention_texts),
-        }, ensure_ascii=False, allow_nan=False)
-        packedTemporal = act_output.packed_temporal
-        if packedTemporal is None or not hasattr(
-            packedTemporal,
-            "candidate_selected",
-        ):
-            raise TypeError(
-                "contract Agent output requires temporal dispatch selection")
-        self.robot.CommitDispatchedTarget(
-            target,
-            packedTemporal.candidate_selected)
-        if converted["dones"] is not None and bool(
-            converted["dones"].gt(0.5).any().item()
-        ):
-            self.robot.Reset()
-        return result
+            request.frame,
+            textExt=request.text_ext,
+            textTrust=request.text_trust,
+            reward=request.reward,
+            done=request.done,
+            sampleActions=request.sample_actions,
+            deterministicActor=request.deterministic_actor,
+            depth=request.depth,
+            depthValid=request.depth_valid,
+            feedbackPacket=request.feedback_packet)
+        return act_output
 
     def AgentHandleForwardJson(
         self,
@@ -757,9 +2192,16 @@ class ManagerFunction:
         done: Optional[float],
         sensorPacketJson: str,
         feedbackPayloadJson: str,
+        executionResultJson: str,
     ) -> str:
+        if self.stream_terminated:
+            raise RuntimeError(
+                "a terminated sensor stream requires a new AgentHandle")
+        if self.agent_handle is None:
+            raise RuntimeError("agent_handle has not been initialized")
         sensor_packet = json.loads(sensorPacketJson)
         feedback_payload = json.loads(feedbackPayloadJson)
+        execution_payload = json.loads(executionResultJson)
         if type(sensor_packet) is not dict or set(sensor_packet) != set(SENSOR_PACKET_WIRE_FIELDS):
             raise ValueError("sensor packet fields do not match the current schema")
         if (
@@ -786,9 +2228,12 @@ class ManagerFunction:
         sequence_index = sensor_packet["sequence_index"]
         if type(feedback_payload) is not dict:
             raise TypeError("external robot feedback must be an object")
+        execution_result = None
         if self.active_sensor_stream_id is None:
             if sequence_index != 0:
                 raise ValueError("a sensor stream must begin at sequence_index 0")
+            if execution_payload is not None or self.pending_action_request is not None:
+                raise ValueError("the first sensor frame cannot carry an execution result")
         else:
             if sensor_packet["stream_id"] != self.active_sensor_stream_id:
                 raise ValueError(
@@ -796,6 +2241,12 @@ class ManagerFunction:
             if sequence_index != self.last_sensor_sequence_index + 1:
                 raise ValueError(
                     "sensor sequence_index must increase by exactly one")
+            if self.pending_action_request is None:
+                raise RuntimeError("the sensor stream has no pending action request")
+            execution_result = self.robot.DecodeActionExecutionResult(
+                execution_payload,
+                self.pending_action_request,
+                self.device)
         text_ext = sensor_packet["text_ext"]
         text_trust = sensor_packet["text_trust"]
         if type(text_ext) is not list or type(text_trust) is not list:
@@ -816,32 +2267,113 @@ class ManagerFunction:
             raise TypeError("sensor deterministic_actor must be a boolean")
         world_context_id = "sensor_stream:{}".format(
             sensor_packet["stream_id"])
-        result = self.ForwardContractBatch(
-            sensor_packet["rgb"],
-            reward,
-            done,
-            textExt=text_ext,
-            textTrust=text_trust,
-            sampleActions=sensor_packet["sample_actions"],
-            deterministicActor=sensor_packet["deterministic_actor"],
+        request_provenance = {
+            "stream_id": sensor_packet["stream_id"],
+            "sequence_index": sequence_index,
+            "frame_id": sensor_packet["frame_id"],
+            "calibration_id": sensor_packet["calibration_id"],
+            "world_frame_id": world_context_id,
+            "description_id": (
+                self.brain_build_spec.contract_view.description_id),
+            "model_contract_id": self.brain_build_spec.model_signature,
+            "adapter_id": self.brain_build_spec.contract_view.adapter_id,
+        }
+        self.ValidateContractRequestProvenance(request_provenance)
+        converted = DataPreprocessor.ConvertCppPerceptionFrame(
+            bitmap=sensor_packet["rgb"],
+            reward=reward,
+            done=done,
             depthBitmap=sensor_packet["depth"],
             depthValid=sensor_packet["depth_valid"],
-            feedbackPayload=feedback_payload,
-            requestProvenance={
-                "stream_id": sensor_packet["stream_id"],
-                "sequence_index": sequence_index,
-                "frame_id": sensor_packet["frame_id"],
-                "calibration_id": sensor_packet["calibration_id"],
-                "world_frame_id": world_context_id,
-                "description_id": (
-                    self.brain_build_spec.contract_view.description_id),
-                "model_contract_id": self.brain_build_spec.model_signature,
-                "adapter_id": self.brain_build_spec.contract_view.adapter_id,
-            })
-        self.active_sensor_stream_id = sensor_packet["stream_id"]
-        self.active_world_frame_id = world_context_id
-        self.last_sensor_sequence_index = sequence_index
-        return result
+            device=self.device,
+            needVisualState=False)
+        batch_size = int(converted["frames"].size(0))
+        robot_runtime_fields = (
+            "CachedTargetValues",
+            "CachedTargetActive",
+            "CachedTargetVersion",
+            "CachedActionEpoch",
+            "CachedRequestId",
+            "CachedExecutionStatus",
+            "CachedExecutionKnown",
+            "CachedExecutionRelevant",
+            "CachedExecutionResultKnown",
+            "CachedExecutionTimestamp",
+            "CachedHardStop",
+            "CachedHelpAccepted",
+            "DwellState",
+            "ReachedState",
+            "ProgressState",
+            "ObservationAgeState",
+            "ObservationKnownState",
+            "LastTimestamp",
+            "LastPerceptionRotation",
+            "LastPerceptionStatePresent",
+        )
+        robot_runtime = {
+            name: (
+                None
+                if getattr(self.robot, name) is None
+                else getattr(self.robot, name).detach().clone())
+            for name in robot_runtime_fields}
+        try:
+            if execution_result is not None:
+                self.robot.CommitAppliedTarget(
+                    self.pending_action_request,
+                    execution_result)
+            feedback_packet = self.EncodeBrainFeedback(
+                feedback_payload,
+                batchSize=batch_size)
+            if (
+                execution_result is not None
+                and bool(feedback_packet.timestamp.lt(
+                    execution_result.timestamp).any().item())
+            ):
+                raise ValueError(
+                    "feedback time precedes the applied action result")
+        except Exception:
+            for name, value in robot_runtime.items():
+                setattr(self.robot, name, value)
+            raise
+        try:
+            act_output = self.ForwardMaterializedContractBatch(
+                ContractAgentActInput(
+                    frame=converted["frames"],
+                    text_ext=text_ext,
+                    reward=converted["rewards"],
+                    done=converted["dones"],
+                    sample_actions=sensor_packet["sample_actions"],
+                    deterministic_actor=sensor_packet[
+                        "deterministic_actor"],
+                    depth=converted["depths"],
+                    depth_valid=converted["depth_valid"],
+                    feedback_packet=feedback_packet,
+                    text_trust=text_trust),
+                request_provenance)
+            terminal = done is not None and float(done) > 0.5
+            response = json.dumps({
+                "schema_version": DECISION_WIRE_SCHEMA_VERSION,
+                "request_provenance": request_provenance,
+                "action_request": (
+                    None
+                    if terminal
+                    else self.robot.EncodeActionRequest(
+                        act_output.action_request)),
+                "cognitive_readout": self.EncodeCognitiveReadout(
+                    act_output.cognitive_readout),
+                "intention_texts": list(act_output.intention_texts),
+            }, ensure_ascii=False, allow_nan=False)
+            if terminal:
+                self.TerminateSensorStream()
+            else:
+                self.pending_action_request = act_output.action_request
+                self.active_sensor_stream_id = sensor_packet["stream_id"]
+                self.active_world_frame_id = world_context_id
+                self.last_sensor_sequence_index = sequence_index
+            return response
+        except Exception:
+            self.TerminateSensorStream()
+            raise
 
     def ResetAgentHandleHebbian(self):
         if self.agent_handle is None:
@@ -1792,6 +3324,37 @@ class ManagerFunction:
         print(f"[{logPrefix}] checkpoint weights overridden from parameter file: {override_path}")
         return True
 
+    def TryLoadOCRTrainingArtifact(
+        self,
+        path: Optional[str],
+        loadFn: Callable[[str], Any],
+        *,
+        logPrefix: str,
+        artifactName: str,
+    ) -> Tuple[bool, Any]:
+        if not path:
+            return False, None
+        artifactPath = Path(path)
+        if not artifactPath.is_file():
+            return False, None
+        try:
+            state = loadFn(str(artifactPath))
+        except (
+            EOFError,
+            KeyError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            pickle.UnpicklingError,
+        ) as error:
+            print(
+                f"[{logPrefix}] {artifactName} is incompatible and will not be loaded: "
+                f"{artifactPath} ({error})")
+            return False, None
+        print(f"[{logPrefix}] loaded {artifactName}: {artifactPath}")
+        return True, state
+
     def ConfigureOCRTrainingTargets(
         self,
         engine: OCREngineExtractor,
@@ -1814,7 +3377,7 @@ class ManagerFunction:
             raise ValueError("OCR parameter fields do not match the current schema")
         if (
             type(payload["schema_version"]) is not int
-            or payload["schema_version"] not in OCR_COMPATIBLE_CHECKPOINT_SCHEMA_VERSIONS
+            or payload["schema_version"] != OCR_CHECKPOINT_SCHEMA_VERSION
         ):
             raise ValueError("OCR parameter schema is unsupported")
         self.ValidateOcrMetadata(engine, payload["ocr_meta"])
@@ -1831,7 +3394,7 @@ class ManagerFunction:
                 "OCR recognizer parameter fields do not match the current schema")
         if (
             type(payload["schema_version"]) is not int
-            or payload["schema_version"] not in OCR_COMPATIBLE_CHECKPOINT_SCHEMA_VERSIONS
+            or payload["schema_version"] != OCR_CHECKPOINT_SCHEMA_VERSION
         ):
             raise ValueError("OCR recognizer parameter schema is unsupported")
         self.ValidateOcrMetadata(engine, payload["ocr_meta"])
@@ -1858,7 +3421,7 @@ class ManagerFunction:
             raise ValueError("OCR checkpoint fields do not match the current schema")
         if (
             type(ckpt["schema_version"]) is not int
-            or ckpt["schema_version"] not in OCR_COMPATIBLE_CHECKPOINT_SCHEMA_VERSIONS
+            or ckpt["schema_version"] != OCR_CHECKPOINT_SCHEMA_VERSION
         ):
             raise ValueError("OCR checkpoint schema is unsupported")
         if (
@@ -1904,7 +3467,7 @@ class ManagerFunction:
                 "OCR recognizer checkpoint fields do not match the current schema")
         if (
             type(ckpt["schema_version"]) is not int
-            or ckpt["schema_version"] not in OCR_COMPATIBLE_CHECKPOINT_SCHEMA_VERSIONS
+            or ckpt["schema_version"] != OCR_CHECKPOINT_SCHEMA_VERSION
         ):
             raise ValueError("OCR recognizer checkpoint schema is unsupported")
         self.ValidateTrainingRngState(ckpt["rng"])
@@ -1951,18 +3514,26 @@ class ManagerFunction:
                 raise ValueError("OCRTrainLoop requires trainDetection or trainRecognition to be True")
 
             ds = OfflineOCRDataset(isTest=isTest)
-            engine = OCREngineExtractor().to(self.device)
-            has_resume_ckpt = resume and Path(ckptPath).exists()
 
-            self.ConfigureOCRTrainingTargets(
-                engine,
-                trainDetection=trainDetection,
-                trainRecognition=trainRecognition,)
+            def BuildOCRTrainingState():
+                engineValue = OCREngineExtractor().to(self.device)
+                self.ConfigureOCRTrainingTargets(
+                    engineValue,
+                    trainDetection=trainDetection,
+                    trainRecognition=trainRecognition,)
+                trainableParameters = [
+                    parameter
+                    for parameter in engineValue.parameters()
+                    if parameter.requires_grad]
+                if len(trainableParameters) == 0:
+                    raise RuntimeError("no trainable OCR parameters selected")
+                optimizerValue = torch.optim.AdamW(
+                    trainableParameters,
+                    lr=3e-4,
+                    weight_decay=1e-2)
+                return engineValue, optimizerValue
 
-            trainable_params = [p for p in engine.parameters() if p.requires_grad]
-            if len(trainable_params) == 0:
-                raise RuntimeError("no trainable OCR parameters selected")
-            optimizer = torch.optim.AdamW(trainable_params, lr=3e-4, weight_decay=1e-2)
+            engine, optimizer = BuildOCRTrainingState()
 
             start_epoch = 0
             best_val = float("inf")
@@ -1970,32 +3541,43 @@ class ManagerFunction:
             train_ds = val_ds = test_ds = None
 
             testSplit = 0.1
-            if has_resume_ckpt:
-                start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds = self.LoadOCRCheckpoint(
-                    engine,
-                    optimizer,
-                    ds,
+            checkpointLoaded = False
+            parameterLoaded = False
+            recognizerLoaded = False
+            shouldLoadArtifacts = bool(resume or overrideCheckpointWithModuleParams)
+            checkpointExists = bool(resume and Path(ckptPath).is_file())
+            if checkpointExists and not overrideCheckpointWithModuleParams:
+                checkpointLoaded, checkpointState = self.TryLoadOCRTrainingArtifact(
                     ckptPath,
-                    trainDetection=trainDetection,
-                    trainRecognition=trainRecognition)
-            else:
-                if recognizerInitPath and Path(recognizerInitPath).exists():
-                    self.LoadRecognizerWeightsIntoEngine(engine, recognizerInitPath)
-                elif not trainRecognition:
-                    if not Path(outPath).is_file():
-                        raise FileNotFoundError(
-                            "detect-only OCR training requires the current OCR "
-                            "parameter artifact or recognizerInitPath")
-                    self.LoadOCRWeightsIntoEngine(engine, outPath)
-                    
-            parameters_overridden = self.ApplyParameterOverrideAfterResume(
-                enabled=overrideCheckpointWithModuleParams,
-                parameterPath=outPath,
-                loadFn=lambda path: self.LoadOCRWeightsIntoEngine(engine, path),
-                logPrefix="TrainOCR")
-            if parameters_overridden:
-                optimizer.state.clear()
-                best_val = float("inf")
+                    lambda path: self.LoadOCRCheckpoint(
+                        engine,
+                        optimizer,
+                        ds,
+                        path,
+                        trainDetection=trainDetection,
+                        trainRecognition=trainRecognition),
+                    logPrefix="TrainOCR",
+                    artifactName="training checkpoint")
+                if checkpointLoaded:
+                    start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds = checkpointState
+                else:
+                    engine, optimizer = BuildOCRTrainingState()
+            if shouldLoadArtifacts and not checkpointLoaded:
+                parameterLoaded, _ = self.TryLoadOCRTrainingArtifact(
+                    outPath,
+                    lambda path: self.LoadOCRWeightsIntoEngine(engine, path),
+                    logPrefix="TrainOCR",
+                    artifactName="model parameters")
+                if not parameterLoaded:
+                    recognizerLoaded, _ = self.TryLoadOCRTrainingArtifact(
+                        recognizerInitPath,
+                        lambda path: self.LoadRecognizerWeightsIntoEngine(engine, path),
+                        logPrefix="TrainOCR",
+                        artifactName="recognizer parameters")
+                if not parameterLoaded and not recognizerLoaded:
+                    print(
+                        "[TrainOCR] no compatible checkpoint or parameter file was found; "
+                        "training a new model")
             self.ConfigureOCRTrainingTargets(
                 engine,
                 trainDetection=trainDetection,
@@ -2475,16 +4057,26 @@ class ManagerFunction:
             self.ResetControllerFlags()
     
             ds = OfflineOCRRecognitionDataset(isTest=isTest)
-            engine = OCREngineExtractor().to(self.device)
-            self.ConfigureOCRTrainingTargets(
-                engine,
-                trainDetection=False,
-                trainRecognition=True,)
 
-            trainable_params = [p for p in engine.parameters() if p.requires_grad]
-            if len(trainable_params) == 0:
-                raise RuntimeError("no trainable OCR recognizer parameters selected")
-            optimizer = torch.optim.AdamW(trainable_params, lr=3e-4, weight_decay=1e-2)
+            def BuildOCRRecognizerTrainingState():
+                engineValue = OCREngineExtractor().to(self.device)
+                self.ConfigureOCRTrainingTargets(
+                    engineValue,
+                    trainDetection=False,
+                    trainRecognition=True,)
+                trainableParameters = [
+                    parameter
+                    for parameter in engineValue.parameters()
+                    if parameter.requires_grad]
+                if len(trainableParameters) == 0:
+                    raise RuntimeError("no trainable OCR recognizer parameters selected")
+                optimizerValue = torch.optim.AdamW(
+                    trainableParameters,
+                    lr=3e-4,
+                    weight_decay=1e-2)
+                return engineValue, optimizerValue
+
+            engine, optimizer = BuildOCRRecognizerTrainingState()
 
             start_epoch = 0
             best_val = float("inf")
@@ -2492,18 +4084,33 @@ class ManagerFunction:
             train_ds = val_ds = test_ds = None
 
             testSplit = 0.1
-            if resume and Path(ckptPath).exists():
-                start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds = self.LoadOCRRecognizerCheckpoint(
-                    engine, optimizer, ds, ckptPath)
-                
-            parameters_overridden = self.ApplyParameterOverrideAfterResume(
-                enabled=overrideCheckpointWithModuleParams,
-                parameterPath=outPath,
-                loadFn=lambda path: self.LoadRecognizerWeightsIntoEngine(engine, path),
-                logPrefix="TrainOCRRec")
-            if parameters_overridden:
-                optimizer.state.clear()
-                best_val = float("inf")
+            checkpointLoaded = False
+            shouldLoadArtifacts = bool(resume or overrideCheckpointWithModuleParams)
+            checkpointExists = bool(resume and Path(ckptPath).is_file())
+            if checkpointExists and not overrideCheckpointWithModuleParams:
+                checkpointLoaded, checkpointState = self.TryLoadOCRTrainingArtifact(
+                    ckptPath,
+                    lambda path: self.LoadOCRRecognizerCheckpoint(
+                        engine,
+                        optimizer,
+                        ds,
+                        path),
+                    logPrefix="TrainOCRRec",
+                    artifactName="training checkpoint")
+                if checkpointLoaded:
+                    start_epoch, best_val, processed_sample_count_total, train_ds, val_ds, test_ds = checkpointState
+                else:
+                    engine, optimizer = BuildOCRRecognizerTrainingState()
+            if shouldLoadArtifacts and not checkpointLoaded:
+                parameterLoaded, _ = self.TryLoadOCRTrainingArtifact(
+                    outPath,
+                    lambda path: self.LoadRecognizerWeightsIntoEngine(engine, path),
+                    logPrefix="TrainOCRRec",
+                    artifactName="recognizer parameters")
+                if not parameterLoaded:
+                    print(
+                        "[TrainOCRRec] no compatible checkpoint or parameter file was found; "
+                        "training a new recognizer")
             self.ConfigureOCRTrainingTargets(
                 engine,
                 trainDetection=False,
@@ -3444,7 +5051,7 @@ class ManagerFunction:
             raise TypeError("brain model state must be a dictionary")
         agent.ValidateOnlineCandidateState(ckpt["online_candidates"])
         world = agent.GetRuntimeWorld()
-        world_batch_size, _ = world._ValidateMemoryPayload(ckpt["world_memory"])
+        world_batch_size, _ = world.ValidateMemoryPayload(ckpt["world_memory"])
         if world_batch_size != batchSize:
             raise ValueError("training checkpoint World memory batch size is invalid")
         brain.mem.ValidateDurableState(
@@ -3527,6 +5134,7 @@ class ManagerFunction:
             feedback = self.BuildContractTestFeedback(batchSize=2)
             adapter = ContractWorldEmbodimentAdapter(
                 contract_view,
+                cognitive_dim,
                 cognitive_dim).to(self.device)
             adapter.train()
             transition = adapter.EncodeTransition(feedback)
@@ -4655,7 +6263,7 @@ class TestManagerMTool:
                     events.append("memory_import")
 
             class FakeWorld:
-                def _ValidateMemoryPayload(self, state):
+                def ValidateMemoryPayload(self, state):
                     events.append("world_validate")
                     return int(state["batch_size"]), 1
 
@@ -5139,6 +6747,8 @@ class TestManagerMTool:
             class FakeAgent:
                 def Act(self, request):
                     return ContractAgentActOutput(
+                        action_request="request",
+                        cognitive_readout="readout",
                         packed_target="target",
                         packed_temporal=FakeTemporal(),
                         decision={},
@@ -5168,6 +6778,47 @@ class TestManagerMTool:
             print(
                 f"Manager temporal envelope projection error: "
                 f"{exception}")
+            return False
+
+    def TestOcrTrainingArtifactFallback(self) -> bool:
+        try:
+            manager = ManagerFunction.__new__(ManagerFunction)
+            manager.device = torch.device("cpu")
+            with tempfile.TemporaryDirectory() as temporaryDirectory:
+                artifactPath = Path(temporaryDirectory) / "ocr-parameters.pth"
+                torch.save({"value": 7}, artifactPath)
+                loaded, value = manager.TryLoadOCRTrainingArtifact(
+                    str(artifactPath),
+                    lambda path: torch.load(
+                        path,
+                        map_location="cpu",
+                        weights_only=True)["value"],
+                    logPrefix="TestOCR",
+                    artifactName="parameters")
+                incompatible, incompatibleValue = manager.TryLoadOCRTrainingArtifact(
+                    str(artifactPath),
+                    lambda path: (_ for _ in ()).throw(
+                        ValueError("shape mismatch")),
+                    logPrefix="TestOCR",
+                    artifactName="parameters")
+                missing, missingValue = manager.TryLoadOCRTrainingArtifact(
+                    str(Path(temporaryDirectory) / "missing.pth"),
+                    lambda path: None,
+                    logPrefix="TestOCR",
+                    artifactName="parameters")
+            ok = (
+                loaded
+                and value == 7
+                and not incompatible
+                and incompatibleValue is None
+                and not missing
+                and missingValue is None)
+            print(
+                f"Manager OCR training artifact fallback "
+                f"{'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as error:
+            print(f"Manager OCR training artifact fallback error: {error}")
             return False
 
     def TestOcrCheckpointStrictContract(self) -> bool:
@@ -5235,12 +6886,20 @@ class TestManagerMTool:
             legacy_recognizer_parameters = dict(
                 saved_payloads["ocr-recognizer-parameters.pth"])
             legacy_recognizer_parameters["schema_version"] = 15
-            manager.LoadOCRWeightsIntoEngine(
-                engine,
-                serialized(legacy_ocr_parameters))
-            manager.LoadRecognizerWeightsIntoEngine(
-                engine,
-                serialized(legacy_recognizer_parameters))
+            try:
+                manager.LoadOCRWeightsIntoEngine(
+                    engine,
+                    serialized(legacy_ocr_parameters))
+                legacy_ocr_rejected = False
+            except ValueError:
+                legacy_ocr_rejected = True
+            try:
+                manager.LoadRecognizerWeightsIntoEngine(
+                    engine,
+                    serialized(legacy_recognizer_parameters))
+                legacy_recognizer_rejected = False
+            except ValueError:
+                legacy_recognizer_rejected = True
             checkpoint = {
                 "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
                 "epoch": 2,
@@ -5264,13 +6923,17 @@ class TestManagerMTool:
                 trainRecognition=True)
             legacy_checkpoint = dict(checkpoint)
             legacy_checkpoint["schema_version"] = 15
-            legacy_restored = manager.LoadOCRCheckpoint(
-                engine,
-                optimizer,
-                dataset,
-                serialized(legacy_checkpoint),
-                trainDetection=True,
-                trainRecognition=True)
+            try:
+                manager.LoadOCRCheckpoint(
+                    engine,
+                    optimizer,
+                    dataset,
+                    serialized(legacy_checkpoint),
+                    trainDetection=True,
+                    trainRecognition=True)
+                legacy_checkpoint_rejected = False
+            except ValueError:
+                legacy_checkpoint_rejected = True
 
             missing = dict(checkpoint)
             missing.pop("rng")
@@ -5344,19 +7007,25 @@ class TestManagerMTool:
                 serialized(recognizer_checkpoint))
             legacy_recognizer_checkpoint = dict(recognizer_checkpoint)
             legacy_recognizer_checkpoint["schema_version"] = 15
-            legacy_recognizer_restored = manager.LoadOCRRecognizerCheckpoint(
-                engine,
-                recognizer_optimizer,
-                dataset,
-                serialized(legacy_recognizer_checkpoint))
+            try:
+                manager.LoadOCRRecognizerCheckpoint(
+                    engine,
+                    recognizer_optimizer,
+                    dataset,
+                    serialized(legacy_recognizer_checkpoint))
+                legacy_recognizer_checkpoint_rejected = False
+            except ValueError:
+                legacy_recognizer_checkpoint_rejected = True
 
             ok = (
                 restored[0:3] == (2, 0.25, 12)
                 and [list(split.indices) for split in restored[3:]]
                 == [[0, 1], [2, 3], [4, 5]]
                 and recognizer_restored[0:3] == (3, 0.1, 18)
-                and legacy_restored[0:3] == (2, 0.25, 12)
-                and legacy_recognizer_restored[0:3] == (3, 0.1, 18)
+                and legacy_ocr_rejected
+                and legacy_recognizer_rejected
+                and legacy_checkpoint_rejected
+                and legacy_recognizer_checkpoint_rejected
                 and missing_rejected
                 and mode_mismatch_rejected
                 and legacy_parameter_rejected
@@ -5372,10 +7041,6 @@ class TestManagerMTool:
                     ("ocr", True),
                     ("recognizer", True),
                     ("ocr", True),
-                    ("recognizer", True),
-                    ("ocr", True),
-                    ("ocr", True),
-                    ("recognizer", True),
                     ("recognizer", True),])
             print(
                 f"Manager OCR strict checkpoint contract "
@@ -5423,6 +7088,43 @@ class TestManagerMTool:
             return False
 
     def TestCppDecisionWireContract(self) -> bool:
+        original_converter = DataPreprocessor.ConvertCppPerceptionFrame
+        processing_counts = {
+            "convert": 0,
+            "encode_feedback": 0,
+            "decode_feedback": 0,
+            "validate_feedback": 0,
+        }
+
+        def ConvertFrame(
+            bitmap,
+            reward,
+            done,
+            *,
+            depthBitmap,
+            depthValid,
+            device,
+            needVisualState,
+        ):
+            processing_counts["convert"] += 1
+            if type(bitmap) is str:
+                raise ValueError("invalid test image")
+            return {
+                "frames": torch.zeros(1, 3, 1, 1, device=device),
+                "rewards": (
+                    None
+                    if reward is None
+                    else torch.tensor([reward], device=device)),
+                "dones": (
+                    None
+                    if done is None
+                    else torch.tensor([done], device=device)),
+                "depths": torch.zeros(1, 1, 1, 1, device=device),
+                "depth_valid": torch.ones(
+                    1, 1, 1, 1, device=device, dtype=torch.bool),
+            }
+
+        DataPreprocessor.ConvertCppPerceptionFrame = ConvertFrame
         try:
             manager = object.__new__(ManagerFunction)
             manager.device = torch.device("cpu")
@@ -5430,18 +7132,111 @@ class TestManagerMTool:
             manager.brain_build_spec = BrainBuildSpec.Compile(
                 ModuleDim.CognitiveProfile(),
                 manager.robot.ContractView)
-            manager.perception_calibration_id = "test-calibration"
+            manager.perception_calibration_id = (
+                manager.robot.ContractView.perception_projection.calibration_id)
             manager.active_sensor_stream_id = None
             manager.active_world_frame_id = None
             manager.last_sensor_sequence_index = None
+            manager.pending_action_request = None
+            manager.stream_terminated = False
+            manager.agent_handle = object()
             captured: Dict[str, Any] = {}
+            original_encode_feedback = manager.robot.EncodeFeedback
+            original_decode_feedback = manager.robot.DecodeFeedback
+            original_validate_feedback = manager.robot.ValidateFeedback
 
-            def CaptureForward(*args, **kwargs):
-                captured["args"] = args
-                captured["kwargs"] = kwargs
-                return "ok"
+            def EncodeFeedback(*args, **kwargs):
+                processing_counts["encode_feedback"] += 1
+                return original_encode_feedback(*args, **kwargs)
 
-            manager.ForwardContractBatch = CaptureForward
+            def DecodeFeedback(*args, **kwargs):
+                processing_counts["decode_feedback"] += 1
+                return original_decode_feedback(*args, **kwargs)
+
+            def ValidateFeedback(*args, **kwargs):
+                processing_counts["validate_feedback"] += 1
+                return original_validate_feedback(*args, **kwargs)
+
+            manager.robot.EncodeFeedback = EncodeFeedback
+            manager.robot.DecodeFeedback = DecodeFeedback
+            manager.robot.ValidateFeedback = ValidateFeedback
+
+            target = PackedEndEffectorTarget(
+                values=torch.zeros(
+                    1,
+                    manager.robot.ContractView.end_effector_target_layout.PackedDim),
+                active=torch.zeros(
+                    1,
+                    manager.robot.ContractView.end_effector_count,
+                    dtype=torch.bool),
+                contract_id=manager.robot.ContractView.contract_id,
+                model_signature=manager.robot.ContractView.model_signature,
+                target_version=torch.zeros(1, dtype=torch.long),
+                timestamp=torch.zeros(1))
+            request = ActionRequest(
+                request_id=torch.ones(1, dtype=torch.long),
+                action_epoch=torch.zeros(1, dtype=torch.long),
+                target=target,
+                command_active=torch.zeros(1, dtype=torch.bool),
+                hold_requested=torch.ones(1, dtype=torch.bool),
+                stop_requested=torch.zeros(1, dtype=torch.bool),
+                help_requested=torch.zeros(1, dtype=torch.bool),
+                policy_path=torch.full(
+                    (1,),
+                    POLICY_PATH_FULL,
+                    dtype=torch.long),
+                planner_override=torch.zeros(1, dtype=torch.bool),
+                temporal_kind_id=torch.zeros(1, dtype=torch.long),
+                timestamp=torch.zeros(1))
+            feature = torch.zeros(1, 1)
+            readout = CognitiveReadout(
+                schema_version=COGNITIVE_READOUT_SCHEMA_VERSION,
+                model_signature=manager.brain_build_spec.model_signature,
+                contract_id=manager.robot.ContractView.contract_id,
+                request_id=request.request_id,
+                timestamp=torch.zeros(1),
+                row_valid=torch.ones(1, dtype=torch.bool),
+                intention_feature=feature,
+                intention_valid=torch.ones(1, dtype=torch.bool),
+                intention_age=torch.zeros(1),
+                world_belief_feature=feature,
+                world_belief_valid=torch.ones(1, dtype=torch.bool),
+                world_belief_age=torch.zeros(1),
+                sensorimotor_evidence=feature,
+                sensorimotor_valid=torch.ones(1, dtype=torch.bool),
+                sensorimotor_age=torch.zeros(1),
+                decision_feature=feature,
+                decision_valid=torch.ones(1, dtype=torch.bool),
+                decision_age=torch.zeros(1),
+                compute_mode=torch.zeros(1, dtype=torch.long),
+                policy_path=request.policy_path,
+                planner_override=request.planner_override,
+                option_id=torch.zeros(1, dtype=torch.long),
+                option_valid=torch.zeros(1, dtype=torch.bool),
+                temporal_kind_id=request.temporal_kind_id)
+            act_output = ContractAgentActOutput(
+                action_request=request,
+                cognitive_readout=readout,
+                packed_target=target,
+                packed_temporal=None,
+                decision={},
+                ocr=None,
+                intention_texts=["pick up the cup"])
+
+            def CaptureForward(request, requestProvenance):
+                if "request" not in captured:
+                    captured["request"] = request
+                    captured["request_provenance"] = requestProvenance
+                    captured["first_processing_counts"] = dict(
+                        processing_counts)
+                cached_request_id = manager.robot.CachedRequestId
+                captured.setdefault("committed_request_ids", []).append(
+                    None
+                    if cached_request_id is None
+                    else int(cached_request_id.item()))
+                return act_output
+
+            manager.ForwardMaterializedContractBatch = CaptureForward
             feedback_payload = dict(
                 manager.robot.BuildNeutralFeedbackPayload(
                     0.0,
@@ -5451,7 +7246,7 @@ class TestManagerMTool:
                 "stream_id": "stream-1",
                 "sequence_index": 0,
                 "frame_id": "frame-1",
-                "calibration_id": "test-calibration",
+                "calibration_id": manager.perception_calibration_id,
                 "rgb_encoding": "rgb8",
                 "depth_unit": "meter",
                 "text_ext": ["pick up the cup"],
@@ -5466,7 +7261,11 @@ class TestManagerMTool:
                 0.5,
                 0.0,
                 json.dumps(sensor_packet),
-                json.dumps(feedback_payload))
+                json.dumps(feedback_payload),
+                "null")
+            response = json.loads(result)
+            baseline_cached_request_id = (
+                manager.robot.CachedRequestId.detach().clone())
 
             duplicate_rejected = False
             try:
@@ -5475,7 +7274,8 @@ class TestManagerMTool:
                     0.5,
                     0.0,
                     json.dumps(sensor_packet),
-                    json.dumps(feedback_payload))
+                    json.dumps(feedback_payload),
+                    "null")
             except ValueError:
                 duplicate_rejected = True
 
@@ -5489,7 +7289,8 @@ class TestManagerMTool:
                     0.5,
                     0.0,
                     json.dumps(gap_sensor_packet),
-                    json.dumps(feedback_payload))
+                    json.dumps(feedback_payload),
+                    "null")
             except ValueError:
                 gap_rejected = True
 
@@ -5505,25 +7306,233 @@ class TestManagerMTool:
                     0.5,
                     0.0,
                     json.dumps(wrong_calibration_sensor),
-                    json.dumps(feedback_payload))
+                    json.dumps(feedback_payload),
+                    "null")
             except ValueError:
                 calibration_mismatch_rejected = True
 
+            missing_result_rejected = False
+            try:
+                ManagerFunction.AgentHandleForwardJson(
+                    manager,
+                    0.5,
+                    0.0,
+                    json.dumps(next_sensor_packet),
+                    json.dumps(feedback_payload),
+                    "null")
+            except (TypeError, ValueError):
+                missing_result_rejected = True
+
+            execution_payload = {
+                "schema_version": manager.robot.ActionSchemaVersion,
+                "request_id": [1],
+                "action_epoch": [0],
+                "applied_target": manager.robot.DecodeTarget(target),
+                "execution_status": [[
+                    SlotExecutionStatus.APPLIED.name
+                    for _ in manager.robot.EndEffectors]],
+                "execution_known": [[
+                    True for _ in manager.robot.EndEffectors]],
+                "hard_stop": [False],
+                "help_accepted": [False],
+                "timestamp": [0.1],
+            }
+            next_feedback_payload = dict(
+                manager.robot.BuildNeutralFeedbackPayload(
+                    0.2,
+                    manager.device))
+
+            def StatePreserved() -> bool:
+                return bool(
+                    torch.equal(
+                        manager.robot.CachedRequestId,
+                        baseline_cached_request_id)
+                    and manager.pending_action_request is request
+                    and manager.active_sensor_stream_id == "stream-1"
+                    and manager.active_world_frame_id == "sensor_stream:stream-1"
+                    and manager.last_sensor_sequence_index == 0
+                    and not manager.stream_terminated)
+
+            invalid_text_sensor = dict(next_sensor_packet)
+            invalid_text_sensor["text_trust"] = ["invalid"]
+            invalid_text_rejected = False
+            try:
+                ManagerFunction.AgentHandleForwardJson(
+                    manager,
+                    0.5,
+                    0.0,
+                    json.dumps(invalid_text_sensor),
+                    json.dumps(next_feedback_payload),
+                    json.dumps(execution_payload))
+            except ValueError:
+                invalid_text_rejected = True
+            invalid_text_preserved = StatePreserved()
+
+            invalid_image_sensor = dict(next_sensor_packet)
+            invalid_image_sensor["rgb"] = "invalid"
+            invalid_image_rejected = False
+            try:
+                ManagerFunction.AgentHandleForwardJson(
+                    manager,
+                    0.5,
+                    0.0,
+                    json.dumps(invalid_image_sensor),
+                    json.dumps(next_feedback_payload),
+                    json.dumps(execution_payload))
+            except ValueError:
+                invalid_image_rejected = True
+            invalid_image_preserved = StatePreserved()
+
+            invalid_feedback_payload = dict(next_feedback_payload)
+            invalid_feedback_payload["contract_id"] = "invalid"
+            invalid_feedback_rejected = False
+            try:
+                ManagerFunction.AgentHandleForwardJson(
+                    manager,
+                    0.5,
+                    0.0,
+                    json.dumps(next_sensor_packet),
+                    json.dumps(invalid_feedback_payload),
+                    json.dumps(execution_payload))
+            except ValueError:
+                invalid_feedback_rejected = True
+            invalid_feedback_preserved = StatePreserved()
+
+            early_feedback_payload = dict(next_feedback_payload)
+            early_feedback_payload["timestamp"] = 0.05
+            early_feedback_rejected = False
+            try:
+                ManagerFunction.AgentHandleForwardJson(
+                    manager,
+                    0.5,
+                    0.0,
+                    json.dumps(next_sensor_packet),
+                    json.dumps(early_feedback_payload),
+                    json.dumps(execution_payload))
+            except ValueError:
+                early_feedback_rejected = True
+            early_feedback_preserved = StatePreserved()
+
+            next_result = ManagerFunction.AgentHandleForwardJson(
+                manager,
+                0.5,
+                1.0,
+                json.dumps(next_sensor_packet),
+                json.dumps(next_feedback_payload),
+                json.dumps(execution_payload))
+            next_response = json.loads(next_result)
+            terminated_stream_rejected = False
+            restarted_sensor_packet = dict(sensor_packet)
+            restarted_sensor_packet["stream_id"] = "stream-2"
+            try:
+                ManagerFunction.AgentHandleForwardJson(
+                    manager,
+                    0.0,
+                    0.0,
+                    json.dumps(restarted_sensor_packet),
+                    json.dumps(feedback_payload),
+                    "null")
+            except RuntimeError:
+                terminated_stream_rejected = True
+
+            failure_manager = object.__new__(ManagerFunction)
+            failure_manager.device = torch.device("cpu")
+            failure_manager.robot = Robot.CreateDefault()
+            failure_manager.brain_build_spec = BrainBuildSpec.Compile(
+                ModuleDim.CognitiveProfile(),
+                failure_manager.robot.ContractView)
+            failure_manager.perception_calibration_id = (
+                failure_manager.robot.ContractView.perception_projection.calibration_id)
+            failure_manager.active_sensor_stream_id = "stream-1"
+            failure_manager.active_world_frame_id = "sensor_stream:stream-1"
+            failure_manager.last_sensor_sequence_index = 0
+            failure_manager.pending_action_request = request
+            failure_manager.stream_terminated = False
+            failure_manager.agent_handle = object()
+            failure_manager.EncodeBrainFeedback(
+                feedback_payload,
+                batchSize=1)
+            failure_capture: Dict[str, Any] = {"calls": 0}
+
+            def FailForward(*args, **kwargs):
+                failure_capture["calls"] += 1
+                cached_request_id = failure_manager.robot.CachedRequestId
+                failure_capture["request_id"] = (
+                    None
+                    if cached_request_id is None
+                    else int(cached_request_id.item()))
+                raise RuntimeError("brain failure")
+
+            failure_manager.ForwardMaterializedContractBatch = FailForward
+            postcommit_failure_raised = False
+            try:
+                ManagerFunction.AgentHandleForwardJson(
+                    failure_manager,
+                    0.5,
+                    0.0,
+                    json.dumps(next_sensor_packet),
+                    json.dumps(next_feedback_payload),
+                    json.dumps(execution_payload))
+            except RuntimeError:
+                postcommit_failure_raised = True
+            postcommit_failure_terminated = bool(
+                postcommit_failure_raised
+                and failure_capture.get("request_id") == 1
+                and failure_capture["calls"] == 1
+                and failure_manager.robot.CachedRequestId is None
+                and failure_manager.pending_action_request is None
+                and failure_manager.active_sensor_stream_id is None
+                and failure_manager.active_world_frame_id is None
+                and failure_manager.last_sensor_sequence_index is None
+                and failure_manager.stream_terminated)
+            half_transaction_retry_rejected = False
+            try:
+                ManagerFunction.AgentHandleForwardJson(
+                    failure_manager,
+                    0.5,
+                    0.0,
+                    json.dumps(next_sensor_packet),
+                    json.dumps(next_feedback_payload),
+                    json.dumps(execution_payload))
+            except RuntimeError:
+                half_transaction_retry_rejected = True
+
             ok = (
-                result == "ok"
-                and captured["args"] == (sensor_packet["rgb"], 0.5, 0.0)
-                and captured["kwargs"]["feedbackPayload"] == feedback_payload
-                and captured["kwargs"]["textExt"] == sensor_packet["text_ext"]
-                and captured["kwargs"]["textTrust"] == sensor_packet["text_trust"]
-                and captured["kwargs"]["sampleActions"] is False
-                and captured["kwargs"]["deterministicActor"] is True
-                and captured["kwargs"]["depthBitmap"] == sensor_packet["depth"]
-                and captured["kwargs"]["depthValid"] == sensor_packet["depth_valid"]
-                and captured["kwargs"]["requestProvenance"] == {
+                set(response) == {
+                    "schema_version",
+                    "request_provenance",
+                    "action_request",
+                    "cognitive_readout",
+                    "intention_texts"}
+                and response["schema_version"] == DECISION_WIRE_SCHEMA_VERSION
+                and response["action_request"]["request_id"] == [1]
+                and response["cognitive_readout"]["request_id"] == [1]
+                and response["intention_texts"] == ["pick up the cup"]
+                and next_response["request_provenance"][
+                    "sequence_index"] == 1
+                and next_response["action_request"] is None
+                and type(captured["request"]) is ContractAgentActInput
+                and captured["request"].text_ext == sensor_packet["text_ext"]
+                and captured["request"].text_trust == sensor_packet["text_trust"]
+                and captured["request"].sample_actions is False
+                and captured["request"].deterministic_actor is True
+                and torch.allclose(
+                    captured["request"].reward,
+                    torch.tensor([0.5]))
+                and torch.allclose(
+                    captured["request"].done,
+                    torch.tensor([0.0]))
+                and captured["first_processing_counts"] == {
+                    "convert": 1,
+                    "encode_feedback": 1,
+                    "decode_feedback": 1,
+                    "validate_feedback": 1,
+                }
+                and captured["request_provenance"] == {
                     "stream_id": "stream-1",
                     "sequence_index": 0,
                     "frame_id": "frame-1",
-                    "calibration_id": "test-calibration",
+                    "calibration_id": manager.perception_calibration_id,
                     "world_frame_id": "sensor_stream:stream-1",
                     "description_id": (
                         manager.brain_build_spec.contract_view.description_id),
@@ -5534,14 +7543,33 @@ class TestManagerMTool:
                 and duplicate_rejected
                 and gap_rejected
                 and calibration_mismatch_rejected
-                and manager.active_sensor_stream_id == "stream-1"
-                and manager.active_world_frame_id == "sensor_stream:stream-1"
-                and manager.last_sensor_sequence_index == 0)
+                and missing_result_rejected
+                and invalid_text_rejected
+                and invalid_text_preserved
+                and invalid_image_rejected
+                and invalid_image_preserved
+                and invalid_feedback_rejected
+                and invalid_feedback_preserved
+                and early_feedback_rejected
+                and early_feedback_preserved
+                and captured["committed_request_ids"] == [-1, 1]
+                and terminated_stream_rejected
+                and postcommit_failure_terminated
+                and half_transaction_retry_rejected
+                and failure_capture["calls"] == 1
+                and manager.active_sensor_stream_id is None
+                and manager.active_world_frame_id is None
+                and manager.last_sensor_sequence_index is None
+                and manager.pending_action_request is None
+                and manager.stream_terminated
+                and manager.robot.CachedRequestId is None)
             print(f"Manager C++ decision wire contract {'passed' if ok else 'failed'}")
             return bool(ok)
         except Exception as e:
             print(f"Manager C++ decision wire contract error: {e}")
             return False
+        finally:
+            DataPreprocessor.ConvertCppPerceptionFrame = original_converter
 
     def TestSingleFramePreprocessContract(self) -> bool:
         try:
@@ -5681,6 +7709,654 @@ class TestManagerMTool:
             print(f"Manager offline preprocess contract error: {e}")
             return False
 
+    def BuildAutonomousHarness(
+        self,
+        *,
+        rolloutSteps: int = 4,
+        terminated: bool = False,
+        truncated: bool = True,
+        executionKnown: bool = True,
+        executionKnownSequence: Optional[Sequence[bool]] = None,
+        inactiveUnknown: bool = False,
+        executionStatus: Optional[SlotExecutionStatus] = None,
+        executionStatusSequence: Optional[Sequence[SlotExecutionStatus]] = None,
+        helpRequestedSequence: Optional[Sequence[bool]] = None,
+        helpAcceptedSequence: Optional[Sequence[bool]] = None,
+        actorCreditSequence: Optional[Sequence[bool]] = None,
+        hardStop: bool = False,
+        controllerOverride: bool = False,
+        plannerOverride: bool = False,
+    ) -> Tuple[
+        AutonomousInteractionTrainer,
+        DecisionExtractor,
+        Any,
+    ]:
+        robot = Robot.CreateDefault()
+        actor = TestDecisionMTool().MakeExtractor()
+        config = AutonomousPpoConfig(
+            rollout_steps=rolloutSteps,
+            ppo_epochs=2,
+            minibatch_size=2,
+            discount=0.5,
+            trace_decay=0.8,
+            entropy_coefficient=0.0,
+            help_request_cost=0.5)
+
+        class FakePolicy:
+            def __init__(self):
+                self.step_index = 0
+                self.value_scale = nn.Parameter(torch.tensor(0.25))
+                self.planner_enabled = True
+                self.value_calls = 0
+
+            def Reset(self, observation: Any) -> None:
+                self.step_index = 0
+                actor.EnsureB(1)
+                actor.ImportEligibilityState({
+                    "trace": torch.full_like(actor.elig_plasticity.trace, 0.1),
+                    "fast": torch.full_like(actor.elig_plasticity.fast, 0.05)}, 1)
+
+            def SetPlannerEnabled(self, enabled: bool) -> None:
+                self.planner_enabled = bool(enabled)
+
+            def PlannerEnabled(self) -> bool:
+                return bool(self.planner_enabled)
+
+            def Step(self, observation: Any) -> AutonomousPolicyOutput:
+                index = self.step_index
+                paths = (
+                    config.full_policy_path,
+                    config.full_policy_path,
+                    config.fast_policy_path,
+                    config.detail_policy_path)
+                candidates = (True, False, True, True)
+                caches = (False, True, False, False)
+                path = paths[min(index, len(paths) - 1)]
+                base_inputs = TestDecisionMTool().MakeBaseInputs(actor, 1)
+                base_inputs = {
+                    name: value
+                    for name, value in base_inputs.items()
+                    if name not in {"sample", "deterministic"}}
+                cached = torch.randn(1, actor.belief_dim)
+                detail = torch.randn(1, actor.goal_decision_context_dim)
+                eligibility = actor.ExportEligibilityState()
+                row_index = torch.zeros(1, dtype=torch.long)
+                if path == config.full_policy_path:
+                    decision = actor(
+                        **base_inputs,
+                        sample=True,
+                        deterministic=False)
+                elif path == config.fast_policy_path:
+                    decision = actor.ForwardFastRows(
+                        row_index,
+                        cached,
+                        **base_inputs,
+                        sample=True,
+                        deterministic=False)
+                else:
+                    decision = actor.ForwardDetailRows(
+                        row_index,
+                        cached,
+                        detail,
+                        **base_inputs,
+                        sample=True,
+                        deterministic=False)
+                candidate = candidates[min(index, len(candidates) - 1)]
+                cache = caches[min(index, len(caches) - 1)]
+                versions = (1, 1, 2, 3)
+                epochs = (1, 1, 2, 3)
+                version = versions[min(index, len(versions) - 1)]
+                action_epoch = epochs[min(index, len(epochs) - 1)]
+                timestamp = float(index + 1)
+                help_requested = (
+                    index == 2
+                    if helpRequestedSequence is None
+                    else bool(helpRequestedSequence[min(
+                        index,
+                        len(helpRequestedSequence) - 1)]))
+                candidate = candidate or help_requested
+                cache = cache and not help_requested
+                actor_credit = (
+                    candidate
+                    if actorCreditSequence is None
+                    else bool(actorCreditSequence[min(
+                        index,
+                        len(actorCreditSequence) - 1)]))
+                target_active = torch.zeros(
+                    1,
+                    robot.ContractView.end_effector_count,
+                    dtype=torch.bool)
+                if not help_requested:
+                    target_active[:, 0] = True
+                target_values = torch.zeros(
+                    1,
+                    robot.ContractView.end_effector_target_layout.PackedDim)
+                if not help_requested and index > 1:
+                    target_values[:, 0] = 0.1 * float(index - 1)
+                target = PackedEndEffectorTarget(
+                    values=target_values,
+                    active=target_active,
+                    contract_id=robot.ContractView.contract_id,
+                    model_signature=robot.ContractView.model_signature,
+                    target_version=torch.tensor([version]),
+                    timestamp=torch.tensor([timestamp]))
+                request = ActionRequest(
+                    request_id=torch.tensor([index + 1]),
+                    action_epoch=torch.tensor([action_epoch]),
+                    target=target,
+                    command_active=torch.tensor([not help_requested]),
+                    hold_requested=torch.tensor([False]),
+                    stop_requested=torch.tensor([help_requested]),
+                    help_requested=torch.tensor([help_requested]),
+                    policy_path=torch.tensor([path]),
+                    planner_override=torch.tensor([plannerOverride]),
+                    temporal_kind_id=torch.tensor([0]),
+                    timestamp=target.timestamp.clone())
+                value_hidden = torch.as_tensor(
+                    observation,
+                    dtype=torch.float32).reshape(1, 1)
+                value_conditioning = {
+                    "valueHidden": value_hidden,
+                    "valueBaseline": (
+                        self.value_scale * value_hidden.reshape(-1)
+                    ).detach().clone()}
+                value = self.ReevaluateValue(value_conditioning)
+                conditioning = actor.StorePolicyConditioning(decision)
+                behavior_probability = actor.RecomputeActionLogProbability(
+                    conditioning)["combinedActionLogProbability"]
+                policy_snapshot = {
+                    "policyPath": torch.tensor([path]),
+                    "cachedDecisionFeature": cached,
+                    "detailGoalFeature": detail,
+                    "stateFeat": base_inputs["stateFeat"],
+                    "intentFeat": base_inputs["intentFeat"],
+                    "valueTensor": base_inputs["valueTensor"],
+                    "vNextTensor": base_inputs["vNextTensor"],
+                    "uncertainty": base_inputs["uncertainty"],
+                    "confidence": base_inputs["confidence"],
+                    "precision": base_inputs["precision"],
+                    "risk": base_inputs["risk"],
+                    "worldHzx": base_inputs["worldHzx"],
+                    "prevFullDecisionState": base_inputs[
+                        "prevDecisionState"],
+                    "prevFastDecisionState": base_inputs[
+                        "prevDecisionState"],
+                    "prevDetailDecisionState": base_inputs[
+                        "prevDecisionState"],
+                    "prevFullLatentControl": base_inputs[
+                        "prevLatentControl"],
+                    "prevFastLatentControl": base_inputs[
+                        "prevLatentControl"],
+                    "prevDetailLatentControl": base_inputs[
+                        "prevLatentControl"],
+                    "prevActionEmbed": base_inputs["prevActionEmbed"],
+                    "prevFullMapperHidden": base_inputs[
+                        "prevMapperHidden"],
+                    "prevFastMapperHidden": base_inputs[
+                        "prevMapperHidden"],
+                    "prevDetailMapperHidden": base_inputs[
+                        "prevMapperHidden"],
+                    "feedbackTdError": base_inputs["feedbackTdError"],
+                    "prevFullOptionLogit": base_inputs[
+                        "prevOptionLogit"],
+                    "prevFastOptionLogit": base_inputs[
+                        "prevOptionLogit"],
+                    "prevDetailOptionLogit": base_inputs[
+                        "prevOptionLogit"],
+                    "uRaw": conditioning["uRaw"],
+                    "optionIndex": conditioning["optionIndex"],
+                    "eligibilityState": eligibility,
+                    "eligibilityFrozen": actor.EligibilityFrozen(),
+                }
+                self.step_index += 1
+                return AutonomousPolicyOutput(
+                    action_request=request,
+                    value_baseline=value,
+                    behavior_log_probability=behavior_probability,
+                    actor_credit_mask=torch.tensor([actor_credit]),
+                    candidate_selected=torch.tensor([candidate]),
+                    cache_selected=torch.tensor([cache]),
+                    neutral_selected=torch.tensor([not candidate and not cache]),
+                    controller_override=torch.tensor([
+                        controllerOverride and index == 0]),
+                    sensorimotor_inconsistency=torch.zeros(1),
+                    sensorimotor_valid=torch.zeros(1, dtype=torch.bool),
+                    policy_snapshot=AutonomousDecisionSnapshot(
+                        conditioning=conditioning,
+                        policy=policy_snapshot,
+                        value_conditioning=value_conditioning))
+
+            def Value(self, observation: Any) -> torch.Tensor:
+                self.value_calls += 1
+                value = torch.as_tensor(
+                    observation,
+                    dtype=torch.float32).reshape(-1)
+                return self.value_scale * value
+
+            def ValueAndReadout(
+                self,
+                observation: Any,
+            ) -> Tuple[torch.Tensor, Any]:
+                return self.Value(observation), None
+
+            def ReevaluateValue(
+                self,
+                valueConditioning: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                return (
+                    self.value_scale
+                    * valueConditioning["valueHidden"].reshape(-1))
+
+            def AfterOptimizerStep(self) -> None:
+                return None
+
+        class FakeEnvironment:
+            def __init__(self):
+                self.step_index = 0
+
+            def Reset(self) -> Any:
+                self.step_index = 0
+                return torch.tensor([1.0])
+
+            def MaterializeObservation(
+                self,
+                observation: Any,
+                robotValue: Robot,
+            ) -> Any:
+                return observation
+
+            def Step(
+                self,
+                actionRequest: ActionRequest,
+            ) -> EmbodiedEnvironmentTransition:
+                index = self.step_index
+                self.step_index += 1
+                final = self.step_index >= rolloutSteps
+                known = (
+                    executionKnown
+                    if executionKnownSequence is None
+                    else bool(executionKnownSequence[
+                        min(index, len(executionKnownSequence) - 1)]))
+                status = (
+                    int(SlotExecutionStatus.STOPPED)
+                    if actionRequest.help_requested.item()
+                    else int(SlotExecutionStatus.APPLIED))
+                if executionStatus is not None:
+                    status = int(executionStatus)
+                if executionStatusSequence is not None:
+                    status = int(executionStatusSequence[min(
+                        index,
+                        len(executionStatusSequence) - 1)])
+                if not known:
+                    status = int(SlotExecutionStatus.UNKNOWN)
+                if hardStop:
+                    status = int(SlotExecutionStatus.STOPPED)
+                applied_target = actionRequest.target
+                if status == int(SlotExecutionStatus.STOPPED) or hardStop:
+                    applied_target = PackedEndEffectorTarget(
+                        values=torch.zeros_like(actionRequest.target.values),
+                        active=torch.zeros_like(actionRequest.target.active),
+                        contract_id=robot.ContractView.contract_id,
+                        model_signature=robot.ContractView.model_signature,
+                        target_version=actionRequest.target.target_version.clone(),
+                        timestamp=actionRequest.timestamp.clone())
+                elif (
+                    not known
+                    or status in (
+                        int(SlotExecutionStatus.REJECTED),
+                        int(SlotExecutionStatus.HELD))
+                ):
+                    cached_values = robot.CachedTargetValues
+                    cached_active = robot.CachedTargetActive
+                    cached_version = robot.CachedTargetVersion
+                    applied_target = PackedEndEffectorTarget(
+                        values=(
+                            torch.zeros_like(actionRequest.target.values)
+                            if cached_values is None
+                            else cached_values.detach().clone()),
+                        active=(
+                            torch.zeros_like(actionRequest.target.active)
+                            if cached_active is None
+                            else cached_active.detach().clone()),
+                        contract_id=robot.ContractView.contract_id,
+                        model_signature=robot.ContractView.model_signature,
+                        target_version=(
+                            actionRequest.target.target_version.clone()
+                            if cached_version is None
+                            else cached_version.clamp_min(0).detach().clone()),
+                        timestamp=actionRequest.timestamp.clone())
+                status_tensor = torch.full(
+                    (1, robot.ContractView.end_effector_count),
+                    status,
+                    dtype=torch.long)
+                known_tensor = torch.full(
+                    (1, robot.ContractView.end_effector_count),
+                    known,
+                    dtype=torch.bool)
+                if inactiveUnknown:
+                    status_tensor.fill_(int(SlotExecutionStatus.UNKNOWN))
+                    known_tensor.zero_()
+                    status_tensor[actionRequest.target.active] = int(
+                        SlotExecutionStatus.APPLIED)
+                    known_tensor[actionRequest.target.active] = True
+                result = ActionExecutionResult(
+                    request_id=actionRequest.request_id.clone(),
+                    action_epoch=actionRequest.action_epoch.clone(),
+                    applied_target=applied_target,
+                    execution_status=status_tensor,
+                    execution_known=known_tensor,
+                    hard_stop=torch.tensor([hardStop]),
+                    help_accepted=torch.tensor([
+                        index == 2
+                        if helpAcceptedSequence is None
+                        else bool(helpAcceptedSequence[min(
+                            index,
+                            len(helpAcceptedSequence) - 1)])]),
+                    timestamp=actionRequest.timestamp + 0.1)
+                rewards = (1.0, 2.0, 3.0, 4.0)
+                return EmbodiedEnvironmentTransition(
+                    observation=torch.tensor([float(self.step_index + 1)]),
+                    execution_result=result,
+                    reward=torch.tensor([
+                        rewards[min(index, len(rewards) - 1)]]),
+                    terminated=torch.tensor([final and terminated]),
+                    truncated=torch.tensor([final and truncated]))
+
+        policy = FakePolicy()
+        trainer = AutonomousInteractionTrainer(
+            FakeEnvironment(),
+            policy,
+            actor,
+            robot,
+            torch.optim.Adam(actor.parameters(), lr=1e-3),
+            torch.optim.Adam([policy.value_scale], lr=1e-3),
+            config)
+        return trainer, actor, policy
+
+    def TestAutonomousInteractionPpo(self) -> bool:
+        try:
+            torch.manual_seed(71)
+            trainer, actor, policy = self.BuildAutonomousHarness()
+            rollout_state = actor.ExportEligibilityState()
+            records = trainer.CollectRollout()
+            expected_advantage = torch.tensor([2.5295, 3.7, 3.625])
+            rollout_ok = bool(
+                len(records) == 3
+                and [record.policy_path for record in records] == [
+                    POLICY_PATH_FULL,
+                    POLICY_PATH_FAST,
+                    POLICY_PATH_DETAIL]
+                and [record.duration for record in records] == [2, 1, 1]
+                and torch.allclose(torch.stack([
+                    record.reward for record in records]),
+                    torch.tensor([2.0, 2.5, 4.0]))
+                and torch.allclose(torch.stack([
+                    record.advantage for record in records]),
+                    expected_advantage,
+                    atol=1e-5,
+                    rtol=1e-5)
+                and records[-1].truncated
+                and not records[-1].terminated
+                and torch.allclose(records[-1].next_value, torch.tensor(1.25))
+                and records[1].help_requested
+                and records[1].help_accepted
+                and policy.planner_enabled
+                and not actor.EligibilityFrozen()
+                and all(torch.equal(
+                    rollout_state[name],
+                    actor.ExportEligibilityState()[name])
+                    for name in rollout_state))
+            state_before = actor.ExportEligibilityState()
+            actor_before = torch.cat([
+                parameter.detach().flatten()
+                for parameter in actor.parameters()]).clone()
+            value_before = policy.value_scale.detach().clone()
+            metrics = trainer.OptimizePpo(records)
+            state_after = actor.ExportEligibilityState()
+            actor_after = torch.cat([
+                parameter.detach().flatten()
+                for parameter in actor.parameters()])
+            optimization_ok = bool(
+                metrics["sample_count"] == 3.0
+                and metrics["full_count"] == 2.0
+                and metrics["fast_count"] == 2.0
+                and metrics["detail_count"] == 2.0
+                and metrics["help_acceptance"] == 1.0
+                and not actor.EligibilityFrozen()
+                and all(
+                    torch.equal(state_before[name], state_after[name])
+                    for name in state_before)
+                and not torch.equal(actor_before, actor_after)
+                and not torch.equal(value_before, policy.value_scale.detach()))
+            return rollout_ok and optimization_ok
+        except Exception as error:
+            print(f"Manager autonomous PPO error: {error}")
+            return False
+
+    def TestAutonomousTerminationAndExclusion(self) -> bool:
+        try:
+            terminated_trainer, _, terminated_policy = self.BuildAutonomousHarness(
+                rolloutSteps=1,
+                terminated=True,
+                truncated=False)
+            terminated_records = terminated_trainer.CollectRollout()
+            unknown_trainer, _, _ = self.BuildAutonomousHarness(
+                rolloutSteps=1,
+                executionKnown=False)
+            unknown_records = unknown_trainer.CollectRollout()
+            override_trainer, _, _ = self.BuildAutonomousHarness(
+                rolloutSteps=1,
+                controllerOverride=True)
+            override_records = override_trainer.CollectRollout()
+            planner_trainer, _, _ = self.BuildAutonomousHarness(
+                rolloutSteps=1,
+                plannerOverride=True)
+            planner_rejected = False
+            try:
+                planner_trainer.CollectRollout()
+            except RuntimeError:
+                planner_rejected = True
+            return bool(
+                len(terminated_records) == 1
+                and terminated_records[0].terminated
+                and not terminated_records[0].truncated
+                and float(terminated_records[0].next_value.item()) == 0.0
+                and terminated_policy.value_calls == 0
+                and len(unknown_records) == 0
+                and len(override_records) == 0
+                and planner_rejected)
+        except Exception as error:
+            print(f"Manager autonomous termination error: {error}")
+            return False
+
+    def TestAutonomousExecutionCreditBoundaries(self) -> bool:
+        try:
+            interrupted_trainer, _, _ = self.BuildAutonomousHarness(
+                rolloutSteps=2,
+                executionKnownSequence=(True, False))
+            interrupted_records = interrupted_trainer.CollectRollout()
+            partial_feedback_trainer, _, _ = self.BuildAutonomousHarness(
+                rolloutSteps=1,
+                inactiveUnknown=True)
+            partial_feedback_records = partial_feedback_trainer.CollectRollout()
+            rejected_trainer, _, _ = self.BuildAutonomousHarness(
+                rolloutSteps=1,
+                executionStatus=SlotExecutionStatus.REJECTED)
+            rejected_records = rejected_trainer.CollectRollout()
+            stopped_trainer, _, _ = self.BuildAutonomousHarness(
+                rolloutSteps=1,
+                executionStatus=SlotExecutionStatus.STOPPED)
+            stopped_records = stopped_trainer.CollectRollout()
+            hard_stop_trainer, _, _ = self.BuildAutonomousHarness(
+                rolloutSteps=1,
+                hardStop=True)
+            hard_stop_records = hard_stop_trainer.CollectRollout()
+            tolerance_trainer, _, tolerance_policy = (
+                self.BuildAutonomousHarness(rolloutSteps=1))
+            tolerance_trainer.robot.Reset()
+            tolerance_observation = (
+                tolerance_trainer.environment.MaterializeObservation(
+                    tolerance_trainer.environment.Reset(),
+                    tolerance_trainer.robot))
+            tolerance_policy.Reset(tolerance_observation)
+            tolerance_output = tolerance_policy.Step(tolerance_observation)
+            tolerance_transition = tolerance_trainer.environment.Step(
+                tolerance_output.action_request)
+            tolerance_result = tolerance_transition.execution_result
+            tolerant_values = tolerance_result.applied_target.values.clone()
+            tolerant_values[:, 0] += 0.5 * float(
+                tolerance_trainer.robot.ContractView
+                .end_effector_target_tolerance[0])
+            tolerant_target = PackedEndEffectorTarget(
+                values=tolerant_values,
+                active=tolerance_result.applied_target.active.clone(),
+                contract_id=tolerance_result.applied_target.contract_id,
+                model_signature=(
+                    tolerance_result.applied_target.model_signature),
+                target_version=(
+                    tolerance_result.applied_target.target_version.clone()),
+                timestamp=tolerance_result.applied_target.timestamp.clone())
+            tolerant_result = ActionExecutionResult(
+                request_id=tolerance_result.request_id.clone(),
+                action_epoch=tolerance_result.action_epoch.clone(),
+                applied_target=tolerant_target,
+                execution_status=tolerance_result.execution_status.clone(),
+                execution_known=tolerance_result.execution_known.clone(),
+                hard_stop=tolerance_result.hard_stop.clone(),
+                help_accepted=tolerance_result.help_accepted.clone(),
+                timestamp=tolerance_result.timestamp.clone())
+            tolerance_record = tolerance_trainer.CreateRecord(
+                tolerance_output,
+                tolerance_transition.execution_result,
+                0,
+                None)
+            return bool(
+                len(interrupted_records) == 1
+                and interrupted_records[0].duration == 1
+                and torch.allclose(
+                    interrupted_records[0].reward,
+                    torch.tensor(1.0))
+                and torch.allclose(
+                    interrupted_records[0].next_value,
+                    torch.tensor(0.5))
+                and len(partial_feedback_records) == 1
+                and len(rejected_records) == 0
+                and len(stopped_records) == 0
+                and len(hard_stop_records) == 0
+                and bool(tolerance_trainer.ExecutionMatchesRequest(
+                    tolerance_output.action_request,
+                    tolerant_result).item())
+                and tolerance_trainer.RecordTargetMatches(
+                    tolerance_record,
+                    tolerant_result,
+                    0))
+        except Exception as error:
+            print(f"Manager autonomous execution credit error: {error}")
+            return False
+
+    def TestAutonomousAppliedExecutionSegmentation(self) -> bool:
+        try:
+            def Collect(
+                finalStatus: SlotExecutionStatus,
+                known: bool = True,
+                helpRequested: bool = False,
+            ) -> List[AutonomousRolloutRecord]:
+                trainer, _, _ = self.BuildAutonomousHarness(
+                    rolloutSteps=3,
+                    executionStatusSequence=(
+                        SlotExecutionStatus.APPLIED,
+                        SlotExecutionStatus.APPLIED,
+                        finalStatus),
+                    executionKnownSequence=(True, True, known),
+                    helpRequestedSequence=(
+                        False,
+                        False,
+                        helpRequested),
+                    helpAcceptedSequence=(False, False, False))
+                return trainer.CollectRollout()
+
+            rejected = Collect(SlotExecutionStatus.REJECTED)
+            held = Collect(SlotExecutionStatus.HELD)
+            help_rejected = Collect(
+                SlotExecutionStatus.REJECTED,
+                helpRequested=True)
+            modified = Collect(SlotExecutionStatus.MODIFIED)
+            stopped = Collect(SlotExecutionStatus.STOPPED)
+            unknown = Collect(
+                SlotExecutionStatus.UNKNOWN,
+                known=False)
+            delayed_trainer, _, _ = self.BuildAutonomousHarness(
+                rolloutSteps=4,
+                helpRequestedSequence=(False, False, True, True),
+                helpAcceptedSequence=(False, False, False, True),
+                actorCreditSequence=(True, False, True, True))
+            delayed = delayed_trainer.CollectRollout()
+            repeated_help_trainer, _, _ = self.BuildAutonomousHarness(
+                rolloutSteps=2,
+                helpRequestedSequence=(True, True),
+                helpAcceptedSequence=(False, True),
+                actorCreditSequence=(True, True))
+            repeated_help = repeated_help_trainer.CollectRollout()
+            continued = rejected + held
+            disrupted = modified + stopped + unknown
+            return bool(
+                all(len(records) == 1 for records in (
+                    rejected,
+                    held,
+                    modified,
+                    stopped,
+                    unknown))
+                and all(record.duration == 3 for record in continued)
+                and all(torch.allclose(
+                    record.reward,
+                    torch.tensor(2.75)) for record in continued)
+                and all(record.applied_action_epoch == 1 for record in continued)
+                and all(bool(record.applied_target_active[0].item()) for record in continued)
+                and all(torch.equal(
+                    record.applied_target_values,
+                    torch.zeros_like(record.applied_target_values)) for record in continued)
+                and len(help_rejected) == 2
+                and help_rejected[0].duration == 2
+                and torch.allclose(
+                    help_rejected[0].reward,
+                    torch.tensor(2.0))
+                and not help_rejected[0].help_requested
+                and help_rejected[0].trace_continues
+                and help_rejected[1].duration == 1
+                and torch.allclose(
+                    help_rejected[1].reward,
+                    torch.tensor(2.5))
+                and help_rejected[1].help_requested
+                and not help_rejected[1].help_accepted
+                and help_rejected[1].help_pending
+                and len(delayed) == 2
+                and delayed[0].duration == 2
+                and torch.allclose(delayed[0].reward, torch.tensor(2.0))
+                and delayed[0].trace_continues
+                and delayed[1].duration == 2
+                and torch.allclose(delayed[1].reward, torch.tensor(4.25))
+                and delayed[1].help_requested
+                and delayed[1].help_accepted
+                and not delayed[1].help_pending
+                and len(repeated_help) == 1
+                and repeated_help[0].duration == 2
+                and torch.allclose(
+                    repeated_help[0].reward,
+                    torch.tensor(1.25))
+                and repeated_help[0].help_requested
+                and repeated_help[0].help_accepted
+                and not repeated_help[0].help_pending
+                and all(record.duration == 2 for record in disrupted)
+                and all(torch.allclose(
+                    record.reward,
+                    torch.tensor(2.0)) for record in disrupted)
+                and all(torch.allclose(
+                    record.next_value,
+                    torch.tensor(0.75)) for record in disrupted))
+        except Exception as error:
+            print(f"Manager applied execution segmentation error: {error}")
+            return False
+
     def RunAll(self) -> Dict[str, bool]:
         results = {
             "DeploymentConfigurationRouting": self.TestDeploymentConfigurationRouting(),
@@ -5692,11 +8368,19 @@ class TestManagerMTool:
             "LoadBrainWeightsStrictModelStateAndSync": self.TestLoadBrainWeightsStrictModelStateAndSync(),
             "TrainStageIsolationContract": self.TestTrainStageIsolationContract(),
             "TemporalEnvelopeProjection": self.TestTemporalEnvelopeProjection(),
+            "OcrTrainingArtifactFallback": self.TestOcrTrainingArtifactFallback(),
             "OcrCheckpointStrictContract": self.TestOcrCheckpointStrictContract(),
             "SequentialLoaderRejectsEmptyRecurrentSplit": self.TestSequentialLoaderRejectsEmptyRecurrentSplit(),
             "CppDecisionWireContract": self.TestCppDecisionWireContract(),
             "SingleFramePreprocessContract": self.TestSingleFramePreprocessContract(),
-            "OfflinePreprocessStrictContract": self.TestOfflinePreprocessStrictContract(),}
+            "OfflinePreprocessStrictContract": self.TestOfflinePreprocessStrictContract(),
+            "AutonomousInteractionPpo": self.TestAutonomousInteractionPpo(),
+            "AutonomousTerminationAndExclusion": (
+                self.TestAutonomousTerminationAndExclusion()),
+            "AutonomousExecutionCreditBoundaries": (
+                self.TestAutonomousExecutionCreditBoundaries()),
+            "AutonomousAppliedExecutionSegmentation": (
+                self.TestAutonomousAppliedExecutionSegmentation()),}
         passed = sum(1 for v in results.values() if v)
         print(f"\nManager tests: {passed}/{len(results)} passed.")
         return results
@@ -5783,6 +8467,8 @@ class ContractInferenceAgent(Agent):
                 "contract brain must return PackedEndEffectorTarget")
         self.CommitPendingWorldAutosave()
         return ContractAgentActOutput(
+            action_request=step_out.action_request,
+            cognitive_readout=step_out.cognitive_readout,
             packed_target=packedTarget,
             packed_temporal=step_out.decision.get("packed_temporal"),
             decision=step_out.decision,

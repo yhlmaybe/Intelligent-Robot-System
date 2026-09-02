@@ -124,17 +124,17 @@ CONTRACT_PREDICATES: Tuple[str, ...] = (
 CONTRACT_EVIDENCE_FIELDS: Tuple[str, ...] = (
     "progress",
     "reached",
-    "child_enabled",
+    "phase_enabled",
+    "phase_known",
     "endpoint_present",
-    "target_active",
-    "target_known",
-    "endpoint_state_present",
+    "applied_target_active",
+    "execution_known",
     "parent_ready",
     "execution_progress",
-    "execution_active",
+    "execution_progress_known",
     "execution_reached",
-    "execution_failed",
-    "safe_known",
+    "execution_reached_known",
+    "hard_stop",
     "plan_stale",
 )
 
@@ -277,8 +277,8 @@ class ContractNeuroSymbolicGrounder(AGICoreModule):
         packet: BrainFeedbackPacket,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return (
-            torch.ones_like(packet.target_active),
-            packet.target_active)
+            packet.phase_enabled,
+            packet.phase_known)
 
     @staticmethod
     def PlanPredicate(
@@ -369,41 +369,41 @@ class ContractNeuroSymbolicGrounder(AGICoreModule):
             parent_ready[:, child_index] = packet.reached.index_select(
                 1, selected_parent_index)
             parent_ready_known[:, child_index] = (
-                packet.endpoint_present.index_select(
-                    1, selected_parent_index))
+                packet.phase_known.index_select(1, child_index))
 
         command_allowed, command_known = self.CommandPredicate(packet)
         plan_stale, plan_stale_known = self.PlanPredicate(
             packet,
             planStale,
             planStaleKnown)
-        execution_active = packet.target_active
-        active_present = execution_active.any(dim=-1)
+        execution_active = packet.applied_target_active
         active_present = execution_active & packet.endpoint_present
         active_count = active_present.to(dtype=dtype).sum(
             dim=-1).clamp_min(1.0)
         execution_progress = (
             packet.progress * active_present.to(dtype=dtype)
         ).sum(dim=-1) / active_count
+        execution_progress_known = active_present.any(dim=-1)
         execution_reached = (
-            active_present
+            execution_active.any(dim=-1)
             & (packet.reached | ~execution_active).all(dim=-1))
-        execution_failed = (
-            execution_active & ~packet.endpoint_present).any(dim=-1)
-        aggregate_safe = ~execution_failed
-        aggregate_safe_known = execution_failed
+        execution_reached_known = (
+            packet.endpoint_present | ~execution_active).all(dim=-1)
+        aggregate_safe = ~packet.hard_stop
+        aggregate_safe_known = (
+            packet.execution_result_known | packet.hard_stop)
 
         slot_predicate_value = torch.stack([
             has_parent,
             parent_ready,
-            packet.child_enabled,
+            packet.phase_enabled,
             packet.endpoint_present,
             command_allowed,
         ], dim=-1)
         slot_predicate_known = torch.stack([
             torch.ones_like(has_parent),
             parent_ready_known,
-            torch.ones_like(packet.child_enabled),
+            packet.phase_known,
             torch.ones_like(packet.endpoint_present),
             command_known,
         ], dim=-1)
@@ -433,22 +433,20 @@ class ContractNeuroSymbolicGrounder(AGICoreModule):
         def Broadcast(value: torch.Tensor) -> torch.Tensor:
             return value.to(dtype=dtype).unsqueeze(-1).expand(-1, slot_count)
 
-        endpoint_state_present = packet.endpoint_present.to(dtype=dtype)
-
         evidence = torch.stack([
             packet.progress,
             packet.reached.to(dtype=dtype),
-            packet.child_enabled.to(dtype=dtype),
+            packet.phase_enabled.to(dtype=dtype),
+            packet.phase_known.to(dtype=dtype),
             packet.endpoint_present.to(dtype=dtype),
-            packet.target_active.to(dtype=dtype),
-            Broadcast(packet.target_version.ge(0)),
-            endpoint_state_present,
+            packet.applied_target_active.to(dtype=dtype),
+            packet.execution_known.to(dtype=dtype),
             parent_ready.to(dtype=dtype),
             Broadcast(execution_progress),
-            Broadcast(active_present),
+            Broadcast(execution_progress_known),
             Broadcast(execution_reached),
-            Broadcast(execution_failed),
-            Broadcast(aggregate_safe_known),
+            Broadcast(execution_reached_known),
+            Broadcast(packet.hard_stop),
             Broadcast(plan_stale),
         ], dim=-1)
         static_tokens = torch.tensor(

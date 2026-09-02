@@ -1778,6 +1778,225 @@ class CognitiveValueOut(NamedTuple):
     eventReasonLogits: torch.Tensor
 
 
+class PotentialShapingOut(NamedTuple):
+    shapedReward: torch.Tensor
+    shapingReward: torch.Tensor
+    previousPotential: torch.Tensor
+    nextPotential: torch.Tensor
+    previousKnown: torch.Tensor
+    nextKnown: torch.Tensor
+
+
+class SmdpAdvantageOut(NamedTuple):
+    optionReward: torch.Tensor
+    temporalDifference: torch.Tensor
+    advantage: torch.Tensor
+    returnTarget: torch.Tensor
+    bootstrapDiscount: torch.Tensor
+    traceDiscount: torch.Tensor
+
+
+class SensorimotorPotentialShaper(AGICoreModule):
+    def __init__(
+        self,
+        discount: float = 0.99,
+        scale: float = 1.0,
+    ):
+        super().__init__()
+        self.discount = float(discount)
+        self.scale = float(scale)
+        self.register_buffer(
+            "last_potential",
+            torch.empty(0, dtype=torch.float32),
+            persistent=False)
+        self.register_buffer(
+            "potential_known",
+            torch.empty(0, dtype=torch.bool),
+            persistent=False)
+
+    @torch.no_grad()
+    def EnsureBatch(self, reference: torch.Tensor):
+        batch_size = int(reference.shape[0])
+        if self.last_potential.shape != (batch_size,):
+            self.last_potential = reference.new_zeros(batch_size)
+            self.potential_known = torch.zeros(
+                batch_size,
+                dtype=torch.bool,
+                device=reference.device)
+
+    @torch.no_grad()
+    def ResetState(self, resetMask: Optional[torch.Tensor] = None):
+        if resetMask is None:
+            self.last_potential.zero_()
+            self.potential_known.zero_()
+            return
+        reset_mask = resetMask.bool().view(-1)
+        self.last_potential.masked_fill_(reset_mask, 0.0)
+        self.potential_known.logical_and_(~reset_mask)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        baseReward: torch.Tensor,
+        inconsistency: torch.Tensor,
+        observationValid: torch.Tensor,
+        duration: torch.Tensor,
+        terminated: torch.Tensor,
+        truncated: Optional[torch.Tensor] = None,
+        commitMask: Optional[torch.Tensor] = None,
+    ) -> PotentialShapingOut:
+        reward = baseReward.view(-1)
+        self.EnsureBatch(reward)
+        valid = observationValid.bool().view(-1)
+        terminal = terminated.bool().view(-1)
+        cutoff = (
+            torch.zeros_like(terminal)
+            if truncated is None
+            else truncated.bool().view(-1))
+        commit = (
+            torch.ones_like(terminal)
+            if commitMask is None
+            else commitMask.bool().view(-1))
+        duration_value = duration.to(
+            device=reward.device,
+            dtype=reward.dtype).view(-1).clamp_min(0.0)
+        energy = inconsistency.to(
+            device=reward.device,
+            dtype=reward.dtype).reshape(reward.shape[0], -1).mean(dim=-1)
+        observed_potential = -energy
+        previous_known = self.potential_known.clone()
+        held_potential = torch.where(
+            valid,
+            observed_potential,
+            self.last_potential)
+        held_known = valid | previous_known
+        previous_potential = torch.where(
+            previous_known,
+            self.last_potential,
+            held_potential)
+        next_potential = torch.where(
+            terminal,
+            torch.zeros_like(held_potential),
+            held_potential)
+        bootstrap_discount = torch.pow(
+            reward.new_full((), self.discount),
+            duration_value)
+        shaping_reward = self.scale * (
+            bootstrap_discount * next_potential - previous_potential)
+        shaping_reward = torch.where(
+            previous_known & held_known,
+            shaping_reward,
+            torch.zeros_like(shaping_reward))
+        ended = terminal | cutoff
+        stored_potential = torch.where(
+            ended,
+            torch.zeros_like(held_potential),
+            held_potential)
+        stored_known = held_known & ~ended
+        self.last_potential.copy_(torch.where(
+            commit,
+            stored_potential,
+            self.last_potential))
+        self.potential_known.copy_(torch.where(
+            commit,
+            stored_known,
+            self.potential_known))
+        return PotentialShapingOut(
+            shapedReward=reward + shaping_reward,
+            shapingReward=shaping_reward,
+            previousPotential=previous_potential,
+            nextPotential=next_potential,
+            previousKnown=previous_known,
+            nextKnown=held_known & ~terminal)
+
+
+class SmdpReturnEstimator:
+    @staticmethod
+    def DiscountOptionRewards(
+        primitiveRewards: torch.Tensor,
+        duration: torch.Tensor,
+        discount: float,
+        rewardValid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        horizon = int(primitiveRewards.shape[-1])
+        duration_value = duration.to(
+            device=primitiveRewards.device).long().clamp(0, horizon)
+        step = torch.arange(
+            horizon,
+            device=primitiveRewards.device,
+            dtype=primitiveRewards.dtype)
+        active = step.view(*([1] * duration_value.dim()), horizon) < duration_value.unsqueeze(-1)
+        if rewardValid is not None:
+            active = active & rewardValid.bool()
+        weights = torch.pow(
+            primitiveRewards.new_full((), float(discount)),
+            step)
+        return (
+            primitiveRewards
+            * active.to(dtype=primitiveRewards.dtype)
+            * weights.view(*([1] * duration_value.dim()), horizon)
+        ).sum(dim=-1)
+
+    @staticmethod
+    def EstimateAdvantages(
+        optionReward: torch.Tensor,
+        values: torch.Tensor,
+        duration: torch.Tensor,
+        terminated: torch.Tensor,
+        truncated: torch.Tensor,
+        valid: Optional[torch.Tensor] = None,
+        discount: float = 0.99,
+        traceDecay: float = 0.95,
+    ) -> SmdpAdvantageOut:
+        transition_valid = (
+            torch.ones_like(optionReward, dtype=torch.bool)
+            if valid is None
+            else valid.bool())
+        terminal = terminated.bool()
+        cutoff = truncated.bool()
+        duration_value = duration.to(
+            device=optionReward.device,
+            dtype=optionReward.dtype).clamp_min(0.0)
+        bootstrap_discount = torch.pow(
+            optionReward.new_full((), float(discount)),
+            duration_value)
+        trace_discount = torch.pow(
+            optionReward.new_full((), float(discount) * float(traceDecay)),
+            duration_value)
+        current_value = values[:-1]
+        next_value = values[1:]
+        temporal_difference = (
+            optionReward
+            + bootstrap_discount * (~terminal).to(optionReward.dtype) * next_value
+            - current_value)
+        temporal_difference = torch.where(
+            transition_valid,
+            temporal_difference,
+            torch.zeros_like(temporal_difference))
+        advantage = torch.zeros_like(optionReward)
+        continuation = transition_valid & ~terminal & ~cutoff
+        carried = values.new_zeros(values.shape[1:])
+        for time_index in range(int(optionReward.shape[0]) - 1, -1, -1):
+            current_advantage = (
+                temporal_difference[time_index]
+                + trace_discount[time_index]
+                * continuation[time_index].to(optionReward.dtype)
+                * carried)
+            current_advantage = torch.where(
+                transition_valid[time_index],
+                current_advantage,
+                torch.zeros_like(current_advantage))
+            advantage[time_index] = current_advantage
+            carried = current_advantage
+        return SmdpAdvantageOut(
+            optionReward=optionReward,
+            temporalDifference=temporal_difference,
+            advantage=advantage,
+            returnTarget=advantage + current_value,
+            bootstrapDiscount=bootstrap_discount,
+            traceDiscount=trace_discount)
+
+
 class ResidualMLPBlock(nn.Module):
     def __init__(
         self,
@@ -2114,6 +2333,40 @@ class ValueEstimationExtractor(AGICoreModule):
             feasibility=torch.sigmoid(metrics[:, 5]),
             safetyConstraint=torch.sigmoid(metrics[:, 6]),
             eventReasonLogits=self.cognitive_event_reason_head(feature))
+
+    def StoreValueConditioning(
+        self,
+        valueOutput: GeoTropicalOut,
+    ) -> Dict[str, torch.Tensor]:
+        if not isinstance(valueOutput, GeoTropicalOut):
+            raise TypeError("valueOutput must be GeoTropicalOut")
+        return {
+            "valueHidden": valueOutput.valueHidden.detach().clone(),
+            "valueBaseline": valueOutput.returnValue.detach().clone(),
+        }
+
+    def RecomputeReturnValue(
+        self,
+        conditioning: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if set(conditioning) != {"valueHidden", "valueBaseline"}:
+            raise ValueError("value conditioning fields do not match")
+        hidden = conditioning["valueHidden"]
+        baseline = conditioning["valueBaseline"]
+        if (
+            not torch.is_tensor(hidden)
+            or hidden.dim() != 2
+            or int(hidden.size(1)) != self.return_value_head.in_features
+            or not hidden.is_floating_point()
+            or not bool(torch.isfinite(hidden).all().item())
+            or not torch.is_tensor(baseline)
+            or tuple(baseline.shape) != (int(hidden.size(0)),)
+            or baseline.device != hidden.device
+            or baseline.dtype != hidden.dtype
+            or not bool(torch.isfinite(baseline).all().item())
+        ):
+            raise ValueError("value conditioning tensors do not match")
+        return self.return_value_head(hidden).squeeze(-1)
 
     def BuildCognitiveProxy(
         self,
@@ -6199,6 +6452,149 @@ class TestValueEstimationMTool:
             print(f"ForwardCognitiveValueSignals error: {error}")
             return False
 
+    def TestSensorimotorPotentialShaping(self) -> bool:
+        try:
+            shaper = SensorimotorPotentialShaper(
+                discount=0.5,
+                scale=1.0).to(self.device)
+            first = shaper(
+                baseReward=torch.zeros(1, device=self.device),
+                inconsistency=torch.tensor([2.0], device=self.device),
+                observationValid=torch.tensor([True], device=self.device),
+                duration=torch.ones(1, device=self.device),
+                terminated=torch.tensor([False], device=self.device))
+            missing = shaper(
+                baseReward=torch.zeros(1, device=self.device),
+                inconsistency=torch.tensor([99.0], device=self.device),
+                observationValid=torch.tensor([False], device=self.device),
+                duration=torch.ones(1, device=self.device),
+                terminated=torch.tensor([False], device=self.device))
+            terminal = shaper(
+                baseReward=torch.zeros(1, device=self.device),
+                inconsistency=torch.tensor([1.0], device=self.device),
+                observationValid=torch.tensor([True], device=self.device),
+                duration=torch.ones(1, device=self.device),
+                terminated=torch.tensor([True], device=self.device))
+            restart = shaper(
+                baseReward=torch.zeros(1, device=self.device),
+                inconsistency=torch.tensor([4.0], device=self.device),
+                observationValid=torch.tensor([True], device=self.device),
+                duration=torch.ones(1, device=self.device),
+                terminated=torch.tensor([False], device=self.device))
+            cutoff = shaper(
+                baseReward=torch.zeros(1, device=self.device),
+                inconsistency=torch.tensor([2.0], device=self.device),
+                observationValid=torch.tensor([True], device=self.device),
+                duration=torch.ones(1, device=self.device),
+                terminated=torch.tensor([False], device=self.device),
+                truncated=torch.tensor([True], device=self.device))
+            return bool(
+                torch.allclose(first.shapingReward, torch.tensor([0.0], device=self.device))
+                and torch.allclose(missing.previousPotential, torch.tensor([-2.0], device=self.device))
+                and torch.allclose(missing.nextPotential, torch.tensor([-2.0], device=self.device))
+                and torch.allclose(missing.shapingReward, torch.tensor([1.0], device=self.device))
+                and torch.allclose(terminal.nextPotential, torch.tensor([0.0], device=self.device))
+                and torch.allclose(terminal.shapingReward, torch.tensor([2.0], device=self.device))
+                and not bool(shaper.potential_known.item())
+                and torch.allclose(restart.shapingReward, torch.tensor([0.0], device=self.device))
+                and torch.allclose(cutoff.previousPotential, torch.tensor([-4.0], device=self.device))
+                and torch.allclose(cutoff.nextPotential, torch.tensor([-2.0], device=self.device))
+                and torch.allclose(cutoff.shapingReward, torch.tensor([3.0], device=self.device)))
+        except Exception as error:
+            print(f"SensorimotorPotentialShaping error: {error}")
+            return False
+
+    def TestSmdpDiscountedOptionReward(self) -> bool:
+        try:
+            primitive_rewards = torch.tensor(
+                [
+                    [[1.0, 2.0, 100.0], [2.0, 4.0, 8.0]],
+                    [[3.0, 99.0, 99.0], [4.0, 8.0, 16.0]],
+                ],
+                device=self.device)
+            duration = torch.tensor(
+                [[2, 3], [1, 2]],
+                device=self.device)
+            reward_valid = torch.tensor(
+                [
+                    [[True, True, True], [True, True, True]],
+                    [[True, True, True], [True, False, True]],
+                ],
+                device=self.device)
+            option_reward = SmdpReturnEstimator.DiscountOptionRewards(
+                primitive_rewards,
+                duration,
+                discount=0.5,
+                rewardValid=reward_valid)
+            expected = torch.tensor(
+                [[2.0, 6.0], [3.0, 4.0]],
+                device=self.device)
+            return bool(torch.allclose(option_reward, expected))
+        except Exception as error:
+            print(f"SmdpDiscountedOptionReward error: {error}")
+            return False
+
+    def TestSmdpTerminationAndTruncation(self) -> bool:
+        try:
+            option_reward = torch.tensor(
+                [[1.0, 1.0], [2.0, 2.0]],
+                device=self.device)
+            values = torch.tensor(
+                [[0.5, 0.5], [1.0, 1.0], [3.0, 3.0]],
+                device=self.device)
+            duration = torch.tensor(
+                [[2.0, 2.0], [1.0, 1.0]],
+                device=self.device)
+            terminated = torch.tensor(
+                [[False, False], [True, False]],
+                device=self.device)
+            truncated = torch.tensor(
+                [[False, False], [False, True]],
+                device=self.device)
+            output = SmdpReturnEstimator.EstimateAdvantages(
+                optionReward=option_reward,
+                values=values,
+                duration=duration,
+                terminated=terminated,
+                truncated=truncated,
+                discount=0.5,
+                traceDecay=0.8)
+            early_cutoff = SmdpReturnEstimator.EstimateAdvantages(
+                optionReward=option_reward[:, :1],
+                values=values[:, :1],
+                duration=duration[:, :1],
+                terminated=torch.zeros_like(terminated[:, :1]),
+                truncated=torch.tensor(
+                    [[True], [False]],
+                    device=self.device),
+                discount=0.5,
+                traceDecay=0.8)
+            expected_delta = torch.tensor(
+                [[0.75, 0.75], [1.0, 2.5]],
+                device=self.device)
+            expected_advantage = torch.tensor(
+                [[0.91, 1.15], [1.0, 2.5]],
+                device=self.device)
+            expected_return = torch.tensor(
+                [[1.41, 1.65], [2.0, 3.5]],
+                device=self.device)
+            return bool(
+                torch.allclose(output.temporalDifference, expected_delta)
+                and torch.allclose(output.advantage, expected_advantage)
+                and torch.allclose(output.returnTarget, expected_return)
+                and torch.allclose(
+                    output.bootstrapDiscount,
+                    torch.tensor([[0.25, 0.25], [0.5, 0.5]], device=self.device))
+                and torch.allclose(
+                    output.traceDiscount,
+                    torch.tensor([[0.16, 0.16], [0.4, 0.4]], device=self.device))
+                and torch.allclose(
+                    early_cutoff.advantage[0],
+                    early_cutoff.temporalDifference[0]))
+        except Exception as error:
+            print(f"SmdpTerminationAndTruncation error: {error}")
+            return False
+
     def RunAll(self):
         import gc as _gc
         tests = [
@@ -6244,6 +6640,9 @@ class TestValueEstimationMTool:
             ("ValueTensorBellmanAnchor", self.TestValueTensorBellmanAnchor),
             ("CognitiveValueInterfaces", self.TestCognitiveValueInterfaces),
             ("ForwardCognitiveValueSignals", self.TestForwardCognitiveValueSignals),
+            ("SensorimotorPotentialShaping", self.TestSensorimotorPotentialShaping),
+            ("SmdpDiscountedOptionReward", self.TestSmdpDiscountedOptionReward),
+            ("SmdpTerminationAndTruncation", self.TestSmdpTerminationAndTruncation),
             ("LossDecreases", self.TestLossDecreases),
             ("NoNanStress", self.TestNoNanStress),]
         results = {}

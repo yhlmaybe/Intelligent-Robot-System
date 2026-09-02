@@ -155,6 +155,7 @@ public:
         StatusValue& result,
         const std::string& sensorPacketJson,
         const std::string& feedbackPayloadJson,
+        const std::string& executionResultJson,
         std::optional<double> reward = std::nullopt,
         std::optional<double> done = std::nullopt);
 

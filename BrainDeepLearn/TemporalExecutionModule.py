@@ -42,7 +42,6 @@ class PackedTemporalProposal:
     duration_ms: torch.Tensor
     soft_timeout_ms: torch.Tensor
     hard_timeout_ms: torch.Tensor
-    action_epoch: torch.Tensor
 
     def Validate(self, batchSize: int, device: torch.device) -> None:
         batch_size = int(batchSize)
@@ -94,39 +93,26 @@ class PackedTemporalProposal:
         if bool((self.soft_timeout_ms > self.hard_timeout_ms).any().item()):
             raise ValueError(
                 "packed temporal soft timeout cannot exceed hard timeout")
-        if (
-            not torch.is_tensor(self.action_epoch)
-            or tuple(self.action_epoch.shape) != (batch_size,)
-            or self.action_epoch.dtype != torch.long
-            or self.action_epoch.device != device
-            or bool((self.action_epoch < 0).any().item())
-        ):
-            raise ValueError(
-                "packed temporal action epoch must be non-negative")
 
 
 @dataclass(frozen=True)
 class PackedTemporalEvent:
-    cache_executing: torch.Tensor
     candidate_ready: torch.Tensor
     redispatch_requested: torch.Tensor
     cancel_requested: torch.Tensor
     planner_failed: torch.Tensor
     plan_reached: torch.Tensor
-    hard_stop: torch.Tensor
     active_risk: torch.Tensor
     candidate_risk: torch.Tensor
 
     def Validate(self, batchSize: int, device: torch.device) -> None:
         expected_shape = (int(batchSize),)
         boolean_fields = (
-            self.cache_executing,
             self.candidate_ready,
             self.redispatch_requested,
             self.cancel_requested,
             self.planner_failed,
             self.plan_reached,
-            self.hard_stop,
         )
         risk_fields = (
             self.active_risk,
@@ -163,7 +149,7 @@ class PackedTemporalDecision:
     kind_id: torch.Tensor
     kind_names: Tuple[str, ...]
     override_applied: torch.Tensor
-    proposal_action_epoch: torch.Tensor
+    applied_action_epoch: torch.Tensor
     action_epoch: torch.Tensor
     duration_ms: torch.Tensor
     soft_timeout_ms: torch.Tensor
@@ -188,19 +174,19 @@ class PackedTemporalExecutionGate:
         contractView: RobotEmbodimentContractView,
         *,
         dispatchRiskThreshold: float = 0.5,
-        failsafeRiskThreshold: float = 0.98,
+        cancelRiskThreshold: float = 0.98,
         ageNormSteps: float = 100.0,
         stepDurationMs: float = 1.0,
     ) -> None:
         dispatch_threshold = float(dispatchRiskThreshold)
-        failsafe_threshold = float(failsafeRiskThreshold)
+        cancel_threshold = float(cancelRiskThreshold)
         if not 0.0 <= dispatch_threshold <= 1.0:
             raise ValueError("dispatch risk threshold must be normalized")
-        if not 0.0 <= failsafe_threshold <= 1.0:
-            raise ValueError("failsafe risk threshold must be normalized")
-        if failsafe_threshold < dispatch_threshold:
+        if not 0.0 <= cancel_threshold <= 1.0:
+            raise ValueError("cancel risk threshold must be normalized")
+        if cancel_threshold < dispatch_threshold:
             raise ValueError(
-                "failsafe risk threshold cannot be below dispatch threshold")
+                "cancel risk threshold cannot be below dispatch threshold")
         age_norm_steps = float(ageNormSteps)
         if not torch.isfinite(torch.tensor(age_norm_steps)) or age_norm_steps <= 0.0:
             raise ValueError("packed temporal age normalization must be positive")
@@ -212,7 +198,7 @@ class PackedTemporalExecutionGate:
             raise ValueError("packed temporal step duration must be positive")
         self.contract_view = contractView
         self.dispatch_risk_threshold = dispatch_threshold
-        self.failsafe_risk_threshold = failsafe_threshold
+        self.cancel_risk_threshold = cancel_threshold
         self.age_norm_steps = age_norm_steps
         self.step_duration_ms = step_duration_ms
 
@@ -310,22 +296,21 @@ class PackedTemporalExecutionGate:
         target: PackedEndEffectorTarget,
         feedback: BrainFeedbackPacket,
     ) -> torch.Tensor:
-        available = (
-            feedback.endpoint_present
-            & feedback.child_enabled
-        )
+        available = feedback.phase_enabled & feedback.phase_known
         return ((~target.active) | available).all(dim=-1)
 
-    def TargetCriticalFailure(
+    def AppliedTarget(
         self,
-        target: PackedEndEffectorTarget,
         feedback: BrainFeedbackPacket,
-    ) -> torch.Tensor:
-        critical = (
-            ~feedback.endpoint_present
-            | ~feedback.child_enabled
+    ) -> PackedEndEffectorTarget:
+        return PackedEndEffectorTarget(
+            values=feedback.applied_target_values,
+            active=feedback.applied_target_active,
+            contract_id=self.contract_view.contract_id,
+            model_signature=self.contract_view.model_signature,
+            target_version=feedback.applied_target_version.clamp_min(0),
+            timestamp=feedback.timestamp,
         )
-        return (target.active & critical).any(dim=-1)
 
     def NeutralTarget(
         self,
@@ -344,13 +329,13 @@ class PackedTemporalExecutionGate:
         self,
         feedback: BrainFeedbackPacket,
         candidateTarget: PackedEndEffectorTarget,
-        cachedTarget: PackedEndEffectorTarget,
         proposal: PackedTemporalProposal,
         events: PackedTemporalEvent,
         actionAgeSteps: torch.Tensor,
     ) -> PackedTemporalDecision:
         self.ValidateTarget(candidateTarget, feedback, "candidate target")
-        self.ValidateTarget(cachedTarget, feedback, "cached target")
+        applied_target = self.AppliedTarget(feedback)
+        self.ValidateTarget(applied_target, feedback, "applied target")
         if type(proposal) is not PackedTemporalProposal:
             raise TypeError(
                 "packed temporal execution requires a learned proposal")
@@ -372,18 +357,14 @@ class PackedTemporalExecutionGate:
         elapsed_ms = action_age_steps * self.step_duration_ms
 
         candidate_present = candidateTarget.active.any(dim=-1)
-        cache_present = (
-            events.cache_executing
-            & cachedTarget.active.any(dim=-1)
-        )
+        cache_present = applied_target.active.any(dim=-1)
         candidate_available = (
             events.candidate_ready
             & candidate_present
             & self.TargetAvailable(candidateTarget, feedback)
             & events.candidate_risk.lt(self.dispatch_risk_threshold)
         )
-        cache_available = self.TargetAvailable(cachedTarget, feedback)
-        active_failure = self.TargetCriticalFailure(cachedTarget, feedback)
+        cache_available = self.TargetAvailable(applied_target, feedback)
         hard_timeout = (
             cache_present
             & proposal.hard_timeout_ms.gt(0.0)
@@ -401,7 +382,7 @@ class PackedTemporalExecutionGate:
             ~cache_present & candidate_available,
             cache_present & cache_available,
             cache_present,
-            torch.ones_like(cache_present),
+            feedback.hard_stop,
             cache_present & candidate_available,
         ), dim=-1)
         execution_kind_scores = proposal.kind_scores.masked_fill(
@@ -411,12 +392,7 @@ class PackedTemporalExecutionGate:
         proposal_kind_id = proposal.kind_scores.argmax(dim=-1)
         kind_id = execution_kind_scores.argmax(dim=-1)
 
-        rule_failsafe = (
-            events.hard_stop
-            | events.active_risk.ge(self.failsafe_risk_threshold)
-            | (cache_present & active_failure)
-            | hard_timeout
-        )
+        rule_failsafe = feedback.hard_stop
         rule_cancel = (
             ~rule_failsafe
             & cache_present
@@ -425,6 +401,8 @@ class PackedTemporalExecutionGate:
                 | events.planner_failed
                 | events.plan_reached
                 | ~cache_available
+                | events.active_risk.ge(self.cancel_risk_threshold)
+                | hard_timeout
                 | (soft_timeout & ~candidate_available)
             )
         )
@@ -466,7 +444,7 @@ class PackedTemporalExecutionGate:
                 candidateTarget.values,
                 torch.where(
                     cache_rows,
-                    cachedTarget.values,
+                    applied_target.values,
                     neutral.values,
                 ),
             ),
@@ -475,7 +453,7 @@ class PackedTemporalExecutionGate:
                 candidateTarget.active,
                 torch.where(
                     cache_rows,
-                    cachedTarget.active,
+                    applied_target.active,
                     neutral.active,
                 ),
             ),
@@ -486,20 +464,20 @@ class PackedTemporalExecutionGate:
                 candidateTarget.target_version,
                 torch.where(
                     keep_cache,
-                    cachedTarget.target_version,
+                    applied_target.target_version,
                     neutral.target_version)),
             timestamp=torch.where(
                 dispatch | redispatch,
                 candidateTarget.timestamp,
                 torch.where(
                     keep_cache,
-                    cachedTarget.timestamp,
+                    applied_target.timestamp,
                     neutral.timestamp)),
         )
         candidate_selected = dispatch | redispatch
         next_epoch = (
-            proposal.action_epoch
-            + candidate_selected.to(proposal.action_epoch.dtype)
+            feedback.applied_action_epoch
+            + candidate_selected.to(feedback.applied_action_epoch.dtype)
         )
         return PackedTemporalDecision(
             proposal_scores=proposal.kind_scores,
@@ -508,7 +486,7 @@ class PackedTemporalExecutionGate:
             kind_id=kind_id,
             kind_names=PACKED_TEMPORAL_KIND_NAMES,
             override_applied=kind_id.ne(proposal_kind_id),
-            proposal_action_epoch=proposal.action_epoch,
+            applied_action_epoch=feedback.applied_action_epoch,
             action_epoch=next_epoch,
             duration_ms=proposal.duration_ms,
             soft_timeout_ms=proposal.soft_timeout_ms,
@@ -625,7 +603,7 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         contractView: RobotEmbodimentContractView,
         *,
         dispatchRiskThreshold: float = 0.5,
-        failsafeRiskThreshold: float = 0.98,
+        cancelRiskThreshold: float = 0.98,
         ageNormSteps: float = 128.0,
         stepDurationMs: float = 1.0,
     ) -> None:
@@ -633,7 +611,7 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         self.execution_gate = PackedTemporalExecutionGate(
             contractView=contractView,
             dispatchRiskThreshold=dispatchRiskThreshold,
-            failsafeRiskThreshold=failsafeRiskThreshold,
+            cancelRiskThreshold=cancelRiskThreshold,
             ageNormSteps=ageNormSteps,
             stepDurationMs=stepDurationMs)
         self.register_buffer(
@@ -842,14 +820,12 @@ class TemporalExecutionGateExtractor(AGICoreModule):
                 cancel_need),
             duration_ms=proposal.duration_ms,
             soft_timeout_ms=proposal.soft_timeout_ms,
-            hard_timeout_ms=proposal.hard_timeout_ms,
-            action_epoch=proposal.action_epoch)
+            hard_timeout_ms=proposal.hard_timeout_ms)
 
     def Step(
         self,
         feedbackPacket: BrainFeedbackPacket,
         candidateTarget: PackedEndEffectorTarget,
-        cachedTarget: PackedEndEffectorTarget,
         temporalContext: TemporalContext,
         proposal: PackedTemporalProposal,
         events: PackedTemporalEvent,
@@ -862,7 +838,6 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         return self.execution_gate.Step(
             feedback=feedbackPacket,
             candidateTarget=candidateTarget,
-            cachedTarget=cachedTarget,
             proposal=refined,
             events=events,
             actionAgeSteps=temporalContext.action_age_steps)
@@ -871,7 +846,6 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         self,
         feedbackPacket: BrainFeedbackPacket,
         candidateTarget: PackedEndEffectorTarget,
-        cachedTarget: PackedEndEffectorTarget,
         temporalContext: TemporalContext,
         proposal: PackedTemporalProposal,
         events: PackedTemporalEvent,
@@ -880,7 +854,6 @@ class TemporalExecutionGateExtractor(AGICoreModule):
         return self.Step(
             feedbackPacket=feedbackPacket,
             candidateTarget=candidateTarget,
-            cachedTarget=cachedTarget,
             temporalContext=temporalContext,
             proposal=proposal,
             events=events,

@@ -24,6 +24,15 @@ class EndEffectorType(IntEnum):
     OTHER = 4
 
 
+class SlotExecutionStatus(IntEnum):
+    UNKNOWN = 0
+    APPLIED = 1
+    MODIFIED = 2
+    REJECTED = 3
+    HELD = 4
+    STOPPED = 5
+
+
 @dataclass(frozen=True)
 class PackedLayout:
     offsets: Tuple[int, ...]
@@ -129,6 +138,7 @@ class EndEffector:
     dwell_cycles: int
     translation_error_scale: float = 1.0
     rotation_error_scale: float = 1.0
+    observation_timeout: float = 0.25
 
     @property
     def TargetDim(self) -> int:
@@ -186,15 +196,79 @@ class RobotEmbodimentContractView:
     end_effector_rotation_basis: PackedTensor
     end_effector_target_lower: Tuple[float, ...]
     end_effector_target_upper: Tuple[float, ...]
+    end_effector_target_tolerance: Tuple[float, ...]
     parent_index: Tuple[int, ...]
     topological_layers: Tuple[Tuple[int, ...], ...]
     root_mask: Tuple[bool, ...]
     child_mask: Tuple[bool, ...]
     independent_mask: Tuple[bool, ...]
+    observation_timeout: Tuple[float, ...]
     perception_view_indices: Tuple[int, ...]
     perception_projection: Optional[PerceptionProjectionView]
     primary_perception_view_index: Optional[int]
     model_shape: EmbodimentShape
+
+    def CompileBrainBuildSignature(
+        self,
+        cognitivePayload: Mapping[str, Any],
+        schemaVersion: int,
+    ) -> str:
+        payload = {
+            "schema_version": schemaVersion,
+            "cognitive": dict(cognitivePayload),
+            "contract": {
+                "schema_version": self.schema_version,
+                "description_id": self.description_id,
+                "semantic_definition_id": self.semantic_definition_id,
+                "contract_id": self.contract_id,
+                "model_shape_id": self.model_shape_id,
+                "adapter_id": self.adapter_id,
+                "model_signature": self.model_signature,
+                "rotation_chart_limit": self.rotation_chart_limit,
+            },
+            "embodiment": asdict(self.model_shape),
+        }
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False).encode("utf-8")
+        return sha256(canonical).hexdigest()
+
+    def TargetSlotsMatch(
+        self,
+        leftValues: torch.Tensor,
+        leftActive: torch.Tensor,
+        rightValues: torch.Tensor,
+        rightActive: torch.Tensor,
+    ) -> torch.Tensor:
+        tolerance = leftValues.new_tensor(
+            self.end_effector_target_tolerance).unsqueeze(0)
+        coordinateMatch = (leftValues - rightValues).abs().le(tolerance)
+        slotMatch = torch.zeros_like(leftActive)
+        for endpointIndex in range(self.end_effector_count):
+            targetSlice = self.end_effector_target_layout.Slice(endpointIndex)
+            activeMatch = leftActive[:, endpointIndex].eq(
+                rightActive[:, endpointIndex])
+            valuesMatch = coordinateMatch[:, targetSlice].all(dim=-1)
+            slotMatch[:, endpointIndex] = (
+                activeMatch
+                & (~leftActive[:, endpointIndex] | valuesMatch))
+        return slotMatch
+
+    def TargetRowsMatch(
+        self,
+        leftValues: torch.Tensor,
+        leftActive: torch.Tensor,
+        rightValues: torch.Tensor,
+        rightActive: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.TargetSlotsMatch(
+            leftValues,
+            leftActive,
+            rightValues,
+            rightActive).all(dim=-1)
 
 
 @dataclass(frozen=True)
@@ -237,13 +311,20 @@ class PackedEndEffectorTarget:
             contractView.end_effector_target_upper,
             device=self.values.device,
             dtype=torch.float64).unsqueeze(0)
-        tolerance = 1e-6
+        tolerance = torch.tensor(
+            contractView.end_effector_target_tolerance,
+            device=self.values.device,
+            dtype=torch.float64).unsqueeze(0)
         for endpointIndex in range(contractView.end_effector_count):
             targetSlice = contractView.end_effector_target_layout.Slice(endpointIndex)
             active = self.active[:, endpointIndex].unsqueeze(-1)
             outside = (
-                (values[:, targetSlice] < lower[:, targetSlice] - tolerance)
-                | (values[:, targetSlice] > upper[:, targetSlice] + tolerance))
+                (
+                    values[:, targetSlice]
+                    < lower[:, targetSlice] - tolerance[:, targetSlice])
+                | (
+                    values[:, targetSlice]
+                    > upper[:, targetSlice] + tolerance[:, targetSlice]))
             if bool((active & outside).any().item()):
                 raise ValueError("active target exceeds end-effector limits")
             translationWidth = contractView.end_effector_translation_basis.shapes[endpointIndex][1]
@@ -255,12 +336,33 @@ class PackedEndEffectorTarget:
                     endpointIndex,
                     self.values.device,
                     torch.float64)
-                norm = torch.linalg.vector_norm(
-                    coordinates @ basis.transpose(0, 1),
+                physicalRotation = coordinates @ basis.transpose(0, 1)
+                norm = torch.linalg.vector_norm(physicalRotation, dim=-1)
+                rotationSlice = slice(
+                    targetSlice.start + translationWidth,
+                    targetSlice.start + translationWidth + rotationWidth)
+                rotationTolerance = tolerance[:, rotationSlice]
+                mappedTolerance = torch.linalg.vector_norm(
+                    rotationTolerance @ basis.abs().transpose(0, 1),
                     dim=-1)
+                epsilon = torch.finfo(torch.float64).eps
+                productRoundoff = (
+                    rotationWidth * epsilon
+                    / (1.0 - rotationWidth * epsilon))
+                normRoundoff = (
+                    int(basis.size(0)) * epsilon
+                    / (1.0 - int(basis.size(0)) * epsilon))
+                arithmeticTolerance = (
+                    productRoundoff
+                    * torch.linalg.vector_norm(
+                        coordinates.abs() @ basis.abs().transpose(0, 1),
+                        dim=-1)
+                    + normRoundoff * norm)
+                chartTolerance = mappedTolerance + arithmeticTolerance
                 if bool((
                     self.active[:, endpointIndex]
-                    & norm.gt(contractView.rotation_chart_limit + tolerance)
+                    & norm.gt(
+                        contractView.rotation_chart_limit + chartTolerance)
                 ).any().item()):
                     raise ValueError("active rotation target leaves the principal chart")
         for endpointIndex, parentIndex in enumerate(contractView.parent_index):
@@ -280,15 +382,158 @@ class PackedEndEffectorTarget:
 
 
 @dataclass(frozen=True)
+class ActionRequest:
+    request_id: torch.Tensor
+    action_epoch: torch.Tensor
+    target: PackedEndEffectorTarget
+    command_active: torch.Tensor
+    hold_requested: torch.Tensor
+    stop_requested: torch.Tensor
+    help_requested: torch.Tensor
+    policy_path: torch.Tensor
+    planner_override: torch.Tensor
+    temporal_kind_id: torch.Tensor
+    timestamp: torch.Tensor
+
+    def Validate(self, contractView: RobotEmbodimentContractView) -> None:
+        self.target.Validate(contractView)
+        batchSize = int(self.target.values.size(0))
+        device = self.target.values.device
+        booleanFields = (
+            self.command_active,
+            self.hold_requested,
+            self.stop_requested,
+            self.help_requested,
+            self.planner_override,
+        )
+        integerFields = (
+            self.request_id,
+            self.action_epoch,
+            self.policy_path,
+            self.temporal_kind_id,
+        )
+        if any(
+            not torch.is_tensor(value)
+            or tuple(value.shape) != (batchSize,)
+            or value.dtype != torch.bool
+            or value.device != device
+            for value in booleanFields
+        ):
+            raise ValueError("action request masks must match the target batch")
+        if any(
+            not torch.is_tensor(value)
+            or tuple(value.shape) != (batchSize,)
+            or value.dtype != torch.long
+            or value.device != device
+            or bool(value.lt(0).any().item())
+            for value in integerFields
+        ):
+            raise ValueError("action request identifiers must be non-negative long vectors")
+        Robot.ValidateTensor(self.timestamp, (batchSize,), "action request timestamp", True)
+        if self.timestamp.device != device or bool(self.timestamp.lt(0.0).any().item()):
+            raise ValueError("action request timestamp must match the target batch")
+        if bool((self.stop_requested & self.target.active.any(dim=-1)).any().item()):
+            raise ValueError("a stop request cannot carry an active target")
+
+
+@dataclass(frozen=True)
+class ActionExecutionResult:
+    request_id: torch.Tensor
+    action_epoch: torch.Tensor
+    applied_target: PackedEndEffectorTarget
+    execution_status: torch.Tensor
+    execution_known: torch.Tensor
+    hard_stop: torch.Tensor
+    help_accepted: torch.Tensor
+    timestamp: torch.Tensor
+
+    def Validate(
+        self,
+        request: ActionRequest,
+        contractView: RobotEmbodimentContractView,
+    ) -> None:
+        request.Validate(contractView)
+        self.applied_target.Validate(contractView)
+        batchSize = int(request.target.values.size(0))
+        endpointCount = contractView.end_effector_count
+        device = request.target.values.device
+        if (
+            self.applied_target.values.device != device
+            or self.applied_target.values.dtype != request.target.values.dtype
+            or int(self.applied_target.values.size(0)) != batchSize
+        ):
+            raise ValueError("applied target must match the action request batch")
+        integerFields = (self.request_id, self.action_epoch)
+        if any(
+            not torch.is_tensor(value)
+            or tuple(value.shape) != (batchSize,)
+            or value.dtype != torch.long
+            or value.device != device
+            or bool(value.lt(0).any().item())
+            for value in integerFields
+        ):
+            raise ValueError("action execution identifiers must be non-negative long vectors")
+        if not torch.equal(self.request_id, request.request_id):
+            raise ValueError("action execution result does not match the request id")
+        if not torch.equal(self.action_epoch, request.action_epoch):
+            raise ValueError("action execution result does not match the action epoch")
+        if (
+            not torch.is_tensor(self.execution_status)
+            or tuple(self.execution_status.shape) != (batchSize, endpointCount)
+            or self.execution_status.dtype != torch.long
+            or self.execution_status.device != device
+            or bool(self.execution_status.lt(int(SlotExecutionStatus.UNKNOWN)).any().item())
+            or bool(self.execution_status.gt(int(SlotExecutionStatus.STOPPED)).any().item())
+        ):
+            raise ValueError("slot execution status is invalid")
+        booleanFields = (
+            (self.execution_known, (batchSize, endpointCount)),
+            (self.hard_stop, (batchSize,)),
+            (self.help_accepted, (batchSize,)),
+        )
+        if any(
+            not torch.is_tensor(value)
+            or tuple(value.shape) != shape
+            or value.dtype != torch.bool
+            or value.device != device
+            for value, shape in booleanFields
+        ):
+            raise ValueError("action execution masks must match the request batch")
+        unknown = self.execution_status.eq(int(SlotExecutionStatus.UNKNOWN))
+        if bool((unknown != ~self.execution_known).any().item()):
+            raise ValueError("unknown execution status must match execution knowledge")
+        Robot.ValidateTensor(self.timestamp, (batchSize,), "action execution timestamp", True)
+        if (
+            self.timestamp.device != device
+            or bool(self.timestamp.lt(request.timestamp).any().item())
+        ):
+            raise ValueError("action execution timestamp precedes its request")
+        if bool((self.help_accepted & ~request.help_requested).any().item()):
+            raise ValueError("help cannot be accepted without a help request")
+        if bool((self.hard_stop & self.applied_target.active.any(dim=-1)).any().item()):
+            raise ValueError("hard stop requires an empty applied target")
+
+
+@dataclass(frozen=True)
 class BrainFeedbackPacket:
     joint_features: torch.Tensor
     end_effector_features: torch.Tensor
     endpoint_present: torch.Tensor
     progress: torch.Tensor
     reached: torch.Tensor
-    child_enabled: torch.Tensor
-    target_active: torch.Tensor
-    target_version: torch.Tensor
+    phase_enabled: torch.Tensor
+    phase_known: torch.Tensor
+    observation_age: torch.Tensor
+    applied_target_values: torch.Tensor
+    applied_target_active: torch.Tensor
+    applied_target_version: torch.Tensor
+    applied_action_epoch: torch.Tensor
+    execution_status: torch.Tensor
+    execution_known: torch.Tensor
+    execution_relevant: torch.Tensor
+    execution_result_known: torch.Tensor
+    hard_stop: torch.Tensor
+    help_accepted: torch.Tensor
     perception_rotation: torch.Tensor
     perception_rotation_delta: torch.Tensor
     perception_angular_velocity: torch.Tensor
@@ -310,6 +555,8 @@ class BrainFeedbackPacket:
             (self.joint_features, (batchSize, contractView.joint_feedback_layout.PackedDim)),
             (self.end_effector_features, (batchSize, contractView.end_effector_feedback_layout.PackedDim)),
             (self.progress, (batchSize, contractView.end_effector_count)),
+            (self.observation_age, (batchSize, contractView.end_effector_count)),
+            (self.applied_target_values, (batchSize, contractView.end_effector_target_layout.PackedDim)),
             (self.perception_rotation, (batchSize, len(contractView.perception_view_indices), 4)),
             (self.perception_rotation_delta, (batchSize, len(contractView.perception_view_indices), 4)),
             (self.perception_angular_velocity, (batchSize, len(contractView.perception_view_indices), 3)),
@@ -318,8 +565,14 @@ class BrainFeedbackPacket:
         booleanFields = (
             (self.endpoint_present, (batchSize, contractView.end_effector_count)),
             (self.reached, (batchSize, contractView.end_effector_count)),
-            (self.child_enabled, (batchSize, contractView.end_effector_count)),
-            (self.target_active, (batchSize, contractView.end_effector_count)),
+            (self.phase_enabled, (batchSize, contractView.end_effector_count)),
+            (self.phase_known, (batchSize, contractView.end_effector_count)),
+            (self.applied_target_active, (batchSize, contractView.end_effector_count)),
+            (self.execution_known, (batchSize, contractView.end_effector_count)),
+            (self.execution_relevant, (batchSize, contractView.end_effector_count)),
+            (self.execution_result_known, (batchSize,)),
+            (self.hard_stop, (batchSize,)),
+            (self.help_accepted, (batchSize,)),
             (self.perception_motion_present, (batchSize, len(contractView.perception_view_indices))),
         )
         for value, shape in floatingFields:
@@ -334,13 +587,59 @@ class BrainFeedbackPacket:
         if self.timestamp.device != device or bool(self.timestamp.lt(0.0).any().item()):
             raise ValueError("feedback timestamp must share the packet device")
         if (
-            not torch.is_tensor(self.target_version)
-            or tuple(self.target_version.shape) != (batchSize,)
-            or self.target_version.dtype != torch.long
-            or self.target_version.device != device
-            or bool(self.target_version.lt(-1).any().item())
+            not torch.is_tensor(self.applied_target_version)
+            or tuple(self.applied_target_version.shape) != (batchSize,)
+            or self.applied_target_version.dtype != torch.long
+            or self.applied_target_version.device != device
+            or bool(self.applied_target_version.lt(-1).any().item())
         ):
-            raise ValueError("feedback target version is invalid")
+            raise ValueError("feedback applied target version is invalid")
+        if (
+            not torch.is_tensor(self.applied_action_epoch)
+            or tuple(self.applied_action_epoch.shape) != (batchSize,)
+            or self.applied_action_epoch.dtype != torch.long
+            or self.applied_action_epoch.device != device
+            or bool(self.applied_action_epoch.lt(0).any().item())
+        ):
+            raise ValueError("feedback applied action epoch is invalid")
+        if (
+            not torch.is_tensor(self.execution_status)
+            or tuple(self.execution_status.shape) != (batchSize, contractView.end_effector_count)
+            or self.execution_status.dtype != torch.long
+            or self.execution_status.device != device
+            or bool(self.execution_status.lt(int(SlotExecutionStatus.UNKNOWN)).any().item())
+            or bool(self.execution_status.gt(int(SlotExecutionStatus.STOPPED)).any().item())
+        ):
+            raise ValueError("feedback execution status is invalid")
+        unknown = self.execution_status.eq(int(SlotExecutionStatus.UNKNOWN))
+        if bool((unknown != ~self.execution_known).any().item()):
+            raise ValueError("feedback execution status knowledge is inconsistent")
+        if bool((self.phase_enabled & ~self.phase_known).any().item()):
+            raise ValueError("an unknown hierarchy phase cannot be enabled")
+        if bool((self.hard_stop & self.applied_target_active.any(dim=-1)).any().item()):
+            raise ValueError("hard stop feedback cannot expose an active target")
+        any_relevant = self.execution_relevant.any(dim=-1)
+        result_known = torch.where(
+            any_relevant,
+            (self.execution_known | ~self.execution_relevant).all(dim=-1),
+            self.execution_known.all(dim=-1))
+        if bool((self.execution_result_known != result_known).any().item()):
+            raise ValueError("feedback execution result knowledge is inconsistent")
+        if bool(self.observation_age.lt(0.0).any().item()):
+            raise ValueError("feedback observation age cannot be negative")
+        if bool((self.applied_target_version.lt(0) & self.applied_target_active.any(dim=-1)).any().item()):
+            raise ValueError("active applied target requires an applied target version")
+        for endpointIndex, parentIndex in enumerate(contractView.parent_index):
+            targetSlice = contractView.end_effector_target_layout.Slice(endpointIndex)
+            inactiveValues = self.applied_target_values[:, targetSlice].ne(0.0).any(dim=-1)
+            if bool((~self.applied_target_active[:, endpointIndex] & inactiveValues).any().item()):
+                raise ValueError("inactive applied target coordinates must be zero")
+            if parentIndex >= 0 and bool((
+                self.applied_target_active[:, endpointIndex]
+                & ~self.applied_target_active[:, parentIndex]
+            ).any().item()):
+                raise ValueError("active applied child target requires its parent target")
+
     def IndexSelectRows(self, rowIndex: torch.Tensor) -> "BrainFeedbackPacket":
         return BrainFeedbackPacket(
             joint_features=self.joint_features.index_select(0, rowIndex),
@@ -348,9 +647,19 @@ class BrainFeedbackPacket:
             endpoint_present=self.endpoint_present.index_select(0, rowIndex),
             progress=self.progress.index_select(0, rowIndex),
             reached=self.reached.index_select(0, rowIndex),
-            child_enabled=self.child_enabled.index_select(0, rowIndex),
-            target_active=self.target_active.index_select(0, rowIndex),
-            target_version=self.target_version.index_select(0, rowIndex),
+            phase_enabled=self.phase_enabled.index_select(0, rowIndex),
+            phase_known=self.phase_known.index_select(0, rowIndex),
+            observation_age=self.observation_age.index_select(0, rowIndex),
+            applied_target_values=self.applied_target_values.index_select(0, rowIndex),
+            applied_target_active=self.applied_target_active.index_select(0, rowIndex),
+            applied_target_version=self.applied_target_version.index_select(0, rowIndex),
+            applied_action_epoch=self.applied_action_epoch.index_select(0, rowIndex),
+            execution_status=self.execution_status.index_select(0, rowIndex),
+            execution_known=self.execution_known.index_select(0, rowIndex),
+            execution_relevant=self.execution_relevant.index_select(0, rowIndex),
+            execution_result_known=self.execution_result_known.index_select(0, rowIndex),
+            hard_stop=self.hard_stop.index_select(0, rowIndex),
+            help_accepted=self.help_accepted.index_select(0, rowIndex),
             perception_rotation=self.perception_rotation.index_select(0, rowIndex),
             perception_rotation_delta=self.perception_rotation_delta.index_select(0, rowIndex),
             perception_angular_velocity=self.perception_angular_velocity.index_select(0, rowIndex),
@@ -369,10 +678,10 @@ class BrainFeedbackPacket:
 
 
 class Robot:
-    SchemaVersion = 24
+    SchemaVersion = 27
+    ActionSchemaVersion = 1
     RotationStateWidth = 6
     PrincipalRotationLimit = math.pi - 1e-4
-    PerceptionTranslationTolerance = 1e-5
     IdentityBasis = (
         (1.0, 0.0, 0.0),
         (0.0, 1.0, 0.0),
@@ -388,12 +697,45 @@ class Robot:
         "contract_id",
         "timestamp",
     })
+    TargetPayloadFields = frozenset({
+        "contract_id",
+        "model_signature",
+        "target_version",
+        "timestamp",
+        "slot_ids",
+        "reference_frame_ids",
+        "active",
+        "translation",
+        "rotation_vector",
+    })
+    ActionRequestPayloadFields = frozenset({
+        "schema_version",
+        "request_id",
+        "action_epoch",
+        "command_active",
+        "hold_requested",
+        "stop_requested",
+        "help_requested",
+        "policy_path",
+        "planner_override",
+        "temporal_kind_id",
+        "timestamp",
+        "end_effector_target",
+    })
+    ActionExecutionResultPayloadFields = frozenset({
+        "schema_version",
+        "request_id",
+        "action_epoch",
+        "applied_target",
+        "execution_status",
+        "execution_known",
+        "hard_stop",
+        "help_accepted",
+        "timestamp",
+    })
 
     def __init__(self, definition: RobotDefinition) -> None:
-        (
-            self.PerceptionJointIndices,
-            self.PerceptionVelocityAxes,
-        ) = self.ValidateDefinition(definition)
+        self.PerceptionJointIndices = self.ValidateDefinition(definition)
         self.Joints = definition.joints
         self.EndEffectors = definition.end_effectors
         self.EndEffectorIds = tuple(value.effector_id for value in self.EndEffectors)
@@ -410,6 +752,7 @@ class Robot:
         self.DwellCycles = tuple(int(value.dwell_cycles) for value in self.EndEffectors)
         self.TranslationErrorScale = tuple(float(value.translation_error_scale) for value in self.EndEffectors)
         self.RotationErrorScale = tuple(float(value.rotation_error_scale) for value in self.EndEffectors)
+        self.ObservationTimeout = tuple(float(value.observation_timeout) for value in self.EndEffectors)
         self.ContractView = self.CompileContractView(definition)
         self.TranslationProjection = self.CompileBasisProjection(
             self.ContractView.end_effector_translation_basis)
@@ -426,29 +769,6 @@ class Robot:
             ensure_ascii=True,
             allow_nan=False).encode("utf-8")
         return sha256(canonical).hexdigest()
-
-    @classmethod
-    def CompileBrainBuildSignature(
-        cls,
-        cognitivePayload: Mapping[str, Any],
-        contractView: RobotEmbodimentContractView,
-        schemaVersion: int,
-    ) -> str:
-        return cls.CompileSignature({
-            "schema_version": schemaVersion,
-            "cognitive": dict(cognitivePayload),
-            "contract": {
-                "schema_version": contractView.schema_version,
-                "description_id": contractView.description_id,
-                "semantic_definition_id": contractView.semantic_definition_id,
-                "contract_id": contractView.contract_id,
-                "model_shape_id": contractView.model_shape_id,
-                "adapter_id": contractView.adapter_id,
-                "model_signature": contractView.model_signature,
-                "rotation_chart_limit": contractView.rotation_chart_limit,
-            },
-            "embodiment": asdict(contractView.model_shape),
-        })
 
     @staticmethod
     def ValidateTensor(
@@ -501,11 +821,47 @@ class Robot:
         return PackedTensor.FromMatrices(tuple(matrices))
 
     @classmethod
+    def CompileTargetCoordinateTolerance(
+        cls,
+        endEffectors: Sequence[EndEffector],
+    ) -> Tuple[float, ...]:
+        epsilon = float(torch.finfo(torch.float32).eps)
+        tolerances = []
+        for endpoint in endEffectors:
+            coordinateOffset = 0
+            for basisRows in (
+                endpoint.translation_basis,
+                endpoint.rotation_basis,
+            ):
+                basis = torch.tensor(basisRows, dtype=torch.float64)
+                coordinateCount = int(basis.size(1))
+                if coordinateCount == 0:
+                    continue
+                condition = float(torch.linalg.cond(basis).item())
+                operationCount = 2 * int(basis.size(0))
+                roundoff = (
+                    operationCount * epsilon
+                    / (1.0 - operationCount * epsilon))
+                for coordinateIndex in range(coordinateCount):
+                    lower = float(endpoint.target_lower[
+                        coordinateOffset + coordinateIndex])
+                    upper = float(endpoint.target_upper[
+                        coordinateOffset + coordinateIndex])
+                    scale = max(
+                        1.0,
+                        abs(lower),
+                        abs(upper),
+                        upper - lower)
+                    tolerances.append(roundoff * condition * scale)
+                coordinateOffset += coordinateCount
+        return tuple(tolerances)
+
+    @classmethod
     def CompilePerceptionJointBindings(
         cls,
         joints: Sequence[JointDefinition],
         endEffectors: Sequence[EndEffector],
-    ) -> Tuple[Tuple[Tuple[int, ...], ...], PackedTensor]:
+    ) -> Tuple[Tuple[int, ...], ...]:
         perceptionById = {
             endpoint.effector_id: endpoint
             for endpoint in endEffectors
@@ -530,37 +886,19 @@ class Robot:
                     "perception joint binding requires a rotational joint")
             bindings[binding].append(jointIndex)
         jointIndices = []
-        velocityAxes = []
         for endpoint in perceptionById.values():
             indices = tuple(bindings[endpoint.effector_id])
             if not indices:
                 raise ValueError(
                     "perception slot requires bound rotational joints")
-            basis = torch.tensor(
-                endpoint.rotation_basis,
-                dtype=torch.float64)
-            axes = torch.tensor(tuple(
-                joints[jointIndex].rotation_axis
-                for jointIndex in indices), dtype=torch.float64).transpose(0, 1)
-            allowedRank = int(torch.linalg.matrix_rank(basis).item())
-            if (
-                int(torch.linalg.matrix_rank(axes).item()) != allowedRank
-                or int(torch.linalg.matrix_rank(
-                    torch.cat((basis, axes), dim=1)).item()) != allowedRank
-            ):
-                raise ValueError(
-                    "perception joint axes must span the allowed rotation subspace")
             jointIndices.append(indices)
-            velocityAxes.append(tuple(
-                tuple(float(value) for value in joints[jointIndex].rotation_axis)
-                for jointIndex in indices))
-        return tuple(jointIndices), PackedTensor.FromMatrices(tuple(velocityAxes))
+        return tuple(jointIndices)
 
     @classmethod
     def ValidateDefinition(
         cls,
         definition: RobotDefinition,
-    ) -> Tuple[Tuple[Tuple[int, ...], ...], PackedTensor]:
+    ) -> Tuple[Tuple[int, ...], ...]:
         if type(definition) is not RobotDefinition:
             raise TypeError("robot definition has the wrong type")
         for name in ("profile_id", "description_id", "semantic_definition_id", "adapter_id"):
@@ -630,6 +968,8 @@ class Robot:
                 or endpoint.dwell_cycles < 1
                 or endpoint.translation_error_scale <= 0.0
                 or endpoint.rotation_error_scale <= 0.0
+                or not math.isfinite(float(endpoint.observation_timeout))
+                or endpoint.observation_timeout <= 0.0
             ):
                 raise ValueError("end-effector execution semantics are invalid")
             if endpoint.is_perception_slot and (
@@ -803,6 +1143,8 @@ class Robot:
         rotationBasis = PackedTensor.FromMatrices(tuple(value.rotation_basis for value in self.EndEffectors))
         targetLower = tuple(value for endpoint in self.EndEffectors for value in endpoint.target_lower)
         targetUpper = tuple(value for endpoint in self.EndEffectors for value in endpoint.target_upper)
+        targetTolerance = self.CompileTargetCoordinateTolerance(
+            self.EndEffectors)
         modelSignature = self.CompileSignature({
             "schema_version": self.SchemaVersion,
             "definition": asdict(definition),
@@ -837,11 +1179,15 @@ class Robot:
             end_effector_rotation_basis=rotationBasis,
             end_effector_target_lower=targetLower,
             end_effector_target_upper=targetUpper,
+            end_effector_target_tolerance=targetTolerance,
             parent_index=parentIndex,
             topological_layers=layers,
             root_mask=rootMask,
             child_mask=childMask,
             independent_mask=independentMask,
+            observation_timeout=tuple(
+                float(value.observation_timeout)
+                for value in self.EndEffectors),
             perception_view_indices=perceptionIndices,
             perception_projection=projection,
             primary_perception_view_index=primaryIndex,
@@ -1159,13 +1505,23 @@ class Robot:
         self.CachedTargetValues: Optional[torch.Tensor] = None
         self.CachedTargetActive: Optional[torch.Tensor] = None
         self.CachedTargetVersion: Optional[torch.Tensor] = None
+        self.CachedActionEpoch: Optional[torch.Tensor] = None
+        self.CachedRequestId: Optional[torch.Tensor] = None
+        self.CachedExecutionStatus: Optional[torch.Tensor] = None
+        self.CachedExecutionKnown: Optional[torch.Tensor] = None
+        self.CachedExecutionRelevant: Optional[torch.Tensor] = None
+        self.CachedExecutionResultKnown: Optional[torch.Tensor] = None
+        self.CachedExecutionTimestamp: Optional[torch.Tensor] = None
+        self.CachedHardStop: Optional[torch.Tensor] = None
+        self.CachedHelpAccepted: Optional[torch.Tensor] = None
         self.DwellState: Optional[torch.Tensor] = None
         self.ReachedState: Optional[torch.Tensor] = None
+        self.ProgressState: Optional[torch.Tensor] = None
+        self.ObservationAgeState: Optional[torch.Tensor] = None
+        self.ObservationKnownState: Optional[torch.Tensor] = None
         self.LastTimestamp: Optional[torch.Tensor] = None
         self.LastPerceptionRotation: Optional[torch.Tensor] = None
         self.LastPerceptionStatePresent: Optional[torch.Tensor] = None
-        self.PerceptionTranslationReference: Optional[torch.Tensor] = None
-        self.PerceptionTranslationKnown: Optional[torch.Tensor] = None
 
     def BuildNeutralFeedbackPayload(
         self,
@@ -1303,6 +1659,11 @@ class Robot:
                 raise ValueError("feedback batch identity changed without robot reset")
             if bool(timestamp.le(self.LastTimestamp).any().item()):
                 raise ValueError("feedback time must increase")
+        if (
+            self.CachedExecutionTimestamp is not None
+            and bool(timestamp.lt(self.CachedExecutionTimestamp).any().item())
+        ):
+            raise ValueError("feedback time precedes the applied action result")
         if self.CachedTargetValues is not None and (
             tuple(self.CachedTargetValues.shape[:1]) != (actualBatch,)
             or self.CachedTargetValues.device != position.device
@@ -1425,21 +1786,292 @@ class Robot:
             "rotation_vector": rotations,
         }
 
-    def CommitDispatchedTarget(
+    def BuildActionRequest(
         self,
         target: PackedEndEffectorTarget,
-        dispatchedMask: Optional[torch.Tensor] = None,
-    ) -> None:
-        batchSize = int(target.values.size(0))
-        if dispatchedMask is None:
-            dispatched = torch.ones(batchSize, device=target.values.device, dtype=torch.bool)
-        else:
-            self.ValidateTensor(dispatchedMask, (batchSize,), "dispatched mask", False)
-            if dispatchedMask.device != target.values.device:
-                raise ValueError("dispatched mask must share the target device")
-            dispatched = dispatchedMask
-        if not bool(dispatched.any().item()):
-            return
+        requestId: torch.Tensor,
+        actionEpoch: torch.Tensor,
+        commandActive: torch.Tensor,
+        holdRequested: torch.Tensor,
+        stopRequested: torch.Tensor,
+        helpRequested: torch.Tensor,
+        policyPath: torch.Tensor,
+        plannerOverride: torch.Tensor,
+        temporalKindId: torch.Tensor,
+        timestamp: Optional[torch.Tensor] = None,
+    ) -> ActionRequest:
+        request = ActionRequest(
+            request_id=requestId,
+            action_epoch=actionEpoch,
+            target=target,
+            command_active=commandActive,
+            hold_requested=holdRequested,
+            stop_requested=stopRequested,
+            help_requested=helpRequested,
+            policy_path=policyPath,
+            planner_override=plannerOverride,
+            temporal_kind_id=temporalKindId,
+            timestamp=target.timestamp if timestamp is None else timestamp)
+        request.Validate(self.ContractView)
+        return request
+
+    def EncodeActionRequest(
+        self,
+        request: ActionRequest,
+    ) -> Mapping[str, Any]:
+        request.Validate(self.ContractView)
+        return {
+            "schema_version": self.ActionSchemaVersion,
+            "request_id": request.request_id.detach().cpu().tolist(),
+            "action_epoch": request.action_epoch.detach().cpu().tolist(),
+            "command_active": request.command_active.detach().cpu().tolist(),
+            "hold_requested": request.hold_requested.detach().cpu().tolist(),
+            "stop_requested": request.stop_requested.detach().cpu().tolist(),
+            "help_requested": request.help_requested.detach().cpu().tolist(),
+            "policy_path": request.policy_path.detach().cpu().tolist(),
+            "planner_override": request.planner_override.detach().cpu().tolist(),
+            "temporal_kind_id": request.temporal_kind_id.detach().cpu().tolist(),
+            "timestamp": request.timestamp.detach().cpu().tolist(),
+            "end_effector_target": self.DecodeTarget(request.target),
+        }
+
+    @staticmethod
+    def DecodeActionVector(
+        value: Any,
+        shape: Tuple[int, ...],
+        device: torch.device,
+        dtype: torch.dtype,
+        fieldName: str,
+    ) -> torch.Tensor:
+        tensor = torch.as_tensor(value, device=device)
+        if tuple(tensor.shape) != shape:
+            raise ValueError(fieldName + " has the wrong shape")
+        if dtype is torch.bool:
+            if tensor.dtype != torch.bool:
+                raise TypeError(fieldName + " must contain booleans")
+        elif tensor.dtype == torch.bool or tensor.is_floating_point():
+            raise TypeError(fieldName + " must contain integers")
+        return tensor.to(dtype=dtype)
+
+    def EncodeTargetPayload(
+        self,
+        payload: Any,
+        device: torch.device,
+    ) -> PackedEndEffectorTarget:
+        device = torch.device(device)
+        if not isinstance(payload, Mapping) or set(payload) != self.TargetPayloadFields:
+            raise ValueError("applied target payload fields do not match")
+        if (
+            payload["contract_id"] != self.ContractView.contract_id
+            or payload["model_signature"] != self.ContractView.model_signature
+            or tuple(payload["slot_ids"]) != self.EndEffectorIds
+            or tuple(payload["reference_frame_ids"]) != self.ReferenceFrameIds
+        ):
+            raise ValueError("applied target payload does not match the robot contract")
+        endpointCount = len(self.EndEffectors)
+        activeValue = torch.as_tensor(payload["active"])
+        if activeValue.dim() != 2 or int(activeValue.size(1)) != endpointCount:
+            raise ValueError("applied target active mask has the wrong shape")
+        batchSize = int(activeValue.size(0))
+        active = self.DecodeActionVector(
+            payload["active"],
+            (batchSize, endpointCount),
+            device,
+            torch.bool,
+            "applied target active mask")
+        translations = payload["translation"]
+        rotations = payload["rotation_vector"]
+        if (
+            not isinstance(translations, (tuple, list))
+            or not isinstance(rotations, (tuple, list))
+            or len(translations) != batchSize
+            or len(rotations) != batchSize
+            or any(
+                not isinstance(row, (tuple, list))
+                or len(row) != endpointCount
+                for row in tuple(translations) + tuple(rotations)
+            )
+        ):
+            raise ValueError("applied target poses have the wrong shape")
+        values = torch.zeros(
+            batchSize,
+            self.ContractView.end_effector_target_layout.PackedDim,
+            device=device,
+            dtype=torch.float32)
+        tolerance = 1e-5
+        for batchIndex in range(batchSize):
+            for endpointIndex in range(endpointCount):
+                targetSlice = self.ContractView.end_effector_target_layout.Slice(endpointIndex)
+                translationWidth = self.ContractView.end_effector_translation_basis.shapes[endpointIndex][1]
+                rotationWidth = self.ContractView.end_effector_rotation_basis.shapes[endpointIndex][1]
+                translationValue = translations[batchIndex][endpointIndex]
+                rotationValue = rotations[batchIndex][endpointIndex]
+                if not bool(active[batchIndex, endpointIndex].item()):
+                    if translationValue is not None or rotationValue is not None:
+                        raise ValueError("inactive applied target pose must be absent")
+                    continue
+                if translationWidth:
+                    physicalTranslation = torch.as_tensor(
+                        translationValue,
+                        device=device,
+                        dtype=torch.float32)
+                    self.ValidateTensor(
+                        physicalTranslation,
+                        (3,),
+                        "applied target translation",
+                        True)
+                    projection = self.TranslationProjection.Matrix(
+                        endpointIndex,
+                        device,
+                        torch.float32)
+                    basis = self.ContractView.end_effector_translation_basis.Matrix(
+                        endpointIndex,
+                        device,
+                        torch.float32)
+                    coordinates = physicalTranslation @ projection
+                    if bool((coordinates @ basis.transpose(0, 1) - physicalTranslation).abs().max().gt(tolerance).item()):
+                        raise ValueError("applied target translation leaves the allowed subspace")
+                    values[
+                        batchIndex,
+                        targetSlice.start:targetSlice.start + translationWidth,
+                    ] = coordinates
+                elif translationValue is not None:
+                    raise ValueError("applied target contains forbidden translation")
+                if rotationWidth:
+                    physicalRotation = torch.as_tensor(
+                        rotationValue,
+                        device=device,
+                        dtype=torch.float32)
+                    self.ValidateTensor(
+                        physicalRotation,
+                        (3,),
+                        "applied target rotation",
+                        True)
+                    projection = self.RotationProjection.Matrix(
+                        endpointIndex,
+                        device,
+                        torch.float32)
+                    basis = self.ContractView.end_effector_rotation_basis.Matrix(
+                        endpointIndex,
+                        device,
+                        torch.float32)
+                    coordinates = physicalRotation @ projection
+                    if bool((coordinates @ basis.transpose(0, 1) - physicalRotation).abs().max().gt(tolerance).item()):
+                        raise ValueError("applied target rotation leaves the allowed subspace")
+                    values[
+                        batchIndex,
+                        targetSlice.start + translationWidth:targetSlice.stop,
+                    ] = coordinates
+                elif rotationValue is not None:
+                    raise ValueError("applied target contains forbidden rotation")
+        target = PackedEndEffectorTarget(
+            values=values,
+            active=active,
+            contract_id=payload["contract_id"],
+            model_signature=payload["model_signature"],
+            target_version=self.DecodeActionVector(
+                payload["target_version"],
+                (batchSize,),
+                device,
+                torch.long,
+                "applied target version"),
+            timestamp=torch.as_tensor(
+                payload["timestamp"],
+                device=device,
+                dtype=torch.float64))
+        target.Validate(self.ContractView)
+        return target
+
+    def DecodeActionExecutionResult(
+        self,
+        payload: Any,
+        pendingRequest: ActionRequest,
+        device: torch.device,
+    ) -> ActionExecutionResult:
+        device = torch.device(device)
+        pendingRequest.Validate(self.ContractView)
+        if pendingRequest.target.values.device != device:
+            raise ValueError("pending action request does not match the result device")
+        if not isinstance(payload, Mapping) or set(payload) != self.ActionExecutionResultPayloadFields:
+            raise ValueError("action execution result fields do not match")
+        if (
+            type(payload["schema_version"]) is not int
+            or payload["schema_version"] != self.ActionSchemaVersion
+        ):
+            raise ValueError("action execution result schema does not match")
+        batchSize = int(pendingRequest.target.values.size(0))
+        endpointCount = len(self.EndEffectors)
+        statusRows = payload["execution_status"]
+        if (
+            not isinstance(statusRows, (tuple, list))
+            or len(statusRows) != batchSize
+            or any(
+                not isinstance(row, (tuple, list))
+                or len(row) != endpointCount
+                for row in statusRows)
+        ):
+            raise ValueError("action execution status has the wrong shape")
+        statusValues = []
+        for row in statusRows:
+            statusRow = []
+            for value in row:
+                if type(value) is str:
+                    statusRow.append(int(SlotExecutionStatus[value]))
+                elif type(value) is int:
+                    statusRow.append(int(SlotExecutionStatus(value)))
+                else:
+                    raise TypeError("action execution status values are invalid")
+            statusValues.append(tuple(statusRow))
+        result = ActionExecutionResult(
+            request_id=self.DecodeActionVector(
+                payload["request_id"],
+                (batchSize,),
+                device,
+                torch.long,
+                "action execution request id"),
+            action_epoch=self.DecodeActionVector(
+                payload["action_epoch"],
+                (batchSize,),
+                device,
+                torch.long,
+                "action execution epoch"),
+            applied_target=self.EncodeTargetPayload(
+                payload["applied_target"],
+                device),
+            execution_status=torch.tensor(
+                statusValues,
+                device=device,
+                dtype=torch.long),
+            execution_known=self.DecodeActionVector(
+                payload["execution_known"],
+                (batchSize, endpointCount),
+                device,
+                torch.bool,
+                "action execution knowledge"),
+            hard_stop=self.DecodeActionVector(
+                payload["hard_stop"],
+                (batchSize,),
+                device,
+                torch.bool,
+                "action execution hard stop"),
+            help_accepted=self.DecodeActionVector(
+                payload["help_accepted"],
+                (batchSize,),
+                device,
+                torch.bool,
+                "action execution help acceptance"),
+            timestamp=torch.as_tensor(
+                payload["timestamp"],
+                device=device,
+                dtype=torch.float64))
+        result.Validate(pendingRequest, self.ContractView)
+        return result
+
+    def CanonicalizeTarget(
+        self,
+        target: PackedEndEffectorTarget,
+    ) -> torch.Tensor:
+        target.Validate(self.ContractView)
         canonicalValues = torch.zeros_like(target.values)
         for endpointIndex in range(len(self.EndEffectors)):
             targetSlice = self.ContractView.end_effector_target_layout.Slice(endpointIndex)
@@ -1447,72 +2079,336 @@ class Robot:
                 target.active[:, endpointIndex].unsqueeze(-1),
                 target.values[:, targetSlice],
                 torch.zeros_like(target.values[:, targetSlice]))
+        return canonicalValues
+
+    def InitializeExecutionState(self, template: torch.Tensor) -> None:
+        batchSize = int(template.size(0))
+        endpointCount = len(self.EndEffectors)
+        self.CachedTargetValues = torch.zeros(
+            batchSize,
+            self.ContractView.end_effector_target_layout.PackedDim,
+            device=template.device,
+            dtype=template.dtype)
+        self.CachedTargetActive = torch.zeros(
+            batchSize,
+            endpointCount,
+            device=template.device,
+            dtype=torch.bool)
+        self.CachedTargetVersion = torch.full(
+            (batchSize,),
+            -1,
+            device=template.device,
+            dtype=torch.long)
+        self.CachedActionEpoch = torch.zeros(
+            batchSize,
+            device=template.device,
+            dtype=torch.long)
+        self.CachedRequestId = torch.full(
+            (batchSize,),
+            -1,
+            device=template.device,
+            dtype=torch.long)
+        self.CachedExecutionStatus = torch.full(
+            (batchSize, endpointCount),
+            int(SlotExecutionStatus.UNKNOWN),
+            device=template.device,
+            dtype=torch.long)
+        self.CachedExecutionKnown = torch.zeros(
+            batchSize,
+            endpointCount,
+            device=template.device,
+            dtype=torch.bool)
+        self.CachedExecutionRelevant = torch.zeros(
+            batchSize,
+            endpointCount,
+            device=template.device,
+            dtype=torch.bool)
+        self.CachedExecutionResultKnown = torch.zeros(
+            batchSize,
+            device=template.device,
+            dtype=torch.bool)
+        self.CachedExecutionTimestamp = torch.zeros(
+            batchSize,
+            device=template.device,
+            dtype=torch.float64)
+        self.CachedHardStop = torch.zeros(
+            batchSize,
+            device=template.device,
+            dtype=torch.bool)
+        self.CachedHelpAccepted = torch.zeros(
+            batchSize,
+            device=template.device,
+            dtype=torch.bool)
+        self.DwellState = torch.zeros(
+            batchSize,
+            endpointCount,
+            device=template.device,
+            dtype=torch.long)
+        self.ReachedState = torch.zeros(
+            batchSize,
+            endpointCount,
+            device=template.device,
+            dtype=torch.bool)
+        self.ProgressState = torch.zeros(
+            batchSize,
+            endpointCount,
+            device=template.device,
+            dtype=template.dtype)
+
+    def CommitAppliedTarget(
+        self,
+        request: ActionRequest,
+        result: ActionExecutionResult,
+    ) -> None:
+        result.Validate(request, self.ContractView)
+        target = result.applied_target
+        canonicalValues = self.CanonicalizeTarget(target)
+        requestedValues = self.CanonicalizeTarget(request.target)
         if self.CachedTargetValues is None:
-            endpointCount = len(self.EndEffectors)
-            self.CachedTargetValues = torch.zeros_like(target.values)
-            self.CachedTargetActive = torch.zeros(batchSize, endpointCount, device=target.values.device, dtype=torch.bool)
-            self.CachedTargetVersion = torch.full((batchSize,), -1, device=target.values.device, dtype=torch.long)
-            self.DwellState = torch.zeros(batchSize, endpointCount, device=target.values.device, dtype=torch.long)
-            self.ReachedState = torch.zeros(batchSize, endpointCount, device=target.values.device, dtype=torch.bool)
+            self.InitializeExecutionState(target.values)
         if (
             tuple(self.CachedTargetValues.shape) != tuple(target.values.shape)
             or self.CachedTargetValues.device != target.values.device
             or self.CachedTargetValues.dtype != target.values.dtype
         ):
             raise ValueError("target batch identity changed without robot reset")
-        if bool((dispatched & target.target_version.lt(self.CachedTargetVersion)).any().item()):
-            raise ValueError("dispatched target version cannot move backwards")
-        sameVersion = dispatched & target.target_version.eq(self.CachedTargetVersion)
+        if bool(target.target_version.lt(self.CachedTargetVersion).any().item()):
+            raise ValueError("applied target version cannot move backwards")
+        if bool(result.action_epoch.lt(self.CachedActionEpoch).any().item()):
+            raise ValueError("applied action epoch cannot move backwards")
+        requestSlotMatches = self.ContractView.TargetSlotsMatch(
+            canonicalValues,
+            target.active,
+            requestedValues,
+            request.target.active)
+        cachedSlotMatches = self.ContractView.TargetSlotsMatch(
+            canonicalValues,
+            target.active,
+            self.CachedTargetValues,
+            self.CachedTargetActive)
+        previousActive = self.CachedTargetActive.detach().clone()
+        for endpointIndex in range(len(self.EndEffectors)):
+            status = result.execution_status[:, endpointIndex]
+            exactRequest = requestSlotMatches[:, endpointIndex]
+            unchanged = cachedSlotMatches[:, endpointIndex]
+            if bool((status.eq(int(SlotExecutionStatus.APPLIED)) & ~exactRequest).any().item()):
+                raise ValueError("applied slot status requires the requested target")
+            if bool((
+                (
+                    status.eq(int(SlotExecutionStatus.UNKNOWN))
+                    | status.eq(int(SlotExecutionStatus.REJECTED))
+                    | status.eq(int(SlotExecutionStatus.HELD))
+                )
+                & ~unchanged
+            ).any().item()):
+                raise ValueError("unknown, rejected or held slot status requires the previous target")
+            if bool((
+                status.eq(int(SlotExecutionStatus.STOPPED))
+                & target.active[:, endpointIndex]
+            ).any().item()):
+                raise ValueError("stopped slot status requires an inactive target")
+        rowMatchesRequest = requestSlotMatches.all(dim=-1)
+        rowMatchesCache = cachedSlotMatches.all(dim=-1)
+        relevant = (
+            previousActive
+            | request.target.active
+            | target.active)
+        requestedSlotsApplied = (
+            ~request.target.active
+            | (
+                result.execution_known
+                & result.execution_status.eq(
+                    int(SlotExecutionStatus.APPLIED)))
+        ).all(dim=-1)
+        stoppedSlots = result.execution_status.eq(
+            int(SlotExecutionStatus.STOPPED))
+        stoppedRequest = (
+            (request.stop_requested | request.help_requested)
+            & torch.where(
+                relevant.any(dim=-1),
+                (stoppedSlots | ~relevant).all(dim=-1),
+                stoppedSlots.all(dim=-1)))
+        requestSnapshot = (
+            rowMatchesRequest
+            & (
+                (
+                    request.target.active.any(dim=-1)
+                    & requestedSlotsApplied)
+                | stoppedRequest))
+        previousStatus = (
+            result.execution_status.eq(
+                int(SlotExecutionStatus.UNKNOWN))
+            | result.execution_status.eq(
+                int(SlotExecutionStatus.REJECTED))
+            | result.execution_status.eq(
+                int(SlotExecutionStatus.HELD)))
+        previousSnapshot = (
+            rowMatchesCache
+            & torch.where(
+                relevant.any(dim=-1),
+                (previousStatus | ~relevant).all(dim=-1),
+                previousStatus.all(dim=-1)))
+        requestVersionValid = (
+            requestSnapshot
+            & target.target_version.eq(request.target.target_version))
+        cacheVersionValid = (
+            previousSnapshot
+            & (
+                (
+                    self.CachedTargetVersion.ge(0)
+                    & target.target_version.eq(
+                        self.CachedTargetVersion))
+                | (
+                    self.CachedTargetVersion.lt(0)
+                    & target.target_version.eq(
+                        request.target.target_version))))
+        compositeSnapshot = ~(requestSnapshot | previousSnapshot)
+        compositeVersionValid = (
+            compositeSnapshot
+            & target.target_version.gt(self.CachedTargetVersion))
+        if bool((~(
+            requestVersionValid
+            | cacheVersionValid
+            | compositeVersionValid
+        )).any().item()):
+            raise ValueError("applied target version does not identify its snapshot")
+        sameVersion = target.target_version.eq(self.CachedTargetVersion)
         if bool(sameVersion.any().item()):
             rows = torch.nonzero(sameVersion, as_tuple=False).squeeze(-1)
-            sameValues = torch.equal(
+            sameTarget = self.ContractView.TargetRowsMatch(
                 canonicalValues.index_select(0, rows),
-                self.CachedTargetValues.index_select(0, rows))
-            sameActive = torch.equal(
                 target.active.index_select(0, rows),
-                self.CachedTargetActive.index_select(0, rows))
-            if not sameValues or not sameActive:
+                self.CachedTargetValues.index_select(0, rows),
+                self.CachedTargetActive.index_select(0, rows),
+            )
+            if not bool(sameTarget.all().item()):
                 raise ValueError("one target version cannot identify different targets")
-        changed = torch.zeros_like(self.CachedTargetActive)
-        for endpointIndex in range(len(self.EndEffectors)):
-            targetSlice = self.ContractView.end_effector_target_layout.Slice(endpointIndex)
-            changed[:, endpointIndex] = dispatched & (
-                target.active[:, endpointIndex].ne(self.CachedTargetActive[:, endpointIndex])
-                | canonicalValues[:, targetSlice].ne(self.CachedTargetValues[:, targetSlice]).any(dim=-1))
+            canonicalValues = torch.where(
+                sameVersion.unsqueeze(-1),
+                self.CachedTargetValues,
+                canonicalValues)
+        changed = ~cachedSlotMatches
+        requestMatches = (
+            rowMatchesRequest
+            & target.target_version.eq(request.target.target_version))
+        requestApplied = (
+            request.target.active.any(dim=-1)
+            & requestMatches
+            & requestedSlotsApplied)
+        ownerChanged = (
+            changed.any(dim=-1)
+            | requestApplied
+            | result.help_accepted
+            | (
+                result.execution_known
+                & result.execution_status.eq(
+                    int(SlotExecutionStatus.MODIFIED))
+                & relevant).any(dim=-1))
+        ownerEpoch = torch.where(
+            ownerChanged,
+            result.action_epoch,
+            self.CachedActionEpoch)
         reset = changed.clone()
         for layer in self.ContractView.topological_layers[1:]:
             for endpointIndex in layer:
                 reset[:, endpointIndex] |= reset[:, self.ContractView.parent_index[endpointIndex]]
-        rows = torch.nonzero(dispatched, as_tuple=False).squeeze(-1)
-        self.CachedTargetValues.index_copy_(0, rows, canonicalValues.index_select(0, rows).detach())
-        self.CachedTargetActive.index_copy_(0, rows, target.active.index_select(0, rows).detach())
-        self.CachedTargetVersion.index_copy_(0, rows, target.target_version.index_select(0, rows).detach())
-        self.DwellState.masked_fill_(reset, 0)
-        self.ReachedState.masked_fill_(reset, False)
+        dwellState = self.DwellState.masked_fill(reset, 0)
+        reachedState = self.ReachedState.masked_fill(reset, False)
+        progressState = self.ProgressState.masked_fill(reset, 0.0)
+        self.CachedTargetValues = canonicalValues.detach().clone()
+        self.CachedTargetActive = target.active.detach().clone()
+        self.CachedTargetVersion = target.target_version.detach().clone()
+        self.CachedActionEpoch = ownerEpoch.detach().clone()
+        self.CachedRequestId = result.request_id.detach().clone()
+        self.CachedExecutionStatus = result.execution_status.detach().clone()
+        self.CachedExecutionKnown = result.execution_known.detach().clone()
+        executionRelevant = relevant
+        anyRelevant = executionRelevant.any(dim=-1)
+        self.CachedExecutionRelevant = executionRelevant.detach().clone()
+        self.CachedExecutionResultKnown = torch.where(
+            anyRelevant,
+            (result.execution_known | ~executionRelevant).all(dim=-1),
+            result.execution_known.all(dim=-1)).detach().clone()
+        self.CachedExecutionTimestamp = result.timestamp.detach().clone()
+        self.CachedHardStop = result.hard_stop.detach().clone()
+        self.CachedHelpAccepted = result.help_accepted.detach().clone()
+        self.DwellState = dwellState.detach().clone()
+        self.ReachedState = reachedState.detach().clone()
+        self.ProgressState = progressState.detach().clone()
 
     def EvaluateHierarchy(
         self,
         translation: torch.Tensor,
         rotation: torch.Tensor,
         endpointPresent: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        timestamp: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batchSize = int(translation.size(0))
         endpointCount = len(self.EndEffectors)
-        progress = translation.new_zeros(batchSize, endpointCount)
-        reached = torch.zeros(batchSize, endpointCount, device=translation.device, dtype=torch.bool)
-        enabled = torch.zeros_like(reached)
         if self.CachedTargetValues is None:
-            rootMask = torch.tensor(self.ContractView.root_mask, device=translation.device, dtype=torch.bool).unsqueeze(0)
-            return progress, reached, rootMask & endpointPresent
+            self.InitializeExecutionState(translation.new_zeros(
+                batchSize,
+                self.ContractView.end_effector_target_layout.PackedDim))
+        if self.ObservationAgeState is None:
+            self.ObservationAgeState = translation.new_zeros(
+                batchSize,
+                endpointCount)
+            self.ObservationKnownState = torch.zeros(
+                batchSize,
+                endpointCount,
+                device=translation.device,
+                dtype=torch.bool)
+        elapsed = (
+            torch.zeros_like(timestamp)
+            if self.LastTimestamp is None
+            else timestamp - self.LastTimestamp
+        ).to(dtype=translation.dtype).unsqueeze(-1)
+        self.ObservationAgeState = torch.where(
+            endpointPresent,
+            torch.zeros_like(self.ObservationAgeState),
+            self.ObservationAgeState + elapsed).detach().clone()
+        self.ObservationKnownState = (
+            self.ObservationKnownState | endpointPresent
+        ).detach().clone()
+        progress = self.ProgressState.clone()
+        reached = self.ReachedState.clone()
+        phaseEnabled = torch.zeros(
+            batchSize,
+            endpointCount,
+            device=translation.device,
+            dtype=torch.bool)
+        phaseKnown = torch.zeros_like(phaseEnabled)
         _, targetRotationVector = self.ExpandTarget(
             self.CachedTargetValues,
             self.CachedTargetActive)
         for layer in self.ContractView.topological_layers:
             for endpointIndex in layer:
                 parentIndex = self.ContractView.parent_index[endpointIndex]
-                hierarchyEnabled = endpointPresent[:, endpointIndex] if parentIndex < 0 else reached[:, parentIndex] & endpointPresent[:, endpointIndex]
-                enabled[:, endpointIndex] = hierarchyEnabled
-                executing = hierarchyEnabled & self.CachedTargetActive[:, endpointIndex]
+                if parentIndex < 0:
+                    endpointPhaseKnown = torch.ones(
+                        batchSize,
+                        device=translation.device,
+                        dtype=torch.bool)
+                    endpointPhaseEnabled = endpointPhaseKnown
+                else:
+                    parentTargetActive = self.CachedTargetActive[:, parentIndex]
+                    parentBlocked = (
+                        ~phaseEnabled[:, parentIndex]
+                        | ~parentTargetActive)
+                    parentConfirmed = self.ObservationKnownState[:, parentIndex]
+                    endpointPhaseKnown = (
+                        phaseKnown[:, parentIndex]
+                        & (parentBlocked | parentConfirmed))
+                    endpointPhaseEnabled = (
+                        phaseKnown[:, parentIndex]
+                        & ~parentBlocked
+                        & parentConfirmed
+                        & self.ReachedState[:, parentIndex])
+                phaseKnown[:, endpointIndex] = endpointPhaseKnown
+                phaseEnabled[:, endpointIndex] = endpointPhaseEnabled
+                targetActive = self.CachedTargetActive[:, endpointIndex]
+                executing = endpointPhaseEnabled & targetActive
+                observedExecution = executing & endpointPresent[:, endpointIndex]
                 errorSquared = translation.new_zeros(batchSize)
                 targetSlice = self.ContractView.end_effector_target_layout.Slice(
                     endpointIndex)
@@ -1521,6 +2417,10 @@ class Robot:
                 rotationWidth = self.ContractView.end_effector_rotation_basis.shapes[
                     endpointIndex][1]
                 if translationWidth:
+                    basis = self.ContractView.end_effector_translation_basis.Matrix(
+                        endpointIndex,
+                        translation.device,
+                        translation.dtype)
                     projection = self.TranslationProjection.Matrix(
                         endpointIndex,
                         translation.device,
@@ -1532,10 +2432,15 @@ class Robot:
                     error = (
                         targetCoordinates - currentCoordinates
                     ) / self.TranslationErrorScale[endpointIndex]
-                    errorSquared = errorSquared + error.square().sum(dim=-1)
+                    physicalError = error @ basis.transpose(0, 1)
+                    errorSquared = errorSquared + physicalError.square().sum(dim=-1)
                 if rotationWidth:
                     targetRotation = self.RotationVectorToMatrix(targetRotationVector[:, endpointIndex])
                     relativeRotation = targetRotation @ rotation[:, endpointIndex].transpose(-1, -2)
+                    basis = self.ContractView.end_effector_rotation_basis.Matrix(
+                        endpointIndex,
+                        rotation.device,
+                        rotation.dtype)
                     projection = self.RotationProjection.Matrix(
                         endpointIndex,
                         rotation.device,
@@ -1544,88 +2449,90 @@ class Robot:
                         self.MatrixToRotationVector(relativeRotation)
                         @ projection
                     ) / self.RotationErrorScale[endpointIndex]
-                    errorSquared = errorSquared + error.square().sum(dim=-1)
+                    physicalError = error @ basis.transpose(0, 1)
+                    errorSquared = errorSquared + physicalError.square().sum(dim=-1)
                 errorNorm = torch.sqrt(errorSquared)
-                progress[:, endpointIndex] = torch.where(
-                    executing,
-                    (1.0 + errorNorm / self.ProgressExit[endpointIndex]).reciprocal(),
-                    torch.zeros_like(errorNorm))
+                measuredProgress = (
+                    1.0 + errorNorm / self.ProgressExit[endpointIndex]
+                ).reciprocal()
                 wasReached = self.ReachedState[:, endpointIndex]
-                inside = executing & errorNorm.le(self.ProgressEnter[endpointIndex])
-                remain = executing & wasReached & errorNorm.le(self.ProgressExit[endpointIndex])
-                dwell = torch.where(
+                inside = observedExecution & errorNorm.le(
+                    self.ProgressEnter[endpointIndex])
+                remain = observedExecution & wasReached & errorNorm.le(
+                    self.ProgressExit[endpointIndex])
+                measuredDwell = torch.where(
                     inside & ~wasReached,
                     self.DwellState[:, endpointIndex] + 1,
                     torch.zeros_like(self.DwellState[:, endpointIndex]))
-                endpointReached = remain | dwell.ge(self.DwellCycles[endpointIndex])
-                self.DwellState[:, endpointIndex] = dwell
-                self.ReachedState[:, endpointIndex] = endpointReached
-                reached[:, endpointIndex] = endpointReached
-        return progress, reached, enabled
-
-    def EncodePerceptionAngularVelocity(
-        self,
-        velocity: torch.Tensor,
-    ) -> torch.Tensor:
-        angularVelocity = []
-        for perceptionIndex, jointIndices in enumerate(
-            self.PerceptionJointIndices
-        ):
-            index = torch.tensor(
-                jointIndices,
-                device=velocity.device,
-                dtype=torch.long)
-            axes = self.PerceptionVelocityAxes.Matrix(
-                perceptionIndex,
-                velocity.device,
-                velocity.dtype)
-            angularVelocity.append(
-                velocity.index_select(1, index) @ axes)
-        if angularVelocity:
-            return torch.stack(angularVelocity, dim=1)
-        return velocity.new_zeros(int(velocity.size(0)), 0, 3)
+                measuredReached = remain | measuredDwell.ge(
+                    self.DwellCycles[endpointIndex])
+                clearState = (
+                    ~targetActive
+                    | (endpointPhaseKnown & ~endpointPhaseEnabled))
+                self.DwellState[:, endpointIndex] = torch.where(
+                    observedExecution,
+                    measuredDwell,
+                    torch.where(
+                        clearState,
+                        torch.zeros_like(measuredDwell),
+                        self.DwellState[:, endpointIndex]))
+                self.ReachedState[:, endpointIndex] = torch.where(
+                    observedExecution,
+                    measuredReached,
+                    torch.where(
+                        clearState,
+                        torch.zeros_like(wasReached),
+                        wasReached))
+                self.ProgressState[:, endpointIndex] = torch.where(
+                    observedExecution,
+                    measuredProgress,
+                    torch.where(
+                        clearState,
+                        torch.zeros_like(measuredProgress),
+                        self.ProgressState[:, endpointIndex]))
+                progress[:, endpointIndex] = self.ProgressState[:, endpointIndex]
+                reached[:, endpointIndex] = self.ReachedState[:, endpointIndex]
+        self.DwellState = self.DwellState.detach().clone()
+        self.ReachedState = self.ReachedState.detach().clone()
+        self.ProgressState = self.ProgressState.detach().clone()
+        return (
+            progress,
+            reached,
+            phaseEnabled,
+            phaseKnown,
+            self.ObservationAgeState.clone())
 
     def ComputePerceptionMotion(
         self,
-        translation: torch.Tensor,
         rotation: torch.Tensor,
         endpointPresent: torch.Tensor,
-        jointAngularVelocity: torch.Tensor,
+        elapsed: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batchSize = int(rotation.size(0))
         perceptionIndices = torch.tensor(self.ContractView.perception_view_indices, device=rotation.device, dtype=torch.long)
         current = rotation.index_select(1, perceptionIndices)
-        currentTranslation = translation.index_select(1, perceptionIndices)
         currentStatePresent = endpointPresent.index_select(1, perceptionIndices)
         perceptionCount = int(current.size(1))
         currentQuaternion = self.MatrixToQuaternion(current)
         deltaQuaternion = rotation.new_zeros(batchSize, perceptionCount, 4)
         deltaQuaternion[..., 3] = 1.0
-        angularVelocity = torch.zeros_like(jointAngularVelocity)
+        angularVelocity = rotation.new_zeros(batchSize, perceptionCount, 3)
         motionPresent = torch.zeros(batchSize, perceptionCount, device=rotation.device, dtype=torch.bool)
         if perceptionCount == 0:
             return currentQuaternion, deltaQuaternion, angularVelocity, motionPresent
-        if self.PerceptionTranslationReference is None:
-            self.PerceptionTranslationReference = torch.zeros_like(currentTranslation)
-            self.PerceptionTranslationKnown = torch.zeros_like(currentStatePresent)
-        drift = torch.linalg.vector_norm(currentTranslation - self.PerceptionTranslationReference, dim=-1)
-        if bool((currentStatePresent & self.PerceptionTranslationKnown & drift.gt(self.PerceptionTranslationTolerance)).any().item()):
-            raise ValueError("pure-rotation perception endpoint translated")
-        establish = currentStatePresent & ~self.PerceptionTranslationKnown
-        self.PerceptionTranslationReference = torch.where(
-            establish.unsqueeze(-1),
-            currentTranslation,
-            self.PerceptionTranslationReference).detach().clone()
-        self.PerceptionTranslationKnown = (self.PerceptionTranslationKnown | currentStatePresent).detach().clone()
         if self.LastPerceptionRotation is None:
             self.LastPerceptionRotation = current.detach().clone()
             self.LastPerceptionStatePresent = torch.zeros_like(currentStatePresent)
         motionPresent = currentStatePresent & self.LastPerceptionStatePresent
         deltaMatrix = self.LastPerceptionRotation.transpose(-1, -2) @ current
+        spatialDeltaMatrix = current @ self.LastPerceptionRotation.transpose(-1, -2)
         computedDelta = self.MatrixToQuaternion(deltaMatrix)
+        computedAngularVelocity = self.MatrixToRotationVector(spatialDeltaMatrix) / elapsed.to(
+            dtype=rotation.dtype).view(batchSize, 1, 1).clamp_min(
+                torch.finfo(rotation.dtype).eps)
         angularVelocity = torch.where(
             motionPresent.unsqueeze(-1),
-            jointAngularVelocity,
+            computedAngularVelocity,
             angularVelocity)
         deltaQuaternion = torch.where(motionPresent.unsqueeze(-1), computedDelta, deltaQuaternion)
         self.LastPerceptionRotation = torch.where(
@@ -1685,41 +2592,53 @@ class Robot:
             translation,
             rotationQuaternion,
             endpointPresent)
-        jointAngularVelocity = self.EncodePerceptionAngularVelocity(velocity)
+        elapsed = (
+            torch.zeros_like(timestamp)
+            if self.LastTimestamp is None
+            else timestamp - self.LastTimestamp)
         (
             perceptionRotation,
             perceptionRotationDelta,
             perceptionAngularVelocity,
             perceptionMotionPresent,
         ) = self.ComputePerceptionMotion(
+            rotation,
+            endpointPresent,
+            elapsed)
+        (
+            progress,
+            reached,
+            phaseEnabled,
+            phaseKnown,
+            observationAge,
+        ) = self.EvaluateHierarchy(
             translation,
             rotation,
             endpointPresent,
-            jointAngularVelocity)
-        progress, reached, childEnabled = self.EvaluateHierarchy(
-            translation,
-            rotation,
-            endpointPresent)
+            timestamp)
         perceptionMotionFeatures = self.EncodePerceptionMotion(
             perceptionRotationDelta,
             perceptionAngularVelocity,
             perceptionMotionPresent)
-        actualBatch = int(position.size(0))
-        if self.CachedTargetActive is None:
-            targetActive = torch.zeros(actualBatch, len(self.EndEffectors), device=position.device, dtype=torch.bool)
-            targetVersion = torch.full((actualBatch,), -1, device=position.device, dtype=torch.long)
-        else:
-            targetActive = self.CachedTargetActive.clone()
-            targetVersion = self.CachedTargetVersion.clone()
         packet = BrainFeedbackPacket(
             joint_features=jointFeatures,
             end_effector_features=endpointFeatures,
             endpoint_present=endpointPresent,
             progress=progress,
             reached=reached,
-            child_enabled=childEnabled,
-            target_active=targetActive,
-            target_version=targetVersion,
+            phase_enabled=phaseEnabled,
+            phase_known=phaseKnown,
+            observation_age=observationAge,
+            applied_target_values=self.CachedTargetValues.clone(),
+            applied_target_active=self.CachedTargetActive.clone(),
+            applied_target_version=self.CachedTargetVersion.clone(),
+            applied_action_epoch=self.CachedActionEpoch.clone(),
+            execution_status=self.CachedExecutionStatus.clone(),
+            execution_known=self.CachedExecutionKnown.clone(),
+            execution_relevant=self.CachedExecutionRelevant.clone(),
+            execution_result_known=self.CachedExecutionResultKnown.clone(),
+            hard_stop=self.CachedHardStop.clone(),
+            help_accepted=self.CachedHelpAccepted.clone(),
             perception_rotation=perceptionRotation,
             perception_rotation_delta=perceptionRotationDelta,
             perception_angular_velocity=perceptionAngularVelocity,
@@ -1730,3 +2649,609 @@ class Robot:
             timestamp=timestamp)
         self.LastTimestamp = timestamp.detach().clone()
         return packet
+
+
+class TestRobotMorphologyMTool:
+    def __init__(self, device: Optional[torch.device] = None) -> None:
+        self.device = device or torch.device("cpu")
+
+    def MakeTarget(
+        self,
+        robot: Robot,
+        activeIndices: Sequence[int],
+        version: int,
+        timestamp: float,
+    ) -> PackedEndEffectorTarget:
+        contract = robot.ContractView
+        values = torch.zeros(
+            1,
+            contract.end_effector_target_layout.PackedDim,
+            device=self.device)
+        active = torch.zeros(
+            1,
+            contract.end_effector_count,
+            device=self.device,
+            dtype=torch.bool)
+        active[:, tuple(activeIndices)] = True
+        return PackedEndEffectorTarget(
+            values=values,
+            active=active,
+            contract_id=contract.contract_id,
+            model_signature=contract.model_signature,
+            target_version=torch.tensor(
+                [version],
+                device=self.device,
+                dtype=torch.long),
+            timestamp=torch.tensor(
+                [timestamp],
+                device=self.device))
+
+    def MakeRequest(
+        self,
+        robot: Robot,
+        target: PackedEndEffectorTarget,
+        requestId: int,
+        actionEpoch: int,
+        stopRequested: bool = False,
+    ) -> ActionRequest:
+        device = target.values.device
+        return robot.BuildActionRequest(
+            target=target,
+            requestId=torch.tensor([requestId], device=device),
+            actionEpoch=torch.tensor([actionEpoch], device=device),
+            commandActive=torch.tensor(
+                [not stopRequested],
+                device=device),
+            holdRequested=torch.tensor([False], device=device),
+            stopRequested=torch.tensor([stopRequested], device=device),
+            helpRequested=torch.tensor([False], device=device),
+            policyPath=torch.tensor([0], device=device),
+            plannerOverride=torch.tensor([False], device=device),
+            temporalKindId=torch.tensor([0], device=device),
+            timestamp=target.timestamp.clone())
+
+    def MakeResult(
+        self,
+        request: ActionRequest,
+        target: PackedEndEffectorTarget,
+        status: SlotExecutionStatus,
+        timestamp: float,
+        hardStop: bool = False,
+    ) -> ActionExecutionResult:
+        batchSize = int(target.values.size(0))
+        endpointCount = int(target.active.size(1))
+        device = target.values.device
+        return ActionExecutionResult(
+            request_id=request.request_id.clone(),
+            action_epoch=request.action_epoch.clone(),
+            applied_target=target,
+            execution_status=torch.full(
+                (batchSize, endpointCount),
+                int(status),
+                device=device,
+                dtype=torch.long),
+            execution_known=torch.ones(
+                batchSize,
+                endpointCount,
+                device=device,
+                dtype=torch.bool),
+            hard_stop=torch.tensor([hardStop], device=device),
+            help_accepted=torch.tensor([False], device=device),
+            timestamp=torch.tensor([timestamp], device=device))
+
+    def TestDefaultProfile(self) -> bool:
+        robot = Robot.CreateDefault()
+        leftJoints, leftEndpoints = Robot.CreateAnthropomorphicArm("left")
+        rightJoints, rightEndpoints = Robot.CreateAnthropomorphicArm("right")
+        assert len(leftJoints) == 27
+        assert len(rightJoints) == 27
+        assert len(leftEndpoints) + len(rightEndpoints) == 12
+        assert len(robot.EndEffectors) == 13
+        assert len(robot.ContractView.perception_view_indices) == 1
+        perceptionIndex = robot.ContractView.perception_view_indices[0]
+        assert robot.ContractView.end_effector_translation_basis.shapes[
+            perceptionIndex][1] == 0
+        assert robot.ContractView.end_effector_rotation_basis.shapes[
+            perceptionIndex][1] > 0
+        return True
+
+    def TestAppliedTransactionAndHierarchy(self) -> bool:
+        robot = Robot.CreateDefault()
+        contract = robot.ContractView
+        target = self.MakeTarget(robot, (0, 1), 0, 0.0)
+        request = self.MakeRequest(robot, target, 11, 3)
+        encodedRequest = robot.EncodeActionRequest(request)
+        assert set(encodedRequest) == robot.ActionRequestPayloadFields
+        result = robot.DecodeActionExecutionResult({
+            "schema_version": robot.ActionSchemaVersion,
+            "request_id": [11],
+            "action_epoch": [3],
+            "applied_target": robot.DecodeTarget(target),
+            "execution_status": [[
+                SlotExecutionStatus.APPLIED.name
+                for _ in robot.EndEffectors]],
+            "execution_known": [[True for _ in robot.EndEffectors]],
+            "hard_stop": [False],
+            "help_accepted": [False],
+            "timestamp": [0.1],
+        }, request, self.device)
+        robot.CommitAppliedTarget(request, result)
+        payload = robot.BuildNeutralFeedbackPayload(
+            0.2,
+            self.device)
+        payload["end_effector_present"][0] = True
+        packet = robot.EncodeFeedback(payload, self.device)
+        assert int(robot.DwellState[0, 0].item()) == 1
+        payload["end_effector_present"][0] = False
+        payload["timestamp"] = 0.3
+        packet = robot.EncodeFeedback(payload, self.device)
+        assert int(robot.DwellState[0, 0].item()) == 1
+        payload["end_effector_present"][0] = True
+        for timestamp in (0.4, 0.5):
+            payload["timestamp"] = timestamp
+            packet = robot.EncodeFeedback(payload, self.device)
+            packet.Validate(contract)
+        assert bool(packet.reached[0, 0].item())
+        assert bool(packet.phase_enabled[0, 1].item())
+        payload["end_effector_present"][0] = False
+        payload["timestamp"] = 0.6
+        packet = robot.EncodeFeedback(payload, self.device)
+        assert bool(packet.reached[0, 0].item())
+        assert bool(packet.phase_enabled[0, 1].item())
+        assert bool(packet.phase_known[0, 1].item())
+        payload["timestamp"] = 0.9
+        packet = robot.EncodeFeedback(payload, self.device)
+        assert bool(packet.reached[0, 0].item())
+        assert bool(packet.phase_enabled[0, 1].item())
+        assert bool(packet.phase_known[0, 1].item())
+        from TemporalExecutionModule import (
+            CONTINUE,
+            PACKED_TEMPORAL_KIND_NAMES,
+            PackedTemporalEvent,
+            PackedTemporalExecutionGate,
+            PackedTemporalProposal,
+        )
+        temporalGate = PackedTemporalExecutionGate(contract)
+        kindScores = torch.full(
+            (1, len(PACKED_TEMPORAL_KIND_NAMES)),
+            -1.0,
+            device=self.device)
+        kindScores[:, CONTINUE] = 1.0
+        temporalDecision = temporalGate.Step(
+            packet,
+            target,
+            PackedTemporalProposal(
+                kind_scores=kindScores,
+                same_operator=torch.ones(1, device=self.device),
+                operator_changed=torch.zeros(1, device=self.device),
+                invoke_delta=torch.zeros(1, device=self.device),
+                reference_drift=torch.zeros(1, device=self.device),
+                redispatch_score=torch.zeros(1, device=self.device),
+                interrupt_score=torch.zeros(1, device=self.device),
+                duration_ms=torch.ones(1, device=self.device),
+                soft_timeout_ms=torch.full((1,), 10.0, device=self.device),
+                hard_timeout_ms=torch.full((1,), 20.0, device=self.device)),
+            PackedTemporalEvent(
+                candidate_ready=torch.zeros(
+                    1, device=self.device, dtype=torch.bool),
+                redispatch_requested=torch.zeros(
+                    1, device=self.device, dtype=torch.bool),
+                cancel_requested=torch.zeros(
+                    1, device=self.device, dtype=torch.bool),
+                planner_failed=torch.zeros(
+                    1, device=self.device, dtype=torch.bool),
+                plan_reached=torch.zeros(
+                    1, device=self.device, dtype=torch.bool),
+                active_risk=torch.zeros(1, device=self.device),
+                candidate_risk=torch.zeros(1, device=self.device)),
+            torch.zeros(1, device=self.device))
+        assert int(temporalDecision.kind_id.item()) == CONTINUE
+        assert not bool(temporalDecision.stop_requested.item())
+        stopTarget = self.MakeTarget(robot, (), 1, 1.0)
+        stopRequest = self.MakeRequest(
+            robot,
+            stopTarget,
+            12,
+            4,
+            True)
+        stopResult = self.MakeResult(
+            stopRequest,
+            stopTarget,
+            SlotExecutionStatus.STOPPED,
+            1.1,
+            True)
+        robot.CommitAppliedTarget(stopRequest, stopResult)
+        assert not bool(robot.CachedTargetActive.any().item())
+        assert bool(robot.CachedHardStop.item())
+        assert not bool(robot.ReachedState.any().item())
+        assert bool(robot.CachedExecutionRelevant[0, 0].item())
+        assert bool(robot.CachedExecutionRelevant[0, 1].item())
+        assert bool(robot.CachedExecutionResultKnown.item())
+        return True
+
+    def TestAppliedTargetOwnerEpoch(self) -> bool:
+        robot = Robot.CreateDefault()
+        targetA = self.MakeTarget(robot, (0,), 0, 0.0)
+        requestA = self.MakeRequest(robot, targetA, 21, 1)
+        resultA = self.MakeResult(
+            requestA,
+            targetA,
+            SlotExecutionStatus.APPLIED,
+            0.1)
+        robot.CommitAppliedTarget(requestA, resultA)
+        targetBValues = targetA.values.clone()
+        targetBValues[:, 0] = 0.25
+        targetB = PackedEndEffectorTarget(
+            values=targetBValues,
+            active=targetA.active.clone(),
+            contract_id=targetA.contract_id,
+            model_signature=targetA.model_signature,
+            target_version=torch.tensor(
+                [1], device=self.device, dtype=torch.long),
+            timestamp=torch.tensor([0.2], device=self.device))
+        requestB = self.MakeRequest(robot, targetB, 22, 2)
+        rejectedB = self.MakeResult(
+            requestB,
+            targetA,
+            SlotExecutionStatus.REJECTED,
+            0.3)
+        robot.CommitAppliedTarget(requestB, rejectedB)
+        assert int(robot.CachedActionEpoch.item()) == 1
+        assert torch.equal(robot.CachedTargetValues, targetA.values)
+        appliedB = self.MakeResult(
+            requestB,
+            targetB,
+            SlotExecutionStatus.APPLIED,
+            0.4)
+        robot.CommitAppliedTarget(requestB, appliedB)
+        assert int(robot.CachedActionEpoch.item()) == 2
+        assert torch.equal(robot.CachedTargetValues, targetB.values)
+        return True
+
+    def TestContractTargetCoordinateComparison(self) -> bool:
+        robot = Robot.CreateDefault()
+        contract = robot.ContractView
+        target = self.MakeTarget(robot, (0,), 0, 0.0)
+        withinValues = target.values.clone()
+        withinValues[:, 0] += 5.0e-7
+        assert bool(contract.TargetRowsMatch(
+            target.values,
+            target.active,
+            withinValues,
+            target.active).item())
+        outsideValues = target.values.clone()
+        outsideValues[:, 0] += 1.0e-3
+        assert not bool(contract.TargetRowsMatch(
+            target.values,
+            target.active,
+            outsideValues,
+            target.active).item())
+        inactive = target.active.clone()
+        inactive[:, 0] = False
+        assert not bool(contract.TargetRowsMatch(
+            target.values,
+            target.active,
+            target.values,
+            inactive).item())
+        return True
+
+    def TestAppliedTargetUsesContractTolerance(self) -> bool:
+        robot = Robot.CreateDefault()
+        requested = self.MakeTarget(robot, (0,), 0, 0.0)
+        request = self.MakeRequest(robot, requested, 31, 1)
+        appliedValues = requested.values.clone()
+        appliedValues[:, 0] += 5.0e-7
+        applied = PackedEndEffectorTarget(
+            values=appliedValues,
+            active=requested.active.clone(),
+            contract_id=requested.contract_id,
+            model_signature=requested.model_signature,
+            target_version=requested.target_version.clone(),
+            timestamp=torch.tensor([0.1], device=self.device))
+        result = self.MakeResult(
+            request,
+            applied,
+            SlotExecutionStatus.APPLIED,
+            0.1)
+        robot.CommitAppliedTarget(request, result)
+        assert int(robot.CachedActionEpoch.item()) == 1
+        return True
+
+    def TestTargetBoundsUseContractTolerance(self) -> bool:
+        robot = Robot.CreateDefault()
+        contract = robot.ContractView
+        target = self.MakeTarget(robot, (0,), 0, 0.0)
+        upper = contract.end_effector_target_upper[0]
+        tolerance = contract.end_effector_target_tolerance[0]
+        withinValues = target.values.clone()
+        withinValues[:, 0] = upper + 0.5 * tolerance
+        within = PackedEndEffectorTarget(
+            values=withinValues,
+            active=target.active.clone(),
+            contract_id=target.contract_id,
+            model_signature=target.model_signature,
+            target_version=target.target_version.clone(),
+            timestamp=target.timestamp.clone())
+        within.Validate(contract)
+        outsideValues = target.values.clone()
+        outsideValues[:, 0] = upper + 2.0 * tolerance
+        outside = PackedEndEffectorTarget(
+            values=outsideValues,
+            active=target.active.clone(),
+            contract_id=target.contract_id,
+            model_signature=target.model_signature,
+            target_version=target.target_version.clone(),
+            timestamp=target.timestamp.clone())
+        rejected = False
+        try:
+            outside.Validate(contract)
+        except ValueError:
+            rejected = True
+        assert rejected
+        return True
+
+    def TestAppliedTargetVersionIsStrict(self) -> bool:
+        robot = Robot.CreateDefault()
+        target = self.MakeTarget(robot, (0,), 0, 0.0)
+        firstRequest = self.MakeRequest(robot, target, 41, 1)
+        robot.CommitAppliedTarget(
+            firstRequest,
+            self.MakeResult(
+                firstRequest,
+                target,
+                SlotExecutionStatus.APPLIED,
+                0.1))
+        nextTarget = PackedEndEffectorTarget(
+            values=target.values.clone(),
+            active=target.active.clone(),
+            contract_id=target.contract_id,
+            model_signature=target.model_signature,
+            target_version=torch.tensor(
+                [1], device=self.device, dtype=torch.long),
+            timestamp=torch.tensor([0.2], device=self.device))
+        nextRequest = self.MakeRequest(robot, nextTarget, 42, 2)
+        rejected = False
+        try:
+            robot.CommitAppliedTarget(
+                nextRequest,
+                self.MakeResult(
+                    nextRequest,
+                    target,
+                    SlotExecutionStatus.APPLIED,
+                    0.3))
+        except ValueError:
+            rejected = True
+        assert rejected
+        return True
+
+    def TestSameVersionTargetSnapsToCache(self) -> bool:
+        robot = Robot.CreateDefault()
+        target = self.MakeTarget(robot, (0,), 0, 0.0)
+        firstRequest = self.MakeRequest(robot, target, 51, 1)
+        robot.CommitAppliedTarget(
+            firstRequest,
+            self.MakeResult(
+                firstRequest,
+                target,
+                SlotExecutionStatus.APPLIED,
+                0.1))
+        heldValues = target.values.clone()
+        heldValues[:, 0] += 5.0e-7
+        heldTarget = PackedEndEffectorTarget(
+            values=heldValues,
+            active=target.active.clone(),
+            contract_id=target.contract_id,
+            model_signature=target.model_signature,
+            target_version=target.target_version.clone(),
+            timestamp=torch.tensor([0.2], device=self.device))
+        heldRequest = self.MakeRequest(robot, target, 52, 1)
+        robot.CommitAppliedTarget(
+            heldRequest,
+            self.MakeResult(
+                heldRequest,
+                heldTarget,
+                SlotExecutionStatus.HELD,
+                0.2))
+        assert torch.equal(robot.CachedTargetValues, target.values)
+        return True
+
+    def TestCompositeAppliedTargetSnapshot(self) -> bool:
+        robot = Robot.CreateDefault()
+        contract = robot.ContractView
+        targetA = self.MakeTarget(robot, (0, 1), 0, 0.0)
+        requestA = self.MakeRequest(robot, targetA, 61, 1)
+        robot.CommitAppliedTarget(
+            requestA,
+            self.MakeResult(
+                requestA,
+                targetA,
+                SlotExecutionStatus.APPLIED,
+                0.1))
+        valuesB = targetA.values.clone()
+        valuesB[:, contract.end_effector_target_layout.Slice(0).start] = 0.25
+        valuesB[:, contract.end_effector_target_layout.Slice(1).start] = 0.15
+        targetB = PackedEndEffectorTarget(
+            values=valuesB,
+            active=targetA.active.clone(),
+            contract_id=targetA.contract_id,
+            model_signature=targetA.model_signature,
+            target_version=torch.tensor(
+                [1], device=self.device, dtype=torch.long),
+            timestamp=torch.tensor([0.2], device=self.device))
+        requestB = self.MakeRequest(robot, targetB, 62, 2)
+        compositeValues = targetA.values.clone()
+        compositeValues[:, contract.end_effector_target_layout.Slice(0)] = (
+            targetB.values[:, contract.end_effector_target_layout.Slice(0)])
+        composite = PackedEndEffectorTarget(
+            values=compositeValues,
+            active=targetA.active.clone(),
+            contract_id=targetA.contract_id,
+            model_signature=targetA.model_signature,
+            target_version=torch.tensor(
+                [1], device=self.device, dtype=torch.long),
+            timestamp=torch.tensor([0.3], device=self.device))
+        result = self.MakeResult(
+            requestB,
+            composite,
+            SlotExecutionStatus.HELD,
+            0.3)
+        status = result.execution_status.clone()
+        status[:, 0] = int(SlotExecutionStatus.APPLIED)
+        result = ActionExecutionResult(
+            request_id=result.request_id,
+            action_epoch=result.action_epoch,
+            applied_target=result.applied_target,
+            execution_status=status,
+            execution_known=result.execution_known,
+            hard_stop=result.hard_stop,
+            help_accepted=result.help_accepted,
+            timestamp=result.timestamp)
+        robot.CommitAppliedTarget(requestB, result)
+        assert int(robot.CachedTargetVersion.item()) == 1
+        assert int(robot.CachedActionEpoch.item()) == 2
+        assert torch.equal(robot.CachedTargetValues, compositeValues)
+        return True
+
+    def TestPerceptionTranslationDoesNotInvalidateMotion(self) -> bool:
+        robot = Robot.CreateDefault()
+        contract = robot.ContractView
+        endpointIndex = contract.perception_view_indices[0]
+        viewIndex = contract.perception_view_indices.index(endpointIndex)
+        payload = robot.BuildNeutralFeedbackPayload(0.1, self.device)
+        payload["end_effector_present"][endpointIndex] = True
+        robot.EncodeFeedback(payload, self.device)
+        payload["end_effector_translation"][endpointIndex] = [1.0, -2.0, 3.0]
+        payload["timestamp"] = 0.2
+        translated = robot.EncodeFeedback(payload, self.device)
+        assert bool(translated.perception_motion_present[0, viewIndex].item())
+        assert torch.allclose(
+            translated.perception_angular_velocity[0, viewIndex],
+            torch.zeros(3, device=self.device))
+        angle = 0.1
+        payload["end_effector_translation"][endpointIndex] = [-3.0, 2.0, 1.0]
+        payload["end_effector_rotation_xyzw"][endpointIndex] = [
+            0.0,
+            0.0,
+            math.sin(0.5 * angle),
+            math.cos(0.5 * angle),
+        ]
+        payload["timestamp"] = 0.3
+        rotated = robot.EncodeFeedback(payload, self.device)
+        assert torch.allclose(
+            rotated.perception_angular_velocity[0, viewIndex],
+            torch.tensor([0.0, 0.0, 1.0], device=self.device),
+            atol=1.0e-5,
+            rtol=1.0e-5)
+        previousMatrix = Robot.RotationVectorToMatrix(torch.tensor(
+            [[0.0, 0.0, angle]], device=self.device))
+        incrementMatrix = Robot.RotationVectorToMatrix(torch.tensor(
+            [[angle, 0.0, 0.0]], device=self.device))
+        nextMatrix = previousMatrix @ incrementMatrix
+        payload["end_effector_rotation_xyzw"][endpointIndex] = (
+            Robot.MatrixToQuaternion(nextMatrix)[0].tolist())
+        payload["timestamp"] = 0.4
+        composed = robot.EncodeFeedback(payload, self.device)
+        expectedAxis = previousMatrix[0] @ torch.tensor(
+            [1.0, 0.0, 0.0], device=self.device)
+        assert torch.allclose(
+            composed.perception_angular_velocity[0, viewIndex],
+            expectedAxis,
+            atol=1.0e-5,
+            rtol=1.0e-5)
+        return True
+
+    def TestBasisMetricIsCoordinateInvariant(self) -> bool:
+        def BuildRobot(
+            profileId: str,
+            basis: Tuple[Tuple[float, ...], ...],
+        ) -> Robot:
+            return Robot(RobotDefinition(
+                profile_id=profileId,
+                description_id=f"{profileId}_description",
+                semantic_definition_id=f"{profileId}_semantic",
+                adapter_id=f"{profileId}_adapter",
+                joints=(Robot.CreateRevoluteJoint(
+                    f"{profileId}_joint",
+                    (1.0, 0.0, 0.0),
+                    -1.0,
+                    1.0,
+                    1.0),),
+                end_effectors=(EndEffector(
+                    effector_id=f"{profileId}_endpoint",
+                    effector_type=EndEffectorType.OTHER,
+                    parent_effector_id=None,
+                    translation_basis=basis,
+                    rotation_basis=Robot.EmptyBasis,
+                    target_lower=(-2.0, -2.0),
+                    target_upper=(2.0, 2.0),
+                    reference_frame_id="external",
+                    is_perception_slot=False,
+                    progress_enter=0.1,
+                    progress_exit=2.0,
+                    dwell_cycles=1),),
+                perception_calibrations=()))
+
+        def Evaluate(
+            robot: Robot,
+            coordinates: Tuple[float, float],
+        ) -> torch.Tensor:
+            contract = robot.ContractView
+            target = PackedEndEffectorTarget(
+                values=torch.tensor(
+                    [coordinates],
+                    device=self.device),
+                active=torch.ones(
+                    1,
+                    contract.end_effector_count,
+                    device=self.device,
+                    dtype=torch.bool),
+                contract_id=contract.contract_id,
+                model_signature=contract.model_signature,
+                target_version=torch.zeros(
+                    1,
+                    device=self.device,
+                    dtype=torch.long),
+                timestamp=torch.zeros(1, device=self.device))
+            request = self.MakeRequest(robot, target, 1, 1)
+            robot.CommitAppliedTarget(
+                request,
+                self.MakeResult(
+                    request,
+                    target,
+                    SlotExecutionStatus.APPLIED,
+                    0.1))
+            payload = robot.BuildNeutralFeedbackPayload(0.2, self.device)
+            payload["end_effector_present"][0] = True
+            return robot.EncodeFeedback(
+                payload,
+                self.device).progress[:, 0]
+
+        orthogonal = BuildRobot(
+            "orthogonal_basis",
+            ((1.0, 0.0), (0.0, 1.0), (0.0, 0.0)))
+        transformed = BuildRobot(
+            "transformed_basis",
+            ((2.0, 1.0), (0.0, 1.0), (0.0, 0.0)))
+        orthogonalProgress = Evaluate(orthogonal, (1.0, 1.0))
+        transformedProgress = Evaluate(transformed, (0.0, 1.0))
+        assert torch.allclose(
+            orthogonalProgress,
+            transformedProgress,
+            atol=1.0e-6,
+            rtol=1.0e-6)
+        return True
+
+    def RunAll(self) -> Mapping[str, bool]:
+        return {
+            "DefaultProfile": self.TestDefaultProfile(),
+            "AppliedTransactionAndHierarchy": self.TestAppliedTransactionAndHierarchy(),
+            "AppliedTargetOwnerEpoch": self.TestAppliedTargetOwnerEpoch(),
+            "ContractTargetCoordinateComparison": self.TestContractTargetCoordinateComparison(),
+            "AppliedTargetUsesContractTolerance": self.TestAppliedTargetUsesContractTolerance(),
+            "TargetBoundsUseContractTolerance": self.TestTargetBoundsUseContractTolerance(),
+            "AppliedTargetVersionIsStrict": self.TestAppliedTargetVersionIsStrict(),
+            "SameVersionTargetSnapsToCache": self.TestSameVersionTargetSnapsToCache(),
+            "CompositeAppliedTargetSnapshot": self.TestCompositeAppliedTargetSnapshot(),
+            "PerceptionTranslationDoesNotInvalidateMotion": self.TestPerceptionTranslationDoesNotInvalidateMotion(),
+            "BasisMetricIsCoordinateInvariant": self.TestBasisMetricIsCoordinateInvariant(),
+        }

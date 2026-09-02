@@ -8,6 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from FunctionTools import AGICoreModule
+from CoreTypes import (
+    POLICY_PATH_DETAIL,
+    POLICY_PATH_FAST,
+    POLICY_PATH_FULL,
+    POLICY_PATH_NONE,
+)
 from ModuleMessagerManager import ModuleDim
 from NeuroSymbolicModule import FAILURE_CAUSES, OPERATORS, NeuroSymbolicOutput
 
@@ -223,6 +229,7 @@ class EligibilityTracePlasticityLayer(AGICoreModule):
         self.base = nn.Parameter(torch.randn(outDim, inDim, device=self.device, dtype=self.dtype) * 0.02)
         self.register_buffer("trace", torch.empty(0), persistent=False)
         self.register_buffer("fast", torch.empty(0), persistent=False)
+        self.Frozen = False
 
     def EnsureB(self, B: int):
         if int(self.trace.size(0)) != B:
@@ -235,25 +242,34 @@ class EligibilityTracePlasticityLayer(AGICoreModule):
         w_eff = self.base.unsqueeze(0) + 0.25 * fast
         out = torch.einsum("bi,boi->bo", x, w_eff)
 
-        with torch.no_grad():
-            mod = neuromod.detach().view(B, 1, 1)
-            self.fast = 0.99 * self.fast + 1e-3 * mod * self.trace
-            flat = self.fast.reshape(B, -1)
-            nrm = flat.norm(p=2, dim=1, keepdim=True).clamp_min(1e-8)
-            scale = (2.0 / nrm).clamp_max(1.0)
-            self.fast = self.fast * scale.view(B, 1, 1)
+        if not self.Frozen:
+            with torch.no_grad():
+                mod = neuromod.detach().view(B, 1, 1)
+                self.fast = 0.99 * self.fast + 1e-3 * mod * self.trace
+                flat = self.fast.reshape(B, -1)
+                nrm = flat.norm(p=2, dim=1, keepdim=True).clamp_min(1e-8)
+                scale = (2.0 / nrm).clamp_max(1.0)
+                self.fast = self.fast * scale.view(B, 1, 1)
 
         return out
 
     def Commit(self, pre: torch.Tensor, post: torch.Tensor, executeMask: torch.Tensor):
+        if self.Frozen:
+            return
         B = int(pre.size(0))
         with torch.no_grad():
             outer = torch.einsum("bo,bi->boi", post.detach(), pre.detach())
             write = executeMask.view(B, 1, 1)
             self.trace = 0.9 * self.trace + 0.1 * write * outer
 
+    def SetFrozen(self, frozen: bool) -> None:
+        self.Frozen = bool(frozen)
+
+    def IsFrozen(self) -> bool:
+        return bool(self.Frozen)
+
     def ClearTrace(self, invalidMask: torch.Tensor):
-        if self.trace.numel() == 0:
+        if self.Frozen or self.trace.numel() == 0:
             return
         with torch.no_grad():
             self.trace.masked_fill_(invalidMask.view(-1, 1, 1).bool(), 0.0)
@@ -514,6 +530,7 @@ class DecisionExtractor(AGICoreModule):
         intentDim: int = 1024,
         includeNoSkill: bool = True,
         *,
+        assistOptionId: int,
         valueTensorDim: int = 512,
         vNextTensorDim: int = 512,
         worldHDim: int = 512,
@@ -568,6 +585,12 @@ class DecisionExtractor(AGICoreModule):
             raise ValueError(
                 "Decision cognitive dimensions must be positive integers: "
                 + ", ".join(invalid_dimensions))
+        if (
+            type(assistOptionId) is not int
+            or int(assistOptionId) < 0
+            or int(assistOptionId) >= int(optionNum)
+        ):
+            raise ValueError("Decision assistOptionId must belong to the option set")
         self.stateDim = int(stateDim)
         self.intentDim = int(intentDim)
         self.includeNoSkill = bool(includeNoSkill)
@@ -583,6 +606,7 @@ class DecisionExtractor(AGICoreModule):
         self.action_embed_dim = int(actionEmbedDim)
         self.mapper_hidden_dim = int(mapperEmbedDim)
         self.num_options = int(optionNum)
+        self.assist_option_id = int(assistOptionId)
         self.psi_dim = int(psiDim)
         self.plan_feature_dim = int(planFeatureDim)
         self.subgoal_feature_dim = int(subgoalFeatureDim)
@@ -756,6 +780,11 @@ class DecisionExtractor(AGICoreModule):
             optionCount=self.num_options,
             mapperDim=self.mapper_hidden_dim,
             hiddenDim=fast_hidden_dim)
+        self.stateless_option_latent_head = nn.Linear(
+            self.u_dim,
+            self.num_options,
+            bias=False)
+        nn.init.zeros_(self.stateless_option_latent_head.weight)
 
     def OptionLogits(
         self,
@@ -776,6 +805,162 @@ class DecisionExtractor(AGICoreModule):
 
     def PredictBelief(self, decisionState: torch.Tensor) -> torch.Tensor:
         return self.belief_predictor(decisionState)
+
+    def ResolveLatentSample(
+        self,
+        mean: torch.Tensor,
+        logvar: torch.Tensor,
+        sample: bool,
+        deterministic: bool,
+        uRaw: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if uRaw is not None:
+            if (
+                not torch.is_tensor(uRaw)
+                or tuple(uRaw.shape) != tuple(mean.shape)
+                or uRaw.device != mean.device
+                or uRaw.dtype != mean.dtype
+                or not bool(torch.isfinite(uRaw).all().item())
+            ):
+                raise ValueError("Decision uRaw does not match its latent distribution")
+            return uRaw
+        if sample and not deterministic:
+            return mean + torch.exp(0.5 * logvar) * torch.randn_like(mean)
+        return mean
+
+    def ResolveOptionIndex(
+        self,
+        optionLogits: torch.Tensor,
+        sample: bool,
+        deterministic: bool,
+        optionIndex: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch_size = int(optionLogits.size(0))
+        if optionIndex is not None:
+            if (
+                not torch.is_tensor(optionIndex)
+                or tuple(optionIndex.shape) != (batch_size,)
+                or optionIndex.dtype != torch.long
+                or optionIndex.device != optionLogits.device
+                or bool(((optionIndex < 0) | (optionIndex >= self.num_options)).any().item())
+            ):
+                raise ValueError("Decision optionIndex does not match its option distribution")
+            return optionIndex
+        if batch_size == 0:
+            return torch.empty(0, dtype=torch.long, device=optionLogits.device)
+        if sample and not deterministic:
+            return torch.distributions.Categorical(logits=optionLogits).sample()
+        return optionLogits.argmax(dim=-1)
+
+    def ActionLogProbabilities(
+        self,
+        uRaw: torch.Tensor,
+        mean: torch.Tensor,
+        logvar: torch.Tensor,
+        optionLogits: torch.Tensor,
+        optionIndex: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if (
+            not torch.is_tensor(uRaw)
+            or not torch.is_tensor(mean)
+            or not torch.is_tensor(logvar)
+            or tuple(uRaw.shape) != tuple(mean.shape)
+            or tuple(logvar.shape) != tuple(mean.shape)
+            or mean.dim() != 2
+            or int(mean.size(1)) != self.u_dim
+            or uRaw.device != mean.device
+            or logvar.device != mean.device
+            or uRaw.dtype != mean.dtype
+            or logvar.dtype != mean.dtype
+            or not bool(torch.isfinite(uRaw).all().item())
+            or not bool(torch.isfinite(mean).all().item())
+            or not bool(torch.isfinite(logvar).all().item())
+        ):
+            raise ValueError("Decision latent probability conditioning is invalid")
+        if (
+            not torch.is_tensor(optionLogits)
+            or tuple(optionLogits.shape) != (int(mean.size(0)), self.num_options)
+            or optionLogits.device != mean.device
+            or optionLogits.dtype != mean.dtype
+            or not bool(torch.isfinite(optionLogits).all().item())
+        ):
+            raise ValueError("Decision option probability conditioning is invalid")
+        selected_option = self.ResolveOptionIndex(
+            optionLogits,
+            False,
+            True,
+            optionIndex)
+        latent_log_probability = -0.5 * (
+            math.log(2.0 * math.pi)
+            + logvar
+            + (uRaw - mean).square() * torch.exp(-logvar)).sum(dim=-1)
+        option_log_probability = F.log_softmax(
+            optionLogits,
+            dim=-1).gather(
+                1,
+                selected_option.view(-1, 1)).squeeze(1)
+        return {
+            "latentLogProbability": latent_log_probability,
+            "optionLogProbability": option_log_probability,
+            "combinedActionLogProbability": (
+                latent_log_probability + option_log_probability)}
+
+    def BuildPolicyConditioning(
+        self,
+        uRaw: torch.Tensor,
+        mean: torch.Tensor,
+        logvar: torch.Tensor,
+        optionLogits: torch.Tensor,
+        optionIndex: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        return {
+            "uRaw": uRaw,
+            "mu": mean,
+            "logvar": logvar,
+            "optionLogits": optionLogits,
+            "optionIndex": optionIndex}
+
+    def StorePolicyConditioning(
+        self,
+        policyOutput: Dict[str, Any],
+    ) -> Dict[str, torch.Tensor]:
+        conditioning = policyOutput["policyConditioning"]
+        if set(conditioning) != {
+            "uRaw",
+            "mu",
+            "logvar",
+            "optionLogits",
+            "optionIndex",
+        }:
+            raise ValueError("Decision policy conditioning fields do not match")
+        return {
+            name: value.detach().clone()
+            for name, value in conditioning.items()}
+
+    def RecomputeActionLogProbability(
+        self,
+        conditioning: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        if set(conditioning) != {
+            "uRaw",
+            "mu",
+            "logvar",
+            "optionLogits",
+            "optionIndex",
+        }:
+            raise ValueError("Decision policy conditioning fields do not match")
+        return self.ActionLogProbabilities(
+            conditioning["uRaw"],
+            conditioning["mu"],
+            conditioning["logvar"],
+            conditioning["optionLogits"],
+            conditioning["optionIndex"])
+
+    def SetEligibilityFrozen(self, frozen: bool) -> None:
+        self.elig_plasticity.SetFrozen(frozen)
+
+    def EligibilityFrozen(self) -> bool:
+        return self.elig_plasticity.IsFrozen()
 
     def CommitEligibility(
         self,
@@ -813,6 +998,14 @@ class DecisionExtractor(AGICoreModule):
 
     @torch.no_grad()
     def ExportEligibilityState(self) -> Dict[str, torch.Tensor]:
+        if self.elig_plasticity.trace.numel() == 0:
+            empty = self.elig_plasticity.base.new_zeros(
+                0,
+                self.u_dim,
+                self.u_dim)
+            return {
+                "trace": empty,
+                "fast": empty.clone()}
         return {
             "trace": self.elig_plasticity.trace.detach().clone(),
             "fast": self.elig_plasticity.fast.detach().clone()}
@@ -988,6 +1181,8 @@ class DecisionExtractor(AGICoreModule):
         residuals: Tuple[torch.Tensor, ...],
         sample: bool,
         deterministic: bool,
+        uRaw: Optional[torch.Tensor] = None,
+        optionIndex: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         (
             belief_residual,
@@ -1002,49 +1197,68 @@ class DecisionExtractor(AGICoreModule):
         decision_state = (
             selected["prevDecisionState"]
             + torch.tanh(state_residual))
-        latent_control = (
+        latent_mean = (
             selected["prevLatentControl"]
             + torch.tanh(latent_residual))
         latent_logvar = (-1.0 + logvar_residual).clamp(-8.0, 4.0)
+        u_raw = self.ResolveLatentSample(
+            latent_mean,
+            latent_logvar,
+            sample,
+            deterministic,
+            uRaw)
+        latent_control = u_raw
         mapper_hidden = (
             selected["prevMapperHidden"]
             + torch.tanh(mapper_residual))
         option_prior_logits = selected["prevOptionLogit"].detach()
-        option_logits = option_prior_logits + option_residual
+        option_logits = (
+            option_prior_logits
+            + option_residual
+            + self.stateless_option_latent_head(latent_control))
         option_log_probs = F.log_softmax(option_logits, dim=-1)
         option_weights = option_log_probs.exp()
         row_count = int(belief.size(0))
-        if row_count == 0:
-            option_index = torch.empty(
-                0,
-                dtype=torch.long,
-                device=belief.device)
-        elif sample and not deterministic:
-            option_index = torch.distributions.Categorical(
-                probs=option_weights).sample()
-        else:
-            option_index = option_logits.argmax(dim=-1)
-        option_psi = belief.new_zeros(
+        option_index = self.ResolveOptionIndex(
+            option_logits,
+            sample,
+            deterministic,
+            optionIndex)
+        policy_input = torch.cat([
+            decision_state,
+            latent_control,
+            mapper_hidden], dim=-1)
+        option_psi = self.option_psi_head(policy_input).view(
             row_count,
             self.num_options,
             self.psi_dim)
-        selected_psi = belief.new_zeros(row_count, self.psi_dim)
-        option_context = torch.tanh(option_context_residual)
-        option_log_probability = (
-            option_log_probs.gather(
-                1,
-                option_index.view(-1, 1)).squeeze(1)
-            if row_count > 0
-            else belief.new_empty(0))
+        if sample and not deterministic and optionIndex is None:
+            option_hard = F.one_hot(
+                option_index,
+                num_classes=self.num_options).to(option_weights.dtype)
+            option_weight = (
+                option_hard + option_weights - option_weights.detach())
+        else:
+            option_weight = F.one_hot(
+                option_index,
+                num_classes=self.num_options).to(option_weights.dtype)
+        selected_psi = (
+            option_weight.unsqueeze(-1) * option_psi).sum(dim=1)
+        option_context = (
+            self.option_to_belief(selected_psi)
+            + torch.tanh(option_context_residual))
+        probabilities = self.ActionLogProbabilities(
+            u_raw,
+            latent_mean,
+            latent_logvar,
+            option_logits,
+            option_index)
+        option_log_probability = probabilities["optionLogProbability"]
         gaussian_entropy = (
             0.5 * (1.0 + math.log(2.0 * math.pi))
             + 0.5 * latent_logvar).sum(dim=-1)
         option_entropy = -(
             option_weights * option_log_probs).sum(dim=-1)
-        policy_input = torch.cat([
-            decision_state,
-            latent_control,
-            mapper_hidden], dim=-1)
         return {
             "z": decision_state,
             "entropy": gaussian_entropy + option_entropy,
@@ -1063,9 +1277,24 @@ class DecisionExtractor(AGICoreModule):
             "decision_state": decision_state,
             "decision_state_next": decision_state.detach(),
             "decision_uncertainty": selected["uncertainty"],
+            "uRaw": u_raw,
+            "mu": latent_mean,
+            "logvar": latent_logvar,
+            "optionIndex": option_index,
+            "latentLogProbability": probabilities["latentLogProbability"],
+            "optionLogProbability": option_log_probability,
+            "combinedActionLogProbability": probabilities[
+                "combinedActionLogProbability"],
+            "policyConditioning": self.BuildPolicyConditioning(
+                u_raw,
+                latent_mean,
+                latent_logvar,
+                option_logits,
+                option_index),
             "latent_control": {
                 "u": latent_control,
-                "mu": latent_control,
+                "raw": u_raw,
+                "mu": latent_mean,
                 "logvar": latent_logvar,},
             "latent_control_next": latent_control.detach(),
             "mapper": {
@@ -1134,6 +1363,8 @@ class DecisionExtractor(AGICoreModule):
         prevOptionLogit: torch.Tensor,
         sample: bool = False,
         deterministic: bool = True,
+        uRaw: Optional[torch.Tensor] = None,
+        optionIndex: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         full_inputs = {
             "stateFeat": stateFeat,
@@ -1161,7 +1392,9 @@ class DecisionExtractor(AGICoreModule):
             cached,
             residuals,
             sample,
-            deterministic)
+            deterministic,
+            uRaw,
+            optionIndex)
 
     def ForwardDetailRows(
         self,
@@ -1186,6 +1419,8 @@ class DecisionExtractor(AGICoreModule):
         prevOptionLogit: torch.Tensor,
         sample: bool = False,
         deterministic: bool = True,
+        uRaw: Optional[torch.Tensor] = None,
+        optionIndex: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         full_inputs = {
             "stateFeat": stateFeat,
@@ -1227,7 +1462,152 @@ class DecisionExtractor(AGICoreModule):
             cached,
             residuals,
             sample,
-            deterministic)
+            deterministic,
+            uRaw,
+            optionIndex)
+
+    def RecomputePolicySnapshot(
+        self,
+        snapshot: Dict[str, Any],
+    ) -> Dict[str, torch.Tensor]:
+        expected = {
+            "policyPath",
+            "cachedDecisionFeature",
+            "detailGoalFeature",
+            "stateFeat",
+            "intentFeat",
+            "valueTensor",
+            "vNextTensor",
+            "uncertainty",
+            "confidence",
+            "precision",
+            "risk",
+            "worldHzx",
+            "prevFullDecisionState",
+            "prevFastDecisionState",
+            "prevDetailDecisionState",
+            "prevFullLatentControl",
+            "prevFastLatentControl",
+            "prevDetailLatentControl",
+            "prevActionEmbed",
+            "prevFullMapperHidden",
+            "prevFastMapperHidden",
+            "prevDetailMapperHidden",
+            "feedbackTdError",
+            "prevFullOptionLogit",
+            "prevFastOptionLogit",
+            "prevDetailOptionLogit",
+            "uRaw",
+            "optionIndex",
+            "eligibilityState",
+            "eligibilityFrozen",
+        }
+        if type(snapshot) is not dict or set(snapshot) != expected:
+            raise ValueError("Decision policy snapshot fields do not match")
+        path = snapshot["policyPath"]
+        if (
+            not torch.is_tensor(path)
+            or path.dim() != 1
+            or path.dtype != torch.long
+            or bool(path.lt(POLICY_PATH_FULL).any().item())
+            or bool(path.gt(POLICY_PATH_NONE).any().item())
+        ):
+            raise ValueError("Decision policy snapshot path is invalid")
+        batchSize = int(path.size(0))
+        originalState = self.ExportEligibilityState()
+        originalBatchSize = int(originalState["trace"].size(0))
+        originalFrozen = self.EligibilityFrozen()
+        self.ImportEligibilityState(snapshot["eligibilityState"], batchSize)
+        self.SetEligibilityFrozen(True)
+        combined = snapshot["uRaw"].new_zeros(batchSize)
+        latent = combined.clone()
+        option = combined.clone()
+        entropy = combined.clone()
+        valid = torch.zeros(
+            batchSize,
+            device=path.device,
+            dtype=torch.bool)
+        common = {
+            "stateFeat": snapshot["stateFeat"],
+            "intentFeat": snapshot["intentFeat"],
+            "valueTensor": snapshot["valueTensor"],
+            "vNextTensor": snapshot["vNextTensor"],
+            "uncertainty": snapshot["uncertainty"],
+            "confidence": snapshot["confidence"],
+            "precision": snapshot["precision"],
+            "risk": snapshot["risk"],
+            "worldHzx": snapshot["worldHzx"],
+            "prevActionEmbed": snapshot["prevActionEmbed"],
+            "feedbackTdError": snapshot["feedbackTdError"],
+        }
+        try:
+            for pathId, prefix in (
+                (POLICY_PATH_FULL, "Full"),
+                (POLICY_PATH_FAST, "Fast"),
+                (POLICY_PATH_DETAIL, "Detail"),
+            ):
+                rowIndex = path.eq(pathId).nonzero(
+                    as_tuple=False).flatten()
+                if rowIndex.numel() < 1:
+                    continue
+                route = {
+                    **common,
+                    "prevDecisionState": snapshot[
+                        "prev" + prefix + "DecisionState"],
+                    "prevLatentControl": snapshot[
+                        "prev" + prefix + "LatentControl"],
+                    "prevMapperHidden": snapshot[
+                        "prev" + prefix + "MapperHidden"],
+                    "prevOptionLogit": snapshot[
+                        "prev" + prefix + "OptionLogit"],
+                    "sample": False,
+                    "deterministic": True,
+                    "uRaw": snapshot["uRaw"].index_select(0, rowIndex),
+                    "optionIndex": snapshot["optionIndex"].index_select(
+                        0, rowIndex),
+                }
+                if pathId == POLICY_PATH_FULL:
+                    output = self.ForwardContractRows(
+                        rowIndex,
+                        **route)
+                elif pathId == POLICY_PATH_FAST:
+                    output = self.ForwardFastRows(
+                        rowIndex,
+                        snapshot["cachedDecisionFeature"],
+                        **route)
+                else:
+                    output = self.ForwardDetailRows(
+                        rowIndex,
+                        snapshot["cachedDecisionFeature"],
+                        snapshot["detailGoalFeature"],
+                        **route)
+                combined = combined.index_copy(
+                    0,
+                    rowIndex,
+                    output["combinedActionLogProbability"])
+                latent = latent.index_copy(
+                    0,
+                    rowIndex,
+                    output["latentLogProbability"])
+                option = option.index_copy(
+                    0,
+                    rowIndex,
+                    output["optionLogProbability"])
+                entropy = entropy.index_copy(
+                    0,
+                    rowIndex,
+                    output["entropy"])
+                valid[rowIndex] = True
+        finally:
+            self.ImportEligibilityState(originalState, originalBatchSize)
+            self.SetEligibilityFrozen(originalFrozen)
+        return {
+            "combinedActionLogProbability": combined,
+            "latentLogProbability": latent,
+            "optionLogProbability": option,
+            "entropy": entropy,
+            "valid": valid,
+        }
 
     def FastDistillationLoss(
         self,
@@ -1397,6 +1777,8 @@ class DecisionExtractor(AGICoreModule):
         prevOptionLogit: torch.Tensor,
         sample: bool = True,
         deterministic: bool = False,
+        uRaw: Optional[torch.Tensor] = None,
+        optionIndex: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         if not torch.is_tensor(stateFeat) or stateFeat.dim() < 1:
             raise ValueError("Decision stateFeat must have a batch dimension")
@@ -1448,7 +1830,9 @@ class DecisionExtractor(AGICoreModule):
             return self(
                 **fullInputs,
                 sample=sample,
-                deterministic=deterministic)
+                deterministic=deterministic,
+                uRaw=uRaw,
+                optionIndex=optionIndex)
 
         originalState = self.ExportEligibilityState()
         try:
@@ -1463,7 +1847,9 @@ class DecisionExtractor(AGICoreModule):
             output = self(
                 **selectedInputs,
                 sample=sample,
-                deterministic=deterministic)
+                deterministic=deterministic,
+                uRaw=uRaw,
+                optionIndex=optionIndex)
             updatedState = self.ExportEligibilityState()
             mergedState = {
                 name: fullState[name].index_copy(
@@ -1497,7 +1883,9 @@ class DecisionExtractor(AGICoreModule):
         feedbackTdError: torch.Tensor,
         prevOptionLogit: torch.Tensor,
         sample: bool = True,
-        deterministic: bool = False,) -> Dict[str, Any]:
+        deterministic: bool = False,
+        uRaw: Optional[torch.Tensor] = None,
+        optionIndex: Optional[torch.Tensor] = None,) -> Dict[str, Any]:
 
         B = stateFeat.size(0)
         self.EnsureB(B)
@@ -1515,11 +1903,13 @@ class DecisionExtractor(AGICoreModule):
             worldHzx=worldHzx,)
 
         u_mu, u_logvar = self.latent_inferer(belief, prevDecisionState)
-        if sample and not deterministic:
-            u_t = u_mu + torch.exp(0.5 * u_logvar) * torch.randn_like(u_mu)
-        else:
-            u_t = u_mu
-        u_pre = 0.8 * u_t + 0.2 * prevLatentControl
+        u_raw = self.ResolveLatentSample(
+            u_mu,
+            u_logvar,
+            sample,
+            deterministic,
+            uRaw)
+        u_pre = 0.8 * u_raw + 0.2 * prevLatentControl
 
         neuromod = feedbackTdError * confidence * (1.0 - uncertainty)
         u_plastic = self.elig_plasticity(u_pre, neuromod)
@@ -1540,22 +1930,30 @@ class DecisionExtractor(AGICoreModule):
         option_log_probs = F.log_softmax(option_logits, dim=-1)
         w_t = option_log_probs.exp()
         psi_all = self.option_psi_head(option_in).view(B, self.num_options, self.psi_dim)
-        if sample and not deterministic:
-            opt_idx = torch.distributions.Categorical(probs=w_t).sample()
+        opt_idx = self.ResolveOptionIndex(
+            option_logits,
+            sample,
+            deterministic,
+            optionIndex)
+        if sample and not deterministic and optionIndex is None:
             option_hard = F.one_hot(opt_idx, num_classes=self.num_options).to(w_t.dtype)
             option_weight = option_hard + w_t - w_t.detach()
         else:
-            opt_idx = option_logits.argmax(dim=-1)
             option_weight = F.one_hot(opt_idx, num_classes=self.num_options).to(w_t.dtype)
         psi_selected = (option_weight.unsqueeze(-1) * psi_all).sum(dim=1)
         option_context = self.option_to_belief(psi_selected)
 
         gaussian_entropy = (
             0.5 * (1.0 + math.log(2.0 * math.pi))
-            + 0.5 * u_logvar
-            + math.log(0.8)).sum(dim=-1)
+            + 0.5 * u_logvar).sum(dim=-1)
         option_entropy = -(w_t * option_log_probs).sum(dim=-1)
         entropy_scalar = gaussian_entropy + option_entropy
+        probabilities = self.ActionLogProbabilities(
+            u_raw,
+            u_mu,
+            u_logvar,
+            option_logits,
+            opt_idx)
 
         out: Dict[str, Any] = {
             "z": decision_state,
@@ -1567,7 +1965,7 @@ class DecisionExtractor(AGICoreModule):
                 "psi_selected": psi_selected,
                 "option_context": option_context,
                 "opt_idx": opt_idx,
-                "logp_option": option_log_probs.gather(1, opt_idx.view(-1, 1)).squeeze(1),
+                "logp_option": probabilities["optionLogProbability"],
                 "policy_input": option_in,
                 "prior_logits": option_prior_logits,},
             "prevOptionLogit_next": option_logits.detach(),
@@ -1575,8 +1973,23 @@ class DecisionExtractor(AGICoreModule):
             "decision_state": decision_state,
             "decision_state_next": decision_state.detach(),
             "decision_uncertainty": uncertainty,
+            "uRaw": u_raw,
+            "mu": u_mu,
+            "logvar": u_logvar,
+            "optionIndex": opt_idx,
+            "latentLogProbability": probabilities["latentLogProbability"],
+            "optionLogProbability": probabilities["optionLogProbability"],
+            "combinedActionLogProbability": probabilities[
+                "combinedActionLogProbability"],
+            "policyConditioning": self.BuildPolicyConditioning(
+                u_raw,
+                u_mu,
+                u_logvar,
+                option_logits,
+                opt_idx),
             "latent_control": {
                 "u": u_t,
+                "raw": u_raw,
                 "mu": u_mu,
                 "logvar": u_logvar,},
             "latent_control_next": u_t.detach(),
@@ -2009,13 +2422,14 @@ class TestDecisionMTool:
     def __init__(self, device: Optional[torch.device] = None):
         self.device = device or torch.device("cpu")
 
-    def MakeExtractor(self) -> DecisionExtractor:
+    def MakeExtractor(self, assistOptionId: int = 4) -> DecisionExtractor:
         return DecisionExtractor(
             stateDim=12,
             optionNum=5,
             hiddenDim=32,
             psiDim=16,
             intentDim=10,
+            assistOptionId=assistOptionId,
             valueTensorDim=8,
             vNextTensorDim=8,
             worldHDim=9,
@@ -2327,6 +2741,11 @@ class TestDecisionMTool:
     def TestOptionAndEligibilityState(self) -> bool:
         try:
             model = self.MakeExtractor()
+            invalid_assist_rejected = False
+            try:
+                self.MakeExtractor(model.num_options)
+            except ValueError:
+                invalid_assist_rejected = True
             batch_size = 2
             model.EnsureB(batch_size)
             pre = torch.randn(batch_size, model.u_dim, device=self.device)
@@ -2349,11 +2768,179 @@ class TestDecisionMTool:
                 model.num_options,
                 device=self.device))
             return bool(
-                first_written
+                model.assist_option_id == 4
+                and invalid_assist_rejected
+                and first_written
                 and second_empty
                 and cleared
                 and tuple(prior.shape) == (batch_size, model.num_options)
                 and bool(torch.isfinite(prior).all().item()))
+        except Exception:
+            return False
+
+    def TestDirectPolicyProbabilities(self) -> bool:
+        try:
+            torch.manual_seed(43)
+            model = self.MakeExtractor()
+            model.eval()
+            model.SetEligibilityFrozen(True)
+            inputs = self.MakeBaseInputs(model)
+            inputs["sample"] = True
+            inputs["deterministic"] = False
+            full_output = model(**inputs)
+            row_index = torch.arange(
+                int(inputs["stateFeat"].size(0)),
+                dtype=torch.long,
+                device=self.device)
+            direct_inputs = {
+                name: value
+                for name, value in inputs.items()
+                if name not in {"sample", "deterministic"}}
+            cached_feature = full_output["belief"].detach()
+            fast_output = model.ForwardFastRows(
+                row_index,
+                cached_feature,
+                **direct_inputs,
+                sample=True,
+                deterministic=False)
+            detail_context = torch.randn(
+                int(row_index.numel()),
+                model.goal_decision_context_dim,
+                device=self.device)
+            detail_output = model.ForwardDetailRows(
+                row_index,
+                cached_feature,
+                detail_context,
+                **direct_inputs,
+                sample=True,
+                deterministic=False)
+            outputs = (full_output, fast_output, detail_output)
+            for output in outputs:
+                for field_name in (
+                    "latentLogProbability",
+                    "optionLogProbability",
+                    "combinedActionLogProbability",
+                ):
+                    value = output[field_name]
+                    if (
+                        tuple(value.shape) != (int(row_index.numel()),)
+                        or not bool(torch.isfinite(value).all().item())
+                    ):
+                        return False
+                if not torch.allclose(
+                    output["combinedActionLogProbability"],
+                    output["latentLogProbability"]
+                    + output["optionLogProbability"],
+                    atol=1e-6,
+                    rtol=1e-6,
+                ):
+                    return False
+                conditioning = model.StorePolicyConditioning(output)
+                recomputed = model.RecomputeActionLogProbability(
+                    conditioning)
+                expected_latent = torch.distributions.Normal(
+                    conditioning["mu"],
+                    torch.exp(0.5 * conditioning["logvar"])).log_prob(
+                        conditioning["uRaw"]).sum(dim=-1)
+                expected_option = torch.distributions.Categorical(
+                    logits=conditioning["optionLogits"]).log_prob(
+                        conditioning["optionIndex"])
+                if (
+                    not torch.allclose(
+                        output["latentLogProbability"],
+                        expected_latent,
+                        atol=1e-6,
+                        rtol=1e-6)
+                    or not torch.allclose(
+                        output["optionLogProbability"],
+                        expected_option,
+                        atol=1e-6,
+                        rtol=1e-6)
+                ):
+                    return False
+                for field_name in (
+                    "latentLogProbability",
+                    "optionLogProbability",
+                    "combinedActionLogProbability",
+                ):
+                    if not torch.allclose(
+                        recomputed[field_name],
+                        output[field_name],
+                        atol=1e-6,
+                        rtol=1e-6,
+                    ):
+                        return False
+            full_recomputed = model(
+                **direct_inputs,
+                sample=True,
+                deterministic=False,
+                uRaw=full_output["uRaw"].detach(),
+                optionIndex=full_output["optionIndex"].detach())
+            fast_recomputed = model.ForwardFastRows(
+                row_index,
+                cached_feature,
+                **direct_inputs,
+                sample=True,
+                deterministic=False,
+                uRaw=fast_output["uRaw"].detach(),
+                optionIndex=fast_output["optionIndex"].detach())
+            detail_recomputed = model.ForwardDetailRows(
+                row_index,
+                cached_feature,
+                detail_context,
+                **direct_inputs,
+                sample=True,
+                deterministic=False,
+                uRaw=detail_output["uRaw"].detach(),
+                optionIndex=detail_output["optionIndex"].detach())
+            return all(
+                torch.allclose(
+                    original["combinedActionLogProbability"],
+                    recomputed["combinedActionLogProbability"],
+                    atol=1e-6,
+                    rtol=1e-6)
+                for original, recomputed in zip(
+                    outputs,
+                    (full_recomputed, fast_recomputed, detail_recomputed)))
+        except Exception:
+            return False
+
+    def TestEligibilityFreezeState(self) -> bool:
+        try:
+            torch.manual_seed(47)
+            model = self.MakeExtractor()
+            model.eval()
+            batch_size = 2
+            model.EnsureB(batch_size)
+            pre = torch.randn(batch_size, model.u_dim, device=self.device)
+            post = torch.randn(batch_size, model.u_dim, device=self.device)
+            execute_mask = torch.ones(
+                batch_size,
+                dtype=torch.bool,
+                device=self.device)
+            model.CommitEligibility(pre, post, execute_mask)
+            model(**self.MakeBaseInputs(model, batch_size))
+            model.SetEligibilityFrozen(True)
+            before = model.ExportEligibilityState()
+            model(**self.MakeBaseInputs(model, batch_size))
+            model.CommitEligibility(-pre, -post, execute_mask)
+            model.ClearInvalidEligibility(execute_mask)
+            after = model.ExportEligibilityState()
+            unchanged = all(
+                torch.equal(before[name], after[name])
+                for name in before)
+            zero_state = {
+                name: torch.zeros_like(value)
+                for name, value in before.items()}
+            model.ImportEligibilityState(zero_state, batch_size)
+            model.ImportEligibilityState(before, batch_size)
+            restored = model.ExportEligibilityState()
+            return bool(
+                model.EligibilityFrozen()
+                and unchanged
+                and all(
+                    torch.equal(before[name], restored[name])
+                    for name in before))
         except Exception:
             return False
 
@@ -2428,6 +3015,9 @@ class TestDecisionMTool:
             "NeuroSymbolicRefinementAndGradient": (
                 self.TestNeuroSymbolicRefinementAndGradient()),
             "OptionAndEligibilityState": self.TestOptionAndEligibilityState(),
+            "DirectPolicyProbabilities": (
+                self.TestDirectPolicyProbabilities()),
+            "EligibilityFreezeState": self.TestEligibilityFreezeState(),
             "CEMFeatureSearch": self.TestCEMFeatureSearch(),
             "CEMFeatureValidation": self.TestCEMFeatureValidation(),
         }

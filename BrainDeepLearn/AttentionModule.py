@@ -1097,49 +1097,6 @@ class AttentionExtractor(AGICoreModule):
         nn.init.zeros_(self.detail_student_residual[-1].weight)
         nn.init.zeros_(self.detail_student_residual[-1].bias)
 
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,):
-        compatibility_prefixes = (
-            "independent_head_scale",
-            "independent_channel_scale",
-            "independent_attention_scale",
-            "inhibition_return_gain",
-            "inhibition_return_decay",
-            "local_detail_query.",
-            "local_detail_value.",
-            "local_detail_gain",
-            "workspace_ignition_gain",
-            "fast_student_residual.",
-            "fast_student_norm.",
-            "fast_student_gain",
-            "detail_token_student.",
-            "detail_token_gain",
-            "detail_student_query.",
-            "detail_student_residual.",
-            "detail_student_norm.",
-            "detail_student_gain")
-        for name, value in self.state_dict().items():
-            if name.startswith(compatibility_prefixes):
-                key = prefix + name
-                if key not in state_dict:
-                    state_dict[key] = value.detach().clone()
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs)
-
-
     def ClipGrads(self):
         if self.gradient_clip_val > 0:
             torch.nn.utils.clip_grad_norm_(self.parameters(), self.gradient_clip_val)

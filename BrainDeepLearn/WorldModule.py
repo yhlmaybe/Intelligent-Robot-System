@@ -13,7 +13,8 @@ from PhysicalStateModule import (
     PSTWorldBinder)
 from RobotMorphologyModule import (
     BrainFeedbackPacket,
-    RobotEmbodimentContractView,)
+    RobotEmbodimentContractView,
+    SlotExecutionStatus,)
 
 
 ROTATION_QUATERNION_DIM = 4
@@ -118,16 +119,16 @@ class ContractWorldFeedbackPredictor(nn.Module):
         self.JointFeedbackHeads = nn.ModuleList([
             nn.Linear(
                 self.CognitiveDim,
-                contractView.joint_feedback_layout.Width(jointIndex))
+                2 * contractView.joint_feedback_layout.Width(jointIndex))
             for jointIndex in range(contractView.joint_count)
         ])
         self.EndpointFeedbackHeads = nn.ModuleList([
             nn.Linear(
                 self.CognitiveDim,
-                contractView.end_effector_feedback_layout.Width(endpointIndex))
+                2 * contractView.end_effector_feedback_layout.Width(endpointIndex))
             for endpointIndex in range(contractView.end_effector_count)
         ])
-        self.EndpointStatusHead = nn.Linear(self.CognitiveDim, 4)
+        self.EndpointStatusHead = nn.Linear(self.CognitiveDim, 5)
 
     @staticmethod
     def MaskedMean(
@@ -150,8 +151,11 @@ class ContractWorldFeedbackPredictor(nn.Module):
             raise ValueError("progress and joint features must share one dtype")
         required = {
             "PackedJointFeatures",
+            "PackedJointLogVariance",
             "PackedEndEffectorFeatures",
+            "PackedEndEffectorLogVariance",
             "Progress",
+            "ProgressLogVariance",
             "ReachedLogits",
             "LatentRisk",
             "LatentFeasibility",
@@ -178,30 +182,36 @@ class ContractWorldFeedbackPredictor(nn.Module):
         endpoint_shape = (
             batch_size,
             self.ContractView.end_effector_count)
-        packed_prediction = prediction["PackedJointFeatures"]
-        if (
-            not torch.is_tensor(packed_prediction)
-            or tuple(packed_prediction.shape)
-            != tuple(feedback.joint_features.shape)
-            or not packed_prediction.is_floating_point()
-            or packed_prediction.device != feedback.joint_features.device
-            or packed_prediction.dtype != feedback.joint_features.dtype
-            or not bool(torch.isfinite(packed_prediction).all().item())
+        for name in ("PackedJointFeatures", "PackedJointLogVariance"):
+            packed_prediction = prediction[name]
+            if (
+                not torch.is_tensor(packed_prediction)
+                or tuple(packed_prediction.shape)
+                != tuple(feedback.joint_features.shape)
+                or not packed_prediction.is_floating_point()
+                or packed_prediction.device != feedback.joint_features.device
+                or packed_prediction.dtype != feedback.joint_features.dtype
+                or not bool(torch.isfinite(packed_prediction).all().item())
+            ):
+                raise ValueError("packed joint prediction has the wrong shape")
+        for name in (
+            "PackedEndEffectorFeatures",
+            "PackedEndEffectorLogVariance",
         ):
-            raise ValueError("packed joint prediction has the wrong shape")
-        endpoint_prediction = prediction["PackedEndEffectorFeatures"]
-        if (
-            not torch.is_tensor(endpoint_prediction)
-            or tuple(endpoint_prediction.shape)
-            != tuple(feedback.end_effector_features.shape)
-            or not endpoint_prediction.is_floating_point()
-            or endpoint_prediction.device != feedback.joint_features.device
-            or endpoint_prediction.dtype != feedback.joint_features.dtype
-            or not bool(torch.isfinite(endpoint_prediction).all().item())
-        ):
-            raise ValueError("packed endpoint prediction has the wrong shape")
+            endpoint_prediction = prediction[name]
+            if (
+                not torch.is_tensor(endpoint_prediction)
+                or tuple(endpoint_prediction.shape)
+                != tuple(feedback.end_effector_features.shape)
+                or not endpoint_prediction.is_floating_point()
+                or endpoint_prediction.device != feedback.joint_features.device
+                or endpoint_prediction.dtype != feedback.joint_features.dtype
+                or not bool(torch.isfinite(endpoint_prediction).all().item())
+            ):
+                raise ValueError("packed endpoint prediction has the wrong shape")
         for name in (
             "Progress",
+            "ProgressLogVariance",
             "ReachedLogits",
             "LatentRisk",
             "LatentFeasibility",
@@ -238,25 +248,31 @@ class ContractWorldFeedbackPredictor(nn.Module):
         endpoint_mask = endpoint_mask & sample_mask.unsqueeze(-1)
         target_mask = (
             feedback.endpoint_present
-            & feedback.target_active
+            & feedback.applied_target_active
             & sample_mask.unsqueeze(-1))
-        loss_joint_features = self.MaskedMean(
-            F.smooth_l1_loss(
-                prediction["PackedJointFeatures"],
-                feedback.joint_features.detach(),
-                reduction="none"),
-            packed_mask)
-        loss_progress = self.MaskedMean(
-            F.smooth_l1_loss(
-                prediction["Progress"],
-                feedback.progress.detach(),
-                reduction="none"),
-            target_mask)
+        joint_error = (
+            prediction["PackedJointFeatures"]
+            - feedback.joint_features.detach())
+        joint_nll = 0.5 * (
+            joint_error.square()
+            * torch.exp(-prediction["PackedJointLogVariance"])
+            + prediction["PackedJointLogVariance"])
+        endpoint_error = (
+            prediction["PackedEndEffectorFeatures"]
+            - feedback.end_effector_features.detach())
+        endpoint_nll = 0.5 * (
+            endpoint_error.square()
+            * torch.exp(-prediction["PackedEndEffectorLogVariance"])
+            + prediction["PackedEndEffectorLogVariance"])
+        progress_error = prediction["Progress"] - feedback.progress.detach()
+        progress_nll = 0.5 * (
+            progress_error.square()
+            * torch.exp(-prediction["ProgressLogVariance"])
+            + prediction["ProgressLogVariance"])
+        loss_joint_features = self.MaskedMean(joint_nll, packed_mask)
+        loss_progress = self.MaskedMean(progress_nll, target_mask)
         loss_endpoint_features = self.MaskedMean(
-            F.smooth_l1_loss(
-                prediction["PackedEndEffectorFeatures"],
-                feedback.end_effector_features.detach(),
-                reduction="none"),
+            endpoint_nll,
             endpoint_mask)
         loss_reached = self.MaskedMean(
             F.binary_cross_entropy_with_logits(
@@ -269,12 +285,54 @@ class ContractWorldFeedbackPredictor(nn.Module):
             + loss_endpoint_features
             + loss_progress
             + loss_reached)
+        joint_weight = packed_mask.to(dtype=joint_nll.dtype)
+        endpoint_weight = endpoint_mask.to(dtype=endpoint_nll.dtype)
+        progress_weight = target_mask.to(dtype=progress_nll.dtype)
+        reached_nll = F.binary_cross_entropy_with_logits(
+            prediction["ReachedLogits"],
+            feedback.reached.to(dtype=feedback.joint_features.dtype),
+            reduction="none")
+        joint_standardized = joint_error.abs() * torch.exp(
+            -0.5 * prediction["PackedJointLogVariance"])
+        endpoint_standardized = endpoint_error.abs() * torch.exp(
+            -0.5 * prediction["PackedEndEffectorLogVariance"])
+        progress_standardized = progress_error.abs() * torch.exp(
+            -0.5 * prediction["ProgressLogVariance"])
+        joint_robust = torch.where(
+            joint_standardized.le(1.0),
+            0.5 * joint_standardized.square(),
+            joint_standardized - 0.5)
+        endpoint_robust = torch.where(
+            endpoint_standardized.le(1.0),
+            0.5 * endpoint_standardized.square(),
+            endpoint_standardized - 0.5)
+        progress_robust = torch.where(
+            progress_standardized.le(1.0),
+            0.5 * progress_standardized.square(),
+            progress_standardized - 0.5)
+        surprise_numerator = (
+            (joint_robust * joint_weight).sum(dim=-1)
+            + (endpoint_robust * endpoint_weight).sum(dim=-1)
+            + (progress_robust * progress_weight).sum(dim=-1)
+            + (reached_nll * progress_weight).sum(dim=-1))
+        surprise_count = (
+            joint_weight.sum(dim=-1)
+            + endpoint_weight.sum(dim=-1)
+            + 2.0 * progress_weight.sum(dim=-1))
+        surprise_valid = surprise_count.gt(0.0)
+        normalized_surprise = torch.where(
+            surprise_valid,
+            torch.sqrt((surprise_numerator / surprise_count.clamp_min(1.0))
+                       .clamp_min(0.0)),
+            torch.zeros_like(surprise_count))
         return {
             "loss": loss,
             "loss_joint_features": loss_joint_features,
             "loss_endpoint_features": loss_endpoint_features,
             "loss_progress": loss_progress,
             "loss_reached": loss_reached,
+            "normalized_surprise": normalized_surprise,
+            "surprise_valid": surprise_valid,
         }
 
     def forward(self, priorWorldState: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -291,20 +349,44 @@ class ContractWorldFeedbackPredictor(nn.Module):
                 device=priorWorldState.device,
                 dtype=priorWorldState.dtype)).unsqueeze(0)
         joint_context = priorWorldState.unsqueeze(1) + joint_static
-        packed = torch.cat([
+        packed_joint_distribution = torch.cat([
             head(joint_context[:, jointIndex])
             for jointIndex, head in enumerate(self.JointFeedbackHeads)
         ], dim=-1)
+        packed_joint_mean = []
+        packed_joint_log_variance = []
+        offset = 0
+        for jointIndex in range(self.ContractView.joint_count):
+            width = self.ContractView.joint_feedback_layout.Width(jointIndex)
+            distribution = packed_joint_distribution[
+                :, offset:offset + 2 * width]
+            mean, log_variance = distribution.split(width, dim=-1)
+            packed_joint_mean.append(mean)
+            packed_joint_log_variance.append(log_variance.clamp(-8.0, 4.0))
+            offset += 2 * width
         endpoint_static = self.EndpointStaticAdapter(
             self.StaticEndpointTokens.to(
                 device=priorWorldState.device,
                 dtype=priorWorldState.dtype)).unsqueeze(0)
         endpoint_context = priorWorldState.unsqueeze(1) + endpoint_static
-        packed_endpoint = torch.cat([
+        packed_endpoint_distribution = torch.cat([
             head(endpoint_context[:, endpointIndex])
             for endpointIndex, head in enumerate(
                 self.EndpointFeedbackHeads)
         ], dim=-1)
+        packed_endpoint_mean = []
+        packed_endpoint_log_variance = []
+        offset = 0
+        for endpointIndex in range(self.ContractView.end_effector_count):
+            width = self.ContractView.end_effector_feedback_layout.Width(
+                endpointIndex)
+            distribution = packed_endpoint_distribution[
+                :, offset:offset + 2 * width]
+            mean, log_variance = distribution.split(width, dim=-1)
+            packed_endpoint_mean.append(mean)
+            packed_endpoint_log_variance.append(
+                log_variance.clamp(-8.0, 4.0))
+            offset += 2 * width
         status = self.EndpointStatusHead(endpoint_context)
         unknown = torch.zeros(
             priorWorldState.size(0),
@@ -312,12 +394,21 @@ class ContractWorldFeedbackPredictor(nn.Module):
             device=priorWorldState.device,
             dtype=torch.bool)
         return {
-            "PackedJointFeatures": packed,
-            "PackedEndEffectorFeatures": packed_endpoint,
+            "PackedJointFeatures": torch.cat(packed_joint_mean, dim=-1),
+            "PackedJointLogVariance": torch.cat(
+                packed_joint_log_variance,
+                dim=-1),
+            "PackedEndEffectorFeatures": torch.cat(
+                packed_endpoint_mean,
+                dim=-1),
+            "PackedEndEffectorLogVariance": torch.cat(
+                packed_endpoint_log_variance,
+                dim=-1),
             "Progress": torch.sigmoid(status[..., 0]),
-            "ReachedLogits": status[..., 1],
-            "LatentRisk": torch.sigmoid(status[..., 2]),
-            "LatentFeasibility": torch.sigmoid(status[..., 3]),
+            "ProgressLogVariance": status[..., 1].clamp(-8.0, 4.0),
+            "ReachedLogits": status[..., 2],
+            "LatentRisk": torch.sigmoid(status[..., 3]),
+            "LatentFeasibility": torch.sigmoid(status[..., 4]),
             "LatentRiskKnown": unknown,
             "LatentFeasibilityKnown": unknown.clone(),
         }
@@ -328,6 +419,7 @@ class ContractWorldEmbodimentAdapter(nn.Module):
         self,
         contractView: RobotEmbodimentContractView,
         cognitiveDim: int,
+        actionDim: int,
     ) -> None:
         super().__init__()
         if type(cognitiveDim) is not int or cognitiveDim < 1:
@@ -340,6 +432,17 @@ class ContractWorldEmbodimentAdapter(nn.Module):
         self.FeedbackPredictor = ContractWorldFeedbackPredictor(
             contractView,
             cognitiveDim)
+        self.ActionDim = int(actionDim)
+        self.ExecutionActionStateDim = len(SlotExecutionStatus) + 4
+        self.ExecutionActionAdapter = nn.Sequential(
+            nn.LayerNorm(
+                self.ActionDim + self.ExecutionActionStateDim),
+            nn.Linear(
+                self.ActionDim + self.ExecutionActionStateDim,
+                self.ActionDim * 2),
+            nn.SiLU(),
+            nn.Linear(self.ActionDim * 2, self.ActionDim),
+            nn.LayerNorm(self.ActionDim))
         self.PerceptionRotationAdapters = nn.ModuleList([
             nn.Sequential(
                 nn.LayerNorm(
@@ -354,11 +457,11 @@ class ContractWorldEmbodimentAdapter(nn.Module):
                 len(contractView.perception_view_indices))
         ])
         self.ExecutionStateAdapter = nn.Sequential(
-            nn.Linear(8, self.CognitiveDim),
+            nn.Linear(10, self.CognitiveDim),
             nn.SiLU(),
             nn.Linear(self.CognitiveDim, self.CognitiveDim))
         self.ActivityAdapter = nn.Sequential(
-            nn.Linear(3, self.CognitiveDim),
+            nn.Linear(8, self.CognitiveDim),
             nn.SiLU(),
             nn.Linear(self.CognitiveDim, self.CognitiveDim))
         self.SlotFusion = nn.Sequential(
@@ -399,6 +502,48 @@ class ContractWorldEmbodimentAdapter(nn.Module):
             child_graph,
             persistent=True)
 
+    def EncodeExecutionAction(
+        self,
+        action: torch.Tensor,
+        executionStatus: torch.Tensor,
+        executionRelevant: torch.Tensor,
+        executionKnown: torch.Tensor,
+        executionResultKnown: torch.Tensor,
+        hardStop: torch.Tensor,
+        helpAccepted: torch.Tensor,
+        targetActive: torch.Tensor,
+    ) -> torch.Tensor:
+        dtype = action.dtype
+        status = F.one_hot(
+            executionStatus,
+            num_classes=len(SlotExecutionStatus)).to(dtype=dtype)
+        relevant = torch.where(
+            executionRelevant.any(dim=-1, keepdim=True),
+            executionRelevant,
+            torch.ones_like(executionRelevant))
+        status_weight = relevant.to(dtype=dtype).unsqueeze(-1)
+        status = (status * status_weight).sum(dim=1) / status_weight.sum(
+            dim=1).clamp_min(1.0)
+        state = torch.cat((
+            status,
+            executionResultKnown.to(dtype=dtype).unsqueeze(-1),
+            hardStop.to(dtype=dtype).unsqueeze(-1),
+            helpAccepted.to(dtype=dtype).unsqueeze(-1),
+            targetActive.to(dtype=dtype).mean(
+                dim=-1,
+                keepdim=True),
+        ), dim=-1)
+        actionKnown = (
+            targetActive
+            & executionRelevant
+            & executionKnown).any(dim=-1)
+        known_action = action * actionKnown.to(
+            dtype=dtype).unsqueeze(-1)
+        return known_action + self.ExecutionActionAdapter(torch.cat((
+            known_action,
+            state,
+        ), dim=-1))
+
     @staticmethod
     def PropagateGraph(
         slotTokens: torch.Tensor,
@@ -435,8 +580,8 @@ class ContractWorldEmbodimentAdapter(nn.Module):
         dtype = feedback.joint_features.dtype
         endpoint_present = feedback.endpoint_present.to(dtype=dtype)
         active_present = (
-            feedback.endpoint_present & feedback.target_active).to(dtype=dtype)
-        present_count = endpoint_present.sum(dim=-1).clamp_min(1.0)
+            feedback.endpoint_present
+            & feedback.applied_target_active).to(dtype=dtype)
         active_count = active_present.sum(dim=-1).clamp_min(1.0)
         progress = (
             feedback.progress * active_present
@@ -444,28 +589,40 @@ class ContractWorldEmbodimentAdapter(nn.Module):
         reached = (
             feedback.reached.to(dtype=dtype) * active_present
         ).sum(dim=-1) / active_count
-        child_enabled = (
-            feedback.child_enabled.to(dtype=dtype) * endpoint_present
-        ).sum(dim=-1) / present_count
-        target_active = feedback.target_active.to(dtype=dtype).mean(dim=-1)
+        phase_enabled = feedback.phase_enabled.to(dtype=dtype).mean(dim=-1)
+        phase_known = feedback.phase_known.to(dtype=dtype).mean(dim=-1)
+        target_active = feedback.applied_target_active.to(
+            dtype=dtype).mean(dim=-1)
         endpoint_present_fraction = endpoint_present.mean(dim=-1)
         if int(feedback.perception_motion_present.size(-1)) > 0:
             perception_motion_present_fraction = feedback.perception_motion_present.to(
                 dtype=dtype).mean(dim=-1)
         else:
             perception_motion_present_fraction = torch.zeros_like(progress)
-        target_known = feedback.target_version.ge(0).to(dtype=dtype)
-        target_version = feedback.target_version.clamp_min(0).to(dtype=dtype)
-        target_version = target_version / (1.0 + target_version)
+        execution_relevant = torch.where(
+            feedback.execution_relevant.any(dim=-1, keepdim=True),
+            feedback.execution_relevant,
+            torch.ones_like(feedback.execution_relevant))
+        execution_known = (
+            feedback.execution_known
+            & execution_relevant).to(dtype=dtype).sum(dim=-1) / (
+                execution_relevant.to(dtype=dtype).sum(
+                    dim=-1).clamp_min(1.0))
+        execution_result_known = feedback.execution_result_known.to(
+            dtype=dtype)
+        action_epoch = feedback.applied_action_epoch.to(dtype=dtype)
+        action_epoch = action_epoch / (1.0 + action_epoch)
         state = torch.stack((
             progress,
             reached,
-            child_enabled,
+            phase_enabled,
+            phase_known,
             target_active,
             endpoint_present_fraction,
             perception_motion_present_fraction,
-            target_known,
-            target_version,
+            execution_known,
+            execution_result_known,
+            action_epoch,
         ), dim=-1)
         return self.ExecutionStateAdapter(state)
 
@@ -546,12 +703,22 @@ class ContractWorldEmbodimentAdapter(nn.Module):
         full_rotation, perception_rotation, perception_motion_present = (
             self.EncodePerceptionRotation(feedback))
         activity = self.ActivityAdapter(torch.stack((
-            feedback.target_active.to(dtype=feedback.joint_features.dtype),
+            feedback.applied_target_active.to(
+                dtype=feedback.joint_features.dtype),
             feedback.reached.to(dtype=feedback.joint_features.dtype),
-            feedback.child_enabled.to(dtype=feedback.joint_features.dtype),
+            feedback.phase_enabled.to(dtype=feedback.joint_features.dtype),
+            feedback.phase_known.to(dtype=feedback.joint_features.dtype),
+            feedback.endpoint_present.to(dtype=feedback.joint_features.dtype),
+            feedback.execution_known.to(dtype=feedback.joint_features.dtype),
+            feedback.execution_relevant.to(
+                dtype=feedback.joint_features.dtype),
+            feedback.execution_status.to(
+                dtype=feedback.joint_features.dtype) / float(
+                    max(int(value) for value in SlotExecutionStatus)),
         ), dim=-1))
 
-        slot_mask = feedback.endpoint_present.to(
+        slot_mask = torch.ones_like(
+            feedback.endpoint_present,
             dtype=feedback.joint_features.dtype)
         slot_weight = slot_mask
         local_tokens = self.SlotFusion(torch.cat((
@@ -2315,7 +2482,8 @@ class RSSMWorldModel(AGICoreModule):
         self.observer_valid = bool(len(contractView.perception_view_indices) > 0)
         self.contract_embodiment_adapter = ContractWorldEmbodimentAdapter(
             contractView,
-            self.embodiment_state_dim)
+            self.embodiment_state_dim,
+            self.action_dim)
         entity_bank_input_dim = (
             self.physical_slot_dim
             + ModuleDim.PstRealmClasses
@@ -4516,6 +4684,46 @@ class RSSMWorldModel(AGICoreModule):
                 "contract transition does not match world physical width")
         return encoded
 
+    def EncodeContractExecutionAction(
+        self,
+        action: torch.Tensor,
+        feedbackPacket: BrainFeedbackPacket,
+    ) -> torch.Tensor:
+        return self.contract_embodiment_adapter.EncodeExecutionAction(
+            action,
+            feedbackPacket.execution_status,
+            feedbackPacket.execution_relevant,
+            feedbackPacket.execution_known,
+            feedbackPacket.execution_result_known,
+            feedbackPacket.hard_stop,
+            feedbackPacket.help_accepted,
+            feedbackPacket.applied_target_active)
+
+    def EncodeAssumedAppliedAction(
+        self,
+        action: torch.Tensor,
+        targetActive: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, endpoint_count = targetActive.shape
+        execution_status = torch.full(
+            (batch_size, endpoint_count),
+            int(SlotExecutionStatus.APPLIED),
+            device=action.device,
+            dtype=torch.long)
+        row_mask = torch.ones(
+            batch_size,
+            device=action.device,
+            dtype=torch.bool)
+        return self.contract_embodiment_adapter.EncodeExecutionAction(
+            action,
+            execution_status,
+            targetActive,
+            torch.ones_like(targetActive),
+            row_mask,
+            torch.zeros_like(row_mask),
+            torch.zeros_like(row_mask),
+            targetActive)
+
     def EncodeContractEmbodiment(
         self,
         feedbackPacket: BrainFeedbackPacket,
@@ -5896,6 +6104,7 @@ class RSSMWorldModel(AGICoreModule):
             "transition_embodiment_context": transition_embodiment_context,
             "posterior_embodied_action": observation_embodied_action,
             "posterior_embodiment_context": observation_embodiment_context,
+            "pst_binding_prior": prior_binding,
             "pst_binding": pst_binding,
             "loss_pst_bind": pst_binding["loss_pst_bind"],}
 
@@ -6062,7 +6271,7 @@ class RSSMWorldModel(AGICoreModule):
         rewardCoef: float = 1.0,
         doneCoef: float = 1.0,
         nsCoef: float = 1.0,
-        nsDistillCoef: float = 1e-2,
+        nsDistillCoef: float = 0.0,
         nsPriorLogicCoef: float = 1e-3,
         physCoef: float = 1e-4,
         pstBindCoef: float = 0.05,) -> Dict[str, torch.Tensor]:
@@ -7177,7 +7386,7 @@ class WorldOnlineWrapper(BaseOnlineWrapper):
         rewardCoef = kwargs.get("rewardCoef", 1.0)
         doneCoef = kwargs.get("doneCoef", 1.0)
         nsCoef = kwargs.get("nsCoef", 1.0)
-        nsDistillCoef = kwargs.get("nsDistillCoef", 1e-2)
+        nsDistillCoef = kwargs.get("nsDistillCoef", 0.0)
         nsPriorLogicCoef = kwargs.get("nsPriorLogicCoef", 1e-3)
         physCoef = kwargs.get("physCoef", 1e-4)
         pstBindCoef = kwargs.get("pstBindCoef", 0.05)

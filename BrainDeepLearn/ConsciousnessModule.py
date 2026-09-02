@@ -569,38 +569,6 @@ class ConsciousnessExtractor(AGICoreModule):
         self.register_buffer("_state_valid", torch.zeros(1, dtype=torch.bool), persistent=True)
         self.register_buffer("_step", torch.zeros(1, dtype=torch.long), persistent=True)
 
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,):
-        compatibility_prefixes = (
-            "source_embedding.",
-            "source_priority.",
-            "metadata_gain",
-            "ignition_context_gain",
-            "mem_ignition_norm.",
-            "world_ignition_norm.",
-            "content_competition_head.",
-            "content_competition_gain")
-        for name, value in self.state_dict().items():
-            if name.startswith(compatibility_prefixes):
-                key = prefix + name
-                if key not in state_dict:
-                    state_dict[key] = value.detach().clone()
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs)
-
     @torch.no_grad()
     def EnsureB(self, B: int):
         if self._dev_trace.size(0) != B:

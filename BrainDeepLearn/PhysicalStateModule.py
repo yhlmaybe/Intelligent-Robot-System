@@ -173,21 +173,23 @@ class ContractPhysicalStateAdapter(nn.Module):
     @staticmethod
     def EncodeEndpointStatus(
         feedback: BrainFeedbackPacket,
-        endpointStatePresent: torch.Tensor,
     ) -> torch.Tensor:
         dtype = feedback.joint_features.dtype
-        target_active = feedback.target_active.to(dtype=dtype)
-        child_enabled = feedback.child_enabled.to(dtype=dtype)
+        target_active = feedback.applied_target_active.to(dtype=dtype)
+        phase_enabled = feedback.phase_enabled.to(dtype=dtype)
+        phase_known = feedback.phase_known.to(dtype=dtype)
         progress = feedback.progress
+        freshness = torch.reciprocal(
+            1.0 + feedback.observation_age.to(dtype=dtype))
         return torch.stack((
             progress,
             feedback.reached.to(dtype=dtype),
-            child_enabled,
+            phase_enabled,
+            phase_known,
             target_active,
             feedback.endpoint_present.to(dtype=dtype),
-            endpointStatePresent,
-            progress * child_enabled,
-            target_active * (1.0 - progress),
+            freshness,
+            feedback.execution_known.to(dtype=dtype),
         ), dim=-1)
 
     def EncodeControlFeedback(
@@ -238,8 +240,10 @@ class ContractPhysicalStateAdapter(nn.Module):
             self.StaticSlotTokens.to(
                 device=endpoint_dynamic.device,
                 dtype=endpoint_dynamic.dtype)).unsqueeze(0)
-        status = self.EncodeEndpointStatus(feedback, endpoint_state_present)
-        slot_weight = feedback.endpoint_present.to(dtype=endpoint_dynamic.dtype)
+        status = self.EncodeEndpointStatus(feedback)
+        slot_weight = torch.ones_like(
+            feedback.endpoint_present,
+            dtype=endpoint_dynamic.dtype)
         slot_tokens = self.OutputNorm(
             endpoint_dynamic + static + self.StatusAdapter(status))
         slot_tokens = slot_tokens * slot_weight.unsqueeze(-1)
@@ -249,7 +253,7 @@ class ContractPhysicalStateAdapter(nn.Module):
         control_feedback = self.EncodeControlFeedback(
             joint_summary,
             status,
-            slot_weight)
+            torch.ones_like(slot_weight))
         context_feature, context_valid = self.EncodeEmbodimentContext(
             joint_summary,
             body_summary,

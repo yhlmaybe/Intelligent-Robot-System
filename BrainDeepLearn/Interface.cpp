@@ -602,6 +602,7 @@ bool BrainDeepLearnInterface::AgentHandleForward(
     StatusValue& result,
     const std::string& sensorPacketJson,
     const std::string& feedbackPayloadJson,
+    const std::string& executionResultJson,
     std::optional<double> reward,
     std::optional<double> done)
 {
@@ -634,11 +635,12 @@ bool BrainDeepLearnInterface::AgentHandleForward(
     PyObject* response = PyObject_CallMethod(
         pManagerObj,
         "AgentHandleForwardJson",
-        "OOss",
+        "OOsss",
         rewardObj,
         doneObj,
         sensorPacketJson.c_str(),
-        feedbackPayloadJson.c_str());
+        feedbackPayloadJson.c_str(),
+        executionResultJson.c_str());
     Py_DECREF(rewardObj);
     Py_DECREF(doneObj);
 

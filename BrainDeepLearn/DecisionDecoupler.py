@@ -310,8 +310,8 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         self.parent_output_encoders = nn.ModuleList()
         self.world_action_adapters = nn.ModuleList()
         self.dynamic_state_encoder = nn.Sequential(
-            nn.LayerNorm(5),
-            nn.Linear(5, self.feedback_token_dim),
+            nn.LayerNorm(7),
+            nn.Linear(7, self.feedback_token_dim),
             nn.SiLU(),
             nn.LayerNorm(self.feedback_token_dim),
         )
@@ -708,11 +708,8 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         if feedbackPacket.joint_features.device != device:
             raise ValueError("feedback must share the decision device")
         feedback_values = feedbackPacket.joint_features.to(dtype=dtype)
-        available = feedbackPacket.endpoint_present
-        enabled = feedbackPacket.child_enabled
-
-        root_mask = self.root_mask.to(device=device).unsqueeze(0)
-        enabled = enabled | root_mask
+        available = torch.ones_like(feedbackPacket.endpoint_present)
+        enabled = feedbackPacket.phase_enabled & feedbackPacket.phase_known
         return feedback_values, available, enabled
 
     def EncodeFeedbackState(
@@ -732,12 +729,21 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         dtype = decisionBackbone.dtype
         device = decisionBackbone.device
         available = feedbackPacket.endpoint_present
+        age_scale = torch.tensor(
+            self.contract_view.observation_timeout,
+            device=device,
+            dtype=dtype).unsqueeze(0).clamp_min(
+                torch.finfo(dtype).eps)
+        freshness = torch.exp(
+            -feedbackPacket.observation_age.to(dtype=dtype) / age_scale)
         dynamic_state = torch.stack([
             feedbackPacket.progress,
             feedbackPacket.reached.to(dtype=dtype),
-            feedbackPacket.child_enabled.to(dtype=dtype),
-            feedbackPacket.target_active.to(dtype=dtype),
+            feedbackPacket.phase_enabled.to(dtype=dtype),
+            feedbackPacket.phase_known.to(dtype=dtype),
+            feedbackPacket.applied_target_active.to(dtype=dtype),
             feedbackPacket.endpoint_present.to(dtype=dtype),
+            freshness,
         ], dim=-1).to(dtype=dtype)
 
         dynamic_tokens = self.dynamic_state_encoder(dynamic_state)
@@ -925,12 +931,24 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
     def EncodeWorldAction(
         self,
         target: PackedEndEffectorTarget,
+        activeMask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if (
             target.values.device != self.static_slot_tokens.device
             or target.values.dtype != self.static_slot_tokens.dtype
         ):
             raise ValueError("end-effector targets must share the decoder device and dtype")
+        effectiveActive = target.active
+        if activeMask is not None:
+            if (
+                not torch.is_tensor(activeMask)
+                or activeMask.shape != target.active.shape
+                or activeMask.dtype != torch.bool
+                or activeMask.device != target.values.device
+            ):
+                raise ValueError(
+                    "world action mask must match the end-effector target")
+            effectiveActive = effectiveActive & activeMask
 
         encoded_slots = []
         for slotIndex, adapter in enumerate(self.world_action_adapters):
@@ -938,14 +956,14 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
                 self.target_offsets[slotIndex],
                 self.target_offsets[slotIndex + 1])
             slotOutput = torch.where(
-                target.active[:, slotIndex].unsqueeze(-1),
+                effectiveActive[:, slotIndex].unsqueeze(-1),
                 target.values[:, slotSlice],
                 torch.zeros_like(target.values[:, slotSlice]))
             slot_feature = adapter(slotOutput)
-            encoded_slots.append(slot_feature * target.active[:, slotIndex].to(
+            encoded_slots.append(slot_feature * effectiveActive[:, slotIndex].to(
                 dtype=slot_feature.dtype).unsqueeze(-1))
 
-        active_count = target.active.to(
+        active_count = effectiveActive.to(
             dtype=encoded_slots[0].dtype).sum(dim=-1, keepdim=True)
         return torch.stack(encoded_slots, dim=1).sum(dim=1) / active_count.clamp_min(1.0)
 
@@ -953,6 +971,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         self,
         target: PackedEndEffectorTarget,
         feedbackPacket: BrainFeedbackPacket,
+        activeMask: Optional[torch.Tensor] = None,
     ) -> PackedPerceptionRotationEfference:
         batch_size = int(target.values.size(0))
         if (
@@ -961,6 +980,17 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             or feedbackPacket.joint_features.dtype != target.values.dtype
         ):
             raise ValueError("perception efference target and feedback must match")
+        effectiveActive = target.active
+        if activeMask is not None:
+            if (
+                not torch.is_tensor(activeMask)
+                or activeMask.shape != target.active.shape
+                or activeMask.dtype != torch.bool
+                or activeMask.device != target.values.device
+            ):
+                raise ValueError(
+                    "perception efference mask must match the target")
+            effectiveActive = effectiveActive & activeMask
         rotations = []
         presence = []
         for view_index, slot_index in enumerate(
@@ -983,7 +1013,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             compact_rotation = compact[
                 :, translation_width:translation_width + rotation_width]
             compact_rotation = torch.where(
-                target.active[:, slot_index].unsqueeze(-1),
+                effectiveActive[:, slot_index].unsqueeze(-1),
                 compact_rotation,
                 torch.zeros_like(compact_rotation))
             tangent = compact_rotation.matmul(rotation_basis.transpose(0, 1))
@@ -1009,14 +1039,14 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
                 quaternion[:, 3:4] < 0.0,
                 -quaternion,
                 quaternion)
-            active = (
-                target.active[:, slot_index]
-                & feedbackPacket.endpoint_present[:, slot_index])
+            viewActive = (
+                effectiveActive[:, slot_index]
+                & feedbackPacket.perception_motion_present[:, view_index])
             identity = torch.zeros_like(quaternion)
             identity[:, -1] = 1.0
             rotations.append(torch.where(
-                active.unsqueeze(-1), quaternion, identity))
-            presence.append(active)
+                viewActive.unsqueeze(-1), quaternion, identity))
+            presence.append(viewActive)
 
         if rotations:
             rotation_delta = torch.stack(rotations, dim=1)
@@ -1236,7 +1266,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             active=slot_active,
             contract_id=self.contract_view.contract_id,
             model_signature=self.contract_view.model_signature,
-            target_version=feedbackPacket.target_version + 1,
+            target_version=feedbackPacket.applied_target_version + 1,
             timestamp=feedbackPacket.timestamp)
         world_action_feature = self.EncodeWorldAction(target)
         safety_scores = torch.stack([
@@ -1348,8 +1378,9 @@ class DecisionDecouplerV2(AGICoreModule):
     def EncodeWorldAction(
         self,
         target: PackedEndEffectorTarget,
+        activeMask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.decoder.EncodeWorldAction(target)
+        return self.decoder.EncodeWorldAction(target, activeMask=activeMask)
 
     def TrainingConstraintLoss(
         self,
@@ -1477,7 +1508,9 @@ class DecisionDecouplerV2(AGICoreModule):
             normalizedValues = normalizedValues * target.active[
                 :, slotIndex].to(dtype=values.dtype).unsqueeze(-1)
             energy = normalizedValues.square().mean(dim=-1)
-            disabled = ~feedbackPacket.child_enabled[:, slotIndex]
+            disabled = ~(
+                feedbackPacket.phase_enabled[:, slotIndex]
+                & feedbackPacket.phase_known[:, slotIndex])
             hierarchy_loss = hierarchy_loss + (
                 energy * disabled.to(dtype=energy.dtype)).mean()
             action_safety_loss = action_safety_loss + (
@@ -1510,10 +1543,10 @@ class DecisionDecouplerV2(AGICoreModule):
             / continuity_count.clamp_min(1.0))
 
         operational_target = (
-            feedbackPacket.endpoint_present
+            feedbackPacket.phase_known
             & decision.hierarchy_enabled
             & decision.slot_legal)
-        classification_mask = torch.ones_like(operational_target)
+        classification_mask = feedbackPacket.phase_known
         legality_loss = MaskedMean(
             F.binary_cross_entropy_with_logits(
                 decision.legality_logits,
@@ -1522,7 +1555,7 @@ class DecisionDecouplerV2(AGICoreModule):
             classification_mask)
         safety_target = (
             (1.0 - decisionContext.risk).unsqueeze(-1)
-            * feedbackPacket.endpoint_present.to(dtype=target.values.dtype))
+            * feedbackPacket.phase_enabled.to(dtype=target.values.dtype))
         safety_prediction_loss = MaskedMean(
             F.binary_cross_entropy_with_logits(
                 decision.safety_logits,
@@ -1563,10 +1596,12 @@ class DecisionDecouplerV2(AGICoreModule):
         self,
         target: PackedEndEffectorTarget,
         feedbackPacket: BrainFeedbackPacket,
+        activeMask: Optional[torch.Tensor] = None,
     ) -> PackedPerceptionRotationEfference:
         return self.decoder.DecodePerceptionRotationEfference(
             target,
-            feedbackPacket)
+            feedbackPacket,
+            activeMask=activeMask)
 
     def forward(
         self,

@@ -3392,23 +3392,19 @@ class MemoryExtractor(AGICoreModule):
         signature = self.ValidateModelSignature(modelSignature)
         if type(batchSize) is not int or batchSize < 1:
             raise ValueError("batchSize must be positive")
-        legacy_fields = {
+        current_fields = {
             "planCache",
             "skillCache",
             "offlineReplay",
             "replaySignature",
             "replaySequence",
-        }
-        current_fields = legacy_fields | {
             "replayTransactionVersion",
             "replayTimelineVersion",
         }
         state_fields = set(state) if type(state) is dict else set()
         if (
             type(state) is not dict
-            or (
-                state_fields != legacy_fields
-                and state_fields != current_fields)
+            or state_fields != current_fields
         ):
             raise ValueError("cognitive cache state fields do not match")
         plan_cache = state["planCache"]
@@ -3416,8 +3412,8 @@ class MemoryExtractor(AGICoreModule):
         offline_replay = state["offlineReplay"]
         replay_signature = state["replaySignature"]
         replay_sequence = state["replaySequence"]
-        replay_transaction = state.get("replayTransactionVersion", 0)
-        replay_timeline = state.get("replayTimelineVersion", 0)
+        replay_transaction = state["replayTransactionVersion"]
+        replay_timeline = state["replayTimelineVersion"]
         self.ValidateReplayVersion(replay_transaction, replay_timeline)
         if (
             type(plan_cache) is not dict
@@ -3452,17 +3448,11 @@ class MemoryExtractor(AGICoreModule):
                 or tuple(cached["valid"].shape) != (batch_size,)
                 or cached["valid"].dtype != torch.bool
                 or cached["valid"].device != cached["feature"].device
-                or (
-                    type(cached["age"]) is not int
-                    and (
-                        not torch.is_tensor(cached["age"])
-                        or tuple(cached["age"].shape) != (batch_size,)
-                        or cached["age"].dtype != torch.long
-                        or cached["age"].device != cached["feature"].device
-                        or bool((cached["age"] < 0).any().item())))
-                or (
-                    type(cached["age"]) is int
-                    and cached["age"] < 0)
+                or not torch.is_tensor(cached["age"])
+                or tuple(cached["age"].shape) != (batch_size,)
+                or cached["age"].dtype != torch.long
+                or cached["age"].device != cached["feature"].device
+                or bool((cached["age"] < 0).any().item())
                 or type(cached["version"]) is not int
                 or cached["version"] < 1
             ):
@@ -3481,14 +3471,12 @@ class MemoryExtractor(AGICoreModule):
                 raise ValueError("skill cache record is invalid")
         previous_sequence = -1
         for record in offline_replay:
-            legacy_record_fields = {
+            current_record_fields = {
                 "kind",
                 "context",
                 "outcome",
                 "modelSignature",
                 "sequence",
-            }
-            current_record_fields = legacy_record_fields | {
                 "confidence",
                 "transactionVersion",
                 "timelineVersion",
@@ -3496,9 +3484,7 @@ class MemoryExtractor(AGICoreModule):
             fields = set(record) if type(record) is dict else set()
             if (
                 type(record) is not dict
-                or (
-                    fields != legacy_record_fields
-                    and fields != current_record_fields)
+                or fields != current_record_fields
                 or record["modelSignature"] != signature
                 or not torch.is_tensor(record["context"])
                 or not torch.is_tensor(record["outcome"])
@@ -3515,17 +3501,14 @@ class MemoryExtractor(AGICoreModule):
                 or record["sequence"] >= replay_sequence
             ):
                 raise ValueError("offline replay record is invalid")
-            if fields == current_record_fields:
-                self.ValidateReplayConfidence(
-                    record["confidence"],
-                    int(record["context"].size(0)),
-                    record["context"].device,
-                    record["context"].dtype)
-                transaction, timeline = self.ValidateReplayVersion(
-                    record["transactionVersion"],
-                    record["timelineVersion"])
-            else:
-                transaction, timeline = 0, 0
+            self.ValidateReplayConfidence(
+                record["confidence"],
+                int(record["context"].size(0)),
+                record["context"].device,
+                record["context"].dtype)
+            transaction, timeline = self.ValidateReplayVersion(
+                record["transactionVersion"],
+                record["timelineVersion"])
             if (
                 timeline > replay_timeline
                 or (
@@ -3542,16 +3525,9 @@ class MemoryExtractor(AGICoreModule):
             cached["valid"] = cached["valid"].to(
                 device=self.device,
                 dtype=torch.bool)
-            if type(cached["age"]) is int:
-                cached["age"] = torch.full(
-                    (batch_size,),
-                    cached["age"],
-                    device=self.device,
-                    dtype=torch.long)
-            else:
-                cached["age"] = cached["age"].to(
-                    device=self.device,
-                    dtype=torch.long)
+            cached["age"] = cached["age"].to(
+                device=self.device,
+                dtype=torch.long)
         migrated_skill = self.CloneCognitiveRecord(skill_cache)
         for cached in migrated_skill.values():
             cached["feature"] = cached["feature"].to(
@@ -3564,17 +3540,9 @@ class MemoryExtractor(AGICoreModule):
             record["outcome"] = record["outcome"].to(
                 device=self.device,
                 dtype=self.dtype)
-            if "confidence" not in record:
-                record["confidence"] = torch.ones(
-                    record["context"].size(0),
-                    device=self.device,
-                    dtype=self.dtype)
-                record["transactionVersion"] = 0
-                record["timelineVersion"] = 0
-            else:
-                record["confidence"] = record["confidence"].to(
-                    device=self.device,
-                    dtype=self.dtype)
+            record["confidence"] = record["confidence"].to(
+                device=self.device,
+                dtype=self.dtype)
         self._plan_cache = migrated_plan
         self._skill_cache = migrated_skill
         self._offline_replay = migrated_replay
@@ -12213,7 +12181,25 @@ class TestMemoryMTool:
                     recall()
                 except ValueError:
                     rejected += 1
-            return rejected == 4
+            invalid_states = []
+            missing_version = memory.CloneCognitiveRecord(cache_state)
+            del missing_version["replayTimelineVersion"]
+            invalid_states.append(missing_version)
+            scalar_age = memory.CloneCognitiveRecord(cache_state)
+            scalar_age["planCache"]["active"]["age"] = 1
+            invalid_states.append(scalar_age)
+            missing_confidence = memory.CloneCognitiveRecord(cache_state)
+            del missing_confidence["offlineReplay"][0]["confidence"]
+            invalid_states.append(missing_confidence)
+            for invalid_state in invalid_states:
+                try:
+                    restored.ImportCognitiveCacheState(
+                        invalid_state,
+                        modelSignature="shape-a",
+                        batchSize=2)
+                except ValueError:
+                    rejected += 1
+            return rejected == 7
         except Exception as error:
             print(f"SignatureBoundPlanAndSkillCache error: {error}")
             return False

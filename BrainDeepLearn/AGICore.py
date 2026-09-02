@@ -18,9 +18,15 @@ from Config import BasicParameters
 from CoreTypes import (
     BrainBuildSpec,
     BrainStepOutput,
+    COGNITIVE_READOUT_SCHEMA_VERSION,
+    CognitiveReadout,
     ContractAgentActInput,
     ContractAgentActOutput,
     ContractBrainStepInput,
+    POLICY_PATH_DETAIL,
+    POLICY_PATH_FAST,
+    POLICY_PATH_FULL,
+    POLICY_PATH_NONE,
     TEXT_TRUST_OPERATOR_COMMAND,
 )
 from PerceptionModule import (
@@ -80,14 +86,17 @@ from TemporalExecutionModule import (
 from ModuleMessagerManager import ModuleDim, ModuleMessagerManager
 from FunctionTools import SynchronizeDynamicAdapterTopologiesForFullLoad
 from RobotMorphologyModule import (
+    ActionExecutionResult,
+    ActionRequest,
     BrainFeedbackPacket,
     PackedEndEffectorTarget,
     RobotEmbodimentContractView,
+    SlotExecutionStatus,
 )
 
-BRAIN_RUNTIME_SCHEMA_VERSION = 33
-WORLD_MEMORY_ARTIFACT_SCHEMA_VERSION = 2
-AGENT_MEMORY_SCHEMA_VERSION = 2
+BRAIN_RUNTIME_SCHEMA_VERSION = 35
+WORLD_MEMORY_ARTIFACT_SCHEMA_VERSION = 3
+AGENT_MEMORY_SCHEMA_VERSION = 3
 BRAIN_RUNTIME_BUFFER_FIELDS = frozenset({
     "schema_version",
     "contract_id",
@@ -99,7 +108,7 @@ ONLINE_WRAPPER_ROOTS = ("perc", "attn", "world", "critic", "intention")
 WORLD_RUNTIME_STATE_NAMES = frozenset(
     {f"_{name}" for name in WORLD_MEMORY_TENSOR_FIELDS}
     | {"s4.x"})
-COGNITIVE_BACKBONE_SCHEMA_VERSION = 1
+COGNITIVE_BACKBONE_SCHEMA_VERSION = 2
 COGNITIVE_BACKBONE_ARTIFACT_FIELDS = frozenset({
     "schema_version",
     "cognitive_profile",
@@ -132,6 +141,8 @@ COGNITIVE_BACKBONE_BLOCKED_PREFIXES = (
     "contract_joint_motion_action_adapter.",
     "contract_action_agency_encoder.",
     "contract_action_agency_gain",
+    "contract_sensorimotor_consistency_encoder.",
+    "contract_sensorimotor_consistency_gain",
     "contract_layer_agency_fuser.",
     "contract_layer_agency_gain",
     "contract_entity_summary_fuser.",
@@ -474,6 +485,7 @@ class CognitiveComputeGate(nn.Module):
         trackingErrorThreshold: float = 0.5,
         contactAnomalyThreshold: float = 0.5,
         evcThreshold: float = 0.0,
+        missingRefreshInterval: float = 1.0,
     ) -> None:
         super().__init__()
         if (
@@ -488,12 +500,15 @@ class CognitiveComputeGate(nn.Module):
             "noveltyThreshold": noveltyThreshold,
             "trackingErrorThreshold": trackingErrorThreshold,
             "contactAnomalyThreshold": contactAnomalyThreshold,
+            "missingRefreshInterval": missingRefreshInterval,
         }
         for name, value in positive_thresholds.items():
             if not math.isfinite(float(value)) or float(value) < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
         if float(maxCacheAge) <= 0.0:
             raise ValueError("maxCacheAge must be positive")
+        if float(missingRefreshInterval) <= 0.0:
+            raise ValueError("missingRefreshInterval must be positive")
         if not math.isfinite(float(evcThreshold)):
             raise ValueError("evcThreshold must be finite")
         self.ContractView = contractView
@@ -504,13 +519,26 @@ class CognitiveComputeGate(nn.Module):
         self.TrackingErrorThreshold = float(trackingErrorThreshold)
         self.ContactAnomalyThreshold = float(contactAnomalyThreshold)
         self.EvcThreshold = float(evcThreshold)
+        self.MissingRefreshInterval = float(missingRefreshInterval)
         self.register_buffer(
-            "PreviousChildEnabled",
+            "PreviousPhaseEnabled",
             torch.empty(0, dtype=torch.bool),
+            persistent=False)
+        self.register_buffer(
+            "PreviousObservationPresent",
+            torch.empty(0, dtype=torch.bool),
+            persistent=False)
+        self.register_buffer(
+            "PreviousMissingRefreshAge",
+            torch.empty(0),
             persistent=False)
 
     def Reset(self) -> None:
-        self.PreviousChildEnabled = self.PreviousChildEnabled.new_empty((0,))
+        self.PreviousPhaseEnabled = self.PreviousPhaseEnabled.new_empty((0,))
+        self.PreviousObservationPresent = (
+            self.PreviousObservationPresent.new_empty((0,)))
+        self.PreviousMissingRefreshAge = (
+            self.PreviousMissingRefreshAge.new_empty((0,)))
 
     def ResetRows(self, doneMask: torch.Tensor) -> None:
         if (
@@ -519,12 +547,18 @@ class CognitiveComputeGate(nn.Module):
             or doneMask.dtype != torch.bool
         ):
             raise ValueError("compute gate reset mask must be batched boolean")
-        if tuple(self.PreviousChildEnabled.shape[:1]) != tuple(doneMask.shape):
+        if tuple(self.PreviousPhaseEnabled.shape[:1]) != tuple(doneMask.shape):
             self.Reset()
             return
-        previous = self.PreviousChildEnabled.clone()
+        previous = self.PreviousPhaseEnabled.clone()
         previous[doneMask] = False
-        self.PreviousChildEnabled = previous
+        self.PreviousPhaseEnabled = previous
+        observation = self.PreviousObservationPresent.clone()
+        observation[doneMask] = False
+        self.PreviousObservationPresent = observation
+        refresh_age = self.PreviousMissingRefreshAge.clone()
+        refresh_age[doneMask] = 0.0
+        self.PreviousMissingRefreshAge = refresh_age
 
     @staticmethod
     def BooleanEvent(
@@ -601,18 +635,18 @@ class CognitiveComputeGate(nn.Module):
 
     def ChildActivation(
         self,
-        childEnabled: torch.Tensor,
+        phaseEnabled: torch.Tensor,
     ) -> torch.Tensor:
-        previous = self.PreviousChildEnabled
+        previous = self.PreviousPhaseEnabled
         if (
-            tuple(previous.shape) == tuple(childEnabled.shape)
-            and previous.device == childEnabled.device
+            tuple(previous.shape) == tuple(phaseEnabled.shape)
+            and previous.device == phaseEnabled.device
         ):
-            activated = childEnabled & ~previous
+            activated = phaseEnabled & ~previous
         else:
-            activated = torch.zeros_like(childEnabled)
-        child_mask = self.ChildSlotMask(childEnabled.device)
-        self.PreviousChildEnabled = childEnabled.detach().clone()
+            activated = torch.zeros_like(phaseEnabled)
+        child_mask = self.ChildSlotMask(phaseEnabled.device)
+        self.PreviousPhaseEnabled = phaseEnabled.detach().clone()
         return activated & child_mask
 
     def ChildSlotMask(self, device: torch.device) -> torch.Tensor:
@@ -643,60 +677,95 @@ class CognitiveComputeGate(nn.Module):
         batch_size = int(feedbackPacket.joint_features.size(0))
         device = feedbackPacket.joint_features.device
         dtype = feedbackPacket.joint_features.dtype
-        try:
-            plan_valid = self.BooleanEvent(
-                planValid, "planValid", batch_size, device)
-            cache_age = self.RealEvent(
-                cacheAge, "cacheAge", batch_size, device, dtype)
-            goal_changed = self.BooleanEvent(
-                goalChanged, "goalChanged", batch_size, device)
-            intent_changed = self.BooleanEvent(
-                intentChanged, "intentChanged", batch_size, device)
-            target_changed = self.BooleanEvent(
-                targetChanged, "targetChanged", batch_size, device)
-            world_surprise = self.RealEvent(
-                worldSurprise, "worldSurprise", batch_size, device, dtype)
-            risk_value = self.RealEvent(
-                risk, "risk", batch_size, device, dtype)
-            novelty_value = self.RealEvent(
-                novelty, "novelty", batch_size, device, dtype)
-            novelty_relevant = self.BooleanEvent(
-                noveltyRelevant, "noveltyRelevant", batch_size, device)
-            tracking_error = self.RealEvent(
-                trackingError, "trackingError", batch_size, device, dtype)
-            contact_anomaly = self.RealEvent(
-                contactAnomaly, "contactAnomaly", batch_size, device, dtype)
-            evc_value = self.RealEvent(
-                evc, "evc", batch_size, device, dtype)
-            safety_violation = (
-                torch.zeros(batch_size, dtype=torch.bool, device=device)
-                if safetyViolation is None
-                else self.BooleanEvent(
-                    safetyViolation,
-                    "safetyViolation",
-                    batch_size,
-                    device))
-            critical_infeasible = (
-                torch.zeros(batch_size, dtype=torch.bool, device=device)
-                if criticalInfeasible is None
-                else self.BooleanEvent(
-                    criticalInfeasible,
-                    "criticalInfeasible",
-                    batch_size,
-                    device))
-        except (TypeError, ValueError, RuntimeError):
-            self.Reset()
-            return self.BuildFailsafe(batch_size, device)
+        plan_valid = self.BooleanEvent(
+            planValid, "planValid", batch_size, device)
+        cache_age = self.RealEvent(
+            cacheAge, "cacheAge", batch_size, device, dtype)
+        goal_changed = self.BooleanEvent(
+            goalChanged, "goalChanged", batch_size, device)
+        intent_changed = self.BooleanEvent(
+            intentChanged, "intentChanged", batch_size, device)
+        target_changed = self.BooleanEvent(
+            targetChanged, "targetChanged", batch_size, device)
+        world_surprise = self.RealEvent(
+            worldSurprise, "worldSurprise", batch_size, device, dtype)
+        risk_value = self.RealEvent(
+            risk, "risk", batch_size, device, dtype)
+        novelty_value = self.RealEvent(
+            novelty, "novelty", batch_size, device, dtype)
+        novelty_relevant = self.BooleanEvent(
+            noveltyRelevant, "noveltyRelevant", batch_size, device)
+        tracking_error = self.RealEvent(
+            trackingError, "trackingError", batch_size, device, dtype)
+        contact_anomaly = self.RealEvent(
+            contactAnomaly, "contactAnomaly", batch_size, device, dtype)
+        evc_value = self.RealEvent(
+            evc, "evc", batch_size, device, dtype)
+        safety_violation = (
+            torch.zeros(batch_size, dtype=torch.bool, device=device)
+            if safetyViolation is None
+            else self.BooleanEvent(
+                safetyViolation,
+                "safetyViolation",
+                batch_size,
+                device))
+        critical_infeasible = (
+            torch.zeros(batch_size, dtype=torch.bool, device=device)
+            if criticalInfeasible is None
+            else self.BooleanEvent(
+                criticalInfeasible,
+                "criticalInfeasible",
+                batch_size,
+                device))
 
-        child_enabled = feedbackPacket.child_enabled.to(device=device)
-        activated_child_mask = self.ChildActivation(child_enabled)
-        feedback_failure = (
-            feedbackPacket.target_active
-            & ~feedbackPacket.endpoint_present).any(dim=-1)
+        phase_enabled = (
+            feedbackPacket.phase_enabled
+            & feedbackPacket.phase_known).to(device=device)
+        activated_child_mask = self.ChildActivation(phase_enabled)
+        observation_present = feedbackPacket.endpoint_present
+        previous_observation = self.PreviousObservationPresent
+        if (
+            tuple(previous_observation.shape) == tuple(observation_present.shape)
+            and previous_observation.device == device
+        ):
+            missing_edge = observation_present.ne(
+                previous_observation).any(dim=-1)
+        else:
+            missing_edge = torch.zeros(
+                batch_size,
+                dtype=torch.bool,
+                device=device)
+        self.PreviousObservationPresent = observation_present.detach().clone()
+        missing = ~observation_present.all(dim=-1)
+        max_missing_age = torch.where(
+            ~observation_present,
+            feedbackPacket.observation_age,
+            torch.zeros_like(feedbackPacket.observation_age)).max(dim=-1).values
+        previous_refresh_age = self.PreviousMissingRefreshAge
+        if (
+            tuple(previous_refresh_age.shape) != (batch_size,)
+            or previous_refresh_age.device != device
+            or previous_refresh_age.dtype != dtype
+        ):
+            previous_refresh_age = torch.zeros(
+                batch_size,
+                device=device,
+                dtype=dtype)
+        missing_periodic = (
+            missing
+            & max_missing_age.sub(previous_refresh_age).ge(
+                self.MissingRefreshInterval))
+        self.PreviousMissingRefreshAge = torch.where(
+            ~missing,
+            torch.zeros_like(max_missing_age),
+            torch.where(
+                missing_periodic | missing_edge,
+                max_missing_age,
+                previous_refresh_age)).detach().clone()
         failsafe = (
             safety_violation
             | critical_infeasible
-            | feedback_failure)
+            | feedbackPacket.hard_stop)
 
         hard_full = (
             ~plan_valid
@@ -710,7 +779,9 @@ class CognitiveComputeGate(nn.Module):
                 novelty_relevant
                 & (novelty_value >= self.NoveltyThreshold))
             | (tracking_error >= self.TrackingErrorThreshold)
-            | (contact_anomaly >= self.ContactAnomalyThreshold))
+            | (contact_anomaly >= self.ContactAnomalyThreshold)
+            | missing_edge
+            | missing_periodic)
         evc_trigger = (
             ~failsafe
             & ~hard_full
@@ -719,7 +790,7 @@ class CognitiveComputeGate(nn.Module):
         detail_execute = (
             ~failsafe
             & ~full_replan
-            & (child_enabled & self.ChildSlotMask(device)).any(dim=-1))
+            & (phase_enabled & self.ChildSlotMask(device)).any(dim=-1))
         reason_target = torch.stack([
             ~plan_valid | (cache_age >= self.MaxCacheAge),
             goal_changed | intent_changed | target_changed,
@@ -727,7 +798,8 @@ class CognitiveComputeGate(nn.Module):
                 novelty_relevant
                 & (novelty_value >= self.NoveltyThreshold)),
             (tracking_error >= self.TrackingErrorThreshold) | (
-                contact_anomaly >= self.ContactAnomalyThreshold),
+                contact_anomaly >= self.ContactAnomalyThreshold)
+                | missing_edge | missing_periodic,
             failsafe | (risk_value >= self.RiskThreshold),
             activated_child_mask.any(dim=-1),
             evc_trigger,
@@ -767,7 +839,7 @@ class BrainCore(nn.Module):
         prioritizeExtStr: bool = True,
         plasticOnlineLearning: bool = False,
         usePlanner: bool = True,
-        plannerTeacherMode: bool = True,
+        plannerTeacherMode: bool = False,
         enablePerceptionSupervision: bool = False,
         saveModuleMessagerOutput: bool = True,
         needTrace: bool = True,
@@ -843,7 +915,9 @@ class BrainCore(nn.Module):
         self.actor = DecisionExtractor(
             stateDim=ModuleDim.MemoryFeat,
             intentDim=ModuleDim.IntentionFeat,
+            optionNum=brainBuildSpec.policy_option_count,
             includeNoSkill=True,
+            assistOptionId=brainBuildSpec.assist_option_id,
             valueTensorDim=self.value_tensor_dim,
             vNextTensorDim=self.value_tensor_dim,
             beliefDim=brainBuildSpec.cognitive.decision_dim,
@@ -874,6 +948,14 @@ class BrainCore(nn.Module):
             nn.LayerNorm(action_agency_dim))
         self.contract_action_agency_gain = nn.Parameter(
             torch.tensor(-2.944439))
+        self.contract_sensorimotor_consistency_encoder = nn.Sequential(
+            nn.LayerNorm(4),
+            nn.Linear(4, action_agency_dim),
+            nn.SiLU(),
+            nn.Linear(action_agency_dim, self.actor.world_hzx_dim),
+            nn.LayerNorm(self.actor.world_hzx_dim))
+        self.contract_sensorimotor_consistency_gain = nn.Parameter(
+            torch.zeros(()))
         self.contract_layer_agency_fuser = nn.Sequential(
             nn.LayerNorm(
                 ModuleDim.PstSlotDim
@@ -1063,8 +1145,6 @@ class BrainCore(nn.Module):
         self.moduleMessager = ModuleMessagerManager(maxSteps=256)
         self.save_module_messager_output = bool(
             saveModuleMessagerOutput)
-        self.ContractCachedTarget: Optional[
-            PackedEndEffectorTarget] = None
         self.ContractIntentionCommitmentState: Dict[
             str, torch.Tensor] = {}
         self.ContractRuntimeBatch = 0
@@ -1279,7 +1359,60 @@ class BrainCore(nn.Module):
             self.active_option_goal_mid = Zeros(ModuleDim.GoalMidDim)
             self.active_option_index = torch.zeros(
                 batch_size, device=device, dtype=torch.long)
+            self.active_option_action_epoch = torch.zeros(
+                batch_size, device=device, dtype=torch.long)
+            self.active_option_request_values = Zeros(
+                self.robot_contract_view.end_effector_target_layout.PackedDim)
+            self.active_option_request_active = torch.zeros(
+                batch_size,
+                self.robot_contract_view.end_effector_count,
+                device=device,
+                dtype=torch.bool)
+            self.active_option_request_version = torch.full(
+                (batch_size,), -1, device=device, dtype=torch.long)
+            self.active_option_policy_path = torch.full(
+                (batch_size,),
+                POLICY_PATH_NONE,
+                device=device,
+                dtype=torch.long)
+            self.active_option_planner_override = torch.zeros(
+                batch_size, device=device, dtype=torch.bool)
+            self.active_option_help_requested = torch.zeros(
+                batch_size, device=device, dtype=torch.bool)
+            self.active_option_eligibility_valid = torch.zeros(
+                batch_size, device=device, dtype=torch.bool)
             self.active_option_valid = torch.zeros(
+                batch_size, device=device, dtype=torch.bool)
+            self.pending_option_policy_input = Zeros(option_policy_width)
+            self.pending_option_prior_logit = Zeros(actor.num_options)
+            self.pending_option_goal_mid = Zeros(ModuleDim.GoalMidDim)
+            self.pending_option_index = torch.zeros(
+                batch_size, device=device, dtype=torch.long)
+            self.pending_option_action_epoch = torch.zeros(
+                batch_size, device=device, dtype=torch.long)
+            self.pending_option_request_values = Zeros(
+                self.robot_contract_view.end_effector_target_layout.PackedDim)
+            self.pending_option_request_active = torch.zeros(
+                batch_size,
+                self.robot_contract_view.end_effector_count,
+                device=device,
+                dtype=torch.bool)
+            self.pending_option_request_version = torch.full(
+                (batch_size,), -1, device=device, dtype=torch.long)
+            self.pending_option_policy_path = torch.full(
+                (batch_size,),
+                POLICY_PATH_NONE,
+                device=device,
+                dtype=torch.long)
+            self.pending_option_planner_override = torch.zeros(
+                batch_size, device=device, dtype=torch.bool)
+            self.pending_option_help_requested = torch.zeros(
+                batch_size, device=device, dtype=torch.bool)
+            self.pending_option_eligibility_pre = Zeros(actor.u_dim)
+            self.pending_option_eligibility_post = Zeros(actor.u_dim)
+            self.pending_option_eligibility_update = torch.zeros(
+                batch_size, device=device, dtype=torch.bool)
+            self.pending_option_valid = torch.zeros(
                 batch_size, device=device, dtype=torch.bool)
             self.prev_decision_state = Zeros(actor.dyn_dim)
             self.prev_fast_decision_state = Zeros(actor.dyn_dim)
@@ -1318,7 +1451,6 @@ class BrainCore(nn.Module):
             self.perc_buffer = []
             self.visual_state_buffer = []
             self.visual_state_valid_buffer = []
-            self.ContractCachedTarget = None
             self.ContractSlowCognitiveCache = None
             self.ContractSlowCacheValid = torch.zeros(
                 batch_size, device=device, dtype=torch.bool)
@@ -1348,7 +1480,11 @@ class BrainCore(nn.Module):
                 dtype=torch.long)
             self.ContractPreviousReferenceIndex = torch.full(
                 (batch_size,), -1, device=device, dtype=torch.long)
-            self.ContractCachedActionEpoch = torch.zeros(
+            self.ContractPreviousAppliedVersion = torch.full(
+                (batch_size,), -1, device=device, dtype=torch.long)
+            self.ContractPreviousAppliedActionEpoch = torch.zeros(
+                batch_size, device=device, dtype=torch.long)
+            self.ContractNextRequestId = torch.zeros(
                 batch_size, device=device, dtype=torch.long)
             self.ContractCacheAge = Zeros()
             self.ContractSlowCacheAge = Zeros()
@@ -1390,6 +1526,23 @@ class BrainCore(nn.Module):
                 "active_option_policy_input",
                 "active_option_prior_logit",
                 "active_option_goal_mid",
+                "active_option_action_epoch",
+                "active_option_request_values",
+                "active_option_request_active",
+                "active_option_planner_override",
+                "active_option_help_requested",
+                "active_option_eligibility_valid",
+                "pending_option_policy_input",
+                "pending_option_prior_logit",
+                "pending_option_goal_mid",
+                "pending_option_action_epoch",
+                "pending_option_request_values",
+                "pending_option_request_active",
+                "pending_option_planner_override",
+                "pending_option_help_requested",
+                "pending_option_eligibility_pre",
+                "pending_option_eligibility_post",
+                "pending_option_eligibility_update",
                 "prev_decision_state",
                 "prev_fast_decision_state",
                 "prev_detail_decision_state",
@@ -1418,6 +1571,18 @@ class BrainCore(nn.Module):
                 value = value.clone()
                 value[doneMask] = 0
                 setattr(self, name, value)
+            self.active_option_policy_path = (
+                self.active_option_policy_path.clone())
+            self.active_option_policy_path[doneMask] = POLICY_PATH_NONE
+            self.pending_option_policy_path = (
+                self.pending_option_policy_path.clone())
+            self.pending_option_policy_path[doneMask] = POLICY_PATH_NONE
+            self.active_option_request_version = (
+                self.active_option_request_version.clone())
+            self.active_option_request_version[doneMask] = -1
+            self.pending_option_request_version = (
+                self.pending_option_request_version.clone())
+            self.pending_option_request_version[doneMask] = -1
             self.prev_precision = self.prev_precision.clone()
             self.prev_precision[doneMask] = 1.0
             self.prev_done_flag = self.prev_done_flag.clone()
@@ -1433,9 +1598,19 @@ class BrainCore(nn.Module):
             self.active_option_index[doneMask] = 0
             self.active_option_valid = self.active_option_valid.clone()
             self.active_option_valid[doneMask] = False
+            self.pending_option_index = self.pending_option_index.clone()
+            self.pending_option_index[doneMask] = 0
+            self.pending_option_valid = self.pending_option_valid.clone()
+            self.pending_option_valid[doneMask] = False
             self.ContractPreviousTargetActive = (
                 self.ContractPreviousTargetActive.clone())
             self.ContractPreviousTargetActive[doneMask] = False
+            self.ContractPreviousAppliedVersion = (
+                self.ContractPreviousAppliedVersion.clone())
+            self.ContractPreviousAppliedVersion[doneMask] = -1
+            self.ContractPreviousAppliedActionEpoch = (
+                self.ContractPreviousAppliedActionEpoch.clone())
+            self.ContractPreviousAppliedActionEpoch[doneMask] = 0
             self.ContractPreviousProgress = (
                 self.ContractPreviousProgress.clone())
             self.ContractPreviousProgress[doneMask] = 0
@@ -1506,6 +1681,226 @@ class BrainCore(nn.Module):
                     batchSize,
                     device,
                     dtype)
+
+    def ResolvePendingOptionTransaction(
+            self,
+            feedbackPacket: BrainFeedbackPacket,
+        ) -> Dict[str, torch.Tensor]:
+            contract = self.robot_contract_view
+            pendingSlotMatches = contract.TargetSlotsMatch(
+                feedbackPacket.applied_target_values,
+                feedbackPacket.applied_target_active,
+                self.pending_option_request_values,
+                self.pending_option_request_active)
+            pendingTargetMatches = (
+                pendingSlotMatches.all(dim=-1)
+                & feedbackPacket.applied_target_version.eq(
+                    self.pending_option_request_version))
+            pendingSlotsApplied = (
+                ~self.pending_option_request_active
+                | (
+                    feedbackPacket.execution_known
+                    & feedbackPacket.execution_status.eq(
+                        int(SlotExecutionStatus.APPLIED)))
+            ).all(dim=-1)
+            pendingPhysicalApplied = (
+                self.pending_option_request_active.any(dim=-1)
+                & pendingTargetMatches
+                & pendingSlotsApplied)
+            pendingEpochMatches = (
+                feedbackPacket.applied_action_epoch.eq(
+                    self.pending_option_action_epoch))
+            pendingHelpAccepted = (
+                self.pending_option_help_requested
+                & feedbackPacket.help_accepted)
+            promoted = (
+                self.pending_option_valid
+                & pendingEpochMatches
+                & (pendingPhysicalApplied | pendingHelpAccepted)
+                & ~feedbackPacket.hard_stop)
+
+            activeSlotMatches = contract.TargetSlotsMatch(
+                feedbackPacket.applied_target_values,
+                feedbackPacket.applied_target_active,
+                self.active_option_request_values,
+                self.active_option_request_active)
+            activeTargetMatches = (
+                activeSlotMatches.all(dim=-1)
+                & feedbackPacket.applied_target_version.eq(
+                    self.active_option_request_version))
+            activeEpochMatches = (
+                feedbackPacket.applied_action_epoch.eq(
+                    self.active_option_action_epoch))
+            activeSlotsContinued = (
+                ~self.active_option_request_active
+                | (
+                    feedbackPacket.execution_known
+                    & (
+                        feedbackPacket.execution_status.eq(
+                            int(SlotExecutionStatus.APPLIED))
+                        | feedbackPacket.execution_status.eq(
+                            int(SlotExecutionStatus.HELD))
+                        | feedbackPacket.execution_status.eq(
+                            int(SlotExecutionStatus.REJECTED)))
+                )
+            ).all(dim=-1)
+            activePhysicalContinued = (
+                self.active_option_request_active.any(dim=-1)
+                & activeTargetMatches
+                & activeSlotsContinued)
+            activeModified = (
+                feedbackPacket.execution_known
+                & feedbackPacket.execution_relevant
+                & feedbackPacket.execution_status.eq(
+                    int(SlotExecutionStatus.MODIFIED))).any(dim=-1)
+            retained = (
+                self.active_option_valid
+                & activeTargetMatches
+                & activeEpochMatches
+                & ~self.active_option_help_requested
+                & ~activeModified
+                & ~feedbackPacket.hard_stop
+                & ~promoted)
+            creditPending = (
+                promoted
+                & ~self.pending_option_planner_override
+                & ~self.prev_done_flag)
+            creditActive = (
+                self.active_option_valid
+                & activeEpochMatches
+                & activePhysicalContinued
+                & ~self.active_option_planner_override
+                & ~self.prev_done_flag
+                & ~promoted)
+            creditGoalMid = torch.where(
+                promoted.unsqueeze(-1),
+                self.pending_option_goal_mid,
+                self.active_option_goal_mid).detach()
+            creditOptionIndex = torch.where(
+                promoted,
+                self.pending_option_index,
+                self.active_option_index).detach()
+            creditOptionValid = (creditPending | creditActive).detach()
+
+            eligibilityCommit = (
+                promoted
+                & self.pending_option_eligibility_update
+                & ~self.pending_option_planner_override)
+            actor = self.RuntimeModule(self.actor)
+            actor.CommitEligibilityRows(
+                self.pending_option_eligibility_pre,
+                self.pending_option_eligibility_post,
+                eligibilityCommit,
+                eligibilityCommit)
+
+            def SelectState(
+                pendingValue: torch.Tensor,
+                activeValue: torch.Tensor,
+                emptyValue: torch.Tensor,
+            ) -> torch.Tensor:
+                selectionShape = (
+                    (int(promoted.size(0)),)
+                    + (1,) * (pendingValue.dim() - 1))
+                promoteMask = promoted.reshape(selectionShape)
+                retainMask = retained.reshape(selectionShape)
+                return torch.where(
+                    promoteMask,
+                    pendingValue,
+                    torch.where(retainMask, activeValue, emptyValue))
+
+            self.active_option_policy_input = SelectState(
+                self.pending_option_policy_input,
+                self.active_option_policy_input,
+                torch.zeros_like(self.active_option_policy_input)).detach()
+            self.active_option_prior_logit = SelectState(
+                self.pending_option_prior_logit,
+                self.active_option_prior_logit,
+                torch.zeros_like(self.active_option_prior_logit)).detach()
+            self.active_option_goal_mid = SelectState(
+                self.pending_option_goal_mid,
+                self.active_option_goal_mid,
+                torch.zeros_like(self.active_option_goal_mid)).detach()
+            self.active_option_index = SelectState(
+                self.pending_option_index,
+                self.active_option_index,
+                torch.zeros_like(self.active_option_index)).detach()
+            self.active_option_action_epoch = SelectState(
+                self.pending_option_action_epoch,
+                self.active_option_action_epoch,
+                torch.zeros_like(self.active_option_action_epoch)).detach()
+            self.active_option_request_values = SelectState(
+                self.pending_option_request_values,
+                self.active_option_request_values,
+                torch.zeros_like(self.active_option_request_values)).detach()
+            self.active_option_request_active = SelectState(
+                self.pending_option_request_active,
+                self.active_option_request_active,
+                torch.zeros_like(self.active_option_request_active)).detach()
+            self.active_option_request_version = SelectState(
+                self.pending_option_request_version,
+                self.active_option_request_version,
+                torch.full_like(
+                    self.active_option_request_version,
+                    -1)).detach()
+            self.active_option_policy_path = SelectState(
+                self.pending_option_policy_path,
+                self.active_option_policy_path,
+                torch.full_like(
+                    self.active_option_policy_path,
+                    POLICY_PATH_NONE)).detach()
+            self.active_option_planner_override = SelectState(
+                self.pending_option_planner_override,
+                self.active_option_planner_override,
+                torch.zeros_like(
+                    self.active_option_planner_override)).detach()
+            self.active_option_help_requested = SelectState(
+                self.pending_option_help_requested,
+                self.active_option_help_requested,
+                torch.zeros_like(self.active_option_help_requested)).detach()
+            promotedEligibility = (
+                self.pending_option_eligibility_update
+                & ~self.pending_option_planner_override)
+            self.active_option_eligibility_valid = torch.where(
+                promoted,
+                promotedEligibility,
+                torch.where(
+                    retained,
+                    self.active_option_eligibility_valid,
+                    torch.zeros_like(
+                        self.active_option_eligibility_valid))).detach()
+            self.active_option_valid = (promoted | retained).detach()
+            actor.ClearInvalidEligibility(
+                ~self.active_option_valid
+                | ~self.active_option_eligibility_valid
+                | self.active_option_planner_override)
+
+            self.pending_option_policy_input.zero_()
+            self.pending_option_prior_logit.zero_()
+            self.pending_option_goal_mid.zero_()
+            self.pending_option_index.zero_()
+            self.pending_option_action_epoch.zero_()
+            self.pending_option_request_values.zero_()
+            self.pending_option_request_active.zero_()
+            self.pending_option_request_version.fill_(-1)
+            self.pending_option_policy_path.fill_(POLICY_PATH_NONE)
+            self.pending_option_planner_override.zero_()
+            self.pending_option_help_requested.zero_()
+            self.pending_option_eligibility_pre.zero_()
+            self.pending_option_eligibility_post.zero_()
+            self.pending_option_eligibility_update.zero_()
+            self.pending_option_valid.zero_()
+
+            return {
+                "credit_goal_mid": creditGoalMid,
+                "credit_option_index": creditOptionIndex,
+                "credit_option_valid": creditOptionValid,
+                "physical_request_continued": torch.where(
+                    promoted,
+                    pendingPhysicalApplied,
+                    activePhysicalContinued).detach(),
+                "promoted": promoted.detach(),
+                "retained": retained.detach(),
+            }
 
     def SelectContractPerceptionRotation(
             self,
@@ -1601,7 +1996,12 @@ class BrainCore(nn.Module):
             self,
             feedbackPacket: BrainFeedbackPacket,
             physicalFeedback: Dict[str, torch.Tensor],
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> Tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]:
             measured = self.contract_joint_motion_action_adapter(
                 physicalFeedback["ControlFeedbackFeature"])
             batch_size = int(measured.size(0))
@@ -1609,43 +2009,32 @@ class BrainCore(nn.Module):
                 batch_size,
                 device=measured.device,
                 dtype=torch.bool)
-            target_matches = torch.zeros(
-                batch_size,
-                device=measured.device,
-                dtype=torch.bool)
-            if self.ContractCachedTarget is None:
-                commanded = torch.zeros_like(measured)
-                commanded_valid = torch.zeros_like(measured_available)
-            else:
-                comparison_active = (
-                    self.ContractCachedTarget.active
-                    & feedbackPacket.endpoint_present)
-                commanded_valid = comparison_active.any(dim=-1)
-                target_matches = feedbackPacket.target_version.eq(
-                    self.ContractCachedTarget.target_version)
-                commanded_target = PackedEndEffectorTarget(
-                    values=self.ContractCachedTarget.values,
-                    active=comparison_active,
-                    contract_id=self.ContractCachedTarget.contract_id,
-                    model_signature=self.ContractCachedTarget.model_signature,
-                    target_version=self.ContractCachedTarget.target_version,
-                    timestamp=self.ContractCachedTarget.timestamp)
-                commanded = self.packed_decision_decoupler.EncodeWorldAction(
-                    commanded_target)
-            evidence_valid = (
-                measured_available
-                & commanded_valid
-                & target_matches)
+            commanded_target = PackedEndEffectorTarget(
+                values=feedbackPacket.applied_target_values,
+                active=feedbackPacket.applied_target_active,
+                contract_id=feedbackPacket.contract_id,
+                model_signature=feedbackPacket.model_signature,
+                target_version=feedbackPacket.applied_target_version.clamp_min(0),
+                timestamp=feedbackPacket.timestamp)
+            knownActionSlots = (
+                feedbackPacket.applied_target_active
+                & feedbackPacket.execution_relevant
+                & feedbackPacket.execution_known)
+            commanded = self.packed_decision_decoupler.EncodeWorldAction(
+                commanded_target,
+                activeMask=knownActionSlots)
+            commanded_valid = knownActionSlots.any(dim=-1)
+            evidence_valid = measured_available & commanded_valid
             mismatch = (measured - commanded) * evidence_valid.to(
                 dtype=measured.dtype).unsqueeze(-1)
             representation_mismatch = torch.linalg.vector_norm(
                 mismatch,
                 dim=-1) / math.sqrt(max(1, int(mismatch.size(-1))))
             provenance = torch.stack([
-                feedbackPacket.target_active.any(dim=-1).to(
+                feedbackPacket.applied_target_active.any(dim=-1).to(
                     dtype=measured.dtype),
                 measured_available.to(dtype=measured.dtype),
-                target_matches.to(dtype=measured.dtype),
+                commanded_valid.to(dtype=measured.dtype),
                 representation_mismatch,
             ], dim=-1)
             evidence = self.contract_action_agency_encoder(torch.cat([
@@ -1656,18 +2045,34 @@ class BrainCore(nn.Module):
             ], dim=-1))
             evidence = evidence * evidence_valid.to(
                 dtype=evidence.dtype).unsqueeze(-1)
-            realized = (
-                measured
+            world_action = self.ContractWorld().EncodeContractExecutionAction(
+                commanded,
+                feedbackPacket)
+            agency_action = (
+                world_action
                 + torch.sigmoid(self.contract_action_agency_gain)
-                * evidence) * measured_available.to(
-                    dtype=measured.dtype).unsqueeze(-1)
-            if tuple(realized.shape) != (
+                * evidence)
+            if tuple(agency_action.shape) != (
                 batch_size,
                 int(self.RuntimeModule(self.actor).action_embed_dim),
             ):
                 raise RuntimeError(
                     "contract agency evidence does not match Decision action width")
-            return realized, evidence, evidence_valid
+            return world_action, agency_action, evidence, evidence_valid
+
+    def BuildAppliedTarget(
+            self,
+            feedbackPacket: BrainFeedbackPacket,
+        ) -> PackedEndEffectorTarget:
+            target = PackedEndEffectorTarget(
+                values=feedbackPacket.applied_target_values,
+                active=feedbackPacket.applied_target_active,
+                contract_id=feedbackPacket.contract_id,
+                model_signature=feedbackPacket.model_signature,
+                target_version=feedbackPacket.applied_target_version.clamp_min(0),
+                timestamp=feedbackPacket.timestamp)
+            target.Validate(self.robot_contract_view)
+            return target
 
     def RefineContractLayerAgency(
             self,
@@ -1744,38 +2149,6 @@ class BrainCore(nn.Module):
                     int.from_bytes(digest[:8], "big") & ((1 << 63) - 1))
             return torch.tensor(values, device=device, dtype=torch.long)
 
-    def ShouldRefreshSlowCognition(
-            self,
-            stepIsTrain: bool,
-            mode: torch.Tensor,
-            cacheAvailable: bool,
-        ) -> bool:
-            if mode.numel() != 1:
-                raise ValueError("scalar compatibility requires one row")
-            cache_valid = torch.full_like(
-                mode, bool(cacheAvailable), dtype=torch.bool)
-            return bool(self.BuildSlowRefreshMask(
-                stepIsTrain,
-                mode,
-                cache_valid,
-                torch.zeros(
-                    int(mode.size(0)), 0,
-                    device=mode.device,
-                    dtype=torch.bool),
-                torch.zeros_like(mode, dtype=torch.bool))[0].item())
-
-    def ShouldRunPlanner(
-            self,
-            stepIsTrain: bool,
-            mode: torch.Tensor,
-        ) -> bool:
-            if mode.numel() != 1:
-                raise ValueError("scalar compatibility requires one row")
-            return bool(self.BuildPlannerMask(
-                stepIsTrain,
-                mode,
-                torch.zeros_like(mode, dtype=torch.bool))[0].item())
-
     def BuildSlowRefreshMask(
             self,
             stepIsTrain: bool,
@@ -1792,11 +2165,12 @@ class BrainCore(nn.Module):
                 or int(activatedChildMask.size(0)) != int(mode.size(0))
             ):
                 raise ValueError("slow refresh masks must share the batch")
-            if bool(stepIsTrain):
-                return ~mode.eq(int(CognitiveComputeMode.FAILSAFE))
             hierarchy_refresh = activatedChildMask.any(dim=-1)
             return (
-                mode.eq(int(CognitiveComputeMode.FULL_REPLAN))
+                (
+                    mode.eq(int(CognitiveComputeMode.FULL_REPLAN))
+                    | mode.eq(int(CognitiveComputeMode.FAILSAFE))
+                )
                 | hierarchy_refresh
                 | ~cacheValid.to(dtype=torch.bool)
             ) & ~stoppedMask.to(dtype=torch.bool)
@@ -1810,7 +2184,7 @@ class BrainCore(nn.Module):
             if mode.dim() != 1 or stoppedMask.shape != mode.shape:
                 raise ValueError("planner masks must share the batch")
             if bool(stepIsTrain):
-                return ~mode.eq(int(CognitiveComputeMode.FAILSAFE))
+                return torch.zeros_like(stoppedMask, dtype=torch.bool)
             return (
                 mode.eq(int(CognitiveComputeMode.FULL_REPLAN))
                 & ~stoppedMask.to(dtype=torch.bool))
@@ -1973,19 +2347,6 @@ class BrainCore(nn.Module):
                 executionKindScores[learnable],
                 targetKind[learnable].to(dtype=torch.long))
 
-    def ShouldReuseOcr(
-            self,
-            currentNovelty: torch.Tensor,
-            batchSize: int,
-            stepIsTrain: bool,
-        ) -> bool:
-            if int(batchSize) != 1:
-                raise ValueError("scalar OCR compatibility requires one row")
-            return not bool(self.BuildOcrRefreshMask(
-                currentNovelty,
-                batchSize,
-                stepIsTrain)[0].item())
-
     def BuildOcrRefreshMask(
             self,
             currentNovelty: torch.Tensor,
@@ -2020,80 +2381,6 @@ class BrainCore(nn.Module):
             ) | ~cache_valid.to(
                 device=currentNovelty.device,
                 dtype=torch.bool)
-
-    def BuildFailsafeTemporalDecision(
-            self,
-            feedbackPacket: BrainFeedbackPacket,
-        ) -> Any:
-            if self.packed_temporal_gate is None:
-                raise RuntimeError("failsafe requires a temporal execution gate")
-            batch_size = int(feedbackPacket.joint_features.size(0))
-            device = feedbackPacket.joint_features.device
-            dtype = feedbackPacket.joint_features.dtype
-            template = PackedEndEffectorTarget(
-                values=torch.zeros(
-                    batch_size,
-                    self.robot_contract_view.end_effector_target_layout.PackedDim,
-                    device=device,
-                    dtype=dtype),
-                active=torch.zeros(
-                    batch_size,
-                    self.robot_contract_view.end_effector_count,
-                    device=device,
-                    dtype=torch.bool),
-                contract_id=self.robot_contract_view.contract_id,
-                model_signature=self.robot_contract_view.model_signature,
-                target_version=feedbackPacket.target_version + 1,
-                timestamp=feedbackPacket.timestamp)
-            execution_gate = self.packed_temporal_gate.execution_gate
-            neutral = execution_gate.NeutralTarget(template)
-            cached = (
-                neutral
-                if self.ContractCachedTarget is None
-                else self.ContractCachedTarget)
-            scores = torch.zeros(
-                batch_size,
-                len(PACKED_TEMPORAL_KIND_NAMES),
-                device=device,
-                dtype=dtype)
-            scores[:, FAILSAFE_STOP] = 1.0
-            zeros = torch.zeros(batch_size, device=device, dtype=dtype)
-            proposal = PackedTemporalProposal(
-                kind_scores=scores,
-                same_operator=zeros,
-                operator_changed=zeros,
-                invoke_delta=zeros,
-                reference_drift=zeros,
-                redispatch_score=zeros,
-                interrupt_score=torch.ones_like(zeros),
-                duration_ms=zeros,
-                soft_timeout_ms=zeros,
-                hard_timeout_ms=zeros,
-                action_epoch=self.ContractCachedActionEpoch)
-            events = PackedTemporalEvent(
-                cache_executing=torch.zeros(
-                    batch_size, device=device, dtype=torch.bool),
-                candidate_ready=torch.zeros(
-                    batch_size, device=device, dtype=torch.bool),
-                redispatch_requested=torch.zeros(
-                    batch_size, device=device, dtype=torch.bool),
-                cancel_requested=torch.ones(
-                    batch_size, device=device, dtype=torch.bool),
-                planner_failed=torch.ones(
-                    batch_size, device=device, dtype=torch.bool),
-                plan_reached=torch.zeros(
-                    batch_size, device=device, dtype=torch.bool),
-                hard_stop=torch.ones(
-                    batch_size, device=device, dtype=torch.bool),
-                active_risk=torch.ones_like(zeros),
-                candidate_risk=torch.ones_like(zeros))
-            return execution_gate.Step(
-                feedback=feedbackPacket,
-                candidateTarget=neutral,
-                cachedTarget=cached,
-                proposal=proposal,
-                events=events,
-                actionAgeSteps=self.ContractCacheAge)
 
     @staticmethod
     def CognitiveUtility(value: Any) -> torch.Tensor:
@@ -2301,17 +2588,14 @@ class BrainCore(nn.Module):
             device = feedbackPacket.joint_features.device
             dtype = feedbackPacket.joint_features.dtype
             cache_present = (
-                self.ContractCachedTarget is not None
-                and self.ContractSlowCognitiveCache is not None
+                self.ContractSlowCognitiveCache is not None
                 and tuple(self.ContractSlowCacheValid.shape) == (batch_size,)
-                and tuple(self.ContractCachedActionEpoch.shape) == (batch_size,))
+                and tuple(self.ContractPreviousAppliedActionEpoch.shape)
+                == (batch_size,))
             if cache_present:
-                cached_active = self.ContractCachedTarget.active.any(dim=-1)
-                target_matches = feedbackPacket.target_version.eq(
-                    self.ContractCachedTarget.target_version)
                 plan_valid = (
-                    cached_active
-                    & target_matches
+                    feedbackPacket.applied_target_active.any(dim=-1)
+                    & feedbackPacket.execution_result_known
                     & self.ContractSlowCacheValid)
             else:
                 plan_valid = torch.zeros(
@@ -2356,31 +2640,30 @@ class BrainCore(nn.Module):
                 active_plan_age.to(
                     device=device,
                     dtype=self.ContractSlowCacheAge.dtype))
-            target_changed = torch.zeros(
-                batch_size,
-                device=device,
-                dtype=torch.bool)
+            target_changed = (
+                feedbackPacket.applied_target_version.ne(
+                    self.ContractPreviousAppliedVersion)
+                | feedbackPacket.applied_action_epoch.ne(
+                    self.ContractPreviousAppliedActionEpoch)
+                | feedbackPacket.applied_target_active.ne(
+                    self.ContractPreviousTargetActive).any(dim=-1))
             enabled_weight = (
-                feedbackPacket.child_enabled
-                & feedbackPacket.endpoint_present).to(dtype=dtype)
+                feedbackPacket.phase_enabled
+                & feedbackPacket.phase_known
+                & feedbackPacket.endpoint_present
+                & feedbackPacket.applied_target_active).to(dtype=dtype)
             progress_regression = (
                 self.ContractPreviousProgress
                 - feedbackPacket.progress).clamp_min(0.0)
             progress_anomaly = torch.log1p((
                 progress_regression * enabled_weight
             ).sum(dim=-1) / enabled_weight.sum(dim=-1).clamp_min(1.0))
-            critical_invalid = (
-                feedbackPacket.target_active
-                & ~feedbackPacket.endpoint_present).any(dim=-1)
-            reached = (
-                feedbackPacket.reached
-                & feedbackPacket.target_active).any(dim=-1)
             tracking_error = (
                 (1.0 - feedbackPacket.progress)
                 * enabled_weight).sum(dim=-1) / enabled_weight.sum(
                     dim=-1).clamp_min(1.0)
             risk = torch.maximum(
-                critical_invalid.to(dtype=dtype),
+                feedbackPacket.hard_stop.to(dtype=dtype),
                 self.prev_risk)
             return self.cognitive_compute_gate(
                 feedbackPacket,
@@ -2396,11 +2679,8 @@ class BrainCore(nn.Module):
                 trackingError=tracking_error,
                 contactAnomaly=progress_anomaly,
                 evc=self.prev_evc,
-                safetyViolation=critical_invalid,
-                criticalInfeasible=(
-                    feedbackPacket.target_active
-                    & ~feedbackPacket.child_enabled
-                    & ~feedbackPacket.reached).any(dim=-1))
+                safetyViolation=feedbackPacket.hard_stop,
+                criticalInfeasible=feedbackPacket.hard_stop)
 
     def BuildContractDecisionContext(
             self,
@@ -2414,8 +2694,10 @@ class BrainCore(nn.Module):
             preserveReachedTargets: Optional[torch.Tensor] = None,
         ) -> PackedDecisionContext:
             constraint_tokens = actOut["decoder_constraint_tokens"]
-            slot_legal = feedbackPacket.endpoint_present
-            previous_target_active = None
+            slot_legal = (
+                feedbackPacket.phase_enabled
+                & feedbackPacket.phase_known)
+            previous_target_active = feedbackPacket.applied_target_active
             if preserveReachedTargets is not None and (
                 not torch.is_tensor(preserveReachedTargets)
                 or tuple(preserveReachedTargets.shape)
@@ -2425,12 +2707,10 @@ class BrainCore(nn.Module):
             ):
                 raise ValueError(
                     "preserveReachedTargets must match the decision batch")
-            if self.ContractCachedTarget is not None:
-                previous_target_active = self.ContractCachedTarget.active
-                if preserveReachedTargets is not None:
-                    previous_target_active = (
-                        previous_target_active
-                        & preserveReachedTargets.unsqueeze(-1))
+            if preserveReachedTargets is not None:
+                previous_target_active = (
+                    previous_target_active
+                    & preserveReachedTargets.unsqueeze(-1))
             if preserveReachedTargets is not None:
                 child_mask = torch.tensor(
                     self.robot_contract_view.child_mask,
@@ -2455,9 +2735,7 @@ class BrainCore(nn.Module):
                 slot_relevance=slotRelevance,
                 slot_selection_mask=slotSelectionMask,
                 previous_target_values=(
-                    None
-                    if self.ContractCachedTarget is None
-                    else self.ContractCachedTarget.values),
+                    feedbackPacket.applied_target_values),
                 previous_target_active=(
                     previous_target_active))
 
@@ -2828,7 +3106,9 @@ class BrainCore(nn.Module):
                     candidateDecisionFeature,
                     feedbackPacket=candidate_packet,
                     decisionContext=candidate_context)
-                action = decoded.world_action_feature
+                action = world.EncodeAssumedAppliedAction(
+                    decoded.world_action_feature,
+                    decoded.target.active)
                 efference = (
                     self.packed_decision_decoupler
                     .DecodePerceptionRotationEfference(
@@ -2869,8 +3149,8 @@ class BrainCore(nn.Module):
                         base_utility,
                         predicted_feedback,
                         decoded.target.active,
-                        candidate_packet.endpoint_present
-                        & candidate_packet.child_enabled))
+                        candidate_packet.phase_enabled
+                        & candidate_packet.phase_known))
                 return candidate_score, candidate_valid
 
             return Evaluate
@@ -4026,131 +4306,9 @@ class BrainCore(nn.Module):
             scheduled_compute_mode = compute_decision.mode
             failsafe_event = scheduled_compute_mode.eq(
                 int(CognitiveComputeMode.FAILSAFE))
-            stopped_event = failsafe_event | done_event
+            motor_stop_event = failsafe_event | done_event
+            stopped_event = torch.zeros_like(done_event)
             SaveModuleOutput("CognitiveCompute", compute_decision)
-            if bool(stopped_event.all().item()) and (
-                not step.is_train
-                or bool(failsafe_event.all().item())
-            ):
-                temporal_decision = self.BuildFailsafeTemporalDecision(
-                    feedback_packet)
-                actor = self.RuntimeModule(self.actor)
-                actor.ResetHebbianMemory()
-                self.prev_option_logit = torch.zeros_like(
-                    self.prev_option_logit)
-                self.prev_fast_option_logit = torch.zeros_like(
-                    self.prev_fast_option_logit)
-                self.prev_detail_option_logit = torch.zeros_like(
-                    self.prev_detail_option_logit)
-                self.prev_decision_state = torch.zeros_like(
-                    self.prev_decision_state)
-                self.prev_fast_decision_state = torch.zeros_like(
-                    self.prev_fast_decision_state)
-                self.prev_detail_decision_state = torch.zeros_like(
-                    self.prev_detail_decision_state)
-                self.prev_latent_control = torch.zeros_like(
-                    self.prev_latent_control)
-                self.prev_fast_latent_control = torch.zeros_like(
-                    self.prev_fast_latent_control)
-                self.prev_detail_latent_control = torch.zeros_like(
-                    self.prev_detail_latent_control)
-                self.prev_mapper_hidden = torch.zeros_like(
-                    self.prev_mapper_hidden)
-                self.prev_fast_mapper_hidden = torch.zeros_like(
-                    self.prev_fast_mapper_hidden)
-                self.prev_detail_mapper_hidden = torch.zeros_like(
-                    self.prev_detail_mapper_hidden)
-                self.prev_entropy = torch.zeros_like(
-                    self.prev_entropy)
-                self.prev_belief_prediction_state = torch.zeros_like(
-                    self.prev_belief_prediction_state)
-                self.prev_belief_prediction_valid = torch.zeros_like(
-                    self.prev_belief_prediction_valid)
-                self.active_option_policy_input = torch.zeros_like(
-                    self.active_option_policy_input)
-                self.active_option_prior_logit = torch.zeros_like(
-                    self.active_option_prior_logit)
-                self.active_option_goal_mid = torch.zeros_like(
-                    self.active_option_goal_mid)
-                self.active_option_index = torch.zeros_like(
-                    self.active_option_index)
-                self.active_option_valid = torch.zeros_like(
-                    self.active_option_valid)
-                self.ContractCachedTarget = temporal_decision.selected_target
-                self.ContractCachedActionEpoch = (
-                    temporal_decision.action_epoch.detach().clone())
-                self.ContractCacheAge = self.ContractCacheAge + 1.0
-                self.ContractSlowCacheAge = torch.where(
-                    failsafe_event,
-                    self.ContractSlowCacheAge,
-                    self.ContractSlowCacheAge + 1.0)
-                self.ContractPreviousTextFingerprint = torch.where(
-                    failsafe_event,
-                    self.ContractPreviousTextFingerprint,
-                    text_fingerprint).detach().clone()
-                self.ContractPreviousCommandFingerprint = torch.where(
-                    failsafe_event,
-                    self.ContractPreviousCommandFingerprint,
-                    command_fingerprint).detach().clone()
-                self.ContractCommandVersion = torch.where(
-                    failsafe_event,
-                    self.ContractCommandVersion,
-                    command_version).detach().clone()
-                self.prev_intent_changed = (
-                    self.prev_intent_changed.detach().clone())
-                self.ContractPreviousTargetActive = (
-                    feedback_packet.target_active.detach().clone())
-                self.ContractPreviousProgress = (
-                    feedback_packet.progress.detach().clone())
-                self.prev_done_flag = torch.where(
-                    failsafe_event,
-                    self.prev_done_flag | done_event,
-                    done_event).detach().clone()
-                cached = self.ContractSlowCognitiveCache
-                ocr_items = (
-                    [[] for _ in range(batch_size)]
-                    if cached is None
-                    else copy.deepcopy(cached.get(
-                        "OcrItems",
-                        [[] for _ in range(batch_size)])))
-                intention_texts = (
-                    []
-                    if cached is None
-                    else copy.deepcopy(cached.get("IntentionTexts", [])))
-                if bool(done_event.any().item()):
-                    self.ResetContractStateRows(done_event)
-                    self.ResetHebbianMemory(doneMask=done_event)
-                    self.mem.ResetEpisodeState(done_event)
-                    self.RuntimeModule(self.critic).ResetState(
-                        doneMask=done_event)
-                    self.conscious.ResetState(doneMask=done_event)
-                    self.OCR.ResetTemporal(doneMask=done_event)
-                    self.contract_neuro_symbolic.ResetPlan(done_event)
-                    self.ContractWorld().ResetEpisodeState(done_event)
-                SaveModuleOutput("TemporalExecution", temporal_decision)
-                return BrainStepOutput(
-                    decision={
-                        "packed_target": temporal_decision.selected_target,
-                        "packed_temporal": temporal_decision,
-                        "planner_prior": None},
-                    world={},
-                    critic=None,
-                    features={
-                        "CognitiveCompute": compute_decision,
-                        "MemoryPosteriorCorrection": replay_correction},
-                    ocr=ocr_items,
-                    intention_texts=intention_texts,
-                    losses={},
-                    stages={
-                        "CognitiveCompute": compute_decision,
-                        "ScheduledComputeMode": scheduled_compute_mode,
-                        "SlowCognitionReused": True,
-                        "PlannerExecuted": False,
-                        "PlanCacheReused": torch.zeros(
-                            batch_size,
-                            device=device,
-                            dtype=torch.bool),
-                        "StoppedRows": stopped_event})
             if (
                 self.contract_physical_adapter is None
                 or self.contract_pst_builder is None
@@ -4164,10 +4322,6 @@ class BrainCore(nn.Module):
 
             rotation_delta, angular_velocity, rotation_valid = (
                 self.SelectContractPerceptionMotion(feedback_packet))
-            previous_rotation, current_rotation = (
-                self.BuildContractObserverGauge(
-                    rotation_delta,
-                    rotation_valid))
 
             top_down = self.BuildTopDownContext(
                 self.prospective_visual_prediction)
@@ -4183,6 +4337,14 @@ class BrainCore(nn.Module):
                 observerRotation=rotation_delta,
                 observerRotationValid=rotation_valid,
                 observerAngularVelocity=angular_velocity)
+            rotation_delta = visual_state.Auxiliary[
+                "ObserverRotationSelectedCurrentToPrevious"]
+            rotation_valid = visual_state.Auxiliary[
+                "ObserverRotationSelectedValid"]
+            previous_rotation, current_rotation = (
+                self.BuildContractObserverGauge(
+                    rotation_delta,
+                    rotation_valid))
             visual_sequence = self.visual_state_buffer + [visual_state]
             visual_valid_sequence = self.visual_state_valid_buffer + [
                 torch.ones(batch_size, device=device, dtype=torch.bool)]
@@ -4267,7 +4429,12 @@ class BrainCore(nn.Module):
                 visual_state.Auxiliary["ObjectGeometryValid"],
                 slotBodyTokens=contract_body["SlotBodyTokens"],
                 slotWeight=contract_body["SlotWeight"])
-            realized_action, action_agency_evidence, agency_evidence_valid = (
+            (
+                world_transition_action,
+                realized_action,
+                action_agency_evidence,
+                agency_evidence_valid,
+            ) = (
                 self.BuildContractActionAgencyEvidence(
                     feedback_packet,
                     contract_body))
@@ -4299,12 +4466,12 @@ class BrainCore(nn.Module):
                 self.visual_state_valid_buffer,
                 visual_sequence,
                 visual_valid_sequence,
-                failsafe_event)
+                stopped_event)
             self.perc_buffer = [
                 value.IntegratedFeat
                 for value in self.visual_state_buffer
                 if value is not None]
-            active_visual_rows = (~failsafe_event).nonzero(
+            active_visual_rows = (~stopped_event).nonzero(
                 as_tuple=False).flatten()
             previous_visual_base = (
                 visual_state
@@ -4320,7 +4487,7 @@ class BrainCore(nn.Module):
                     active_visual_rows,
                     batch_size))
             self.prev_visual_valid = torch.where(
-                failsafe_event,
+                stopped_event,
                 previous_visual_valid,
                 torch.ones(
                     batch_size,
@@ -4332,7 +4499,9 @@ class BrainCore(nn.Module):
                 compute_decision.mode.eq(
                     int(CognitiveComputeMode.DETAIL_EXECUTE))
                 | compute_decision.mode.eq(
-                    int(CognitiveComputeMode.FULL_REPLAN))) & ~stopped_event
+                    int(CognitiveComputeMode.FULL_REPLAN))
+                | compute_decision.mode.eq(
+                    int(CognitiveComputeMode.FAILSAFE))) & ~stopped_event
             local_detail = self.BuildLocalDetailMask(
                 object_seq,
                 motion_seq,
@@ -4341,8 +4510,12 @@ class BrainCore(nn.Module):
                 detail_rows)
             attention_active = ~stopped_event
             attention_full_mask = (
-                compute_decision.mode.eq(
-                    int(CognitiveComputeMode.FULL_REPLAN))
+                (
+                    compute_decision.mode.eq(
+                        int(CognitiveComputeMode.FULL_REPLAN))
+                    | compute_decision.mode.eq(
+                        int(CognitiveComputeMode.FAILSAFE))
+                )
                 & attention_active)
             attention_fast_mask = (
                 compute_decision.mode.eq(
@@ -4371,7 +4544,7 @@ class BrainCore(nn.Module):
                 informationGain=self.prev_information_gain,
                 stageMask=attention_stage,
                 localDetailMask=local_detail,
-                trainStudents=step.is_train,
+                trainStudents=False,
                 returnExtras=True)
 
             world = self.ContractWorld()
@@ -4383,8 +4556,8 @@ class BrainCore(nn.Module):
             world_embodiment_state = world.EncodeContractTransition(
                 feedback_packet)
             physical_runtime_snapshot = (
-                world.CapturePhysicalRuntimeRows(failsafe_event)
-                if bool(failsafe_event.any().item())
+                world.CapturePhysicalRuntimeRows(stopped_event)
+                if bool(stopped_event.any().item())
                 else None)
             pst = world.UpdateContractPhysicalState(
                 observed_pst,
@@ -4394,7 +4567,7 @@ class BrainCore(nn.Module):
             if physical_runtime_snapshot is not None:
                 world.RestorePhysicalRuntimeRows(
                     physical_runtime_snapshot,
-                    failsafe_event)
+                    stopped_event)
             pst["U"] = self.mem.usage_bank.SlotReadout(
                 pst["IdentityKey"],
                 pst["ARaw"],
@@ -4434,7 +4607,7 @@ class BrainCore(nn.Module):
                 with torch.no_grad():
                     preview_world = world.StepPosterior(
                         visionIn=atten_out,
-                        actionEnc=realized_action,
+                        actionEnc=world_transition_action,
                         physicalState=pst,
                         transitionPhysicalState=previous_physical_state,
                         embodimentState=world_embodiment_state,
@@ -4474,7 +4647,7 @@ class BrainCore(nn.Module):
                             rewardModel=preview_reward,
                             doneModel=preview_done,
                             computeLoss=False,
-                            commitMask=~failsafe_event,
+                            commitMask=~stopped_event,
                             policyEntropyPrev=self.prev_entropy,
                             worldDeltaTransport=preview_world["d_tr"],
                             worldDeltaPhysics=preview_world["d_ph"])
@@ -4482,7 +4655,7 @@ class BrainCore(nn.Module):
                             critic_module.RefineEntityOntologyRisk(
                                 preview_value,
                                 pst,
-                                sampleMask=~failsafe_event))
+                                sampleMask=~stopped_event))
                         compute_decision = (
                             self.EscalateContractComputeDecision(
                                 compute_decision,
@@ -4586,7 +4759,7 @@ class BrainCore(nn.Module):
             if step.is_train:
                 w_out = self.RunWorldTrainingStep(
                     visionIn=atten_out,
-                    actionEnc=realized_action,
+                    actionEnc=world_transition_action,
                     physicalState=pst,
                     transitionPhysicalState=previous_physical_state,
                     embodimentState=world_embodiment_state,
@@ -4596,7 +4769,7 @@ class BrainCore(nn.Module):
                     reward=step.reward_ext,
                     done=step.done_flag,
                     sample=(step.is_train and not step.deterministic_actor),
-                    commitMask=~failsafe_event)
+                    commitMask=~stopped_event)
             elif not bool(attention_refinement_mask.any().item()):
                 if (
                     preview_world is None
@@ -4607,7 +4780,7 @@ class BrainCore(nn.Module):
                 try:
                     w_out = world.CommitPosteriorPreview(
                         preview_world,
-                        commitMask=~failsafe_event)
+                        commitMask=~stopped_event)
                 except BaseException:
                     self.RuntimeModule(self.critic).ImportState(
                         preview_critic_state)
@@ -4615,7 +4788,7 @@ class BrainCore(nn.Module):
             else:
                 w_out = world.StepPosterior(
                     visionIn=atten_out,
-                    actionEnc=realized_action,
+                    actionEnc=world_transition_action,
                     physicalState=pst,
                     transitionPhysicalState=previous_physical_state,
                     embodimentState=world_embodiment_state,
@@ -4623,17 +4796,25 @@ class BrainCore(nn.Module):
                     observerMotion=rotation_delta,
                     observerMotionValid=rotation_valid,
                     sample=False,
-                    commitMask=~failsafe_event)
+                    commitMask=~stopped_event)
+            contract_feedback_prediction = (
+                self.PredictCausalContractFeedback(world, w_out))
+            contract_feedback_evaluation = world.ComputeContractFeedbackLoss(
+                contract_feedback_prediction,
+                feedback_packet,
+                sampleMask=(
+                    ~stopped_event
+                    & feedback_packet.execution_result_known))
+            w_out["contract_feedback_prediction"] = (
+                contract_feedback_prediction)
+            w_out["contract_feedback_surprise"] = (
+                contract_feedback_evaluation["normalized_surprise"])
+            w_out["contract_feedback_surprise_valid"] = (
+                contract_feedback_evaluation["surprise_valid"])
             if step.is_train:
-                contract_feedback_prediction = (
-                    self.PredictCausalContractFeedback(world, w_out))
-                contract_feedback_losses = world.ComputeContractFeedbackLoss(
-                    contract_feedback_prediction,
-                    feedback_packet,
-                    sampleMask=~failsafe_event)
-                w_out["contract_feedback_prediction"] = (
-                    contract_feedback_prediction)
-                for name, value in contract_feedback_losses.items():
+                for name, value in contract_feedback_evaluation.items():
+                    if name in ("normalized_surprise", "surprise_valid"):
+                        continue
                     telemetry_name = (
                         "loss_contract_feedback"
                         if name == "loss"
@@ -4641,7 +4822,7 @@ class BrainCore(nn.Module):
                     w_out[telemetry_name] = value
                 w_out["loss"] = (
                     w_out["loss"]
-                    + 0.1 * contract_feedback_losses["loss"])
+                    + 0.1 * contract_feedback_evaluation["loss"])
             information_gain = self.ComputeRealizedInformationGain(
                 w_out["mu_q"],
                 w_out["logstd_q"],
@@ -4650,14 +4831,42 @@ class BrainCore(nn.Module):
             w_out["realized_information_gain"] = information_gain
             w_out["uncertainty_weighted_surprise"] = (
                 uncertainty_weighted_surprise)
+            observation_missing = (
+                ~feedback_packet.endpoint_present).to(
+                    dtype=dtype).mean(dim=-1)
+            observation_age = torch.log1p(
+                feedback_packet.observation_age.mean(dim=-1))
+            sensorimotor_valid = contract_feedback_evaluation[
+                "surprise_valid"]
+            sensorimotor_evidence = torch.stack([
+                contract_feedback_evaluation["normalized_surprise"],
+                sensorimotor_valid.to(dtype=dtype),
+                observation_missing,
+                observation_age,
+            ], dim=-1)
+            w_out["sensorimotor_evidence"] = sensorimotor_evidence
+            w_out["sensorimotor_evidence_valid"] = sensorimotor_valid
             SaveModuleOutput("World", w_out)
-            world_hzx = torch.cat([
+            world_hzx_base = torch.cat([
                 w_out["h_next"],
                 w_out["z_next"],
                 w_out["x_next"],
             ], dim=-1)
+            world_hzx = (
+                world_hzx_base
+                + torch.tanh(self.contract_sensorimotor_consistency_gain)
+                * self.contract_sensorimotor_consistency_encoder(
+                    sensorimotor_evidence))
             world_surprise = torch.log1p(
                 information_gain)
+            feedback_surprise = torch.where(
+                contract_feedback_evaluation["surprise_valid"],
+                torch.log1p(
+                    contract_feedback_evaluation["normalized_surprise"]),
+                torch.zeros_like(world_surprise))
+            world_surprise = torch.maximum(
+                world_surprise,
+                feedback_surprise)
             world_surprise = torch.where(
                 self.prev_done_flag,
                 torch.zeros_like(world_surprise),
@@ -4686,7 +4895,7 @@ class BrainCore(nn.Module):
                     rewardModel=value_reward,
                     doneModel=value_done,
                     computeLoss=step.is_train,
-                    commitMask=~failsafe_event,
+                    commitMask=~stopped_event,
                     policyEntropyPrev=self.prev_entropy,
                     worldDeltaTransport=w_out["d_tr"],
                     worldDeltaPhysics=w_out["d_ph"])
@@ -4694,7 +4903,7 @@ class BrainCore(nn.Module):
                     self.critic).RefineEntityOntologyRisk(
                         critic_out,
                         pst,
-                        sampleMask=~failsafe_event)
+                        sampleMask=~stopped_event)
             SaveModuleOutput("Value", critic_out)
             td_signal = critic_out.tdError.detach()
             return_advantage = critic_out.returnAdvantage.detach()
@@ -4724,8 +4933,8 @@ class BrainCore(nn.Module):
                 uncertainty=uncertainty,
                 risk=risk,
                 confidence=confidence,
-                writeMask=~failsafe_event,
-                lossSampleMask=~failsafe_event)
+                writeMask=~stopped_event,
+                lossSampleMask=~stopped_event)
             SaveModuleOutput("Memory", mem_feat)
             if step.is_train:
                 replay_training = self.mem.ConsumeCounterfactualReplay(
@@ -4734,7 +4943,7 @@ class BrainCore(nn.Module):
                     seed=int(self.mem.time_step.max().item()),
                     addInternalLoss=True)
                 SaveModuleOutput("MemoryCounterfactualReplay", replay_training)
-            stopped_rows = done_event | failsafe_event
+            stopped_rows = torch.zeros_like(done_event)
             self.RecordContractReplayTrace(
                 mem_feat,
                 w_out["r_pred"],
@@ -4887,10 +5096,13 @@ class BrainCore(nn.Module):
                     timeRequirement=task_requirements[:, 1],
                     terminationRequirement=task_requirements[:, 2],
                     activePerceptionRequirement=task_requirements[:, 3],
-                    endpointAvailable=feedback_packet.endpoint_present.index_select(
-                        0, slow_row_index),
-                    hierarchyEnabled=feedback_packet.child_enabled.index_select(
-                        0, slow_row_index))
+                    endpointAvailable=torch.ones_like(
+                        feedback_packet.endpoint_present).index_select(
+                            0, slow_row_index),
+                    hierarchyEnabled=(
+                        feedback_packet.phase_enabled
+                        & feedback_packet.phase_known).index_select(
+                            0, slow_row_index))
                 selected_pst = self.IndexRuntimeRows(
                     pst,
                     slow_row_index,
@@ -4927,23 +5139,17 @@ class BrainCore(nn.Module):
             slow_cache = self.ContractSlowCognitiveCache
             if slow_cache is None:
                 raise RuntimeError("slow cognitive cache is unavailable")
-            if step.is_train:
-                if live_slow_phase is None:
-                    raise RuntimeError("training slow cognition has no active rows")
-                conscious_out = live_slow_phase["Consciousness"]
-                intent_sem = live_slow_phase["Intention"]
-                sym_probs = live_slow_phase["SymbolProbabilities"]
-                intention_extras = live_slow_phase["IntentionState"]
-                intention_texts = live_slow_phase["IntentionTexts"]
-                goals = dict(live_slow_phase["Goals"])
-                grounding = live_slow_phase["GoalGrounding"]
-            else:
-                conscious_out = slow_cache["Consciousness"]
-                intent_sem = slow_cache["Intention"]
-                intention_extras = slow_cache["IntentionState"]
-                intention_texts = slow_cache["IntentionTexts"]
-                goals = dict(slow_cache["Goals"])
-                grounding = slow_cache["GoalGrounding"]
+            active_slow_phase = (
+                live_slow_phase
+                if step.is_train and live_slow_phase is not None
+                else slow_cache)
+            conscious_out = active_slow_phase["Consciousness"]
+            intent_sem = active_slow_phase["Intention"]
+            sym_probs = active_slow_phase["SymbolProbabilities"]
+            intention_extras = active_slow_phase["IntentionState"]
+            intention_texts = active_slow_phase["IntentionTexts"]
+            goals = dict(active_slow_phase["Goals"])
+            grounding = active_slow_phase["GoalGrounding"]
             if not step.is_train:
                 live_short_goal = self.goal_manager.ShortGoal(
                     goals["g_ultimate"],
@@ -4964,8 +5170,11 @@ class BrainCore(nn.Module):
                     observed_pst)
             goals["endpoint_active"] = (
                 self.goal_manager.ResolveEndpointActivity(
-                    endpointAvailable=feedback_packet.endpoint_present,
-                    hierarchyEnabled=feedback_packet.child_enabled,
+                    endpointAvailable=torch.ones_like(
+                        feedback_packet.endpoint_present),
+                    hierarchyEnabled=(
+                        feedback_packet.phase_enabled
+                        & feedback_packet.phase_known),
                     batchSize=batch_size,
                     device=device))
             goals["subtree_relevance"], goals["subtree_active"] = (
@@ -5064,30 +5273,26 @@ class BrainCore(nn.Module):
                 | reference_changed)
             plan_stale_known = torch.ones_like(plan_stale)
 
-            cache_active = (
-                torch.zeros(batch_size, device=device, dtype=torch.bool)
-                if self.ContractCachedTarget is None
-                else self.ContractCachedTarget.active.any(dim=-1))
-            target_matches = (
-                torch.zeros(batch_size, device=device, dtype=torch.bool)
-                if self.ContractCachedTarget is None
-                else feedback_packet.target_version.eq(
-                    self.ContractCachedTarget.target_version))
-            cache_executing = cache_active & target_matches
+            cache_active = feedback_packet.applied_target_active.any(dim=-1)
+            cache_executing = (
+                cache_active
+                & feedback_packet.execution_result_known
+                & ~feedback_packet.hard_stop)
             progress_weight = (
-                feedback_packet.target_active
+                feedback_packet.applied_target_active
                 & feedback_packet.endpoint_present).to(dtype=dtype)
             planner_progress = (
                 feedback_packet.progress * progress_weight
             ).sum(dim=-1) / progress_weight.sum(dim=-1).clamp_min(1.0)
             planner_reached = (
-                feedback_packet.target_active.any(dim=-1)
+                feedback_packet.applied_target_active.any(dim=-1)
                 & (
                     feedback_packet.reached
-                    | ~feedback_packet.target_active).all(dim=-1))
+                    | ~feedback_packet.applied_target_active).all(dim=-1))
             planner_failed = (
-                feedback_packet.target_active
-                & ~feedback_packet.endpoint_present).any(dim=-1)
+                feedback_packet.execution_known
+                & feedback_packet.execution_status.eq(
+                    int(SlotExecutionStatus.REJECTED))).any(dim=-1)
             planner_tracking_error = (
                 (1.0 - feedback_packet.progress) * progress_weight
             ).sum(dim=-1) / progress_weight.sum(dim=-1).clamp_min(1.0)
@@ -5100,12 +5305,18 @@ class BrainCore(nn.Module):
                 safetyRisk=risk,
                 candidateSafetyRisk=risk,
                 interruptRisk=torch.maximum(risk, uncertainty),
-                observationFreshness=(~stopped_rows).to(dtype=dtype),
+                observationFreshness=torch.exp(
+                    -(
+                        feedback_packet.observation_age
+                        / feedback_packet.observation_age.new_tensor(
+                            self.robot_contract_view.observation_timeout)
+                        .unsqueeze(0)
+                        .clamp_min(torch.finfo(dtype).eps)
+                    ).amax(dim=-1)).clamp(0.0, 1.0),
                 canInterrupt=torch.ones(batch_size, device=device, dtype=dtype),
                 hardStop=(
-                    planner_failed
-                    | done_event
-                    | failsafe_event).to(dtype=dtype),
+                    feedback_packet.hard_stop
+                    | done_event).to(dtype=dtype),
                 plannerProgress=planner_progress,
                 plannerTrackingError=planner_tracking_error,
                 plannerExecuting=cache_executing.to(dtype=dtype),
@@ -5118,10 +5329,7 @@ class BrainCore(nn.Module):
             if int(realized_action.size(-1)) != int(actor.action_embed_dim):
                 raise RuntimeError(
                     "contract realized action does not match Decision input width")
-            decision_mask = (
-                ~failsafe_event
-                if step.is_train
-                else ~stopped_rows)
+            decision_mask = torch.ones_like(done_event)
             decision_row_index = decision_mask.nonzero(
                 as_tuple=False).flatten()
             if decision_row_index.numel() < 1:
@@ -5135,17 +5343,16 @@ class BrainCore(nn.Module):
                 self.prev_world_z,
                 self.prev_world_x,
             ], dim=-1).detach()
-            credit_option_policy_input = (
-                self.active_option_policy_input.detach())
-            credit_option_prior_logit = (
-                self.active_option_prior_logit.detach())
-            credit_option_goal_mid = self.active_option_goal_mid.detach()
-            credit_option_index = self.active_option_index.detach()
-            credit_option_valid = (
-                self.active_option_valid
-                & target_matches
-                & ~self.prev_done_flag
-                & ~stopped_rows).detach()
+            option_transaction = self.ResolvePendingOptionTransaction(
+                feedback_packet)
+            credit_option_goal_mid = option_transaction[
+                "credit_goal_mid"]
+            credit_option_index = option_transaction[
+                "credit_option_index"]
+            credit_option_valid = option_transaction[
+                "credit_option_valid"]
+            physical_request_continued = option_transaction[
+                "physical_request_continued"]
             cached_option_skill = self.mem.RecallSkill(
                 "executedOption",
                 self.model_signature)
@@ -5158,19 +5365,13 @@ class BrainCore(nn.Module):
                     goals["g_mid"],
                     cached_option_skill,
                     actor.num_options))
-            eligibility_invalid = (
-                ~self.active_option_valid
-                | ~target_matches
-                | self.prev_done_flag
-                | stopped_rows)
-            actor.ClearInvalidEligibility(eligibility_invalid)
             full_decision_mask = (
                 decision_mask
                 & (
-                    torch.ones_like(decision_mask)
-                    if step.is_train
-                    else compute_decision.mode.eq(
-                        int(CognitiveComputeMode.FULL_REPLAN))))
+                    compute_decision.mode.eq(
+                        int(CognitiveComputeMode.FULL_REPLAN))
+                    | compute_decision.mode.eq(
+                        int(CognitiveComputeMode.FAILSAFE))))
             fast_decision_mask = (
                 decision_mask
                 & ~full_decision_mask
@@ -5287,19 +5488,17 @@ class BrainCore(nn.Module):
             slow_cache = self.ContractSlowCognitiveCache
             if slow_cache is None:
                 raise RuntimeError("slow cognitive cache is unavailable")
-            if step.is_train:
-                if (
-                    live_contract_grounding is None
-                    or live_neuro_symbolic is None
-                ):
-                    raise RuntimeError(
-                        "training symbolic cognition has no active rows")
-                contract_grounding = live_contract_grounding
-                neuro_symbolic_out = live_neuro_symbolic
-            else:
-                contract_grounding = slow_cache["ContractGrounding"]
-                neuro_symbolic_out = slow_cache["NeuroSymbolic"]
+            contract_grounding = (
+                live_contract_grounding
+                if step.is_train and live_contract_grounding is not None
+                else slow_cache["ContractGrounding"])
+            neuro_symbolic_out = (
+                live_neuro_symbolic
+                if step.is_train and live_neuro_symbolic is not None
+                else slow_cache["NeuroSymbolic"])
             SaveModuleOutput("NeuroSymbolic", neuro_symbolic_out)
+            eligibility_state_before = actor.ExportEligibilityState()
+            eligibility_frozen_before = actor.EligibilityFrozen()
             base_act_out = None
             if full_decision_rows.numel() > 0:
                 full_base_update = actor.ForwardContractRows(
@@ -5349,8 +5548,8 @@ class BrainCore(nn.Module):
                     prevOptionLogit=(
                         self.prev_fast_option_logit
                         + skill_option_prior_bias),
-                    sample=False,
-                    deterministic=True)
+                    sample=step.sample_actions,
+                    deterministic=step.deterministic_actor)
                 base_act_out = self.ScatterRuntimeRows(
                     base_act_out,
                     fast_base_update,
@@ -5378,8 +5577,8 @@ class BrainCore(nn.Module):
                     prevOptionLogit=(
                         self.prev_detail_option_logit
                         + skill_option_prior_bias),
-                    sample=False,
-                    deterministic=True)
+                    sample=step.sample_actions,
+                    deterministic=step.deterministic_actor)
                 base_act_out = self.ScatterRuntimeRows(
                     base_act_out,
                     detail_base_update,
@@ -5387,58 +5586,6 @@ class BrainCore(nn.Module):
                     batch_size)
             if base_act_out is None:
                 raise RuntimeError("Decision produced no active rows")
-            fast_student_base = None
-            detail_student_base = None
-            if step.is_train:
-                student_cache = torch.where(
-                    recalled_valid.unsqueeze(-1),
-                    recalled_feature,
-                    base_act_out["belief"].detach())
-                fast_student_base = actor.ForwardFastRows(
-                    decision_row_index,
-                    student_cache,
-                    mem_feat,
-                    intent_sem,
-                    valueTensor=critic_out.value,
-                    vNextTensor=critic_out.valueNext,
-                    uncertainty=uncertainty,
-                    confidence=confidence,
-                    precision=precision,
-                    risk=risk,
-                    worldHzx=world_hzx,
-                    prevDecisionState=self.prev_fast_decision_state,
-                    prevLatentControl=self.prev_fast_latent_control,
-                    prevActionEmbed=realized_action,
-                    prevMapperHidden=self.prev_fast_mapper_hidden,
-                    feedbackTdError=feedback_td_error,
-                    prevOptionLogit=(
-                        self.prev_fast_option_logit
-                        + skill_option_prior_bias),
-                    sample=False,
-                    deterministic=True)
-                detail_student_base = actor.ForwardDetailRows(
-                    decision_row_index,
-                    student_cache,
-                    goals["goal_decision"],
-                    mem_feat,
-                    intent_sem,
-                    valueTensor=critic_out.value,
-                    vNextTensor=critic_out.valueNext,
-                    uncertainty=uncertainty,
-                    confidence=confidence,
-                    precision=precision,
-                    risk=risk,
-                    worldHzx=world_hzx,
-                    prevDecisionState=self.prev_detail_decision_state,
-                    prevLatentControl=self.prev_detail_latent_control,
-                    prevActionEmbed=realized_action,
-                    prevMapperHidden=self.prev_detail_mapper_hidden,
-                    feedbackTdError=feedback_td_error,
-                    prevOptionLogit=(
-                        self.prev_detail_option_logit
-                        + skill_option_prior_bias),
-                    sample=False,
-                    deterministic=True)
             belief_prediction_delayed = actor.PredictBelief(
                 belief_prediction_state_prev.index_select(
                     0, decision_row_index))
@@ -5460,8 +5607,9 @@ class BrainCore(nn.Module):
                 neuro_symbolic_out,
                 decision_row_index,
                 batch_size)
-            selected_world_hzx = world_abstract[
-                "world_hzx"].index_select(0, decision_row_index)
+            selected_world_hzx = world_hzx.index_select(
+                0,
+                decision_row_index)
             selected_abstract_feature = world_abstract[
                 "abstract_feat"].index_select(0, decision_row_index)
             selected_world_abstract = self.FuseWorldAbstractDecision(
@@ -5499,37 +5647,6 @@ class BrainCore(nn.Module):
                 act_update,
                 decision_row_index,
                 batch_size)
-            fast_student_out = None
-            detail_student_out = None
-            if step.is_train:
-                fast_student_update = actor.RefineWithNeuroSymbolic(
-                    fast_student_base,
-                    selected_neuro_symbolic,
-                    selected_world_abstract,
-                    selected_scene_abstract,
-                    selected_goal_decision,
-                    selected_temporal_goal,
-                    selected_body_state,
-                    selected_control_feedback,
-                    selected_embodiment_context)
-                detail_student_update = actor.RefineWithNeuroSymbolic(
-                    detail_student_base,
-                    selected_neuro_symbolic,
-                    selected_world_abstract,
-                    selected_scene_abstract,
-                    selected_goal_decision,
-                    selected_temporal_goal,
-                    selected_body_state,
-                    selected_control_feedback,
-                    selected_embodiment_context)
-                fast_student_out = self.ExpandRuntimeRows(
-                    fast_student_update,
-                    decision_row_index,
-                    batch_size)
-                detail_student_out = self.ExpandRuntimeRows(
-                    detail_student_update,
-                    decision_row_index,
-                    batch_size)
             SaveModuleOutput("Decision", act_out)
 
             decision_context = self.BuildContractDecisionContext(
@@ -5642,28 +5759,9 @@ class BrainCore(nn.Module):
                 batch_size)
             packed_decision = self.ApplyFailsafeDecision(
                 packed_decision,
-                stopped_rows)
+                motor_stop_event)
             SaveModuleOutput("DecisionDecoupler", packed_decision)
 
-            neutral_target = PackedEndEffectorTarget(
-                values=torch.zeros(
-                    batch_size,
-                    self.robot_contract_view.end_effector_target_layout.PackedDim,
-                    device=device,
-                    dtype=dtype),
-                active=torch.zeros(
-                    batch_size,
-                    self.robot_contract_view.end_effector_count,
-                    device=device,
-                    dtype=torch.bool),
-                contract_id=self.robot_contract_view.contract_id,
-                model_signature=self.robot_contract_view.model_signature,
-                target_version=feedback_packet.target_version + 1,
-                timestamp=feedback_packet.timestamp)
-            cached_target = (
-                neutral_target
-                if self.ContractCachedTarget is None
-                else self.ContractCachedTarget)
             temporal_readout = act_out["temporal_decision"]
             temporal_proposal = PackedTemporalProposal(
                 kind_scores=temporal_readout["kind_logits"],
@@ -5675,10 +5773,8 @@ class BrainCore(nn.Module):
                 interrupt_score=temporal_readout["p_interrupt"],
                 duration_ms=temporal_readout["duration_ms"],
                 soft_timeout_ms=temporal_readout["soft_timeout_ms"],
-                hard_timeout_ms=temporal_readout["hard_timeout_ms"],
-                action_epoch=self.ContractCachedActionEpoch)
+                hard_timeout_ms=temporal_readout["hard_timeout_ms"])
             temporal_events = PackedTemporalEvent(
-                cache_executing=cache_executing,
                 candidate_ready=packed_decision.target.active.any(dim=-1),
                 redispatch_requested=(
                     temporal_readout["redispatch_score"] > 0.5),
@@ -5686,82 +5782,47 @@ class BrainCore(nn.Module):
                     temporal_readout["p_interrupt"] > 0.5),
                 planner_failed=planner_failed,
                 plan_reached=planner_reached,
-                hard_stop=(
-                    planner_failed
-                    | done_event
-                    | failsafe_event),
                 active_risk=risk.clamp(0.0, 1.0),
                 candidate_risk=risk.clamp(0.0, 1.0))
             temporal_decision = self.packed_temporal_gate.Step(
                 feedback_packet,
                 packed_decision.target,
-                cached_target,
                 temporal_context,
                 temporal_proposal,
                 temporal_events,
                 temporal_readout["invoke_delta"])
             temporal_decision = self.ApplyStoppedTemporalDecision(
                 temporal_decision,
-                stopped_rows)
+                motor_stop_event)
             SaveModuleOutput("TemporalExecution", temporal_decision)
-            option_start = temporal_decision.candidate_selected
-            option_continue = temporal_decision.cache_selected
-            option_inactive = ~(option_start | option_continue)
-            actor.CommitEligibilityRows(
-                act_out["eligibility"]["pre"],
-                act_out["eligibility"]["post"],
+            help_requested = (
+                base_act_out["option"]["opt_idx"].eq(
+                    actor.assist_option_id)
+                & ~motor_stop_event)
+            request_action_epoch = torch.where(
+                help_requested,
+                feedback_packet.applied_action_epoch + 1,
+                temporal_decision.action_epoch)
+            option_start = (
+                temporal_decision.candidate_selected
+                | help_requested)
+            option_continue = (
+                temporal_decision.cache_selected
+                & ~help_requested)
+            scheduled_option_index = torch.where(
                 option_start,
-                full_decision_mask)
-            self.active_option_policy_input = torch.where(
-                option_start.unsqueeze(-1),
-                base_act_out["option"]["policy_input"].detach(),
-                self.active_option_policy_input)
-            self.active_option_prior_logit = torch.where(
-                option_start.unsqueeze(-1),
-                base_act_out["option"]["prior_logits"].detach(),
-                self.active_option_prior_logit)
-            self.active_option_goal_mid = torch.where(
-                option_start.unsqueeze(-1),
-                goals["g_mid"].detach(),
-                self.active_option_goal_mid)
-            self.active_option_index = torch.where(
-                option_start,
-                base_act_out["option"]["opt_idx"].detach(),
+                base_act_out["option"]["opt_idx"],
                 self.active_option_index)
-            self.active_option_index = torch.where(
-                option_inactive,
-                torch.zeros_like(self.active_option_index),
-                self.active_option_index)
-            self.active_option_policy_input = torch.where(
-                option_inactive.unsqueeze(-1),
-                torch.zeros_like(self.active_option_policy_input),
-                self.active_option_policy_input)
-            self.active_option_prior_logit = torch.where(
-                option_inactive.unsqueeze(-1),
-                torch.zeros_like(self.active_option_prior_logit),
-                self.active_option_prior_logit)
-            self.active_option_goal_mid = torch.where(
-                option_inactive.unsqueeze(-1),
-                torch.zeros_like(self.active_option_goal_mid),
-                self.active_option_goal_mid)
-            self.active_option_valid = (
+            scheduled_option_valid = (
                 option_start
                 | (option_continue & self.active_option_valid))
-            fast_state_out = (
-                fast_student_out
-                if step.is_train
-                else act_out)
-            detail_state_out = (
-                detail_student_out
-                if step.is_train
-                else act_out)
-            if fast_state_out is None or detail_state_out is None:
-                raise RuntimeError("Decision student state is unavailable")
+            fast_state_out = act_out
+            detail_state_out = act_out
             full_candidate_selected = option_start & full_decision_mask
             fast_candidate_selected = option_start & (
-                decision_mask if step.is_train else fast_decision_mask)
+                fast_decision_mask)
             detail_candidate_selected = option_start & (
-                decision_mask if step.is_train else detail_decision_mask)
+                detail_decision_mask)
             scheduled_prev_option_logit = self.ScheduleExecutedState(
                 act_out["prevOptionLogit_next"].detach(),
                 self.prev_option_logit,
@@ -5779,8 +5840,8 @@ class BrainCore(nn.Module):
                 option_continue)
             act_out["candidate_option_index"] = base_act_out[
                 "option"]["opt_idx"]
-            act_out["scheduled_option_index"] = self.active_option_index
-            act_out["scheduled_option_valid"] = self.active_option_valid
+            act_out["scheduled_option_index"] = scheduled_option_index
+            act_out["scheduled_option_valid"] = scheduled_option_valid
             act_out["credited_option_index"] = credit_option_index
             act_out["credited_option_valid"] = credit_option_valid
             act_out["skill_prior_bias"] = skill_option_prior_bias
@@ -5788,32 +5849,268 @@ class BrainCore(nn.Module):
             act_out["option_assignment"] = {
                 "candidate_index": base_act_out["option"]["opt_idx"],
                 "candidate_selected": option_start,
-                "scheduled_index": self.active_option_index,
-                "scheduled_valid": self.active_option_valid,
+                "scheduled_index": scheduled_option_index,
+                "scheduled_valid": scheduled_option_valid,
                 "continued": option_continue,
                 "credited_index": credit_option_index,
                 "credited_valid": credit_option_valid}
+            evaluated_planner_override = (
+                planner_valid_mask
+                & bool(self.use_planner)
+                & ~help_requested)
+            evaluated_policy_path = torch.full(
+                (batch_size,),
+                POLICY_PATH_NONE,
+                device=device,
+                dtype=torch.long)
+            evaluated_policy_path = torch.where(
+                full_decision_mask,
+                torch.full_like(evaluated_policy_path, POLICY_PATH_FULL),
+                evaluated_policy_path)
+            evaluated_policy_path = torch.where(
+                fast_decision_mask,
+                torch.full_like(evaluated_policy_path, POLICY_PATH_FAST),
+                evaluated_policy_path)
+            evaluated_policy_path = torch.where(
+                detail_decision_mask,
+                torch.full_like(evaluated_policy_path, POLICY_PATH_DETAIL),
+                evaluated_policy_path)
+            evaluated_policy_path = torch.where(
+                motor_stop_event,
+                torch.full_like(evaluated_policy_path, POLICY_PATH_NONE),
+                evaluated_policy_path)
+            request_policy_path = torch.where(
+                option_start,
+                evaluated_policy_path,
+                torch.where(
+                    option_continue,
+                    self.active_option_policy_path,
+                    torch.full_like(
+                        evaluated_policy_path,
+                        POLICY_PATH_NONE)))
+            request_planner_override = torch.where(
+                option_start,
+                evaluated_planner_override,
+                torch.where(
+                    option_continue,
+                    self.active_option_planner_override,
+                    torch.zeros_like(evaluated_planner_override)))
+            request_motion = (
+                ~help_requested
+                & ~temporal_decision.hold_requested
+                & ~motor_stop_event)
+            request_active = (
+                temporal_decision.selected_target.active
+                & request_motion.unsqueeze(-1))
+            request_values = torch.where(
+                request_motion.unsqueeze(-1),
+                temporal_decision.selected_target.values,
+                torch.zeros_like(temporal_decision.selected_target.values))
+            request_target = PackedEndEffectorTarget(
+                values=request_values,
+                active=request_active,
+                contract_id=self.robot_contract_view.contract_id,
+                model_signature=self.robot_contract_view.model_signature,
+                target_version=torch.where(
+                    help_requested,
+                    feedback_packet.applied_target_version.clamp_min(0) + 1,
+                    temporal_decision.selected_target.target_version),
+                timestamp=feedback_packet.timestamp)
+            action_request = ActionRequest(
+                request_id=self.ContractNextRequestId.detach().clone(),
+                action_epoch=request_action_epoch,
+                target=request_target,
+                command_active=request_active.any(dim=-1),
+                hold_requested=(
+                    temporal_decision.hold_requested
+                    & ~help_requested
+                    & ~motor_stop_event),
+                stop_requested=(
+                    temporal_decision.stop_requested
+                    | help_requested
+                    | motor_stop_event),
+                help_requested=help_requested,
+                policy_path=request_policy_path,
+                planner_override=request_planner_override,
+                temporal_kind_id=temporal_decision.kind_id,
+                timestamp=feedback_packet.timestamp)
+            action_request.Validate(self.robot_contract_view)
+            self.pending_option_policy_input = torch.where(
+                option_start.unsqueeze(-1),
+                base_act_out["option"]["policy_input"].detach(),
+                torch.zeros_like(
+                    self.pending_option_policy_input)).detach()
+            self.pending_option_prior_logit = torch.where(
+                option_start.unsqueeze(-1),
+                base_act_out["option"]["prior_logits"].detach(),
+                torch.zeros_like(
+                    self.pending_option_prior_logit)).detach()
+            self.pending_option_goal_mid = torch.where(
+                option_start.unsqueeze(-1),
+                goals["g_mid"].detach(),
+                torch.zeros_like(
+                    self.pending_option_goal_mid)).detach()
+            self.pending_option_index = torch.where(
+                option_start,
+                base_act_out["option"]["opt_idx"].detach(),
+                torch.zeros_like(self.pending_option_index)).detach()
+            self.pending_option_action_epoch = torch.where(
+                option_start,
+                request_action_epoch.detach(),
+                torch.zeros_like(
+                    self.pending_option_action_epoch)).detach()
+            self.pending_option_request_values = torch.where(
+                option_start.unsqueeze(-1),
+                request_target.values.detach(),
+                torch.zeros_like(
+                    self.pending_option_request_values)).detach()
+            self.pending_option_request_active = torch.where(
+                option_start.unsqueeze(-1),
+                request_target.active.detach(),
+                torch.zeros_like(
+                    self.pending_option_request_active)).detach()
+            self.pending_option_request_version = torch.where(
+                option_start,
+                request_target.target_version.detach(),
+                torch.full_like(
+                    self.pending_option_request_version,
+                    -1)).detach()
+            self.pending_option_policy_path = torch.where(
+                option_start,
+                request_policy_path.detach(),
+                torch.full_like(
+                    self.pending_option_policy_path,
+                    POLICY_PATH_NONE)).detach()
+            self.pending_option_planner_override = torch.where(
+                option_start,
+                request_planner_override.detach(),
+                torch.zeros_like(
+                    self.pending_option_planner_override)).detach()
+            self.pending_option_help_requested = (
+                option_start & help_requested).detach()
+            self.pending_option_eligibility_pre = torch.where(
+                option_start.unsqueeze(-1),
+                act_out["eligibility"]["pre"].detach(),
+                torch.zeros_like(
+                    self.pending_option_eligibility_pre)).detach()
+            self.pending_option_eligibility_post = torch.where(
+                option_start.unsqueeze(-1),
+                act_out["eligibility"]["post"].detach(),
+                torch.zeros_like(
+                    self.pending_option_eligibility_post)).detach()
+            self.pending_option_eligibility_update = (
+                option_start & full_decision_mask).detach()
+            self.pending_option_valid = option_start.detach()
+            policy_conditioning = actor.StorePolicyConditioning(
+                base_act_out)
+            policy_snapshot = self.DetachRuntimeObject({
+                "policyPath": evaluated_policy_path,
+                "cachedDecisionFeature": recalled_feature,
+                "detailGoalFeature": goals["goal_decision"],
+                "stateFeat": mem_feat,
+                "intentFeat": intent_sem,
+                "valueTensor": critic_out.value,
+                "vNextTensor": critic_out.valueNext,
+                "uncertainty": uncertainty,
+                "confidence": confidence,
+                "precision": precision,
+                "risk": risk,
+                "worldHzx": world_hzx,
+                "prevFullDecisionState": self.prev_decision_state,
+                "prevFastDecisionState": self.prev_fast_decision_state,
+                "prevDetailDecisionState": self.prev_detail_decision_state,
+                "prevFullLatentControl": self.prev_latent_control,
+                "prevFastLatentControl": self.prev_fast_latent_control,
+                "prevDetailLatentControl": self.prev_detail_latent_control,
+                "prevActionEmbed": realized_action,
+                "prevFullMapperHidden": self.prev_mapper_hidden,
+                "prevFastMapperHidden": self.prev_fast_mapper_hidden,
+                "prevDetailMapperHidden": self.prev_detail_mapper_hidden,
+                "feedbackTdError": feedback_td_error,
+                "prevFullOptionLogit": (
+                    self.prev_option_logit + skill_option_prior_bias),
+                "prevFastOptionLogit": (
+                    self.prev_fast_option_logit + skill_option_prior_bias),
+                "prevDetailOptionLogit": (
+                    self.prev_detail_option_logit + skill_option_prior_bias),
+                "uRaw": base_act_out["uRaw"],
+                "optionIndex": base_act_out["optionIndex"],
+                "eligibilityState": eligibility_state_before,
+                "eligibilityFrozen": eligibility_frozen_before,
+            }, clone=True)
+            value_conditioning = self.RuntimeModule(
+                self.critic).StoreValueConditioning(critic_out)
+            actor_credit_mask = (
+                option_start
+                & ~request_planner_override
+                & ~motor_stop_event)
+            cognitive_readout = CognitiveReadout(
+                schema_version=COGNITIVE_READOUT_SCHEMA_VERSION,
+                model_signature=self.model_signature,
+                contract_id=self.robot_contract_view.contract_id,
+                request_id=action_request.request_id.detach().clone(),
+                timestamp=feedback_packet.timestamp.detach().clone(),
+                row_valid=torch.ones_like(done_event),
+                intention_feature=intent_sem.detach().clone(),
+                intention_valid=self.ContractSlowCacheValid.detach().clone(),
+                intention_age=torch.where(
+                    slow_refresh_mask,
+                    torch.zeros_like(self.ContractSlowCacheAge),
+                    self.ContractSlowCacheAge).detach().clone(),
+                world_belief_feature=world_hzx.detach().clone(),
+                world_belief_valid=torch.ones_like(done_event),
+                world_belief_age=torch.zeros_like(
+                    feedback_packet.timestamp),
+                sensorimotor_evidence=sensorimotor_evidence.detach().clone(),
+                sensorimotor_valid=sensorimotor_valid.detach().clone(),
+                sensorimotor_age=feedback_packet.observation_age.max(
+                    dim=-1).values.detach().clone(),
+                decision_feature=selected_decision_feature.detach().clone(),
+                decision_valid=(~motor_stop_event).detach().clone(),
+                decision_age=torch.zeros_like(feedback_packet.timestamp),
+                compute_mode=compute_decision.mode.detach().clone(),
+                policy_path=request_policy_path.detach().clone(),
+                planner_override=request_planner_override.detach().clone(),
+                option_id=self.active_option_index.detach().clone(),
+                option_valid=self.active_option_valid.detach().clone(),
+                temporal_kind_id=temporal_decision.kind_id.detach().clone())
+            cognitive_readout.Validate(self.brain_build_spec)
+            act_out["policy_path"] = request_policy_path
+            act_out["evaluated_policy_path"] = evaluated_policy_path
+            act_out["planner_override"] = request_planner_override
+            act_out["behavior_log_probability"] = base_act_out[
+                "combinedActionLogProbability"]
+            act_out["policy_conditioning"] = policy_conditioning
+            act_out["policy_snapshot"] = policy_snapshot
+            act_out["value_baseline"] = critic_out.returnValue
+            act_out["value_conditioning"] = value_conditioning
+            act_out["actor_credit_mask"] = actor_credit_mask
+            act_out["action_request"] = action_request
+            act_out["cognitive_readout"] = cognitive_readout
+            self.ContractNextRequestId = (
+                self.ContractNextRequestId + 1).detach().clone()
             SaveModuleOutput("Decision", act_out)
 
+            applied_target = self.BuildAppliedTarget(feedback_packet)
+            knownActionSlots = (
+                feedback_packet.applied_target_active
+                & feedback_packet.execution_relevant
+                & feedback_packet.execution_known)
             selected_efference = (
                 self.packed_decision_decoupler
                 .DecodePerceptionRotationEfference(
-                    temporal_decision.selected_target,
-                    feedback_packet))
+                    applied_target,
+                    feedback_packet,
+                    activeMask=knownActionSlots))
             prospective_rotation, prospective_rotation_valid = (
                 self.SelectContractPerceptionRotation(
                     feedback_packet,
                     rotationDelta=selected_efference.rotation_delta,
                     rotationPresent=selected_efference.present))
-            cached_world_action = self.packed_decision_decoupler.EncodeWorldAction(
-                cached_target)
-            prospective_action = torch.where(
-                temporal_decision.candidate_selected.unsqueeze(-1),
-                packed_decision.world_action_feature,
-                torch.where(
-                    temporal_decision.cache_selected.unsqueeze(-1),
-                    cached_world_action,
-                    torch.zeros_like(packed_decision.world_action_feature)))
+            prospective_action = (
+                self.packed_decision_decoupler.EncodeWorldAction(
+                    applied_target,
+                    activeMask=knownActionSlots))
             prospective_visual_prediction = (
                 world.PredictNextVisualFromPosterior(
                     w_out["h_next"].detach(),
@@ -5828,7 +6125,7 @@ class BrainCore(nn.Module):
 
             losses: Dict[str, torch.Tensor] = {}
             if step.is_train:
-                loss_sample_mask = ~failsafe_event
+                loss_sample_mask = torch.ones_like(failsafe_event)
                 loss_row_index = loss_sample_mask.nonzero(
                     as_tuple=False).flatten()
                 world_loss = w_out["loss"]
@@ -5906,31 +6203,6 @@ class BrainCore(nn.Module):
                 prediction_error_loss = (
                     prediction_error_per_row * prediction_error_weight
                 ).sum() / prediction_error_weight.sum().clamp_min(1.0)
-                detail_distill_per_row = F.smooth_l1_loss(
-                    attention_extras["local_detail_readout"],
-                    attention_extras["full_temporal_readout"].detach(),
-                    reduction="none").mean(dim=-1)
-                detail_distill_weight = (
-                    local_detail.any(dim=-1)
-                    & ~stopped_rows).to(dtype=dtype)
-                attention_detail_distill_loss = (
-                    detail_distill_per_row * detail_distill_weight
-                ).sum() / detail_distill_weight.sum().clamp_min(1.0)
-                attention_module = self.RuntimeModule(self.attn)
-                fast_attention_distill_loss = (
-                    attention_module.StudentDistillationLoss(
-                        attention_extras["fast_student_attention"],
-                        atten_out,
-                        compute_decision.mode.eq(
-                            int(CognitiveComputeMode.FAST_EXECUTE))
-                        & ~stopped_rows))
-                detail_attention_distill_loss = (
-                    attention_module.StudentDistillationLoss(
-                        attention_extras["detail_student_attention"],
-                        atten_out,
-                        compute_decision.mode.eq(
-                            int(CognitiveComputeMode.DETAIL_EXECUTE))
-                        & ~stopped_rows))
                 world_prediction_loss = world_loss.new_zeros(())
                 world_prediction_losses: Dict[str, torch.Tensor] = {}
                 alive_prediction_mask = (
@@ -5948,7 +6220,7 @@ class BrainCore(nn.Module):
                             self.prev_world_z,
                             self.prev_world_x,
                             physicalState=previous_physical_state,
-                            actionEnc=realized_action,
+                            actionEnc=world_transition_action,
                             embodimentState=previous_embodiment_state,
                             observerMotion=rotation_delta,
                             observerMotionValid=rotation_valid,
@@ -5970,27 +6242,8 @@ class BrainCore(nn.Module):
                 credited_goal_progress = self.goal_manager.ProjectedProgress(
                     world_delta,
                     credit_option_goal_mid)
-                realized_information_gain = information_gain.detach()
-                credited_advantage = (
-                    return_advantage
-                    + 0.1 * credited_goal_progress
-                    + 0.05 * realized_information_gain).detach()
-                credit_option_weight = credit_option_valid.to(dtype=dtype)
-                actor_learning_mask = ~stopped_rows
-                actor_learning_weight = actor_learning_mask.to(dtype=dtype)
-                actor_loss = -1e-3 * (
-                    base_act_out["entropy"] * actor_learning_weight
-                ).sum() / actor_learning_weight.sum().clamp_min(1.0)
-                if bool(credit_option_valid.any().item()):
-                    credited_log_probability = actor.OptionLogProb(
-                        credit_option_policy_input,
-                        credit_option_prior_logit,
-                        credit_option_index)
-                    actor_loss = actor_loss - (
-                        credited_advantage
-                        * credited_log_probability
-                        * credit_option_weight
-                    ).sum() / credit_option_weight.sum()
+                actor_learning_mask = ~done_event
+                actor_loss = world_loss.new_zeros(())
                 goal_progress_weight = (
                     credit_option_valid
                     & ~self.prev_done_flag).to(dtype=dtype)
@@ -6012,49 +6265,6 @@ class BrainCore(nn.Module):
                     decision_prediction_loss = (
                         prediction_per_row * prediction_weight
                     ).sum() / prediction_weight.sum()
-                fast_distillation = actor.FastDistillationLoss(
-                    fast_student_out,
-                    act_out,
-                    compute_decision.mode.eq(
-                        int(CognitiveComputeMode.FAST_EXECUTE))
-                    & ~stopped_rows)
-                detail_distillation = actor.FastDistillationLoss(
-                    detail_student_out,
-                    act_out,
-                    compute_decision.mode.eq(
-                        int(CognitiveComputeMode.DETAIL_EXECUTE))
-                    & ~stopped_rows)
-                fast_decision_distill_loss = fast_distillation["total"]
-                detail_decision_distill_loss = detail_distillation["total"]
-                planner_distill_loss = world_loss.new_zeros(())
-                decision_energy_loss = world_loss.new_zeros(())
-                if planner_prior is not None and self.planner_teacher_mode:
-                    stable = (
-                        compute_decision.mode.eq(
-                            int(CognitiveComputeMode.FAST_EXECUTE))
-                        & ~stopped_rows
-                        & planner_valid_mask).to(dtype=dtype)
-                    convergence = torch.exp(
-                        -planner_prior["diagnostics"]["std"].detach().mean(
-                            dim=-1))
-                    weight = (
-                        stable
-                        * precision.detach()
-                        * (1.0 - risk.detach())
-                        * convergence)
-                    if bool((weight > 0.0).any().item()):
-                        distill = F.smooth_l1_loss(
-                            network_decision_feature,
-                            planner_prior["decision_feature"].detach(),
-                            reduction="none").mean(dim=-1)
-                        planner_distill_loss = (
-                            distill * weight).sum() / weight.sum()
-                        energy = F.smooth_l1_loss(
-                            act_out["decision_energy"],
-                            -planner_prior["expected_return"].detach(),
-                            reduction="none")
-                        decision_energy_loss = (
-                            energy * weight).sum() / weight.sum()
                 symbolic_target = self.RuntimeModule(
                     self.contract_neuro_symbolic).InvocationNeedTarget(
                         torch.maximum(
@@ -6110,8 +6320,9 @@ class BrainCore(nn.Module):
                     dtype=dtype).unsqueeze(0)
                 valid_progress = (
                     feedback_packet.endpoint_present
-                    & feedback_packet.target_active
-                    & feedback_packet.child_enabled).to(dtype=dtype)
+                    & feedback_packet.applied_target_active
+                    & feedback_packet.phase_enabled
+                    & feedback_packet.phase_known).to(dtype=dtype)
                 coarse_weight = valid_progress * root_mask
                 detail_weight = valid_progress * detail_mask
                 coarse_progress = (
@@ -6121,7 +6332,8 @@ class BrainCore(nn.Module):
                     feedback_packet.progress * detail_weight
                 ).sum(dim=-1) / detail_weight.sum(dim=-1).clamp_min(1.0)
                 enabled_weight = (
-                    feedback_packet.child_enabled
+                    feedback_packet.phase_enabled
+                    & feedback_packet.phase_known
                     & feedback_packet.endpoint_present).to(dtype=dtype)
                 coarse_supervision = coarse_weight.sum(dim=-1).gt(0.0).to(
                     dtype=dtype) * loss_sample_mask.to(dtype=dtype)
@@ -6252,9 +6464,12 @@ class BrainCore(nn.Module):
                     compute_decision.mode.eq(
                         int(CognitiveComputeMode.DETAIL_EXECUTE))
                     & ~stopped_rows,
-                    compute_decision.mode.eq(
-                        int(CognitiveComputeMode.FULL_REPLAN))
-                    & ~stopped_rows,
+                    (
+                        compute_decision.mode.eq(
+                            int(CognitiveComputeMode.FULL_REPLAN))
+                        | compute_decision.mode.eq(
+                            int(CognitiveComputeMode.FAILSAFE))
+                    ) & ~stopped_rows,
                     selected_planner_mask,
                     stopped_rows)
                 compute_cost_per_row = F.smooth_l1_loss(
@@ -6332,7 +6547,7 @@ class BrainCore(nn.Module):
                 if action_learning_rows.numel() > 0:
                     continuation_supervision = (
                         option_continue
-                        & target_matches
+                        & physical_request_continued
                         & cache_executing)
                     constraint_losses = (
                         self.packed_decision_decoupler.TrainingConstraintLoss(
@@ -6373,8 +6588,6 @@ class BrainCore(nn.Module):
                     + 0.05 * target_continuity_loss
                     + 0.05 * goal_progress_loss
                     + 0.05 * decision_prediction_loss
-                    + 0.05 * fast_decision_distill_loss
-                    + 0.05 * detail_decision_distill_loss
                     + 0.5 * temporal_kind_loss
                     + 0.05 * temporal_duration_loss)
                 world_optimization_loss = (
@@ -6393,12 +6606,7 @@ class BrainCore(nn.Module):
                     + intention_loss
                     + 0.05 * perception_loss
                     + 0.05 * prediction_error_loss
-                    + 0.05 * attention_detail_distill_loss
-                    + 0.05 * fast_attention_distill_loss
-                    + 0.05 * detail_attention_distill_loss
                     + 0.1 * actor_loss
-                    + planner_distill_loss
-                    + 0.05 * decision_energy_loss
                     + policy_auxiliary_loss
                     + physical_loss)
                 total_loss = (
@@ -6415,23 +6623,11 @@ class BrainCore(nn.Module):
                     "conscious_loss": conscious_loss,
                     "intention_loss": intention_loss,
                     "perception_loss": perception_loss,
-                    "attention_detail_distill_loss": (
-                        attention_detail_distill_loss),
-                    "fast_attention_distill_loss": (
-                        fast_attention_distill_loss),
-                    "detail_attention_distill_loss": (
-                        detail_attention_distill_loss),
                     "world_prediction_loss": world_prediction_loss,
                     "prediction_error_loss": prediction_error_loss,
                     "actor_loss": actor_loss,
                     "goal_progress_loss": goal_progress_loss,
                     "decision_prediction_loss": decision_prediction_loss,
-                    "fast_decision_distill_loss": (
-                        fast_decision_distill_loss),
-                    "detail_decision_distill_loss": (
-                        detail_decision_distill_loss),
-                    "planner_distill_loss": planner_distill_loss,
-                    "decision_energy_loss": decision_energy_loss,
                     "symbolic_invocation_loss": symbolic_invocation_loss,
                     "symbolic_sparsity_loss": symbolic_sparsity_loss,
                     "grounding_loss": grounding_loss,
@@ -6478,7 +6674,7 @@ class BrainCore(nn.Module):
                     for name, value in world_prediction_losses.items()})
                 SaveModuleOutput("Losses", losses)
 
-            self.mem.AgePlanCache(ageMask=~failsafe_event)
+            self.mem.AgePlanCache(ageMask=~stopped_event)
             if bool(temporal_decision.candidate_selected.any().item()):
                 self.mem.CachePlan(
                     "activePlan",
@@ -6538,8 +6734,9 @@ class BrainCore(nn.Module):
                     dtype=dtype).unsqueeze(0)
                 hierarchy_valid = (
                     feedback_packet.endpoint_present
-                    & feedback_packet.target_active
-                    & feedback_packet.child_enabled).to(dtype=dtype)
+                    & feedback_packet.applied_target_active
+                    & feedback_packet.phase_enabled
+                    & feedback_packet.phase_known).to(dtype=dtype)
                 hierarchy_coarse_weight = hierarchy_valid * hierarchy_root
                 hierarchy_detail_weight = hierarchy_valid * hierarchy_child
                 hierarchy_coarse_progress = (
@@ -6573,31 +6770,31 @@ class BrainCore(nn.Module):
             self.prev_mem = self.PreserveRuntimeStateRows(
                 mem_feat.detach(),
                 self.prev_mem,
-                failsafe_event).clone() # [B, D_mem]
+                stopped_event).clone() # [B, D_mem]
             self.prev_attn = self.PreserveRuntimeStateRows(
                 atten_out.detach(),
                 self.prev_attn,
-                failsafe_event).clone() # [B, D_attn]
+                stopped_event).clone() # [B, D_attn]
             self.prev_world_h = self.PreserveRuntimeStateRows(
                 w_out["h_next"].detach(),
                 self.prev_world_h,
-                failsafe_event).clone() # [B, D_world_h]
+                stopped_event).clone() # [B, D_world_h]
             self.prev_world_z = self.PreserveRuntimeStateRows(
                 w_out["z_next"].detach(),
                 self.prev_world_z,
-                failsafe_event).clone() # [B, D_world_z] (PST-conditioned stochastic latent)
+                stopped_event).clone() # [B, D_world_z] (PST-conditioned stochastic latent)
             self.prev_world_x = self.PreserveRuntimeStateRows(
                 w_out["x_next"].detach(),
                 self.prev_world_x,
-                failsafe_event).clone() # [B, D_world_x]
+                stopped_event).clone() # [B, D_world_x]
             self.prev_world_s = self.PreserveRuntimeStateRows(
                 w_out["s_next"].detach(),
                 self.prev_world_s,
-                failsafe_event).clone()
+                stopped_event).clone()
             self.prev_world_embodiment = self.PreserveRuntimeStateRows(
                 world_embodiment_state.detach(),
                 self.prev_world_embodiment,
-                failsafe_event).clone()
+                stopped_event).clone()
             self.prev_entropy = self.ScheduleExecutedState(
                 act_out["entropy"].detach(),
                 self.prev_entropy,
@@ -6671,42 +6868,42 @@ class BrainCore(nn.Module):
             self.prev_world_surprise = self.PreserveRuntimeStateRows(
                 world_surprise.detach(),
                 self.prev_world_surprise,
-                failsafe_event).clone()
+                stopped_event).clone()
             self.prev_novelty = task_relevant_novelty.detach().clone()
             self.prev_information_gain = self.PreserveRuntimeStateRows(
                 information_gain.detach(),
                 self.prev_information_gain,
-                failsafe_event).clone()
+                stopped_event).clone()
             self.prev_evc = self.PreserveRuntimeStateRows(
                 (prospective_value.replanBenefit
                  - prospective_value.computeCost).detach(),
                 self.prev_evc,
-                failsafe_event).clone()
+                stopped_event).clone()
             self.prev_intent_changed = (
                 confirmed_intent_event.detach().clone())
             self.prev_goal_changed = goal_changed.detach().clone()
             self.prev_goal_bias = self.PreserveRuntimeStateRows(
                 intent_sem.detach(),
                 self.prev_goal_bias,
-                failsafe_event).clone()
+                stopped_event).clone()
             self.prev_attention_goal = self.PreserveRuntimeStateRows(
                 goals["g_short"].detach(),
                 self.prev_attention_goal,
-                failsafe_event).clone()
+                stopped_event).clone()
             self.prev_self_sem = self.PreserveRuntimeStateRows(
                 conscious_out.self_sem.detach(),
                 self.prev_self_sem,
-                failsafe_event).clone()
+                stopped_event).clone()
             self.prev_intent_sem = self.PreserveRuntimeStateRows(
                 intent_sem.detach(),
                 self.prev_intent_sem,
-                failsafe_event).clone()
+                stopped_event).clone()
             self.prev_failure_count = (
                 self.prev_failure_count
                 + planner_failed.to(dtype=dtype)) * (
                     ~planner_reached).to(dtype=dtype)
             active_world_rows = torch.nonzero(
-                ~failsafe_event,
+                ~stopped_event,
                 as_tuple=False).flatten()
             active_prospective_visual = self.IndexRuntimeRows(
                 prospective_visual_prediction,
@@ -6721,60 +6918,52 @@ class BrainCore(nn.Module):
             self.ContractObserverRotationGauge = self.PreserveRuntimeStateRows(
                 current_rotation.detach(),
                 self.ContractObserverRotationGauge,
-                failsafe_event).clone()
+                stopped_event).clone()
             self.ContractPreviousTargetActive = (
-                feedback_packet.target_active.detach().clone())
+                feedback_packet.applied_target_active.detach().clone())
             self.ContractPreviousProgress = (
                 feedback_packet.progress.detach().clone())
             self.ContractPreviousTextFingerprint = (
                 torch.where(
-                    failsafe_event,
+                    stopped_event,
                     self.ContractPreviousTextFingerprint,
                     text_fingerprint).detach().clone())
             self.ContractPreviousCommandFingerprint = torch.where(
-                failsafe_event,
+                stopped_event,
                 self.ContractPreviousCommandFingerprint,
                 command_fingerprint).detach().clone()
             self.ContractCommandVersion = torch.where(
-                failsafe_event,
+                stopped_event,
                 self.ContractCommandVersion,
                 command_version).detach().clone()
             self.ContractPreviousGoalCode = self.PreserveRuntimeStateRows(
                 goal_code.detach(),
                 self.ContractPreviousGoalCode,
-                failsafe_event).clone()
+                stopped_event).clone()
             self.ContractPreviousReferenceIndex = (
                 self.PreserveRuntimeStateRows(
                     reference_index.detach(),
                     self.ContractPreviousReferenceIndex,
-                    failsafe_event).clone())
+                    stopped_event).clone())
             self.prev_done_flag = torch.where(
-                failsafe_event,
+                stopped_event,
                 self.prev_done_flag | done_event,
                 done_event).detach().clone()
 
             done_now = done_event
-            cached_values = temporal_decision.selected_target.values.detach().clone()
-            cached_active = temporal_decision.selected_target.active.detach().clone()
-            cached_values[done_now] = 0.0
-            cached_active[done_now] = False
-            cached_version = temporal_decision.selected_target.target_version.detach().clone()
-            cached_timestamp = temporal_decision.selected_target.timestamp.detach().clone()
-            cached_version[done_now] = 0
-            cached_timestamp[done_now] = 0.0
-            self.ContractCachedTarget = PackedEndEffectorTarget(
-                values=cached_values,
-                active=cached_active,
-                contract_id=self.robot_contract_view.contract_id,
-                model_signature=self.robot_contract_view.model_signature,
-                target_version=cached_version,
-                timestamp=cached_timestamp)
-            self.ContractCachedActionEpoch = torch.where(
-                done_now,
-                torch.zeros_like(temporal_decision.action_epoch),
-                temporal_decision.action_epoch.detach()).clone()
+            applied_changed = (
+                feedback_packet.applied_target_version.ne(
+                    self.ContractPreviousAppliedVersion)
+                | feedback_packet.applied_action_epoch.ne(
+                    self.ContractPreviousAppliedActionEpoch))
+            self.ContractPreviousAppliedVersion = (
+                feedback_packet.applied_target_version.detach().clone())
+            self.ContractPreviousAppliedActionEpoch = (
+                feedback_packet.applied_action_epoch.detach().clone())
             self.ContractCacheAge = torch.where(
-                done_now | temporal_decision.candidate_selected,
+                done_now
+                | applied_changed
+                | ~feedback_packet.applied_target_active.any(dim=-1),
                 torch.zeros_like(self.ContractCacheAge),
                 self.ContractCacheAge + 1.0)
             advanced_slow_cache_age = torch.where(
@@ -6785,7 +6974,7 @@ class BrainCore(nn.Module):
                 done_now,
                 torch.zeros_like(self.ContractSlowCacheAge),
                 torch.where(
-                    failsafe_event,
+                    stopped_event,
                     self.ContractSlowCacheAge,
                     advanced_slow_cache_age))
             if bool(done_now.any().item()):
@@ -6807,12 +6996,26 @@ class BrainCore(nn.Module):
                 world.ResetEpisodeState(done_now)
 
             return BrainStepOutput(
+                action_request=action_request,
+                cognitive_readout=cognitive_readout,
                 decision={
                     "decision_feature": selected_decision_feature,
                     "candidate_packed_decision": packed_decision,
-                    "packed_target": temporal_decision.selected_target,
+                    "packed_target": action_request.target,
                     "packed_temporal": temporal_decision,
                     "planner_prior": planner_prior,
+                    "action_request": action_request,
+                    "cognitive_readout": cognitive_readout,
+                    "policy_path": request_policy_path,
+                    "evaluated_policy_path": evaluated_policy_path,
+                    "planner_override": request_planner_override,
+                    "behavior_log_probability": base_act_out[
+                        "combinedActionLogProbability"],
+                    "policy_conditioning": policy_conditioning,
+                    "policy_snapshot": policy_snapshot,
+                    "value_baseline": critic_out.returnValue,
+                    "value_conditioning": value_conditioning,
+                    "actor_credit_mask": actor_credit_mask,
                 },
                 world=w_out,
                 critic=critic_out,
@@ -6857,6 +7060,7 @@ class BrainCore(nn.Module):
                         if self.planner is not None
                         else torch.zeros_like(planner_mask)),
                     "PlanCacheReused": plan_cache_reused,
+                    "MotorStoppedRows": motor_stop_event,
                     "StoppedRows": stopped_rows,
                 })
 
@@ -6884,8 +7088,31 @@ class BrainCore(nn.Module):
                 "active_option_policy_input",
                 "active_option_prior_logit",
                 "active_option_goal_mid",
+                "active_option_action_epoch",
+                "active_option_request_values",
+                "active_option_request_active",
+                "active_option_request_version",
+                "active_option_policy_path",
+                "active_option_planner_override",
+                "active_option_help_requested",
+                "active_option_eligibility_valid",
                 "active_option_index",
                 "active_option_valid",
+                "pending_option_policy_input",
+                "pending_option_prior_logit",
+                "pending_option_goal_mid",
+                "pending_option_action_epoch",
+                "pending_option_request_values",
+                "pending_option_request_active",
+                "pending_option_request_version",
+                "pending_option_policy_path",
+                "pending_option_planner_override",
+                "pending_option_help_requested",
+                "pending_option_eligibility_pre",
+                "pending_option_eligibility_post",
+                "pending_option_eligibility_update",
+                "pending_option_index",
+                "pending_option_valid",
                 "prev_decision_state",
                 "prev_fast_decision_state",
                 "prev_detail_decision_state",
@@ -6912,7 +7139,9 @@ class BrainCore(nn.Module):
                 "prev_evc",
                 "prev_intent_changed",
                 "prev_goal_changed",
-                "ContractCachedActionEpoch",
+                "ContractPreviousAppliedVersion",
+                "ContractPreviousAppliedActionEpoch",
+                "ContractNextRequestId",
                 "ContractObserverRotationGauge",
                 "ContractCacheAge",
                 "ContractSlowCacheAge",
@@ -7005,9 +7234,6 @@ class BrainCore(nn.Module):
                     self.actor).ExportEligibilityState(),
                 "consciousness": conscious,
                 "plan": self.contract_neuro_symbolic.ExportPlanState(),
-                "cached_target": self.DetachRuntimeObject(
-                    self.ContractCachedTarget,
-                    clone=True),
                 "commitment": self.DetachRuntimeObject(
                     self.ContractIntentionCommitmentState,
                     clone=True),
@@ -7036,9 +7262,17 @@ class BrainCore(nn.Module):
                 "prospective_visual": self.DetachRuntimeObject(
                     self.prospective_visual_prediction,
                     clone=True),
-                "compute_previous": (
-                    self.cognitive_compute_gate.PreviousChildEnabled
-                    .detach().clone()),
+                "compute_gate": {
+                    "phase": (
+                        self.cognitive_compute_gate.PreviousPhaseEnabled
+                        .detach().clone()),
+                    "observation": (
+                        self.cognitive_compute_gate.PreviousObservationPresent
+                        .detach().clone()),
+                    "refresh_age": (
+                        self.cognitive_compute_gate.PreviousMissingRefreshAge
+                        .detach().clone()),
+                },
                 "ocr": {
                     "temporal_step": int(self.OCR._temporal_step),
                     "last_batch_size": int(self.OCR._last_batch_size),
@@ -7441,36 +7675,6 @@ class BrainCore(nn.Module):
                     or not bool(torch.isfinite(value).all().item())
                 ):
                     raise ValueError(path + ".Auxiliary." + name + " is invalid")
-
-    def ValidateCachedTargetRuntimeState(
-            self,
-            target: Any,
-            batchSize: int,
-            device: torch.device,
-            dtype: torch.dtype,
-        ) -> None:
-            if target is None:
-                return
-            if type(target) is not PackedEndEffectorTarget:
-                raise TypeError(
-                    "brain cached target must be PackedEndEffectorTarget")
-            self.ValidateBatchedTensor(
-                target.values,
-                batchSize,
-                device,
-                dtype,
-                "brain cached target values",
-                trailingShape=(
-                    self.robot_contract_view.end_effector_target_layout.PackedDim,))
-            self.ValidateBatchedTensor(
-                target.active,
-                batchSize,
-                device,
-                dtype,
-                "brain cached target activity",
-                trailingShape=(self.robot_contract_view.end_effector_count,),
-                expectedDtype=torch.bool)
-            target.Validate(self.robot_contract_view)
 
     def ValidateCommitmentRuntimeState(
             self,
@@ -8269,7 +8473,6 @@ class BrainCore(nn.Module):
                 "decision_eligibility",
                 "consciousness",
                 "plan",
-                "cached_target",
                 "commitment",
                 "slow_cache",
                 "replay_history",
@@ -8280,7 +8483,7 @@ class BrainCore(nn.Module):
                 "visual_valid_buffer",
                 "perception_buffer",
                 "prospective_visual",
-                "compute_previous",
+                "compute_gate",
                 "ocr",
             }
             if type(cognitive) is not dict or set(cognitive) != expected_cognitive:
@@ -8400,15 +8603,22 @@ class BrainCore(nn.Module):
                         and not bool(torch.isfinite(value).all().item()))
                 ):
                     raise ValueError("brain plan runtime state is invalid")
-            compute_previous = cognitive["compute_previous"]
+            compute_gate = cognitive["compute_gate"]
             if (
-                not torch.is_tensor(compute_previous)
-                or tuple(compute_previous.shape) != (
+                type(compute_gate) is not dict
+                or set(compute_gate) != {"phase", "observation", "refresh_age"}
+                or not torch.is_tensor(compute_gate["phase"])
+                or tuple(compute_gate["phase"].shape) != (
                     int(batchSize),
                     self.robot_contract_view.end_effector_count)
-                or compute_previous.dtype != torch.bool
-                or compute_previous.device
-                != self.cognitive_compute_gate.PreviousChildEnabled.device
+                or compute_gate["phase"].dtype != torch.bool
+                or not torch.is_tensor(compute_gate["observation"])
+                or compute_gate["observation"].shape != compute_gate["phase"].shape
+                or compute_gate["observation"].dtype != torch.bool
+                or not torch.is_tensor(compute_gate["refresh_age"])
+                or tuple(compute_gate["refresh_age"].shape) != (int(batchSize),)
+                or not compute_gate["refresh_age"].is_floating_point()
+                or not bool(torch.isfinite(compute_gate["refresh_age"]).all().item())
             ):
                 raise ValueError("brain compute-gate runtime state is invalid")
             replay_history = cognitive["replay_history"]
@@ -8483,11 +8693,6 @@ class BrainCore(nn.Module):
                         visual_state.IntegratedFeat)
                 ):
                     raise ValueError("brain visual runtime state is invalid")
-            self.ValidateCachedTargetRuntimeState(
-                cognitive["cached_target"],
-                batchSize,
-                device,
-                dtype)
             commitment = cognitive["commitment"]
             self.ValidateCommitmentRuntimeState(
                 commitment,
@@ -8540,7 +8745,6 @@ class BrainCore(nn.Module):
                 setattr(self.conscious, name, value)
             self.contract_neuro_symbolic.ImportPlanState(
                 cognitive["plan"])
-            self.ContractCachedTarget = cognitive["cached_target"]
             self.ContractIntentionCommitmentState = cognitive["commitment"]
             self.ContractSlowCognitiveCache = cognitive["slow_cache"]
             replay_history = cognitive["replay_history"]
@@ -8556,8 +8760,13 @@ class BrainCore(nn.Module):
             self.perc_buffer = cognitive["perception_buffer"]
             self.prospective_visual_prediction = cognitive[
                 "prospective_visual"]
-            self.cognitive_compute_gate.PreviousChildEnabled = cognitive[
-                "compute_previous"]
+            compute_gate = cognitive["compute_gate"]
+            self.cognitive_compute_gate.PreviousPhaseEnabled = compute_gate[
+                "phase"]
+            self.cognitive_compute_gate.PreviousObservationPresent = compute_gate[
+                "observation"]
+            self.cognitive_compute_gate.PreviousMissingRefreshAge = compute_gate[
+                "refresh_age"]
             ocr = cognitive["ocr"]
             self.OCR._temporal_step = int(ocr["temporal_step"])
             self.OCR._last_batch_size = int(ocr["last_batch_size"])
@@ -8653,6 +8862,7 @@ class Agent:
             "contract_physical_adapter",
             "contract_joint_motion_action_adapter",
             "contract_action_agency_encoder",
+            "contract_sensorimotor_consistency_encoder",
             "contract_layer_agency_fuser",
             "contract_entity_summary_fuser",
             "world_abstract_decision_adapter",
@@ -8684,6 +8894,7 @@ class Agent:
         seen = {id(parameter) for parameter in parameters}
         for name in (
             "contract_action_agency_gain",
+            "contract_sensorimotor_consistency_gain",
             "contract_layer_agency_gain",
             "contract_entity_summary_gain",
             "world_abstract_decision_gain",
@@ -9100,7 +9311,7 @@ class Agent:
                     None
                     if actInput.done is None
                     else actInput.done.to(self.device)),
-                is_train=self.is_train,
+                is_train=model_training,
                 sample_actions=actInput.sample_actions,
                 deterministic_actor=actInput.deterministic_actor,
                 depth=actInput.depth.to(self.device),
@@ -9110,12 +9321,112 @@ class Agent:
                 perception_targets=self.MovePerceptionTargets(
                     actInput.perception_targets)))
 
+    @staticmethod
+    @torch.no_grad()
+    def ExportMutableRuntimeBuffers(
+        module: nn.Module,
+    ) -> Tuple[Tuple[nn.Module, str, Optional[torch.Tensor]], ...]:
+        state = []
+        for child in module.modules():
+            for name in sorted(child._non_persistent_buffers_set):
+                value = child._buffers.get(name)
+                state.append((
+                    child,
+                    name,
+                    None if value is None else value.detach().clone()))
+        return tuple(state)
+
+    @staticmethod
+    @torch.no_grad()
+    def ImportMutableRuntimeBuffers(
+        state: Tuple[Tuple[nn.Module, str, Optional[torch.Tensor]], ...],
+    ) -> None:
+        for module, name, saved in state:
+            current = module._buffers.get(name)
+            if saved is None:
+                module._buffers[name] = None
+            elif (
+                torch.is_tensor(current)
+                and current.shape == saved.shape
+                and current.device == saved.device
+                and current.dtype == saved.dtype
+            ):
+                current.copy_(saved)
+            else:
+                module._buffers[name] = saved.detach().clone()
+
+    @torch.no_grad()
+    def EvaluateValueAndReadout(
+        self,
+        actInput: ContractAgentActInput,
+    ) -> Tuple[torch.Tensor, CognitiveReadout]:
+        if type(actInput) is not ContractAgentActInput:
+            raise TypeError(
+                "Agent.EvaluateValueAndReadout requires ContractAgentActInput")
+        runtimeState = self.brain.ExportBuffers()
+        mutableRuntimeBuffers = self.ExportMutableRuntimeBuffers(self.brain)
+        world = self.GetRuntimeWorld()
+        physicalState = world.ExportPhysicalState()
+        durableMemoryState = self.brain.mem.ExportDurableState()
+        modelTraining = self.brain.training
+        cpuRngState = torch.random.get_rng_state()
+        cudaRngState = (
+            torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available()
+            else None)
+        try:
+            self.brain.eval()
+            output = self.brain.StepContract(ContractBrainStepInput(
+                frame=actInput.frame.to(self.device),
+                text_ext=actInput.text_ext,
+                reward_ext=None,
+                done_flag=None,
+                is_train=False,
+                sample_actions=False,
+                deterministic_actor=True,
+                depth=actInput.depth.to(self.device),
+                depth_valid=actInput.depth_valid.to(self.device),
+                feedback_packet=actInput.feedback_packet,
+                text_trust=actInput.text_trust,
+                perception_targets=self.MovePerceptionTargets(
+                    actInput.perception_targets)))
+            return (
+                output.critic.returnValue.detach().clone(),
+                self.brain.DetachRuntimeObject(
+                    output.cognitive_readout,
+                    clone=True))
+        finally:
+            try:
+                try:
+                    world.ImportPhysicalState(physicalState)
+                    self.brain.mem.ImportDurableState(durableMemoryState)
+                    self.brain.ImportBuffers(runtimeState)
+                finally:
+                    self.ImportMutableRuntimeBuffers(mutableRuntimeBuffers)
+            finally:
+                try:
+                    torch.random.set_rng_state(cpuRngState)
+                    if cudaRngState is not None:
+                        torch.cuda.set_rng_state_all(cudaRngState)
+                finally:
+                    self.brain.train(modelTraining)
+
+    @torch.no_grad()
+    def EvaluateValue(
+        self,
+        actInput: ContractAgentActInput,
+    ) -> torch.Tensor:
+        value, _ = self.EvaluateValueAndReadout(actInput)
+        return value
+
     def Act(
         self,
         actInput: ContractAgentActInput,
     ) -> ContractAgentActOutput:
         output = self.RunStep(actInput)
         return ContractAgentActOutput(
+            action_request=output.action_request,
+            cognitive_readout=output.cognitive_readout,
             packed_target=output.decision["packed_target"],
             packed_temporal=output.decision["packed_temporal"],
             decision=output.decision,
@@ -9232,8 +9543,544 @@ class Agent:
 
 
 class TestAGICoreMTool:
+    @staticmethod
+    def CreateTestRobot():
+            from RobotMorphologyModule import Robot
+            return Robot.CreateDefault()
+
+    def BuildOptionTransactionBrain(
+            self,
+            robot: Any,
+        ) -> BrainCore:
+            brain = BrainCore.__new__(BrainCore)
+            nn.Module.__init__(brain)
+            brain.robot_contract_view = robot.ContractView
+            brain.actor = DecisionExtractor(
+                stateDim=4,
+                optionNum=2,
+                hiddenDim=4,
+                psiDim=4,
+                intentDim=4,
+                assistOptionId=1,
+                valueTensorDim=4,
+                vNextTensorDim=4,
+                worldHDim=2,
+                worldZDim=2,
+                worldXDim=2,
+                beliefDim=4,
+                decisionDynDim=4,
+                latentControlDim=2,
+                mapperEmbedDim=4,
+                actionEmbedDim=4,
+                planFeatureDim=4,
+                subgoalFeatureDim=2,
+                constraintTokenCount=1,
+                constraintTokenDim=2,
+                bodyStateFeatureDim=2,
+                controlFeedbackFeatureDim=2,
+                embodimentContextFeatureDim=2,
+                embodimentStateFeatureDim=2,
+                sceneStateFeatureDim=2,
+                goalDecisionContextDim=4)
+            actor = brain.RuntimeModule(brain.actor)
+            actor.elig_plasticity.EnsureB(1)
+            targetWidth = robot.ContractView.end_effector_target_layout.PackedDim
+            endpointCount = robot.ContractView.end_effector_count
+            policyWidth = actor.dyn_dim + actor.u_dim + actor.mapper_hidden_dim
+            brain.prev_done_flag = torch.zeros(1, dtype=torch.bool)
+            brain.active_option_policy_input = torch.zeros(1, policyWidth)
+            brain.active_option_prior_logit = torch.zeros(
+                1, actor.num_options)
+            brain.active_option_goal_mid = torch.zeros(1, 3)
+            brain.active_option_index = torch.zeros(1, dtype=torch.long)
+            brain.active_option_action_epoch = torch.zeros(
+                1, dtype=torch.long)
+            brain.active_option_request_values = torch.zeros(1, targetWidth)
+            brain.active_option_request_active = torch.zeros(
+                1, endpointCount, dtype=torch.bool)
+            brain.active_option_request_version = torch.full(
+                (1,), -1, dtype=torch.long)
+            brain.active_option_policy_path = torch.full(
+                (1,), POLICY_PATH_NONE, dtype=torch.long)
+            brain.active_option_planner_override = torch.zeros(
+                1, dtype=torch.bool)
+            brain.active_option_help_requested = torch.zeros(
+                1, dtype=torch.bool)
+            brain.active_option_eligibility_valid = torch.zeros(
+                1, dtype=torch.bool)
+            brain.active_option_valid = torch.zeros(1, dtype=torch.bool)
+            brain.pending_option_policy_input = torch.zeros(1, policyWidth)
+            brain.pending_option_prior_logit = torch.zeros(
+                1, actor.num_options)
+            brain.pending_option_goal_mid = torch.zeros(1, 3)
+            brain.pending_option_index = torch.zeros(1, dtype=torch.long)
+            brain.pending_option_action_epoch = torch.zeros(
+                1, dtype=torch.long)
+            brain.pending_option_request_values = torch.zeros(1, targetWidth)
+            brain.pending_option_request_active = torch.zeros(
+                1, endpointCount, dtype=torch.bool)
+            brain.pending_option_request_version = torch.full(
+                (1,), -1, dtype=torch.long)
+            brain.pending_option_policy_path = torch.full(
+                (1,), POLICY_PATH_NONE, dtype=torch.long)
+            brain.pending_option_planner_override = torch.zeros(
+                1, dtype=torch.bool)
+            brain.pending_option_help_requested = torch.zeros(
+                1, dtype=torch.bool)
+            brain.pending_option_eligibility_pre = torch.zeros(
+                1, actor.u_dim)
+            brain.pending_option_eligibility_post = torch.zeros(
+                1, actor.u_dim)
+            brain.pending_option_eligibility_update = torch.zeros(
+                1, dtype=torch.bool)
+            brain.pending_option_valid = torch.zeros(1, dtype=torch.bool)
+            return brain
+
+    def MakeOptionTarget(
+            self,
+            robot: Any,
+            value: float,
+            version: int,
+            timestamp: float,
+        ) -> PackedEndEffectorTarget:
+            contract = robot.ContractView
+            slotIndex = next(
+                index
+                for index, isRoot in enumerate(contract.root_mask)
+                if isRoot)
+            targetSlice = contract.end_effector_target_layout.Slice(
+                slotIndex)
+            values = torch.zeros(
+                1,
+                contract.end_effector_target_layout.PackedDim)
+            values[:, targetSlice.start] = value
+            active = torch.zeros(
+                1,
+                contract.end_effector_count,
+                dtype=torch.bool)
+            active[:, slotIndex] = True
+            return PackedEndEffectorTarget(
+                values=values,
+                active=active,
+                contract_id=contract.contract_id,
+                model_signature=contract.model_signature,
+                target_version=torch.tensor([version], dtype=torch.long),
+                timestamp=torch.tensor([timestamp]))
+
+    def MakeOptionRequest(
+            self,
+            robot: Any,
+            target: PackedEndEffectorTarget,
+            requestId: int,
+            actionEpoch: int,
+        ) -> ActionRequest:
+            return robot.BuildActionRequest(
+                target,
+                torch.tensor([requestId], dtype=torch.long),
+                torch.tensor([actionEpoch], dtype=torch.long),
+                torch.ones(1, dtype=torch.bool),
+                torch.zeros(1, dtype=torch.bool),
+                torch.zeros(1, dtype=torch.bool),
+                torch.zeros(1, dtype=torch.bool),
+                torch.zeros(1, dtype=torch.long),
+                torch.zeros(1, dtype=torch.bool),
+                torch.zeros(1, dtype=torch.long))
+
+    def MakeOptionResult(
+            self,
+            robot: Any,
+            request: ActionRequest,
+            target: PackedEndEffectorTarget,
+            status: SlotExecutionStatus,
+            timestamp: float,
+        ) -> ActionExecutionResult:
+            return ActionExecutionResult(
+                request_id=request.request_id.clone(),
+                action_epoch=request.action_epoch.clone(),
+                applied_target=target,
+                execution_status=torch.full(
+                    (1, robot.ContractView.end_effector_count),
+                    int(status),
+                    dtype=torch.long),
+                execution_known=torch.full(
+                    (1, robot.ContractView.end_effector_count),
+                    status is not SlotExecutionStatus.UNKNOWN,
+                    dtype=torch.bool),
+                hard_stop=torch.zeros(1, dtype=torch.bool),
+                help_accepted=torch.zeros(1, dtype=torch.bool),
+                timestamp=torch.tensor([timestamp]))
+
+    def SetActiveOption(
+            self,
+            brain: BrainCore,
+            target: PackedEndEffectorTarget,
+            optionIndex: int,
+            actionEpoch: int,
+        ) -> None:
+            brain.active_option_index.fill_(optionIndex)
+            brain.active_option_action_epoch.fill_(actionEpoch)
+            brain.active_option_request_values.copy_(target.values)
+            brain.active_option_request_active.copy_(target.active)
+            brain.active_option_request_version.copy_(target.target_version)
+            brain.active_option_policy_path.fill_(POLICY_PATH_FULL)
+            brain.active_option_eligibility_valid.fill_(True)
+            brain.active_option_valid.fill_(True)
+
+    def SetPendingOption(
+            self,
+            brain: BrainCore,
+            target: PackedEndEffectorTarget,
+            optionIndex: int,
+            actionEpoch: int,
+        ) -> None:
+            brain.pending_option_index.fill_(optionIndex)
+            brain.pending_option_action_epoch.fill_(actionEpoch)
+            brain.pending_option_request_values.copy_(target.values)
+            brain.pending_option_request_active.copy_(target.active)
+            brain.pending_option_request_version.copy_(target.target_version)
+            brain.pending_option_policy_path.fill_(POLICY_PATH_FULL)
+            brain.pending_option_eligibility_pre.fill_(0.5)
+            brain.pending_option_eligibility_post.fill_(0.25)
+            brain.pending_option_eligibility_update.fill_(True)
+            brain.pending_option_valid.fill_(True)
+
+    def BuildOptionFeedback(
+            self,
+            robot: Any,
+            timestamp: float,
+        ) -> BrainFeedbackPacket:
+            return robot.EncodeFeedback(
+                robot.BuildNeutralFeedbackPayload(
+                    timestamp,
+                    torch.device("cpu")),
+                torch.device("cpu"))
+
+    def TestRejectedPendingOptionRetainsActive(self) -> bool:
+            robot = self.CreateTestRobot()
+            targetA = self.MakeOptionTarget(robot, 0.10, 0, 0.0)
+            requestA = self.MakeOptionRequest(robot, targetA, 1, 1)
+            robot.CommitAppliedTarget(
+                requestA,
+                self.MakeOptionResult(
+                    robot,
+                    requestA,
+                    targetA,
+                    SlotExecutionStatus.APPLIED,
+                    0.1))
+            targetB = self.MakeOptionTarget(robot, 0.20, 1, 0.2)
+            requestB = self.MakeOptionRequest(robot, targetB, 2, 2)
+            robot.CommitAppliedTarget(
+                requestB,
+                self.MakeOptionResult(
+                    robot,
+                    requestB,
+                    targetA,
+                    SlotExecutionStatus.REJECTED,
+                    0.3))
+            brain = self.BuildOptionTransactionBrain(robot)
+            self.SetActiveOption(brain, targetA, 0, 1)
+            self.SetPendingOption(brain, targetB, 1, 2)
+            transaction = brain.ResolvePendingOptionTransaction(
+                self.BuildOptionFeedback(robot, 0.4))
+            assert not bool(transaction["promoted"].item())
+            assert bool(transaction["retained"].item())
+            assert bool(transaction["credit_option_valid"].item())
+            assert int(brain.active_option_index.item()) == 0
+            assert not bool(brain.pending_option_valid.item())
+            return True
+
+    def TestAppliedPendingOptionCreditsTerminalTransition(self) -> bool:
+            robot = self.CreateTestRobot()
+            targetA = self.MakeOptionTarget(robot, 0.10, 0, 0.0)
+            requestA = self.MakeOptionRequest(robot, targetA, 11, 1)
+            robot.CommitAppliedTarget(
+                requestA,
+                self.MakeOptionResult(
+                    robot,
+                    requestA,
+                    targetA,
+                    SlotExecutionStatus.APPLIED,
+                    0.1))
+            targetB = self.MakeOptionTarget(robot, 0.20, 1, 0.2)
+            requestB = self.MakeOptionRequest(robot, targetB, 12, 2)
+            robot.CommitAppliedTarget(
+                requestB,
+                self.MakeOptionResult(
+                    robot,
+                    requestB,
+                    targetB,
+                    SlotExecutionStatus.APPLIED,
+                    0.3))
+            brain = self.BuildOptionTransactionBrain(robot)
+            self.SetActiveOption(brain, targetA, 0, 1)
+            self.SetPendingOption(brain, targetB, 1, 2)
+            transaction = brain.ResolvePendingOptionTransaction(
+                self.BuildOptionFeedback(robot, 0.4))
+            assert bool(transaction["promoted"].item())
+            assert bool(transaction["credit_option_valid"].item())
+            assert int(transaction["credit_option_index"].item()) == 1
+            assert int(brain.active_option_index.item()) == 1
+            assert not bool(brain.pending_option_valid.item())
+            return True
+
+    def TestUnknownAndModifiedOptionOwnership(self) -> bool:
+            unknownRobot = self.CreateTestRobot()
+            targetA = self.MakeOptionTarget(unknownRobot, 0.10, 0, 0.0)
+            requestA = self.MakeOptionRequest(unknownRobot, targetA, 21, 1)
+            unknownRobot.CommitAppliedTarget(
+                requestA,
+                self.MakeOptionResult(
+                    unknownRobot,
+                    requestA,
+                    targetA,
+                    SlotExecutionStatus.APPLIED,
+                    0.1))
+            targetB = self.MakeOptionTarget(unknownRobot, 0.20, 1, 0.2)
+            requestB = self.MakeOptionRequest(unknownRobot, targetB, 22, 2)
+            unknownRobot.CommitAppliedTarget(
+                requestB,
+                self.MakeOptionResult(
+                    unknownRobot,
+                    requestB,
+                    targetA,
+                    SlotExecutionStatus.UNKNOWN,
+                    0.3))
+            unknownBrain = self.BuildOptionTransactionBrain(unknownRobot)
+            self.SetActiveOption(unknownBrain, targetA, 0, 1)
+            self.SetPendingOption(unknownBrain, targetB, 1, 2)
+            unknownTransaction = (
+                unknownBrain.ResolvePendingOptionTransaction(
+                    self.BuildOptionFeedback(unknownRobot, 0.4)))
+            assert bool(unknownTransaction["retained"].item())
+            assert not bool(unknownTransaction[
+                "credit_option_valid"].item())
+
+            modifiedRobot = self.CreateTestRobot()
+            modifiedA = self.MakeOptionTarget(
+                modifiedRobot, 0.10, 0, 0.0)
+            modifiedRequestA = self.MakeOptionRequest(
+                modifiedRobot, modifiedA, 31, 1)
+            modifiedRobot.CommitAppliedTarget(
+                modifiedRequestA,
+                self.MakeOptionResult(
+                    modifiedRobot,
+                    modifiedRequestA,
+                    modifiedA,
+                    SlotExecutionStatus.APPLIED,
+                    0.1))
+            modifiedB = self.MakeOptionTarget(
+                modifiedRobot, 0.20, 1, 0.2)
+            modifiedRequestB = self.MakeOptionRequest(
+                modifiedRobot, modifiedB, 32, 2)
+            overriddenA = self.MakeOptionTarget(
+                modifiedRobot, 0.10, 1, 0.3)
+            modifiedRobot.CommitAppliedTarget(
+                modifiedRequestB,
+                self.MakeOptionResult(
+                    modifiedRobot,
+                    modifiedRequestB,
+                    overriddenA,
+                    SlotExecutionStatus.MODIFIED,
+                    0.3))
+            modifiedBrain = self.BuildOptionTransactionBrain(modifiedRobot)
+            self.SetActiveOption(modifiedBrain, modifiedA, 0, 1)
+            self.SetPendingOption(modifiedBrain, modifiedB, 1, 2)
+            modifiedTransaction = (
+                modifiedBrain.ResolvePendingOptionTransaction(
+                    self.BuildOptionFeedback(modifiedRobot, 0.4)))
+            assert not bool(modifiedTransaction["promoted"].item())
+            assert not bool(modifiedTransaction["retained"].item())
+            assert not bool(modifiedBrain.active_option_valid.item())
+            return True
+
+    def TestReadOnlyRuntimeBufferTransaction(self) -> bool:
+            class RuntimeBufferModule(nn.Module):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.register_buffer(
+                        "hebb_memory",
+                        torch.tensor([1.0]),
+                        persistent=False)
+                    self.register_buffer(
+                        "optional_memory",
+                        None,
+                        persistent=False)
+
+            module = RuntimeBufferModule()
+            state = Agent.ExportMutableRuntimeBuffers(module)
+            module.hebb_memory = torch.tensor([2.0, 3.0])
+            module.optional_memory = torch.tensor([4.0])
+            Agent.ImportMutableRuntimeBuffers(state)
+            assert torch.equal(
+                module.hebb_memory,
+                torch.tensor([1.0]))
+            assert module.optional_memory is None
+            assert "hebb_memory" not in module.state_dict()
+            return True
+
+    def TestBrainBuildSpecAssistZero(self) -> bool:
+            robot = self.CreateTestRobot()
+            spec = BrainBuildSpec.Compile(
+                ModuleDim.CognitiveProfile(),
+                robot.ContractView,
+                policyOptionCount=2,
+                assistOptionId=0)
+            spec.ValidateCognitiveProfileCompatibility(
+                spec.CognitiveProfilePayload())
+            for assistOptionId in (-1, 2):
+                try:
+                    BrainBuildSpec.Compile(
+                        ModuleDim.CognitiveProfile(),
+                        robot.ContractView,
+                        policyOptionCount=2,
+                        assistOptionId=assistOptionId)
+                except ValueError:
+                    continue
+                return False
+            return True
+
+    def TestKnownAppliedActionMask(self) -> bool:
+            from RobotMorphologyModule import TestRobotMorphologyMTool
+            from WorldModule import ContractWorldEmbodimentAdapter
+            torch.manual_seed(41)
+            robot = self.CreateTestRobot()
+            contract = robot.ContractView
+            childIndex = next(
+                index
+                for index, parentIndex in enumerate(contract.parent_index)
+                if parentIndex >= 0)
+            rootIndex = contract.parent_index[childIndex]
+            target = TestRobotMorphologyMTool().MakeTarget(
+                robot,
+                (rootIndex, childIndex),
+                0,
+                0.0)
+            rootSlice = contract.end_effector_target_layout.Slice(rootIndex)
+            childSlice = contract.end_effector_target_layout.Slice(childIndex)
+
+            def WithValues(
+                rootValue: float,
+                childValue: float,
+            ) -> PackedEndEffectorTarget:
+                values = target.values.clone()
+                values[:, rootSlice.start] = rootValue
+                values[:, childSlice.start] = childValue
+                return PackedEndEffectorTarget(
+                    values=values,
+                    active=target.active.clone(),
+                    contract_id=target.contract_id,
+                    model_signature=target.model_signature,
+                    target_version=target.target_version.clone(),
+                    timestamp=target.timestamp.clone())
+
+            decoder = DecisionDecouplerV2(
+                contract,
+                decisionDim=4,
+                slotTokenDim=4,
+                feedbackTokenDim=4,
+                hierarchyDim=4,
+                hiddenDim=8,
+                planDim=4,
+                subgoalDim=4,
+                contextDim=4,
+                constraintTokenDim=4,
+                taskDim=4,
+                motionDim=4,
+                dynamicsDim=4,
+                constraintDim=4,
+                uncertaintyDim=4,
+                attentionHeads=2,
+                worldActionDim=4).eval()
+            baseTarget = WithValues(0.10, 0.20)
+            knownChangedTarget = WithValues(0.30, 0.20)
+            unknownChangedTarget = WithValues(0.10, 0.40)
+            relevant = torch.zeros_like(target.active)
+            relevant[:, (rootIndex, childIndex)] = True
+            partialKnown = torch.zeros_like(target.active)
+            partialKnown[:, rootIndex] = True
+            knownMask = target.active & relevant & partialKnown
+            unknownMask = torch.zeros_like(target.active)
+            baseAction = decoder.EncodeWorldAction(
+                baseTarget,
+                activeMask=knownMask)
+            knownChangedAction = decoder.EncodeWorldAction(
+                knownChangedTarget,
+                activeMask=knownMask)
+            unknownChangedAction = decoder.EncodeWorldAction(
+                unknownChangedTarget,
+                activeMask=knownMask)
+            unknownAction = decoder.EncodeWorldAction(
+                baseTarget,
+                activeMask=unknownMask)
+            assert torch.equal(baseAction, unknownChangedAction)
+            assert not torch.equal(baseAction, knownChangedAction)
+            assert torch.equal(unknownAction, torch.zeros_like(unknownAction))
+
+            status = torch.full_like(
+                target.active,
+                int(SlotExecutionStatus.UNKNOWN),
+                dtype=torch.long)
+            status[:, rootIndex] = int(SlotExecutionStatus.APPLIED)
+            rowFalse = torch.zeros(1, dtype=torch.bool)
+            adapter = ContractWorldEmbodimentAdapter(
+                contract,
+                cognitiveDim=4,
+                actionDim=4).eval()
+            worldBase = adapter.EncodeExecutionAction(
+                baseAction,
+                status,
+                relevant,
+                partialKnown,
+                rowFalse,
+                rowFalse,
+                rowFalse,
+                target.active)
+            worldKnownChanged = adapter.EncodeExecutionAction(
+                knownChangedAction,
+                status,
+                relevant,
+                partialKnown,
+                rowFalse,
+                rowFalse,
+                rowFalse,
+                target.active)
+            fullyUnknown = torch.zeros_like(partialKnown)
+            worldUnknownBase = adapter.EncodeExecutionAction(
+                baseAction,
+                status,
+                relevant,
+                fullyUnknown,
+                rowFalse,
+                rowFalse,
+                rowFalse,
+                target.active)
+            worldUnknownChanged = adapter.EncodeExecutionAction(
+                knownChangedAction,
+                status,
+                relevant,
+                fullyUnknown,
+                rowFalse,
+                rowFalse,
+                rowFalse,
+                target.active)
+            assert not torch.equal(worldBase, worldKnownChanged)
+            assert torch.equal(worldUnknownBase, worldUnknownChanged)
+            return True
+
     def RunAll(self) -> Dict[str, bool]:
         return {
             "ModelStateBoundary": callable(ExportBrainModelState),
             "ComputeModes": len(CognitiveComputeMode) == 4,
+            "RejectedPendingOptionRetainsActive": (
+                self.TestRejectedPendingOptionRetainsActive()),
+            "AppliedPendingOptionCreditsTerminalTransition": (
+                self.TestAppliedPendingOptionCreditsTerminalTransition()),
+            "UnknownAndModifiedOptionOwnership": (
+                self.TestUnknownAndModifiedOptionOwnership()),
+            "ReadOnlyRuntimeBufferTransaction": (
+                self.TestReadOnlyRuntimeBufferTransaction()),
+            "BrainBuildSpecAssistZero": (
+                self.TestBrainBuildSpecAssistZero()),
+            "KnownAppliedActionMask": (
+                self.TestKnownAppliedActionMask()),
         }

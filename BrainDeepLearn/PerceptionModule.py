@@ -2853,6 +2853,10 @@ class DepthGeometryFusion(AGICoreModule):
 
 
 class PerceiveExtractor(AGICoreModule):
+    ObserverRotationSourceNone = 0
+    ObserverRotationSourceExternal = 1
+    ObserverRotationSourceVisual = 2
+
     def __init__(
         self,
         projectionMatrix: torch.Tensor,
@@ -3266,6 +3270,453 @@ class PerceiveExtractor(AGICoreModule):
         for module in self.modules():
             if isinstance(module, (HebbianConv2d, HebbianLinear)):
                 module.EnsureB(B)
+
+    @staticmethod
+    @torch.no_grad()
+    def BuildVisualRotationFeature(frame: torch.Tensor) -> torch.Tensor:
+        luminance = (
+            0.2126 * frame[:, 0:1]
+            + 0.7152 * frame[:, 1:2]
+            + 0.0722 * frame[:, 2:3])
+        target_height = min(32, int(frame.size(-2)))
+        target_width = min(32, int(frame.size(-1)))
+        luminance = F.interpolate(
+            luminance,
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True)
+        local_mean = F.avg_pool2d(
+            F.pad(luminance, (2, 2, 2, 2), mode="replicate"),
+            kernel_size=5,
+            stride=1)
+        centered = luminance - local_mean
+        padded = F.pad(luminance, (1, 1, 1, 1), mode="replicate")
+        gradient_x = 0.5 * (
+            padded[:, :, 1:-1, 2:] - padded[:, :, 1:-1, :-2])
+        gradient_y = 0.5 * (
+            padded[:, :, 2:, 1:-1] - padded[:, :, :-2, 1:-1])
+        gradient_magnitude = torch.sqrt(
+            gradient_x.square() + gradient_y.square() + 1e-12)
+        local_scale = torch.sqrt(F.avg_pool2d(
+            F.pad(
+                centered.square() + gradient_magnitude.square(),
+                (2, 2, 2, 2),
+                mode="replicate"),
+            kernel_size=5,
+            stride=1) + 1e-8)
+        feature = torch.cat([
+            centered / local_scale,
+            gradient_x / local_scale,
+            gradient_y / local_scale,
+            gradient_magnitude / local_scale,
+            F.avg_pool2d(
+                F.pad(centered, (1, 1, 1, 1), mode="replicate"),
+                kernel_size=3,
+                stride=1) / local_scale,
+        ], dim=1)
+        return F.normalize(feature, dim=1, eps=1e-6).detach()
+
+    @staticmethod
+    def VisualFlowLevel(
+        currentFeature: torch.Tensor,
+        previousFeature: torch.Tensor,
+        initialFlow: torch.Tensor,
+        radius: int,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, _, height, width = currentFeature.shape
+        channel_count = int(currentFeature.size(1))
+        current_descriptor = F.normalize(
+            F.unfold(
+                currentFeature,
+                kernel_size=3,
+                padding=1).view(
+                    batch_size,
+                    channel_count * 9,
+                    height,
+                    width),
+            dim=1,
+            eps=1e-6)
+        previous_descriptor = F.normalize(
+            F.unfold(
+                previousFeature,
+                kernel_size=3,
+                padding=1).view(
+                    batch_size,
+                    channel_count * 9,
+                    height,
+                    width),
+            dim=1,
+            eps=1e-6)
+        coordinate_y, coordinate_x = torch.meshgrid(
+            torch.arange(
+                height,
+                device=currentFeature.device,
+                dtype=currentFeature.dtype),
+            torch.arange(
+                width,
+                device=currentFeature.device,
+                dtype=currentFeature.dtype),
+            indexing="ij")
+        coordinate_x = coordinate_x.view(1, height, width)
+        coordinate_y = coordinate_y.view(1, height, width)
+        similarities = []
+        offsets = []
+        for offset_y in range(-int(radius), int(radius) + 1):
+            for offset_x in range(-int(radius), int(radius) + 1):
+                previous_x = coordinate_x + initialFlow[:, 0] + float(offset_x)
+                previous_y = coordinate_y + initialFlow[:, 1] + float(offset_y)
+                grid = torch.stack([
+                    2.0 * (previous_x + 0.5) / float(width) - 1.0,
+                    2.0 * (previous_y + 0.5) / float(height) - 1.0,
+                ], dim=-1)
+                sampled = F.grid_sample(
+                    previous_descriptor,
+                    grid,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=False)
+                in_bounds = (
+                    (previous_x >= 0.0)
+                    & (previous_x <= float(width - 1))
+                    & (previous_y >= 0.0)
+                    & (previous_y <= float(height - 1)))
+                similarity = (current_descriptor * sampled).sum(dim=1)
+                similarities.append(similarity.masked_fill(~in_bounds, -2.0))
+                offsets.append((float(offset_x), float(offset_y)))
+        scores = torch.stack(similarities, dim=1)
+        best_scores, best_indices = scores.topk(k=2, dim=1)
+        offset_table = currentFeature.new_tensor(offsets)
+        selected_offset = offset_table[best_indices[:, 0]].permute(0, 3, 1, 2)
+        refined_flow = initialFlow + selected_offset
+        margin = best_scores[:, 0] - best_scores[:, 1]
+        confidence = (
+            (margin / 0.25).clamp(0.0, 1.0)
+            * ((best_scores[:, 0] + 1.0) * 0.5).clamp(0.0, 1.0))
+        return refined_flow, confidence
+
+    @classmethod
+    def EstimateVisualFlow(
+        cls,
+        currentFeature: torch.Tensor,
+        previousFeature: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        target_height = int(currentFeature.size(-2))
+        target_width = int(currentFeature.size(-1))
+        previous_feature = F.interpolate(
+            previousFeature,
+            size=(target_height, target_width),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True)
+        scale_sizes = []
+        for scale in (0.25, 0.5, 1.0):
+            size = (
+                max(4, min(target_height, int(round(target_height * scale)))),
+                max(4, min(target_width, int(round(target_width * scale)))))
+            if size not in scale_sizes:
+                scale_sizes.append(size)
+        flow = None
+        confidence = None
+        previous_size = None
+        for level_index, size in enumerate(scale_sizes):
+            current_level = F.interpolate(
+                currentFeature,
+                size=size,
+                mode="bilinear",
+                align_corners=False,
+                antialias=True)
+            previous_level = F.interpolate(
+                previous_feature,
+                size=size,
+                mode="bilinear",
+                align_corners=False,
+                antialias=True)
+            current_level = F.normalize(current_level, dim=1, eps=1e-6)
+            previous_level = F.normalize(previous_level, dim=1, eps=1e-6)
+            if flow is None:
+                flow = current_level.new_zeros(
+                    current_level.size(0), 2, size[0], size[1])
+            else:
+                flow = F.interpolate(
+                    flow,
+                    size=size,
+                    mode="bilinear",
+                    align_corners=False)
+                flow[:, 0] *= float(size[1]) / float(previous_size[1])
+                flow[:, 1] *= float(size[0]) / float(previous_size[0])
+            flow, confidence = cls.VisualFlowLevel(
+                current_level,
+                previous_level,
+                flow,
+                radius=3 if level_index == 0 else 2)
+            previous_size = size
+        return flow, confidence
+
+    @staticmethod
+    def RotationMatrixToQuaternion(rotation: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        trace = (
+            rotation[:, 0, 0]
+            + rotation[:, 1, 1]
+            + rotation[:, 2, 2])
+        scalar = 0.5 * torch.sqrt((1.0 + trace).clamp_min(1e-8))
+        denominator = (4.0 * scalar).clamp_min(1e-6)
+        quaternion = torch.stack([
+            (rotation[:, 2, 1] - rotation[:, 1, 2]) / denominator,
+            (rotation[:, 0, 2] - rotation[:, 2, 0]) / denominator,
+            (rotation[:, 1, 0] - rotation[:, 0, 1]) / denominator,
+            scalar,
+        ], dim=-1)
+        finite = torch.isfinite(quaternion).all(dim=-1) & scalar.gt(0.05)
+        quaternion = F.normalize(quaternion, dim=-1, eps=1e-8)
+        return quaternion, finite
+
+    @torch.no_grad()
+    def EstimateVisualCurrentToPreviousRotation(
+        self,
+        currentFeature: torch.Tensor,
+        previousFeature: torch.Tensor,
+        previousValid: torch.Tensor,
+        projectionMatrix: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        work_dtype = torch.float32
+        current_feature = currentFeature.to(dtype=work_dtype)
+        previous_feature = previousFeature.to(dtype=work_dtype)
+        current_to_previous, forward_confidence = self.EstimateVisualFlow(
+            current_feature,
+            previous_feature)
+        previous_to_current, backward_confidence = self.EstimateVisualFlow(
+            previous_feature,
+            current_feature)
+        batch_size, _, height, width = current_to_previous.shape
+        coordinate_y, coordinate_x = torch.meshgrid(
+            torch.arange(height, device=current_feature.device, dtype=work_dtype),
+            torch.arange(width, device=current_feature.device, dtype=work_dtype),
+            indexing="ij")
+        coordinate_x = coordinate_x.view(1, height, width)
+        coordinate_y = coordinate_y.view(1, height, width)
+        previous_x = coordinate_x + current_to_previous[:, 0]
+        previous_y = coordinate_y + current_to_previous[:, 1]
+        previous_grid = torch.stack([
+            2.0 * (previous_x + 0.5) / float(width) - 1.0,
+            2.0 * (previous_y + 0.5) / float(height) - 1.0,
+        ], dim=-1)
+        sampled_backward = F.grid_sample(
+            previous_to_current,
+            previous_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False)
+        sampled_backward_confidence = F.grid_sample(
+            backward_confidence.unsqueeze(1),
+            previous_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False)[:, 0]
+        cycle_error = torch.linalg.vector_norm(
+            current_to_previous + sampled_backward,
+            ord=2,
+            dim=1)
+        cycle_confidence = torch.exp(-0.5 * cycle_error.square())
+        texture = current_feature[:, 3].clamp_min(0.0)
+        texture_scale = texture.flatten(1).mean(dim=-1).view(-1, 1, 1)
+        texture_confidence = (
+            texture / (2.0 * texture_scale + 1e-6)).clamp(0.0, 1.0)
+        in_bounds = (
+            (previous_x >= 0.0)
+            & (previous_x <= float(width - 1))
+            & (previous_y >= 0.0)
+            & (previous_y <= float(height - 1)))
+        base_weight = (
+            forward_confidence
+            * sampled_backward_confidence
+            * cycle_confidence
+            * texture_confidence
+            * in_bounds.to(dtype=work_dtype))
+        reference_height, reference_width = self.ProjectionMatrixReferenceSize()
+        projection = projectionMatrix.to(dtype=work_dtype)
+        scale_x = float(width) / float(reference_width)
+        scale_y = float(height) / float(reference_height)
+        focal_x = projection[:, 0, 0].view(-1, 1, 1) * scale_x
+        focal_y = projection[:, 1, 1].view(-1, 1, 1) * scale_y
+        skew = projection[:, 0, 1].view(-1, 1, 1) * scale_x
+        center_x = (
+            projection[:, 0, 2].view(-1, 1, 1) + 0.5
+        ) * scale_x - 0.5
+        center_y = (
+            projection[:, 1, 2].view(-1, 1, 1) + 0.5
+        ) * scale_y - 0.5
+        current_normalized_y = (coordinate_y - center_y) / focal_y
+        previous_normalized_y = (previous_y - center_y) / focal_y
+        current_ray = torch.stack([
+            (coordinate_x - center_x - skew * current_normalized_y) / focal_x,
+            current_normalized_y,
+            torch.ones_like(current_normalized_y),
+        ], dim=-1)
+        previous_ray = torch.stack([
+            (previous_x - center_x - skew * previous_normalized_y) / focal_x,
+            previous_normalized_y,
+            torch.ones_like(previous_normalized_y),
+        ], dim=-1)
+        current_ray = F.normalize(current_ray, dim=-1, eps=1e-8).flatten(1, 2)
+        previous_ray = F.normalize(previous_ray, dim=-1, eps=1e-8).flatten(1, 2)
+        base_weight = base_weight.flatten(1)
+        robust_weight = base_weight
+        singular_values = current_feature.new_zeros(batch_size, 3)
+        rotation = torch.eye(
+            3,
+            device=current_feature.device,
+            dtype=work_dtype).unsqueeze(0).expand(batch_size, -1, -1).clone()
+        residual = base_weight.new_full(base_weight.shape, math.pi)
+        for _ in range(3):
+            covariance = torch.einsum(
+                "bn,bni,bnj->bij",
+                robust_weight,
+                previous_ray,
+                current_ray)
+            left, singular_values, right = torch.linalg.svd(covariance)
+            orientation = torch.linalg.det(left @ right)
+            correction = torch.eye(
+                3,
+                device=current_feature.device,
+                dtype=work_dtype).unsqueeze(0).repeat(batch_size, 1, 1)
+            correction[:, 2, 2] = torch.where(
+                orientation >= 0.0,
+                torch.ones_like(orientation),
+                -torch.ones_like(orientation))
+            rotation = left @ correction @ right
+            predicted_previous = torch.einsum(
+                "bij,bnj->bni",
+                rotation,
+                current_ray)
+            residual = torch.acos((
+                predicted_previous * previous_ray
+            ).sum(dim=-1).clamp(-1.0, 1.0))
+            robust_weight = base_weight * (
+                0.04 / residual.clamp_min(0.04)).clamp(max=1.0)
+        support = base_weight.gt(0.02)
+        support_ratio = support.to(dtype=work_dtype).mean(dim=-1)
+        weight_sum = base_weight.sum(dim=-1).clamp_min(1e-6)
+        inlier_ratio = (
+            base_weight * residual.lt(0.06).to(dtype=work_dtype)
+        ).sum(dim=-1) / weight_sum
+        mean_residual = (base_weight * residual).sum(dim=-1) / weight_sum
+        normalized_x = (
+            2.0 * coordinate_x.expand(batch_size, -1, -1)
+            / float(max(width - 1, 1)) - 1.0).flatten(1)
+        normalized_y = (
+            2.0 * coordinate_y.expand(batch_size, -1, -1)
+            / float(max(height - 1, 1)) - 1.0).flatten(1)
+        mean_x = (base_weight * normalized_x).sum(dim=-1) / weight_sum
+        mean_y = (base_weight * normalized_y).sum(dim=-1) / weight_sum
+        variance_x = (
+            base_weight * (normalized_x - mean_x.unsqueeze(-1)).square()
+        ).sum(dim=-1) / weight_sum
+        variance_y = (
+            base_weight * (normalized_y - mean_y.unsqueeze(-1)).square()
+        ).sum(dim=-1) / weight_sum
+        condition = singular_values[:, 2] / singular_values[:, 0].clamp_min(1e-6)
+        match_confidence = base_weight.sum(dim=-1) / support.sum(
+            dim=-1).clamp_min(1).to(dtype=work_dtype)
+        confidence = (
+            inlier_ratio
+            * torch.exp(-20.0 * mean_residual)
+            * (support_ratio / 0.2).clamp(0.0, 1.0)
+            * (match_confidence / 0.08).clamp(0.0, 1.0)
+            * (variance_x / 0.08).clamp(0.0, 1.0)
+            * (variance_y / 0.08).clamp(0.0, 1.0)
+            * (condition / 0.02).clamp(0.0, 1.0))
+        quaternion, quaternion_valid = self.RotationMatrixToQuaternion(rotation)
+        valid = (
+            previousValid
+            & quaternion_valid
+            & support_ratio.gt(0.08)
+            & inlier_ratio.gt(0.35)
+            & mean_residual.lt(0.08)
+            & variance_x.gt(0.04)
+            & variance_y.gt(0.04)
+            & condition.gt(0.005)
+            & confidence.gt(0.03))
+        identity = ObserverRotationIdentity(currentFeature, batch_size).to(
+            dtype=work_dtype)
+        quaternion = torch.where(valid.unsqueeze(-1), quaternion, identity)
+        confidence = torch.where(valid, confidence, torch.zeros_like(confidence))
+        return (
+            quaternion.to(dtype=currentFeature.dtype),
+            valid,
+            confidence.to(dtype=currentFeature.dtype))
+
+    @torch.no_grad()
+    def ResolveObserverRotationSources(
+        self,
+        frame: torch.Tensor,
+        prevVisualState: Optional[VisualState],
+        prevVisualValid: torch.Tensor,
+        observerRotation: Optional[torch.Tensor],
+        observerRotationValid: Optional[torch.Tensor],
+        projectionMatrix: torch.Tensor,
+        ) -> Dict[str, torch.Tensor]:
+        batch_size = int(frame.size(0))
+        external_valid = NormalizeObserverRotationValidity(
+            observerRotationValid,
+            frame)
+        external_rotation = ResolveObserverRotation(
+            observerRotation,
+            external_valid,
+            frame)
+        visual_feature = self.BuildVisualRotationFeature(frame)
+        visual_rotation = ObserverRotationIdentity(frame, batch_size)
+        visual_valid = torch.zeros(
+            batch_size,
+            device=frame.device,
+            dtype=torch.bool)
+        visual_confidence = frame.new_zeros(batch_size)
+        if prevVisualState is not None:
+            previous_feature = prevVisualState.Auxiliary.get(
+                "VisualRotationFeature")
+            if previous_feature is not None:
+                (
+                    visual_rotation,
+                    visual_valid,
+                    visual_confidence,
+                ) = self.EstimateVisualCurrentToPreviousRotation(
+                    visual_feature,
+                    previous_feature,
+                    prevVisualValid,
+                    projectionMatrix)
+        selected_valid = external_valid | visual_valid
+        selected_rotation = torch.where(
+            external_valid.unsqueeze(-1),
+            external_rotation,
+            visual_rotation)
+        source = torch.where(
+            external_valid,
+            torch.full_like(
+                external_valid,
+                self.ObserverRotationSourceExternal,
+                dtype=torch.long),
+            torch.where(
+                visual_valid,
+                torch.full_like(
+                    visual_valid,
+                    self.ObserverRotationSourceVisual,
+                    dtype=torch.long),
+                torch.full_like(
+                    visual_valid,
+                    self.ObserverRotationSourceNone,
+                    dtype=torch.long)))
+        return {
+            "VisualRotationFeature": visual_feature,
+            "VisualCurrentToPreviousRotation": visual_rotation.detach(),
+            "VisualRotationValid": visual_valid.detach(),
+            "VisualRotationConfidence": visual_confidence.detach(),
+            "ObserverRotationExternalCurrentToPrevious": external_rotation.detach(),
+            "ObserverRotationExternalValid": external_valid.detach(),
+            "ObserverRotationSelectedCurrentToPrevious": selected_rotation.detach(),
+            "ObserverRotationSelectedValid": selected_valid.detach(),
+            "ObserverRotationSource": source.detach(),
+            "ObserverRotationValid": external_valid.detach(),
+        }
 
     def BuildAugmentedPyramid(
         self,
@@ -4282,6 +4733,16 @@ class PerceiveExtractor(AGICoreModule):
         prevVisualValid: torch.Tensor,
         observerAngularVelocity: Optional[torch.Tensor] = None,
         enhancementAuxiliary: Optional[Dict[str, torch.Tensor]] = None,) -> VisualState:
+        external_rotation_valid = (
+            observerRotationValid
+            if enhancementAuxiliary is None
+            else enhancementAuxiliary.get(
+                "ObserverRotationExternalValid",
+                observerRotationValid))
+        observer_angular_velocity = NormalizeObserverAngularVelocity(
+            observerAngularVelocity,
+            external_rotation_valid,
+            tokens)
         x = self.encoder_norm(tokens)
         cls_rep = x[:, 0, :]
         mlp_out = self.mlp(cls_rep)
@@ -4586,7 +5047,7 @@ class PerceiveExtractor(AGICoreModule):
             patchWidth=patchWidth,
             factorPriors=factor_priors,
             factorPriorConfidence=factor_prior_confidence,
-            observerAngularVelocity=observerAngularVelocity)
+            observerAngularVelocity=observer_angular_velocity)
         object_tokens_base = object_tokens
         object_tokens = (
             object_tokens_base
@@ -4727,11 +5188,8 @@ class PerceiveExtractor(AGICoreModule):
                 "WarpedPrevPatchTokens": warped_prev_tokens.detach(),
                 "WarpPrevPatchValid": warp_valid.detach(),
                 "ObserverRotationFromPrev": observer_rotation_from_prev.detach(),
-                "ObserverRotationValid": observerRotationValid.detach(),
-                "ObserverAngularVelocity": NormalizeObserverAngularVelocity(
-                    observerAngularVelocity,
-                    observerRotationValid,
-                    patch_tokens).detach(),
+                "ObserverRotationValid": external_rotation_valid.detach(),
+                "ObserverAngularVelocity": observer_angular_velocity.detach(),
                 "PatchGridShape": torch.tensor(
                     [patchHeight, patchWidth],
                     dtype=torch.long),
@@ -4754,14 +5212,18 @@ class PerceiveExtractor(AGICoreModule):
         batch_size = int(frame.size(0))
         self.ValidatePreviousVisualMask(frame, prevVisualValid)
         self.EnsureB(batch_size)
-        observer_rotation_valid = NormalizeObserverRotationValidity(
-            observerRotationValid,
-            frame)
-        observer_rotation = ResolveObserverRotation(
-            observerRotation,
-            observer_rotation_valid,
-            frame)
         projection_matrix = self.ProjectionMatrixBatch(batch_size)
+        rotation_state = self.ResolveObserverRotationSources(
+            frame,
+            prevVisualState,
+            prevVisualValid,
+            observerRotation,
+            observerRotationValid,
+            projection_matrix)
+        observer_rotation = rotation_state[
+            "ObserverRotationSelectedCurrentToPrevious"]
+        observer_rotation_valid = rotation_state[
+            "ObserverRotationSelectedValid"]
         (
             pyramid,
             parvo_feature,
@@ -4775,6 +5237,7 @@ class PerceiveExtractor(AGICoreModule):
             observer_rotation,
             projection_matrix,
             observerRotationValid=observer_rotation_valid)
+        enhancement_auxiliary.update(rotation_state)
         feat, depth_state = self.depth_fusion(
             pyramid["Deep"],
             pyramid["Layer3"],
@@ -5070,14 +5533,18 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
         batch_size = int(frame.size(0))
         self.base.ValidatePreviousVisualMask(frame, prevVisualValid)
         self.base.EnsureB(batch_size)
-        observer_rotation_valid = NormalizeObserverRotationValidity(
-            observerRotationValid,
-            frame)
-        observer_rotation = ResolveObserverRotation(
-            observerRotation,
-            observer_rotation_valid,
-            frame)
         projection_matrix = self.base.ProjectionMatrixBatch(batch_size)
+        rotation_state = self.base.ResolveObserverRotationSources(
+            frame,
+            prevVisualState,
+            prevVisualValid,
+            observerRotation,
+            observerRotationValid,
+            projection_matrix)
+        observer_rotation = rotation_state[
+            "ObserverRotationSelectedCurrentToPrevious"]
+        observer_rotation_valid = rotation_state[
+            "ObserverRotationSelectedValid"]
 
         (
             pyramid,
@@ -5092,6 +5559,7 @@ class PerceptionOnlineWrapper(BaseOnlineWrapper):
             observer_rotation,
             projection_matrix,
             observerRotationValid=observer_rotation_valid)
+        enhancement_auxiliary.update(rotation_state)
         feat, depth_state = self.base.depth_fusion(
             pyramid["Deep"],
             pyramid["Layer3"],
@@ -7639,6 +8107,150 @@ class TestPerceptionMTool:
             "RotationStabilizedCorticalMotion",
             check)
 
+    def TestVisualRotationFallbackSelection(self):
+        def Check():
+            torch.manual_seed(704)
+            size = 48
+            model = self.MakeRegressionModel(imgSize=size).eval()
+            previous_frame = torch.rand(
+                1, 3, size, size, device=self.device)
+            for _ in range(2):
+                previous_frame = F.avg_pool2d(
+                    F.pad(
+                        previous_frame,
+                        (1, 1, 1, 1),
+                        mode="reflect"),
+                    kernel_size=3,
+                    stride=1)
+            projection = model.ProjectionMatrixBatch(1)
+            angle = previous_frame.new_tensor(0.07)
+            expected_rotation = torch.stack([
+                angle.new_zeros(()),
+                torch.sin(0.5 * angle),
+                angle.new_zeros(()),
+                torch.cos(0.5 * angle),
+            ]).view(1, 4)
+            grid, _ = model.perception_enhancement.early_vision.RotationWarpGrid(
+                previous_frame,
+                expected_rotation,
+                projection,
+                (size, size))
+            current_frame = F.grid_sample(
+                previous_frame,
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=False)
+            depth = torch.ones(
+                1, 1, size, size,
+                device=self.device)
+            depth_valid = torch.ones_like(depth, dtype=torch.bool)
+            external_valid = torch.zeros(
+                1,
+                device=self.device,
+                dtype=torch.bool)
+            identity = ObserverRotationIdentity(previous_frame, 1)
+            top_down = self.MakeTopDownContext(model, 1)
+            with torch.no_grad():
+                previous = model(
+                    previous_frame,
+                    topDownContext=top_down,
+                    depth=depth,
+                    depthValid=depth_valid,
+                    observerRotation=identity,
+                    prevVisualValid=external_valid,
+                    observerRotationValid=external_valid)
+                current = model(
+                    current_frame,
+                    topDownContext=top_down,
+                    depth=depth,
+                    depthValid=depth_valid,
+                    observerRotation=identity,
+                    prevVisualValid=torch.ones_like(external_valid),
+                    prevVisualState=previous,
+                    observerRotationValid=external_valid)
+            auxiliary = current.Auxiliary
+            estimated_rotation = auxiliary[
+                "ObserverRotationSelectedCurrentToPrevious"]
+            agreement = (
+                estimated_rotation * expected_rotation
+            ).sum(dim=-1).abs()
+            assert bool(auxiliary["VisualRotationValid"].all().item())
+            assert bool(auxiliary[
+                "ObserverRotationSelectedValid"].all().item())
+            assert not bool(auxiliary[
+                "ObserverRotationExternalValid"].any().item())
+            assert not bool(auxiliary["ObserverRotationValid"].any().item())
+            assert int(auxiliary["ObserverRotationSource"][0].item()) == (
+                model.ObserverRotationSourceVisual)
+            assert float(auxiliary[
+                "VisualRotationConfidence"][0].item()) > 0.1
+            assert float(agreement[0].item()) > 0.995
+            assert bool(auxiliary[
+                "CorticalRotationWarpValid"].any().item())
+            assert float(auxiliary["WarpPrevPatchValid"].sum().item()) > 0.0
+            assert float(auxiliary[
+                "CorticalRetinalTemporalResponse"].abs().mean().item()) > 0.0
+            external_state = model.ResolveObserverRotationSources(
+                current_frame,
+                previous,
+                torch.ones_like(external_valid),
+                identity,
+                torch.ones_like(external_valid),
+                projection)
+            assert bool(external_state["VisualRotationValid"].all().item())
+            assert bool(external_state[
+                "ObserverRotationExternalValid"].all().item())
+            assert int(external_state["ObserverRotationSource"][0].item()) == (
+                model.ObserverRotationSourceExternal)
+            assert torch.equal(
+                external_state[
+                    "ObserverRotationSelectedCurrentToPrevious"],
+                identity)
+        return self.RunRegressionCheck(
+            "VisualRotationFallbackSelection",
+            Check)
+
+    def TestVisualRotationDegeneracy(self):
+        def Check():
+            torch.manual_seed(705)
+            size = 48
+            model = self.MakeRegressionModel(imgSize=size).eval()
+            projection = model.ProjectionMatrixBatch(1)
+            previous_valid = torch.ones(
+                1,
+                device=self.device,
+                dtype=torch.bool)
+            flat = torch.full(
+                (1, 3, size, size),
+                0.5,
+                device=self.device)
+            flat_feature = model.BuildVisualRotationFeature(flat)
+            flat_rotation, flat_valid, flat_confidence = (
+                model.EstimateVisualCurrentToPreviousRotation(
+                    flat_feature,
+                    flat_feature,
+                    previous_valid,
+                    projection))
+            dynamic_previous = torch.rand_like(flat)
+            dynamic_current = torch.rand_like(flat)
+            dynamic_rotation, dynamic_valid, dynamic_confidence = (
+                model.EstimateVisualCurrentToPreviousRotation(
+                    model.BuildVisualRotationFeature(dynamic_current),
+                    model.BuildVisualRotationFeature(dynamic_previous),
+                    previous_valid,
+                    projection))
+            identity = ObserverRotationIdentity(flat, 1)
+            assert not bool(flat_valid.any().item())
+            assert not bool(dynamic_valid.any().item())
+            assert float(flat_confidence.abs().sum().item()) == 0.0
+            assert float(dynamic_confidence.abs().sum().item()) == 0.0
+            assert torch.equal(flat_rotation, identity)
+            assert torch.equal(dynamic_rotation, identity)
+        return self.RunRegressionCheck(
+            "VisualRotationDegeneracy",
+            Check)
+
     def TestHierarchicalMotionDecomposition(self):
         def check():
             embed_dim = 32
@@ -9635,6 +10247,8 @@ class TestPerceptionMTool:
             "SpatialFrequencyEntropyAndCorticalSelectivity": self.TestSpatialFrequencyEntropyAndCorticalSelectivity(),
             "ParvoMagnoSeparation": self.TestParvoMagnoSeparation(),
             "RotationStabilizedCorticalMotion": self.TestRotationStabilizedCorticalMotion(),
+            "VisualRotationFallbackSelection": self.TestVisualRotationFallbackSelection(),
+            "VisualRotationDegeneracy": self.TestVisualRotationDegeneracy(),
             "HierarchicalMotionDecomposition": self.TestHierarchicalMotionDecomposition(),
             "PerceptionParameterNonDecrease": self.TestPerceptionParameterNonDecrease(),
             "VentralDorsalStreamIsolation": self.TestVentralDorsalStreamIsolation(),
