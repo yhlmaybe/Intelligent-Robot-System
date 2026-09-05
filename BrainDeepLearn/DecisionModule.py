@@ -606,7 +606,9 @@ class DecisionExtractor(AGICoreModule):
         self.action_embed_dim = int(actionEmbedDim)
         self.mapper_hidden_dim = int(mapperEmbedDim)
         self.num_options = int(optionNum)
-        self.assist_option_id = int(assistOptionId)
+        self.register_buffer(
+            "AssistOptionIndex",
+            torch.tensor(int(assistOptionId), dtype=torch.long))
         self.psi_dim = int(psiDim)
         self.plan_feature_dim = int(planFeatureDim)
         self.subgoal_feature_dim = int(subgoalFeatureDim)
@@ -785,6 +787,12 @@ class DecisionExtractor(AGICoreModule):
             self.num_options,
             bias=False)
         nn.init.zeros_(self.stateless_option_latent_head.weight)
+
+    def AssistOptionMask(
+        self,
+        optionIndex: torch.Tensor,
+    ) -> torch.Tensor:
+        return optionIndex.eq(self.AssistOptionIndex)
 
     def OptionLogits(
         self,
@@ -2768,13 +2776,43 @@ class TestDecisionMTool:
                 model.num_options,
                 device=self.device))
             return bool(
-                model.assist_option_id == 4
+                int(model.AssistOptionIndex.item()) == 4
                 and invalid_assist_rejected
                 and first_written
                 and second_empty
                 and cleared
                 and tuple(prior.shape) == (batch_size, model.num_options)
                 and bool(torch.isfinite(prior).all().item()))
+        except Exception:
+            return False
+
+    def TestAssistOptionSemanticState(self) -> bool:
+        try:
+            source = self.MakeExtractor(1)
+            target = self.MakeExtractor(4)
+            option_index = torch.tensor(
+                [0, 1, 4],
+                device=self.device,
+                dtype=torch.long)
+            before = target.AssistOptionMask(option_index)
+            state = source.state_dict()
+            target.load_state_dict(state, strict=True)
+            after = target.AssistOptionMask(option_index)
+            return bool(
+                "AssistOptionIndex" in state
+                and tuple(state["AssistOptionIndex"].shape) == ()
+                and state["AssistOptionIndex"].dtype == torch.long
+                and torch.equal(
+                    before,
+                    torch.tensor(
+                        [False, False, True],
+                        device=self.device))
+                and torch.equal(
+                    after,
+                    torch.tensor(
+                        [False, True, False],
+                        device=self.device))
+                and int(target.AssistOptionIndex.item()) == 1)
         except Exception:
             return False
 
@@ -3015,6 +3053,7 @@ class TestDecisionMTool:
             "NeuroSymbolicRefinementAndGradient": (
                 self.TestNeuroSymbolicRefinementAndGradient()),
             "OptionAndEligibilityState": self.TestOptionAndEligibilityState(),
+            "AssistOptionSemanticState": self.TestAssistOptionSemanticState(),
             "DirectPolicyProbabilities": (
                 self.TestDirectPolicyProbabilities()),
             "EligibilityFreezeState": self.TestEligibilityFreezeState(),

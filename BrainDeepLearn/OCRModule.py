@@ -340,10 +340,43 @@ class CRNNRecognizer(nn.Module):
         inCh: int = 1,
         nClasses: int = 96, 
         rnnHidden: int = 256,
-        residualRank: int = 64,):
+        residualRank: int = 64,
+        orderedCharacters: Optional[Tuple[str, ...]] = None,
+        blankIndex: int = 0,):
         super().__init__()
         self.imgH = int(imgH)
         self.nClasses = int(nClasses)
+        blank_index = int(blankIndex)
+        if not 0 <= blank_index < self.nClasses:
+            raise ValueError("OCR blank index must belong to the character set")
+        if orderedCharacters is None:
+            codepoints = list(range(self.nClasses))
+            codepoints[blank_index] = -1
+        else:
+            if len(orderedCharacters) != self.nClasses:
+                raise ValueError("OCR ordered characters must match nClasses")
+            codepoints = []
+            for index, character in enumerate(orderedCharacters):
+                if index == blank_index:
+                    if character != "<blank>":
+                        raise ValueError("OCR blank character is misplaced")
+                    codepoints.append(-1)
+                else:
+                    if type(character) is not str or len(character) != 1:
+                        raise ValueError("OCR characters must be single code points")
+                    codepoints.append(ord(character))
+            non_blank = tuple(
+                value for value in codepoints if value >= 0)
+            if len(set(non_blank)) != len(non_blank):
+                raise ValueError("OCR characters must be unique")
+        self.register_buffer(
+            "CharacterCodepoints",
+            torch.tensor(codepoints, dtype=torch.long),
+            persistent=True)
+        self.register_buffer(
+            "BlankIndexState",
+            torch.tensor(blank_index, dtype=torch.long),
+            persistent=True)
 
         self.conv1 = nn.Sequential(
             nn.Conv2d(inCh, 64, 3, 1, 1),
@@ -393,11 +426,61 @@ class CRNNRecognizer(nn.Module):
 
         self.fc = nn.Linear(rnnHidden * 2, self.nClasses)
 
-        self.ctcLoss = nn.CTCLoss(blank=0, reduction="none", zero_infinity=True)
+        self.ctcLoss = nn.CTCLoss(
+            blank=blank_index,
+            reduction="none",
+            zero_infinity=True)
         self.residualHead = LowRankCTCResidualHead(
             inDim=512,
             rank=int(residualRank),
             nClasses=self.nClasses,) if int(residualRank) > 0 else None
+        self._IndexToCharacter: Tuple[str, ...] = ()
+        self._CharacterToIndex: Dict[str, int] = {}
+        self.register_load_state_dict_post_hook(self.RefreshCharacterState)
+        self.RefreshCharacterState(self, None)
+
+    def RefreshCharacterState(
+        self,
+        module: nn.Module,
+        incompatibleKeys: Any,
+    ) -> None:
+        blank_index = int(self.BlankIndexState.item())
+        codepoints = tuple(
+            int(value)
+            for value in self.CharacterCodepoints.detach().cpu().tolist())
+        if (
+            tuple(self.CharacterCodepoints.shape) != (self.nClasses,)
+            or not 0 <= blank_index < self.nClasses
+            or codepoints[blank_index] != -1
+            or any(
+                value < 0 or value > 0x10FFFF
+                for index, value in enumerate(codepoints)
+                if index != blank_index)
+        ):
+            raise ValueError("OCR character state is invalid")
+        ordered = tuple(
+            "<blank>" if index == blank_index else chr(value)
+            for index, value in enumerate(codepoints))
+        non_blank = tuple(
+            character
+            for index, character in enumerate(ordered)
+            if index != blank_index)
+        if len(set(non_blank)) != len(non_blank):
+            raise ValueError("OCR character state contains duplicates")
+        self._IndexToCharacter = ordered
+        self._CharacterToIndex = {
+            character: index
+            for index, character in enumerate(ordered)}
+        self.ctcLoss.blank = blank_index
+
+    def IndexToCharacter(self) -> Tuple[str, ...]:
+        return self._IndexToCharacter
+
+    def CharacterToIndex(self) -> Dict[str, int]:
+        return self._CharacterToIndex
+
+    def BlankIndex(self) -> int:
+        return int(self.BlankIndexState.item())
 
     def EncodeVisual(self, imgsTensor: torch.Tensor) -> torch.Tensor:
         x = self.conv1(imgsTensor)
@@ -527,24 +610,25 @@ class OCREngineExtractor(nn.Module):
         self.dbHead = DBHead(inCh=256)
         self.dbLoss = DBLoss()
 
-        self.blankIndex = 0
         vocabChars = self.LoadOcrVocabFromTxt(vocabCharsPath)
-        self.idx2Char = ["<blank>"] + list(vocabChars)
-        self.char2Idx = {c: i for i, c in enumerate(self.idx2Char)}
+        ordered_characters = ("<blank>", *tuple(vocabChars))
+        self.recognizer = CRNNRecognizer(
+            imgH=32,
+            inCh=1,
+            nClasses=len(ordered_characters),
+            rnnHidden=256,
+            orderedCharacters=ordered_characters,
+            blankIndex=0,)
 
-        self.recognizer = CRNNRecognizer(imgH=32,inCh=1, nClasses=len(self.idx2Char), rnnHidden=256,)
 
+    def IndexToCharacter(self) -> Tuple[str, ...]:
+        return self.recognizer.IndexToCharacter()
 
-    def OcrMetadata(self) -> Dict[str, Any]:
-        return {
-            "vocab": list(self.idx2Char),
-            "blank_index": int(self.blankIndex),
-            "addon_cfg": {
-                "db_residual": self.dbHead.residual is not None,
-                "rec_residual_rank": (
-                    int(self.recognizer.residualHead.down.out_features)
-                    if self.recognizer.residualHead is not None else 0),
-                "width_aware_ctc": True,},}
+    def CharacterToIndex(self) -> Dict[str, int]:
+        return self.recognizer.CharacterToIndex()
+
+    def BlankIndex(self) -> int:
+        return self.recognizer.BlankIndex()
 
     def LoadOcrVocabFromTxt(self, dictPath: str, *, encoding: str = "utf-8") -> str:
         chars: List[str] = []
@@ -785,9 +869,7 @@ class OCREngineExtractor(nn.Module):
                 if line_imgs.size(0) != 0:
                     rec_out = self.ForwardRecognize(line_imgs, validWidths=valid_widths)
                     pairs = self.CtcGreedyDecodeWithConf(
-                        rec_out["log_probs"],
-                        idx2Char=self.idx2Char,
-                        blankIndex=self.blankIndex)
+                        rec_out["log_probs"])
 
                     h_map, w_map = pm.shape[-2], pm.shape[-1]
                     pm_np = pm.detach().cpu().squeeze(0).numpy() 
@@ -902,9 +984,11 @@ class OCREngineExtractor(nn.Module):
 
     def CtcGreedyDecodeWithConf(
         self,
-        logProbs: torch.Tensor, 
-        idx2Char: List[str],
-        blankIndex: int = 0,) -> List[tuple[str, float]]:
+        logProbs: torch.Tensor,) -> List[tuple[str, float]]:
+        idx_to_character = self.IndexToCharacter()
+        blank_index = self.BlankIndex()
+        if int(logProbs.size(-1)) != len(idx_to_character):
+            raise ValueError("OCR logits do not match the character state")
         preds = logProbs.argmax(dim=-1) 
         chosen_lp = logProbs.gather(dim=-1, index=preds.unsqueeze(-1)).squeeze(-1) 
         chosen_p = torch.exp(chosen_lp).clamp(0.0, 1.0)  
@@ -920,12 +1004,12 @@ class OCREngineExtractor(nn.Module):
             chars: List[str] = []
             confs: List[float] = []
             for idx, p in zip(seq, pseq):
-                if idx == blankIndex:
+                if idx == blank_index:
                     prev = None
                     continue
                 if prev == idx:
                     continue
-                chars.append(idx2Char[idx])
+                chars.append(idx_to_character[idx])
                 confs.append(float(p))
                 prev = idx
             text = "".join(chars)
@@ -1502,6 +1586,56 @@ class TestOCRMTool:
             print("EngineJointTrainGradCoverage error:", e)
             return False
 
+    def VocabularyStateRoundTrip(self) -> bool:
+        try:
+            source = CRNNRecognizer(
+                imgH=32,
+                inCh=1,
+                nClasses=3,
+                rnnHidden=4,
+                residualRank=0,
+                orderedCharacters=("甲", "乙", "<blank>"),
+                blankIndex=2,).to(self.device)
+            target = CRNNRecognizer(
+                imgH=32,
+                inCh=1,
+                nClasses=3,
+                rnnHidden=4,
+                residualRank=0,
+                orderedCharacters=("<blank>", "乙", "甲"),
+                blankIndex=0,).to(self.device)
+            source_engine = OCREngineExtractor.__new__(OCREngineExtractor)
+            nn.Module.__init__(source_engine)
+            source_engine.recognizer = source
+            target_engine = OCREngineExtractor.__new__(OCREngineExtractor)
+            nn.Module.__init__(target_engine)
+            target_engine.recognizer = target
+            target_engine.load_state_dict(source_engine.state_dict(), strict=True)
+            logits = torch.full(
+                (3, 1, 3),
+                -8.0,
+                device=self.device)
+            logits[0, 0, 0] = 8.0
+            logits[1, 0, 2] = 8.0
+            logits[2, 0, 1] = 8.0
+            decoded = target_engine.CtcGreedyDecodeWithConf(
+                F.log_softmax(logits, dim=-1))
+            mapping = target_engine.CharacterToIndex()
+            ok = (
+                target_engine.IndexToCharacter() == ("甲", "乙", "<blank>")
+                and target_engine.BlankIndex() == 2
+                and target.ctcLoss.blank == 2
+                and mapping["甲"] == 0
+                and mapping["乙"] == 1
+                and decoded[0][0] == "甲乙")
+            print(
+                f"VocabularyStateRoundTrip "
+                f"{'passed' if ok else 'failed'}")
+            return bool(ok)
+        except Exception as e:
+            print("VocabularyStateRoundTrip error:", e)
+            return False
+
 
     def RunAll(self) -> Dict[str, bool]:
         results = {
@@ -1513,7 +1647,8 @@ class TestOCRMTool:
             "EngineForwardDetectAndLoss": self.EngineForwardDetectAndLoss(),
             "EngineForwardRecognizeAndLoss": self.EngineForwardRecognizeAndLoss(),
             "EngineFullForwardPipeline": self.EngineFullForwardPipeline(),
-            "EngineJointTrainGradCoverage": self.EngineJointTrainGradCoverage(),}
+            "EngineJointTrainGradCoverage": self.EngineJointTrainGradCoverage(),
+            "VocabularyStateRoundTrip": self.VocabularyStateRoundTrip(),}
         
         passed = sum(1 for v in results.values() if v)
         print(f"\nOCR module tests: {passed}/{len(results)} passed.")

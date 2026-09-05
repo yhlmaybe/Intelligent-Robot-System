@@ -84,99 +84,6 @@ def BuildReferenceScaleContext(
         unresolved], dim=-1)
 
 
-@torch.no_grad()
-def SynchronizeDynamicAdapterTopology(
-    module: nn.Module,
-    stateDict: Dict[str, Any],
-    prefix: str,
-    shapeValidator: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], bool],
-    *,
-    authoritative: bool,) -> int:
-    names = ("A_list", "B_list", "alpha")
-    topology_key = f"{prefix}topology_count"
-
-    def SavedIndices(name: str) -> set[int]:
-        key_prefix = f"{prefix}{name}."
-        return {
-            int(str(key)[len(key_prefix):])
-            for key in stateDict
-            if str(key).startswith(key_prefix)
-            and str(key)[len(key_prefix):].isdigit()}
-
-    index_sets = [SavedIndices(name) for name in names]
-    marker_present = topology_key in stateDict
-    label = prefix[:-1] or module.__class__.__name__
-    if not any(index_sets):
-        if not marker_present:
-            if authoritative:
-                raise ValueError(f"{label} is missing required topology_count")
-            return 0
-        saved_count = int(torch.as_tensor(stateDict[topology_key]).item())
-        if saved_count != 0:
-            raise ValueError(
-                f"{label} topology_count={saved_count} has no adapter entries")
-        replaced = len(module.A_list)
-        module.A_list = nn.ParameterList()
-        module.B_list = nn.ParameterList()
-        module.alpha = nn.ParameterList()
-        module.topology_count.zero_()
-        return replaced
-
-    expected = set(range(len(index_sets[0])))
-    if any(indices != expected for indices in index_sets):
-        raise ValueError(
-            f"{label} has inconsistent dynamic adapter topology: "
-            f"A={sorted(index_sets[0])}, B={sorted(index_sets[1])}, "
-            f"alpha={sorted(index_sets[2])}")
-    if not marker_present:
-        raise ValueError(f"{label} is missing required topology_count")
-    saved_count = int(torch.as_tensor(stateDict[topology_key]).item())
-    if saved_count != len(expected):
-        raise ValueError(
-            f"{label} topology_count={saved_count} does not match "
-            f"{len(expected)} saved adapter entries")
-
-    saved_shapes = []
-    for index in sorted(expected):
-        a_value = stateDict[f"{prefix}A_list.{index}"]
-        b_value = stateDict[f"{prefix}B_list.{index}"]
-        scale = stateDict[f"{prefix}alpha.{index}"]
-        if (
-            not all(torch.is_tensor(value) for value in (a_value, b_value, scale))
-            or not shapeValidator(a_value, b_value, scale)
-        ):
-            raise ValueError(
-                f"{label} dynamic adapter entry {index} has invalid shapes")
-        saved_shapes.append((int(a_value.size(0)), tuple(scale.shape)))
-
-    current_shapes = [
-        (int(a_value.size(0)), tuple(scale.shape))
-        for a_value, scale in zip(module.A_list, module.alpha)]
-    if (
-        len(module.A_list) == len(module.B_list) == len(module.alpha)
-        and current_shapes == saved_shapes
-    ):
-        module.topology_count.fill_(len(saved_shapes))
-        return 0
-
-    replaced = len(module.A_list)
-    module.A_list = nn.ParameterList()
-    module.B_list = nn.ParameterList()
-    module.alpha = nn.ParameterList()
-    reference = (
-        module.target.weight
-        if hasattr(module, "target")
-        else module.anchor_)
-    for rank, scale_shape in saved_shapes:
-        scale = torch.zeros(
-            scale_shape,
-            device=reference.device,
-            dtype=reference.dtype)
-        module.Grow(rank, init={"scale": scale}, freezeOld=True)
-    module.topology_count.fill_(len(saved_shapes))
-    return replaced
-
-
 class DynamicAdapterTopologyMixin:
     def ValidateDynamicAdapterEntry(
         self,
@@ -185,6 +92,107 @@ class DynamicAdapterTopologyMixin:
         scale: torch.Tensor,) -> bool:
         raise NotImplementedError
 
+    def ReadCommittedTopology(
+        self,
+        stateDict: Dict[str, Any],
+        prefix: str,
+        *,
+        authoritative: bool,
+    ) -> Optional[Tuple[Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]], ...]]:
+        names = ("A_list", "B_list", "alpha")
+        label = prefix[:-1] or self.__class__.__name__
+        index_sets = []
+        for name in names:
+            key_prefix = f"{prefix}{name}."
+            suffixes = [
+                str(key)[len(key_prefix):]
+                for key in stateDict
+                if str(key).startswith(key_prefix)]
+            if any(not suffix.isdigit() for suffix in suffixes):
+                raise ValueError(f"{label} has an invalid dynamic adapter key")
+            index_sets.append({int(suffix) for suffix in suffixes})
+
+        if not any(index_sets):
+            return tuple() if authoritative else None
+
+        expected = set(range(len(index_sets[0])))
+        if any(indices != expected for indices in index_sets):
+            raise ValueError(
+                f"{label} has inconsistent dynamic adapter topology: "
+                f"A={sorted(index_sets[0])}, B={sorted(index_sets[1])}, "
+                f"alpha={sorted(index_sets[2])}")
+
+        saved_shapes = []
+        reference = self.target.weight if hasattr(self, "target") else self.anchor_
+        for index in sorted(expected):
+            a_value = stateDict[f"{prefix}A_list.{index}"]
+            b_value = stateDict[f"{prefix}B_list.{index}"]
+            scale = stateDict[f"{prefix}alpha.{index}"]
+            if (
+                not all(torch.is_tensor(value) for value in (a_value, b_value, scale))
+                or a_value.ndim == 0
+                or int(a_value.size(0)) <= 0
+                or any(
+                    value.dtype != reference.dtype
+                    for value in (a_value, b_value, scale))
+                or not self.ValidateDynamicAdapterEntry(a_value, b_value, scale)
+            ):
+                raise ValueError(
+                    f"{label} dynamic adapter entry {index} is incompatible")
+            saved_shapes.append((
+                tuple(a_value.shape),
+                tuple(b_value.shape),
+                tuple(scale.shape)))
+        return tuple(saved_shapes)
+
+    @torch.no_grad()
+    def ApplyCommittedTopology(
+        self,
+        savedShapes: Tuple[
+            Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]], ...],
+    ) -> int:
+        current_shapes = tuple(
+            (tuple(a_value.shape), tuple(b_value.shape), tuple(scale.shape))
+            for a_value, b_value, scale in zip(
+                self.A_list,
+                self.B_list,
+                self.alpha))
+        if (
+            len(self.A_list) == len(self.B_list) == len(self.alpha)
+            and current_shapes == savedShapes
+        ):
+            return 0
+
+        replaced = len(self.A_list)
+        self.A_list = nn.ParameterList()
+        self.B_list = nn.ParameterList()
+        self.alpha = nn.ParameterList()
+        reference = self.target.weight if hasattr(self, "target") else self.anchor_
+        for a_shape, _, scale_shape in savedShapes:
+            scale = torch.zeros(
+                scale_shape,
+                device=reference.device,
+                dtype=reference.dtype)
+            self.Grow(int(a_shape[0]), init={"scale": scale}, freezeOld=True)
+        return replaced
+
+    def CaptureCommittedTopology(self) -> Tuple[
+        nn.ParameterList,
+        nn.ParameterList,
+        nn.ParameterList,
+    ]:
+        return self.A_list, self.B_list, self.alpha
+
+    def RestoreCommittedTopology(
+        self,
+        topology: Tuple[
+            nn.ParameterList,
+            nn.ParameterList,
+            nn.ParameterList,
+        ],
+    ) -> None:
+        self.A_list, self.B_list, self.alpha = topology
+
     @torch.no_grad()
     def SynchronizeCommittedTopology(
         self,
@@ -192,12 +200,13 @@ class DynamicAdapterTopologyMixin:
         prefix: str,
         *,
         authoritative: bool,) -> int:
-        return SynchronizeDynamicAdapterTopology(
-            self,
+        saved_shapes = self.ReadCommittedTopology(
             stateDict,
             prefix,
-            self.ValidateDynamicAdapterEntry,
             authoritative=authoritative)
+        if saved_shapes is None:
+            return 0
+        return self.ApplyCommittedTopology(saved_shapes)
 
     def _load_from_state_dict(
         self,
@@ -236,10 +245,6 @@ class GrowableLoRALinear(DynamicAdapterTopologyMixin, nn.Module):
         self.A_list = nn.ParameterList()
         self.B_list = nn.ParameterList()
         self.alpha = nn.ParameterList()
-        self.register_buffer(
-            "topology_count",
-            torch.zeros((), dtype=torch.int64),
-            persistent=True)
 
     def ValidateDynamicAdapterEntry(
         self,
@@ -274,7 +279,6 @@ class GrowableLoRALinear(DynamicAdapterTopologyMixin, nn.Module):
         self.A_list.append(A)
         self.B_list.append(B)
         self.alpha.append(s)
-        self.topology_count.fill_(len(self.A_list))
 
     def DeltaWeight(self) -> Optional[torch.Tensor]:
         if len(self.A_list) == 0:
@@ -298,16 +302,30 @@ def SynchronizeDynamicAdapterTopologiesForFullLoad(
     root: nn.Module,
     stateDict: Dict[str, Any],
     ) -> int:
-    cleared = 0
+    planned = []
     for module_name, module in root.named_modules():
         if not isinstance(module, DynamicAdapterTopologyMixin):
             continue
         prefix = f"{module_name}." if module_name else ""
-        cleared += module.SynchronizeCommittedTopology(
-            stateDict,
-            prefix,
-            authoritative=True)
-    return cleared
+        planned.append((
+            module,
+            module.ReadCommittedTopology(
+                stateDict,
+                prefix,
+                authoritative=True)))
+
+    snapshots = [
+        (module, module.CaptureCommittedTopology())
+        for module, _ in planned]
+    try:
+        cleared = 0
+        for module, saved_shapes in planned:
+            cleared += module.ApplyCommittedTopology(saved_shapes)
+        return cleared
+    except Exception:
+        for module, topology in snapshots:
+            module.RestoreCommittedTopology(topology)
+        raise
 
 
 @dataclass
@@ -325,7 +343,7 @@ class SiteSpec:
 class AGICoreModule(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
-        self.register_buffer("anchor_", torch.empty(0), persistent=True)
+        self.register_buffer("anchor_", torch.empty(0), persistent=False)
 
     @property
     def device(self):
@@ -783,24 +801,18 @@ class BaseOnlineWrapper(nn.Module):
                     for layerIdx in range(self.layerCount)]
                 for name in self.sites}
         return {
-            "site_names": tuple(self.sites),
             "layers": layers,
             "grad_ema": grad_ema,}
 
     def ValidateCandidateState(self, state: Dict[str, Any]) -> None:
         if type(state) is not dict or set(state) != {
-            "site_names",
             "layers",
             "grad_ema",
         }:
             raise TypeError(
                 "online candidate state fields do not match the current schema")
-        site_names = state["site_names"]
-        if type(site_names) is not tuple or site_names != tuple(self.sites):
-            raise ValueError(
-                "online candidate sites do not match the current wrapper")
         layers = state["layers"]
-        if type(layers) is not dict or tuple(layers) != tuple(self.sites):
+        if type(layers) is not dict or set(layers) != set(self.sites):
             raise ValueError(
                 "online candidate layer sites do not match the current wrapper")
         for name, spec in self.sites.items():
@@ -863,20 +875,19 @@ class BaseOnlineWrapper(nn.Module):
                         raise ValueError(
                             "online candidate tensor shapes do not match the site")
                     if any(
-                        not value.dtype.is_floating_point
+                        value.dtype != self.dtypeRef
                         or not bool(torch.isfinite(value).all().item())
                         for value in (a_value, b_value, s_value)
                     ):
                         raise ValueError(
-                            "online candidate tensors must be finite floating point")
+                            "online candidate tensor dtype does not match the wrapper")
                 if sum(int(value.size(0)) for value in a_values) > spec.maxRank:
                     raise ValueError(
                         "online candidate state exceeds the site rank limit")
         grad_ema = state["grad_ema"]
         if grad_ema is None:
             return
-        if type(grad_ema) is not dict or tuple(
-            grad_ema) != tuple(self.sites):
+        if type(grad_ema) is not dict or set(grad_ema) != set(self.sites):
             raise ValueError(
                 "online candidate gradient EMA sites do not match the wrapper")
         for name in self.sites:
@@ -908,7 +919,7 @@ class BaseOnlineWrapper(nn.Module):
                             or saved_value.layout != torch.strided
                             or tuple(saved_value.shape)
                             != tuple(expected_value.shape)
-                            or not saved_value.dtype.is_floating_point
+                            or saved_value.dtype != self.dtypeRef
                             or not bool(torch.isfinite(
                                 saved_value).all().item())
                         ):
@@ -918,12 +929,10 @@ class BaseOnlineWrapper(nn.Module):
     @torch.no_grad()
     def ImportCandidateState(self, state: Dict[str, Any]) -> None:
         self.ValidateCandidateState(state)
-        if type(state) is not dict or set(state) != {"site_names", "layers", "grad_ema"}:
+        if type(state) is not dict or set(state) != {"layers", "grad_ema"}:
             raise TypeError("online candidate state fields do not match the current schema")
-        if tuple(state["site_names"]) != tuple(self.sites):
-            raise ValueError("online candidate sites do not match the current wrapper")
         layers = state["layers"]
-        if type(layers) is not dict or tuple(layers) != tuple(self.sites):
+        if type(layers) is not dict or set(layers) != set(self.sites):
             raise ValueError("online candidate layer sites do not match the current wrapper")
 
         self.InitCandidates(0)
@@ -976,7 +985,7 @@ class BaseOnlineWrapper(nn.Module):
         if grad_ema is None:
             self.gradEmaBuf = None
             return
-        if type(grad_ema) is not dict or tuple(grad_ema) != tuple(self.sites):
+        if type(grad_ema) is not dict or set(grad_ema) != set(self.sites):
             raise ValueError("online candidate gradient EMA sites do not match the wrapper")
         restored_ema: Dict[str, List[Dict[str, List[Optional[torch.Tensor]]]]] = {}
         for name in self.sites:
@@ -1327,6 +1336,15 @@ class TestFunctionToolsMTool:
                 name: value.detach().clone()
                 for name, value in source.base.state_dict().items()}
             candidate_state = source.ExportCandidateState()
+            assert set(candidate_state) == {"layers", "grad_ema"}
+            invalid_sites = {
+                "layers": {"unexpected": candidate_state["layers"]["adapter"]},
+                "grad_ema": candidate_state["grad_ema"],}
+            try:
+                source.ValidateCandidateState(invalid_sites)
+                raise AssertionError("candidate layer keys were not validated")
+            except ValueError:
+                pass
             optimizer_state = source_optimizer.state_dict()
             expected = source(sample).detach()
 
@@ -1474,6 +1492,7 @@ class TestFunctionToolsMTool:
             sample = torch.randn(5, 3)
             expected = source_base.adapter(sample).detach()
             saved = source_base.state_dict()
+            assert "anchor_" not in saved
 
             restored_base = _TestOnlineBase()
             restored_base.load_state_dict(saved, strict=True)
@@ -1486,6 +1505,58 @@ class TestFunctionToolsMTool:
             return True
         except Exception as e:
             print(f"GrowableLoRA commit/save/strict-load test failed: {type(e).__name__}: {e}")
+            return False
+
+    def TestFullStateTopologyValidationIsAtomic(self) -> bool:
+        try:
+            class AdapterPair(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.first = GrowableLoRALinear(nn.Linear(3, 2))
+                    self.second = GrowableLoRALinear(nn.Linear(3, 2))
+
+            source = AdapterPair()
+            source.first.Grow(2)
+            source.second.Grow(1)
+            malformed = dict(source.state_dict())
+            malformed["second.B_list.0"] = torch.zeros(2, 2)
+
+            restored = AdapterPair()
+            restored.first.Grow(1)
+            restored.second.Grow(2)
+            original_parameters = tuple(
+                id(parameter)
+                for adapter in (restored.first, restored.second)
+                for parameter in (
+                    *adapter.A_list,
+                    *adapter.B_list,
+                    *adapter.alpha))
+            rejected = False
+            try:
+                SynchronizeDynamicAdapterTopologiesForFullLoad(
+                    restored,
+                    malformed)
+            except ValueError:
+                rejected = True
+            remaining_parameters = tuple(
+                id(parameter)
+                for adapter in (restored.first, restored.second)
+                for parameter in (
+                    *adapter.A_list,
+                    *adapter.B_list,
+                    *adapter.alpha))
+            assert rejected
+            assert original_parameters == remaining_parameters
+            assert [len(restored.first.A_list), len(restored.second.A_list)] == [1, 1]
+            assert [
+                int(restored.first.A_list[0].size(0)),
+                int(restored.second.A_list[0].size(0))] == [1, 2]
+            print("Full state topology atomic validation test passed.")
+            return True
+        except Exception as e:
+            print(
+                "Full state topology atomic validation test failed: "
+                f"{type(e).__name__}: {e}")
             return False
 
     def TestHungarianRejectsNonFiniteCost(self) -> bool:
@@ -1508,6 +1579,7 @@ class TestFunctionToolsMTool:
             "OnlineCandidateCheckpointRoundTrip": self.TestOnlineCandidateCheckpointRoundTrip(),
             "FullStateLoadClearsAbsentCommittedTopology": self.TestFullStateLoadClearsAbsentCommittedTopology(),
             "GrowableLoRACommitSaveStrictLoad": self.TestGrowableLoRACommitSaveStrictLoad(),
+            "FullStateTopologyValidationIsAtomic": self.TestFullStateTopologyValidationIsAtomic(),
             "OnlineWrapperStrictLoadRestoresBaseTrainability": self.TestOnlineWrapperStrictLoadRestoresBaseTrainability(),
             "OnlineWrapperZeroGradIncludesCandidates": self.TestOnlineWrapperZeroGradIncludesCandidates(),
             "OnlineWrapperRankZeroSurvivesNextOptimizerStep": self.TestOnlineWrapperRankZeroSurvivesNextOptimizerStep(),

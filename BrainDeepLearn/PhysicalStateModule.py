@@ -53,11 +53,24 @@ class ContractPhysicalStateAdapter(nn.Module):
         self.register_buffer(
             "StaticJointTokens",
             static_joint_tokens,
-            persistent=True)
+            persistent=False)
         self.register_buffer(
             "StaticSlotTokens",
             static_slot_tokens,
-            persistent=True)
+            persistent=False)
+        effector_joint_membership = torch.zeros(
+            contractView.end_effector_count,
+            contractView.joint_count,
+            dtype=torch.float32)
+        for endpointIndex in range(contractView.end_effector_count):
+            start = contractView.effector_joint_offsets[endpointIndex]
+            end = contractView.effector_joint_offsets[endpointIndex + 1]
+            jointIndices = contractView.effector_joint_indices[start:end]
+            effector_joint_membership[endpointIndex, jointIndices] = 1.0
+        self.register_buffer(
+            "EffectorJointMembership",
+            effector_joint_membership,
+            persistent=False)
         self.JointStaticAdapter = nn.Linear(
             contractView.model_shape.joint_static_descriptor_dim,
             self.BodyDim)
@@ -156,6 +169,25 @@ class ContractPhysicalStateAdapter(nn.Module):
             keepdim=True).clamp_min(1.0)
         return joint_tokens, joint_weight, joint_summary
 
+    def EncodeEndpointBody(
+        self,
+        jointTokens: torch.Tensor,
+        jointWeight: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        membership = self.EffectorJointMembership.to(
+            device=jointTokens.device,
+            dtype=jointTokens.dtype)
+        endpoint_joint_weight = (
+            jointWeight.unsqueeze(1) * membership.unsqueeze(0))
+        weight_sum = endpoint_joint_weight.sum(dim=-1)
+        endpoint_body_tokens = torch.bmm(
+            endpoint_joint_weight,
+            jointTokens) / weight_sum.unsqueeze(-1).clamp_min(1.0)
+        endpoint_weight = weight_sum.gt(0.0).to(dtype=jointTokens.dtype)
+        return (
+            endpoint_body_tokens * endpoint_weight.unsqueeze(-1),
+            endpoint_weight)
+
     def EncodeEndpointState(
         self,
         feedback: BrainFeedbackPacket,
@@ -194,34 +226,40 @@ class ContractPhysicalStateAdapter(nn.Module):
 
     def EncodeControlFeedback(
         self,
-        jointSummary: torch.Tensor,
+        endpointBodyTokens: torch.Tensor,
         endpointStatus: torch.Tensor,
         slotWeight: torch.Tensor,
     ) -> torch.Tensor:
         static = self.ControlStaticAdapter(
             self.StaticSlotTokens.to(
-                device=jointSummary.device,
-                dtype=jointSummary.dtype)).unsqueeze(0)
+                device=endpointBodyTokens.device,
+                dtype=endpointBodyTokens.dtype)).unsqueeze(0)
         endpoint_tokens = (
-            static + self.ControlActivityAdapter(endpointStatus))
+            self.ControlJointAdapter(endpointBodyTokens)
+            + static
+            + self.ControlActivityAdapter(endpointStatus))
         endpoint_summary = (
             endpoint_tokens * slotWeight.unsqueeze(-1)
         ).sum(dim=1) / slotWeight.sum(dim=1, keepdim=True).clamp_min(1.0)
-        return self.ControlOutputNorm(
-            self.ControlJointAdapter(jointSummary) + endpoint_summary)
+        return self.ControlOutputNorm(endpoint_summary)
 
     def EncodeEmbodimentContext(
         self,
-        jointSummary: torch.Tensor,
+        endpointBodyTokens: torch.Tensor,
         bodySummary: torch.Tensor,
-        jointWeight: torch.Tensor,
+        endpointWeight: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        context_valid = jointWeight.gt(0.0).any(dim=-1)
+        context_valid = endpointWeight.gt(0.0).any(dim=-1)
+        endpoint_body_summary = (
+            endpointBodyTokens * endpointWeight.unsqueeze(-1)
+        ).sum(dim=1) / endpointWeight.sum(
+            dim=1,
+            keepdim=True).clamp_min(1.0)
         valid_feature = (
-            self.ContextJointAdapter(jointSummary)
+            self.ContextJointAdapter(endpoint_body_summary)
             + self.ContextEndpointAdapter(bodySummary))
         invalid_feature = self.InvalidContextState.unsqueeze(0).expand(
-            jointSummary.size(0), -1)
+            endpointBodyTokens.size(0), -1)
         context_feature = torch.where(
             context_valid.unsqueeze(-1),
             valid_feature,
@@ -234,6 +272,9 @@ class ContractPhysicalStateAdapter(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         joint_tokens, joint_weight, joint_summary = self.EncodeJointState(
             feedback)
+        endpoint_body_tokens, endpoint_joint_weight = self.EncodeEndpointBody(
+            joint_tokens,
+            joint_weight)
         endpoint_dynamic, endpoint_state_present = self.EncodeEndpointState(
             feedback)
         static = self.StaticAdapter(
@@ -245,21 +286,25 @@ class ContractPhysicalStateAdapter(nn.Module):
             feedback.endpoint_present,
             dtype=endpoint_dynamic.dtype)
         slot_tokens = self.OutputNorm(
-            endpoint_dynamic + static + self.StatusAdapter(status))
+            endpoint_dynamic
+            + endpoint_body_tokens
+            + static
+            + self.StatusAdapter(status))
         slot_tokens = slot_tokens * slot_weight.unsqueeze(-1)
         body_summary = slot_tokens.sum(dim=1) / slot_weight.sum(
             dim=1,
             keepdim=True).clamp_min(1.0)
         control_feedback = self.EncodeControlFeedback(
-            joint_summary,
+            endpoint_body_tokens,
             status,
             torch.ones_like(slot_weight))
         context_feature, context_valid = self.EncodeEmbodimentContext(
-            joint_summary,
+            endpoint_body_tokens,
             body_summary,
-            joint_weight)
+            endpoint_joint_weight)
         return {
             "SlotBodyTokens": slot_tokens,
+            "EndpointBodyTokens": endpoint_body_tokens,
             "BodySummary": body_summary,
             "SlotWeight": slot_weight,
             "JointStateTokens": joint_tokens,

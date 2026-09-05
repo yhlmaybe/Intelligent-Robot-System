@@ -1929,8 +1929,6 @@ class ObjectUsageBank(AGICoreModule):
 
 
 class MemoryExtractor(AGICoreModule):
-    DURABLE_MEMORY_ARTIFACT_TYPE = "MemoryExtractorDurableMemory"
-    DURABLE_MEMORY_SCHEMA_VERSION = 6
     COUNTERFACTUAL_PREDICTED_REWARD = 0
     COUNTERFACTUAL_CORRECTED_REWARD = 1
     COUNTERFACTUAL_PREDICTED_DONE = 2
@@ -1944,7 +1942,7 @@ class MemoryExtractor(AGICoreModule):
         "time_step",
         "memory_filled",
         "memory_version",
-        "merged_delta_signature",
+        "merged_delta_transaction",
         "memory_keys",
         "memory_values",
         "memory_importance",
@@ -2056,7 +2054,7 @@ class MemoryExtractor(AGICoreModule):
     FULL_MEMORY_STATE_FIELDS = DURABLE_MEMORY_STATE_FIELDS + TRANSIENT_MEMORY_STATE_FIELDS
     UNBATCHED_MEMORY_STATE_FIELDS = (
         "memory_version",
-        "merged_delta_signature",
+        "merged_delta_transaction",
         "pattern_usage",
         "usage_applicable",
         "usage_default_params",
@@ -2190,7 +2188,7 @@ class MemoryExtractor(AGICoreModule):
         self.register_buffer("memory_reward_abs", torch.zeros(B0, memorySize))
         self.register_buffer("memory_version", torch.zeros((), dtype=torch.long))
         self.register_buffer(
-            "merged_delta_signature",
+            "merged_delta_transaction",
             torch.full((3,), -1, dtype=torch.long))
 
         self.emotion_dim = int(emotionDim)
@@ -2553,7 +2551,6 @@ class MemoryExtractor(AGICoreModule):
         self._plan_cache: Dict[str, Dict[str, Any]] = {}
         self._skill_cache: Dict[str, Dict[str, Any]] = {}
         self._offline_replay: List[Dict[str, Any]] = []
-        self._replay_signature: Optional[str] = None
         self._replay_sequence = 0
         self._replay_transaction_version = 0
         self._replay_timeline_version = 0
@@ -2564,15 +2561,8 @@ class MemoryExtractor(AGICoreModule):
             nn.Linear(memoryDim * 2, memoryDim),)
         nn.init.zeros_(self.counterfactual_replay_predictor[-1].weight)
         nn.init.zeros_(self.counterfactual_replay_predictor[-1].bias)
-        self._row_merge_contract_id: Optional[str] = None
-        self._row_merge_model_signature: Optional[str] = None
         self._row_merge_transactions: Dict[str, str] = {}
         self._row_merge_versions: Dict[int, Tuple[int, int]] = {}
-
-    def ValidateModelSignature(self, modelSignature: str) -> str:
-        if type(modelSignature) is not str or not modelSignature.strip():
-            raise ValueError("modelSignature must be a non-empty string")
-        return modelSignature
 
     def ValidateWriteMask(
         self,
@@ -2707,11 +2697,9 @@ class MemoryExtractor(AGICoreModule):
         self,
         planId: str,
         planFeature: torch.Tensor,
-        modelSignature: str,
         validMask: Optional[torch.Tensor] = None,
     ) -> None:
         plan_id = self.ValidateCacheKey(planId)
-        signature = self.ValidateModelSignature(modelSignature)
         if not torch.is_tensor(planFeature) or planFeature.dim() < 2:
             raise ValueError("planFeature must be a batched tensor")
         batch_size = int(planFeature.size(0))
@@ -2731,8 +2719,6 @@ class MemoryExtractor(AGICoreModule):
                     "validMask must match the plan feature batch")
             valid = validMask
         previous = self._plan_cache.get(plan_id)
-        if previous is not None and previous["modelSignature"] != signature:
-            raise ValueError("plan cache model signature mismatch")
         if previous is not None and tuple(previous["feature"].shape) != tuple(
             planFeature.shape
         ):
@@ -2774,7 +2760,6 @@ class MemoryExtractor(AGICoreModule):
             feature)
         age = torch.where(valid, torch.zeros_like(age), age)
         self._plan_cache[plan_id] = {
-            "modelSignature": signature,
             "feature": feature,
             "valid": previous_valid | valid.detach(),
             "age": age,
@@ -2782,15 +2767,11 @@ class MemoryExtractor(AGICoreModule):
 
     def RecallPlan(
         self,
-        planId: str,
-        modelSignature: str,) -> Optional[Dict[str, Any]]:
+        planId: str,) -> Optional[Dict[str, Any]]:
         plan_id = self.ValidateCacheKey(planId)
-        signature = self.ValidateModelSignature(modelSignature)
         cached = self._plan_cache.get(plan_id)
         if cached is None:
             return None
-        if cached["modelSignature"] != signature:
-            raise ValueError("plan cache model signature mismatch")
         if not bool(cached["valid"].any().item()):
             return None
         return self.CloneCognitiveRecord(cached)
@@ -2837,53 +2818,31 @@ class MemoryExtractor(AGICoreModule):
 
     def InvalidatePlan(
         self,
-        planId: str,
-        modelSignature: str,) -> None:
+        planId: str,) -> None:
         plan_id = self.ValidateCacheKey(planId)
-        signature = self.ValidateModelSignature(modelSignature)
         cached = self._plan_cache.get(plan_id)
         if cached is None:
             return
-        if cached["modelSignature"] != signature:
-            raise ValueError("plan cache model signature mismatch")
         self._plan_cache.pop(plan_id)
 
     def CacheSkill(
         self,
         skillId: str,
-        skillFeature: torch.Tensor,
-        modelSignature: str,) -> None:
+        skillFeature: torch.Tensor,) -> None:
         skill_id = self.ValidateCacheKey(skillId)
-        signature = self.ValidateModelSignature(modelSignature)
         if not torch.is_tensor(skillFeature) or skillFeature.dim() < 1:
             raise ValueError("skillFeature must be a tensor")
-        previous = self._skill_cache.get(skill_id)
-        if previous is not None and previous["modelSignature"] != signature:
-            raise ValueError("skill cache model signature mismatch")
         self._skill_cache[skill_id] = {
-            "modelSignature": signature,
             "feature": skillFeature.detach().clone(),}
 
     def RecallSkill(
         self,
-        skillId: str,
-        modelSignature: str,) -> Optional[torch.Tensor]:
+        skillId: str,) -> Optional[torch.Tensor]:
         skill_id = self.ValidateCacheKey(skillId)
-        signature = self.ValidateModelSignature(modelSignature)
         cached = self._skill_cache.get(skill_id)
         if cached is None:
             return None
-        if cached["modelSignature"] != signature:
-            raise ValueError("skill cache model signature mismatch")
         return cached["feature"].detach().clone()
-
-    def ValidateReplaySignature(self, modelSignature: str) -> str:
-        signature = self.ValidateModelSignature(modelSignature)
-        if self._replay_signature is None:
-            self._replay_signature = signature
-        elif self._replay_signature != signature:
-            raise ValueError("offline replay model signature mismatch")
-        return signature
 
     def ValidateReplayVersion(
         self,
@@ -2949,15 +2908,11 @@ class MemoryExtractor(AGICoreModule):
         kind: str,
         context: torch.Tensor,
         outcome: torch.Tensor,
-        modelSignature: str,
         *,
         confidence: Optional[torch.Tensor] = None,
         transactionVersion: int = 0,
         timelineVersion: int = 0,) -> None:
         episode_kind = self.ValidateCacheKey(kind)
-        signature = self.ValidateModelSignature(modelSignature)
-        if self._replay_signature not in (None, signature):
-            raise ValueError("offline replay model signature mismatch")
         if not torch.is_tensor(context) or context.dim() < 2:
             raise ValueError("episode context must be a batched tensor")
         if not torch.is_tensor(outcome) or outcome.dim() < 2:
@@ -2982,14 +2937,11 @@ class MemoryExtractor(AGICoreModule):
             context.device,
             context.dtype)
         self.AdvanceReplayBoundary(transaction, timeline)
-        if self._replay_signature is None:
-            self._replay_signature = signature
         self._offline_replay.append({
             "kind": episode_kind,
             "context": context.detach().clone(),
             "outcome": outcome.detach().clone(),
             "confidence": replay_confidence.detach().clone(),
-            "modelSignature": signature,
             "sequence": self._replay_sequence,
             "transactionVersion": transaction,
             "timelineVersion": timeline,})
@@ -3003,7 +2955,6 @@ class MemoryExtractor(AGICoreModule):
         context: torch.Tensor,
         coarseProgress: torch.Tensor,
         detailProgress: torch.Tensor,
-        modelSignature: str,
         *,
         confidence: Optional[torch.Tensor] = None,
         transactionVersion: int = 0,
@@ -3014,7 +2965,6 @@ class MemoryExtractor(AGICoreModule):
             "hierarchyTransition",
             context,
             torch.cat([coarse, detail], dim=-1),
-            modelSignature,
             confidence=confidence,
             transactionVersion=transactionVersion,
             timelineVersion=timelineVersion)
@@ -3023,7 +2973,6 @@ class MemoryExtractor(AGICoreModule):
         self,
         context: torch.Tensor,
         outcome: torch.Tensor,
-        modelSignature: str,
         *,
         confidence: Optional[torch.Tensor] = None,
         transactionVersion: int = 0,
@@ -3032,7 +2981,6 @@ class MemoryExtractor(AGICoreModule):
             "failure",
             context,
             outcome,
-            modelSignature,
             confidence=confidence,
             transactionVersion=transactionVersion,
             timelineVersion=timelineVersion)
@@ -3041,7 +2989,6 @@ class MemoryExtractor(AGICoreModule):
         self,
         context: torch.Tensor,
         outcome: torch.Tensor,
-        modelSignature: str,
         *,
         confidence: Optional[torch.Tensor] = None,
         transactionVersion: int = 0,
@@ -3061,7 +3008,6 @@ class MemoryExtractor(AGICoreModule):
             "counterfactual",
             context,
             outcome,
-            modelSignature,
             confidence=replay_confidence,
             transactionVersion=transactionVersion,
             timelineVersion=timelineVersion)
@@ -3069,13 +3015,11 @@ class MemoryExtractor(AGICoreModule):
     def SampleOfflineReplay(
         self,
         batchSize: int,
-        modelSignature: str,
         *,
         kind: Optional[str] = None,
         transactionVersion: Optional[int] = None,
         timelineVersion: Optional[int] = None,
         seed: Optional[int] = None,) -> List[Dict[str, Any]]:
-        self.ValidateReplaySignature(modelSignature)
         count = int(batchSize)
         if count <= 0:
             raise ValueError("batchSize must be positive")
@@ -3219,7 +3163,6 @@ class MemoryExtractor(AGICoreModule):
     def ConsumeCounterfactualReplay(
         self,
         batchSize: int,
-        modelSignature: str,
         *,
         transactionVersion: Optional[int] = None,
         timelineVersion: Optional[int] = None,
@@ -3233,7 +3176,6 @@ class MemoryExtractor(AGICoreModule):
             raise ValueError("replay seed must be a non-negative integer")
         records = self.SampleOfflineReplay(
             self.replay_capacity,
-            modelSignature,
             kind="counterfactual",
             transactionVersion=transactionVersion,
             timelineVersion=timelineVersion)
@@ -3376,7 +3318,6 @@ class MemoryExtractor(AGICoreModule):
             "planCache": self._plan_cache,
             "skillCache": self._skill_cache,
             "offlineReplay": self._offline_replay,
-            "replaySignature": self._replay_signature,
             "replaySequence": self._replay_sequence,
             "replayTransactionVersion": self._replay_transaction_version,
             "replayTimelineVersion": self._replay_timeline_version,
@@ -3386,17 +3327,14 @@ class MemoryExtractor(AGICoreModule):
         self,
         state: Dict[str, Any],
         *,
-        modelSignature: str,
         batchSize: int,
     ) -> None:
-        signature = self.ValidateModelSignature(modelSignature)
         if type(batchSize) is not int or batchSize < 1:
             raise ValueError("batchSize must be positive")
         current_fields = {
             "planCache",
             "skillCache",
             "offlineReplay",
-            "replaySignature",
             "replaySequence",
             "replayTransactionVersion",
             "replayTimelineVersion",
@@ -3410,7 +3348,6 @@ class MemoryExtractor(AGICoreModule):
         plan_cache = state["planCache"]
         skill_cache = state["skillCache"]
         offline_replay = state["offlineReplay"]
-        replay_signature = state["replaySignature"]
         replay_sequence = state["replaySequence"]
         replay_transaction = state["replayTransactionVersion"]
         replay_timeline = state["replayTimelineVersion"]
@@ -3419,8 +3356,6 @@ class MemoryExtractor(AGICoreModule):
             type(plan_cache) is not dict
             or type(skill_cache) is not dict
             or type(offline_replay) is not list
-            or replay_signature not in (None, signature)
-            or self._replay_signature not in (None, signature)
             or type(replay_sequence) is not int
             or replay_sequence < 0
         ):
@@ -3431,15 +3366,12 @@ class MemoryExtractor(AGICoreModule):
         for plan_id, cached in plan_cache.items():
             self.ValidateCacheKey(plan_id)
             if type(cached) is not dict or set(cached) != {
-                "modelSignature",
                 "feature",
                 "valid",
                 "age",
                 "version",
             }:
                 raise ValueError("plan cache record fields do not match")
-            if cached["modelSignature"] != signature:
-                raise ValueError("plan cache model signature mismatch")
             if (
                 not torch.is_tensor(cached["feature"])
                 or cached["feature"].dim() < 2
@@ -3460,14 +3392,10 @@ class MemoryExtractor(AGICoreModule):
         for skill_id, cached in skill_cache.items():
             self.ValidateCacheKey(skill_id)
             if type(cached) is not dict or set(cached) != {
-                "modelSignature",
                 "feature",
             }:
                 raise ValueError("skill cache record fields do not match")
-            if (
-                cached["modelSignature"] != signature
-                or not torch.is_tensor(cached["feature"])
-            ):
+            if not torch.is_tensor(cached["feature"]):
                 raise ValueError("skill cache record is invalid")
         previous_sequence = -1
         for record in offline_replay:
@@ -3475,7 +3403,6 @@ class MemoryExtractor(AGICoreModule):
                 "kind",
                 "context",
                 "outcome",
-                "modelSignature",
                 "sequence",
                 "confidence",
                 "transactionVersion",
@@ -3485,7 +3412,6 @@ class MemoryExtractor(AGICoreModule):
             if (
                 type(record) is not dict
                 or fields != current_record_fields
-                or record["modelSignature"] != signature
                 or not torch.is_tensor(record["context"])
                 or not torch.is_tensor(record["outcome"])
                 or record["context"].dim() < 2
@@ -3546,7 +3472,6 @@ class MemoryExtractor(AGICoreModule):
         self._plan_cache = migrated_plan
         self._skill_cache = migrated_skill
         self._offline_replay = migrated_replay
-        self._replay_signature = replay_signature
         self._replay_sequence = replay_sequence
         self._replay_transaction_version = replay_transaction
         self._replay_timeline_version = replay_timeline
@@ -3669,7 +3594,7 @@ class MemoryExtractor(AGICoreModule):
         self.ltm.semantic.EnsureB(B)
         self.ltm.episodic.EnsureB(B)
         self.sym_mem.EnsureB(B)
-        self.merged_delta_signature.fill_(-1)
+        self.merged_delta_transaction.fill_(-1)
         self.pending.clear()
 
         self.ResetInternalLoss()
@@ -5481,7 +5406,7 @@ class MemoryExtractor(AGICoreModule):
         self.memory_source_confidence.zero_()
         self.memory_realm.fill_(ONTOLOGY_REALM_UNKNOWN)
         self.memory_reward_abs.zero_()
-        self.merged_delta_signature.fill_(-1)
+        self.merged_delta_transaction.fill_(-1)
 
         self.time_step.zero_()
         self.memory_filled.zero_()
@@ -5508,12 +5433,9 @@ class MemoryExtractor(AGICoreModule):
         self._plan_cache.clear()
         self._skill_cache.clear()
         self._offline_replay.clear()
-        self._replay_signature = None
         self._replay_sequence = 0
         self._replay_transaction_version = 0
         self._replay_timeline_version = 0
-        self._row_merge_contract_id = None
-        self._row_merge_model_signature = None
         self._row_merge_transactions.clear()
         self._row_merge_versions.clear()
         self.memory_version.add_(1)
@@ -5532,8 +5454,6 @@ class MemoryExtractor(AGICoreModule):
         self.FlushPendingWrites()
         state = self.ExportDurableState()
         payload = {
-            "artifact_type": self.DURABLE_MEMORY_ARTIFACT_TYPE,
-            "schema_version": self.DURABLE_MEMORY_SCHEMA_VERSION,
             "batch_size": int(state["memory_filled"].size(0)),
             "state": state,}
         directory = os.path.dirname(path)
@@ -5557,16 +5477,9 @@ class MemoryExtractor(AGICoreModule):
             return
 
         obj = torch.load(path, map_location=self.device, weights_only=True)
-        expected_payload_fields = {"artifact_type", "schema_version", "batch_size", "state"}
+        expected_payload_fields = {"batch_size", "state"}
         if type(obj) is not dict or set(obj) != expected_payload_fields:
             raise TypeError("memory artifact fields do not match the durable-memory schema")
-        if obj["artifact_type"] != self.DURABLE_MEMORY_ARTIFACT_TYPE:
-            raise ValueError(f"unsupported memory artifact type: {obj['artifact_type']!r}")
-        if (
-            type(obj["schema_version"]) is not int
-            or obj["schema_version"] != self.DURABLE_MEMORY_SCHEMA_VERSION
-        ):
-            raise ValueError(f"unsupported durable-memory schema: {obj['schema_version']!r}")
         if type(obj["batch_size"]) is not int or obj["batch_size"] < 1:
             raise TypeError("durable-memory batch_size must be a positive integer")
         if expectedBatch is not None and obj["batch_size"] != int(expectedBatch):
@@ -5586,7 +5499,7 @@ class MemoryExtractor(AGICoreModule):
             "time_step": self.time_step,
             "memory_filled": self.memory_filled,
             "memory_version": self.memory_version,
-            "merged_delta_signature": self.merged_delta_signature,
+            "merged_delta_transaction": self.merged_delta_transaction,
             "memory_keys": self.memory_keys,
             "memory_values": self.memory_values,
             "memory_importance": self.memory_importance,
@@ -5702,7 +5615,7 @@ class MemoryExtractor(AGICoreModule):
             "time_step": (batch_size,),
             "memory_filled": (batch_size,),
             "memory_version": (),
-            "merged_delta_signature": (3,),
+            "merged_delta_transaction": (3,),
             "memory_keys": (batch_size, self.memory_size, self.memory_dim),
             "memory_values": (batch_size, self.memory_size, self.memory_dim),
             "memory_importance": (batch_size, self.memory_size),
@@ -7591,32 +7504,28 @@ class MemoryExtractor(AGICoreModule):
         kind = int(delta["kind"].item())
         if kind not in (1, 2):
             raise ValueError("memory delta transaction kind is invalid")
-        signature = self.merged_delta_signature.new_tensor([
+        transaction = self.merged_delta_transaction.new_tensor([
             int(delta["base_step"].item()),
             int(delta["new_step"].item()),
             kind,])
-        if torch.equal(signature, self.merged_delta_signature):
+        if torch.equal(transaction, self.merged_delta_transaction):
             return
         self.MergeMemoryState(
             delta["state"],
             sourceBaseStep=int(delta["base_step"].item()),
             sourceNewStep=int(delta["new_step"].item()))
-        self.merged_delta_signature.copy_(signature)
+        self.merged_delta_transaction.copy_(transaction)
 
     def MemoryDeltaRowsFingerprint(
         self,
         delta: Dict[str, Any],
         destinationRows: torch.Tensor,
-        contractId: str,
-        modelSignature: str,
         transactionId: str,
         timelineVersion: int,
         episodeVersion: int,
     ) -> str:
         digest = hashlib.sha256()
         identity = (
-            contractId,
-            modelSignature,
             transactionId,
             int(timelineVersion),
             int(episodeVersion),
@@ -7639,8 +7548,6 @@ class MemoryExtractor(AGICoreModule):
         self,
         delta: Dict[str, Any],
         destinationRows: torch.Tensor,
-        contractId: str,
-        modelSignature: str,
         transactionId: str,
         timelineVersion: int,
         episodeVersion: int,
@@ -7664,9 +7571,6 @@ class MemoryExtractor(AGICoreModule):
             raise TypeError("memory delta state fields do not match the current schema")
         if not all(torch.is_tensor(value) for value in state.values()):
             raise TypeError("every memory delta state field must be a tensor")
-        if type(contractId) is not str or not contractId.strip():
-            raise ValueError("contractId must be a non-empty string")
-        signature = self.ValidateModelSignature(modelSignature)
         if type(transactionId) is not str or not transactionId.strip():
             raise ValueError("transactionId must be a non-empty string")
         if type(timelineVersion) is not int or timelineVersion < 0:
@@ -7694,16 +7598,6 @@ class MemoryExtractor(AGICoreModule):
             raise ValueError("destinationRows contains an out-of-range row")
         if int(torch.unique(destinationRows).numel()) != source_batch:
             raise ValueError("destinationRows must be unique")
-        if (
-            self._row_merge_contract_id is not None
-            and self._row_merge_contract_id != contractId
-        ):
-            raise ValueError("row merge contract identity mismatch")
-        if (
-            self._row_merge_model_signature is not None
-            and self._row_merge_model_signature != signature
-        ):
-            raise ValueError("row merge model signature mismatch")
         for row in destinationRows.tolist():
             previous = self._row_merge_versions.get(int(row))
             if previous is not None and (
@@ -7716,8 +7610,6 @@ class MemoryExtractor(AGICoreModule):
         fingerprint = self.MemoryDeltaRowsFingerprint(
             delta,
             destinationRows,
-            contractId,
-            signature,
             transactionId,
             timelineVersion,
             episodeVersion)
@@ -7764,8 +7656,6 @@ class MemoryExtractor(AGICoreModule):
             self._row_merge_versions = versions
             raise
         self.RestoreFrozenRows(frozen, selected)
-        self._row_merge_contract_id = contractId
-        self._row_merge_model_signature = signature
         self._row_merge_transactions[transactionId] = fingerprint
         for row in destinationRows.tolist():
             self._row_merge_versions[int(row)] = (
@@ -7826,7 +7716,7 @@ class MemoryExtractor(AGICoreModule):
         unbatched_fields = {
             "pattern_usage",
             "memory_version",
-            "merged_delta_signature",
+            "merged_delta_transaction",
             "usage_applicable",
             "usage_default_params",
             "usage_expected_dx",
@@ -7877,7 +7767,7 @@ class MemoryExtractor(AGICoreModule):
 
     @torch.no_grad()
     def ResetSteps(self, resetGlobal: bool = True) -> None:
-        self.merged_delta_signature.fill_(-1)
+        self.merged_delta_transaction.fill_(-1)
         self._row_merge_transactions.clear()
         self._row_merge_versions.clear()
         if hasattr(self, "time_step") and isinstance(self.time_step, torch.Tensor):
@@ -7928,7 +7818,7 @@ class MemoryExtractor(AGICoreModule):
 
     @torch.no_grad()
     def ReorderMemorySteps(self) -> None:
-        self.merged_delta_signature.fill_(-1)
+        self.merged_delta_transaction.fill_(-1)
         self._row_merge_transactions.clear()
         self._row_merge_versions.clear()
 
@@ -8020,8 +7910,8 @@ class TestMemoryMTool:
         return (self.root / name).absolute()
 
     def FilterKwargs(self, cls, cfg: Dict) -> Dict:
-        sig = inspect.signature(cls.__init__)
-        allowed = set(sig.parameters.keys()) - {"self"}
+        args = inspect.getfullargspec(cls.__init__)
+        allowed = set(args.args + args.kwonlyargs) - {"self"}
         return {k: v for k, v in cfg.items() if k in allowed}
 
     def MakeEmotion(self, B: int, mem) -> torch.Tensor:
@@ -8684,7 +8574,7 @@ class TestMemoryMTool:
             assert set(transient_state).isdisjoint(expected_state)
             mem.SaveState(str(path))
             payload = torch.load(path, map_location=self.device, weights_only=True)
-            assert set(payload) == {"artifact_type", "schema_version", "batch_size", "state"}
+            assert set(payload) == {"batch_size", "state"}
             assert payload["batch_size"] == 3
             assert set(payload["state"]) == set(MemoryExtractor.DURABLE_MEMORY_STATE_FIELDS)
             assert "state_dict" not in payload
@@ -8729,9 +8619,9 @@ class TestMemoryMTool:
             except OSError:
                 pass
 
-    def TestDurableStateRejectsNonCurrentSchema(self):
-        legacy_path = self.StatePath("memory_legacy_schema_test.pth")
-        incomplete_path = self.StatePath("memory_incomplete_schema_test.pth")
+    def TestDurableStateRejectsMalformedStructure(self):
+        legacy_path = self.StatePath("memory_legacy_state_test.pth")
+        incomplete_path = self.StatePath("memory_incomplete_state_test.pth")
         try:
             cfg = self.FilterKwargs(MemoryExtractor, dict(
                 inputDim=16, ssmStateDim=16, memoryDim=8, memorySize=6,
@@ -8750,8 +8640,6 @@ class TestMemoryMTool:
             state = mem.ExportDurableState()
             del state["usage_attribute_centroid"]
             torch.save({
-                "artifact_type": MemoryExtractor.DURABLE_MEMORY_ARTIFACT_TYPE,
-                "schema_version": MemoryExtractor.DURABLE_MEMORY_SCHEMA_VERSION,
                 "batch_size": 1,
                 "state": state,}, incomplete_path)
             incomplete_rejected = False
@@ -8761,13 +8649,13 @@ class TestMemoryMTool:
                 incomplete_rejected = True
             assert incomplete_rejected, "incomplete durable-memory state was accepted"
 
-            print("Durable-memory strict-schema rejection test passed.")
+            print("Durable-memory structural rejection test passed.")
             return True
         except AssertionError as e:
-            print(f"Durable-memory strict-schema rejection test failed: {e}")
+            print(f"Durable-memory structural rejection test failed: {e}")
             return False
         except Exception as e:
-            print(f"Durable-memory strict-schema rejection test error: {e}")
+            print(f"Durable-memory structural rejection test error: {e}")
             return False
         finally:
             for path in (legacy_path, incomplete_path):
@@ -10123,11 +10011,11 @@ class TestMemoryMTool:
             plan = torch.tensor(
                 [[1.0, 2.0], [3.0, 4.0]],
                 device=self.device)
-            mem.CachePlan("active", plan, "shape-a")
+            mem.CachePlan("active", plan)
 
             mem.ResetEpisodeState(torch.tensor(
                 [True, False], device=self.device))
-            cached_plan = mem.RecallPlan("active", "shape-a")
+            cached_plan = mem.RecallPlan("active")
             partial_ok = (
                 torch.count_nonzero(mem.h_state[0]).item() == 0
                 and torch.count_nonzero(mem.h_state[1]).item() > 0
@@ -10153,7 +10041,7 @@ class TestMemoryMTool:
                 torch.count_nonzero(mem.gws.keys).item() == 0
                 and torch.count_nonzero(mem.gws.priority).item() == 0
                 and mem.memory_filled.tolist() == [1, 1]
-                and mem.RecallPlan("active", "shape-a") is None
+                and mem.RecallPlan("active") is None
                 and not mem.pending)
             dtype_rejected = False
             try:
@@ -11038,7 +10926,6 @@ class TestMemoryMTool:
             assert int(policy_memory.ltm.semantic.filled[0].item()) == 0
 
             state = mem.ExportDurableState()
-            assert mem.DURABLE_MEMORY_SCHEMA_VERSION == 6
             restored = self.MakeTinyMemory()
             restored.ImportDurableState(state)
             assert torch.equal(restored.memory_realm, mem.memory_realm)
@@ -11463,38 +11350,38 @@ class TestMemoryMTool:
             print(f"Delta KV identity/time/idempotency test failed: {e}")
             return False
 
-    def TestDeltaSignatureTimelineBoundaries(self):
+    def TestDeltaTransactionTimelineBoundaries(self):
         try:
             mem = self.MakeTinyMemory()
-            signature = torch.tensor(
+            transaction = torch.tensor(
                 [3, 7, 2], device=self.device, dtype=torch.long)
-            mem.merged_delta_signature.copy_(signature)
+            mem.merged_delta_transaction.copy_(transaction)
             mem.time_step.fill_(11)
             mem.SoftReset()
-            assert torch.equal(mem.merged_delta_signature, signature)
+            assert torch.equal(mem.merged_delta_transaction, transaction)
             assert int(mem.time_step[0].item()) == 11
 
             mem.EnsureB(1)
-            assert torch.equal(mem.merged_delta_signature, signature)
+            assert torch.equal(mem.merged_delta_transaction, transaction)
             mem.ResetEpisodeState(torch.zeros(
                 1, device=self.device, dtype=torch.bool))
-            assert torch.equal(mem.merged_delta_signature, signature)
+            assert torch.equal(mem.merged_delta_transaction, transaction)
 
             mem.EnsureB(2)
-            assert bool((mem.merged_delta_signature == -1).all().item())
-            mem.merged_delta_signature.copy_(signature)
+            assert bool((mem.merged_delta_transaction == -1).all().item())
+            mem.merged_delta_transaction.copy_(transaction)
             mem.ResetSteps()
-            assert bool((mem.merged_delta_signature == -1).all().item())
-            mem.merged_delta_signature.copy_(signature)
+            assert bool((mem.merged_delta_transaction == -1).all().item())
+            mem.merged_delta_transaction.copy_(transaction)
             mem.ReorderMemorySteps()
-            assert bool((mem.merged_delta_signature == -1).all().item())
-            mem.merged_delta_signature.copy_(signature)
+            assert bool((mem.merged_delta_transaction == -1).all().item())
+            mem.merged_delta_transaction.copy_(transaction)
             mem.ResetAll()
-            assert bool((mem.merged_delta_signature == -1).all().item())
-            print("Delta-signature timeline-boundary test passed.")
+            assert bool((mem.merged_delta_transaction == -1).all().item())
+            print("Delta-transaction timeline-boundary test passed.")
             return True
         except Exception as e:
-            print(f"Delta-signature timeline-boundary test failed: {e}")
+            print(f"Delta-transaction timeline-boundary test failed: {e}")
             return False
 
     def TestDeltaMergeSemanticStatistics(self):
@@ -11546,7 +11433,7 @@ class TestMemoryMTool:
 
             concurrent = self.MakeTinyMemory()
             concurrent.ImportState(base.ExportState())
-            concurrent.merged_delta_signature.fill_(-1)
+            concurrent.merged_delta_transaction.fill_(-1)
             concurrent.ltm.semantic.global_step.fill_(100)
             value_c = torch.zeros_like(value_a); value_c[0, 2] = 5.0
             concurrent.ltm.semantic.Store(
@@ -12128,59 +12015,48 @@ class TestMemoryMTool:
             print(f"LossDecrease test error: {e}")
             return False
 
-    def TestSignatureBoundPlanAndSkillCache(self):
+    def TestPlanSkillAndReplayCache(self):
         try:
             memory = self.MakeTinyMemory()
             plan = torch.randn(2, 7, device=self.device)
             skill = torch.randn(2, 5, device=self.device)
-            memory.CachePlan("active", plan, "shape-a")
-            memory.CacheSkill("refine", skill, "shape-a")
-            recalled_plan = memory.RecallPlan("active", "shape-a")
-            recalled_skill = memory.RecallSkill("refine", "shape-a")
+            memory.CachePlan("active", plan)
+            memory.CacheSkill("refine", skill)
+            recalled_plan = memory.RecallPlan("active")
+            recalled_skill = memory.RecallSkill("refine")
             recalled_plan["feature"].zero_()
             recalled_skill.zero_()
             if not torch.equal(
-                memory.RecallPlan("active", "shape-a")["feature"],
+                memory.RecallPlan("active")["feature"],
                 plan):
                 return False
-            if not torch.equal(memory.RecallSkill("refine", "shape-a"), skill):
+            if not torch.equal(memory.RecallSkill("refine"), skill):
                 return False
             memory.AgePlanCache()
             if not torch.equal(
-                memory.RecallPlan("active", "shape-a")["age"],
+                memory.RecallPlan("active")["age"],
                 torch.ones(2, device=self.device, dtype=torch.long)
             ):
                 return False
             memory.RecordFailureEpisode(
                 torch.randn(2, 8, device=self.device),
-                torch.randn(2, 3, device=self.device),
-                "shape-a")
+                torch.randn(2, 3, device=self.device))
             cache_state = memory.ExportCognitiveCacheState()
             restored = self.MakeTinyMemory(batch=2)
             restored.ImportCognitiveCacheState(
                 cache_state,
-                modelSignature="shape-a",
                 batchSize=2)
-            restored_plan = restored.RecallPlan("active", "shape-a")
+            restored_plan = restored.RecallPlan("active")
             if (
                 restored_plan is None
                 or not torch.equal(
                     restored_plan["age"],
                     torch.ones(2, device=self.device, dtype=torch.long))
                 or not torch.equal(restored_plan["feature"], plan)
-                or len(restored.SampleOfflineReplay(1, "shape-a")) != 1
+                or len(restored.SampleOfflineReplay(1)) != 1
             ):
                 return False
             rejected = 0
-            for recall in (
-                lambda: memory.RecallPlan("active", "shape-b"),
-                lambda: memory.RecallSkill("refine", "shape-b"),
-                lambda: memory.CachePlan("active", plan, "shape-b"),
-                lambda: memory.CacheSkill("refine", skill, "shape-b")):
-                try:
-                    recall()
-                except ValueError:
-                    rejected += 1
             invalid_states = []
             missing_version = memory.CloneCognitiveRecord(cache_state)
             del missing_version["replayTimelineVersion"]
@@ -12195,13 +12071,12 @@ class TestMemoryMTool:
                 try:
                     restored.ImportCognitiveCacheState(
                         invalid_state,
-                        modelSignature="shape-a",
                         batchSize=2)
                 except ValueError:
                     rejected += 1
-            return rejected == 7
+            return rejected == 3
         except Exception as error:
-            print(f"SignatureBoundPlanAndSkillCache error: {error}")
+            print(f"PlanSkillAndReplayCache error: {error}")
             return False
 
     def TestReplayAndTransitionEpisodes(self):
@@ -12212,31 +12087,24 @@ class TestMemoryMTool:
             memory.RecordHierarchyTransition(
                 context,
                 torch.tensor([0.2, 0.8], device=self.device),
-                torch.tensor([0.0, 1.0], device=self.device),
-                "shape-a")
+                torch.tensor([0.0, 1.0], device=self.device))
             memory.RecordFailureEpisode(
                 context,
-                outcome,
-                "shape-a")
+                outcome)
             memory.RecordCounterfactualEpisode(
                 context,
-                -outcome,
-                "shape-a")
-            replay = memory.SampleOfflineReplay(8, "shape-a")
+                -outcome)
+            replay = memory.SampleOfflineReplay(8)
             if len(replay) != 3:
                 return False
             kinds = {item["kind"] for item in replay}
             if kinds != {"hierarchyTransition", "failure", "counterfactual"}:
                 return False
             replay[0]["context"].zero_()
-            replay_again = memory.SampleOfflineReplay(8, "shape-a")
+            replay_again = memory.SampleOfflineReplay(8)
             if not bool(any(item["context"].abs().sum().item() > 0 for item in replay_again)):
                 return False
-            try:
-                memory.SampleOfflineReplay(1, "shape-b")
-                return False
-            except ValueError:
-                return True
+            return True
         except Exception as error:
             print(f"ReplayAndTransitionEpisodes error: {error}")
             return False
@@ -12288,7 +12156,7 @@ class TestMemoryMTool:
             "ExportMemoryBankMixedRowValidity": self.TestExportMemoryBankMixedRowValidity(),
             "ExportConsciousBank": self.TestExportConsciousBank(),
             "DurableStatePreservesBatchLanes": self.TestDurableStatePreservesBatchLanes(),
-            "DurableStateRejectsNonCurrentSchema": self.TestDurableStateRejectsNonCurrentSchema(),
+            "DurableStateRejectsMalformedStructure": self.TestDurableStateRejectsMalformedStructure(),
             "GlobalWorkspaceLaneIsolation": self.TestGlobalWorkspaceLaneIsolation(),
             "SymbolicMemoryLaneIsolation": self.TestSymbolicMemoryLaneIsolation(),
             "SourceConfidenceOrdering": self.TestSourceConfidenceOrdering(),
@@ -12315,7 +12183,7 @@ class TestMemoryMTool:
             "SaveStateFlushesPending": self.TestSaveStateFlushesPending(),
             "CapacityNotReduced": self.TestCapacityNotReduced(),
             "DeltaMergeKvIdentityTimeAndIdempotency": self.TestDeltaMergeKvIdentityTimeAndIdempotency(),
-            "DeltaSignatureTimelineBoundaries": self.TestDeltaSignatureTimelineBoundaries(),
+            "DeltaTransactionTimelineBoundaries": self.TestDeltaTransactionTimelineBoundaries(),
             "DeltaMergeSemanticStatistics": self.TestDeltaMergeSemanticStatistics(),
             "ConcurrentDeltaPreservesMainUpdates": self.TestConcurrentDeltaPreservesMainUpdates(),
             "DeltaMergeEpisodicLinksAndSymbolicMetadata": self.TestDeltaMergeEpisodicLinksAndSymbolicMetadata(),
@@ -12340,7 +12208,7 @@ class TestMemoryMTool:
             "AutoCompress": self.TestAutoCompress(),
             "ResetAndSoftReset": self.TestResetAndSoftReset(),
             "PartialEpisodeResetPreservesSharedState": self.TestPartialEpisodeResetPreservesSharedState(),
-            "SignatureBoundPlanAndSkillCache": self.TestSignatureBoundPlanAndSkillCache(),
+            "PlanSkillAndReplayCache": self.TestPlanSkillAndReplayCache(),
             "ReplayAndTransitionEpisodes": self.TestReplayAndTransitionEpisodes(),
             "SemanticReconsolidation": self.TestSemanticReconsolidation(),
             "TrainStepSmoke": self.TrainStepSmoke(),

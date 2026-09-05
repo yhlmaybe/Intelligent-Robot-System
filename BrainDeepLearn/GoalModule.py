@@ -573,11 +573,11 @@ class FourLevelGoalManager(AGICoreModule):
         self.register_buffer(
             "static_end_effector_tokens",
             static_end_effector_tokens,
-            persistent=True)
+            persistent=False)
         self.register_buffer(
             "root_mask",
             torch.tensor(contractView.root_mask, dtype=torch.bool),
-            persistent=True)
+            persistent=False)
         self.parent_index = tuple(int(value) for value in contractView.parent_index)
         self.topological_layers = tuple(
             tuple(int(index) for index in layer)

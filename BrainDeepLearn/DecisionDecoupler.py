@@ -27,6 +27,10 @@ class PackedDecisionContext:
     risk: torch.Tensor
     confidence: torch.Tensor
     precision: torch.Tensor
+    joint_state_tokens: torch.Tensor
+    endpoint_body_tokens: torch.Tensor
+    detail_access: torch.Tensor
+    full_access: torch.Tensor
     slot_relevance: Optional[torch.Tensor] = None
     slot_selection_mask: Optional[torch.Tensor] = None
     previous_target_values: Optional[torch.Tensor] = None
@@ -68,6 +72,10 @@ class PackedDecisionContext:
             risk=Select(self.risk),
             confidence=Select(self.confidence),
             precision=Select(self.precision),
+            joint_state_tokens=Select(self.joint_state_tokens),
+            endpoint_body_tokens=Select(self.endpoint_body_tokens),
+            detail_access=Select(self.detail_access),
+            full_access=Select(self.full_access),
             slot_relevance=(
                 None
                 if self.slot_relevance is None
@@ -112,7 +120,6 @@ class PackedDecoupledDecision:
 class PackedPerceptionRotationEfference:
     rotation_delta: torch.Tensor
     present: torch.Tensor
-    contract_id: str
 
 
 class PackedHierarchicalDecisionDecoder(AGICoreModule):
@@ -120,6 +127,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         self,
         contractView: RobotEmbodimentContractView,
         decisionDim: int,
+        jointTokenDim: int,
         slotTokenDim: int = 128,
         feedbackTokenDim: int = 128,
         hierarchyDim: int = 128,
@@ -145,6 +153,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             decisionDim if constraintTokenDim is None else constraintTokenDim)
         dimensions = (
             decisionDim,
+            jointTokenDim,
             worldActionDim,
             slotTokenDim,
             feedbackTokenDim,
@@ -170,6 +179,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
 
         self.contract_view = contractView
         self.decision_dim = int(decisionDim)
+        self.joint_token_dim = int(jointTokenDim)
         self.world_action_dim = int(worldActionDim)
         self.slot_token_dim = int(slotTokenDim)
         self.feedback_token_dim = int(feedbackTokenDim)
@@ -214,8 +224,10 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         self.rotation_widths = tuple(
             int(shape[1])
             for shape in contractView.end_effector_rotation_basis.shapes)
-        self.feedback_offsets = tuple(
-            int(value) for value in contractView.joint_feedback_layout.offsets)
+        self.effector_joint_offsets = tuple(
+            int(value) for value in contractView.effector_joint_offsets)
+        self.effector_joint_indices = tuple(
+            int(value) for value in contractView.effector_joint_indices)
         self.endpoint_feedback_offsets = tuple(
             int(value)
             for value in contractView.end_effector_feedback_layout.offsets)
@@ -224,33 +236,26 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         static_slot_tokens = torch.tensor(
             contractView.static_end_effector_tokens,
             dtype=torch.float32)
-        static_joint_tokens = torch.tensor(
-            contractView.static_joint_tokens,
-            dtype=torch.float32)
         self.register_buffer(
             "static_slot_tokens",
             static_slot_tokens,
-            persistent=True)
-        self.register_buffer(
-            "static_joint_tokens",
-            static_joint_tokens,
-            persistent=True)
+            persistent=False)
         self.register_buffer(
             "root_mask",
             torch.tensor(contractView.root_mask, dtype=torch.bool),
-            persistent=True)
+            persistent=False)
         self.register_buffer(
             "target_lower",
             torch.tensor(
                 contractView.end_effector_target_lower,
                 dtype=torch.float32),
-            persistent=True)
+            persistent=False)
         self.register_buffer(
             "target_upper",
             torch.tensor(
                 contractView.end_effector_target_upper,
                 dtype=torch.float32),
-            persistent=True)
+            persistent=False)
         rotationBases = []
         for slotIndex, rotationWidth in enumerate(self.rotation_widths):
             basis = contractView.end_effector_rotation_basis.Matrix(
@@ -263,7 +268,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         self.register_buffer(
             "rotation_basis",
             torch.stack(rotationBases, dim=0),
-            persistent=True)
+            persistent=False)
 
         descriptor_dim = int(static_slot_tokens.size(-1))
         static_normalizer = (
@@ -276,25 +281,33 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             nn.SiLU(),
             nn.LayerNorm(self.slot_token_dim),
         )
-        joint_descriptor_dim = int(static_joint_tokens.size(-1))
-        joint_static_normalizer = (
-            nn.Identity()
-            if joint_descriptor_dim == 1
-            else nn.LayerNorm(joint_descriptor_dim))
-        self.static_joint_encoder = nn.Sequential(
-            joint_static_normalizer,
-            nn.Linear(joint_descriptor_dim, self.feedback_token_dim),
-            nn.SiLU(),
-            nn.LayerNorm(self.feedback_token_dim),
-        )
-        self.joint_feedback_adapters = nn.ModuleList()
         self.endpoint_feedback_adapters = nn.ModuleList()
-        self.joint_token_fuser = nn.Sequential(
-            nn.LayerNorm(2 * self.feedback_token_dim),
-            nn.Linear(2 * self.feedback_token_dim, self.feedback_token_dim),
+        self.endpoint_body_encoder = nn.Sequential(
+            nn.LayerNorm(self.joint_token_dim),
+            nn.Linear(self.joint_token_dim, self.feedback_token_dim),
             nn.SiLU(),
             nn.LayerNorm(self.feedback_token_dim),
         )
+        joint_attention_heads = max(
+            headCount
+            for headCount in range(1, int(attentionHeads) + 1)
+            if self.feedback_token_dim % headCount == 0)
+        self.detail_joint_attention = nn.MultiheadAttention(
+            self.feedback_token_dim,
+            joint_attention_heads,
+            kdim=self.joint_token_dim,
+            vdim=self.joint_token_dim,
+            batch_first=True)
+        self.full_joint_attention = nn.MultiheadAttention(
+            self.feedback_token_dim,
+            joint_attention_heads,
+            kdim=self.joint_token_dim,
+            vdim=self.joint_token_dim,
+            batch_first=True)
+        self.detail_joint_attention_norm = nn.LayerNorm(
+            self.feedback_token_dim)
+        self.full_joint_attention_norm = nn.LayerNorm(
+            self.feedback_token_dim)
         self.endpoint_feedback_fuser = nn.Sequential(
             nn.LayerNorm(2 * self.feedback_token_dim),
             nn.Linear(2 * self.feedback_token_dim, self.feedback_token_dim),
@@ -372,20 +385,6 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             + self.slot_token_dim
             + 2 * self.feedback_token_dim
             + self.hierarchy_dim)
-        for jointIndex in range(self.joint_count):
-            feedback_width = contractView.joint_feedback_layout.Width(jointIndex)
-            if feedback_width < 1:
-                raise ValueError("joint feedback widths must be positive")
-            feedback_normalizer = (
-                nn.Identity()
-                if feedback_width == 1
-                else nn.LayerNorm(feedback_width))
-            self.joint_feedback_adapters.append(nn.Sequential(
-                feedback_normalizer,
-                nn.Linear(feedback_width, self.feedback_token_dim),
-                nn.SiLU(),
-                nn.LayerNorm(self.feedback_token_dim),
-            ))
         for slotIndex in range(self.slot_count):
             endpointFeedbackWidth = (
                 contractView.end_effector_feedback_layout.Width(slotIndex))
@@ -477,6 +476,22 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             risk=decisionBackbone.new_zeros(batch_size),
             confidence=decisionBackbone.new_ones(batch_size),
             precision=decisionBackbone.new_ones(batch_size),
+            joint_state_tokens=decisionBackbone.new_zeros(
+                batch_size,
+                self.joint_count,
+                self.joint_token_dim),
+            endpoint_body_tokens=decisionBackbone.new_zeros(
+                batch_size,
+                self.slot_count,
+                self.joint_token_dim),
+            detail_access=torch.zeros(
+                batch_size,
+                device=decisionBackbone.device,
+                dtype=torch.bool),
+            full_access=torch.zeros(
+                batch_size,
+                device=decisionBackbone.device,
+                dtype=torch.bool),
         )
 
     def ValidateContext(
@@ -533,6 +548,41 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             or decisionContext.slot_legal.device != device
         ):
             raise ValueError("packed decoder legality mask is invalid")
+        physical_tokens = (
+            (
+                decisionContext.joint_state_tokens,
+                (batch_size, self.joint_count, self.joint_token_dim)),
+            (
+                decisionContext.endpoint_body_tokens,
+                (batch_size, self.slot_count, self.joint_token_dim)),
+        )
+        if any(
+            not torch.is_tensor(value)
+            or tuple(value.shape) != shape
+            or not value.is_floating_point()
+            or value.device != device
+            or value.dtype != decisionBackbone.dtype
+            or not bool(torch.isfinite(value).all().item())
+            for value, shape in physical_tokens
+        ):
+            raise ValueError("packed decoder physical tokens are invalid")
+        access_masks = (
+            decisionContext.detail_access,
+            decisionContext.full_access,
+        )
+        if any(
+            not torch.is_tensor(value)
+            or tuple(value.shape) != (batch_size,)
+            or value.dtype != torch.bool
+            or value.device != device
+            for value in access_masks
+        ):
+            raise ValueError("packed decoder physical access masks are invalid")
+        if bool((
+            decisionContext.detail_access
+            & decisionContext.full_access
+        ).any().item()):
+            raise ValueError("packed decoder physical access modes overlap")
         selection_mask = decisionContext.slot_selection_mask
         if selection_mask is not None and (
             not torch.is_tensor(selection_mask)
@@ -699,24 +749,76 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         self,
         decisionBackbone: torch.Tensor,
         feedbackPacket: BrainFeedbackPacket,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch_size = int(decisionBackbone.size(0))
         device = decisionBackbone.device
-        dtype = decisionBackbone.dtype
-        if int(feedbackPacket.joint_features.size(0)) != batch_size:
+        if int(feedbackPacket.end_effector_features.size(0)) != batch_size:
             raise ValueError("feedback batch does not match decision backbone")
-        if feedbackPacket.joint_features.device != device:
+        if feedbackPacket.end_effector_features.device != device:
             raise ValueError("feedback must share the decision device")
-        feedback_values = feedbackPacket.joint_features.to(dtype=dtype)
         available = torch.ones_like(feedbackPacket.endpoint_present)
         enabled = feedbackPacket.phase_enabled & feedbackPacket.phase_known
-        return feedback_values, available, enabled
+        return available, enabled
+
+    def EncodeJointAccess(
+        self,
+        decisionContext: PackedDecisionContext,
+    ) -> torch.Tensor:
+        endpoint_tokens = self.endpoint_body_encoder(
+            decisionContext.endpoint_body_tokens)
+        detail_rows = torch.nonzero(
+            decisionContext.detail_access,
+            as_tuple=False).flatten()
+        slot_tokens = []
+        for slotIndex in range(self.slot_count):
+            current = endpoint_tokens[:, slotIndex]
+            start = self.effector_joint_offsets[slotIndex]
+            end = self.effector_joint_offsets[slotIndex + 1]
+            joint_indices = self.effector_joint_indices[start:end]
+            if detail_rows.numel() > 0 and joint_indices:
+                index = torch.tensor(
+                    joint_indices,
+                    device=endpoint_tokens.device,
+                    dtype=torch.long)
+                query = current.index_select(0, detail_rows).unsqueeze(1)
+                source = decisionContext.joint_state_tokens.index_select(
+                    0,
+                    detail_rows).index_select(1, index)
+                attended, _ = self.detail_joint_attention(
+                    query,
+                    source,
+                    source,
+                    need_weights=False)
+                updated = self.detail_joint_attention_norm(
+                    query + attended).squeeze(1)
+                current = current.index_copy(0, detail_rows, updated)
+            slot_tokens.append(current)
+        access_tokens = torch.stack(slot_tokens, dim=1)
+        full_rows = torch.nonzero(
+            decisionContext.full_access,
+            as_tuple=False).flatten()
+        if full_rows.numel() > 0:
+            query = endpoint_tokens.index_select(0, full_rows)
+            source = decisionContext.joint_state_tokens.index_select(
+                0,
+                full_rows)
+            attended, _ = self.full_joint_attention(
+                query,
+                source,
+                source,
+                need_weights=False)
+            updated = self.full_joint_attention_norm(query + attended)
+            access_tokens = access_tokens.index_copy(
+                0,
+                full_rows,
+                updated)
+        return access_tokens
 
     def EncodeFeedbackState(
         self,
         decisionBackbone: torch.Tensor,
         feedbackPacket: BrainFeedbackPacket,
-        feedbackValues: torch.Tensor,
+        jointAccessTokens: torch.Tensor,
         staticTokens: torch.Tensor,
     ) -> Tuple[
         Tuple[torch.Tensor, ...],
@@ -747,24 +849,6 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         ], dim=-1).to(dtype=dtype)
 
         dynamic_tokens = self.dynamic_state_encoder(dynamic_state)
-        static_joint_tokens = self.static_joint_encoder(
-            self.static_joint_tokens.to(device=device, dtype=dtype))
-        joint_tokens = []
-        for jointIndex in range(self.joint_count):
-            feedback_slice = slice(
-                self.feedback_offsets[jointIndex],
-                self.feedback_offsets[jointIndex + 1])
-            feedback_token = self.joint_feedback_adapters[jointIndex](
-                feedbackValues[:, feedback_slice])
-            joint_token = self.joint_token_fuser(torch.cat([
-                feedback_token,
-                static_joint_tokens[jointIndex].unsqueeze(0).expand(
-                    batch_size, -1),
-            ], dim=-1))
-            joint_tokens.append(joint_token)
-        joint_token_tensor = torch.stack(joint_tokens, dim=1)
-        joint_summary = joint_token_tensor.mean(dim=1)
-
         feedback_tokens = []
         for slotIndex, adapter in enumerate(self.endpoint_feedback_adapters):
             feedbackSlice = slice(
@@ -774,7 +858,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
                 feedbackPacket.end_effector_features[:, feedbackSlice])
             feedback_token = self.endpoint_feedback_fuser(torch.cat((
                 endpointToken,
-                joint_summary), dim=-1))
+                jointAccessTokens[:, slotIndex]), dim=-1))
             feedback_token = feedback_token * available[:, slotIndex].to(
                 dtype=dtype).unsqueeze(-1)
             feedback_tokens.append(feedback_token)
@@ -975,9 +1059,9 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
     ) -> PackedPerceptionRotationEfference:
         batch_size = int(target.values.size(0))
         if (
-            int(feedbackPacket.joint_features.size(0)) != batch_size
-            or feedbackPacket.joint_features.device != target.values.device
-            or feedbackPacket.joint_features.dtype != target.values.dtype
+            int(feedbackPacket.perception_rotation.size(0)) != batch_size
+            or feedbackPacket.perception_rotation.device != target.values.device
+            or feedbackPacket.perception_rotation.dtype != target.values.dtype
         ):
             raise ValueError("perception efference target and feedback must match")
         effectiveActive = target.active
@@ -1060,8 +1144,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
                 device=target.values.device)
         return PackedPerceptionRotationEfference(
             rotation_delta=rotation_delta,
-            present=present,
-            contract_id=target.contract_id)
+            present=present)
 
     def Decode(
         self,
@@ -1074,7 +1157,6 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             decisionContext = self.BuildNeutralContext(decisionBackbone)
         self.ValidateContext(decisionContext, decisionBackbone)
         (
-            feedback_values,
             slot_available,
             hierarchy_enabled,
         ) = self.ResolveExecutionState(
@@ -1085,6 +1167,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
             self.static_slot_tokens.to(
                 device=decisionBackbone.device,
                 dtype=decisionBackbone.dtype))
+        joint_access_tokens = self.EncodeJointAccess(decisionContext)
         (
             feedback_tokens,
             dynamic_tokens,
@@ -1094,7 +1177,7 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         ) = self.EncodeFeedbackState(
             decisionBackbone,
             feedbackPacket,
-            feedback_values,
+            joint_access_tokens,
             static_tokens)
         factor_input = torch.cat([
             decisionBackbone,
@@ -1264,8 +1347,6 @@ class PackedHierarchicalDecisionDecoder(AGICoreModule):
         target = PackedEndEffectorTarget(
             values=torch.cat(slot_outputs, dim=-1),
             active=slot_active,
-            contract_id=self.contract_view.contract_id,
-            model_signature=self.contract_view.model_signature,
             target_version=feedbackPacket.applied_target_version + 1,
             timestamp=feedbackPacket.timestamp)
         world_action_feature = self.EncodeWorldAction(target)
@@ -1318,6 +1399,7 @@ class DecisionDecouplerV2(AGICoreModule):
         self,
         contractView: RobotEmbodimentContractView,
         decisionDim: int,
+        jointTokenDim: int,
         slotTokenDim: int = 128,
         feedbackTokenDim: int = 128,
         hierarchyDim: int = 128,
@@ -1338,6 +1420,7 @@ class DecisionDecouplerV2(AGICoreModule):
         self.decoder = PackedHierarchicalDecisionDecoder(
             contractView=contractView,
             decisionDim=decisionDim,
+            jointTokenDim=jointTokenDim,
             slotTokenDim=slotTokenDim,
             feedbackTokenDim=feedbackTokenDim,
             hierarchyDim=hierarchyDim,
@@ -1394,15 +1477,13 @@ class DecisionDecouplerV2(AGICoreModule):
         if type(decisionContext) is not PackedDecisionContext:
             raise TypeError("constraint loss requires PackedDecisionContext")
         target = decision.target
-        if target.contract_id != self.ContractView.contract_id:
-            raise ValueError("constraint loss contract identity mismatch")
-        batch_size = int(feedbackPacket.joint_features.size(0))
+        batch_size = int(target.values.size(0))
         slot_shape = (batch_size, self.ContractView.end_effector_count)
         if (
             tuple(target.values.shape) != (
                 batch_size,
                 self.ContractView.end_effector_target_layout.PackedDim)
-            or target.values.device != feedbackPacket.joint_features.device
+            or target.values.device != feedbackPacket.end_effector_features.device
             or not target.values.is_floating_point()
             or not bool(torch.isfinite(target.values).all().item())
         ):

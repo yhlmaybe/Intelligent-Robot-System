@@ -196,10 +196,6 @@ class GrowableLoRAConv2d(DynamicAdapterTopologyMixin, nn.Module):
         self.A_list = nn.ParameterList()
         self.B_list = nn.ParameterList()
         self.alpha = nn.ParameterList()
-        self.register_buffer(
-            "topology_count",
-            torch.zeros((), dtype=torch.int64),
-            persistent=True)
 
         w = self.target.weight # [cout, cin, kh, kw]
         self.cout, self.cin, self.kh, self.kw = w.shape
@@ -237,7 +233,6 @@ class GrowableLoRAConv2d(DynamicAdapterTopologyMixin, nn.Module):
         self.A_list.append(A)
         self.B_list.append(B)
         self.alpha.append(s)
-        self.topology_count.fill_(len(self.A_list))
 
     def DeltaWeight(self):
         if len(self.A_list) == 0:
@@ -268,10 +263,6 @@ class GrowableConv1x1Adapter(DynamicAdapterTopologyMixin, AGICoreModule):
         self.A_list = nn.ParameterList()
         self.B_list = nn.ParameterList()
         self.alpha = nn.ParameterList()
-        self.register_buffer(
-            "topology_count",
-            torch.zeros((), dtype=torch.int64),
-            persistent=True)
 
     def ValidateDynamicAdapterEntry(
         self,
@@ -304,7 +295,6 @@ class GrowableConv1x1Adapter(DynamicAdapterTopologyMixin, AGICoreModule):
         self.A_list.append(A)
         self.B_list.append(B)
         self.alpha.append(s)
-        self.topology_count.fill_(len(self.A_list))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if len(self.A_list) == 0:
@@ -324,10 +314,6 @@ class GrowableTokenAdapter(DynamicAdapterTopologyMixin, AGICoreModule):
         self.A_list = nn.ParameterList()
         self.B_list = nn.ParameterList()
         self.alpha = nn.ParameterList()
-        self.register_buffer(
-            "topology_count",
-            torch.zeros((), dtype=torch.int64),
-            persistent=True)
 
     def ValidateDynamicAdapterEntry(
         self,
@@ -360,7 +346,6 @@ class GrowableTokenAdapter(DynamicAdapterTopologyMixin, AGICoreModule):
         self.A_list.append(A)
         self.B_list.append(B)
         self.alpha.append(s)
-        self.topology_count.fill_(len(self.A_list))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if len(self.A_list) == 0:
@@ -9102,19 +9087,6 @@ class TestPerceptionMTool:
             assert len(restored_model.patch_adapter.A_list) == 0
             assert len(restored_model.token_adapters[0].A_list) == 0
 
-            markerless_adapter_state = dict(conv.state_dict())
-            markerless_adapter_state.pop("topology_count")
-            markerless_rejected = False
-            try:
-                GrowableLoRAConv2d(
-                    nn.Conv2d(
-                        4, 6, 3, padding=1, bias=False).to(
-                            self.device)).load_state_dict(
-                                markerless_adapter_state,
-                                strict=True)
-            except RuntimeError:
-                markerless_rejected = True
-
             incomplete_model_state = dict(
                 self.MakeRegressionModel().state_dict())
             incomplete_model_state.pop("patch_content_gain")
@@ -9125,7 +9097,6 @@ class TestPerceptionMTool:
                     strict=True)
             except RuntimeError:
                 incomplete_model_rejected = True
-            assert markerless_rejected
             assert incomplete_model_rejected
         return self.RunRegressionCheck("GrowableAdapterStateRoundTrip", check)
 
@@ -9215,9 +9186,8 @@ class TestPerceptionMTool:
         def check():
             adapter = GrowableConv1x1Adapter(8).to(self.device)
             adapter.Grow(2)
-            adapter.load_state_dict(
-                {"anchor_": adapter.anchor_.clone()},
-                strict=False)
+            assert "anchor_" not in adapter.state_dict()
+            adapter.load_state_dict({}, strict=False)
             assert len(adapter.A_list) == 1
             model = self.MakeRegressionModel()
             model.load_state_dict(

@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import IntEnum
-from hashlib import sha256
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
-import json
 import math
 
 import torch
@@ -136,6 +134,7 @@ class EndEffector:
     progress_enter: float
     progress_exit: float
     dwell_cycles: int
+    joint_ids: Tuple[str, ...]
     translation_error_scale: float = 1.0
     rotation_error_scale: float = 1.0
     observation_timeout: float = 0.25
@@ -165,10 +164,6 @@ class PerceptionProjectionView:
 
 @dataclass(frozen=True)
 class RobotDefinition:
-    profile_id: str
-    description_id: str
-    semantic_definition_id: str
-    adapter_id: str
     joints: Tuple[JointDefinition, ...]
     end_effectors: Tuple[EndEffector, ...]
     perception_calibrations: Tuple[PerceptionCalibration, ...]
@@ -176,13 +171,6 @@ class RobotDefinition:
 
 @dataclass(frozen=True)
 class RobotEmbodimentContractView:
-    schema_version: int
-    description_id: str
-    semantic_definition_id: str
-    contract_id: str
-    model_shape_id: str
-    adapter_id: str
-    model_signature: str
     rotation_chart_limit: float
     joint_count: int
     end_effector_count: int
@@ -192,6 +180,8 @@ class RobotEmbodimentContractView:
     perception_motion_layout: PackedLayout
     static_joint_tokens: Tuple[Tuple[float, ...], ...]
     static_end_effector_tokens: Tuple[Tuple[float, ...], ...]
+    effector_joint_offsets: Tuple[int, ...]
+    effector_joint_indices: Tuple[int, ...]
     end_effector_translation_basis: PackedTensor
     end_effector_rotation_basis: PackedTensor
     end_effector_target_lower: Tuple[float, ...]
@@ -207,34 +197,6 @@ class RobotEmbodimentContractView:
     perception_projection: Optional[PerceptionProjectionView]
     primary_perception_view_index: Optional[int]
     model_shape: EmbodimentShape
-
-    def CompileBrainBuildSignature(
-        self,
-        cognitivePayload: Mapping[str, Any],
-        schemaVersion: int,
-    ) -> str:
-        payload = {
-            "schema_version": schemaVersion,
-            "cognitive": dict(cognitivePayload),
-            "contract": {
-                "schema_version": self.schema_version,
-                "description_id": self.description_id,
-                "semantic_definition_id": self.semantic_definition_id,
-                "contract_id": self.contract_id,
-                "model_shape_id": self.model_shape_id,
-                "adapter_id": self.adapter_id,
-                "model_signature": self.model_signature,
-                "rotation_chart_limit": self.rotation_chart_limit,
-            },
-            "embodiment": asdict(self.model_shape),
-        }
-        canonical = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False).encode("utf-8")
-        return sha256(canonical).hexdigest()
 
     def TargetSlotsMatch(
         self,
@@ -275,14 +237,10 @@ class RobotEmbodimentContractView:
 class PackedEndEffectorTarget:
     values: torch.Tensor
     active: torch.Tensor
-    contract_id: str
-    model_signature: str
     target_version: torch.Tensor
     timestamp: torch.Tensor
 
     def Validate(self, contractView: RobotEmbodimentContractView) -> None:
-        if self.contract_id != contractView.contract_id or self.model_signature != contractView.model_signature:
-            raise ValueError("target identity does not match robot contract")
         if (
             not torch.is_tensor(self.values)
             or self.values.dim() != 2
@@ -539,13 +497,9 @@ class BrainFeedbackPacket:
     perception_angular_velocity: torch.Tensor
     perception_motion_features: torch.Tensor
     perception_motion_present: torch.Tensor
-    contract_id: str
-    model_signature: str
     timestamp: torch.Tensor
 
     def Validate(self, contractView: RobotEmbodimentContractView) -> None:
-        if self.contract_id != contractView.contract_id or self.model_signature != contractView.model_signature:
-            raise ValueError("feedback identity does not match robot contract")
         if not torch.is_tensor(self.joint_features) or self.joint_features.dim() != 2:
             raise ValueError("joint features must be a batched matrix")
         batchSize = int(self.joint_features.size(0))
@@ -665,8 +619,6 @@ class BrainFeedbackPacket:
             perception_angular_velocity=self.perception_angular_velocity.index_select(0, rowIndex),
             perception_motion_features=self.perception_motion_features.index_select(0, rowIndex),
             perception_motion_present=self.perception_motion_present.index_select(0, rowIndex),
-            contract_id=self.contract_id,
-            model_signature=self.model_signature,
             timestamp=self.timestamp.index_select(0, rowIndex))
 
     def RepeatCandidates(self, candidateCount: int) -> "BrainFeedbackPacket":
@@ -678,8 +630,6 @@ class BrainFeedbackPacket:
 
 
 class Robot:
-    SchemaVersion = 27
-    ActionSchemaVersion = 1
     RotationStateWidth = 6
     PrincipalRotationLimit = math.pi - 1e-4
     IdentityBasis = (
@@ -694,12 +644,9 @@ class Robot:
         "end_effector_translation",
         "end_effector_rotation_xyzw",
         "end_effector_present",
-        "contract_id",
         "timestamp",
     })
     TargetPayloadFields = frozenset({
-        "contract_id",
-        "model_signature",
         "target_version",
         "timestamp",
         "slot_ids",
@@ -709,7 +656,6 @@ class Robot:
         "rotation_vector",
     })
     ActionRequestPayloadFields = frozenset({
-        "schema_version",
         "request_id",
         "action_epoch",
         "command_active",
@@ -723,7 +669,6 @@ class Robot:
         "end_effector_target",
     })
     ActionExecutionResultPayloadFields = frozenset({
-        "schema_version",
         "request_id",
         "action_epoch",
         "applied_target",
@@ -759,16 +704,6 @@ class Robot:
         self.RotationProjection = self.CompileBasisProjection(
             self.ContractView.end_effector_rotation_basis)
         self.Reset()
-
-    @staticmethod
-    def CompileSignature(payload: Mapping[str, Any]) -> str:
-        canonical = json.dumps(
-            dict(payload),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False).encode("utf-8")
-        return sha256(canonical).hexdigest()
 
     @staticmethod
     def ValidateTensor(
@@ -901,8 +836,6 @@ class Robot:
     ) -> Tuple[Tuple[int, ...], ...]:
         if type(definition) is not RobotDefinition:
             raise TypeError("robot definition has the wrong type")
-        for name in ("profile_id", "description_id", "semantic_definition_id", "adapter_id"):
-            cls.ValidateIdentifier(getattr(definition, name), name)
         if not definition.joints or any(type(value) is not JointDefinition for value in definition.joints):
             raise ValueError("robot definition requires joint coordinates")
         if not definition.end_effectors or any(type(value) is not EndEffector for value in definition.end_effectors):
@@ -936,12 +869,18 @@ class Robot:
             ):
                 raise ValueError("joint limits are invalid")
         endpointSet = set(endpointIds)
+        jointSet = set(jointIds)
         for endpoint in definition.end_effectors:
             cls.ValidateIdentifier(endpoint.effector_id, "end-effector id")
             if type(endpoint.effector_type) is not EndEffectorType:
                 raise ValueError("end-effector type is invalid")
             if endpoint.parent_effector_id is not None and endpoint.parent_effector_id not in endpointSet:
                 raise ValueError("end-effector parent is unknown")
+            if not endpoint.joint_ids or any(
+                jointId not in jointSet
+                for jointId in endpoint.joint_ids
+            ):
+                raise ValueError("end-effector joints are invalid")
             cls.ValidateIdentifier(endpoint.reference_frame_id, "reference frame")
             translation = cls.ValidateBasis(endpoint.translation_basis, "translation basis")
             rotation = cls.ValidateBasis(endpoint.rotation_basis, "rotation basis")
@@ -1037,23 +976,6 @@ class Robot:
         return layers, rootMask, childMask, independentMask
 
     @staticmethod
-    def CompileShapeId(
-        shape: EmbodimentShape,
-        jointLayout: PackedLayout,
-        feedbackLayout: PackedLayout,
-        targetLayout: PackedLayout,
-        perceptionLayout: PackedLayout,
-    ) -> str:
-        return Robot.CompileSignature({
-            "kind": "embodiment_shape",
-            "shape": asdict(shape),
-            "joint_feedback_widths": tuple(jointLayout.Width(index) for index in range(jointLayout.SlotCount)),
-            "end_effector_feedback_widths": tuple(feedbackLayout.Width(index) for index in range(feedbackLayout.SlotCount)),
-            "end_effector_target_widths": tuple(targetLayout.Width(index) for index in range(targetLayout.SlotCount)),
-            "perception_motion_widths": tuple(perceptionLayout.Width(index) for index in range(perceptionLayout.SlotCount)),
-        })
-
-    @staticmethod
     def CompileJointTokens(joints: Sequence[JointDefinition]) -> Tuple[Tuple[float, ...], ...]:
         return tuple(tuple(float(value) for value in (
             *(float(typeIndex == int(joint.joint_type)) for typeIndex in range(len(JointType))),
@@ -1138,34 +1060,25 @@ class Robot:
             hierarchy_edge_count=sum(value >= 0 for value in parentIndex),
             perception_view_dim=len(perceptionIndices),
             perception_motion_packed_dim=perceptionLayout.PackedDim)
-        shapeId = self.CompileShapeId(shape, jointLayout, feedbackLayout, targetLayout, perceptionLayout)
+        jointIndex = {
+            value.joint_id: index
+            for index, value in enumerate(self.Joints)}
+        effectorJointWidths = tuple(
+            len(endpoint.joint_ids)
+            for endpoint in self.EndEffectors)
+        effectorJointOffsets = PackedLayout.FromWidths(
+            effectorJointWidths).offsets
+        effectorJointIndices = tuple(
+            jointIndex[jointId]
+            for endpoint in self.EndEffectors
+            for jointId in endpoint.joint_ids)
         translationBasis = PackedTensor.FromMatrices(tuple(value.translation_basis for value in self.EndEffectors))
         rotationBasis = PackedTensor.FromMatrices(tuple(value.rotation_basis for value in self.EndEffectors))
         targetLower = tuple(value for endpoint in self.EndEffectors for value in endpoint.target_lower)
         targetUpper = tuple(value for endpoint in self.EndEffectors for value in endpoint.target_upper)
         targetTolerance = self.CompileTargetCoordinateTolerance(
             self.EndEffectors)
-        modelSignature = self.CompileSignature({
-            "schema_version": self.SchemaVersion,
-            "definition": asdict(definition),
-            "joint_feedback_layout": jointLayout.offsets,
-            "end_effector_feedback_layout": feedbackLayout.offsets,
-            "end_effector_target_layout": targetLayout.offsets,
-            "perception_motion_layout": perceptionLayout.offsets,
-            "joint_tokens": jointTokens,
-            "end_effector_tokens": endpointTokens,
-            "parent_index": parentIndex,
-            "topological_layers": layers,
-        })
-        contractId = self.CompileSignature({"kind": "robot_contract", "model_signature": modelSignature})
         view = RobotEmbodimentContractView(
-            schema_version=self.SchemaVersion,
-            description_id=definition.description_id,
-            semantic_definition_id=definition.semantic_definition_id,
-            contract_id=contractId,
-            model_shape_id=shapeId,
-            adapter_id=definition.adapter_id,
-            model_signature=modelSignature,
             rotation_chart_limit=self.PrincipalRotationLimit,
             joint_count=len(self.Joints),
             end_effector_count=len(self.EndEffectors),
@@ -1175,6 +1088,8 @@ class Robot:
             perception_motion_layout=perceptionLayout,
             static_joint_tokens=jointTokens,
             static_end_effector_tokens=endpointTokens,
+            effector_joint_offsets=effectorJointOffsets,
+            effector_joint_indices=effectorJointIndices,
             end_effector_translation_basis=translationBasis,
             end_effector_rotation_basis=rotationBasis,
             end_effector_target_lower=targetLower,
@@ -1215,20 +1130,12 @@ class Robot:
         cls,
         urdfSource: Any,
         srdfSource: Any,
-        profileId: str,
-        adapterId: str,
         urdfReader: Callable[[Any], Mapping[str, Any]],
         srdfReader: Callable[[Any], Mapping[str, Any]],
     ) -> "Robot":
         urdf = cls.ParseUrdf(urdfSource, urdfReader)
         srdf = cls.ParseSrdf(srdfSource, srdfReader)
-        if urdf["robot_name"] != srdf["robot_name"] or urdf["description_id"] != srdf["description_id"]:
-            raise ValueError("URDF and SRDF identities do not match")
         definition = RobotDefinition(
-            profile_id=profileId,
-            description_id=urdf["description_id"],
-            semantic_definition_id=srdf["semantic_definition_id"],
-            adapter_id=adapterId,
             joints=tuple(urdf["joints"]),
             end_effectors=tuple(srdf["end_effectors"]),
             perception_calibrations=tuple(srdf["perception_calibrations"]))
@@ -1291,6 +1198,7 @@ class Robot:
             cls.CreateRevoluteJoint(f"{sideId}_{name}", axis, lower, upper, velocity)
             for name, axis, (lower, upper, velocity) in zip(upperNames, upperAxes, upperLimits)
         ]
+        armJointIds = tuple(joint.joint_id for joint in joints)
         fingerSpecifications = (
             ("thumb", ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 0.0, 0.0)), ((-0.70, 0.70), (-0.35, 1.40), (0.0, 1.40), (0.0, 1.40))),
             ("index", ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (1.0, 0.0, 0.0)), ((-0.35, 1.57), (-0.35, 0.35), (0.0, 1.75), (0.0, 1.40))),
@@ -1321,7 +1229,8 @@ class Robot:
             is_perception_slot=False,
             progress_enter=0.025,
             progress_exit=0.040,
-            dwell_cycles=3)]
+            dwell_cycles=3,
+            joint_ids=armJointIds)]
         endpoints.extend(EndEffector(
             effector_id=f"{sideId}_{fingerName}_tip",
             effector_type=EndEffectorType.FINGERTIP,
@@ -1334,7 +1243,11 @@ class Robot:
             is_perception_slot=False,
             progress_enter=0.012,
             progress_exit=0.020,
-            dwell_cycles=3) for fingerName in fingerNames)
+            dwell_cycles=3,
+            joint_ids=armJointIds + tuple(
+                f"{sideId}_{fingerName}_{coordinateIndex}"
+                for coordinateIndex in range(4)))
+            for fingerName in fingerNames)
         return tuple(joints), tuple(endpoints)
 
     @classmethod
@@ -1378,12 +1291,9 @@ class Robot:
             is_perception_slot=True,
             progress_enter=0.020,
             progress_exit=0.040,
-            dwell_cycles=2)
+            dwell_cycles=2,
+            joint_ids=tuple(joint.joint_id for joint in cameraJoints))
         return cls(RobotDefinition(
-            profile_id="temporary_dual_anthropomorphic_arm_camera",
-            description_id="temporary_dual_anthropomorphic_arm_camera_urdf",
-            semantic_definition_id="temporary_dual_anthropomorphic_arm_camera_srdf",
-            adapter_id="external_endpoint_pose_adapter",
             joints=leftJoints + rightJoints + cameraJoints,
             end_effectors=leftEndpoints + rightEndpoints + (camera,),
             perception_calibrations=(PerceptionCalibration(
@@ -1549,7 +1459,6 @@ class Robot:
                 dtype=dtype).cpu().tolist(),
             "end_effector_rotation_xyzw": rotation.cpu().tolist(),
             "end_effector_present": [False] * self.ContractView.end_effector_count,
-            "contract_id": self.ContractView.contract_id,
             "timestamp": float(timestamp),
         }
 
@@ -1563,16 +1472,13 @@ class Robot:
         self,
         rawPayload: Any,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         payloads = tuple(rawPayload) if isinstance(rawPayload, (tuple, list)) else None
         if payloads is not None:
             if not payloads:
                 raise ValueError("robot feedback batch cannot be empty")
             for payload in payloads:
                 self.ValidatePayload(payload)
-            contractIds = {payload["contract_id"] for payload in payloads}
-            if len(contractIds) != 1:
-                raise ValueError("robot feedback batch must share one contract")
             position = torch.stack(tuple(torch.as_tensor(
                 payload["position"],
                 device=device,
@@ -1594,7 +1500,6 @@ class Robot:
                 device=device,
                 dtype=torch.bool) for payload in payloads))
             timestamp = torch.tensor(tuple(float(torch.as_tensor(payload["timestamp"]).item()) for payload in payloads), device=device, dtype=torch.float64)
-            contractId = next(iter(contractIds))
         else:
             self.ValidatePayload(rawPayload)
             position = torch.as_tensor(rawPayload["position"], device=device, dtype=torch.float32)
@@ -1613,8 +1518,7 @@ class Robot:
             if present.dim() == 1:
                 present = present.unsqueeze(0)
             timestamp = torch.as_tensor(rawPayload["timestamp"], device=device, dtype=torch.float64).reshape(-1)
-            contractId = rawPayload["contract_id"]
-        return position, velocity, translation, rotation, present, contractId, timestamp
+        return position, velocity, translation, rotation, present, timestamp
 
     def ValidateFeedback(
         self,
@@ -1623,12 +1527,9 @@ class Robot:
         translation: torch.Tensor,
         rotation: torch.Tensor,
         endpointPresent: torch.Tensor,
-        contractId: str,
         timestamp: torch.Tensor,
         batchSize: Optional[int],
     ) -> None:
-        if contractId != self.ContractView.contract_id:
-            raise ValueError("robot feedback contract identity does not match")
         actualBatch = int(position.size(0)) if position.dim() == 2 else 0
         if batchSize is not None and actualBatch != int(batchSize):
             raise ValueError("robot feedback batch does not match sensory batch")
@@ -1775,8 +1676,6 @@ class Robot:
             translations.append(translationRow)
             rotations.append(rotationRow)
         return {
-            "contract_id": target.contract_id,
-            "model_signature": target.model_signature,
             "target_version": target.target_version.detach().cpu().tolist(),
             "timestamp": target.timestamp.detach().cpu().tolist(),
             "slot_ids": list(self.EndEffectorIds),
@@ -1821,7 +1720,6 @@ class Robot:
     ) -> Mapping[str, Any]:
         request.Validate(self.ContractView)
         return {
-            "schema_version": self.ActionSchemaVersion,
             "request_id": request.request_id.detach().cpu().tolist(),
             "action_epoch": request.action_epoch.detach().cpu().tolist(),
             "command_active": request.command_active.detach().cpu().tolist(),
@@ -1862,9 +1760,7 @@ class Robot:
         if not isinstance(payload, Mapping) or set(payload) != self.TargetPayloadFields:
             raise ValueError("applied target payload fields do not match")
         if (
-            payload["contract_id"] != self.ContractView.contract_id
-            or payload["model_signature"] != self.ContractView.model_signature
-            or tuple(payload["slot_ids"]) != self.EndEffectorIds
+            tuple(payload["slot_ids"]) != self.EndEffectorIds
             or tuple(payload["reference_frame_ids"]) != self.ReferenceFrameIds
         ):
             raise ValueError("applied target payload does not match the robot contract")
@@ -1967,8 +1863,6 @@ class Robot:
         target = PackedEndEffectorTarget(
             values=values,
             active=active,
-            contract_id=payload["contract_id"],
-            model_signature=payload["model_signature"],
             target_version=self.DecodeActionVector(
                 payload["target_version"],
                 (batchSize,),
@@ -1994,11 +1888,6 @@ class Robot:
             raise ValueError("pending action request does not match the result device")
         if not isinstance(payload, Mapping) or set(payload) != self.ActionExecutionResultPayloadFields:
             raise ValueError("action execution result fields do not match")
-        if (
-            type(payload["schema_version"]) is not int
-            or payload["schema_version"] != self.ActionSchemaVersion
-        ):
-            raise ValueError("action execution result schema does not match")
         batchSize = int(pendingRequest.target.values.size(0))
         endpointCount = len(self.EndEffectors)
         statusRows = payload["execution_status"]
@@ -2574,7 +2463,6 @@ class Robot:
             translation,
             rotationQuaternion,
             endpointPresent,
-            contractId,
             timestamp,
         ) = self.DecodeFeedback(rawPayload, torch.device(device))
         self.ValidateFeedback(
@@ -2583,7 +2471,6 @@ class Robot:
             translation,
             rotationQuaternion,
             endpointPresent,
-            contractId,
             timestamp,
             batchSize,
         )
@@ -2644,8 +2531,6 @@ class Robot:
             perception_angular_velocity=perceptionAngularVelocity,
             perception_motion_features=perceptionMotionFeatures,
             perception_motion_present=perceptionMotionPresent,
-            contract_id=self.ContractView.contract_id,
-            model_signature=self.ContractView.model_signature,
             timestamp=timestamp)
         self.LastTimestamp = timestamp.detach().clone()
         return packet
@@ -2676,8 +2561,6 @@ class TestRobotMorphologyMTool:
         return PackedEndEffectorTarget(
             values=values,
             active=active,
-            contract_id=contract.contract_id,
-            model_signature=contract.model_signature,
             target_version=torch.tensor(
                 [version],
                 device=self.device,
@@ -2763,7 +2646,6 @@ class TestRobotMorphologyMTool:
         encodedRequest = robot.EncodeActionRequest(request)
         assert set(encodedRequest) == robot.ActionRequestPayloadFields
         result = robot.DecodeActionExecutionResult({
-            "schema_version": robot.ActionSchemaVersion,
             "request_id": [11],
             "action_epoch": [3],
             "applied_target": robot.DecodeTarget(target),
@@ -2884,8 +2766,6 @@ class TestRobotMorphologyMTool:
         targetB = PackedEndEffectorTarget(
             values=targetBValues,
             active=targetA.active.clone(),
-            contract_id=targetA.contract_id,
-            model_signature=targetA.model_signature,
             target_version=torch.tensor(
                 [1], device=self.device, dtype=torch.long),
             timestamp=torch.tensor([0.2], device=self.device))
@@ -2944,8 +2824,6 @@ class TestRobotMorphologyMTool:
         applied = PackedEndEffectorTarget(
             values=appliedValues,
             active=requested.active.clone(),
-            contract_id=requested.contract_id,
-            model_signature=requested.model_signature,
             target_version=requested.target_version.clone(),
             timestamp=torch.tensor([0.1], device=self.device))
         result = self.MakeResult(
@@ -2968,8 +2846,6 @@ class TestRobotMorphologyMTool:
         within = PackedEndEffectorTarget(
             values=withinValues,
             active=target.active.clone(),
-            contract_id=target.contract_id,
-            model_signature=target.model_signature,
             target_version=target.target_version.clone(),
             timestamp=target.timestamp.clone())
         within.Validate(contract)
@@ -2978,8 +2854,6 @@ class TestRobotMorphologyMTool:
         outside = PackedEndEffectorTarget(
             values=outsideValues,
             active=target.active.clone(),
-            contract_id=target.contract_id,
-            model_signature=target.model_signature,
             target_version=target.target_version.clone(),
             timestamp=target.timestamp.clone())
         rejected = False
@@ -3004,8 +2878,6 @@ class TestRobotMorphologyMTool:
         nextTarget = PackedEndEffectorTarget(
             values=target.values.clone(),
             active=target.active.clone(),
-            contract_id=target.contract_id,
-            model_signature=target.model_signature,
             target_version=torch.tensor(
                 [1], device=self.device, dtype=torch.long),
             timestamp=torch.tensor([0.2], device=self.device))
@@ -3040,8 +2912,6 @@ class TestRobotMorphologyMTool:
         heldTarget = PackedEndEffectorTarget(
             values=heldValues,
             active=target.active.clone(),
-            contract_id=target.contract_id,
-            model_signature=target.model_signature,
             target_version=target.target_version.clone(),
             timestamp=torch.tensor([0.2], device=self.device))
         heldRequest = self.MakeRequest(robot, target, 52, 1)
@@ -3073,8 +2943,6 @@ class TestRobotMorphologyMTool:
         targetB = PackedEndEffectorTarget(
             values=valuesB,
             active=targetA.active.clone(),
-            contract_id=targetA.contract_id,
-            model_signature=targetA.model_signature,
             target_version=torch.tensor(
                 [1], device=self.device, dtype=torch.long),
             timestamp=torch.tensor([0.2], device=self.device))
@@ -3085,8 +2953,6 @@ class TestRobotMorphologyMTool:
         composite = PackedEndEffectorTarget(
             values=compositeValues,
             active=targetA.active.clone(),
-            contract_id=targetA.contract_id,
-            model_signature=targetA.model_signature,
             target_version=torch.tensor(
                 [1], device=self.device, dtype=torch.long),
             timestamp=torch.tensor([0.3], device=self.device))
@@ -3166,10 +3032,6 @@ class TestRobotMorphologyMTool:
             basis: Tuple[Tuple[float, ...], ...],
         ) -> Robot:
             return Robot(RobotDefinition(
-                profile_id=profileId,
-                description_id=f"{profileId}_description",
-                semantic_definition_id=f"{profileId}_semantic",
-                adapter_id=f"{profileId}_adapter",
                 joints=(Robot.CreateRevoluteJoint(
                     f"{profileId}_joint",
                     (1.0, 0.0, 0.0),
@@ -3188,7 +3050,8 @@ class TestRobotMorphologyMTool:
                     is_perception_slot=False,
                     progress_enter=0.1,
                     progress_exit=2.0,
-                    dwell_cycles=1),),
+                    dwell_cycles=1,
+                    joint_ids=(f"{profileId}_joint",)),),
                 perception_calibrations=()))
 
         def Evaluate(
@@ -3205,8 +3068,6 @@ class TestRobotMorphologyMTool:
                     contract.end_effector_count,
                     device=self.device,
                     dtype=torch.bool),
-                contract_id=contract.contract_id,
-                model_signature=contract.model_signature,
                 target_version=torch.zeros(
                     1,
                     device=self.device,

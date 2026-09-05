@@ -80,7 +80,6 @@ def LoadImageFirstFrame(path: Union[str, Path]) -> np.ndarray:
 
 DEPTH_FILE_SUFFIXES = (".npy", ".npz", ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 ARRAY_FILE_SUFFIXES = DEPTH_FILE_SUFFIXES
-SYNTHETIC_SUPERVISION_SCHEMA_VERSION = 5
 
 
 def ResolveContractFeedbackPath(isTest: bool) -> str:
@@ -667,12 +666,6 @@ class DataPreprocessor:
             "agency_names": list(AGENCY_NAMES),
             "motion_layer_names": list(MOTION_LAYER_NAMES),
             "ontology_relation_names": list(ONTOLOGY_RELATION_NAMES),
-            "description_id": contractView.description_id,
-            "semantic_definition_id": contractView.semantic_definition_id,
-            "contract_id": contractView.contract_id,
-            "model_shape_id": contractView.model_shape_id,
-            "adapter_id": contractView.adapter_id,
-            "model_signature": contractView.model_signature,
             "self_part_slot_count": contractView.end_effector_count,
             "self_part_parent_indices": list(contractView.parent_index),
             "observed_slot_capacity": int(maxNodes),
@@ -954,17 +947,10 @@ class DataPreprocessor:
         maxNodes: int = ModuleDim.PstObservedSlots,
     ) -> Dict[str, torch.Tensor]:
         if type(annotation) is not dict or set(annotation) != {
-            "schema_version",
             "contract_binding",
             "targets",
         }:
             raise ValueError("synthetic supervision fields do not match schema")
-        if (
-            type(annotation["schema_version"]) is not int
-            or annotation["schema_version"]
-            != SYNTHETIC_SUPERVISION_SCHEMA_VERSION
-        ):
-            raise ValueError("unsupported synthetic supervision schema")
         expectedBinding = DataPreprocessor.ExpectedSyntheticOntologyVocabularyContract(
             contractView,
             maxNodes=maxNodes)

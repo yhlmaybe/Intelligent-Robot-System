@@ -306,8 +306,6 @@ class PackedTemporalExecutionGate:
         return PackedEndEffectorTarget(
             values=feedback.applied_target_values,
             active=feedback.applied_target_active,
-            contract_id=self.contract_view.contract_id,
-            model_signature=self.contract_view.model_signature,
             target_version=feedback.applied_target_version.clamp_min(0),
             timestamp=feedback.timestamp,
         )
@@ -319,8 +317,6 @@ class PackedTemporalExecutionGate:
         return PackedEndEffectorTarget(
             values=torch.zeros_like(template.values),
             active=torch.zeros_like(template.active),
-            contract_id=self.contract_view.contract_id,
-            model_signature=self.contract_view.model_signature,
             target_version=template.target_version,
             timestamp=template.timestamp,
         )
@@ -457,8 +453,6 @@ class PackedTemporalExecutionGate:
                     neutral.active,
                 ),
             ),
-            contract_id=self.contract_view.contract_id,
-            model_signature=self.contract_view.model_signature,
             target_version=torch.where(
                 dispatch | redispatch,
                 candidateTarget.target_version,

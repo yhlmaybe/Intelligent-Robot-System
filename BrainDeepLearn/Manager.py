@@ -42,7 +42,6 @@ from DataPreprocess import (
 from AGICore import (
     Agent,
     BRAIN_RUNTIME_BUFFER_FIELDS,
-    BRAIN_RUNTIME_SCHEMA_VERSION,
     BrainCore,
     ExportCognitiveBackboneState,
     ExportBrainModelState,
@@ -55,20 +54,17 @@ from AGICore import (
 from Config import BasicParameters
 from CoreTypes import (
     BrainBuildSpec,
-    COGNITIVE_READOUT_SCHEMA_VERSION,
     CognitiveReadout,
     ContractAgentActInput,
     ContractAgentActOutput,
     ContractBrainStepInput,
     ContractOfflineBatch,
     ContractOfflineSample,
-    DECISION_WIRE_SCHEMA_VERSION,
     DECISION_REQUEST_PROVENANCE_FIELDS,
     POLICY_PATH_DETAIL,
     POLICY_PATH_FAST,
     POLICY_PATH_FULL,
     SENSOR_PACKET_WIRE_FIELDS,
-    SENSOR_PACKET_WIRE_SCHEMA_VERSION,
     TEXT_TRUST_OCR_OBSERVED,
     TEXT_TRUST_OPERATOR_COMMAND,
     TEXT_TRUST_UNSAFE_EXTERNAL)
@@ -81,9 +77,6 @@ from RobotMorphologyModule import (
     Robot,
     SlotExecutionStatus)
 
-
-TRAIN_CHECKPOINT_SCHEMA_VERSION = BRAIN_RUNTIME_SCHEMA_VERSION
-OCR_CHECKPOINT_SCHEMA_VERSION = 16
 
 CONTRACT_TRAINING_TEST_CONFIG_FIELDS = (
     "DATA_ROOT_PATH_TEST",
@@ -100,18 +93,11 @@ CONTRACT_TRAINING_TEST_CONFIG_FIELDS = (
 CONTRACT_TRAINING_TEST_LOCK = threading.Lock()
 
 MODULE_PARAMETER_FIELDS = frozenset({
-    "schema_version",
-    "calibration_id",
-    "model_contract_id",
     "brain",
 })
 
 TRAIN_CHECKPOINT_FIELDS = frozenset({
-    "schema_version",
     "calibration_id",
-    "description_id",
-    "model_contract_id",
-    "adapter_id",
     "world_frame_id",
     "epoch",
     "next_batch_index",
@@ -144,41 +130,25 @@ TRAIN_RNG_FIELDS = frozenset({
 })
 
 DEPLOYMENT_MANIFEST_FIELDS = frozenset({
-    "schema_version",
     "calibration_id",
-    "description_id",
-    "model_contract_id",
-    "adapter_id",
     "generation",
     "model_path",
     "world_memory_path",
     "memory_path",
 })
 
-OCR_METADATA_FIELDS = frozenset({
-    "vocab",
-    "blank_index",
-    "addon_cfg",
-})
-
 OCR_MODULE_PARAMETER_FIELDS = frozenset({
-    "schema_version",
     "ocr",
-    "ocr_meta",
 })
 
 OCR_RECOGNIZER_PARAMETER_FIELDS = frozenset({
-    "schema_version",
     "recognizer",
-    "ocr_meta",
 })
 
 OCR_TRAIN_CHECKPOINT_FIELDS = frozenset({
-    "schema_version",
     "epoch",
     "best_val",
     "ocr",
-    "ocr_meta",
     "optimizer",
     "train_indices",
     "val_indices",
@@ -190,11 +160,9 @@ OCR_TRAIN_CHECKPOINT_FIELDS = frozenset({
 })
 
 OCR_RECOGNIZER_TRAIN_CHECKPOINT_FIELDS = frozenset({
-    "schema_version",
     "epoch",
     "best_val",
     "recognizer",
-    "ocr_meta",
     "optimizer",
     "train_indices",
     "val_indices",
@@ -2050,9 +2018,6 @@ class ManagerFunction:
             "frame_id",
             "calibration_id",
             "world_frame_id",
-            "description_id",
-            "model_contract_id",
-            "adapter_id",
         ):
             if (
                 type(requestProvenance[name]) is not str
@@ -2066,20 +2031,12 @@ class ManagerFunction:
         ):
             raise ValueError(
                 "contract request sequence_index must be non-negative")
-        contract_view = self.brain_build_spec.contract_view
-        projection = contract_view.perception_projection
-        expected_identity = {
-            "calibration_id": (
-                projection.calibration_id if projection is not None else ""),
-            "description_id": contract_view.description_id,
-            "model_contract_id": self.brain_build_spec.model_signature,
-            "adapter_id": contract_view.adapter_id,
-        }
-        for name, expected in expected_identity.items():
-            if requestProvenance[name] != expected:
-                raise ValueError(
-                    "contract request {} does not match BrainBuildSpec".format(
-                        name))
+        projection = self.brain_build_spec.contract_view.perception_projection
+        calibration_id = (
+            projection.calibration_id if projection is not None else "")
+        if requestProvenance["calibration_id"] != calibration_id:
+            raise ValueError(
+                "contract request calibration_id does not match the projection")
 
     def EncodeCognitiveReadout(
         self,
@@ -2204,11 +2161,6 @@ class ManagerFunction:
         execution_payload = json.loads(executionResultJson)
         if type(sensor_packet) is not dict or set(sensor_packet) != set(SENSOR_PACKET_WIRE_FIELDS):
             raise ValueError("sensor packet fields do not match the current schema")
-        if (
-            type(sensor_packet["schema_version"]) is not int
-            or sensor_packet["schema_version"] != SENSOR_PACKET_WIRE_SCHEMA_VERSION
-        ):
-            raise ValueError("unsupported sensor packet schema")
         if self.perception_calibration_id is None:
             raise RuntimeError("agent_handle has not been initialized")
         if sensor_packet["calibration_id"] != self.perception_calibration_id:
@@ -2273,10 +2225,6 @@ class ManagerFunction:
             "frame_id": sensor_packet["frame_id"],
             "calibration_id": sensor_packet["calibration_id"],
             "world_frame_id": world_context_id,
-            "description_id": (
-                self.brain_build_spec.contract_view.description_id),
-            "model_contract_id": self.brain_build_spec.model_signature,
-            "adapter_id": self.brain_build_spec.contract_view.adapter_id,
         }
         self.ValidateContractRequestProvenance(request_provenance)
         converted = DataPreprocessor.ConvertCppPerceptionFrame(
@@ -2352,7 +2300,6 @@ class ManagerFunction:
                 request_provenance)
             terminal = done is not None and float(done) > 0.5
             response = json.dumps({
-                "schema_version": DECISION_WIRE_SCHEMA_VERSION,
                 "request_provenance": request_provenance,
                 "action_request": (
                     None
@@ -3004,11 +2951,7 @@ class ManagerFunction:
         cls,
         modelPath: Union[str, Path],
         *,
-        calibrationId: str,
-        brainBuildSpec: BrainBuildSpec,) -> Tuple[str, str, str]:
-        if type(brainBuildSpec) is not BrainBuildSpec:
-            raise TypeError("deployment resolution requires BrainBuildSpec")
-        contract_view = brainBuildSpec.contract_view
+        calibrationId: str,) -> Tuple[str, str, str]:
         manifest_path = cls.DeploymentManifestPath(modelPath)
         if not manifest_path.exists():
             raise FileNotFoundError(
@@ -3016,22 +2959,8 @@ class ManagerFunction:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if type(manifest) is not dict or set(manifest) != DEPLOYMENT_MANIFEST_FIELDS:
             raise ValueError("deployment manifest fields do not match the current schema")
-        if (
-            type(manifest["schema_version"]) is not int
-            or manifest["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
-        ):
-            raise ValueError("deployment manifest schema is unsupported")
         if manifest["calibration_id"] != calibrationId:
             raise ValueError("deployment manifest calibration_id does not match configured K")
-        if manifest["description_id"] != contract_view.description_id:
-            raise ValueError(
-                "deployment manifest description_id does not match the robot")
-        if manifest["model_contract_id"] != brainBuildSpec.model_signature:
-            raise ValueError(
-                "deployment manifest model_contract_id does not match the foundation")
-        if manifest["adapter_id"] != contract_view.adapter_id:
-            raise ValueError(
-                "deployment manifest adapter_id does not match the robot")
         for field in ("generation", "model_path", "world_memory_path", "memory_path"):
             if type(manifest[field]) is not str or not manifest[field]:
                 raise TypeError(f"deployment manifest {field} must be a non-empty string")
@@ -3060,9 +2989,6 @@ class ManagerFunction:
             for k, v in ExportDeploymentModelState(brain).items()}
 
         self.AtomicTorchSave({
-            "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
-            "calibration_id": brain.calibration_id,
-            "model_contract_id": brain.model_contract_id,
             "brain": brain_state,}, out_path)
 
     def SaveCognitiveBackboneParameters(
@@ -3082,9 +3008,7 @@ class ManagerFunction:
 
         ocr_state = {k: v.detach().cpu() for k, v in engine.state_dict().items()}
         self.AtomicTorchSave({
-            "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
-            "ocr": ocr_state,
-            "ocr_meta": self.CurrentOcrMetadata(engine),}, out_path)
+            "ocr": ocr_state,}, out_path)
 
     def SaveOCRRecognizerParameters(self, engine: OCREngineExtractor, path: str) -> None:
         out_path = Path(path)
@@ -3092,28 +3016,7 @@ class ManagerFunction:
 
         rec_state = {k: v.detach().cpu() for k, v in engine.recognizer.state_dict().items()}
         self.AtomicTorchSave({
-            "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
-            "recognizer": rec_state,
-            "ocr_meta": self.CurrentOcrMetadata(engine),}, out_path)
-
-    @staticmethod
-    def CurrentOcrMetadata(engine: OCREngineExtractor) -> Dict[str, Any]:
-        metadata = engine.OcrMetadata()
-        if type(metadata) is not dict:
-            raise TypeError("OCR metadata must be a dictionary")
-        if set(metadata) != OCR_METADATA_FIELDS:
-            raise RuntimeError("OCR metadata does not match the current schema")
-        return metadata
-
-    @classmethod
-    def ValidateOcrMetadata(
-        cls,
-        engine: OCREngineExtractor,
-        metadata: Any,) -> None:
-        if type(metadata) is not dict or set(metadata) != OCR_METADATA_FIELDS:
-            raise ValueError("OCR metadata fields do not match the current schema")
-        if metadata != cls.CurrentOcrMetadata(engine):
-            raise ValueError("OCR metadata does not match the configured model")
+            "recognizer": rec_state,}, out_path)
 
     @staticmethod
     def ValidateExactStateDict(
@@ -3266,18 +3169,6 @@ class ManagerFunction:
         if type(payload) is not dict or set(payload) != MODULE_PARAMETER_FIELDS:
             raise TypeError(
                 f"checkpoint {path} brain-weight fields do not match the current schema")
-        if (
-            type(payload["schema_version"]) is not int
-            or payload["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
-        ):
-            raise ValueError(
-                f"unsupported brain parameter schema {payload['schema_version']!r}")
-        if payload["calibration_id"] != brain.calibration_id:
-            raise ValueError(
-                "brain parameter calibration_id does not match configured K")
-        if payload["model_contract_id"] != brain.model_contract_id:
-            raise ValueError(
-                "brain parameter model_contract_id does not match the foundation")
         brain_state = payload["brain"]
         if type(brain_state) is not dict:
             raise TypeError("brain model state must be a dictionary")
@@ -3375,12 +3266,6 @@ class ManagerFunction:
             weights_only=True)
         if type(payload) is not dict or set(payload) != OCR_MODULE_PARAMETER_FIELDS:
             raise ValueError("OCR parameter fields do not match the current schema")
-        if (
-            type(payload["schema_version"]) is not int
-            or payload["schema_version"] != OCR_CHECKPOINT_SCHEMA_VERSION
-        ):
-            raise ValueError("OCR parameter schema is unsupported")
-        self.ValidateOcrMetadata(engine, payload["ocr_meta"])
         self.ValidateExactStateDict(engine, payload["ocr"], name="OCR")
         engine.load_state_dict(payload["ocr"], strict=True)
 
@@ -3392,12 +3277,6 @@ class ManagerFunction:
         if type(payload) is not dict or set(payload) != OCR_RECOGNIZER_PARAMETER_FIELDS:
             raise ValueError(
                 "OCR recognizer parameter fields do not match the current schema")
-        if (
-            type(payload["schema_version"]) is not int
-            or payload["schema_version"] != OCR_CHECKPOINT_SCHEMA_VERSION
-        ):
-            raise ValueError("OCR recognizer parameter schema is unsupported")
-        self.ValidateOcrMetadata(engine, payload["ocr_meta"])
         self.ValidateExactStateDict(
             engine.recognizer,
             payload["recognizer"],
@@ -3420,11 +3299,6 @@ class ManagerFunction:
         if type(ckpt) is not dict or set(ckpt) != OCR_TRAIN_CHECKPOINT_FIELDS:
             raise ValueError("OCR checkpoint fields do not match the current schema")
         if (
-            type(ckpt["schema_version"]) is not int
-            or ckpt["schema_version"] != OCR_CHECKPOINT_SCHEMA_VERSION
-        ):
-            raise ValueError("OCR checkpoint schema is unsupported")
-        if (
             type(ckpt["train_detection"]) is not bool
             or ckpt["train_detection"] != trainDetection
             or type(ckpt["train_recognition"]) is not bool
@@ -3432,7 +3306,6 @@ class ManagerFunction:
         ):
             raise ValueError("OCR checkpoint training mode does not match")
         self.ValidateTrainingRngState(ckpt["rng"])
-        self.ValidateOcrMetadata(engine, ckpt["ocr_meta"])
         self.ValidateExactStateDict(engine, ckpt["ocr"], name="OCR")
         self.ValidateOcrCheckpointCursor(ckpt, dataset)
 
@@ -3465,13 +3338,7 @@ class ManagerFunction:
         ):
             raise ValueError(
                 "OCR recognizer checkpoint fields do not match the current schema")
-        if (
-            type(ckpt["schema_version"]) is not int
-            or ckpt["schema_version"] != OCR_CHECKPOINT_SCHEMA_VERSION
-        ):
-            raise ValueError("OCR recognizer checkpoint schema is unsupported")
         self.ValidateTrainingRngState(ckpt["rng"])
-        self.ValidateOcrMetadata(engine, ckpt["ocr_meta"])
         self.ValidateExactStateDict(
             engine.recognizer,
             ckpt["recognizer"],
@@ -3641,7 +3508,7 @@ class ManagerFunction:
                                 boxes,
                                 texts,
                                 ignoreFlags=ignore_flags,
-                                char2Idx=engine.char2Idx,
+                                char2Idx=engine.CharacterToIndex(),
                                 imageSize=768,
                                 targetH=32,
                                 maxW=512,
@@ -3688,9 +3555,7 @@ class ManagerFunction:
                                 rec_loss = rec_out["loss"] # []
 
                                 pairs = engine.CtcGreedyDecodeWithConf(
-                                    rec_out["log_probs"], # [T, N_line, C_vocab]
-                                    idx2Char=engine.idx2Char,
-                                    blankIndex=engine.blankIndex,)
+                                    rec_out["log_probs"],) # [T, N_line, C_vocab]
                                 pred_texts = [txt for txt, _ in pairs]
                                 for pred_text, target_text in zip(pred_texts, norm_texts):
                                     correct_chars, total_chars = self.ComputeOcrCharMatchStats(
@@ -3713,11 +3578,9 @@ class ManagerFunction:
 
             def BuildOCRCheckpointPayload(epochValue: int) -> Dict[str, Any]:
                 return {
-                    "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
                     "epoch": int(epochValue),
                     "best_val": best_val,
                     "ocr": engine.state_dict(),
-                    "ocr_meta": self.CurrentOcrMetadata(engine),
                     "optimizer": optimizer.state_dict(),
                     "train_indices": list(train_ds.indices),
                     "val_indices": list(val_ds.indices),
@@ -3781,7 +3644,7 @@ class ManagerFunction:
                             boxes, 
                             texts,
                             ignoreFlags=ignore_flags,
-                            char2Idx=engine.char2Idx,
+                            char2Idx=engine.CharacterToIndex(),
                             imageSize=768,
                             targetH=32,
                             maxW=512,
@@ -3819,9 +3682,7 @@ class ManagerFunction:
 
                             with torch.no_grad():
                                 pairs = engine.CtcGreedyDecodeWithConf(
-                                    rec_out["log_probs"].detach(), # [T, N_line, C_vocab]
-                                    idx2Char=engine.idx2Char,
-                                    blankIndex=engine.blankIndex,)
+                                    rec_out["log_probs"].detach(),) # [T, N_line, C_vocab]
                                 rec_forward_texts = [txt for txt, _ in pairs]
                                 for pred_text, target_text in zip(rec_forward_texts, norm_texts):
                                     correct_chars, total_chars = self.ComputeOcrCharMatchStats(
@@ -4164,7 +4025,7 @@ class ManagerFunction:
                                 img,
                                 text,
                                 ignoreFlag=ignore_flag,
-                                char2Idx=engine.char2Idx,
+                                char2Idx=engine.CharacterToIndex(),
                                 targetH=32,
                                 maxW=512,
                                 device=self.device,)
@@ -4185,9 +4046,7 @@ class ManagerFunction:
                             rec_loss = rec_out["loss"] # []
 
                             pairs = engine.CtcGreedyDecodeWithConf(
-                                rec_out["log_probs"], # [T, N_line, C_vocab]
-                                idx2Char=engine.idx2Char,
-                                blankIndex=engine.blankIndex,)
+                                rec_out["log_probs"],) # [T, N_line, C_vocab]
                             pred_text = pairs[0][0] if len(pairs) > 0 else ""
                             total_correct += int(pred_text == norm_text)
                             total_elems += 1
@@ -4200,11 +4059,9 @@ class ManagerFunction:
 
             def BuildOCRRecognizerCheckpointPayload(epochValue: int) -> Dict[str, Any]:
                 return {
-                    "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
                     "epoch": int(epochValue),
                     "best_val": best_val,
                     "recognizer": engine.recognizer.state_dict(),
-                    "ocr_meta": self.CurrentOcrMetadata(engine),
                     "optimizer": optimizer.state_dict(),
                     "train_indices": list(train_ds.indices),
                     "val_indices": list(val_ds.indices),
@@ -4257,7 +4114,7 @@ class ManagerFunction:
                             img,
                             text,
                             ignoreFlag=ignore_flag,
-                            char2Idx=engine.char2Idx,
+                            char2Idx=engine.CharacterToIndex(),
                             targetH=32,
                             maxW=512,
                             device=self.device,)
@@ -4279,9 +4136,7 @@ class ManagerFunction:
 
                         with torch.no_grad():
                             pairs = engine.CtcGreedyDecodeWithConf(
-                                rec_out["log_probs"].detach(), # [T, N_line, C_vocab]
-                                idx2Char=engine.idx2Char,
-                                blankIndex=engine.blankIndex,)
+                                rec_out["log_probs"].detach(),) # [T, N_line, C_vocab]
                             pred_text = pairs[0][0] if len(pairs) > 0 else ""
                             batch_correct += int(pred_text == norm_text)
                             batch_elems += 1
@@ -4435,8 +4290,7 @@ class ManagerFunction:
                     initial_memory_path,
                 ) = self.ResolveDeploymentArtifactPaths(
                     output_path,
-                    calibrationId=projection.calibration_id,
-                    brainBuildSpec=self.brain_build_spec)
+                    calibrationId=projection.calibration_id)
             else:
                 deployment_model_path = output_path
                 initial_world_path = worldMemPath
@@ -4558,11 +4412,7 @@ class ManagerFunction:
             ) -> Dict[str, Any]:
                 brain.mem.FlushPendingWrites()
                 return {
-                    "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                     "calibration_id": projection.calibration_id,
-                    "description_id": brain.description_id,
-                    "model_contract_id": brain.model_contract_id,
-                    "adapter_id": brain.adapter_id,
                     "world_frame_id": dataset.world_frame_id,
                     "epoch": int(epoch_value),
                     "next_batch_index": int(next_batch_index),
@@ -4634,11 +4484,7 @@ class ManagerFunction:
                             brain,
                             str(generation_model))
                         self.AtomicJsonSave({
-                            "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                             "calibration_id": projection.calibration_id,
-                            "description_id": brain.description_id,
-                            "model_contract_id": brain.model_contract_id,
-                            "adapter_id": brain.adapter_id,
                             "generation": generation,
                             "model_path": str(generation_model.resolve()),
                             "world_memory_path": str(
@@ -4910,12 +4756,6 @@ class ManagerFunction:
             raise ValueError(
                 f"checkpoint {ckpt_path} fields do not match the current schema")
 
-        if (
-            type(raw["schema_version"]) is not int
-            or raw["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
-        ):
-            raise ValueError(
-                f"unsupported training checkpoint schema {raw['schema_version']!r}")
         if type(raw["brain"]) is not dict:
             raise TypeError("training checkpoint brain state must be a dictionary")
         if raw["online_learning"]:
@@ -4923,9 +4763,6 @@ class ManagerFunction:
                 "online training checkpoints require the published deployment artifact; "
                 "their candidate adapters cannot be exported without materialization")
         params = {
-            "schema_version": raw["schema_version"],
-            "calibration_id": raw["calibration_id"],
-            "model_contract_id": raw["model_contract_id"],
             "brain": raw["brain"],}
         runtime_keys = sorted(
             name for name in params["brain"]
@@ -4970,24 +4807,9 @@ class ManagerFunction:
             raise ValueError(
                 "training checkpoint fields do not match the current schema")
         self.ValidateTrainingRngState(ckpt["rng"])
-        if (
-            type(ckpt["schema_version"]) is not int
-            or ckpt["schema_version"] != TRAIN_CHECKPOINT_SCHEMA_VERSION
-        ):
-            raise ValueError(
-                f"unsupported training checkpoint schema {ckpt['schema_version']!r}")
         if ckpt["calibration_id"] != brain.calibration_id:
             raise ValueError(
                 "training checkpoint calibration_id does not match configured K")
-        if ckpt["description_id"] != brain.description_id:
-            raise ValueError(
-                "training checkpoint description_id does not match the robot")
-        if ckpt["model_contract_id"] != brain.model_contract_id:
-            raise ValueError(
-                "training checkpoint model_contract_id does not match the foundation")
-        if ckpt["adapter_id"] != brain.adapter_id:
-            raise ValueError(
-                "training checkpoint adapter_id does not match the robot")
         if ckpt["world_frame_id"] != dataset.world_frame_id:
             raise ValueError(
                 "training checkpoint world_frame_id does not match the dataset")
@@ -5061,12 +4883,6 @@ class ManagerFunction:
         if type(buffer_state) is not dict or set(buffer_state) != BRAIN_RUNTIME_BUFFER_FIELDS:
             raise ValueError(
                 "training checkpoint brain runtime buffer fields are invalid")
-        if (
-            type(buffer_state["schema_version"]) is not int
-            or buffer_state["schema_version"] != BRAIN_RUNTIME_SCHEMA_VERSION
-        ):
-            raise ValueError(
-                "training checkpoint brain runtime schema is invalid")
         brain.ValidateBufferState(buffer_state)
         self.ImportTrainingCheckpointState(
             brain,
@@ -5817,7 +5633,7 @@ class ManagerFunction:
         epochs: int = 6,
         batchSize: int = 4,
         valSplit: float = 0.2,
-        isResume: bool = False,
+        isResume: bool = True,
         saveEverySampleCount: Optional[int] = None,
         *,
         trainDetection: bool = True,
@@ -5891,7 +5707,7 @@ class ManagerFunction:
         epochs: int = 6,
         batchSize: int = 8,
         valSplit: float = 0.2,
-        isResume: bool = False,
+        isResume: bool = True,
         overrideCheckpointWithModuleParams: Optional[bool] = None,
         saveEverySampleCount: Optional[int] = None,) -> Dict[str, Any]:
         try:
@@ -6173,10 +5989,6 @@ class TestManagerMTool:
             import tempfile as tempfile_module
 
             manager = ManagerFunction.__new__(ManagerFunction)
-            robot = Robot.CreateDefault()
-            brain_build_spec = BrainBuildSpec.Compile(
-                ModuleDim.CognitiveProfile(),
-                robot.ContractView)
             with tempfile_module.TemporaryDirectory() as directory:
                 root = Path(directory)
                 configured_model = root / "model.pth"
@@ -6185,8 +5997,7 @@ class TestManagerMTool:
                 try:
                     manager.ResolveDeploymentArtifactPaths(
                         configured_model,
-                        calibrationId="calibration-a",
-                        brainBuildSpec=brain_build_spec)
+                        calibrationId="calibration-a")
                 except FileNotFoundError:
                     missing_manifest_rejected = True
 
@@ -6197,12 +6008,7 @@ class TestManagerMTool:
                 for path in (model, world, memory):
                     manager.AtomicTorchSave({"complete": True}, path)
                 manager.AtomicJsonSave({
-                    "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                     "calibration_id": "calibration-a",
-                    "description_id": (
-                        brain_build_spec.contract_view.description_id),
-                    "model_contract_id": brain_build_spec.model_signature,
-                    "adapter_id": brain_build_spec.contract_view.adapter_id,
                     "generation": "generation-1",
                     "model_path": str(model),
                     "world_memory_path": str(world),
@@ -6210,14 +6016,12 @@ class TestManagerMTool:
                 }, manager.DeploymentManifestPath(configured_model))
                 resolved = manager.ResolveDeploymentArtifactPaths(
                     configured_model,
-                    calibrationId="calibration-a",
-                    brainBuildSpec=brain_build_spec)
+                    calibrationId="calibration-a")
                 mismatch_rejected = False
                 try:
                     manager.ResolveDeploymentArtifactPaths(
                         configured_model,
-                        calibrationId="calibration-b",
-                        brainBuildSpec=brain_build_spec)
+                        calibrationId="calibration-b")
                 except ValueError:
                     mismatch_rejected = True
                 mixed_generation = dict(json.loads(
@@ -6231,8 +6035,7 @@ class TestManagerMTool:
                 try:
                     manager.ResolveDeploymentArtifactPaths(
                         configured_model,
-                        calibrationId="calibration-a",
-                        brainBuildSpec=brain_build_spec)
+                        calibrationId="calibration-a")
                     mixed_generation_rejected = False
                 except ValueError:
                     mixed_generation_rejected = True
@@ -6276,9 +6079,6 @@ class TestManagerMTool:
                 def __init__(self):
                     super().__init__()
                     self.calibration_id = "test-calibration"
-                    self.description_id = "test-description"
-                    self.model_contract_id = "test-model-contract"
-                    self.adapter_id = "test-adapter"
                     self.register_buffer("buffer", torch.zeros(2))
                     self.mem = FakeMemory()
 
@@ -6313,19 +6113,13 @@ class TestManagerMTool:
                     return self.world
 
                 def ValidateOnlineCandidateState(self, state):
-                    if state != {
-                        "model_signature": "test-model-contract",
-                        "wrappers": {},
-                    }:
+                    if state != {"wrappers": {}}:
                         raise ValueError("unexpected online candidates")
                     events.append("candidates_validate")
                     return state["wrappers"]
 
                 def ImportOnlineCandidateState(self, state):
-                    if state != {
-                        "model_signature": "test-model-contract",
-                        "wrappers": {},
-                    }:
+                    if state != {"wrappers": {}}:
                         raise ValueError("unexpected online candidates")
                     events.append("candidates")
 
@@ -6350,11 +6144,7 @@ class TestManagerMTool:
 
             manager.robot = FakeRobot()
             checkpoint = {
-                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
                 "calibration_id": "test-calibration",
-                "description_id": "test-description",
-                "model_contract_id": "test-model-contract",
-                "adapter_id": "test-adapter",
                 "world_frame_id": "test-world",
                 "epoch": 3,
                 "next_batch_index": 0,
@@ -6365,10 +6155,7 @@ class TestManagerMTool:
                 "batch_size": 1,
                 "online_learning": False,
                 "brain": {"buffer": torch.zeros(2)},
-                "online_candidates": {
-                    "model_signature": "test-model-contract",
-                    "wrappers": {},
-                },
+                "online_candidates": {"wrappers": {}},
                 "opt_actor": {},
                 "opt_critic": {},
                 "opt_world": {},
@@ -6378,8 +6165,7 @@ class TestManagerMTool:
                 "processed_sample_count_total": 9,
                 "rng": manager.CaptureRngState(),
                 "buffers": {
-                    **{name: None for name in BRAIN_RUNTIME_BUFFER_FIELDS},
-                    "schema_version": BRAIN_RUNTIME_SCHEMA_VERSION,},
+                    name: None for name in BRAIN_RUNTIME_BUFFER_FIELDS},
                 "world_memory": {"batch_size": 1},
                 "memory_durable": {"batch_size": 1},}
             payload = io.BytesIO()
@@ -6465,8 +6251,7 @@ class TestManagerMTool:
 
             malformed_candidates = dict(checkpoint)
             malformed_candidates["online_candidates"] = {
-                "model_signature": "other-model-contract",
-                "wrappers": {},
+                "wrappers": {"unexpected": {}},
             }
             events.clear()
             try:
@@ -6577,9 +6362,6 @@ class TestManagerMTool:
             class FakeBrain(nn.Module):
                 def __init__(self):
                     super().__init__()
-                    self.calibration_id = "test-calibration"
-                    self.description_id = "test-description"
-                    self.model_contract_id = "test-model-contract"
                     self.adapter = GrowableLoRALinear(nn.Linear(2, 2))
                     self.adapter.Grow(1)
 
@@ -6596,55 +6378,23 @@ class TestManagerMTool:
 
             brain = FakeBrain()
             manager = ManagerFunction.__new__(ManagerFunction)
-            manager.LoadTorchPayload = lambda path: {
-                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION - 1,
-                "calibration_id": "test-calibration",
-                "model_contract_id": "test-model-contract",
-                "brain": {}}
-            old_schema_rejected = False
+            manager.LoadTorchPayload = lambda path: {"brain": {}}
+            incomplete_state_rejected = False
             try:
                 manager.LoadBrainWeights(brain, "unused.pth")
             except ValueError:
-                old_schema_rejected = True
+                incomplete_state_rejected = True
 
             manager.LoadTorchPayload = lambda path: {
-                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
-                "calibration_id": "other-calibration",
-                "model_contract_id": "test-model-contract",
-                "brain": {}}
-            calibration_mismatch_rejected = False
-            try:
-                manager.LoadBrainWeights(brain, "unused.pth")
-            except ValueError:
-                calibration_mismatch_rejected = True
-
-            manager.LoadTorchPayload = lambda path: {
-                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
-                "calibration_id": "test-calibration",
-                "model_contract_id": "other-model-contract",
-                "brain": {}}
-            model_mismatch_rejected = False
-            try:
-                manager.LoadBrainWeights(brain, "unused.pth")
-            except ValueError:
-                model_mismatch_rejected = True
-
-            manager.LoadTorchPayload = lambda path: {
-                "schema_version": TRAIN_CHECKPOINT_SCHEMA_VERSION,
-                "calibration_id": "test-calibration",
-                "model_contract_id": "test-model-contract",
                 "brain": {
                     "adapter.target.weight": torch.randn_like(brain.adapter.target.weight),
-                    "adapter.target.bias": torch.randn_like(brain.adapter.target.bias),
-                    "adapter.topology_count": torch.zeros((), dtype=torch.long)}}
+                    "adapter.target.bias": torch.randn_like(brain.adapter.target.bias)}}
             manager.LoadBrainWeights(
                 brain,
                 "unused.pth",
                 agent=FakeAgent())
             ok = (
-                old_schema_rejected
-                and calibration_mismatch_rejected
-                and model_mismatch_rejected
+                incomplete_state_rejected
                 and events == [
                     "load:False",
                     "reset_candidates",
@@ -6823,7 +6573,6 @@ class TestManagerMTool:
 
     def TestOcrCheckpointStrictContract(self) -> bool:
         caller_rng = None
-        runtime_schema_version = TRAIN_CHECKPOINT_SCHEMA_VERSION
         try:
             import io
 
@@ -6844,15 +6593,6 @@ class TestManagerMTool:
                     strict_loads.append(("ocr", strict))
                     return super().load_state_dict(state_dict, strict=strict)
 
-                def OcrMetadata(self):
-                    return {
-                        "vocab": ["<blank>", "a"],
-                        "blank_index": 0,
-                        "addon_cfg": {
-                            "db_residual": True,
-                            "rec_residual_rank": 1,
-                            "width_aware_ctc": True,},}
-
             def serialized(value):
                 result = io.BytesIO()
                 torch.save(value, result)
@@ -6865,8 +6605,6 @@ class TestManagerMTool:
             engine = FakeOcrEngine()
             optimizer = torch.optim.AdamW(engine.parameters(), lr=1e-3)
             caller_rng = manager.CaptureRngState()
-            globals()["TRAIN_CHECKPOINT_SCHEMA_VERSION"] = (
-                OCR_CHECKPOINT_SCHEMA_VERSION + 1)
             saved_payloads: Dict[str, Any] = {}
             manager.AtomicTorchSave = lambda payload, path: saved_payloads.__setitem__(
                 str(path), payload)
@@ -6880,32 +6618,10 @@ class TestManagerMTool:
             manager.LoadRecognizerWeightsIntoEngine(
                 engine,
                 serialized(saved_payloads["ocr-recognizer-parameters.pth"]))
-            legacy_ocr_parameters = dict(
-                saved_payloads["ocr-parameters.pth"])
-            legacy_ocr_parameters["schema_version"] = 15
-            legacy_recognizer_parameters = dict(
-                saved_payloads["ocr-recognizer-parameters.pth"])
-            legacy_recognizer_parameters["schema_version"] = 15
-            try:
-                manager.LoadOCRWeightsIntoEngine(
-                    engine,
-                    serialized(legacy_ocr_parameters))
-                legacy_ocr_rejected = False
-            except ValueError:
-                legacy_ocr_rejected = True
-            try:
-                manager.LoadRecognizerWeightsIntoEngine(
-                    engine,
-                    serialized(legacy_recognizer_parameters))
-                legacy_recognizer_rejected = False
-            except ValueError:
-                legacy_recognizer_rejected = True
             checkpoint = {
-                "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
                 "epoch": 2,
                 "best_val": 0.25,
                 "ocr": engine.state_dict(),
-                "ocr_meta": manager.CurrentOcrMetadata(engine),
                 "optimizer": optimizer.state_dict(),
                 "train_indices": [0, 1],
                 "val_indices": [2, 3],
@@ -6921,19 +6637,6 @@ class TestManagerMTool:
                 serialized(checkpoint),
                 trainDetection=True,
                 trainRecognition=True)
-            legacy_checkpoint = dict(checkpoint)
-            legacy_checkpoint["schema_version"] = 15
-            try:
-                manager.LoadOCRCheckpoint(
-                    engine,
-                    optimizer,
-                    dataset,
-                    serialized(legacy_checkpoint),
-                    trainDetection=True,
-                    trainRecognition=True)
-                legacy_checkpoint_rejected = False
-            except ValueError:
-                legacy_checkpoint_rejected = True
 
             missing = dict(checkpoint)
             missing.pop("rng")
@@ -6961,39 +6664,13 @@ class TestManagerMTool:
             except ValueError:
                 mode_mismatch_rejected = True
 
-            legacy_parameter = {
-                "ocr": engine.state_dict(),
-                "brain": {
-                    f"OCR.{name}": value
-                    for name, value in engine.state_dict().items()},}
-            try:
-                manager.LoadOCRWeightsIntoEngine(
-                    engine,
-                    serialized(legacy_parameter))
-                legacy_parameter_rejected = False
-            except ValueError:
-                legacy_parameter_rejected = True
-
-            runtime_schema_parameter = dict(saved_payloads["ocr-parameters.pth"])
-            runtime_schema_parameter["schema_version"] = (
-                TRAIN_CHECKPOINT_SCHEMA_VERSION)
-            try:
-                manager.LoadOCRWeightsIntoEngine(
-                    engine,
-                    serialized(runtime_schema_parameter))
-                runtime_schema_parameter_rejected = False
-            except ValueError:
-                runtime_schema_parameter_rejected = True
-
             recognizer_optimizer = torch.optim.AdamW(
                 engine.recognizer.parameters(),
                 lr=1e-3)
             recognizer_checkpoint = {
-                "schema_version": OCR_CHECKPOINT_SCHEMA_VERSION,
                 "epoch": 3,
                 "best_val": 0.1,
                 "recognizer": engine.recognizer.state_dict(),
-                "ocr_meta": manager.CurrentOcrMetadata(engine),
                 "optimizer": recognizer_optimizer.state_dict(),
                 "train_indices": [0, 1],
                 "val_indices": [2, 3],
@@ -7005,38 +6682,14 @@ class TestManagerMTool:
                 recognizer_optimizer,
                 dataset,
                 serialized(recognizer_checkpoint))
-            legacy_recognizer_checkpoint = dict(recognizer_checkpoint)
-            legacy_recognizer_checkpoint["schema_version"] = 15
-            try:
-                manager.LoadOCRRecognizerCheckpoint(
-                    engine,
-                    recognizer_optimizer,
-                    dataset,
-                    serialized(legacy_recognizer_checkpoint))
-                legacy_recognizer_checkpoint_rejected = False
-            except ValueError:
-                legacy_recognizer_checkpoint_rejected = True
 
             ok = (
                 restored[0:3] == (2, 0.25, 12)
                 and [list(split.indices) for split in restored[3:]]
                 == [[0, 1], [2, 3], [4, 5]]
                 and recognizer_restored[0:3] == (3, 0.1, 18)
-                and legacy_ocr_rejected
-                and legacy_recognizer_rejected
-                and legacy_checkpoint_rejected
-                and legacy_recognizer_checkpoint_rejected
                 and missing_rejected
                 and mode_mismatch_rejected
-                and legacy_parameter_rejected
-                and runtime_schema_parameter_rejected
-                and TRAIN_CHECKPOINT_SCHEMA_VERSION
-                == OCR_CHECKPOINT_SCHEMA_VERSION + 1
-                and saved_payloads["ocr-parameters.pth"]["schema_version"]
-                == OCR_CHECKPOINT_SCHEMA_VERSION
-                and saved_payloads[
-                    "ocr-recognizer-parameters.pth"]["schema_version"]
-                == OCR_CHECKPOINT_SCHEMA_VERSION
                 and strict_loads == [
                     ("ocr", True),
                     ("recognizer", True),
@@ -7050,7 +6703,6 @@ class TestManagerMTool:
             print(f"Manager OCR strict checkpoint contract error: {e}")
             return False
         finally:
-            globals()["TRAIN_CHECKPOINT_SCHEMA_VERSION"] = runtime_schema_version
             if caller_rng is not None:
                 manager.RestoreRngState(caller_rng)
 
@@ -7169,8 +6821,6 @@ class TestManagerMTool:
                     1,
                     manager.robot.ContractView.end_effector_count,
                     dtype=torch.bool),
-                contract_id=manager.robot.ContractView.contract_id,
-                model_signature=manager.robot.ContractView.model_signature,
                 target_version=torch.zeros(1, dtype=torch.long),
                 timestamp=torch.zeros(1))
             request = ActionRequest(
@@ -7190,9 +6840,6 @@ class TestManagerMTool:
                 timestamp=torch.zeros(1))
             feature = torch.zeros(1, 1)
             readout = CognitiveReadout(
-                schema_version=COGNITIVE_READOUT_SCHEMA_VERSION,
-                model_signature=manager.brain_build_spec.model_signature,
-                contract_id=manager.robot.ContractView.contract_id,
                 request_id=request.request_id,
                 timestamp=torch.zeros(1),
                 row_valid=torch.ones(1, dtype=torch.bool),
@@ -7242,7 +6889,6 @@ class TestManagerMTool:
                     0.0,
                     manager.device))
             sensor_packet = {
-                "schema_version": SENSOR_PACKET_WIRE_SCHEMA_VERSION,
                 "stream_id": "stream-1",
                 "sequence_index": 0,
                 "frame_id": "frame-1",
@@ -7324,7 +6970,6 @@ class TestManagerMTool:
                 missing_result_rejected = True
 
             execution_payload = {
-                "schema_version": manager.robot.ActionSchemaVersion,
                 "request_id": [1],
                 "action_epoch": [0],
                 "applied_target": manager.robot.DecodeTarget(target),
@@ -7384,7 +7029,7 @@ class TestManagerMTool:
             invalid_image_preserved = StatePreserved()
 
             invalid_feedback_payload = dict(next_feedback_payload)
-            invalid_feedback_payload["contract_id"] = "invalid"
+            invalid_feedback_payload["unexpected"] = True
             invalid_feedback_rejected = False
             try:
                 ManagerFunction.AgentHandleForwardJson(
@@ -7499,12 +7144,10 @@ class TestManagerMTool:
 
             ok = (
                 set(response) == {
-                    "schema_version",
                     "request_provenance",
                     "action_request",
                     "cognitive_readout",
                     "intention_texts"}
-                and response["schema_version"] == DECISION_WIRE_SCHEMA_VERSION
                 and response["action_request"]["request_id"] == [1]
                 and response["cognitive_readout"]["request_id"] == [1]
                 and response["intention_texts"] == ["pick up the cup"]
@@ -7534,11 +7177,6 @@ class TestManagerMTool:
                     "frame_id": "frame-1",
                     "calibration_id": manager.perception_calibration_id,
                     "world_frame_id": "sensor_stream:stream-1",
-                    "description_id": (
-                        manager.brain_build_spec.contract_view.description_id),
-                    "model_contract_id": manager.brain_build_spec.model_signature,
-                    "adapter_id": (
-                        manager.brain_build_spec.contract_view.adapter_id),
                 }
                 and duplicate_rejected
                 and gap_rejected
@@ -7836,8 +7474,6 @@ class TestManagerMTool:
                 target = PackedEndEffectorTarget(
                     values=target_values,
                     active=target_active,
-                    contract_id=robot.ContractView.contract_id,
-                    model_signature=robot.ContractView.model_signature,
                     target_version=torch.tensor([version]),
                     timestamp=torch.tensor([timestamp]))
                 request = ActionRequest(
@@ -7996,8 +7632,6 @@ class TestManagerMTool:
                     applied_target = PackedEndEffectorTarget(
                         values=torch.zeros_like(actionRequest.target.values),
                         active=torch.zeros_like(actionRequest.target.active),
-                        contract_id=robot.ContractView.contract_id,
-                        model_signature=robot.ContractView.model_signature,
                         target_version=actionRequest.target.target_version.clone(),
                         timestamp=actionRequest.timestamp.clone())
                 elif (
@@ -8018,8 +7652,6 @@ class TestManagerMTool:
                             torch.zeros_like(actionRequest.target.active)
                             if cached_active is None
                             else cached_active.detach().clone()),
-                        contract_id=robot.ContractView.contract_id,
-                        model_signature=robot.ContractView.model_signature,
                         target_version=(
                             actionRequest.target.target_version.clone()
                             if cached_version is None
@@ -8210,9 +7842,6 @@ class TestManagerMTool:
             tolerant_target = PackedEndEffectorTarget(
                 values=tolerant_values,
                 active=tolerance_result.applied_target.active.clone(),
-                contract_id=tolerance_result.applied_target.contract_id,
-                model_signature=(
-                    tolerance_result.applied_target.model_signature),
                 target_version=(
                     tolerance_result.applied_target.target_version.clone()),
                 timestamp=tolerance_result.applied_target.timestamp.clone())
@@ -8390,15 +8019,12 @@ class ContractInferenceAgent(Agent):
     def __init__(
         self,
         brain: BrainCore,
-        brainBuildSpec: BrainBuildSpec,
         *,
         device: Union[str, torch.device],
         worldMemoryPath: Optional[str],
         memMemoryPath: Optional[str],
     ) -> None:
-        if type(brainBuildSpec) is not BrainBuildSpec:
-            raise TypeError("contract inference Agent requires BrainBuildSpec")
-        self.brain_build_spec = brainBuildSpec
+        self.brain_build_spec = brain.brain_build_spec
         super().__init__(
             brain,
             isTrain=False,
@@ -8499,14 +8125,9 @@ class AgentHandle:
                 self.robot.ContractView))
         if type(self.brain_build_spec) is not BrainBuildSpec:
             raise TypeError("brainBuildSpec must be a BrainBuildSpec")
+        if self.brain_build_spec.contract_view != self.robot.ContractView:
+            raise ValueError("brainBuildSpec does not describe the selected robot")
         contract_view = self.robot.ContractView
-        if (
-            self.brain_build_spec.contract_view.contract_id
-            != contract_view.contract_id
-            or self.brain_build_spec.contract_view.model_signature
-            != contract_view.model_signature
-        ):
-            raise ValueError("BrainBuildSpec does not match the selected contract")
         projection = contract_view.perception_projection
         if projection is None:
             raise RuntimeError("robot contract has no perception calibration")
@@ -8521,8 +8142,7 @@ class AgentHandle:
             resolved_memory_path,
         ) = ManagerFunction.ResolveDeploymentArtifactPaths(
             parameter_path,
-            calibrationId=projection.calibration_id,
-            brainBuildSpec=self.brain_build_spec)
+            calibrationId=projection.calibration_id)
         resolved_path = Path(resolved_model_path)
         if not resolved_path.exists():
             raise FileNotFoundError(f"brain parameter file not found: {resolved_path}")
@@ -8538,7 +8158,6 @@ class AgentHandle:
 
         self.agent = ContractInferenceAgent(
             self.brain,
-            self.brain_build_spec,
             device=self.device,
             worldMemoryPath=resolved_world_memory_path,
             memMemoryPath=resolved_memory_path)

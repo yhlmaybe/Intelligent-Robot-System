@@ -8,9 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from FunctionTools import SiteSpec, BaseOnlineWrapper, AGICoreModule, GrowableLoRALinear, GetParametersScale, HungarianAssignment
 from ModuleMessagerManager import ModuleDim
-from PhysicalStateModule import (
-    ContractPhysicalStateAdapter,
-    PSTWorldBinder)
+from PhysicalStateModule import PSTWorldBinder
 from RobotMorphologyModule import (
     BrainFeedbackPacket,
     RobotEmbodimentContractView,
@@ -36,9 +34,6 @@ class ContractWorldFeedbackAdapter(nn.Module):
             raise ValueError("cognitiveDim must be a positive integer")
         self.ContractView = contractView
         self.CognitiveDim = int(cognitiveDim)
-        self.BodyAdapter = ContractPhysicalStateAdapter(
-            contractView,
-            cognitiveDim)
         self.EndpointAdapters = nn.ModuleList()
         for endpointIndex in range(contractView.end_effector_count):
             endpointWidth = contractView.end_effector_feedback_layout.Width(
@@ -60,8 +55,8 @@ class ContractWorldFeedbackAdapter(nn.Module):
     def forward(
         self,
         feedback: BrainFeedbackPacket,
+        contractBody: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        body = self.BodyAdapter(feedback)
         direct_tokens = torch.stack(tuple(
             adapter(feedback.end_effector_features[
                 ...,
@@ -71,15 +66,15 @@ class ContractWorldFeedbackAdapter(nn.Module):
                 self.EndpointAdapters)), dim=1)
         direct_tokens = direct_tokens * feedback.endpoint_present.to(
             dtype=direct_tokens.dtype).unsqueeze(-1)
-        slot_weight = body["SlotWeight"]
+        slot_weight = contractBody["SlotWeight"]
         slot_tokens = self.SlotNorm(
-            body["SlotBodyTokens"] + direct_tokens)
+            contractBody["SlotBodyTokens"] + direct_tokens)
         slot_tokens = slot_tokens * slot_weight.unsqueeze(-1)
         summary = slot_tokens.sum(dim=1) / slot_weight.sum(
             dim=1,
             keepdim=True).clamp_min(1.0)
         return {
-            **body,
+            **contractBody,
             "SlotFeedbackTokens": slot_tokens,
             "EncodedFeedback": self.OutputAdapter(summary),
         }
@@ -103,13 +98,26 @@ class ContractWorldFeedbackPredictor(nn.Module):
             torch.tensor(
                 contractView.static_joint_tokens,
                 dtype=torch.float32),
-            persistent=True)
+            persistent=False)
         self.register_buffer(
             "StaticEndpointTokens",
             torch.tensor(
                 contractView.static_end_effector_tokens,
                 dtype=torch.float32),
-            persistent=True)
+            persistent=False)
+        endpoint_joint_membership = torch.zeros(
+            contractView.end_effector_count,
+            contractView.joint_count,
+            dtype=torch.bool)
+        for endpointIndex in range(contractView.end_effector_count):
+            start = contractView.effector_joint_offsets[endpointIndex]
+            end = contractView.effector_joint_offsets[endpointIndex + 1]
+            jointIndices = contractView.effector_joint_indices[start:end]
+            endpoint_joint_membership[endpointIndex, jointIndices] = True
+        self.register_buffer(
+            "EndpointJointMembership",
+            endpoint_joint_membership,
+            persistent=False)
         self.JointStaticAdapter = nn.Linear(
             contractView.model_shape.joint_static_descriptor_dim,
             self.CognitiveDim)
@@ -140,6 +148,15 @@ class ContractWorldFeedbackPredictor(nn.Module):
             weight = weight.unsqueeze(-1)
         weight = weight.expand_as(value)
         return (value * weight).sum() / weight.sum().clamp_min(1.0)
+
+    @staticmethod
+    def PackedSlotMean(
+        value: torch.Tensor,
+        layout: Any,
+    ) -> torch.Tensor:
+        return torch.stack(tuple(
+            value[..., layout.Slice(slotIndex)].mean(dim=-1)
+            for slotIndex in range(layout.SlotCount)), dim=-1)
 
     def ComputeLoss(
         self,
@@ -236,8 +253,6 @@ class ContractWorldFeedbackPredictor(nn.Module):
                 or bool(value.any().item())
             ):
                 raise ValueError("latent supervision availability is invalid")
-        packed_mask = sample_mask.unsqueeze(-1).expand_as(
-            feedback.joint_features)
         endpoint_mask = torch.cat([
             feedback.endpoint_present[:, endpointIndex].unsqueeze(-1).expand(
                 -1,
@@ -269,7 +284,12 @@ class ContractWorldFeedbackPredictor(nn.Module):
             progress_error.square()
             * torch.exp(-prediction["ProgressLogVariance"])
             + prediction["ProgressLogVariance"])
-        loss_joint_features = self.MaskedMean(joint_nll, packed_mask)
+        joint_nll_by_joint = self.PackedSlotMean(
+            joint_nll,
+            self.ContractView.joint_feedback_layout)
+        loss_joint_features = self.MaskedMean(
+            joint_nll_by_joint,
+            sample_mask)
         loss_progress = self.MaskedMean(progress_nll, target_mask)
         loss_endpoint_features = self.MaskedMean(
             endpoint_nll,
@@ -285,9 +305,6 @@ class ContractWorldFeedbackPredictor(nn.Module):
             + loss_endpoint_features
             + loss_progress
             + loss_reached)
-        joint_weight = packed_mask.to(dtype=joint_nll.dtype)
-        endpoint_weight = endpoint_mask.to(dtype=endpoint_nll.dtype)
-        progress_weight = target_mask.to(dtype=progress_nll.dtype)
         reached_nll = F.binary_cross_entropy_with_logits(
             prediction["ReachedLogits"],
             feedback.reached.to(dtype=feedback.joint_features.dtype),
@@ -310,9 +327,24 @@ class ContractWorldFeedbackPredictor(nn.Module):
             progress_standardized.le(1.0),
             0.5 * progress_standardized.square(),
             progress_standardized - 0.5)
+        joint_robust_by_joint = self.PackedSlotMean(
+            joint_robust,
+            self.ContractView.joint_feedback_layout)
+        endpoint_robust_by_endpoint = self.PackedSlotMean(
+            endpoint_robust,
+            self.ContractView.end_effector_feedback_layout)
+        task_endpoint_mask = target_mask
+        task_joint_mask = torch.matmul(
+            task_endpoint_mask.to(dtype=joint_robust.dtype),
+            self.EndpointJointMembership.to(
+                device=joint_robust.device,
+                dtype=joint_robust.dtype)).gt(0.0)
+        joint_weight = task_joint_mask.to(dtype=joint_robust.dtype)
+        endpoint_weight = task_endpoint_mask.to(dtype=endpoint_robust.dtype)
+        progress_weight = task_endpoint_mask.to(dtype=progress_robust.dtype)
         surprise_numerator = (
-            (joint_robust * joint_weight).sum(dim=-1)
-            + (endpoint_robust * endpoint_weight).sum(dim=-1)
+            (joint_robust_by_joint * joint_weight).sum(dim=-1)
+            + (endpoint_robust_by_endpoint * endpoint_weight).sum(dim=-1)
             + (progress_robust * progress_weight).sum(dim=-1)
             + (reached_nll * progress_weight).sum(dim=-1))
         surprise_count = (
@@ -325,6 +357,12 @@ class ContractWorldFeedbackPredictor(nn.Module):
             torch.sqrt((surprise_numerator / surprise_count.clamp_min(1.0))
                        .clamp_min(0.0)),
             torch.zeros_like(surprise_count))
+        joint_safety_surprise = torch.sqrt(
+            joint_robust_by_joint.amax(dim=-1).clamp_min(0.0))
+        joint_safety_surprise = torch.where(
+            sample_mask,
+            joint_safety_surprise,
+            torch.zeros_like(joint_safety_surprise))
         return {
             "loss": loss,
             "loss_joint_features": loss_joint_features,
@@ -333,6 +371,8 @@ class ContractWorldFeedbackPredictor(nn.Module):
             "loss_reached": loss_reached,
             "normalized_surprise": normalized_surprise,
             "surprise_valid": surprise_valid,
+            "joint_safety_surprise": joint_safety_surprise,
+            "joint_safety_surprise_valid": sample_mask,
         }
 
     def forward(self, priorWorldState: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -496,11 +536,11 @@ class ContractWorldEmbodimentAdapter(nn.Module):
         self.register_buffer(
             "ParentGraph",
             parent_graph,
-            persistent=True)
+            persistent=False)
         self.register_buffer(
             "ChildGraph",
             child_graph,
-            persistent=True)
+            persistent=False)
 
     def EncodeExecutionAction(
         self,
@@ -669,8 +709,9 @@ class ContractWorldEmbodimentAdapter(nn.Module):
     def EncodeFeedback(
         self,
         feedback: BrainFeedbackPacket,
+        contractBody: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        return self.FeedbackAdapter(feedback)
+        return self.FeedbackAdapter(feedback, contractBody)
 
     def PredictFeedback(
         self,
@@ -692,8 +733,9 @@ class ContractWorldEmbodimentAdapter(nn.Module):
     def EncodeTransition(
         self,
         feedback: BrainFeedbackPacket,
+        contractBody: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        encoded_feedback = self.FeedbackAdapter(feedback)
+        encoded_feedback = self.FeedbackAdapter(feedback, contractBody)
         control_feedback = encoded_feedback["ControlFeedbackFeature"]
         control_slots = control_feedback.unsqueeze(1).expand(
             -1,
@@ -889,7 +931,6 @@ OBSERVED_PHYSICAL_STATE_FIELDS = (
     "OntologyRelationProb",
 )
 
-WORLD_MEMORY_SCHEMA_VERSION = 8
 WORLD_MEMORY_TENSOR_FIELDS = (
     "mem_keys",
     "mem_vals",
@@ -954,7 +995,6 @@ WORLD_MEMORY_TENSOR_FIELDS = (
     "pst_step",
 )
 WORLD_MEMORY_PAYLOAD_FIELDS = frozenset((
-    "world_memory_schema_version",
     "calibration_id",
     "world_frame_id",
     "batch_size",
@@ -2991,11 +3031,6 @@ class RSSMWorldModel(AGICoreModule):
             unexpected = sorted(actual_fields - WORLD_MEMORY_PAYLOAD_FIELDS)
             raise ValueError(
                 f"world memory payload fields mismatch: missing={missing}, unexpected={unexpected}")
-        schema_version = payload["world_memory_schema_version"]
-        if type(schema_version) is not int or schema_version != WORLD_MEMORY_SCHEMA_VERSION:
-            raise ValueError(
-                "world memory schema mismatch: "
-                f"expected {WORLD_MEMORY_SCHEMA_VERSION}, got {schema_version!r}")
         calibration_id, world_frame_id = self.RequireMemoryContext()
         if payload["calibration_id"] != calibration_id:
             raise ValueError(
@@ -3170,7 +3205,6 @@ class RSSMWorldModel(AGICoreModule):
         if maxN < 0 or maxN > self._mem_capacity:
             raise ValueError("world memory size exceeds its configured capacity")
         payload = {
-            "world_memory_schema_version": WORLD_MEMORY_SCHEMA_VERSION,
             "calibration_id": calibration_id,
             "world_frame_id": world_frame_id,
             "batch_size": B,
@@ -4672,17 +4706,11 @@ class RSSMWorldModel(AGICoreModule):
     def EncodeContractTransition(
         self,
         feedbackPacket: BrainFeedbackPacket,
+        contractBody: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        if self.contract_embodiment_adapter is None:
-            raise RuntimeError(
-                "world model is not bound to an embodiment contract")
-        transition = self.contract_embodiment_adapter.EncodeTransition(
-            feedbackPacket)
-        encoded = transition["EncodedTransition"]
-        if int(encoded.size(-1)) != self.embodiment_state_dim:
-            raise RuntimeError(
-                "contract transition does not match world physical width")
-        return encoded
+        return self.EncodeContractEmbodiment(
+            feedbackPacket,
+            contractBody)["EncodedTransition"]
 
     def EncodeContractExecutionAction(
         self,
@@ -4727,12 +4755,18 @@ class RSSMWorldModel(AGICoreModule):
     def EncodeContractEmbodiment(
         self,
         feedbackPacket: BrainFeedbackPacket,
+        contractBody: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         if self.contract_embodiment_adapter is None:
             raise RuntimeError(
                 "world model is not bound to an embodiment contract")
-        return self.contract_embodiment_adapter.EncodeTransition(
-            feedbackPacket)
+        transition = self.contract_embodiment_adapter.EncodeTransition(
+            feedbackPacket,
+            contractBody)
+        if int(transition["EncodedTransition"].size(-1)) != self.embodiment_state_dim:
+            raise RuntimeError(
+                "contract transition does not match world physical width")
+        return transition
 
 
 

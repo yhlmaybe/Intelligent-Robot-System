@@ -18,7 +18,6 @@ from Config import BasicParameters
 from CoreTypes import (
     BrainBuildSpec,
     BrainStepOutput,
-    COGNITIVE_READOUT_SCHEMA_VERSION,
     CognitiveReadout,
     ContractAgentActInput,
     ContractAgentActOutput,
@@ -53,7 +52,7 @@ from ValueEstimationModule import (
 )
 from ConsciousnessModule import ConsciousnessExtractor, ConsciousnessOutput
 from IntentionModule import IntentionExtractor, IntentionOnlineWrapper
-from OCRModule import OCREngineExtractor, OcrLineObs, OcrTrack
+from OCRModule import CRNNRecognizer, OCREngineExtractor, OcrLineObs, OcrTrack
 from PhysicalStateModule import (
     ContractPhysicalStateAdapter,
     PhysicalStateExtractor,
@@ -84,7 +83,11 @@ from TemporalExecutionModule import (
     TemporalExecutionGateExtractor,
 )
 from ModuleMessagerManager import ModuleDim, ModuleMessagerManager
-from FunctionTools import SynchronizeDynamicAdapterTopologiesForFullLoad
+from FunctionTools import (
+    DynamicAdapterTopologyMixin,
+    GrowableLoRALinear,
+    SynchronizeDynamicAdapterTopologiesForFullLoad,
+)
 from RobotMorphologyModule import (
     ActionExecutionResult,
     ActionRequest,
@@ -94,13 +97,7 @@ from RobotMorphologyModule import (
     SlotExecutionStatus,
 )
 
-BRAIN_RUNTIME_SCHEMA_VERSION = 35
-WORLD_MEMORY_ARTIFACT_SCHEMA_VERSION = 3
-AGENT_MEMORY_SCHEMA_VERSION = 3
 BRAIN_RUNTIME_BUFFER_FIELDS = frozenset({
-    "schema_version",
-    "contract_id",
-    "model_signature",
     "batch_size",
     "cognitive_state",
 })
@@ -108,10 +105,7 @@ ONLINE_WRAPPER_ROOTS = ("perc", "attn", "world", "critic", "intention")
 WORLD_RUNTIME_STATE_NAMES = frozenset(
     {f"_{name}" for name in WORLD_MEMORY_TENSOR_FIELDS}
     | {"s4.x"})
-COGNITIVE_BACKBONE_SCHEMA_VERSION = 2
 COGNITIVE_BACKBONE_ARTIFACT_FIELDS = frozenset({
-    "schema_version",
-    "cognitive_profile",
     "parameters",
 })
 COGNITIVE_BACKBONE_PARAMETER_PREFIXES = (
@@ -168,6 +162,11 @@ COGNITIVE_BACKBONE_BLOCKED_PREFIXES = (
     "world.embodiment_context_proj.",
     "world.embodied_action_proj.",
 )
+COGNITIVE_BACKBONE_STATE_BUFFER_NAMES = frozenset({
+    "actor.AssistOptionIndex",
+    "OCR.recognizer.CharacterCodepoints",
+    "OCR.recognizer.BlankIndexState",
+})
 
 
 def NormalizeRotation(value: torch.Tensor) -> torch.Tensor:
@@ -256,7 +255,7 @@ def IsCognitiveBackboneParameter(name: str) -> bool:
 
 def CognitiveBackboneParameters(
     brain: nn.Module,
-) -> Dict[str, nn.Parameter]:
+) -> Dict[str, torch.Tensor]:
     if not isinstance(brain, nn.Module):
         raise TypeError("cognitive backbone requires a torch module")
     if bool(getattr(brain, "is_online_learning", False)):
@@ -267,7 +266,7 @@ def CognitiveBackboneParameters(
             ):
                 raise RuntimeError(
                     "online candidates must be materialized before cognitive export")
-    parameters: Dict[str, nn.Parameter] = {}
+    parameters: Dict[str, torch.Tensor] = {}
     for name, value in brain.named_parameters():
         canonical = CanonicalCognitiveBackboneParameterName(name)
         if not IsCognitiveBackboneParameter(canonical):
@@ -276,27 +275,32 @@ def CognitiveBackboneParameters(
             raise RuntimeError(
                 f"duplicate cognitive backbone parameter: {canonical}")
         parameters[canonical] = value
+    for name, value in brain.named_buffers():
+        canonical = CanonicalCognitiveBackboneParameterName(name)
+        if canonical not in COGNITIVE_BACKBONE_STATE_BUFFER_NAMES:
+            continue
+        if not IsCognitiveBackboneParameter(canonical):
+            raise RuntimeError(
+                f"cognitive backbone state is outside the whitelist: {canonical}")
+        if canonical in parameters:
+            raise RuntimeError(
+                f"duplicate cognitive backbone state: {canonical}")
+        parameters[canonical] = value
     if not parameters:
         raise ValueError("cognitive backbone parameter set is empty")
     return parameters
 
 
 def ExportCognitiveBackboneState(brain: nn.Module) -> Dict[str, Any]:
-    build_spec = getattr(brain, "brain_build_spec", None)
-    if type(build_spec) is not BrainBuildSpec:
-        raise TypeError("cognitive backbone source requires BrainBuildSpec")
     entries = []
     for name, value in sorted(CognitiveBackboneParameters(brain).items()):
-        if not value.is_floating_point():
-            raise TypeError(
-                f"cognitive backbone parameter {name} must be floating point")
-        if not bool(torch.isfinite(value).all().item()):
+        if value.is_floating_point() and not bool(
+            torch.isfinite(value).all().item()
+        ):
             raise ValueError(
-                f"cognitive backbone parameter {name} must be finite")
+                f"cognitive backbone state {name} must be finite")
         entries.append((name, value.detach().cpu().clone()))
     return {
-        "schema_version": COGNITIVE_BACKBONE_SCHEMA_VERSION,
-        "cognitive_profile": build_spec.CognitiveProfilePayload(),
         "parameters": tuple(entries),
     }
 
@@ -305,18 +309,8 @@ def LoadCognitiveBackboneState(
     brain: nn.Module,
     artifact: Any,
 ) -> None:
-    build_spec = getattr(brain, "brain_build_spec", None)
-    if type(build_spec) is not BrainBuildSpec:
-        raise TypeError("cognitive backbone target requires BrainBuildSpec")
     if type(artifact) is not dict or set(artifact) != COGNITIVE_BACKBONE_ARTIFACT_FIELDS:
         raise ValueError("cognitive backbone artifact fields do not match")
-    if (
-        type(artifact["schema_version"]) is not int
-        or artifact["schema_version"] != COGNITIVE_BACKBONE_SCHEMA_VERSION
-    ):
-        raise ValueError("cognitive backbone schema is unsupported")
-    build_spec.ValidateCognitiveProfileCompatibility(
-        artifact["cognitive_profile"])
     entries = artifact["parameters"]
     if not isinstance(entries, (list, tuple)) or not entries:
         raise ValueError("cognitive backbone parameter list must be non-empty")
@@ -335,12 +329,13 @@ def LoadCognitiveBackboneState(
         if name in incoming:
             raise ValueError(
                 f"duplicate cognitive backbone parameter: {name}")
-        if not torch.is_tensor(value) or not value.is_floating_point():
-            raise TypeError(
-                f"cognitive backbone parameter {name} must be a floating tensor")
-        if not bool(torch.isfinite(value).all().item()):
+        if not torch.is_tensor(value):
+            raise TypeError(f"cognitive backbone state {name} must be a tensor")
+        if value.is_floating_point() and not bool(
+            torch.isfinite(value).all().item()
+        ):
             raise ValueError(
-                f"cognitive backbone parameter {name} must be finite")
+                f"cognitive backbone state {name} must be finite")
         incoming[name] = value
     expected = CognitiveBackboneParameters(brain)
     missing = sorted(set(expected).difference(incoming))
@@ -358,6 +353,13 @@ def LoadCognitiveBackboneState(
         for name, value in incoming.items():
             target = expected[name]
             target.copy_(value.to(device=target.device))
+    if {
+        "OCR.recognizer.CharacterCodepoints",
+        "OCR.recognizer.BlankIndexState",
+    }.issubset(incoming):
+        brain.OCR.recognizer.RefreshCharacterState(
+            brain.OCR.recognizer,
+            None)
 
 
 def ExportDeploymentModelState(brain: nn.Module) -> Dict[str, torch.Tensor]:
@@ -419,19 +421,35 @@ def LoadBrainModelState(
     if runtime_keys:
         raise ValueError(
             f"brain parameter artifact contains non-model state: {runtime_keys}")
-    SynchronizeDynamicAdapterTopologiesForFullLoad(brain, state)
-    expected = ExportBrainModelState(brain)
-    missing = sorted(set(expected).difference(state))
-    unexpected = sorted(set(state).difference(expected))
-    if missing or unexpected:
-        raise ValueError(
-            f"brain model state fields do not match: missing={missing}, "
-            f"unexpected={unexpected}")
-    result = brain.load_state_dict(state, strict=False)
-    expected_runtime = sorted(non_model_keys)
-    if sorted(result.missing_keys) != expected_runtime or result.unexpected_keys:
-        raise RuntimeError(
-            "brain model load crossed the runtime-state boundary")
+    topology_snapshots = tuple(
+        (module, module.CaptureCommittedTopology())
+        for module in brain.modules()
+        if isinstance(module, DynamicAdapterTopologyMixin))
+    try:
+        SynchronizeDynamicAdapterTopologiesForFullLoad(brain, state)
+        expected = ExportBrainModelState(brain)
+        missing = sorted(set(expected).difference(state))
+        unexpected = sorted(set(state).difference(expected))
+        if missing or unexpected:
+            raise ValueError(
+                f"brain model state fields do not match: missing={missing}, "
+                f"unexpected={unexpected}")
+        for name, value in state.items():
+            target = expected[name]
+            if not torch.is_tensor(value):
+                raise TypeError(f"brain model state {name} must be a tensor")
+            if tuple(value.shape) != tuple(target.shape) or value.dtype != target.dtype:
+                raise ValueError(
+                    f"brain model state {name} shape or dtype does not match")
+        result = brain.load_state_dict(state, strict=False)
+        expected_runtime = sorted(non_model_keys)
+        if sorted(result.missing_keys) != expected_runtime or result.unexpected_keys:
+            raise RuntimeError(
+                "brain model load crossed the runtime-state boundary")
+    except Exception:
+        for module, topology in topology_snapshots:
+            module.RestoreCommittedTopology(topology)
+        raise
 
 
 class CognitiveComputeMode(IntEnum):
@@ -854,16 +872,12 @@ class BrainCore(nn.Module):
         self.contract_only = True
         self.brain_build_spec = brainBuildSpec
         self.robot_contract_view = brainBuildSpec.contract_view
-        self.model_signature = brainBuildSpec.model_signature
-        self.model_contract_id = self.model_signature
-        self.description_id = self.robot_contract_view.description_id
-        self.adapter_id = self.robot_contract_view.adapter_id
         self.register_buffer(
             "ContractStaticSlotTokens",
             torch.tensor(
                 self.robot_contract_view.static_end_effector_tokens,
                 dtype=torch.float32),
-            persistent=True)
+            persistent=False)
         self.SEQ_LEN = int(seqLen)
         if type(slowPeriod) is not int or slowPeriod <= 0:
             raise ValueError("slowPeriod must be a positive integer")
@@ -983,6 +997,7 @@ class BrainCore(nn.Module):
         self.packed_decision_decoupler = DecisionDecouplerV2(
             contractView=self.robot_contract_view,
             decisionDim=int(self.actor.belief_dim),
+            jointTokenDim=int(self.actor.body_state_feature_dim),
             worldActionDim=int(self.actor.action_embed_dim),
             planDim=int(self.actor.plan_feature_dim),
             subgoalDim=int(self.actor.subgoal_feature_dim),
@@ -1087,7 +1102,7 @@ class BrainCore(nn.Module):
             torch.full((2,), -2.944439))
         self.option_skill_gain = nn.Parameter(torch.zeros(()))
         contract_slot_feature_dim = (
-            brainBuildSpec.embodiment.end_effector_static_descriptor_dim
+            brainBuildSpec.contract_view.model_shape.end_effector_static_descriptor_dim
             + len(CONTRACT_EVIDENCE_FIELDS)
             + 2 * len(CONTRACT_SLOT_PREDICATES))
         self.contract_neuro_symbolic_grounder = (
@@ -1194,12 +1209,14 @@ class BrainCore(nn.Module):
                 batchSize=batchSize,
                 device=device)
             world = self.ContractWorld()
-            world_transition = world.EncodeContractEmbodiment(feedbackPacket)
+            contract_body = self.contract_physical_adapter(feedbackPacket)
+            world_transition = world.EncodeContractEmbodiment(
+                feedbackPacket,
+                contract_body)
             return {
-                "Physical": self.contract_physical_adapter(feedbackPacket),
+                "Physical": contract_body,
                 "World": world_transition,
-                "WorldPhysical": world.EncodeContractTransition(
-                    feedbackPacket),
+                "WorldPhysical": world_transition["EncodedTransition"],
                 "Perception": {
                     "Rotation": feedbackPacket.perception_rotation,
                     "RotationDelta": feedbackPacket.perception_rotation_delta,
@@ -1214,7 +1231,10 @@ class BrainCore(nn.Module):
         ) -> Dict[str, torch.Tensor]:
             self.ValidateFeedbackPacket(feedbackPacket)
             world = self.ContractWorld()
-            return world.EncodeContractEmbodiment(feedbackPacket)
+            contract_body = self.contract_physical_adapter(feedbackPacket)
+            return world.EncodeContractEmbodiment(
+                feedbackPacket,
+                contract_body)
 
     def EncodeWorldContractTransition(
             self,
@@ -1222,7 +1242,10 @@ class BrainCore(nn.Module):
         ) -> torch.Tensor:
             self.ValidateFeedbackPacket(feedbackPacket)
             world = self.ContractWorld()
-            return world.EncodeContractTransition(feedbackPacket)
+            contract_body = self.contract_physical_adapter(feedbackPacket)
+            return world.EncodeContractTransition(
+                feedbackPacket,
+                contract_body)
 
     def ValidateFeedbackPacket(
             self,
@@ -2012,8 +2035,6 @@ class BrainCore(nn.Module):
             commanded_target = PackedEndEffectorTarget(
                 values=feedbackPacket.applied_target_values,
                 active=feedbackPacket.applied_target_active,
-                contract_id=feedbackPacket.contract_id,
-                model_signature=feedbackPacket.model_signature,
                 target_version=feedbackPacket.applied_target_version.clamp_min(0),
                 timestamp=feedbackPacket.timestamp)
             knownActionSlots = (
@@ -2067,8 +2088,6 @@ class BrainCore(nn.Module):
             target = PackedEndEffectorTarget(
                 values=feedbackPacket.applied_target_values,
                 active=feedbackPacket.applied_target_active,
-                contract_id=feedbackPacket.contract_id,
-                model_signature=feedbackPacket.model_signature,
                 target_version=feedbackPacket.applied_target_version.clamp_min(0),
                 timestamp=feedbackPacket.timestamp)
             target.Validate(self.robot_contract_view)
@@ -2601,8 +2620,7 @@ class BrainCore(nn.Module):
                 plan_valid = torch.zeros(
                     batch_size, device=device, dtype=torch.bool)
             active_plan = self.mem.RecallPlan(
-                "activePlan",
-                self.model_signature)
+                "activePlan")
             active_plan_valid = torch.zeros(
                 batch_size,
                 device=device,
@@ -2686,6 +2704,8 @@ class BrainCore(nn.Module):
             self,
             actOut: Dict[str, Any],
             feedbackPacket: BrainFeedbackPacket,
+            contractBody: Dict[str, torch.Tensor],
+            computeMode: torch.Tensor,
             risk: torch.Tensor,
             confidence: torch.Tensor,
             precision: torch.Tensor,
@@ -2732,6 +2752,13 @@ class BrainCore(nn.Module):
                 risk=risk,
                 confidence=confidence,
                 precision=precision,
+                joint_state_tokens=contractBody["JointStateTokens"],
+                endpoint_body_tokens=contractBody["EndpointBodyTokens"],
+                detail_access=computeMode.eq(
+                    int(CognitiveComputeMode.DETAIL_EXECUTE)),
+                full_access=(
+                    computeMode.eq(int(CognitiveComputeMode.FULL_REPLAN))
+                    | computeMode.eq(int(CognitiveComputeMode.FAILSAFE))),
                 slot_relevance=slotRelevance,
                 slot_selection_mask=slotSelectionMask,
                 previous_target_values=(
@@ -2808,8 +2835,6 @@ class BrainCore(nn.Module):
                     failsafeMask.unsqueeze(-1),
                     torch.zeros_like(decision.target.active),
                     decision.target.active),
-                contract_id=decision.target.contract_id,
-                model_signature=decision.target.model_signature,
                 target_version=decision.target.target_version,
                 timestamp=decision.target.timestamp)
             values = {
@@ -2838,8 +2863,6 @@ class BrainCore(nn.Module):
                     stopMask.unsqueeze(-1),
                     torch.zeros_like(decision.selected_target.active),
                     decision.selected_target.active),
-                contract_id=decision.selected_target.contract_id,
-                model_signature=decision.selected_target.model_signature,
                 target_version=decision.selected_target.target_version,
                 timestamp=decision.selected_target.timestamp)
             values = {
@@ -3082,6 +3105,14 @@ class BrainCore(nn.Module):
                     risk=ExpandCandidates(decisionContext.risk),
                     confidence=ExpandCandidates(decisionContext.confidence),
                     precision=ExpandCandidates(decisionContext.precision),
+                    joint_state_tokens=ExpandCandidates(
+                        decisionContext.joint_state_tokens),
+                    endpoint_body_tokens=ExpandCandidates(
+                        decisionContext.endpoint_body_tokens),
+                    detail_access=ExpandCandidates(
+                        decisionContext.detail_access),
+                    full_access=ExpandCandidates(
+                        decisionContext.full_access),
                     slot_relevance=(
                         None
                         if decisionContext.slot_relevance is None
@@ -3911,7 +3942,6 @@ class BrainCore(nn.Module):
                     self.mem.RecordCounterfactualEpisode(
                         contexts[write_mask],
                         outcomes[write_mask],
-                        self.model_signature,
                         confidence=write_confidence[write_mask],
                         transactionVersion=(
                             self.ContractReplayTransactionVersion),
@@ -4554,7 +4584,8 @@ class BrainCore(nn.Module):
                 previous_rotation)
             previous_embodiment_state = self.prev_world_embodiment
             world_embodiment_state = world.EncodeContractTransition(
-                feedback_packet)
+                feedback_packet,
+                contract_body)
             physical_runtime_snapshot = (
                 world.CapturePhysicalRuntimeRows(stopped_event)
                 if bool(stopped_event.any().item())
@@ -4811,9 +4842,14 @@ class BrainCore(nn.Module):
                 contract_feedback_evaluation["normalized_surprise"])
             w_out["contract_feedback_surprise_valid"] = (
                 contract_feedback_evaluation["surprise_valid"])
+            w_out["joint_safety_surprise"] = (
+                contract_feedback_evaluation["joint_safety_surprise"])
+            w_out["joint_safety_surprise_valid"] = (
+                contract_feedback_evaluation[
+                    "joint_safety_surprise_valid"])
             if step.is_train:
                 for name, value in contract_feedback_evaluation.items():
-                    if name in ("normalized_surprise", "surprise_valid"):
+                    if name != "loss" and not name.startswith("loss_"):
                         continue
                     telemetry_name = (
                         "loss_contract_feedback"
@@ -4867,6 +4903,16 @@ class BrainCore(nn.Module):
             world_surprise = torch.maximum(
                 world_surprise,
                 feedback_surprise)
+            joint_safety_surprise = torch.where(
+                contract_feedback_evaluation[
+                    "joint_safety_surprise_valid"],
+                torch.log1p(
+                    contract_feedback_evaluation[
+                        "joint_safety_surprise"]),
+                torch.zeros_like(world_surprise))
+            world_surprise = torch.maximum(
+                world_surprise,
+                joint_safety_surprise)
             world_surprise = torch.where(
                 self.prev_done_flag,
                 torch.zeros_like(world_surprise),
@@ -4939,7 +4985,6 @@ class BrainCore(nn.Module):
             if step.is_train:
                 replay_training = self.mem.ConsumeCounterfactualReplay(
                     batchSize=batch_size,
-                    modelSignature=self.model_signature,
                     seed=int(self.mem.time_step.max().item()),
                     addInternalLoss=True)
                 SaveModuleOutput("MemoryCounterfactualReplay", replay_training)
@@ -4955,8 +5000,7 @@ class BrainCore(nn.Module):
                 isTrain=step.is_train)
             actor = self.RuntimeModule(self.actor)
             recalled_plan = self.mem.RecallPlan(
-                "activePlan",
-                self.model_signature)
+                "activePlan")
             recalled_feature = mem_feat.new_zeros(
                 batch_size,
                 actor.belief_dim)
@@ -5354,8 +5398,7 @@ class BrainCore(nn.Module):
             physical_request_continued = option_transaction[
                 "physical_request_continued"]
             cached_option_skill = self.mem.RecallSkill(
-                "executedOption",
-                self.model_signature)
+                "executedOption")
             if cached_option_skill is not None:
                 cached_option_skill = cached_option_skill.to(
                     device=device,
@@ -5652,6 +5695,8 @@ class BrainCore(nn.Module):
             decision_context = self.BuildContractDecisionContext(
                 act_out,
                 feedback_packet,
+                contract_body,
+                compute_decision.mode,
                 risk,
                 confidence,
                 precision,
@@ -5795,10 +5840,9 @@ class BrainCore(nn.Module):
                 temporal_decision,
                 motor_stop_event)
             SaveModuleOutput("TemporalExecution", temporal_decision)
-            help_requested = (
-                base_act_out["option"]["opt_idx"].eq(
-                    actor.assist_option_id)
-                & ~motor_stop_event)
+            help_requested = actor.AssistOptionMask(
+                base_act_out["option"]["opt_idx"]
+            ) & ~motor_stop_event
             request_action_epoch = torch.where(
                 help_requested,
                 feedback_packet.applied_action_epoch + 1,
@@ -5909,8 +5953,6 @@ class BrainCore(nn.Module):
             request_target = PackedEndEffectorTarget(
                 values=request_values,
                 active=request_active,
-                contract_id=self.robot_contract_view.contract_id,
-                model_signature=self.robot_contract_view.model_signature,
                 target_version=torch.where(
                     help_requested,
                     feedback_packet.applied_target_version.clamp_min(0) + 1,
@@ -6045,9 +6087,6 @@ class BrainCore(nn.Module):
                 & ~request_planner_override
                 & ~motor_stop_event)
             cognitive_readout = CognitiveReadout(
-                schema_version=COGNITIVE_READOUT_SCHEMA_VERSION,
-                model_signature=self.model_signature,
-                contract_id=self.robot_contract_view.contract_id,
                 request_id=action_request.request_id.detach().clone(),
                 timestamp=feedback_packet.timestamp.detach().clone(),
                 row_valid=torch.ones_like(done_event),
@@ -6679,7 +6718,6 @@ class BrainCore(nn.Module):
                 self.mem.CachePlan(
                     "activePlan",
                     selected_decision_feature,
-                    self.model_signature,
                     validMask=temporal_decision.candidate_selected)
             successful_skill = (
                 credit_option_valid
@@ -6700,8 +6738,7 @@ class BrainCore(nn.Module):
                         dtype=dtype),
                 ], dim=-1)
                 previous_skill = self.mem.RecallSkill(
-                    "executedOption",
-                    self.model_signature)
+                    "executedOption")
                 if previous_skill is None:
                     previous_skill = torch.zeros_like(skill_update)
                 else:
@@ -6716,8 +6753,7 @@ class BrainCore(nn.Module):
                     previous_skill)
                 self.mem.CacheSkill(
                     "executedOption",
-                    stored_skill,
-                    self.model_signature)
+                    stored_skill)
             hierarchy_rows = compute_decision.activated_child_mask.any(dim=-1)
             if bool(hierarchy_rows.any().item()):
                 hierarchy_root = torch.tensor(
@@ -6751,7 +6787,6 @@ class BrainCore(nn.Module):
                     mem_feat[hierarchy_rows],
                     hierarchy_coarse_progress[hierarchy_rows],
                     hierarchy_detail_progress[hierarchy_rows],
-                    self.model_signature,
                     transactionVersion=(
                         self.ContractReplayTransactionVersion),
                     timelineVersion=self.ContractReplayTimelineVersion)
@@ -6762,7 +6797,6 @@ class BrainCore(nn.Module):
                         risk,
                         uncertainty,
                         planner_tracking_error], dim=-1)[planner_failed],
-                    self.model_signature,
                     transactionVersion=(
                         self.ContractReplayTransactionVersion),
                     timelineVersion=self.ContractReplayTimelineVersion)
@@ -7280,9 +7314,6 @@ class BrainCore(nn.Module):
                         self.OCR._last_ocr_texts_batch),
                     "tracks": copy.deepcopy(self.OCR._tracks_by_bi)}}
             return {
-                "schema_version": BRAIN_RUNTIME_SCHEMA_VERSION,
-                "contract_id": self.robot_contract_view.contract_id,
-                "model_signature": self.model_signature,
                 "batch_size": int(self.ContractRuntimeBatch),
                 "cognitive_state": cognitive_state}
 
@@ -8438,17 +8469,6 @@ class BrainCore(nn.Module):
         ) -> Tuple[Dict[str, Any], int]:
             if type(state) is not dict or set(state) != BRAIN_RUNTIME_BUFFER_FIELDS:
                 raise ValueError("brain runtime buffer fields do not match")
-            if (
-                type(state["schema_version"]) is not int
-                or state["schema_version"] != BRAIN_RUNTIME_SCHEMA_VERSION
-            ):
-                raise ValueError("brain runtime schema does not match")
-            if (
-                state["contract_id"]
-                != self.robot_contract_view.contract_id
-                or state["model_signature"] != self.model_signature
-            ):
-                raise ValueError("brain runtime identity does not match")
             batch_size = state["batch_size"]
             if type(batch_size) is not int or batch_size < 1:
                 raise ValueError("brain runtime batch size is invalid")
@@ -8732,7 +8752,6 @@ class BrainCore(nn.Module):
             self.mem.ImportTransientState(cognitive["memory"])
             self.mem.ImportCognitiveCacheState(
                 cognitive["memory_cognitive_cache"],
-                modelSignature=self.model_signature,
                 batchSize=batchSize)
             self.RuntimeModule(self.attn).ImportState(
                 cognitive["attention"])
@@ -9021,11 +9040,7 @@ class Agent:
 
     @torch.no_grad()
     def ExportOnlineCandidateState(self) -> Dict[str, Any]:
-        model_signature = getattr(self.brain, "model_signature", None)
-        if type(model_signature) is not str or not model_signature:
-            raise ValueError("brain model signature is invalid")
         return {
-            "model_signature": model_signature,
             "wrappers": {
                 name: wrapper.ExportCandidateState()
                 for name, wrapper in self.NamedOnlineWrappers()},
@@ -9037,16 +9052,8 @@ class Agent:
     ) -> Dict[str, Any]:
         if type(state) is not dict:
             raise TypeError("online candidate state must be a dictionary")
-        if set(state) != {"model_signature", "wrappers"}:
+        if set(state) != {"wrappers"}:
             raise ValueError("online candidate state fields do not match")
-        model_signature = state["model_signature"]
-        expected_signature = getattr(self.brain, "model_signature", None)
-        if type(model_signature) is not str or not model_signature:
-            raise ValueError("online candidate model signature is invalid")
-        if type(expected_signature) is not str or not expected_signature:
-            raise ValueError("brain model signature is invalid")
-        if model_signature != expected_signature:
-            raise ValueError("online candidate model signature does not match")
         wrapper_state = state["wrappers"]
         if type(wrapper_state) is not dict:
             raise TypeError("online candidate wrappers must be a dictionary")
@@ -9120,27 +9127,17 @@ class Agent:
                 map_location=self.device,
                 weights_only=True)
             expected = {
-                "schema_version",
-                "contract_id",
-                "model_signature",
                 "batch_size",
                 "world",
             }
             if type(payload) is not dict or set(payload) != expected:
                 raise ValueError("world memory fields do not match")
             if (
-                type(payload["schema_version"]) is not int
-                or payload["schema_version"]
-                != WORLD_MEMORY_ARTIFACT_SCHEMA_VERSION
-                or type(payload["batch_size"]) is not int
-                or payload["contract_id"]
-                != self.brain.robot_contract_view.contract_id
-                or payload["model_signature"]
-                != self.brain.model_signature
+                type(payload["batch_size"]) is not int
                 or payload["batch_size"]
                 != self.world_memory_batch_size
             ):
-                raise ValueError("world memory identity does not match")
+                raise ValueError("world memory batch size does not match")
             world.ImportMemoryPayload(
                 payload["world"],
                 batchSize=self.world_memory_batch_size)
@@ -9149,9 +9146,6 @@ class Agent:
 
     def SaveWorldMemory(self, path: str) -> None:
         self.AtomicSave({
-            "schema_version": WORLD_MEMORY_ARTIFACT_SCHEMA_VERSION,
-            "contract_id": self.brain.robot_contract_view.contract_id,
-            "model_signature": self.brain.model_signature,
             "batch_size": self.world_memory_batch_size,
             "world": self.GetRuntimeWorld().ExportMemoryPayload(),
         }, path)
@@ -9164,26 +9158,17 @@ class Agent:
                 map_location=self.device,
                 weights_only=True)
             expected = {
-                "schema_version",
-                "contract_id",
-                "model_signature",
                 "batch_size",
                 "memory",
             }
             if type(payload) is not dict or set(payload) != expected:
                 raise ValueError("memory fields do not match")
             if (
-                type(payload["schema_version"]) is not int
-                or payload["schema_version"] != AGENT_MEMORY_SCHEMA_VERSION
-                or type(payload["batch_size"]) is not int
-                or payload["contract_id"]
-                != self.brain.robot_contract_view.contract_id
-                or payload["model_signature"]
-                != self.brain.model_signature
+                type(payload["batch_size"]) is not int
                 or payload["batch_size"]
                 != self.world_memory_batch_size
             ):
-                raise ValueError("memory identity does not match")
+                raise ValueError("memory batch size does not match")
             memory.ImportDurableState(payload["memory"])
         else:
             memory.EnsureB(self.world_memory_batch_size)
@@ -9192,9 +9177,6 @@ class Agent:
         memory = self.brain.mem
         memory.FlushPendingWrites()
         self.AtomicSave({
-            "schema_version": AGENT_MEMORY_SCHEMA_VERSION,
-            "contract_id": self.brain.robot_contract_view.contract_id,
-            "model_signature": self.brain.model_signature,
             "batch_size": self.world_memory_batch_size,
             "memory": memory.ExportDurableState(),
         }, path)
@@ -9229,22 +9211,9 @@ class Agent:
             path,
             map_location=self.device,
             weights_only=True)
-        expected = {
-            "schema_version",
-            "calibration_id",
-            "model_contract_id",
-            "brain",
-        }
+        expected = {"brain"}
         if type(payload) is not dict or set(payload) != expected:
             raise ValueError("brain parameter fields do not match")
-        if (
-            type(payload["schema_version"]) is not int
-            or payload["schema_version"] != BRAIN_RUNTIME_SCHEMA_VERSION
-            or payload["calibration_id"] != self.brain.calibration_id
-            or payload["model_contract_id"]
-            != self.brain.model_signature
-        ):
-            raise ValueError("brain parameter identity does not match")
         LoadDeploymentModelState(self.brain, payload["brain"])
 
     def EncodeEmbodimentFeedback(
@@ -9662,8 +9631,6 @@ class TestAGICoreMTool:
             return PackedEndEffectorTarget(
                 values=values,
                 active=active,
-                contract_id=contract.contract_id,
-                model_signature=contract.model_signature,
                 target_version=torch.tensor([version], dtype=torch.long),
                 timestamp=torch.tensor([timestamp]))
 
@@ -9925,8 +9892,8 @@ class TestAGICoreMTool:
                 robot.ContractView,
                 policyOptionCount=2,
                 assistOptionId=0)
-            spec.ValidateCognitiveProfileCompatibility(
-                spec.CognitiveProfilePayload())
+            assert spec.policy_option_count == 2
+            assert spec.assist_option_id == 0
             for assistOptionId in (-1, 2):
                 try:
                     BrainBuildSpec.Compile(
@@ -9938,6 +9905,59 @@ class TestAGICoreMTool:
                     continue
                 return False
             return True
+
+    def TestCognitiveBackboneSemanticState(self) -> bool:
+            robot = self.CreateTestRobot()
+            source = self.BuildOptionTransactionBrain(robot)
+            target = self.BuildOptionTransactionBrain(robot)
+            target.actor.AssistOptionIndex.zero_()
+
+            def MakeOcr(
+                orderedCharacters: Tuple[str, ...],
+                blankIndex: int,
+            ) -> OCREngineExtractor:
+                engine = OCREngineExtractor.__new__(OCREngineExtractor)
+                nn.Module.__init__(engine)
+                engine.recognizer = CRNNRecognizer(
+                    imgH=32,
+                    inCh=1,
+                    nClasses=len(orderedCharacters),
+                    rnnHidden=4,
+                    residualRank=0,
+                    orderedCharacters=orderedCharacters,
+                    blankIndex=blankIndex)
+                return engine
+
+            source.OCR = MakeOcr(("甲", "乙", "<blank>"), 2)
+            target.OCR = MakeOcr(("<blank>", "乙", "甲"), 0)
+            option_index = torch.tensor([0, 1], dtype=torch.long)
+            before_assist = target.actor.AssistOptionMask(option_index)
+            artifact = ExportCognitiveBackboneState(source)
+            entry_names = {
+                name for name, value in artifact["parameters"]}
+            LoadCognitiveBackboneState(target, artifact)
+            logits = torch.full((3, 1, 3), -8.0)
+            logits[0, 0, 0] = 8.0
+            logits[1, 0, 2] = 8.0
+            logits[2, 0, 1] = 8.0
+            decoded = target.OCR.CtcGreedyDecodeWithConf(
+                F.log_softmax(logits, dim=-1))
+            return bool(
+                COGNITIVE_BACKBONE_STATE_BUFFER_NAMES.issubset(entry_names)
+                and not any(
+                    name.startswith(COGNITIVE_BACKBONE_BLOCKED_PREFIXES)
+                    for name in entry_names)
+                and torch.equal(
+                    before_assist,
+                    torch.tensor([True, False]))
+                and torch.equal(
+                    target.actor.AssistOptionMask(option_index),
+                    torch.tensor([False, True]))
+                and target.OCR.IndexToCharacter()
+                == ("甲", "乙", "<blank>")
+                and target.OCR.BlankIndex() == 2
+                and target.OCR.CharacterToIndex()["甲"] == 0
+                and decoded[0][0] == "甲乙")
 
     def TestKnownAppliedActionMask(self) -> bool:
             from RobotMorphologyModule import TestRobotMorphologyMTool
@@ -9968,14 +9988,13 @@ class TestAGICoreMTool:
                 return PackedEndEffectorTarget(
                     values=values,
                     active=target.active.clone(),
-                    contract_id=target.contract_id,
-                    model_signature=target.model_signature,
                     target_version=target.target_version.clone(),
                     timestamp=target.timestamp.clone())
 
             decoder = DecisionDecouplerV2(
                 contract,
                 decisionDim=4,
+                jointTokenDim=4,
                 slotTokenDim=4,
                 feedbackTokenDim=4,
                 hierarchyDim=4,
@@ -10067,6 +10086,39 @@ class TestAGICoreMTool:
             assert torch.equal(worldUnknownBase, worldUnknownChanged)
             return True
 
+    def TestModelStateValidationRestoresDynamicTopology(self) -> bool:
+        class DynamicBrain(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.adapter = GrowableLoRALinear(nn.Linear(3, 2))
+
+        source = DynamicBrain()
+        source.adapter.Grow(2)
+        incomplete_state = dict(source.state_dict())
+        incomplete_state.pop("adapter.target.bias")
+
+        restored = DynamicBrain()
+        restored.adapter.Grow(1)
+        original_topology = restored.adapter.CaptureCommittedTopology()
+        original_parameters = tuple(
+            id(parameter)
+            for values in original_topology
+            for parameter in values)
+        rejected = False
+        try:
+            LoadBrainModelState(restored, incomplete_state)
+        except ValueError:
+            rejected = True
+        restored_topology = restored.adapter.CaptureCommittedTopology()
+        restored_parameters = tuple(
+            id(parameter)
+            for values in restored_topology
+            for parameter in values)
+        return (
+            rejected
+            and original_parameters == restored_parameters
+            and int(restored.adapter.A_list[0].size(0)) == 1)
+
     def RunAll(self) -> Dict[str, bool]:
         return {
             "ModelStateBoundary": callable(ExportBrainModelState),
@@ -10081,6 +10133,10 @@ class TestAGICoreMTool:
                 self.TestReadOnlyRuntimeBufferTransaction()),
             "BrainBuildSpecAssistZero": (
                 self.TestBrainBuildSpecAssistZero()),
+            "CognitiveBackboneSemanticState": (
+                self.TestCognitiveBackboneSemanticState()),
             "KnownAppliedActionMask": (
                 self.TestKnownAppliedActionMask()),
+            "ModelStateValidationRestoresDynamicTopology": (
+                self.TestModelStateValidationRestoresDynamicTopology()),
         }

@@ -9,7 +9,6 @@ from ModuleMessagerManager import CognitiveDimProfile
 from RobotMorphologyModule import (
     ActionRequest,
     BrainFeedbackPacket,
-    EmbodimentShape,
     PackedEndEffectorTarget,
     RobotEmbodimentContractView,
 )
@@ -18,12 +17,8 @@ from RobotMorphologyModule import (
 TEXT_TRUST_OCR_OBSERVED = "ocr_observed"
 TEXT_TRUST_OPERATOR_COMMAND = "operator_command"
 TEXT_TRUST_UNSAFE_EXTERNAL = "unsafe_external"
-SENSOR_PACKET_WIRE_SCHEMA_VERSION = 6
-DECISION_WIRE_SCHEMA_VERSION = 12
-BRAIN_BUILD_SPEC_SCHEMA_VERSION = 13
 POLICY_OPTION_COUNT = 81
 ASSIST_OPTION_ID = 80
-COGNITIVE_READOUT_SCHEMA_VERSION = 2
 POLICY_PATH_FULL = 0
 POLICY_PATH_FAST = 1
 POLICY_PATH_DETAIL = 2
@@ -33,37 +28,9 @@ POLICY_PATH_NONE = 3
 @dataclass(frozen=True)
 class BrainBuildSpec:
     cognitive: CognitiveDimProfile
-    embodiment: EmbodimentShape
     contract_view: RobotEmbodimentContractView
     policy_option_count: int
     assist_option_id: int
-    model_signature: str
-
-    @staticmethod
-    def CompileModelSignature(
-        cognitive: CognitiveDimProfile,
-        contractView: RobotEmbodimentContractView,
-        policyOptionCount: int = POLICY_OPTION_COUNT,
-        assistOptionId: int = ASSIST_OPTION_ID,
-    ) -> str:
-        if type(cognitive) is not CognitiveDimProfile:
-            raise TypeError("cognitive must be a CognitiveDimProfile")
-        if type(contractView) is not RobotEmbodimentContractView:
-            raise TypeError(
-                "contractView must be a RobotEmbodimentContractView")
-
-        embodiment = contractView.model_shape
-        if type(embodiment) is not EmbodimentShape:
-            raise TypeError("contractView.model_shape must be an EmbodimentShape")
-
-        cognitive_payload = {
-            name: getattr(cognitive, name)
-            for name in cognitive.__dataclass_fields__}
-        cognitive_payload["policy_option_count"] = int(policyOptionCount)
-        cognitive_payload["assist_option_id"] = int(assistOptionId)
-        return contractView.CompileBrainBuildSignature(
-            cognitive_payload,
-            BRAIN_BUILD_SPEC_SCHEMA_VERSION)
 
     @classmethod
     def Compile(
@@ -77,71 +44,12 @@ class BrainBuildSpec:
         assist_option_id = int(assistOptionId)
         if option_count < 2 or not 0 <= assist_option_id < option_count:
             raise ValueError("assist option must belong to the policy option set")
-        model_signature = cls.CompileModelSignature(
-            cognitive,
-            contractView,
-            option_count,
-            assist_option_id)
         return cls(
             cognitive=cognitive,
-            embodiment=contractView.model_shape,
             contract_view=contractView,
             policy_option_count=option_count,
             assist_option_id=assist_option_id,
-            model_signature=model_signature,
         )
-
-    def IsCheckpointCompatible(self, checkpointModelSignature: Any) -> bool:
-        return (
-            type(checkpointModelSignature) is str
-            and checkpointModelSignature == self.model_signature
-        )
-
-    def ValidateCheckpointCompatibility(
-        self,
-        checkpointModelSignature: Any,
-    ) -> None:
-        if not self.IsCheckpointCompatible(checkpointModelSignature):
-            raise ValueError(
-                "full checkpoint model_signature does not match BrainBuildSpec")
-
-    def CognitiveProfilePayload(self) -> Dict[str, int]:
-        payload = {
-            name: getattr(self.cognitive, name)
-            for name in self.cognitive.__dataclass_fields__}
-        payload["policy_option_count"] = self.policy_option_count
-        payload["assist_option_id"] = self.assist_option_id
-        return payload
-
-    def ValidateCognitiveProfileCompatibility(
-        self,
-        cognitivePayload: Any,
-    ) -> None:
-        expected = self.CognitiveProfilePayload()
-        if type(cognitivePayload) is not dict or set(cognitivePayload) != set(expected):
-            raise ValueError(
-                "cognitive backbone profile fields do not match")
-        cognitive_fields = self.cognitive.__dataclass_fields__
-        if any(
-            type(cognitivePayload[name]) is not int
-            or cognitivePayload[name] <= 0
-            for name in cognitive_fields
-        ):
-            raise ValueError(
-                "cognitive backbone profile dimensions must be positive integers")
-        option_count = cognitivePayload["policy_option_count"]
-        assist_option_id = cognitivePayload["assist_option_id"]
-        if (
-            type(option_count) is not int
-            or option_count < 2
-            or type(assist_option_id) is not int
-            or not 0 <= assist_option_id < option_count
-        ):
-            raise ValueError(
-                "cognitive backbone policy option profile is invalid")
-        if cognitivePayload != expected:
-            raise ValueError(
-                "cognitive backbone requires an identical CognitiveDimProfile")
 
     def ValidateFeedbackPacket(
         self,
@@ -166,7 +74,6 @@ class BrainBuildSpec:
 
 
 SENSOR_PACKET_WIRE_FIELDS = (
-    "schema_version",
     "stream_id",
     "sequence_index",
     "frame_id",
@@ -188,9 +95,6 @@ DECISION_REQUEST_PROVENANCE_FIELDS = (
     "frame_id",
     "calibration_id",
     "world_frame_id",
-    "description_id",
-    "model_contract_id",
-    "adapter_id",
 )
 
 
@@ -229,9 +133,6 @@ class ContractAgentActInput:
 
 @dataclass(frozen=True)
 class CognitiveReadout:
-    schema_version: int
-    model_signature: str
-    contract_id: str
     request_id: torch.Tensor
     timestamp: torch.Tensor
     row_valid: torch.Tensor
@@ -255,12 +156,6 @@ class CognitiveReadout:
     temporal_kind_id: torch.Tensor
 
     def Validate(self, buildSpec: BrainBuildSpec) -> None:
-        if (
-            self.schema_version != COGNITIVE_READOUT_SCHEMA_VERSION
-            or self.model_signature != buildSpec.model_signature
-            or self.contract_id != buildSpec.contract_view.contract_id
-        ):
-            raise ValueError("cognitive readout identity does not match")
         if not torch.is_tensor(self.timestamp) or self.timestamp.dim() != 1:
             raise ValueError("cognitive readout timestamp must be a vector")
         batchSize = int(self.timestamp.size(0))
